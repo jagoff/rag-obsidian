@@ -249,12 +249,17 @@ def _anticipate_signal_calendar(now: datetime) -> list["AnticipatoryCandidate"]:
             continue
         if delta_min > _ANTICIPATE_CALENDAR_MAX_MIN:
             continue
-        # Retrieve contexto del vault para el evento
+        # Retrieve contexto del vault para el evento.
+        # `caller="anticipate-calendar"` (2026-04-28): etiqueta este
+        # impression con el caller real para que no se mezcle con user
+        # signal en `rag_behavior` (loop estructural cerrado en el commit
+        # `fd97829`). El ranker training filtra esto out.
         try:
             col = get_db()
             result = retrieve(
                 col, title, 3, folder=None, tag=None,
                 precise=False, multi_query=False, auto_filter=False,
+                caller="anticipate-calendar",
             )
         except Exception as exc:
             _silent_log("anticipate_calendar_retrieve", exc)
@@ -373,11 +378,15 @@ def _anticipate_signal_echo(now: datetime) -> list["AnticipatoryCandidate"]:
         snippet = _anticipate_note_first_chars(note, n=500)
         if not snippet or len(snippet) < 50:
             continue
+        # `caller="anticipate-echo"` (2026-04-28): etiqueta el impression
+        # con el caller real para que el ranker training pueda filtrarlo.
+        # Ver doc en rag.retrieve() y commit `fd97829`.
         try:
             col = get_db()
             result = retrieve(
                 col, snippet, 5, folder=None, tag=None,
                 precise=False, multi_query=False, auto_filter=False,
+                caller="anticipate-echo",
             )
         except Exception as exc:
             _silent_log("anticipate_echo_retrieve", exc)

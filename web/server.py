@@ -10456,6 +10456,12 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             _retrieve_k = 8 if _is_list_intent else 4
             _retrieve_pool = 15 if _is_list_intent else 5
             _retrieve_multi_query = _is_list_intent
+            # `caller="web"` (2026-04-28): impressions del chat web son
+            # user-initiated (cada vez que el user manda un mensaje al
+            # /api/chat). El default era "cli" — funcionalmente equivalente
+            # como user signal pero ahora distinguimos para poder splitear
+            # métricas por canal (CLI vs PWA vs WhatsApp listener vía
+            # serve.chat). Ver doc en `rag.retrieve()` y commit `fd97829`.
             result = multi_retrieve(
                 vaults, search_question, _retrieve_k, None, history, None, False,
                 multi_query=_retrieve_multi_query, auto_filter=True, date_range=None,
@@ -10471,6 +10477,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     "04-Archive/99-obsidian-system/99-AI/conversations/",
                 ),
                 intent=_intent_for_log,
+                caller="web",
             )
             # Normalizar shape del result ANTES de cualquier acceso
             # downstream. Garantiza len(docs) == len(metas) == len(scores),

@@ -28870,9 +28870,14 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool,
             q = entry["question"]
             expected = set(entry.get("expected") or [])
             _t0 = time.perf_counter()
+            # `caller="eval"` (2026-04-28): impressions del eval set NO
+            # son user signal — el ranker training filtra esto out. Ver
+            # commit `fd97829` y RAG_SKIP_BEHAVIOR_LOG (que también blokea
+            # log_query_event para eval).
             result = retrieve(
                 col, q, k, folder=None, tag=None,
                 precise=hyde, multi_query=not no_multi, auto_filter=True,
+                caller="eval",
             )
             singles_latency_ms.append((time.perf_counter() - _t0) * 1000)
             seen_paths = _dedup([m.get("file", "") for m in result["metas"]])
@@ -28970,6 +28975,7 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool,
                     # the LLM to drift off-topic (see retrieve() docstring
                     # for the earlier prompt-injection attempt that failed).
                     seen_titles=_titles_from_paths(chain_seen_paths),
+                    caller="eval",
                 )
                 chains_latency_ms.append((time.perf_counter() - _t0) * 1000)
                 seen_paths = _dedup([m.get("file", "") for m in result["metas"]])
@@ -42992,10 +42998,15 @@ def _classify_followup_loop(
             out["resolved_by"] = "reminder"
             return out
 
+    # `caller="followup"` (2026-04-28): el find_followup_loops daemon corre
+    # automáticamente y dispara retrieve() para cada loop pendiente. Sin
+    # caller explícito, esos impressions se mezclaban con user signal en
+    # rag_behavior. Ver doc en `retrieve()` y commit `fd97829`.
     try:
         result = retrieve(
             col, loop["loop_text"], k=5, folder=None,
             multi_query=False, auto_filter=False,
+            caller="followup",
         )
     except Exception:
         return out

@@ -244,7 +244,11 @@ T4: cuál sería el principal mensaje? → ❌ goes to chats/Maria/Moni (off-top
 
 ---
 
-### ⚠️ MEDIUM #9 — Mails en respuesta exponen commit SHA / metadata interna
+### ✅ MEDIUM #9 — Mails en respuesta exponen commit SHA / metadata interna — FIXED 2026-04-28 (wave-8 `2bdb667`)
+
+**Status:** RESUELTO. `_format_gmail_block` agrupa noise (CI/security/marketing/automated) en summary lines y solo lista mails personales uno por uno. CI desglose por outcome ("3 CI/builds (2 failed, 1 passed)").
+
+
 
 **Repro:**
 ```
@@ -264,7 +268,11 @@ bot: [jagoff/rag-obsidian] Run failed: CI - master (4a03565) (de Fer F)
 
 ---
 
-### ⚠️ MEDIUM #10 — "qué eventos puedo postergar" no usa context del turn previo
+### ✅ MEDIUM #10 — "qué eventos puedo postergar" no usa context del turn previo — PARCIALMENTE FIXED 2026-04-28 (wave-8 `29f8e54`)
+
+**Status:** PARCIAL. `_ANAPHORIC_REFERENCE_RE` matchea follow-ups referenciales ("y de eso", "cuál podría posponer", "los demás"). Cuando matchea, re-fires los mismos tools del turno previo. El LLM ahora tiene los datos frescos + la pregunta meta. Limit: cuando el turno previo dijo "no había eventos", el LLM puede usar otros tools del set (e.g. whatsapp_pending) y desviar el foco. Solución completa requiere persistir el output renderizado del turno previo y marcarlo como CONTEXTO autoritativo.
+
+
 
 **Repro:**
 ```
@@ -396,9 +404,9 @@ bot: Tarjeta $549.439 + U$S98.93 + MOZE $5.119.709
 8. ✅ **Auto-recovery no debe matar web server** — wave-6 `5b42c0d`
 
 ### P3 (MEDIUM)
-9. **Topic anchor multi-turn** (limit conocido del CONCAT) — backlog
-10. **Mails summary** (agrupar CI/notifications) — backlog
-11. **Tool output context al siguiente turn** ("y de eso qué puedo postergar?") — backlog
+9. ✅ **Mails summary** (agrupar CI/notifications) — wave-8 `2bdb667`
+10. ✅ **Tool output context al siguiente turn** ("y de eso qué puedo postergar?") — PARCIAL — wave-8 `29f8e54`
+11. **Topic anchor multi-turn** (limit conocido del CONCAT) — backlog
 12. ✅ **Cache versioning** (prompt_version + filter_version en key) — wave-7 + wave-8
 
 ### P4 (LOW — nits)

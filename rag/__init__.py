@@ -44524,6 +44524,8 @@ def _web_plist(rag_bin: str) -> str:
     <key>TRANSFORMERS_OFFLINE</key><string>1</string>
     <key>RAG_MEMORY_PRESSURE_INTERVAL</key><string>20</string>
     <key>RAG_MEMORY_PRESSURE_THRESHOLD</key><string>80</string>
+    <key>RAG_AUTO_FIX_WORKER</key><string>1</string>
+    <key>RAG_AUTO_FIX_HOURLY_CAP</key><string>12</string>
 {yt_line}  </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>

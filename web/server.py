@@ -17011,7 +17011,7 @@ def _enqueue_error(
 # Rate limit del worker — max N invocaciones de Devin por hora.
 # Cada invocación tarda ~60-120s y consume ACUs pagas, así que el cap
 # es conservador. Ajustable con env var.
-_AUTO_FIX_WORKER_HOURLY_CAP = int(os.environ.get("RAG_AUTO_FIX_HOURLY_CAP", "5"))
+_AUTO_FIX_WORKER_HOURLY_CAP = int(os.environ.get("RAG_AUTO_FIX_HOURLY_CAP", "12"))
 _AUTO_FIX_WORKER_INVOCATIONS: list[float] = []  # monotonic ts de invocaciones
 
 
@@ -17144,19 +17144,64 @@ def _process_error_with_devin(error_id: int) -> dict:
     ]
     _AUTO_FIX_WORKER_INVOCATIONS.append(time.monotonic())
     t0 = time.monotonic()
+    proc_pid: int | None = None
     try:
-        proc = subprocess.run(
+        # Usamos Popen + wait en lugar de subprocess.run() porque queremos
+        # capturar el PID del subprocess para poder recuperar el transcript
+        # JSON aunque Devin no haya escrito nada a stdout (block-buffering
+        # en modo no-TTY — mismo bug que rompía el SSE endpoint /api/auto-
+        # fix-devin antes del fix del 2026-04-29).
+        proc = subprocess.Popen(
             cmd,
             cwd=str(ROOT),
-            stdin=subprocess.DEVNULL,  # evitar bloqueo esperando input
-            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=_AUTO_FIX_DEVIN_TIMEOUT_S,
             shell=False,
             env={**os.environ, "TERM": "dumb", "NO_COLOR": "1"},
         )
-        output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
+        proc_pid = proc.pid
+        try:
+            stdout_str, stderr_str = proc.communicate(timeout=_AUTO_FIX_DEVIN_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            try:
+                stdout_str, stderr_str = proc.communicate(timeout=8)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout_str, stderr_str = proc.communicate(timeout=2)
+            output_partial = (stdout_str or "") + (
+                "\n" + stderr_str if stderr_str else "")
+            recovered = _recover_devin_final_message(proc_pid)
+            if recovered and recovered not in output_partial:
+                output_partial = (output_partial + "\n\n" + recovered).strip()
+            duration_s = round(time.monotonic() - t0, 3)
+            # Si el transcript SÍ tiene STATUS (Devin alcanzó a terminar
+            # antes del SIGTERM), parseamos ese; si no, marcamos failed
+            # con razón "timeout".
+            if recovered:
+                resolution_status, reason = _parse_devin_resolution_status(output_partial)
+                if resolution_status == "failed" and "no status marker" in reason:
+                    reason = f"timeout {_AUTO_FIX_DEVIN_TIMEOUT_S}s, transcript recuperado sin STATUS"
+            else:
+                resolution_status, reason = "failed", f"timeout {_AUTO_FIX_DEVIN_TIMEOUT_S}s"
+            _finalize_error(error_id, 124, output_partial, resolution_status, reason, duration_s)
+            return {
+                "error_id": error_id, "exit_code": 124,
+                "resolution_status": resolution_status, "reason": reason,
+                "duration_s": duration_s,
+            }
+        output = (stdout_str or "") + ("\n" + stderr_str if stderr_str else "")
         exit_code = proc.returncode
+        # Recovery del transcript JSON: si el output está vacío (típico:
+        # Devin block-buffera stdout cuando el parent es pipe), o si no
+        # tiene STATUS marker, intentamos recuperar el final assistant
+        # message del transcript que Devin escribe siempre al disco.
+        if proc_pid is not None:
+            recovered = _recover_devin_final_message(proc_pid)
+            if recovered and recovered not in output:
+                output = (output + "\n\n" + recovered).strip() if output.strip() else recovered
         duration_s = round(time.monotonic() - t0, 3)
         if exit_code == 0:
             resolution_status, reason = _parse_devin_resolution_status(output)
@@ -17168,11 +17213,6 @@ def _process_error_with_devin(error_id: int) -> dict:
             "resolution_status": resolution_status, "reason": reason,
             "duration_s": duration_s,
         }
-    except subprocess.TimeoutExpired:
-        duration_s = round(time.monotonic() - t0, 3)
-        _finalize_error(error_id, 124, "", "failed",
-                        f"timeout {_AUTO_FIX_DEVIN_TIMEOUT_S}s", duration_s)
-        return {"error_id": error_id, "exit_code": 124, "resolution_status": "failed"}
     except Exception as e:
         duration_s = round(time.monotonic() - t0, 3)
         _finalize_error(error_id, -1, "", "failed",

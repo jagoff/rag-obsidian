@@ -2,6 +2,8 @@
 patterns (people + topics) before the LLM narrative call.
 """
 
+import pytest
+
 from rag.today_correlator import (
     _canonicalize_name,
     _extract_name_from_email,
@@ -267,14 +269,19 @@ def test_topics_sorted_by_sources_count_desc():
 # ── correlate_today_signals — empty / edge cases ────────────────────────────
 
 
-def test_empty_inputs():
+def test_empty_inputs(monkeypatch):
+    # Sin RAG_MOOD_ENABLED el bucket mood queda None.
+    monkeypatch.delenv("RAG_MOOD_ENABLED", raising=False)
     result = correlate_today_signals({}, {})
-    assert result == {"people": [], "topics": [], "time_overlaps": [], "gaps": []}
+    assert result == {"people": [], "topics": [], "time_overlaps": [],
+                      "gaps": [], "mood": None}
 
 
-def test_handles_none_inputs():
+def test_handles_none_inputs(monkeypatch):
+    monkeypatch.delenv("RAG_MOOD_ENABLED", raising=False)
     result = correlate_today_signals(None, None)
-    assert result == {"people": [], "topics": [], "time_overlaps": [], "gaps": []}
+    assert result == {"people": [], "topics": [], "time_overlaps": [],
+                      "gaps": [], "mood": None}
 
 
 # ── Self-notifications (github bot, google alerts, etc.) ───────────────────
@@ -790,3 +797,117 @@ def test_time_overlap_uses_local_time_consistently():
         "Time overlap NO detectado — posible timezone mismatch entre "
         "_ms_at_local_time (test helper) y fromtimestamp (correlator)."
     )
+
+
+# ── mood bucket ────────────────────────────────────────────────────────────
+
+
+def test_mood_bucket_none_when_feature_off(monkeypatch):
+    """Sin RAG_MOOD_ENABLED, correlate_today_signals devuelve mood=None."""
+    monkeypatch.delenv("RAG_MOOD_ENABLED", raising=False)
+    result = correlate_today_signals({}, {})
+    assert result["mood"] is None
+
+
+def test_mood_bucket_none_when_no_score_today(monkeypatch):
+    """Con feature on pero sin row para hoy en rag_mood_score_daily,
+    bucket queda None (no asumimos score=0 = ok)."""
+    monkeypatch.setenv("RAG_MOOD_ENABLED", "1")
+    from rag import mood
+    monkeypatch.setattr(mood, "get_score_for_date", lambda _d: None)
+    monkeypatch.setattr(mood, "get_recent_scores", lambda days=7: [])
+    monkeypatch.setattr(mood, "recent_drift", lambda **kw: {
+        "drifting": False, "n_consecutive": 0, "avg_score": 0.0,
+    })
+    result = correlate_today_signals({}, {})
+    assert result["mood"] is None
+
+
+def test_mood_bucket_none_when_score_has_zero_signals(monkeypatch):
+    """Row para hoy pero n_signals=0 (daemon corrió pero no encontró
+    nada): bucket None, no contaminamos el prompt con neutro vacío."""
+    monkeypatch.setenv("RAG_MOOD_ENABLED", "1")
+    from rag import mood
+    monkeypatch.setattr(mood, "get_score_for_date", lambda _d: {
+        "date": "2026-04-30", "score": 0.0, "n_signals": 0,
+        "sources_used": [], "top_evidence": [], "updated_at": 0,
+    })
+    monkeypatch.setattr(mood, "get_recent_scores", lambda days=7: [])
+    monkeypatch.setattr(mood, "recent_drift", lambda **kw: {
+        "drifting": False, "n_consecutive": 0, "avg_score": 0.0,
+    })
+    result = correlate_today_signals({}, {})
+    assert result["mood"] is None
+
+
+def test_mood_bucket_populated_when_active(monkeypatch):
+    """Feature on + score con n_signals > 0: bucket completo."""
+    monkeypatch.setenv("RAG_MOOD_ENABLED", "1")
+    from rag import mood
+    monkeypatch.setattr(mood, "get_score_for_date", lambda _d: {
+        "date": "2026-04-30", "score": -0.5, "n_signals": 4,
+        "sources_used": ["spotify", "journal"],
+        "top_evidence": [
+            {"source": "journal", "signal_kind": "keyword_negative",
+             "value": -0.7, "weight": 1.0, "evidence": {}},
+            {"source": "spotify", "signal_kind": "artist_mood_lookup",
+             "value": -0.4, "weight": 1.0, "evidence": {}},
+        ],
+        "updated_at": 0,
+    })
+    monkeypatch.setattr(mood, "get_recent_scores", lambda days=7: [
+        {"date": "2026-04-30", "score": -0.5, "n_signals": 4},
+        {"date": "2026-04-29", "score": -0.1, "n_signals": 2},
+        {"date": "2026-04-28", "score": +0.1, "n_signals": 3},
+    ])
+    monkeypatch.setattr(mood, "recent_drift", lambda **kw: {
+        "drifting": False, "n_consecutive": 1,
+        "avg_score": -0.5, "dates": ["2026-04-30"], "reason": "only_1_days",
+    })
+    result = correlate_today_signals({}, {})
+    bucket = result["mood"]
+    assert bucket is not None
+    assert bucket["score"] == -0.5
+    assert bucket["n_signals"] == 4
+    assert "spotify" in bucket["sources_used"]
+    # week_avg = mean(-0.5, -0.1, +0.1) = -0.166
+    assert bucket["week_avg"] == pytest.approx(-0.166, abs=0.01)
+    # delta = -0.5 - (-0.166) = -0.334 → declining
+    assert bucket["trend"] == "declining"
+    # Drift bucket pasa con shape limpia.
+    assert bucket["drift"]["drifting"] is False
+    assert bucket["drift"]["n_consecutive"] == 1
+    # Top evidence top 2 incluido.
+    assert len(bucket["top_evidence"]) == 2
+
+
+def test_mood_bucket_trend_improving(monkeypatch):
+    """Score hoy MUY arriba del promedio 7d → trend improving."""
+    monkeypatch.setenv("RAG_MOOD_ENABLED", "1")
+    from rag import mood
+    monkeypatch.setattr(mood, "get_score_for_date", lambda _d: {
+        "date": "2026-04-30", "score": +0.6, "n_signals": 3,
+        "sources_used": ["spotify"], "top_evidence": [], "updated_at": 0,
+    })
+    monkeypatch.setattr(mood, "get_recent_scores", lambda days=7: [
+        {"date": "2026-04-30", "score": +0.6, "n_signals": 3},
+        {"date": "2026-04-29", "score": -0.1, "n_signals": 2},
+        {"date": "2026-04-28", "score": -0.2, "n_signals": 2},
+    ])
+    monkeypatch.setattr(mood, "recent_drift", lambda **kw: {
+        "drifting": False, "n_consecutive": 0, "avg_score": 0.0,
+    })
+    result = correlate_today_signals({}, {})
+    assert result["mood"]["trend"] == "improving"
+
+
+def test_mood_bucket_silent_fail_on_exception(monkeypatch):
+    """Si alguna función de rag.mood tira, _correlate_mood devuelve None
+    en vez de propagar (no rompe el today brief si la DB está locked)."""
+    monkeypatch.setenv("RAG_MOOD_ENABLED", "1")
+    from rag import mood
+    def _broken(*args, **kwargs):
+        raise RuntimeError("DB locked")
+    monkeypatch.setattr(mood, "get_score_for_date", _broken)
+    result = correlate_today_signals({}, {})
+    assert result["mood"] is None

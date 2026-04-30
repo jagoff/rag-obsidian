@@ -910,6 +910,86 @@ def normalize_voice_to_2da_persona(text: str) -> str:
     return "".join(out_parts)
 
 
+def _correlate_mood(today_ev: dict, extras: dict) -> dict | None:
+    """Lee el score diario de hoy + los últimos 7 días desde
+    `rag_mood_score_daily` (lo escribe el daemon `mood-poll` cada 30
+    min — `rag/mood.py:run_poll_cycle()`). Devuelve un bucket con
+    shape:
+
+        {
+            "score": float,              # score de hoy (-1..+1)
+            "n_signals": int,            # cuántas señales lo soportan
+            "sources_used": [str],       # ["spotify", "journal", ...]
+            "trend": str,                # "stable" | "improving" | "declining"
+            "week_avg": float,           # media móvil 7d
+            "drift": {                   # del recent_drift()
+                "drifting": bool,
+                "n_consecutive": int,
+                "avg_score": float,
+            },
+            "top_evidence": [...],       # top 3 señales del día
+        }
+
+    Devuelve `None` si:
+      - el feature está off (`RAG_MOOD_ENABLED` no seteado),
+      - no hay row para hoy todavía (daemon nunca corrió),
+      - hubo error leyendo (silent-fail con None).
+
+    El consumer downstream (today brief prompt) decide si/cómo
+    modular tono según este bucket. ESTE módulo NO verbaliza el
+    score — solo lo expone como contexto cross-source. La regla
+    "no decir 'noté que estás triste'" se aplica en el prompt
+    template, no acá.
+    """
+    try:
+        from rag import mood as _mood  # noqa: PLC0415
+    except Exception:
+        return None
+    if not _mood._is_mood_enabled():
+        return None
+
+    try:
+        today = _mood._today_local()
+        score_row = _mood.get_score_for_date(today)
+        if score_row is None or score_row.get("n_signals", 0) == 0:
+            return None
+        recent = _mood.get_recent_scores(days=7)
+        drift = _mood.recent_drift(days=7)
+    except Exception:
+        return None
+
+    # week_avg de los últimos 7 días con n_signals > 0 (excluye hoy si querés
+    # comparar con baseline, pero acá lo incluimos: el "trend" mide cuánto
+    # se desvía hoy del promedio reciente).
+    valid = [r for r in recent if r["n_signals"] > 0]
+    if not valid:
+        week_avg = score_row["score"]
+    else:
+        week_avg = sum(r["score"] for r in valid) / len(valid)
+
+    delta = score_row["score"] - week_avg
+    if delta > 0.2:
+        trend = "improving"
+    elif delta < -0.2:
+        trend = "declining"
+    else:
+        trend = "stable"
+
+    return {
+        "score": round(score_row["score"], 3),
+        "n_signals": score_row["n_signals"],
+        "sources_used": score_row.get("sources_used") or [],
+        "trend": trend,
+        "week_avg": round(week_avg, 3),
+        "drift": {
+            "drifting": bool(drift.get("drifting", False)),
+            "n_consecutive": int(drift.get("n_consecutive", 0)),
+            "avg_score": round(float(drift.get("avg_score", 0.0)), 3),
+        },
+        "top_evidence": (score_row.get("top_evidence") or [])[:3],
+    }
+
+
 def correlate_today_signals(today_ev: dict, extras: dict) -> dict:
     """Pre-correlate cross-source signals. Returns:
         {
@@ -917,14 +997,21 @@ def correlate_today_signals(today_ev: dict, extras: dict) -> dict:
             "topics": [{topic, sources, sources_count}, ...],
             "time_overlaps": [{time, items: [...], shared_tokens}, ...],
             "gaps": [{kind, person, hours_waiting, snippet, context}, ...],
+            "mood": {score, trend, drift, ...} | None,  # None si feature off
         }
 
     Empty buckets are silently skipped — `today_ev` and `extras` can
     have any subset of keys; missing keys default to []/{}.
+
+    `mood` viene poblado solo cuando `RAG_MOOD_ENABLED=1` Y el daemon
+    `mood-poll` ya escribió un row para hoy en `rag_mood_score_daily`.
+    En cualquier otro caso queda `None` y el prompt downstream lo
+    detecta + skipea la modulación.
     """
     return {
         "people": _correlate_people(today_ev or {}, extras or {}),
         "topics": _correlate_topics(today_ev or {}, extras or {}),
         "time_overlaps": _correlate_time_overlaps(today_ev or {}, extras or {}),
         "gaps": _correlate_gaps(today_ev or {}, extras or {}),
+        "mood": _correlate_mood(today_ev or {}, extras or {}),
     }

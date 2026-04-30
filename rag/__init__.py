@@ -52,6 +52,7 @@ import contextlib
 import csv
 import fcntl
 import hashlib
+import heapq
 import json
 import queue
 import random
@@ -14751,9 +14752,10 @@ def bm25_search(
             ]
             if not valid:
                 return []
-            top = sorted(valid, key=lambda i: scores[i], reverse=True)[:k]
+            # heapq.nlargest: O(n log k) en vez de O(n log n) con sorted+slice
+            top = heapq.nlargest(k, valid, key=lambda i: scores[i])
         else:
-            top = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:k]
+            top = heapq.nlargest(k, range(len(scores)), key=lambda i: scores[i])
 
         return [ids[i] for i in top]
     finally:

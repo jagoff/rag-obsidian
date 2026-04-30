@@ -101,7 +101,14 @@ def test_ensure_telemetry_tables_idempotent(tmp_path):
     # 47 tables total.
     expected = {name for name, _ in rag._TELEMETRY_DDL}
     assert expected.issubset(after)
-    assert len(expected) == 47
+    # Sanity floor: si esto baja accidentalmente, alguien borró tablas en
+    # _TELEMETRY_DDL sin migration. El upper bound no se trackea acá — la
+    # lista crece naturalmente con cada feature nueva (49 al 2026-04-30,
+    # historic baseline 47 pre-2026-04-30 cuando se agregaron 2 nuevas).
+    assert len(expected) >= 47, (
+        f"_TELEMETRY_DDL bajó de 47 tablas (ahora {len(expected)}) — "
+        "verificar que ninguna feature perdió su tabla"
+    )
     c.close()
 
 

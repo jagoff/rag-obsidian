@@ -29,6 +29,7 @@ def tmp_routing_db(tmp_path: Path, monkeypatch):
             transcript TEXT NOT NULL,
             transcript_hash TEXT NOT NULL,
             bucket_llm TEXT NOT NULL,
+            confidence_llm TEXT,
             extracted_json TEXT NOT NULL,
             bucket_final TEXT,
             user_response TEXT,

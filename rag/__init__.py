@@ -6869,6 +6869,40 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             "ON rag_behavior_priors_wa(computed_at DESC)",
         ),
     ),
+    (
+        # Spotify local poller log — populated by
+        # `rag.integrations.spotify_local.record_now_playing()` driven by
+        # the `com.fer.obsidian-rag-spotify-poll` plist (StartInterval=60s).
+        # Reemplaza el path de la API HTTP `/me/player/recently-played`
+        # que rompió 2026-04-30 (Spotify cambió las reglas: 403 "Active
+        # premium subscription required for the owner of the app" para
+        # apps de devs sin Premium).
+        #
+        # Idempotencia: el writer hace UPDATE last_seen cuando el track_id
+        # actual matchea el último insert dentro de los últimos 5min,
+        # sino INSERT nuevo. Resultado: una row por sesión continua de un
+        # track (no una por cada poll). `date` (YYYY-MM-DD local) facilita
+        # el query de "hoy" sin recalcular timezone.
+        "rag_spotify_log",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_spotify_log ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " track_id TEXT NOT NULL,"
+            " name TEXT NOT NULL,"
+            " artist TEXT NOT NULL,"
+            " album TEXT,"
+            " state TEXT,"
+            " duration_ms INTEGER,"
+            " first_seen REAL NOT NULL,"
+            " last_seen REAL NOT NULL,"
+            " date TEXT NOT NULL"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_spotify_log_date "
+            "ON rag_spotify_log(date)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_spotify_log_last_seen "
+            "ON rag_spotify_log(last_seen DESC)",
+        ),
+    ),
 )
 
 
@@ -7122,19 +7156,78 @@ def _ensure_telemetry_tables(conn) -> None:
         has_schema_version = bool(conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='rag_schema_version'"
         ).fetchone())
+        # Fast path 2026-04-30 (bug fix `database is locked` recurrente):
+        # si TODAS las tablas declaradas en _TELEMETRY_DDL ya existen en
+        # sqlite_master, otro proceso las creó. Saltamos el BEGIN write-lock
+        # entero — resuelve el race del bootstrap concurrent (cron despierta
+        # wa-scheduled-send mientras web server está escribiendo, BEGIN
+        # bloquea por busy_timeout=60s y al final tira OperationalError
+        # crasheando al worker). Una lectura SELECT FROM sqlite_master no
+        # toma write lock, así que es seguro bajo contención.
+        declared_tables = {name for name, _ in _TELEMETRY_DDL}
+        existing_tables = {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        skip_ddl = declared_tables.issubset(existing_tables)
         try:
-            conn.execute("BEGIN")
-            for _table_name, stmts in _TELEMETRY_DDL:
-                for stmt in stmts:
-                    conn.execute(stmt)
-            if has_schema_version:
-                conn.executemany(
-                    "INSERT OR IGNORE INTO rag_schema_version(table_name, version) VALUES(?, 1)",
-                    [(name,) for name, _ in _TELEMETRY_DDL],
-                )
-            conn.execute("COMMIT")
+            if skip_ddl:
+                # Las tablas existen — solo aplicamos los inserts a
+                # rag_schema_version (idempotent INSERT OR IGNORE), sin BEGIN
+                # explícito para reducir la window de write-lock.
+                if has_schema_version:
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO rag_schema_version(table_name, version) VALUES(?, 1)",
+                        [(name,) for name, _ in _TELEMETRY_DDL],
+                    )
+            else:
+                # Slow path: hacer el bootstrap completo con retry transient.
+                # Si chocamos contra un writer concurrente y el busy_timeout
+                # se agota, volvemos a probar después de backoff. Las DDL son
+                # CREATE TABLE IF NOT EXISTS (idempotent) — el rollback no
+                # deja state corrupto.
+                last_exc: Exception | None = None
+                for attempt in range(5):
+                    try:
+                        conn.execute("BEGIN")
+                        for _table_name, stmts in _TELEMETRY_DDL:
+                            for stmt in stmts:
+                                conn.execute(stmt)
+                        if has_schema_version:
+                            conn.executemany(
+                                "INSERT OR IGNORE INTO rag_schema_version(table_name, version) VALUES(?, 1)",
+                                [(name,) for name, _ in _TELEMETRY_DDL],
+                            )
+                        conn.execute("COMMIT")
+                        last_exc = None
+                        break
+                    except _sqlite3.OperationalError as exc:
+                        try:
+                            conn.execute("ROLLBACK")
+                        except _sqlite3.Error:
+                            pass
+                        if not _is_transient_sql_error(exc):
+                            raise
+                        last_exc = exc
+                        # Antes de reintentar: ¿completó otro proceso el
+                        # bootstrap mientras esperábamos? Si sí, salir.
+                        existing_after = {
+                            r[0] for r in conn.execute(
+                                "SELECT name FROM sqlite_master WHERE type='table'"
+                            ).fetchall()
+                        }
+                        if declared_tables.issubset(existing_after):
+                            last_exc = None
+                            break
+                        time.sleep(0.5 * (2 ** attempt))  # 0.5, 1, 2, 4, 8s
+                if last_exc is not None:
+                    raise last_exc
         except _sqlite3.Error:
-            conn.execute("ROLLBACK")
+            try:
+                conn.execute("ROLLBACK")
+            except _sqlite3.Error:
+                pass
             raise
         # Lazy schema migrations — corren FUERA de la transaction principal
         # porque ALTER TABLE no siempre es transactable y no queremos abortar

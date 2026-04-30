@@ -132,9 +132,31 @@ def extract_pivot_phrases(
 
     try:
         with rag._ragvec_state_conn() as conn:
+            # Bug fix 2026-04-30: el listener TS escribía `bucket_llm` y
+            # `confidence_llm` pero NUNCA actualizaba `bucket_final` después
+            # de la ejecución (gap del wiring entre TS y RAG). Resultado:
+            # 17/17 rows con `bucket_final IS NULL` → 0 patterns extraíbles
+            # → 0 reglas promovidas → loop muerto desde día 1.
+            #
+            # Workaround acá: usar `bucket_llm` como fallback cuando hay
+            # `confidence_llm='high'`. La premisa: si el LLM clasificó con
+            # alta confianza y nadie lo corrigió, asumimos que el bucket
+            # final fue ese (caso común — el user solo interviene cuando
+            # hay error visible). Riesgo controlado: requerimos
+            # min_count=5 + min_ratio=0.90 para promover, así que un
+            # outlier ocasional no genera regla mala.
+            #
+            # Forma final del bucket: COALESCE(bucket_final,
+            #   bucket_llm WHERE confidence_llm='high', NULL).
             rows = conn.execute(
-                "SELECT transcript, bucket_final FROM rag_routing_decisions "
-                "WHERE bucket_final IS NOT NULL AND ts >= ? "
+                "SELECT transcript, COALESCE(NULLIF(bucket_final, ''), "
+                "                            CASE WHEN confidence_llm = 'high' "
+                "                                 AND bucket_llm IS NOT NULL "
+                "                                 AND bucket_llm != '_failed' "
+                "                                 THEN bucket_llm END) "
+                "       AS bucket_effective "
+                "FROM rag_routing_decisions "
+                "WHERE ts >= ? "
                 "ORDER BY ts DESC",
                 (cutoff_ts,),
             ).fetchall()

@@ -43,6 +43,7 @@ def tmp_routing_db(tmp_path: Path, monkeypatch):
             transcript TEXT NOT NULL,
             transcript_hash TEXT NOT NULL,
             bucket_llm TEXT NOT NULL,
+            confidence_llm TEXT,
             extracted_json TEXT NOT NULL,
             bucket_final TEXT,
             user_response TEXT,
@@ -283,3 +284,104 @@ def test_extract_orders_by_count_desc(tmp_routing_db):
     frec_idx = next(i for i, p in enumerate(patterns) if p.pattern == "frase frecuente")
     rara_idx = next(i for i, p in enumerate(patterns) if p.pattern == "frase rara")
     assert frec_idx < rara_idx
+
+
+# ── Fallback bucket_llm cuando bucket_final IS NULL (bug fix 2026-04-30) ────
+
+
+def _insert_decisions_with_confidence(
+    db_path: Path,
+    rows: list[tuple[str, str | None, str, str | None, int]],
+):
+    """Insert helper extendido. Tupla = (transcript, bucket_final,
+    bucket_llm, confidence_llm, ts)."""
+    conn = sqlite3.connect(str(db_path))
+    for i, (transcript, bucket_final, bucket_llm, confidence, ts) in enumerate(rows):
+        conn.execute(
+            "INSERT INTO rag_routing_decisions "
+            "(ts, chat_jid, message_id, transcript, transcript_hash, "
+            " bucket_llm, confidence_llm, extracted_json, bucket_final) "
+            "VALUES (?, 'test@chat', ?, ?, ?, ?, ?, '{}', ?)",
+            (ts, f"msg_{i}", transcript, f"hash_{i}",
+             bucket_llm, confidence, bucket_final),
+        )
+    conn.commit()
+    conn.close()
+
+
+def test_extract_uses_bucket_llm_when_bucket_final_null_and_confidence_high(tmp_routing_db):
+    """Bug 2026-04-30: el listener TS no actualiza bucket_final → 0 patterns.
+    Workaround: usar bucket_llm como fallback cuando confidence_llm='high'."""
+    import time
+    from rag_routing_learning.patterns import extract_pivot_phrases
+    now = int(time.time())
+    # bucket_final = NULL en todas; bucket_llm='reminder' con high confidence.
+    _insert_decisions_with_confidence(tmp_routing_db, [
+        ("tengo que llamar a juan", None, "reminder", "high", now - 100),
+        ("tengo que comprar pan", None, "reminder", "high", now - 200),
+        ("tengo que ir al banco", None, "reminder", "high", now - 300),
+        ("tengo que pagar la factura", None, "reminder", "high", now - 400),
+        ("tengo que llevar el auto", None, "reminder", "high", now - 500),
+    ])
+    patterns = extract_pivot_phrases(min_count=5, min_ratio=0.90)
+    matching = [p for p in patterns if p.pattern == "tengo que"]
+    assert len(matching) == 1, "fallback bucket_llm debería haber emitido el patrón"
+    assert matching[0].bucket == "reminder"
+    assert matching[0].count == 5
+
+
+def test_extract_skips_when_confidence_not_high(tmp_routing_db):
+    """Si confidence_llm != 'high', no usar bucket_llm como fallback."""
+    import time
+    from rag_routing_learning.patterns import extract_pivot_phrases
+    now = int(time.time())
+    _insert_decisions_with_confidence(tmp_routing_db, [
+        ("tengo que A", None, "reminder", "low", now - 100),
+        ("tengo que B", None, "reminder", "medium", now - 200),
+        ("tengo que C", None, "reminder", None, now - 300),
+        ("tengo que D", None, "reminder", "low", now - 400),
+        ("tengo que E", None, "reminder", "medium", now - 500),
+    ])
+    patterns = extract_pivot_phrases(min_count=5, min_ratio=0.90)
+    assert all(p.pattern != "tengo que" for p in patterns), \
+        "low/medium confidence no deberían contar"
+
+
+def test_extract_skips_failed_bucket(tmp_routing_db):
+    """`bucket_llm = '_failed'` (LLM error) no debe contarse aunque
+    confidence='high'."""
+    import time
+    from rag_routing_learning.patterns import extract_pivot_phrases
+    now = int(time.time())
+    _insert_decisions_with_confidence(tmp_routing_db, [
+        ("tengo que A", None, "_failed", "high", now - 100),
+        ("tengo que B", None, "_failed", "high", now - 200),
+        ("tengo que C", None, "_failed", "high", now - 300),
+        ("tengo que D", None, "_failed", "high", now - 400),
+        ("tengo que E", None, "_failed", "high", now - 500),
+    ])
+    patterns = extract_pivot_phrases(min_count=5, min_ratio=0.90)
+    assert all(p.pattern != "tengo que" for p in patterns), \
+        "_failed bucket no debería generar reglas"
+
+
+def test_extract_prefers_bucket_final_over_bucket_llm_fallback(tmp_routing_db):
+    """Si bucket_final está set (no null/empty), wins sobre bucket_llm aunque
+    confidence_llm='high'. Esto preserva la verdad del user feedback."""
+    import time
+    from rag_routing_learning.patterns import extract_pivot_phrases
+    now = int(time.time())
+    # bucket_final='note' (user lo redirigió), bucket_llm='reminder' (LLM
+    # original). El extractor debería contar 'note', no 'reminder'.
+    _insert_decisions_with_confidence(tmp_routing_db, [
+        ("tengo que A", "note", "reminder", "high", now - 100),
+        ("tengo que B", "note", "reminder", "high", now - 200),
+        ("tengo que C", "note", "reminder", "high", now - 300),
+        ("tengo que D", "note", "reminder", "high", now - 400),
+        ("tengo que E", "note", "reminder", "high", now - 500),
+    ])
+    patterns = extract_pivot_phrases(min_count=5, min_ratio=0.90)
+    matching = [p for p in patterns if p.pattern == "tengo que"]
+    assert len(matching) == 1
+    assert matching[0].bucket == "note", \
+        "bucket_final debe ganar sobre bucket_llm fallback"

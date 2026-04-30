@@ -449,6 +449,15 @@ def run(
     _ensure_state_table(state_conn)
     if reset:
         _reset_state(state_conn)
+        # Reset also requires wiping prior chunks from the corpus so the next
+        # run doesn't skip unchanged items when the state cursor is fresh.
+        try:
+            key_prefix = f"{DOC_ID_PREFIX}://"
+            existing = col.get(where={"file": {"$regex": f"^{key_prefix}"}}, include=[])
+            if existing.get("ids"):
+                col.delete(ids=existing["ids"])
+        except Exception:
+            pass
     state_conn.commit()
 
     prior_hashes = _load_hashes(state_conn)

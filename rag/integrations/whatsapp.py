@@ -172,6 +172,26 @@ def _whatsapp_send_to_jid(
     """
     from rag import AMBIENT_WHATSAPP_BRIDGE_URL, _AMBIENT_ANTILOOP_MARKER
     import urllib.request
+    # Hard kill-switch para tests / dry-run. 2026-04-30 (bug fix tras
+    # leak del NARRATIVE_STUB de tests/test_today.py al grupo RagNet
+    # real: 4 evening briefs duplicados con texto placeholder posteados
+    # al WhatsApp del user). Defensa en profundidad — si algún test
+    # olvida mockear, este guard previene el blast radius.
+    #
+    # ENV vars que activan el guard (cualquiera de las dos basta):
+    #   RAG_DISABLE_WHATSAPP_SEND=1   — explícito, override máximo
+    #   RAG_TESTING=1                 — alias semántico
+    #
+    # `tests/conftest.py` setea RAG_DISABLE_WHATSAPP_SEND=1 por default
+    # vía autouse session-scoped fixture; los tests que necesitan
+    # ejercitar el path real del send (mockeando `urlopen` directamente)
+    # hacen `monkeypatch.delenv("RAG_DISABLE_WHATSAPP_SEND")` para opt-out.
+    # NO chequeamos PYTEST_CURRENT_TEST acá porque hay tests legítimos
+    # del wire format del send que se rompen — el opt-in vía conftest +
+    # delenv selectivo es más explícito y trackeable.
+    if (os.environ.get("RAG_DISABLE_WHATSAPP_SEND", "").lower() in ("1", "true", "yes")
+        or os.environ.get("RAG_TESTING", "").lower() in ("1", "true", "yes")):
+        return False
     payload_text = text
     if anti_loop and not text.startswith(_AMBIENT_ANTILOOP_MARKER):
         payload_text = _AMBIENT_ANTILOOP_MARKER + text

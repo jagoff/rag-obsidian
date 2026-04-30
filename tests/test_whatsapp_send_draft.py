@@ -26,13 +26,32 @@ from __future__ import annotations
 import json
 
 
+import pytest
 import rag
 from fastapi.testclient import TestClient
+
 import web.server as _server
 from web import tools as _tools
 
 
 _client = TestClient(_server.app)
+
+
+@pytest.fixture(autouse=True)
+def _allow_real_whatsapp_send(monkeypatch):
+    """Este archivo testea el WIRE FORMAT del send (anti_loop, U+200B,
+    payload JSON, ragnet redirect flag, reply_to). Necesita ejercitar
+    el path real del send con `urllib.request.urlopen` mockeado.
+
+    El conftest top-level setea `RAG_DISABLE_WHATSAPP_SEND=1` para
+    bloquear sends reales accidentales en otros tests (bug 2026-04-30:
+    NARRATIVE_STUB filtró al grupo RagNet). Acá hacemos opt-out explícito
+    porque sí queremos que el send corra hasta el `urlopen` que mockeamos.
+
+    No es inseguro porque cada test mockea `urlopen` con un fake que
+    captura el payload sin tocar la red.
+    """
+    monkeypatch.delenv("RAG_DISABLE_WHATSAPP_SEND", raising=False)
 
 
 # ── 1. _whatsapp_send_to_jid ───────────────────────────────────────────────

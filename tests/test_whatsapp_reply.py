@@ -44,6 +44,19 @@ from web import tools as _tools
 _client = TestClient(_server.app)
 
 
+@pytest.fixture(autouse=True)
+def _allow_real_whatsapp_send(monkeypatch):
+    """Opt-out del guard `RAG_DISABLE_WHATSAPP_SEND` que el conftest
+    top-level activa por default (ver `_block_real_whatsapp_send`).
+
+    Estos tests del wire format del reply send mockean
+    `urllib.request.urlopen` directamente con un fake que captura
+    el payload — necesitan que el `_whatsapp_send_to_jid` corra hasta
+    ese punto sin que el guard inline corte antes.
+    """
+    monkeypatch.delenv("RAG_DISABLE_WHATSAPP_SEND", raising=False)
+
+
 # ── Fixture: tiny in-memory bridge DB with a few inbound messages ──────────
 
 

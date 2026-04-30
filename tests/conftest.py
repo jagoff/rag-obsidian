@@ -77,6 +77,54 @@ def _stub_chat_model_cache_if_no_ollama(monkeypatch, request):
 
 
 @pytest.fixture(autouse=True)
+def _block_real_whatsapp_send(request, monkeypatch):
+    """Safety-critical: bloquear envíos al WhatsApp real durante tests.
+
+    Bug observado 2026-04-30: el test
+    `test_today_cli_writes_evening_suffix_and_frontmatter` invocaba
+    `rag.cli ['today', '--plain']` con `runner.invoke`. El CLI llama a
+    `_brief_push_to_whatsapp` que llama a `_ambient_whatsapp_send` que
+    finalmente hace `urllib.request.urlopen(AMBIENT_WHATSAPP_BRIDGE_URL)`.
+    Ningún mock interceptaba ese path. Si el bridge local estaba
+    corriendo (y el ambient config existía), el POST aterrizaba y el
+    listener TS posteaba al WhatsApp del user.
+
+    Resultado real medido 2026-04-30 13:54-13:56: 4 evening briefs
+    duplicados con texto placeholder ("texto de recap hoy", "item sin
+    tags", "seed 1/2" — el `NARRATIVE_STUB` literal de `test_today.py`)
+    posteados al grupo RagNet, visibles para el user.
+
+    Fix defensa-en-profundidad:
+      - Capa 1 (acá): seteamos `RAG_DISABLE_WHATSAPP_SEND=1` por default
+        en TODA la suite. El guard inline en
+        `rag.integrations.whatsapp._whatsapp_send_to_jid` lee la env var
+        y devuelve False sin tocar el bridge.
+      - Capa 2 (test específico): tests que validan el wire format del
+        send (mockean `urllib.request.urlopen` directamente) hacen
+        `monkeypatch.delenv("RAG_DISABLE_WHATSAPP_SEND")` para opt-out.
+        Hoy: ~11 tests en `test_whatsapp_send_draft.py` y
+        `test_whatsapp_reply.py` lo necesitan — usan el helper de pytest
+        `request.node.get_closest_marker("real_whatsapp_send")` opcional
+        (no implementado, prefiero `delenv` explícito por trackeabilidad).
+
+    Opt-out: tests genuinos del wire format del send hacen:
+        ```python
+        @pytest.fixture(autouse=True)
+        def _allow_real_send(monkeypatch):
+            monkeypatch.delenv("RAG_DISABLE_WHATSAPP_SEND", raising=False)
+        ```
+    al inicio del archivo, o per-test con monkeypatch.delenv.
+
+    Compatibilidad: NO toca tests que ya mockean
+    `_ambient_whatsapp_send` o `_whatsapp_send_to_jid` con setattr —
+    esos sustituyen la función entera, así que el guard inline nunca
+    se ejecuta y el test sigue funcionando como antes.
+    """
+    monkeypatch.setenv("RAG_DISABLE_WHATSAPP_SEND", "1")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_apple_integrations(request, monkeypatch):
     """Safety-critical: bloquear escrituras a Apple Reminders / Calendar /
     Contacts reales durante los tests.

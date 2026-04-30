@@ -1522,7 +1522,12 @@ def _format_whatsapp_search_block(raw: str) -> str:
 # and the CLI `rag chat` loop can share it without inverting the
 # web → rag import direction. See rag.py `_detect_propose_intent` for
 # the full regex list + three-branch logic.
-from rag import _detect_propose_intent, _detect_metachat_intent  # noqa: E402
+from rag import (  # noqa: E402
+    _detect_propose_intent,
+    _detect_metachat_intent,
+    _detect_spotify_command_intent,
+    _handle_spotify_command,
+)
 
 
 # Canned replies for the meta-chat short-circuit. Buckets keyed by the
@@ -9985,6 +9990,18 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         _last_turn_tools = []
         _last_turn_weather_location = None
 
+    # Spotify control short-circuit — comandos directos de playback
+    # ("pausa", "siguiente", "anterior", "pone Bohemian Rhapsody", etc.).
+    # Determinístico, ~50-500ms (regex + AppleScript + opcional Web API
+    # search), sin LLM. Va ANTES de `is_metachat` para evitar que "play"
+    # bare se confunda con saludo (no debería, pero defense in depth).
+    # `_detect_spotify_command_intent` está en rag/__init__.py — el
+    # parser real (`_parse_spotify_command`) se llama de nuevo en el
+    # handler para obtener `{action, query?}`.
+    is_spotify_command = (
+        not is_propose_intent
+    ) and _detect_spotify_command_intent(question)
+
     # Meta-chat short-circuit — greetings / thanks / "what can you do".
     # 2026-04-21 Playwright probe (Fer F.): "hola" produced "Según tus
     # notas, tenés varias interacciones con diferentes contactos por
@@ -9994,7 +10011,10 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
     # canned line, skipping retrieval + tool-calling + LLM entirely.
     # Zero latency (<1ms) + no hallucination possible. See
     # `_detect_metachat_intent` for the matcher shape + rationale.
-    is_metachat = (not is_propose_intent) and _detect_metachat_intent(question)
+    is_metachat = (
+        not is_propose_intent
+        and not is_spotify_command
+    ) and _detect_metachat_intent(question)
 
     # 2026-04-23: degenerate-query short-circuit. Inputs sin ≥2 chars
     # alfanuméricos (ej. "x", "?¡@#") caían al retrieve y devolvían
@@ -10006,6 +10026,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
     is_degenerate = (
         not is_propose_intent
         and not is_metachat
+        and not is_spotify_command
         and _is_degenerate_query(question)
     )
 
@@ -10418,6 +10439,61 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     "cmd": "web.chat.finance", "q": question[:200],
                     "session": sess["id"], "answered": True,
                     "t_total": round(total_ms / 1000.0, 3),
+                })
+            except Exception:
+                pass
+            return
+
+        # Spotify control short-circuit. Ejecuta el comando vía
+        # `_handle_spotify_command` (rag/__init__.py) — que internamente
+        # llama AppleScript local (control de playback) o Web API
+        # (search). Devuelve `{ok, action, message}` con el reply ya
+        # formateado. Salida idéntica al metachat pattern (sources/
+        # status/token/done) para que la UI lo trate como respuesta
+        # normal — solo flag `spotify_command: True` la diferencia en
+        # analytics.
+        if is_spotify_command:
+            spotify_res = _handle_spotify_command(question)
+            if spotify_res is None:
+                # Defensive: el detector dijo True pero el handler no
+                # parseó. Caer al flow normal en vez de bloquearse.
+                spotify_res = {"ok": False, "message": "(comando no reconocido)"}
+            reply = spotify_res.get("message") or "(sin respuesta)"
+            turn_id = new_turn_id()
+            yield _sse("sources", {
+                "items": [], "confidence": None,
+                "spotify_command": True,
+            })
+            yield _sse("status", {"stage": "executing"})
+            for i in range(0, len(reply), 40):
+                yield _sse("token", {"delta": reply[i:i+40]})
+            total_ms = int((time.perf_counter() - _t0) * 1000)
+            yield _sse("done", {
+                "turn_id": turn_id, "elapsed_ms": total_ms,
+                "spotify_command": True,
+                "spotify_action": spotify_res.get("action"),
+                "spotify_ok": bool(spotify_res.get("ok")),
+            })
+            try:
+                append_turn(sess, {
+                    "turn_id": turn_id, "q": question,
+                    "a": reply[:500],
+                    "spotify_command": True,
+                    "spotify_action": spotify_res.get("action"),
+                    "spotify_ok": bool(spotify_res.get("ok")),
+                })
+                save_session(sess)
+            except Exception:
+                pass
+            try:
+                log_query_event({
+                    "cmd": "web.chat.spotify",
+                    "q": question[:200],
+                    "session": sess["id"], "answered": True,
+                    "t_total": round(total_ms / 1000.0, 3),
+                    "spotify_action": spotify_res.get("action"),
+                    "spotify_ok": bool(spotify_res.get("ok")),
+                    "device": _client_device,
                 })
             except Exception:
                 pass

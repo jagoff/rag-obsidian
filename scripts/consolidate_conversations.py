@@ -4,7 +4,7 @@ Scans `04-Archive/99-obsidian-system/99-AI/conversations/`, groups
 related conversations by embedding similarity (connected components on
 cosine ≥ threshold), synthesises each cluster into a single consolidated
 note in the appropriate PARA folder, and archives the originals under
-`04-Archive/conversations/YYYY-MM/`.
+`04-Archive/99-obsidian-system/99-AI/_archive/conversations/YYYY-MM/`.
 
 Invoked via `rag consolidate` or the weekly launchd plist
 `com.fer.obsidian-rag-consolidate` (Mondays 06:00 local).
@@ -14,8 +14,13 @@ Design notes:
   excluded from the search index (`is_excluded` cubre TODO el prefix
   `04-Archive/99-obsidian-system/`), así que originals son invisibles a
   `retrieve()` hasta que un consolidated note las promueva a PARA.
-  `04-Archive/conversations/` también se excluye explícitamente para
-  que los originales archivados no leakeen de vuelta.
+  El archive también vive bajo `99-obsidian-system/` (ver
+  `ARCHIVE_SUBFOLDER` abajo), por lo cual la exclusion del index lo
+  cubre automáticamente — antes vivía en `04-Archive/conversations/`,
+  fuera del paraguas de `99-obsidian-system/`, y se necesitaba una
+  rama defensiva extra en `is_excluded`. Movido bajo `99-AI/_archive/`
+  el 2026-04-30 para cumplir la regla "todo lo de sistema vive bajo
+  `99-obsidian-system/99-AI/`".
 - Pre-2026-04-25 las conversations vivían en `00-Inbox/conversations/`.
   El consolidator antes scaneaba esa carpeta. Tras 2026-04-25 las
   conversations son "system files" (no son del PARA del user, son
@@ -61,7 +66,7 @@ from web import conversation_writer  # noqa: E402
 
 
 CONVERSATIONS_SUBFOLDER = "04-Archive/99-obsidian-system/99-AI/conversations"
-ARCHIVE_SUBFOLDER = "04-Archive/conversations"
+ARCHIVE_SUBFOLDER = "04-Archive/99-obsidian-system/99-AI/_archive/conversations"
 CONSOLIDATION_LOG = Path.home() / ".local/share/obsidian-rag/consolidation.log"
 
 # Default heuristics — tuneable via flags. 0.75 is the midpoint between
@@ -446,7 +451,7 @@ def promote(
 def archive_originals(
     vault_root: Path, cluster: list[ConversationNote],
 ) -> list[Path]:
-    """Move each conversation into `04-Archive/conversations/YYYY-MM/`.
+    """Move each conversation into `04-Archive/99-obsidian-system/99-AI/_archive/conversations/YYYY-MM/`.
     Returns the new absolute paths. Errors skip individual files — caller
     sees the partial list and logs the discrepancy."""
     archive_dir = vault_root / ARCHIVE_SUBFOLDER / datetime.now().strftime("%Y-%m")

@@ -19,16 +19,29 @@ required for the owner of the app" para apps de devs sin Premium —
 - `recent_tracks_today(limit)` — lee `rag_spotify_log` filtrado por
   `date = today` ordenado por `first_seen DESC`. Para el panel del home
   + el bucket del evening brief.
+- `control(action)` — ejecuta playpause / next / previous / play / pause /
+  stop sobre Spotify desktop via AppleScript. Determinístico, ~50ms-500ms.
+  Devuelve `{ok, state?, error?}`.
+- `play_uri(uri)` — reproduce un URI de Spotify (`spotify:track:XXX` o
+  `spotify:album:YYY` o `spotify:playlist:ZZZ`) en el desktop. Lanza
+  Spotify si está cerrado (a propósito — el user pidió poner música).
+- `search_track(query)` — busca un track via Web API con Client Credentials
+  (NO requiere Premium ni OAuth user — el gate de Premium aplica a
+  `/me/*`, no a `/search`). Devuelve `{name, artist, uri}` o None.
 
 ## Invariantes
 
 - Silent-fail: AppleScript timeout / Spotify cerrado / DB locked → return
   vacío o `{ok: False, reason: ...}`. Nunca raise — el poller debe poder
   fallar 1 tick sin matar el daemon.
-- Sin auth: usa solo el desktop app. NO hay OAuth ni API keys aquí.
-- Sin lanzar Spotify: el AppleScript usa `if application "Spotify" is running`
-  para evitar abrir el app si el user lo cerró deliberadamente. Sin este
-  guard, cada poll de 60s reabriría Spotify infinitamente.
+- Sin auth para queries pasivas: `now_playing` / `recent_tracks_today` /
+  `control` usan solo el desktop app, sin OAuth.
+- `search_track` SÍ requiere Client Credentials (`~/.config/obsidian-rag/
+  spotify_client.json` con `client_id` + `client_secret`). Silent-fails
+  si no están.
+- `now_playing` y `control(playpause/next/previous/pause)` NO lanzan
+  Spotify si está cerrado (guard `is running`). Pero `play_uri` y
+  `control(play)` SÍ lo lanzan — el user explicit quiere música.
 
 ## Por qué deferred imports
 `_ragvec_state_conn` vive en `rag.__init__`. Module-level `from rag import _ragvec_state_conn`
@@ -38,8 +51,10 @@ de cargar.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import time
+from pathlib import Path
 from typing import Optional
 
 
@@ -230,3 +245,258 @@ def recent_tracks_today(limit: int = 20) -> list[dict]:
             "duration_played_s": int(last_seen - first_seen),
         })
     return out
+
+
+# Acciones soportadas por `control()`. Mapean 1:1 a comandos AppleScript
+# del Spotify desktop app ([docs](https://developer.spotify.com/documentation/applescript)
+# — sí, Spotify mantiene una scripting dictionary pública). `playpause`
+# es el toggle (más útil para "pausa" cuando podría estar paused ya).
+_CONTROL_ACTIONS = {
+    "play": "play",
+    "pause": "pause",
+    "playpause": "playpause",
+    "next": "next track",
+    "previous": "previous track",
+}
+
+
+def control(action: str, timeout: float = 3.0) -> dict:
+    """Ejecuta un comando de control de playback sobre Spotify desktop.
+
+    Args:
+        action: uno de play/pause/playpause/next/previous.
+        timeout: AppleScript timeout (default 3s — más alto que `now_playing`
+          porque `next`/`previous` cargan track nuevo y pueden tardar).
+
+    Devuelve:
+        `{ok: bool, action: str, state?: str, name?, artist?, error?: str}`.
+        En `ok=True`, incluye el `now_playing()` post-acción para que el
+        caller pueda armar respuesta tipo "⏭ Saltando — ahora suena: X / Y"
+        sin un round-trip extra.
+
+    NO lanza Spotify si está cerrado para `pause`/`playpause`/`next`/
+    `previous` (no tiene sentido pausar nada). Para `play`, sí lanza —
+    "play" sin nada cargado es ambiguo, pero al menos abre el app.
+    """
+    a = action.strip().lower()
+    cmd = _CONTROL_ACTIONS.get(a)
+    if cmd is None:
+        return {"ok": False, "action": a, "error": f"unknown_action: {a}"}
+
+    # Para `play` permitimos lanzar Spotify (user pidió música).
+    # Para el resto, guard `is running` — sino reabriríamos el app.
+    if a == "play":
+        script = f'''\
+tell application "Spotify"
+  {cmd}
+end tell
+return "OK"
+'''
+    else:
+        script = f'''\
+if application "Spotify" is running then
+  tell application "Spotify"
+    {cmd}
+  end tell
+  return "OK"
+else
+  return "NOT_RUNNING"
+end if
+'''
+    try:
+        res = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        return {"ok": False, "action": a, "error": f"applescript_failed: {exc!r}"}
+    out = (res.stdout or "").strip()
+    if out == "NOT_RUNNING":
+        return {"ok": False, "action": a, "error": "spotify_not_running"}
+    if res.returncode != 0:
+        return {"ok": False, "action": a, "error": (res.stderr or "").strip()[:200]}
+
+    # Post-acción: pequeño settle (Spotify tarda ~100-300ms en actualizar el
+    # track después de un `next`) y leer el now_playing actual.
+    if a in ("next", "previous"):
+        time.sleep(0.4)
+    np = now_playing(timeout=2.0)
+    if np:
+        return {
+            "ok": True, "action": a,
+            "state": np.get("state"),
+            "name": np.get("name"),
+            "artist": np.get("artist"),
+            "album": np.get("album"),
+        }
+    return {"ok": True, "action": a}
+
+
+def play_uri(uri: str, timeout: float = 4.0) -> dict:
+    """Reproduce un URI de Spotify en el desktop app.
+
+    Args:
+        uri: URI de Spotify, formato `spotify:track:XXX`, `spotify:album:YYY`
+          o `spotify:playlist:ZZZ`.
+        timeout: AppleScript timeout (default 4s — load de track + arranque).
+
+    Devuelve `{ok, name?, artist?, error?}`. Si Spotify está cerrado, lo
+    lanza (a diferencia de `now_playing`) — el user explícitamente pidió
+    música.
+    """
+    if not uri or not uri.startswith("spotify:"):
+        return {"ok": False, "error": f"invalid_uri: {uri!r}"}
+    # Escapamos la URI para AppleScript (paranoid — los URIs de Spotify
+    # son ASCII alphanumeric + `:` así que no debería haber edge cases).
+    safe = uri.replace('"', '')
+    script = f'''\
+tell application "Spotify"
+  play track "{safe}"
+end tell
+return "OK"
+'''
+    try:
+        res = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        return {"ok": False, "error": f"applescript_failed: {exc!r}"}
+    if res.returncode != 0:
+        return {"ok": False, "error": (res.stderr or "").strip()[:200]}
+
+    # Settle: Spotify tarda ~300-700ms en arrancar el track nuevo.
+    time.sleep(0.6)
+    np = now_playing(timeout=2.0)
+    if np:
+        return {
+            "ok": True,
+            "name": np.get("name"),
+            "artist": np.get("artist"),
+            "album": np.get("album"),
+        }
+    return {"ok": True}
+
+
+# Cache del token de Client Credentials. Spotify devuelve tokens válidos
+# por 1h (3600s); cacheamos in-process porque el server es persistente.
+_CC_TOKEN_CACHE: dict = {"token": None, "expires_at": 0.0}
+
+_SPOTIFY_CREDS_PATH = Path.home() / ".config/obsidian-rag/spotify_client.json"
+
+
+def _client_credentials_token() -> Optional[str]:
+    """Devuelve un access token via Client Credentials flow.
+
+    [Docs](https://developer.spotify.com/documentation/web-api/tutorials/client-credentials-flow).
+    Cachea in-process. Silent-fails (devuelve None) si:
+      - No hay `~/.config/obsidian-rag/spotify_client.json`.
+      - `client_id` o `client_secret` faltan.
+      - urllib request falla (red, cred inválido, etc.).
+    """
+    now = time.time()
+    cached = _CC_TOKEN_CACHE.get("token")
+    expires = float(_CC_TOKEN_CACHE.get("expires_at") or 0.0)
+    # Refrescamos 60s antes para evitar carrera con expiración.
+    if cached and now < (expires - 60.0):
+        return cached  # type: ignore[return-value]
+
+    if not _SPOTIFY_CREDS_PATH.is_file():
+        return None
+    try:
+        creds = json.loads(_SPOTIFY_CREDS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    cid = (creds.get("client_id") or "").strip()
+    secret = (creds.get("client_secret") or "").strip()
+    if not (cid and secret):
+        return None
+
+    # Usamos urllib para no agregar otra dep — `requests` no está garantizado
+    # en este path y `spotipy` arrastra OAuth user flow (que no queremos).
+    import base64
+    import urllib.parse
+    import urllib.request
+
+    auth_b64 = base64.b64encode(f"{cid}:{secret}".encode("ascii")).decode("ascii")
+    body = urllib.parse.urlencode({"grant_type": "client_credentials"}).encode("ascii")
+    req = urllib.request.Request(
+        "https://accounts.spotify.com/api/token",
+        data=body,
+        headers={
+            "Authorization": f"Basic {auth_b64}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=4.0) as resp:  # noqa: S310
+            payload = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+    token = payload.get("access_token")
+    expires_in = float(payload.get("expires_in") or 3600.0)
+    if not token:
+        return None
+    _CC_TOKEN_CACHE["token"] = token
+    _CC_TOKEN_CACHE["expires_at"] = now + expires_in
+    return token
+
+
+def search_track(query: str, limit: int = 1, timeout: float = 4.0) -> Optional[dict]:
+    """Busca un track via Spotify Web API (Client Credentials).
+
+    [Docs](https://developer.spotify.com/documentation/web-api/reference/search).
+    NO requiere Premium ni user OAuth — el gate de Premium aplica a
+    `/me/*` (`/me/player/recently-played` etc.), pero `/v1/search` es
+    público para apps en development mode con Client Credentials.
+
+    Args:
+        query: texto de búsqueda (ej. "bohemian rhapsody queen", "spinetta").
+        limit: cuántos resultados pedir (devuelve solo el top — el limit
+          es para la API, que por default ya es 1).
+        timeout: HTTP timeout (default 4s).
+
+    Devuelve `{name, artist, album, uri, track_id}` del top result o None
+    si no hay match / API falla / no hay credenciales.
+    """
+    q = (query or "").strip()
+    if not q:
+        return None
+    token = _client_credentials_token()
+    if not token:
+        return None
+
+    import urllib.parse
+    import urllib.request
+
+    params = urllib.parse.urlencode({
+        "q": q, "type": "track", "limit": int(limit),
+        # `market=AR` ayuda a Spotify a devolver versiones regionales con
+        # mejor disponibilidad (algunos tracks tienen múltiples releases).
+        "market": "AR",
+    })
+    req = urllib.request.Request(
+        f"https://api.spotify.com/v1/search?{params}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            payload = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+    items = (((payload or {}).get("tracks") or {}).get("items") or [])
+    if not items:
+        return None
+    top = items[0]
+    artists = top.get("artists") or []
+    artist_names = ", ".join((a.get("name") or "") for a in artists if a.get("name"))
+    album = (top.get("album") or {}).get("name") or ""
+    return {
+        "name": top.get("name") or "",
+        "artist": artist_names,
+        "album": album,
+        "uri": top.get("uri") or "",
+        "track_id": top.get("id") or "",
+    }

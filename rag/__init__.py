@@ -27802,6 +27802,33 @@ def query(
                 pass
             return
 
+    # ── Spotify control short-circuit ───────────────────────────────────────
+    # `rag query "siguiente"` / `"pausa"` / `"pone Bohemian Rhapsody"` son
+    # comandos de control directo, no consultas al vault. Determinístico
+    # vía AppleScript local + Spotify Web API search.
+    if _detect_spotify_command_intent(question):
+        _t_spotify_start = time.perf_counter()
+        spotify_res = _handle_spotify_command(question)
+        if spotify_res is not None:
+            msg = spotify_res.get("message") or "(sin respuesta)"
+            style = "green" if spotify_res.get("ok") else "yellow"
+            console.print(f"[{style}]{msg}[/{style}]")
+            try:
+                _elapsed = time.perf_counter() - _t_spotify_start
+                log_query_event({
+                    "cmd": "query",
+                    "q": question,
+                    "t_retrieve": 0.0,
+                    "t_gen": round(_elapsed, 3),
+                    "spotify_command": True,
+                    "spotify_action": spotify_res.get("action"),
+                    "spotify_ok": bool(spotify_res.get("ok")),
+                    "intent": "spotify_control",
+                })
+            except Exception:
+                pass
+            return
+
     # Explicit --since wins over auto-detect; both are pushed through retrieve().
     date_range: tuple[float, float] | None = None
     if since:
@@ -29358,6 +29385,18 @@ def chat(
             if handled:
                 if created_info is not None:
                     last_created = created_info
+                continue
+
+        # Spotify control short-circuit — "pausa", "siguiente", "pone X".
+        # Determinístico vía AppleScript local (control) + Web API
+        # search (cuando hay query). Mismo handler que /api/chat — solo
+        # cambia el output (Rich console en vez de SSE).
+        if _detect_spotify_command_intent(question):
+            spotify_res = _handle_spotify_command(question)
+            if spotify_res is not None:
+                msg = spotify_res.get("message") or "(sin respuesta)"
+                style = "green" if spotify_res.get("ok") else "yellow"
+                console.print(f"[{style}]{msg}[/{style}]")
                 continue
 
         # /undo — delete the most recent chat-created reminder. Only
@@ -38643,6 +38682,247 @@ def _detect_metachat_intent(q: str) -> bool:
     if len(s) > 40:
         return False
     return bool(_METACHAT_RE.match(s))
+
+
+# Spotify control intents. Mirror del flow de metachat: short-circuit
+# determinístico para comandos como "pausa" / "siguiente" / "pone X" sin
+# pasar por LLM (latencia: ~50-500ms regex + AppleScript vs 2-5s LLM).
+#
+# Diseño: regex anchored + length cap. False-positives son peor que
+# false-negatives — si el user dice "pone una nota X" y matcheamos como
+# spotify, le ponemos música en vez de crear una nota. Mejor cap fuerte.
+#
+# Comandos sin argumentos (pause/play/next/previous). El cap de 30 chars
+# evita matchear "pausa el experimento porque...".
+_SPOTIFY_NOARG_RE = re.compile(
+    r"^\s*"
+    r"(?P<action>"
+    # Pause / stop family.
+    r"pausa|paus[aá]|pause|stop|fren[aá]|par[aá]|det[eé]n(?:e|er)?|detener|"
+    # Play / resume family (BARE only — "play" + nada, no "play X").
+    r"play|reanud[aá](?:r|me)?|segu[ií](?:r)?|continu[aá](?:r|me)?|"
+    # Next family.
+    r"siguiente(?:\s+(?:tema|canci[oó]n|track))?|next|salt[aá](?:r|me|alo)?|"
+    r"skip(?:e[aá]r?)?|pr[oó]xim[ao](?:\s+(?:tema|canci[oó]n))?|"
+    r"otra(?:\s+(?:canci[oó]n|tema))?|otro\s+tema|cambi[aá]\s+(?:de\s+)?canci[oó]n|"
+    # Previous family.
+    r"anterior(?:\s+(?:tema|canci[oó]n))?|previous|prev|atr[aá]s|volv[eé](?:r)?|"
+    r"tema\s+anterior|canci[oó]n\s+anterior"
+    r")"
+    # Optional spotify suffix — "pausa spotify", "next spotify".
+    r"(?:\s+(?:la\s+)?(?:m[uú]sica|spotify|el\s+tema|la\s+canci[oó]n))?"
+    r"\s*[!?.¡¿,:;]*\s*$",
+    re.IGNORECASE,
+)
+
+# "Pone X" / "tocá X" / "play X" — captura X como query para search_track.
+# Triggers separados de `_SPOTIFY_NOARG_RE` porque acá X es obligatorio
+# (sin X, "play" cae en el otro regex como resume).
+#
+# Triggers: pone[lo|me], poné[lo|me], tocá[me], reproducí[me], play (+algo),
+# escuch[á|emos], ponéme algo de X (forma idiomática), música de X.
+#
+# El query (group "query") tiene cap [3,80] chars — corto rechaza matches
+# accidentales tipo "ponéle"; largo rechaza matches en oraciones largas
+# tipo "pone una alarma porque me tengo que despertar...".
+_SPOTIFY_PLAY_RE = re.compile(
+    r"^\s*"
+    r"(?:"
+    r"pon[eé](?:lo|me|le)?|"
+    r"toc[aá](?:me|lo|le)?|"
+    r"play|"
+    r"reproduc[ií](?:r|me|lo)?|"
+    r"escuch(?:[aá]|emos)|"
+    r"quiero\s+escuchar|"
+    r"meté(?:me|lo)?|"
+    r"dale\s+(?:con|a)"
+    r")"
+    # Optional connectives: "pone algo de X", "tocá un tema de X", "play una
+    # canción de Y", "música de Z". Soportar varias formas idiomáticas.
+    r"\s+(?:(?:un[ao]?\s+)?(?:tema|canci[oó]n|m[uú]sica|track|playlist|disco|"
+    r"album|[aá]lbum|algo)\s+(?:de\s+|del\s+|por\s+)?)?"
+    r"(?P<query>.{3,80}?)"
+    r"\s*[!?.¡¿,:;]*\s*$",
+    re.IGNORECASE,
+)
+
+
+def _parse_spotify_command(q: str) -> dict | None:
+    """Parse `q` como comando de Spotify. Devuelve `{action, query?}` o None.
+
+    Acciones soportadas:
+      - `pause` / `play` / `next` / `previous` — sin args.
+      - `play_search` — con `query` para buscar antes de reproducir.
+
+    Returns None si `q` no matchea ningún comando.
+    """
+    if not q:
+        return None
+    s = q.strip()
+    if not s or len(s) > 80:
+        return None
+
+    # Try noarg first (más restrictivo).
+    m = _SPOTIFY_NOARG_RE.match(s)
+    if m:
+        a = (m.group("action") or "").lower()
+        # Normalizar a {pause, play, next, previous}.
+        if a.startswith(("pausa", "paus", "pause", "stop", "fren", "par", "det")):
+            return {"action": "pause"}
+        if a.startswith(("play", "reanud", "segu", "continu")):
+            return {"action": "play"}
+        if a.startswith(("siguiente", "next", "salt", "skip", "próxim",
+                         "proxim", "otra", "otro", "cambi")):
+            return {"action": "next"}
+        if a.startswith(("anterior", "previous", "prev", "atr", "volv", "tema", "canci")):
+            return {"action": "previous"}
+        return None
+
+    # Try play_search.
+    m = _SPOTIFY_PLAY_RE.match(s)
+    if m:
+        query = (m.group("query") or "").strip()
+        # Filter de queries demasiado cortos o que parecen pronombres /
+        # palabras vacías ("eso", "algo", "lo", etc.) — evita matches
+        # accidentales en frases como "pone eso ahí".
+        if len(query) < 3:
+            return None
+        ql = query.lower()
+        if ql in {"eso", "algo", "esto", "aquello", "lo mismo",
+                 "una", "un", "uno", "ahí", "ahi", "aqui", "aquí", "allá",
+                 "store", "ese", "esa", "estos", "esas"}:
+            return None
+        # Reject queries que ARRANCAN con pronombres demostrativos seguidos
+        # de adverbios — "eso ahí", "esto acá", "aquello allá". Son
+        # comandos genéricos no-musicales.
+        if re.match(r"^(?:eso|esto|aquello|ese|esa)\s+(?:ah[ií]|ac[aá]|all[aá])\b", ql):
+            return None
+        # Reject queries que refieren a otros dominios (alarma, nota,
+        # recordatorio, evento) — esos son propose_intent, no Spotify.
+        # "pone una alarma a las 8" / "pone una nota" / etc.
+        # `\b` word boundaries para no matchear "alarmar" / "notable".
+        if re.search(
+            r"\b(?:alarma|recordatorio|nota|evento|reuni[oó]n|cita|"
+            r"meeting|task|tarea|reminder|note)\b",
+            ql,
+        ):
+            return None
+        # Reject queries con anchors temporales ("a las 8", "mañana",
+        # "el viernes", "en 2 horas") — propose_intent territory.
+        if re.search(
+            r"\b(?:a\s+las?\s+\d|ma[ñn]ana|hoy|esta\s+(?:noche|tarde)|"
+            r"el\s+(?:lunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo)|"
+            r"en\s+\d+\s+(?:min|hora|d[ií]a|semana))\b",
+            ql,
+        ):
+            return None
+        # "play store" is a brand reference, not a music search.
+        if ql in {"play store", "app store", "ios", "android"}:
+            return None
+        return {"action": "play_search", "query": query}
+
+    return None
+
+
+def _detect_spotify_command_intent(q: str) -> bool:
+    """Wrapper booleano sobre `_parse_spotify_command()`. Lo expone para
+    que el web handler haga el dispatch sin re-parsear. El handler real
+    llama directamente a `_parse_spotify_command()` para evitar dupe work.
+    """
+    return _parse_spotify_command(q) is not None
+
+
+def _handle_spotify_command(q: str) -> dict | None:
+    """Ejecuta un comando de Spotify parseado de `q`. Devuelve
+    `{ok: bool, action: str, message: str, error?: str}` o None si `q`
+    no era un comando Spotify.
+
+    El `message` ya viene formateado en español rioplatense para emitir
+    directo al stream SSE. Usado por web `/api/chat` (short-circuit) y
+    por CLI `rag chat` (mismo flow).
+    """
+    cmd = _parse_spotify_command(q)
+    if cmd is None:
+        return None
+
+    # Deferred import para evitar costo de cargar el integration en startup
+    # del package. `rag/__init__.py` ya importa muchísimo; este módulo es
+    # opt-in (solo se ejecuta cuando el user manda comando Spotify).
+    from rag.integrations import spotify_local  # noqa: PLC0415
+
+    action = cmd["action"]
+
+    if action == "pause":
+        res = spotify_local.control("pause")
+        if res.get("ok"):
+            return {"ok": True, "action": "pause",
+                    "message": "⏸️ Pausado"}
+        if res.get("error") == "spotify_not_running":
+            return {"ok": False, "action": "pause",
+                    "message": "Spotify no está abierto."}
+        return {"ok": False, "action": "pause",
+                "message": "No pude pausar.",
+                "error": str(res.get("error", ""))}
+
+    if action == "play":
+        res = spotify_local.control("play")
+        if res.get("ok"):
+            name = res.get("name") or ""
+            artist = res.get("artist") or ""
+            if name and artist:
+                return {"ok": True, "action": "play",
+                        "message": f"▶️ Reanudado — {name} / {artist}"}
+            return {"ok": True, "action": "play", "message": "▶️ Reanudado"}
+        return {"ok": False, "action": "play",
+                "message": "No pude reanudar.",
+                "error": str(res.get("error", ""))}
+
+    if action in ("next", "previous"):
+        res = spotify_local.control(action)
+        icon = "⏭️" if action == "next" else "⏮️"
+        if res.get("ok"):
+            name = res.get("name") or ""
+            artist = res.get("artist") or ""
+            verb = "Siguiente" if action == "next" else "Anterior"
+            if name and artist:
+                return {"ok": True, "action": action,
+                        "message": f"{icon} {verb} — {name} / {artist}"}
+            return {"ok": True, "action": action,
+                    "message": f"{icon} {verb}"}
+        if res.get("error") == "spotify_not_running":
+            return {"ok": False, "action": action,
+                    "message": "Spotify no está abierto."}
+        return {"ok": False, "action": action,
+                "message": f"No pude saltar.",
+                "error": str(res.get("error", ""))}
+
+    if action == "play_search":
+        query = cmd.get("query") or ""
+        track = spotify_local.search_track(query)
+        if not track:
+            # Posibles causas: no hay creds, o no encontró match.
+            return {"ok": False, "action": "play_search",
+                    "message": (
+                        f'No encontré "{query}" en Spotify '
+                        "(o no tengo credenciales configuradas)."
+                    )}
+        uri = track.get("uri") or ""
+        res = spotify_local.play_uri(uri)
+        if res.get("ok"):
+            name = res.get("name") or track.get("name") or query
+            artist = res.get("artist") or track.get("artist") or ""
+            if artist:
+                return {"ok": True, "action": "play_search",
+                        "message": f"🎵 Sonando — {name} / {artist}"}
+            return {"ok": True, "action": "play_search",
+                    "message": f"🎵 Sonando — {name}"}
+        return {"ok": False, "action": "play_search",
+                "message": (
+                    f"Encontré '{track.get('name')}' pero no pude reproducirlo."
+                ),
+                "error": str(res.get("error", ""))}
+
+    return None
 
 
 _PROPOSE_INTENT_RE = re.compile(

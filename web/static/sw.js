@@ -32,7 +32,7 @@
 
 // Bump cuando cambie el shell / la estrategia. El activate handler borra
 // todo cache que no matchee esta versión, así no se acumulan huérfanos.
-const CACHE_VERSION = "rag-pwa-v29-2026-04-29-atlas-pulse";
+const CACHE_VERSION = "rag-pwa-v30-2026-04-30-network-first-shell";
 const SHELL_CACHE = `${CACHE_VERSION}-shell`;
 const STATIC_CACHE = `${CACHE_VERSION}-static`;
 
@@ -162,40 +162,39 @@ self.addEventListener("fetch", (event) => {
 });
 
 async function shellStrategy(event) {
+  // Network-first (con cache fallback offline-only). El stale-while-
+  // revalidate previo entregaba el HTML viejo del shell que apuntaba a
+  // /static/home.v2.js?v=N-1 — así, aunque bumpearas el cache-buster
+  // a ?v=N, el browser seguía pidiendo el JS viejo (cache HIT en SW)
+  // hasta que algún reload eventual trajera el shell nuevo. Síntoma
+  // observado: bug fixes en home.v2.js no llegaban a usuarios con la
+  // PWA cacheada — quedaban con la versión vieja del progress bar
+  // clavada en 9%, paneles draggable rotos, etc. Network-first sacrifica
+  // ~30-50ms de speed (se nota poco con navigation preload) a cambio
+  // de garantizar que cada navegación sirva el HTML fresh con los
+  // últimos ?v= apuntando a los static assets nuevos.
   const cache = await caches.open(SHELL_CACHE);
 
-  // 1) Intento usar la preload response si el browser ya empezó el fetch.
+  // Intento usar la preload response (browser ya inició el fetch).
   const preload = event.preloadResponse ? await event.preloadResponse : null;
-
-  // 2) Paralelo: cached copy (puede no existir) + network fetch fresh.
-  const cached = await cache.match(event.request, { ignoreSearch: true });
-  const networkFetch = (async () => {
-    try {
-      const resp = preload || (await fetch(event.request));
-      // Solo cacheamos 2xx. Errores 4xx/5xx no los queremos pisar el shell.
-      if (resp && resp.ok && resp.type !== "opaque") {
-        // clone() porque el body del Response es single-use.
-        cache.put(event.request, resp.clone()).catch(() => {});
-      }
-      return resp;
-    } catch (err) {
-      return null; // offline o DNS fail
-    }
-  })();
-
-  // 3) Si hay copia en cache: devolverla ya y dejar que el fetch se
-  //    complete en background (stale-while-revalidate). Si no hay,
-  //    esperar al network.
-  if (cached) {
-    // Fire-and-forget del networkFetch para revalidar.
-    event.waitUntil(networkFetch);
-    return cached;
+  let resp;
+  try {
+    resp = preload || (await fetch(event.request));
+  } catch (err) {
+    resp = null; // offline / DNS fail
   }
-  const fromNet = await networkFetch;
-  if (fromNet) return fromNet;
 
-  // 4) Offline sin cache: página de error mínima inline (no tenemos
-  //    una /offline.html dedicada; mejor evitar el 404 feo del browser).
+  if (resp && resp.ok && resp.type !== "opaque") {
+    // Cachear el shell fresh para fallback offline.
+    cache.put(event.request, resp.clone()).catch(() => {});
+    return resp;
+  }
+
+  // Sin red: fallback al shell cacheado de la última visita exitosa.
+  const cached = await cache.match(event.request, { ignoreSearch: true });
+  if (cached) return cached;
+
+  // Offline + sin cache: página de error mínima inline.
   return new Response(
     `<!doctype html><meta charset=utf-8><title>rag — offline</title>` +
       `<style>body{background:#1a1a1f;color:#ececed;font:14px/1.4 -apple-system,SF Mono,Menlo,monospace;display:grid;place-items:center;min-height:100vh;margin:0}main{text-align:center;max-width:320px;padding:24px}h1{font-size:18px;margin:0 0 8px}p{color:#a0a0a6;margin:8px 0}</style>` +

@@ -994,6 +994,95 @@
     renderPanelList("p-drive", rows, { emptyText: "sin actividad reciente" });
   }
 
+  function renderSpotify(payload) {
+    const sp = payload.signals?.spotify;
+    const panel = document.getElementById("p-spotify");
+    if (!panel) return;
+    // Hide whole panel cuando no hay nada — Spotify cerrado + sin
+    // historial del día. Mejor que mostrar "sin actividad" vacío
+    // (la mayoría del tiempo va a estar así para el primer día post-
+    // install antes de que el poller acumule data).
+    if (!sp || (!sp.now_playing && !(sp.recent_today || []).length)) {
+      panel.hidden = true;
+      return;
+    }
+    panel.hidden = false;
+
+    // Helper local: segundos → "Nm Ns" o "Ns" para tracks de <1 min.
+    // Usado en aside del row para mostrar cuánto sonó cada track.
+    const fmtSecs = (s) => {
+      if (!s || s < 1) return "";
+      if (s < 60) return `${Math.round(s)}s`;
+      const m = Math.floor(s / 60);
+      const sec = s % 60;
+      return sec >= 5 ? `${m}m ${Math.round(sec)}s` : `${m}m`;
+    };
+    // Spotify desktop URI handler — abre el track en el desktop app.
+    // Web URL como fallback para cuando no hay desktop instalado.
+    const trackHref = (id) => {
+      if (!id) return null;
+      // `spotify:track:abc` → URI handler nativa. Browser-friendly también
+      // (Chrome lo abre directo en Spotify desktop si está instalado).
+      return id;
+    };
+
+    const np = sp.now_playing;
+    const recent = sp.recent_today || [];
+    const rows = [];
+
+    if (np) {
+      const isPlaying = np.state === "playing";
+      const stateBadge = isPlaying ? "▶ ahora" : "⏸ pausado";
+      const stateClass = isPlaying
+        ? "spotify-state-playing"
+        : "spotify-state-paused";
+      const meta = [
+        { cls: stateClass, text: stateBadge },
+        np.artist,
+      ];
+      if (np.album) meta.push(np.album);
+      rows.push({
+        title: np.name,
+        meta,
+        href: trackHref(np.track_id),
+      });
+    }
+
+    // Tracks recientes que NO son el currently playing (dedupe por
+    // track_id). Si Spotify está cerrado, np es null y simplemente
+    // mostramos toda la lista reciente.
+    const npId = np?.track_id;
+    const rest = recent
+      .filter((t) => t.track_id !== npId)
+      .slice(0, 4);
+    for (const t of rest) {
+      const meta = [t.artist];
+      const ago = fmtTimeAgo(new Date(t.first_seen * 1000).toISOString());
+      if (ago && ago !== "ahora") meta.push(ago);
+      rows.push({
+        title: t.name,
+        meta,
+        // Solo mostrar duración si es >30s — los polls de 60s no
+        // detectan tracks de <30s con resolución útil.
+        aside: t.duration_played_s > 30 ? fmtSecs(t.duration_played_s) : null,
+        href: trackHref(t.track_id),
+      });
+    }
+    renderPanelList("p-spotify", rows, {
+      emptyText: "sin actividad hoy",
+      // Count chip muestra TOTAL de tracks distintos hoy (incluye el
+      // currently playing si existe). Da idea del "stream" del día.
+      showCount: true,
+    });
+    // Override count para mostrar el TOTAL de hoy (incluyendo np si
+    // estaba), no solo los rows visibles. Más informativo que "5".
+    const countEl = panel.querySelector("[data-count]");
+    if (countEl) {
+      const totalToday = recent.length + (np && !recent.some((t) => t.track_id === npId) ? 1 : 0);
+      countEl.textContent = totalToday;
+    }
+  }
+
   // ──────────────────────────────────────────────────────────────
   // Topbar status
   // ──────────────────────────────────────────────────────────────
@@ -1130,6 +1219,7 @@
     renderBookmarks(payload);
     renderYouTube(payload);
     renderDrive(payload);
+    renderSpotify(payload);
   }
 
   // Auto-refresh cada 5 min

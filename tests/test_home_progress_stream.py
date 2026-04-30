@@ -50,7 +50,7 @@ _EXPECTED_STAGES = [
     "today", "signals", "tomorrow", "forecast",
     "pagerank", "chrome", "eval", "followup",
     "drive", "wa_unreplied", "bookmarks", "vaults",
-    "finance", "cards", "youtube",
+    "finance", "cards", "youtube", "spotify",
 ]
 
 
@@ -100,6 +100,7 @@ def stub_fetchers(monkeypatch):
     monkeypatch.setattr(server_mod, "_fetch_finance", _bump("finance"))
     monkeypatch.setattr(server_mod, "_fetch_credit_cards", _bump("cards"))
     monkeypatch.setattr(server_mod, "_fetch_youtube_watched", _bump("youtube"))
+    monkeypatch.setattr(server_mod, "_fetch_spotify", _bump("spotify"))
 
     # Skip pendientes-urgent / narrative — not fetchers, but they read
     # signals + may call ollama. Stub to keep _home_compute pure.

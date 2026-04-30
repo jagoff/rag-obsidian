@@ -500,6 +500,18 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 .row .row-meta .age.warn  { color: var(--amber); }
 .row .row-meta .age.stale { color: var(--red); }
 
+/* Spotify state badges en el panel p-spotify. Verde para playing
+   (acción activa), dim para paused. Sin background — un span inline
+   en row-meta, mismo size que el resto del meta. */
+.row .row-meta .spotify-state-playing {
+  color: var(--green, #1db954);
+  font-variant-numeric: tabular-nums;
+}
+.row .row-meta .spotify-state-paused {
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
 .row .row-aside {
   flex-shrink: 0;
   font-size: var(--fs-mini);

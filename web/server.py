@@ -7447,6 +7447,41 @@ def _fetch_chrome_top_week(n: int = 5) -> list[dict]:
     return out
 
 
+def _fetch_spotify(limit: int = 10) -> dict | None:
+    """Spotify desktop app: track actual + tracks de hoy.
+
+    Source: AppleScript directo al desktop app (no API HTTP — el path de
+    `/me/player/recently-played` rompió 2026-04-30, ver
+    `rag.integrations.spotify_local`). El historial de hoy lo escribe
+    el plist `com.fer.obsidian-rag-spotify-poll` cada 60s en
+    `rag_spotify_log` (telemetry.db).
+
+    Silent-fail: si Spotify está cerrado, no hay daemon corriendo, o
+    AppleScript timeout → devuelve `None`. El frontend hidea el panel
+    cuando `signals.spotify` es null.
+
+    Returns: `{now_playing: dict|None, recent_today: list[dict]}` o `None`
+    si AMBOS están vacíos (no point en mostrar el panel).
+    """
+    try:
+        from rag.integrations.spotify_local import (
+            now_playing, recent_tracks_today,
+        )
+    except Exception:
+        return None
+    try:
+        np = now_playing()
+    except Exception:
+        np = None
+    try:
+        recent = recent_tracks_today(limit=limit)
+    except Exception:
+        recent = []
+    if not np and not recent:
+        return None
+    return {"now_playing": np, "recent_today": recent}
+
+
 def _fetch_youtube_watched(n: int = 5, hours: int = 168) -> list[dict]:
     """Most-recent YouTube video pages opened in Chrome, last `hours` window.
 
@@ -8757,7 +8792,7 @@ async def home_stream(request: Request, regenerate: bool = False) -> StreamingRe
                 "today", "signals", "tomorrow", "forecast",
                 "pagerank", "chrome", "eval", "followup",
                 "drive", "wa_unreplied", "bookmarks", "vaults",
-                "finance", "cards", "youtube",
+                "finance", "cards", "youtube", "spotify",
             ],
             "substages": {
                 "signals": [
@@ -9154,7 +9189,7 @@ def _home_compute(
     # with timeouts, and then `shutdown(wait=False)` to return fast while
     # any straggler (e.g. cold `_fetch_followup_aging` doing LLM-judge per
     # loop) keeps running in the background to warm its own cache.
-    pool = ThreadPoolExecutor(max_workers=14, thread_name_prefix="home")
+    pool = ThreadPoolExecutor(max_workers=15, thread_name_prefix="home")
     timings: dict[str, float] = {}
     t_submit = time.time()
 
@@ -9212,6 +9247,11 @@ def _home_compute(
         fut_finance     = pool.submit(_timed, "finance", _fetch_finance, now)
         fut_cards       = pool.submit(_timed, "cards", _fetch_credit_cards, now)
         fut_youtube     = pool.submit(_timed, "youtube", _fetch_youtube_watched, 5, 168)
+        # Spotify: track actual del desktop app via AppleScript + historial
+        # de hoy desde `rag_spotify_log` (poblado por el plist de 60s).
+        # Cheap (~50ms cold) — el budget de 5s es defensivo por si el
+        # AppleScript se cuelga (Spotify mid-update, etc).
+        fut_spotify     = pool.submit(_timed, "spotify", _fetch_spotify, 10)
 
         # Helper: wait on a future with budget, return default on timeout
         # or worker exception. Emits "timeout" progress event so the UI
@@ -9271,6 +9311,12 @@ def _home_compute(
         finance = _await("finance", fut_finance, 5, default=None)
         cards = _await("cards", fut_cards, 5, default=[]) or []
         youtube_watched = _await("youtube", fut_youtube, 5, default=[]) or []
+        # Spotify hot path: el AppleScript desde un launchd daemon paga
+        # TCC permission check + warm de AppleScriptObjC en el primer call,
+        # llegando a ~3s. 8s deja margen sin penalizar el critical path
+        # (signals típicamente domina con 5-25s, así que el spotify se
+        # esconde detrás de eso).
+        spotify = _await("spotify", fut_spotify, 8, default=None)
 
         signals["pagerank_top"] = pagerank_top
         signals["chrome_top_week"] = chrome_top_week
@@ -9283,6 +9329,7 @@ def _home_compute(
         signals["finance"] = finance
         signals["cards"] = cards
         signals["youtube_watched"] = youtube_watched
+        signals["spotify"] = spotify
     finally:
         # Detach stragglers; they continue warming caches for the next call.
         # On SSE-client disconnect (cancel_event set), drop pending

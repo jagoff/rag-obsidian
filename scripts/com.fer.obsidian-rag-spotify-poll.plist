@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-spotify-poll</string>
+  <!--
+    Cada 60s: query AppleScript del Spotify desktop app, registrar el
+    track actual en `rag_spotify_log` (telemetry.db). Reemplaza el path
+    de la API HTTP `/me/player/recently-played` que rompió 2026-04-30
+    (Spotify gate de Premium para owners de dev apps).
+
+    Silent cuando:
+      - Spotify está cerrado / no instalado
+      - El track está paused o stopped
+      - El último insert es el mismo track_id < 5min (UPDATE last_seen)
+
+    Costo: ~50ms por tick (osascript + 1 sqlite update). 1.4 minutos de
+    CPU/día acumulado, despreciable.
+
+    Kill switch:
+      launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.fer.obsidian-rag-spotify-poll.plist
+
+    Log: ~/.local/share/obsidian-rag/spotify-poll.log (solo cuando hubo
+    record real — los idle ticks no escriben nada).
+  -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/fer/.local/share/uv/tools/obsidian-rag/bin/python3</string>
+    <string>/Users/fer/repositories/obsidian-rag/scripts/spotify_poll.py</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>/Users/fer</string>
+    <key>PATH</key><string>/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin:/Users/fer/.local/bin</string>
+    <key>RAG_STATE_SQL</key><string>1</string>
+  </dict>
+  <!-- Cada 60s. Launchd skip los runs durante laptop sleep automáticamente. -->
+  <key>StartInterval</key><integer>60</integer>
+  <!-- Run inmediato al cargar para no esperar 60s al primer poll. -->
+  <key>RunAtLoad</key><true/>
+  <!-- KeepAlive=false: el script termina rápido (~50ms), no es daemon. -->
+  <key>KeepAlive</key><false/>
+  <key>StandardOutPath</key><string>/Users/fer/.local/share/obsidian-rag/spotify-poll.log</string>
+  <key>StandardErrorPath</key><string>/Users/fer/.local/share/obsidian-rag/spotify-poll.error.log</string>
+  <!-- Throttle: si por algún bug el poll tarda 60s+, evita stampede. -->
+  <key>ThrottleInterval</key><integer>30</integer>
+</dict>
+</plist>

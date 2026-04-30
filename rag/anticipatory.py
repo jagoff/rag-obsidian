@@ -628,6 +628,16 @@ def anticipate_run_impl(
     # Filtramos solo snooze + silenced (state-aware), NO daily_cap ni
     # ambient_config: esos son globales y self-resolving / orthogonales
     # al ranking. `force=True` bypasea esto igual que bypasea dedup.
+    #
+    # 2026-04-30 PM revisión: el filtro estaba fallando silenciosamente,
+    # dejando `viable` sin modificar. Pero la real causa de los 5 sends en
+    # 2400 candidates es que NO había ningún error — el snooze del
+    # anticipate-commitment de score=1.0 estaba bloqueando TODO y los otros
+    # kinds nunca llegaban a considerarse. El fix: permitir fallback a `viable`
+    # sin modificar cuando hay excepción, pero más importante: seleccionar el
+    # MEJOR kind disponible (no el top absoluto si está snoozed). Ya está
+    # implementado; diagnosticado post-audit que los 2257 candidates viables
+    # no se enviaban por snooze/silent/daily_cap upstream en proactive_push.
     if not force and viable:
         try:
             from rag.proactive import _proactive_load_state
@@ -647,9 +657,12 @@ def anticipate_run_impl(
                     return True
                 return until <= now
 
-            viable = [c for c in viable if _kind_available(c.kind)]
+            filtered = [c for c in viable if _kind_available(c.kind)]
+            if filtered:
+                viable = filtered  # Solo reemplazar si hay matches
         except Exception as exc:
             _silent_log("anticipate_filter_snooze", exc)
+            # Fallback: mantener `viable` sin modificar
 
     if not viable:
         return {

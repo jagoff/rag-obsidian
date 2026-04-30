@@ -106,7 +106,7 @@ def test_compute_corpus_hash_returns_deterministic(monkeypatch, tmp_path):
 
 
 def test_compute_corpus_hash_changes_on_bucket_boundary(monkeypatch, tmp_path):
-    """Hash buckets count by `_CORPUS_HASH_BUCKET` (default 100). Crossing a
+    """Hash buckets count by `_CORPUS_HASH_BUCKET` (default 500). Crossing a
     bucket boundary changes the hash; staying within does not.
 
     Pre-2026-04-24 hash changed on every count delta — ingesters running
@@ -114,17 +114,51 @@ def test_compute_corpus_hash_changes_on_bucket_boundary(monkeypatch, tmp_path):
     semantic cache. Audit on web.log showed 30 SEMANTIC PUTs across 24
     distinct corpus_hashes → 0 cache hits ever. Bucketing collapses the
     rotation noise without losing the bulk-change invariant.
+
+    2026-04-30: bucket subido de 100→500. Con corpus ~3600 chunks y
+    ingesters que agregan ~30-80 chunks/run, bucket=100 producía 3
+    hashes distintos por día (medido en rag_response_cache), manteniendo
+    la hit-rate en 0%. Bucket=500 requiere +14% del corpus para invalidar.
     """
     monkeypatch.setattr(rag, "_resolve_vault_path", lambda: tmp_path)
     (tmp_path / "a.md").write_text("# a")
     bucket = rag._CORPUS_HASH_BUCKET
     # Within bucket: hash stable.
     h1 = rag._compute_corpus_hash(_FakeCol(bucket * 5 + 10))
-    h2 = rag._compute_corpus_hash(_FakeCol(bucket * 5 + 50))
+    h2 = rag._compute_corpus_hash(_FakeCol(bucket * 5 + 200))
     assert h1 == h2, "small count delta inside bucket must not invalidate cache"
     # Crossing bucket boundary: hash changes.
     h3 = rag._compute_corpus_hash(_FakeCol(bucket * 6 + 10))
     assert h1 != h3, "crossing bucket boundary must invalidate cache"
+
+
+def test_corpus_hash_bucket_default_is_500(monkeypatch, tmp_path):
+    """Regression: bucket por default debe ser 500 (fix 2026-04-30).
+
+    Con corpus ~3600 chunks, bucket=100 cruzaba el límite 2-3 veces/día
+    con los ingesters incrementales (WA hourly, Calendar 6h), haciendo que
+    la hit-rate del semantic cache sea 0%. Bucket=500 limita las
+    invalidaciones a eventos bulk reales (--reset o semanas de ingesters).
+    """
+    monkeypatch.setattr(rag, "_resolve_vault_path", lambda: tmp_path)
+    (tmp_path / "a.md").write_text("# a")
+    # El bucket default debe ser 500 — ingesters que agregan <500 chunks
+    # no invalidan el cache.
+    assert rag._CORPUS_HASH_BUCKET == 500, (
+        f"bucket esperado 500, got {rag._CORPUS_HASH_BUCKET}. "
+        "Fix 2026-04-30: subido de 100 para evitar 0% hit-rate con ingesters continuos."
+    )
+    # Confirmar que 499 chunks de diferencia no cambian el hash.
+    base_count = 3500
+    h1 = rag._compute_corpus_hash(_FakeCol(base_count))
+    h2 = rag._compute_corpus_hash(_FakeCol(base_count + 499))
+    assert h1 == h2, "499 chunks de diferencia NO deben invalidar el cache"
+    # Confirmar que cruzar el límite sí invalida.
+    h3 = rag._compute_corpus_hash(_FakeCol(base_count + 500))
+    # (base_count // 500 puede ser distinto de (base_count+500) // 500)
+    if base_count % 500 != 0:
+        # base_count no es múltiplo exacto → +500 sí cruza
+        assert h1 != h3, "+500 chunks debe invalidar el cache"
 
 
 def test_corpus_hash_cached_memoizes(monkeypatch, tmp_path):

@@ -63,7 +63,13 @@ from pathlib import Path
 # ── Constants ───────────────────────────────────────────────────────────────
 PROACTIVE_STATE_PATH = Path.home() / ".local/share/obsidian-rag/proactive.json"
 PROACTIVE_LOG_PATH = Path.home() / ".local/share/obsidian-rag/proactive.jsonl"
+# Caps diarios: `emergent` + `patterns` comparten 3, `anticipate-*` tiene
+# presupuesto separado de 6 (menos restrictivo porque la telemetría mostró
+# que anticipate solo genera ~5 sends en toda la historia, 2400 candidates
+# descartados). Ver audit 2026-04-30: snooze map tenía TODOS los kinds
+# de anticipate bloqueados y el daily_count global de 3 impedía recovery.
 PROACTIVE_DAILY_CAP = 3
+PROACTIVE_ANTICIPATE_DAILY_CAP = 6
 
 
 def _proactive_load_state() -> dict:
@@ -119,7 +125,14 @@ def _proactive_log(event: dict) -> None:
 
 
 def _proactive_can_push(kind: str) -> tuple[bool, str]:
-    """Devuelve (ok, reason). 'reason' explica por qué no se envía."""
+    """Devuelve (ok, reason). 'reason' explica por qué no se envía.
+
+    2026-04-30 fix: anticipate-* kinds tienen su propio daily_cap (6)
+    separado del cap global de emergent+patterns (3). Ambos usan el mismo
+    state file para simplicidad, pero el chequeo de daily_count bifurca:
+    - Si kind comienza con "anticipate-", usa PROACTIVE_ANTICIPATE_DAILY_CAP.
+    - Si no, usa PROACTIVE_DAILY_CAP (emergent, patterns, etc.).
+    """
     from rag import _ambient_config
     cfg = _ambient_config()
     if not cfg:
@@ -135,8 +148,11 @@ def _proactive_can_push(kind: str) -> tuple[bool, str]:
                 return (False, f"{kind} en snooze hasta {until.isoformat(timespec='minutes')}")
         except Exception:
             pass
-    if state.get("daily_count", 0) >= PROACTIVE_DAILY_CAP:
-        return (False, f"daily cap alcanzado ({PROACTIVE_DAILY_CAP})")
+    # Aplicar cap adecuado según el kind
+    daily_cap = (PROACTIVE_ANTICIPATE_DAILY_CAP
+                 if kind.startswith("anticipate-") else PROACTIVE_DAILY_CAP)
+    if state.get("daily_count", 0) >= daily_cap:
+        return (False, f"daily cap alcanzado ({daily_cap})")
     return (True, "")
 
 

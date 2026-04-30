@@ -1084,6 +1084,232 @@
   }
 
   // ──────────────────────────────────────────────────────────────
+  // Sleep panel (Pillow + mood self-report)
+  // ──────────────────────────────────────────────────────────────
+
+  // Helper: build inline SVG sparkline. `values` may contain nulls
+  // (gaps where the user didn't sleep / track). Renders a polyline
+  // skipping nulls + a dot for each non-null. Y-axis is inferred
+  // from value range (0..1 default for quality), with a small pad.
+  function renderSparkline(values, opts = {}) {
+    const W = opts.width || 120;
+    const H = opts.height || 24;
+    const ymin = opts.ymin ?? 0;
+    const ymax = opts.ymax ?? 1;
+    const padX = 2;
+    const padY = 2;
+    const innerW = W - 2 * padX;
+    const innerH = H - 2 * padY;
+    const N = values.length;
+    if (N === 0) return "";
+
+    const xFor = (i) => padX + (i / Math.max(1, N - 1)) * innerW;
+    const yFor = (v) => {
+      const t = Math.max(0, Math.min(1, (v - ymin) / (ymax - ymin)));
+      return padY + (1 - t) * innerH;
+    };
+
+    // Polyline path — skip null gaps by starting a new sub-path.
+    const segs = [];
+    let started = false;
+    values.forEach((v, i) => {
+      if (v == null) { started = false; return; }
+      const cmd = started ? "L" : "M";
+      segs.push(`${cmd}${xFor(i).toFixed(1)},${yFor(v).toFixed(1)}`);
+      started = true;
+    });
+    const pathD = segs.join(" ");
+
+    // Dots — color the last non-null differently.
+    const dots = [];
+    let lastIdx = -1;
+    for (let i = N - 1; i >= 0; i--) {
+      if (values[i] != null) { lastIdx = i; break; }
+    }
+    values.forEach((v, i) => {
+      if (v == null) return;
+      const cls = i === lastIdx ? "spark-dot last" : "spark-dot";
+      dots.push(`<circle class="${cls}" cx="${xFor(i).toFixed(1)}" cy="${yFor(v).toFixed(1)}" r="1.5"></circle>`);
+    });
+
+    return `<svg class="spark-svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true">
+      <path class="spark-line" d="${pathD}" />
+      ${dots.join("")}
+    </svg>`;
+  }
+
+  // Map de mood label → emoji + texto corto.
+  const MOOD_OPTIONS = [
+    { key: "good", emoji: "😀", label: "bien" },
+    { key: "meh", emoji: "😐", label: "normal" },
+    { key: "bad", emoji: "😞", label: "mal" },
+  ];
+
+  // Map del wakeup_mood de Pillow (escala 0-3) a label legible.
+  const WAKEUP_MOOD_LABELS = {
+    0: "—",
+    1: "mal",
+    2: "normal",
+    3: "bien",
+  };
+
+  function renderSleep(payload) {
+    const sleep = payload.signals?.sleep;
+    const panel = document.getElementById("p-sleep");
+    if (!panel) return;
+    if (!sleep || !sleep.last_night) {
+      panel.hidden = true;
+      return;
+    }
+    panel.hidden = false;
+
+    const ln = sleep.last_night;
+    const week = sleep.week || {};
+    const delta = sleep.delta || {};
+    const moodNow = sleep.mood_now;
+
+    // Headline: duración + quality
+    const totalH = ln.sleep_total_h || 0;
+    const totalLabel = (() => {
+      const mins = Math.round(totalH * 60);
+      const h = Math.floor(mins / 60);
+      const m = mins % 60;
+      return `${h}h${m.toString().padStart(2, "0")}m`;
+    })();
+    const qLabel = ln.quality != null ? `Q ${ln.quality.toFixed(2)}` : "";
+
+    // Stages: deep / REM / awakenings con warn thresholds
+    const deepPct = ln.deep_pct;
+    const remPct = ln.rem_pct;
+    const awak = ln.awakenings ?? 0;
+    const deepWarn = deepPct != null && deepPct < 15;
+    const remWarn = remPct != null && remPct < 15;
+    const awakWarnCls = awak >= 5 ? "stale" : awak >= 3 ? "warn" : "";
+
+    // Delta vs hist — solo mostramos los más relevantes
+    const fmtDelta = (val, suffix, decimals = 2) => {
+      if (val == null || !isFinite(val)) return null;
+      const sign = val > 0 ? "+" : "";
+      const cls = Math.abs(val) < 0.01 ? "delta-flat"
+                : val > 0 ? "delta-up"
+                : "delta-down";
+      const arrow = val > 0 ? "↑" : val < 0 ? "↓" : "·";
+      return `<span class="${cls}">${arrow} ${sign}${val.toFixed(decimals)}${suffix}</span>`;
+    };
+    const deltaParts = [
+      fmtDelta(delta.duration_h, "h", 1),
+      delta.quality != null ? fmtDelta(delta.quality, "Q") : null,
+      delta.deep_pct != null ? fmtDelta(delta.deep_pct, "%", 1) : null,
+    ].filter(Boolean);
+
+    // Wake-up mood read-only desde Pillow
+    const wakeupMood = ln.wakeup_mood;
+    const wakeupLabel = wakeupMood != null
+      ? `${WAKEUP_MOOD_LABELS[wakeupMood] || "—"}`
+      : null;
+
+    // Mood now selected
+    const moodNowKey = moodNow?.label;
+
+    // Build mood buttons
+    const moodBtns = MOOD_OPTIONS.map((m) => {
+      const cls = m.key === moodNowKey ? "mood-btn selected" : "mood-btn";
+      return `<button type="button" class="${cls}" data-mood="${m.key}"
+        title="${m.label}" aria-label="estado: ${m.label}">${m.emoji}</button>`;
+    }).join("");
+
+    const moodTimeAgo = moodNow?.ts
+      ? fmtTimeAgo(new Date(moodNow.ts * 1000).toISOString())
+      : null;
+
+    // Sparkline values (quality 7d) — null gaps preserved
+    const sparkVals = sleep.spark_quality_7d || [];
+    const sparkSVG = renderSparkline(sparkVals, { width: 120, height: 22, ymin: 0, ymax: 1 });
+
+    // Insight (anomalía detectada server-side)
+    const insightHTML = sleep.insight
+      ? `<div class="sleep-insight" role="status">⚠ ${escapeHTML(sleep.insight)}</div>`
+      : "";
+
+    const body = panel.querySelector("[data-body]");
+    body.innerHTML = `
+      <div class="sleep-summary">
+        <div class="sleep-row">
+          <span class="sleep-headline">${totalLabel}<span class="quality">${escapeHTML(qLabel)}</span></span>
+          <span class="sleep-clock">${ln.bedtime_local || "—"}<span class="arrow">→</span>${ln.waketime_local || "—"}</span>
+        </div>
+        <div class="sleep-stages">
+          <span class="stage stage-deep ${deepWarn ? "warn" : ""}">
+            <span class="stage-label">deep</span><span>${deepPct != null ? deepPct.toFixed(0) + "%" : "—"}</span>
+          </span>
+          <span class="stage stage-rem ${remWarn ? "warn" : ""}">
+            <span class="stage-label">rem</span><span>${remPct != null ? remPct.toFixed(0) + "%" : "—"}</span>
+          </span>
+          <span class="stage stage-awakenings ${awakWarnCls}">
+            <span class="stage-label">awk</span><span>${awak}</span>
+          </span>
+        </div>
+        <div class="sleep-sparkline">
+          ${sparkSVG}
+          <span class="spark-label">Q · 7d</span>
+        </div>
+        ${deltaParts.length ? `<div class="sleep-delta">vs hist: ${deltaParts.join(" ")}</div>` : ""}
+        ${insightHTML}
+        <div class="sleep-mood" data-mood-widget>
+          <span class="mood-label">ahora:</span>
+          ${moodBtns}
+          <span class="mood-current">
+            ${moodNowKey ? `<span class="mood-saved">✓</span>` : ""}
+            ${wakeupLabel ? `<span class="wakeup-mood">despertaste: <span class="label">${escapeHTML(wakeupLabel)}</span></span>` : ""}
+            ${moodTimeAgo ? `<span class="when">${escapeHTML(moodTimeAgo)}</span>` : ""}
+          </span>
+        </div>
+      </div>
+    `;
+
+    // Wire mood buttons → POST /api/mood
+    const widget = body.querySelector("[data-mood-widget]");
+    widget?.querySelectorAll(".mood-btn").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const mood = btn.dataset.mood;
+        if (!mood) return;
+        // Optimistic UI: marca seleccionado inmediatamente
+        widget.querySelectorAll(".mood-btn").forEach((b) => b.classList.remove("selected"));
+        btn.classList.add("selected");
+        try {
+          const r = await fetch("/api/mood", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ mood }),
+          });
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          // Refresh el indicador "✓" sin re-fetch entero
+          const cur = widget.querySelector(".mood-current");
+          if (cur && !cur.querySelector(".mood-saved")) {
+            cur.insertAdjacentHTML("afterbegin", `<span class="mood-saved">✓</span> `);
+          }
+        } catch (err) {
+          console.error("mood post failed", err);
+          btn.classList.remove("selected");
+        }
+      });
+    });
+
+    // Count chip: muestra duración total como signal rápido al colapsar
+    const countEl = panel.querySelector("[data-count]");
+    if (countEl) countEl.textContent = totalLabel;
+
+    // Footer: source attribution (1×/día) + insight si aplica
+    const foot = panel.querySelector("[data-foot]");
+    if (foot) {
+      const histN = sleep.hist?.n;
+      foot.innerHTML = histN
+        ? `<span class="row-meta">${histN} noches en hist · Pillow + Apple Watch</span>`
+        : "";
+    }
+  }
+
+  // ──────────────────────────────────────────────────────────────
   // Topbar status
   // ──────────────────────────────────────────────────────────────
 
@@ -1220,6 +1446,7 @@
     renderYouTube(payload);
     renderDrive(payload);
     renderSpotify(payload);
+    renderSleep(payload);
   }
 
   // Auto-refresh cada 5 min
@@ -1245,6 +1472,7 @@
   // queda como no-op. El user accede a la feature desde desktop.
 
   const LS_PANELS_ORDER = "home.v2.panels.order.v1";
+  const LS_PANELS_COLLAPSED = "home.v2.panels.collapsed.v1";
   const SECTION_BODY_IDS = ["sec-acc-body", "sec-mon-body", "sec-amb-body"];
 
   function readSavedOrder() {
@@ -1295,9 +1523,96 @@
 
   function clearSavedOrder() {
     try { localStorage.removeItem(LS_PANELS_ORDER); } catch {}
+    // El bot\u00f3n "\u21ba orden" tambi\u00e9n limpia el estado de collapse \u2014 si el user
+    // dijo "resetear", quiere TODO el layout custom borrado, no s\u00f3lo el orden.
+    try { localStorage.removeItem(LS_PANELS_COLLAPSED); } catch {}
     // Restore default DOM order — más simple recargar que reconstruir
     // el orden hard-coded del HTML.
     window.location.reload();
+  }
+
+  // ── Collapse por panel: cada .panel tiene un botón ▼/▶ en su header
+  // que toggle `data-collapsed`. CSS oculta panel-body + panel-foot
+  // cuando data-collapsed="true". Estado persistido en localStorage
+  // como mapa { <panel-id>: true } — sólo guardamos los collapsed.
+
+  function readCollapsedMap() {
+    try {
+      const raw = localStorage.getItem(LS_PANELS_COLLAPSED);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      return (parsed && typeof parsed === "object") ? parsed : {};
+    } catch { return {}; }
+  }
+
+  function saveCollapsedMap(map) {
+    try {
+      // Limpiar entries falsy para que el JSON quede chico
+      const trimmed = {};
+      for (const [k, v] of Object.entries(map)) if (v) trimmed[k] = true;
+      if (Object.keys(trimmed).length === 0) {
+        localStorage.removeItem(LS_PANELS_COLLAPSED);
+      } else {
+        localStorage.setItem(LS_PANELS_COLLAPSED, JSON.stringify(trimmed));
+      }
+    } catch (e) {
+      console.warn("[home.v2] no pude persistir collapse de paneles:", e);
+    }
+  }
+
+  function applySavedCollapse() {
+    const map = readCollapsedMap();
+    for (const pid of Object.keys(map)) {
+      const panel = document.getElementById(pid);
+      if (!panel) continue;
+      panel.setAttribute("data-collapsed", "true");
+      const btn = panel.querySelector(".panel-collapse-btn");
+      if (btn) {
+        btn.setAttribute("aria-expanded", "false");
+        const icon = btn.querySelector(".toggle-icon");
+        if (icon) icon.textContent = "\u25B6";
+      }
+    }
+  }
+
+  function togglePanelCollapse(panel) {
+    const collapsed = panel.getAttribute("data-collapsed") === "true";
+    const next = !collapsed;
+    panel.setAttribute("data-collapsed", next ? "true" : "false");
+    const btn = panel.querySelector(".panel-collapse-btn");
+    if (btn) {
+      btn.setAttribute("aria-expanded", next ? "false" : "true");
+      const icon = btn.querySelector(".toggle-icon");
+      if (icon) icon.textContent = next ? "\u25B6" : "\u25BC";
+    }
+    const map = readCollapsedMap();
+    if (next) map[panel.id] = true;
+    else delete map[panel.id];
+    saveCollapsedMap(map);
+    updateResetButtonVisibility();
+  }
+
+  function injectCollapseButton(panel) {
+    const head = panel.querySelector(".panel-head");
+    if (!head || head.querySelector(".panel-collapse-btn")) return;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "panel-collapse-btn";
+    btn.setAttribute("aria-label", "Colapsar/expandir panel");
+    btn.setAttribute("aria-expanded", "true");
+    btn.title = "Colapsar/expandir";
+    btn.innerHTML = '<span class="toggle-icon" aria-hidden="true">\u25BC</span>';
+    btn.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      togglePanelCollapse(panel);
+    });
+    // Evitar que el click en el bot\u00f3n inicie un drag (los eventos de DnD
+    // se disparan en el panel padre con draggable=true, pero el click
+    // del bot\u00f3n no debe ser interpretado como dragstart).
+    btn.addEventListener("mousedown", (ev) => ev.stopPropagation());
+    // Lo agregamos como \u00faltimo hijo del head \u2014 a la derecha del .count
+    head.appendChild(btn);
   }
 
   let _draggingPanel = null;
@@ -1412,10 +1727,16 @@
     });
   }
 
+  function hasCustomLayout() {
+    if (readSavedOrder()) return true;
+    const map = readCollapsedMap();
+    return map && Object.keys(map).length > 0;
+  }
+
   function updateResetButtonVisibility() {
     const btn = document.getElementById("reset-order-btn");
     if (!btn) return;
-    btn.hidden = !readSavedOrder();
+    btn.hidden = !hasCustomLayout();
   }
 
   function injectResetButton() {
@@ -1425,12 +1746,12 @@
     btn.type = "button";
     btn.id = "reset-order-btn";
     btn.className = "reset-order-btn";
-    btn.title = "Resetear orden de los paneles al default";
-    btn.setAttribute("aria-label", "Resetear orden de los paneles");
-    btn.textContent = "↺ orden";
-    btn.hidden = !readSavedOrder();      // sólo visible si hay orden custom
+    btn.title = "Resetear layout (orden + paneles colapsados)";
+    btn.setAttribute("aria-label", "Resetear layout de los paneles");
+    btn.textContent = "↺ layout";
+    btn.hidden = !hasCustomLayout();
     btn.addEventListener("click", () => {
-      if (confirm("¿Resetear el orden de los paneles al default?")) {
+      if (confirm("¿Resetear el layout de los paneles al default? (orden + collapse)")) {
         clearSavedOrder();
       }
     });
@@ -1442,11 +1763,16 @@
     //    (Los renderers usan getElementById por panel-id, así que mover
     //     el nodo en el DOM no rompe el data-binding.)
     applySavedOrder();
-    // 2. Hacer cada panel draggable + insertar el grip
-    document.querySelectorAll(".section-body > .panel").forEach(makePanelDraggable);
-    // 3. Hacer cada section-body un drop zone para "soltar al final"
+    // 2. Hacer cada panel draggable + insertar el grip + botón collapse
+    document.querySelectorAll(".section-body > .panel").forEach((panel) => {
+      makePanelDraggable(panel);
+      injectCollapseButton(panel);
+    });
+    // 3. Aplicar estado de collapse persistido (ya con los botones inyectados)
+    applySavedCollapse();
+    // 4. Hacer cada section-body un drop zone para "soltar al final"
     SECTION_BODY_IDS.forEach(makeSectionDroppable);
-    // 4. Inyectar botón reset en la topbar
+    // 5. Inyectar botón reset en la topbar
     injectResetButton();
   });
 })();

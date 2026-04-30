@@ -13,7 +13,7 @@
   <link rel="icon" type="image/png" sizes="32x32" href="/static/pwa/favicon-32.png">
   <link rel="icon" type="image/png" sizes="16x16" href="/static/pwa/favicon-16.png">
   <link rel="apple-touch-icon" href="/static/pwa/apple-touch-icon.png">
-  <link rel="stylesheet" href="/static/home.v2.css?v=11">
+  <link rel="stylesheet" href="/static/home.v2.css?v=12">
   <!-- marked@18 vendored — same SRI as the v1 home. Used to parse the
        today/tomorrow narrative which has 4 H2 sub-sections that need
        real markdown rendering (lists, headers) — not the regex hack. -->
@@ -205,6 +205,18 @@
           <div class="panel-body" data-body><div class="empty">cargando…</div></div>
           <footer class="panel-foot" data-foot></footer>
         </article>
+        <!-- Sleep · anoche + sparkline 7d + widget mood self-report.
+             Source: rag_sleep_sessions (poblada 1×/día por
+             obsidian-rag-ingest-pillow), Pillow iOS export via iCloud.
+             Hidden via JS si signals.sleep es null (Pillow no instalado). -->
+        <article class="panel panel-sleep" id="p-sleep" hidden>
+          <header class="panel-head">
+            <span class="title">Sueño · anoche</span>
+            <span class="count" data-count></span>
+          </header>
+          <div class="panel-body" data-body><div class="empty">cargando…</div></div>
+          <footer class="panel-foot" data-foot></footer>
+        </article>
         <article class="panel" id="p-cards">
           <header class="panel-head">
             <span class="title">Tarjetas · ciclo</span>
@@ -319,6 +331,6 @@
     </section>
   </main>
 
-  <script src="/static/home.v2.js?v=11"></script>
+  <script src="/static/home.v2.js?v=12"></script>
 </body>
 </html>

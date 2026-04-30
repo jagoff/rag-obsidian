@@ -1275,3 +1275,259 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
   .panel.drop-before::before,
   .panel.drop-after::after { box-shadow: none; }
 }
+
+/* ── Panel Sueño (p-sleep) ───────────────────────────────────────── */
+/* Layout: línea 1 con métricas clave (duración + quality + bedtime),
+   línea 2 con stages breakdown, línea 3 sparkline 7d + delta, línea 4
+   widget mood input. Compacto pero denso. */
+
+.sleep-summary {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.sleep-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  font-size: var(--fs-small);
+  font-variant-numeric: tabular-nums;
+}
+
+.sleep-headline {
+  font-size: var(--fs-base);
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.sleep-headline .quality {
+  color: var(--text-dim);
+  font-weight: 500;
+  margin-left: var(--space-2);
+}
+
+.sleep-clock {
+  color: var(--text-dim);
+}
+
+.sleep-clock .arrow {
+  margin: 0 var(--space-1);
+  opacity: 0.6;
+}
+
+.sleep-stages {
+  display: flex;
+  gap: var(--space-3);
+  font-size: var(--fs-mini);
+  color: var(--text-dim);
+}
+
+.sleep-stages .stage {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+}
+
+.sleep-stages .stage-label {
+  color: var(--text-faint);
+  text-transform: lowercase;
+}
+
+.sleep-stages .stage-deep.warn,
+.sleep-stages .stage-rem.warn {
+  color: var(--amber);
+}
+
+.sleep-stages .stage-awakenings.warn {
+  color: var(--amber);
+}
+
+.sleep-stages .stage-awakenings.stale {
+  color: var(--red);
+}
+
+.sleep-insight {
+  font-size: var(--fs-mini);
+  padding: 4px 8px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--amber) 15%, transparent);
+  color: var(--amber);
+  border-left: 2px solid var(--amber);
+}
+
+/* Sparkline SVG mini-chart 7d. Eje Y: 0-1 (quality). Width 100% del row. */
+.sleep-sparkline {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+}
+
+.sleep-sparkline .spark-svg {
+  flex: 1;
+  height: 24px;
+  min-width: 0;
+}
+
+.sleep-sparkline .spark-label {
+  font-size: var(--fs-mini);
+  color: var(--text-faint);
+  flex-shrink: 0;
+}
+
+.sleep-sparkline .spark-line {
+  fill: none;
+  stroke: var(--text-dim);
+  stroke-width: 1.5;
+  stroke-linejoin: round;
+}
+
+.sleep-sparkline .spark-dot {
+  fill: var(--text-dim);
+}
+
+.sleep-sparkline .spark-dot.last {
+  fill: var(--accent, var(--text-strong));
+  r: 2.5;
+}
+
+/* Delta vs hist — pequeñas badges "↑+0.2h" / "↓-0.05Q" */
+.sleep-delta {
+  display: flex;
+  gap: var(--space-2);
+  font-size: var(--fs-mini);
+  color: var(--text-dim);
+}
+
+.sleep-delta .delta-up   { color: var(--green); }
+.sleep-delta .delta-down { color: var(--red); }
+.sleep-delta .delta-flat { color: var(--text-faint); }
+
+/* Mood input widget — 3 botones emoji + label "ahora". */
+.sleep-mood {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--border-subtle);
+  margin-top: var(--space-2);
+}
+
+.sleep-mood .mood-label {
+  font-size: var(--fs-mini);
+  color: var(--text-faint);
+  flex-shrink: 0;
+}
+
+.sleep-mood .mood-btn {
+  appearance: none;
+  background: transparent;
+  border: 1px solid var(--border-subtle);
+  border-radius: 3px;
+  padding: 4px 8px;
+  font-size: var(--fs-base);
+  cursor: pointer;
+  color: var(--text-dim);
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+  line-height: 1;
+}
+
+.sleep-mood .mood-btn:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-hover);
+  color: var(--text-strong);
+}
+
+.sleep-mood .mood-btn:focus-visible {
+  outline: none;
+  border-color: var(--border-focus);
+  box-shadow: var(--shadow-focus);
+}
+
+.sleep-mood .mood-btn.selected {
+  background: color-mix(in srgb, var(--accent, var(--text-strong)) 12%, transparent);
+  border-color: var(--accent, var(--text-strong));
+  color: var(--text-strong);
+}
+
+.sleep-mood .mood-current {
+  margin-left: auto;
+  font-size: var(--fs-mini);
+  color: var(--text-faint);
+}
+
+.sleep-mood .mood-current .mood-saved {
+  color: var(--green);
+  margin-right: 4px;
+}
+
+/* Wake-up mood badge (read-only, viene de Pillow) */
+.sleep-mood .wakeup-mood {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: var(--fs-mini);
+  color: var(--text-faint);
+}
+
+.sleep-mood .wakeup-mood .label {
+  text-transform: lowercase;
+}
+
+
+/* ────────────────────────────────────────────────────────────
+   Collapse por panel: cada .panel tiene un botón ▼/▶ a la derecha
+   del header. Click colapsa el panel a sólo el header (oculta
+   panel-body + panel-foot). Estado persiste en localStorage.
+   ──────────────────────────────────────────────────────────── */
+
+/* El botón toggle vive a la derecha del .count, dentro del header */
+.panel-collapse-btn {
+  flex-shrink: 0;
+  background: transparent;
+  border: 0;
+  color: var(--text-faint);
+  cursor: pointer;
+  padding: 0 var(--space-1);
+  font-size: 11px;
+  line-height: 1;
+  border-radius: 2px;
+  transition: color var(--dur-fast) var(--ease-out),
+              background var(--dur-fast) var(--ease-out);
+}
+.panel-collapse-btn:hover {
+  color: var(--cyan);
+  background: var(--bg-elev-2);
+}
+.panel-collapse-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 1px var(--border-focus);
+}
+.panel-collapse-btn .toggle-icon {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  transition: transform var(--dur-fast) var(--ease-out);
+}
+
+/* Panel colapsado: ocultamos body + foot, dejamos sólo el header.
+   No tocamos display del panel (sigue siendo grid item) — sólo
+   altura mínima y borde más sutil para distinguirlo visualmente. */
+.panel[data-collapsed="true"] .panel-body,
+.panel[data-collapsed="true"] .panel-foot {
+  display: none !important;
+}
+.panel[data-collapsed="true"] {
+  min-height: 0;
+}
+.panel[data-collapsed="true"] .panel-head {
+  border-bottom: 0;
+  padding-bottom: var(--space-3);  /* mismo padding que top, queda balanceado */
+}
+
+/* Reduce-motion friendliness para el toggle icon */
+@media (prefers-reduced-motion: reduce) {
+  .panel-collapse-btn .toggle-icon { transition: none; }
+}

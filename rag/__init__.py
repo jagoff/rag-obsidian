@@ -5256,7 +5256,12 @@ def _compute_corpus_hash(col) -> str:
 
 def _corpus_hash_cached(col) -> str:
     """Cached version of _compute_corpus_hash — re-computes only when chunk
-    count changes bucket (same trigger as _load_corpus invalidation)."""
+    count changes bucket (same trigger as _load_corpus invalidation).
+
+    Una sola llamada a col.count(): si el cache está caliente devolvemos
+    directo; si miss, computamos hash desde el cnt ya leído (sin re-llamar
+    col.count() dentro de _compute_corpus_hash).
+    """
     try:
         cnt = int(col.count())
     except Exception:
@@ -5264,7 +5269,10 @@ def _corpus_hash_cached(col) -> str:
     with _corpus_hash_lock:
         if _corpus_hash_memo["hash"] and _corpus_hash_memo["chunk_count"] == cnt:
             return _corpus_hash_memo["hash"]
-    h = _compute_corpus_hash(col)
+    # Miss: computamos hash desde cnt sin re-llamar col.count() (era el
+    # patrón viejo cnt = col.count() + _compute_corpus_hash(col) que adentro
+    # vuelve a hacer col.count()).
+    h = _hash_chunk_count(cnt)
     with _corpus_hash_lock:
         _corpus_hash_memo["hash"] = h
         _corpus_hash_memo["chunk_count"] = cnt
@@ -19135,13 +19143,14 @@ def _suggest_folder_for_note(
         return ("", 0.0)
     raw = full.read_text(encoding="utf-8", errors="ignore")
     text = clean_md(raw)[:3000].strip()
-    if not text or col.count() == 0:
+    col_total = int(col.count())
+    if not text or col_total == 0:
         return ("", 0.0)
     try:
         q_embed = embed([text])[0]
     except Exception:
         return ("", 0.0)
-    n = min(k * 4, col.count())
+    n = min(k * 4, col_total)
     res = col.query(
         query_embeddings=[q_embed], n_results=n, include=["metadatas"],
     )
@@ -19230,7 +19239,8 @@ def _top_k_neighbors(
         full.relative_to(VAULT_PATH.resolve())
     except ValueError:
         return []
-    if not full.is_file() or col.count() == 0:
+    col_total = int(col.count())
+    if not full.is_file() or col_total == 0:
         return []
     text = clean_md(full.read_text(encoding="utf-8", errors="ignore"))[:3000].strip()
     if not text:
@@ -19239,7 +19249,7 @@ def _top_k_neighbors(
         q_embed = embed([text])[0]
     except Exception:
         return []
-    n = min(k * 4, col.count())
+    n = min(k * 4, col_total)
     res = col.query(
         query_embeddings=[q_embed], n_results=n,
         include=["metadatas", "distances"],
@@ -19851,7 +19861,8 @@ def find_contradictions(
     Non-fatal: parse errors, short answers, empty vault all return [].
     """
     answer = (answer or "").strip()
-    if len(answer) < 40 or col.count() == 0:
+    col_total = int(col.count())
+    if len(answer) < 40 or col_total == 0:
         return []
     try:
         ans_embed = embed([answer])[0]
@@ -19859,7 +19870,7 @@ def find_contradictions(
         return []
     # Pull generously; we'll filter + rerank down. Dedup by path so the
     # counter-set isn't dominated by multiple chunks of the same note.
-    n = min(k * 4 + len(exclude_paths) + 5, col.count())
+    n = min(k * 4 + len(exclude_paths) + 5, col_total)
     cand = col.query(
         query_embeddings=[ans_embed], n_results=n,
         include=["documents", "metadatas"],
@@ -21628,15 +21639,23 @@ def retrieve(
             continue
         final = float(s)
         rec_raw = recency_boost(meta) if (apply_recency or weights.recency_always) else 0.0
+        # Audit 2026-04-30: pre-fix sumábamos recency_cue + recency_always
+        # cuando ambos pesos estaban activos y la query tenía cue temporal —
+        # double-count. Históricamente recency_always=0 hacía que el bug
+        # fuera no-op, pero `rag tune` puede levantarlo. Ahora usamos el
+        # max de los dos para que la contribución total de recency quede
+        # capada por el mayor de los pesos efectivos.
         if apply_recency:
             # Feature #10: when the query has a temporal-lookup cue,
             # multiply the recency contribution so fresh notes win ties.
             _cue_weight = weights.recency_cue
             if _temporal_lookup:
                 _cue_weight = _cue_weight * _temporal_boost
-            final += _cue_weight * rec_raw
-        if weights.recency_always:
-            final += weights.recency_always * rec_raw
+            recency_weight = max(_cue_weight, weights.recency_always)
+        else:
+            recency_weight = weights.recency_always
+        if recency_weight > 0 and rec_raw:
+            final += recency_weight * rec_raw
         if query_tag_hits and weights.tag_literal:
             meta_tags = {t.strip() for t in (meta.get("tags") or "").split(",") if t.strip()}
             n_matches = len(query_tag_hits & meta_tags)
@@ -22526,7 +22545,9 @@ def collect_ranker_features(
     ranker.json and have retrieve read it, or (b) align the tune pool to
     the dominant surface (currently web chat at pool=5).
     """
-    if col.count() == 0:
+    # Single col.count() — antes había dos llamadas (early-return + n_results).
+    col_total = int(col.count())
+    if col_total == 0:
         return []
 
     # Filters identical to retrieve()'s default path.
@@ -22556,7 +22577,7 @@ def collect_ranker_features(
     where = build_where(folder, tag, date_range)
     seen_ids: set[str] = set()
     merged_ordered: list[str] = []
-    n_results = min(RETRIEVE_K, col.count())
+    n_results = min(RETRIEVE_K, col_total)
     for v, q_embed in zip(variants, variant_embeds):
         sem_kwargs: dict = {
             "query_embeddings": [q_embed],
@@ -22808,10 +22829,15 @@ def apply_weighted_scores(
         if f["ignored"]:
             continue
         score = f["rerank"]
+        # Audit 2026-04-30: paridad con retrieve() — si ambos pesos están
+        # activos y la query tiene cue, usamos el max(cue, always) en vez
+        # de sumar ambos (double-count fix).
         if f["has_recency_cue"]:
-            score += weights.recency_cue * f["recency_raw"]
-        if weights.recency_always:
-            score += weights.recency_always * f["recency_raw"]
+            recency_weight = max(weights.recency_cue, weights.recency_always)
+        else:
+            recency_weight = weights.recency_always
+        if recency_weight > 0 and f.get("recency_raw"):
+            score += recency_weight * f["recency_raw"]
         if weights.tag_literal and f["tag_hits"]:
             # Same normalisation as retrieve(): cap at TAG_HITS_NORM_CAP.
             score += weights.tag_literal * min(f["tag_hits"] / TAG_HITS_NORM_CAP, 1.0)
@@ -37954,12 +37980,13 @@ def _find_related_by_embedding(
     metas (deduped by file, best chunk wins). Used by `rag read` where we have
     a summary but no in-vault source metas for the graph-based `find_related`.
     """
-    if col.count() == 0:
+    col_total = int(col.count())
+    if col_total == 0:
         return []
     try:
         res = col.query(
             query_embeddings=[query_embedding],
-            n_results=min(limit * 4, col.count()),
+            n_results=min(limit * 4, col_total),
             include=["metadatas", "distances"],
         )
     except Exception:

@@ -43,12 +43,15 @@ def test_heapq_nlargest_equivalent_to_sorted():
 def test_collect_ranker_features_single_count_call():
     """Fix 2: collect_ranker_features no debe llamar col.count() dos veces seguidas."""
     src = inspect.getsource(rag.collect_ranker_features)
-    # Contamos cuántas veces aparece col.count() — el patrón viejo era 2,
-    # con el fix queda 1 (asignado a variable y reusado).
-    n_count_calls = src.count("col.count()")
+    # Contamos sólo apariciones en líneas de código (no en comentarios).
+    n_count_calls = sum(
+        1
+        for line in src.splitlines()
+        if "col.count()" in line and not line.lstrip().startswith("#")
+    )
     assert n_count_calls <= 1, (
-        f"collect_ranker_features llama col.count() {n_count_calls} veces; "
-        f"debe ser 1 (asignar a variable + reusar)"
+        f"collect_ranker_features llama col.count() {n_count_calls} veces "
+        f"en código (no comments); debe ser 1 (asignar a variable + reusar)"
     )
 
 

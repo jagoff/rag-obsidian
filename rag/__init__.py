@@ -23898,16 +23898,22 @@ def _scan_queries_log(days: int = 14) -> list[dict]:
     """
     cutoff = datetime.now() - timedelta(days=days)
     since_iso = cutoff.isoformat(timespec="seconds")
+    # LIMIT defensive: en deployments con tráfico alto (web + WA listener +
+    # daemons) la ventana de 14d puede acumular >10k rows × extra_json
+    # parse. Acotamos a 5k para que `rag emergent` / `rag dashboard` no se
+    # inflen. Si un día se necesitan más, el limit es configurable via env.
+    scan_limit = int(os.environ.get("RAG_SCAN_QUERIES_LIMIT", "5000"))
     sql = (
         "SELECT ts, cmd, q, session, mode, top_score, t_retrieve, t_gen,"
         " answer_len, citation_repaired, critique_fired, critique_changed,"
         " extra_json"
         " FROM rag_queries WHERE ts >= ? AND q IS NOT NULL AND q != ''"
         " ORDER BY ts ASC"
+        " LIMIT ?"
     )
     try:
         with _ragvec_state_conn() as conn:
-            cursor = conn.execute(sql, (since_iso,))
+            cursor = conn.execute(sql, (since_iso, scan_limit))
             rows = cursor.fetchall()
             cols = [d[0] for d in cursor.description]
     except Exception as exc:

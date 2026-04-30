@@ -2699,24 +2699,32 @@ def _wrap_untrusted(content: str, label: str = "CONTENIDO") -> str:
 #     bge-m3 (1) ≈ 8 GB — holgado en 36 GB. Los launchd plists (web, serve,
 #     morning, today, ...) ya corren con `-1` sin causar freeze — evidencia
 #     empírica a favor de que el problema original era command-r, no `-1`.
-#     Alinea el CLI one-shot con la infra real y elimina el 2-3s cold-load
-#     cuando pasaste >20min sin queries.
+#   - 2026-04-30 (tarde): → `"20m"` ROLLBACK del 2026-04-21. Reproducimos
+#     el síntoma: ollama directo tomaba 6.85s para 3 tokens (debería <1s),
+#     RagNet /api/chat 41-90s (debería 7-15s). Root cause: con
+#     `OLLAMA_MAX_LOADED_MODELS=3` + `KEEP_ALIVE=-1`, los 3 modelos del
+#     stack (qwen2.5:7b + qwen2.5:3b + bge-m3 = ~9GB VRAM) quedaban
+#     pinned forever. Sumado a Chrome/OrbStack/etc, el unified memory de
+#     36 GB se saturaba y MPS hacia swap → tokens/s caían 10x. Con
+#     `KEEP_ALIVE=20m` los modelos secundarios (qwen2.5:3b helper) se
+#     unloadan si no se tocan; el principal (qwen2.5:7b chat) se mantiene
+#     warm porque siempre se usa. Junto con `MAX_LOADED_MODELS=2` (ver
+#     `~/.local/bin/ollama-env-init.sh`), ollama vuelve a 0.7s/3tok y
+#     RagNet a 14-23s. Mejora 4-10x end-to-end.
 #
-# ⚠️ ROLLBACK: si volvés a sentir la Mac pesada (beachballs, RAM pressure
-# alta en Activity Monitor), exportá `OLLAMA_KEEP_ALIVE=20m` (o "5m") en
-# tu shell ANTES de la primera invocación de `rag`. O revertí este commit.
+# ⚠️ ROLLBACK: si necesitás `-1` por algún motivo puntual (test perf,
+# benchmark sin cold loads), exportá `OLLAMA_KEEP_ALIVE=-1` en tu shell.
 # El env var override sigue funcionando en cualquier dirección.
 #
 # ⚠️ FALLBACK RISK: `resolve_chat_model()` cae a command-r (~19 GB) si
-# qwen2.5:7b + qwen3:30b-a3b no están. En ese caso el Mac freeze puede
-# volver — setear OLLAMA_KEEP_ALIVE=20m manualmente hasta que vuelva a
-# haber un modelo chico disponible.
+# qwen2.5:7b + qwen3:30b-a3b no están. Con KEEP_ALIVE=20m (default actual)
+# command-r se descarga si no se usa, evitando el Mac freeze.
 def _parse_keep_alive(val: str) -> int | str:
     try:
         return int(val)
     except ValueError:
         return val
-OLLAMA_KEEP_ALIVE = _parse_keep_alive(os.environ.get("OLLAMA_KEEP_ALIVE", "-1"))
+OLLAMA_KEEP_ALIVE = _parse_keep_alive(os.environ.get("OLLAMA_KEEP_ALIVE", "20m"))
 
 
 # Modelos >10 GB cuya wired-pin en 36 GB unified bloquea el kernel de
@@ -46450,7 +46458,8 @@ def _serve_plist(rag_bin: str) -> str:
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
     <key>PYTHONUNBUFFERED</key><string>1</string>
-    <key>OLLAMA_KEEP_ALIVE</key><string>-1</string>
+    <key>OLLAMA_KEEP_ALIVE</key><string>20m</string>
+    <key>OLLAMA_MAX_LOADED_MODELS</key><string>2</string>
     <key>RAG_RERANKER_NEVER_UNLOAD</key><string>1</string>
     <key>RAG_LOCAL_EMBED</key><string>1</string>
     <key>RAG_STATE_SQL</key><string>1</string>
@@ -46547,7 +46556,8 @@ def _web_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>PYTHONUNBUFFERED</key><string>1</string>
     <key>OBSIDIAN_RAG_WEB_CHAT_MODEL</key><string>{chat_model}</string>
-    <key>OLLAMA_KEEP_ALIVE</key><string>-1</string>
+    <key>OLLAMA_KEEP_ALIVE</key><string>20m</string>
+    <key>OLLAMA_MAX_LOADED_MODELS</key><string>2</string>
     <key>RAG_LOCAL_EMBED</key><string>1</string>
     <key>RAG_RERANKER_NEVER_UNLOAD</key><string>1</string>
     <key>RAG_STATE_SQL</key><string>1</string>
@@ -46936,7 +46946,7 @@ def _consolidate_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
-    <key>OLLAMA_KEEP_ALIVE</key><string>-1</string>
+    <key>OLLAMA_KEEP_ALIVE</key><string>20m</string>
     <key>RAG_STATE_SQL</key><string>1</string>
   </dict>
   <key>StartCalendarInterval</key>
@@ -47415,7 +47425,7 @@ def _ingest_whatsapp_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
-    <key>OLLAMA_KEEP_ALIVE</key><string>-1</string>
+    <key>OLLAMA_KEEP_ALIVE</key><string>20m</string>
   </dict>
   <key>StartInterval</key><integer>900</integer>
   <key>RunAtLoad</key><true/>
@@ -47458,7 +47468,7 @@ def _ingest_gmail_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
-    <key>OLLAMA_KEEP_ALIVE</key><string>-1</string>
+    <key>OLLAMA_KEEP_ALIVE</key><string>20m</string>
   </dict>
   <key>StartInterval</key><integer>3600</integer>
   <key>RunAtLoad</key><true/>
@@ -47502,7 +47512,7 @@ def _ingest_calendar_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
-    <key>OLLAMA_KEEP_ALIVE</key><string>-1</string>
+    <key>OLLAMA_KEEP_ALIVE</key><string>20m</string>
   </dict>
   <key>StartInterval</key><integer>3600</integer>
   <key>RunAtLoad</key><true/>
@@ -47551,7 +47561,7 @@ def _ingest_reminders_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
-    <key>OLLAMA_KEEP_ALIVE</key><string>-1</string>
+    <key>OLLAMA_KEEP_ALIVE</key><string>20m</string>
   </dict>
   <key>StartInterval</key><integer>3600</integer>
   <key>RunAtLoad</key><true/>
@@ -47595,7 +47605,7 @@ def _wake_up_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
-    <key>OLLAMA_KEEP_ALIVE</key><string>-1</string>
+    <key>OLLAMA_KEEP_ALIVE</key><string>20m</string>
   </dict>
   <key>StartCalendarInterval</key>
   <dict>
@@ -54951,7 +54961,7 @@ _CONFIG_VARS: tuple[tuple[str, str, str, str], ...] = (
      "Post-T10 es no-op (SQL es el único path). Seteado en launchd plists para simetría."),
 
     # — Ollama / models
-    ("OLLAMA_KEEP_ALIVE", "-1", "duration",
+    ("OLLAMA_KEEP_ALIVE", "20m", "duration",
      "Pinea modelos ollama en VRAM indefinidamente. '20m', '-1' forever, etc."),
     ("RAG_KEEP_ALIVE_LARGE_MODEL", "", "duration",
      "Opt-out del auto-clamp de chat_keep_alive() para modelos grandes."),

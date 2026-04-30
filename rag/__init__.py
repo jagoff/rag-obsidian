@@ -38877,6 +38877,22 @@ def _parse_spotify_command(q: str) -> dict | None:
     if not s or len(s) > 80:
         return None
 
+    # Idiomatic prefix strip: "dale play" / "dale stop" / "dale siguiente"
+    # / "metele play" — strippeamos el modal antes del match para que el
+    # resto de los regex traten el verbo central. Negative lookahead
+    # `(?!con\s|a\s)` evita strippear "dale con Tool" / "dale a algo de X"
+    # — ese pattern lo maneja `_SPOTIFY_PLAY_RE` como play_search.
+    _modal = re.match(
+        r"^(?:dale|metele|met[eé]le|met[eé](?:lo|lá)?)\s+(?!con\s|a\s)",
+        s, re.IGNORECASE,
+    )
+    if _modal:
+        rest = s[_modal.end():].strip()
+        # Solo aplicar el strip si lo que queda es plausiblemente un
+        # comando bare. Heuristic: el resto no contiene muchas words.
+        if rest and (len(rest.split()) <= 2 or len(rest) < 15):
+            s = rest
+
     # Try now-playing first ("qué estoy escuchando"). Antes que noarg
     # porque "qué tema es esta" comparte tokens con el dominio Spotify
     # pero NO es un comando de control — es una read-query.
@@ -52743,7 +52759,11 @@ def _telemetry_wal_checkpoint(dry_run: bool = False) -> dict:
 #        history feeds `rag dashboard`, contradictions are audit).
 #
 # Tables explicitly NOT rotated (empty tuple): retained forever.
-_SQL_ROTATION_POLICY: tuple[tuple[str, int], ...] = (
+# Each entry is (table_name, retention_days[, time_col]).
+# time_col defaults to "ts" when omitted — matches the log-style DDL convention.
+# Tables with a non-standard timestamp column (e.g. `created_at`) must list it
+# explicitly to avoid aborting the loop mid-run with "no such column: ts".
+_SQL_ROTATION_POLICY: tuple[tuple, ...] = (
     ("rag_queries", 90),
     ("rag_behavior", 90),
     ("rag_ambient", 60),
@@ -52766,7 +52786,10 @@ _SQL_ROTATION_POLICY: tuple[tuple[str, int], ...] = (
     ("rag_synthetic_queries", 90),
     ("rag_synthetic_negatives", 90),
     ("rag_promises", 90),
-    ("rag_whatsapp_scheduled", 30),
+    # rag_whatsapp_scheduled usa `created_at` como columna timestamp — el DDL
+    # original (wa_scheduled.py) eligió ese nombre; aquí se declara explícito
+    # para que el loop no aborte con "no such column: ts".
+    ("rag_whatsapp_scheduled", 30, "created_at"),
 )
 
 # Tables that upsert on a PK instead of appending log rows. Listed here both

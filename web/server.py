@@ -2527,6 +2527,18 @@ class ChatRequest(BaseModel):
     # chat model tag.
     mode: str | None = Field(None, max_length=16)
 
+    # ── Feature H: scope a folder / nota específica ──────────────────────
+    # Limita el retrieval a un subset del vault. Mutuamente complementario
+    # con `vault_scope` (que elige cuál vault). `folder` es un prefix
+    # vault-relative (ej. "01-Projects/Coaching"). `path` es UNA nota
+    # vault-relative específica (ej. "01-Projects/Coaching/Autoridad.md").
+    # Si vienen los dos, `path` gana (más específico). Pasarlos vacíos /
+    # None → comportamiento legacy (vault entero). Ver sección "Feature H"
+    # en CLAUDE.md y tests/test_chat_scoped.py.
+    folder: str | None = Field(None, max_length=500)
+    path: str | None = Field(None, max_length=512)
+    # ── /Feature H ───────────────────────────────────────────────────────
+
     @field_validator("question")
     @classmethod
     def _check_question(cls, v: str) -> str:
@@ -2564,6 +2576,39 @@ class ChatRequest(BaseModel):
         if len(v) > 200 or not re.match(r"^[A-Za-z0-9_./\-]{1,200}$", v):
             raise ValueError("invalid vault_scope format")
         return v
+
+    # ── Feature H: validators de folder/path ─────────────────────────────
+    @field_validator("folder")
+    @classmethod
+    def _check_folder(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        v = v.strip().strip("/")
+        if not v:
+            return None
+        # Vault-relative; rechazar URI schemes y traversal. No exigimos que
+        # el folder exista — el handler hace la validación final cuando
+        # consulta el corpus (un folder vacío post-filter degrada a "no
+        # results", no a 400).
+        if "://" in v or v.startswith("/") or ".." in v.split("/"):
+            raise ValueError("folder must be vault-relative (no URI/traversal)")
+        return v
+
+    @field_validator("path")
+    @classmethod
+    def _check_path(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        v = v.strip()
+        if not v:
+            return None
+        if "://" in v or v.startswith("/") or ".." in v.split("/"):
+            raise ValueError("path must be vault-relative (no URI/traversal)")
+        # Aceptamos cualquier extensión — el filtro post-retrieve es exact-
+        # match contra `meta.file`, así que un path sin .md simplemente no
+        # matchea nada y degrada a no-hits (mensaje claro al user).
+        return v
+    # ── /Feature H ───────────────────────────────────────────────────────
 
 
 class FeedbackRequest(BaseModel):
@@ -5213,6 +5258,119 @@ def _is_in_excluded_folder(path: str, excluded: list[str]) -> bool:
         return False
     p = path.lstrip("/")
     return any(p.startswith(prefix) for prefix in excluded)
+
+
+# ── Feature H: /api/notes/autocomplete ───────────────────────────────────
+# Devuelve paths del vault que matchean substring case-insensitive contra
+# la query. Lo consume el selector "scope" del chat (composer) para que el
+# user elija una nota o un folder y limitar el retrieval ahí.
+#
+# Implementación deliberadamente simple — no hay reranker, sólo substring
+# matching contra `meta.file` (paths) + `meta.note` (titles) + `meta.folder`
+# (folders únicos del corpus). Sortea por:
+#   1. exact match del path completo (peso máximo)
+#   2. path startswith query
+#   3. path contains query (y title contains)
+#   4. folder match
+#
+# Se sirve desde `_load_corpus(get_db())` — ya cached con invalidación por
+# col.id, así que el cost amortizado es <5ms en hits warm. Cold call:
+# 50-300ms en vaults de ~10k chunks.
+#
+# Rate limit re-usa `_BEHAVIOR_BUCKETS` para no abrir un nuevo bucket por
+# este endpoint — el cliente legítimo es el composer que tippea (1-2 req/s
+# debouncado), bien por debajo del límite.
+@app.get("/api/notes/autocomplete")
+def notes_autocomplete(
+    q: str = "",
+    limit: int = 20,
+    request: Request = None,  # type: ignore[assignment]
+) -> dict:
+    """Sugiere paths/folders del vault que matchean `q` por substring.
+
+    Args:
+        q: Substring a buscar (case-insensitive). Vacío → devuelve los
+           primeros `limit` paths sin filtrar (útil para abrir el dropdown
+           sin haber tipeado nada).
+        limit: Top-N (1-50, default 20).
+
+    Returns:
+        {"items": [{kind: "note"|"folder", path, title}], "count": N,
+         "query": "..."}
+        Si el vault no está indexado, items=[] con `reason: "empty_index"`.
+    """
+    if request is not None:
+        client_ip = (request.client.host if request.client else "unknown")
+        _check_rate_limit(_BEHAVIOR_BUCKETS, client_ip,
+                          _BEHAVIOR_RATE_LIMIT, _BEHAVIOR_RATE_WINDOW)
+    needle = (q or "").strip().lower()
+    limit = max(1, min(int(limit or 20), 50))
+
+    col = get_db()
+    if col.count() == 0:
+        return {
+            "items": [], "count": 0, "query": q or "",
+            "reason": "empty_index",
+        }
+    corpus = _load_corpus(col)
+
+    # Dedupe paths — _load_corpus tiene 1 row por chunk, una nota grande
+    # aparece N veces. Igual con folders. Mantenemos el primer title
+    # encontrado por path para mostrar como display name.
+    paths_seen: dict[str, str] = {}
+    folders_seen: set[str] = set()
+    for m in corpus.get("metas") or []:
+        f = (m.get("file") or "").strip()
+        if f and f not in paths_seen:
+            paths_seen[f] = (m.get("note") or "").strip()
+        folder = (m.get("folder") or "").strip()
+        if folder:
+            folders_seen.add(folder)
+        # Folders virtuales (cada prefix path/foo/bar → path, path/foo).
+        for i, _ in enumerate(f.split("/")[:-1]):
+            prefix = "/".join(f.split("/")[: i + 1])
+            if prefix:
+                folders_seen.add(prefix)
+
+    def _rank(item_path: str, kind: str, title: str) -> tuple[int, int, str]:
+        """Ranking: lower-is-better. Tuple sort por (bucket, length, alpha)."""
+        ip = item_path.lower()
+        ti = title.lower()
+        if not needle:
+            return (10, len(item_path), ip)
+        if ip == needle:
+            return (0, 0, ip)
+        if ip.startswith(needle):
+            return (1, len(item_path), ip)
+        if needle in ip:
+            return (2, len(item_path), ip)
+        if needle in ti:
+            return (3, len(item_path), ip)
+        return (9, len(item_path), ip)
+
+    items: list[dict] = []
+    if needle:
+        # Filtrar y rankear.
+        for path, title in paths_seen.items():
+            ip = path.lower()
+            ti = (title or "").lower()
+            if needle in ip or needle in ti:
+                items.append({"kind": "note", "path": path, "title": title})
+        for folder in folders_seen:
+            if needle in folder.lower():
+                items.append({"kind": "folder", "path": folder, "title": folder})
+    else:
+        # Sin query: devolvemos los más cortos primero (folders top-level
+        # + notas de la raíz). Útil para abrir el dropdown de cero.
+        for folder in folders_seen:
+            items.append({"kind": "folder", "path": folder, "title": folder})
+        for path, title in paths_seen.items():
+            items.append({"kind": "note", "path": path, "title": title})
+
+    items.sort(key=lambda it: _rank(it["path"], it["kind"], it.get("title") or ""))
+    items = items[:limit]
+    return {"items": items, "count": len(items), "query": q or ""}
+# ── /Feature H ───────────────────────────────────────────────────────────
 
 
 # ── /api/notes/related ────────────────────────────────────────────────────────
@@ -9971,6 +10129,143 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         _t0 = time.perf_counter()
         yield _sse("session", {"id": sess["id"]})
 
+        # ══ Feature K: "recordame X" inline short-circuit ══════════════════
+        # Detectar si el user escribió "recordame X mañana 9am" (o variantes).
+        # Si parsea limpio (intent + tiempo) → crear el reminder directo
+        # y devolver SSE `created` event sin tocar LLM ni retrieval. Si la
+        # detección falla / es ambigua → fall-through al flow normal,
+        # donde el LLM y `propose_reminder` siguen funcionando como antes.
+        #
+        # Wire-up de la función `parse_remind_intent` en `rag/__init__.py`.
+        # El payload del SSE `created` event imita el shape que emite
+        # `propose_reminder` (kind="reminder", created=True, reminder_id,
+        # fields{title, due_iso, ...}) para que el frontend lo renderee
+        # con `appendCreatedChip` (handler ya existente — no requiere
+        # cambios en app.js).
+        try:
+            import rag as _rag_mod_for_remind
+            _remind_intent_match = _rag_mod_for_remind.parse_remind_intent(question)
+        except Exception:
+            _remind_intent_match = None
+        if (
+            _remind_intent_match
+            and _remind_intent_match.get("title")
+            and _remind_intent_match.get("due_iso")
+        ):
+            from datetime import datetime as _dt_remind
+            from rag import _create_reminder as _create_reminder_fn  # noqa: PLC0415
+
+            _r_title = _remind_intent_match["title"]
+            _r_due_iso = _remind_intent_match["due_iso"]
+            try:
+                _r_due_dt = _dt_remind.fromisoformat(_r_due_iso)
+                # Strip tzinfo — `_create_reminder` espera naive (mismo
+                # contract que el flow propose_reminder, ver rag/__init__.py
+                # ~38609). El offset ya lo aplicó parse_remind_intent.
+                if _r_due_dt.tzinfo is not None:
+                    _r_due_dt = _r_due_dt.replace(tzinfo=None)
+            except Exception:
+                _r_due_dt = None
+
+            _r_ok, _r_res = _create_reminder_fn(
+                _r_title, due_dt=_r_due_dt,
+            )
+            turn_id = new_turn_id()
+            if _r_ok:
+                _r_payload = {
+                    "kind": "reminder",
+                    "created": True,
+                    "reminder_id": _r_res,
+                    "fields": {
+                        "title": _r_title,
+                        "due_iso": _r_due_iso,
+                        "due_text": _remind_intent_match.get("original_text", ""),
+                        "list": None,
+                        "priority": None,
+                        "notes": None,
+                        "recurrence": None,
+                        "recurrence_text": "",
+                    },
+                    "remind_inline": True,
+                }
+                yield _sse("sources", {
+                    "items": [], "confidence": 1.0, "intent": "remind_inline",
+                })
+                yield _sse("created", _r_payload)
+                _r_msg = f"✓ Reminder creado: «{_r_title}» para {_r_due_iso}"
+                # Token-stream chico para que el chip + texto convivan
+                # naturalmente con la animación del frontend.
+                for i in range(0, len(_r_msg), 40):
+                    yield _sse("token", {"delta": _r_msg[i:i+40]})
+                total_ms = int((time.perf_counter() - _t0) * 1000)
+                yield _sse("done", {
+                    "turn_id": turn_id, "elapsed_ms": total_ms,
+                    "mode": "remind_inline",
+                    "source_specific": True,
+                })
+                try:
+                    append_turn(sess, {
+                        "turn_id": turn_id, "q": question,
+                        "a": _r_msg[:500],
+                        "outcome": "reminder_created",
+                        "reminder_id": _r_res,
+                    })
+                    save_session(sess)
+                except Exception:
+                    pass
+                try:
+                    log_query_event({
+                        "cmd": "web.chat.remind_inline",
+                        "q": question[:200],
+                        "session": sess["id"], "answered": True,
+                        "t_total": round(total_ms / 1000.0, 3),
+                    })
+                except Exception:
+                    pass
+                return
+            else:
+                # `_create_reminder` falló — emitir un proposal card para
+                # que el user vea el error y reintente. Cae sin tocar LLM,
+                # mismo patrón que `_maybe_emit_proposal` con created=False.
+                _err = _r_res or "no se pudo crear el reminder"
+                _err_payload = {
+                    "kind": "reminder",
+                    "created": False,
+                    "error": _err,
+                    "proposal_id": f"prop-err-remind-{turn_id[:8]}",
+                    "needs_clarification": True,
+                    "fields": {
+                        "title": _r_title,
+                        "due_iso": _r_due_iso,
+                    },
+                    "remind_inline": True,
+                }
+                yield _sse("sources", {
+                    "items": [], "confidence": 0.0, "intent": "remind_inline",
+                })
+                yield _sse("proposal", _err_payload)
+                _msg_err = f"No pude crear el reminder: {_err}"
+                for i in range(0, len(_msg_err), 40):
+                    yield _sse("token", {"delta": _msg_err[i:i+40]})
+                total_ms = int((time.perf_counter() - _t0) * 1000)
+                yield _sse("done", {
+                    "turn_id": turn_id, "elapsed_ms": total_ms,
+                    "mode": "remind_inline",
+                    "source_specific": True,
+                    "error": True,
+                })
+                try:
+                    append_turn(sess, {
+                        "turn_id": turn_id, "q": question,
+                        "a": _msg_err[:500],
+                        "outcome": "reminder_error",
+                    })
+                    save_session(sess)
+                except Exception:
+                    pass
+                return
+        # ══ /Feature K ═════════════════════════════════════════════════════
+
         # Degenerate query short-circuit. Devuelve canned reply e
         # invita a reformular. No loggea como metachat (bucket propio
         # en analytics: `web.chat.degenerate`).
@@ -10739,8 +11034,21 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             # como user signal pero ahora distinguimos para poder splitear
             # métricas por canal (CLI vs PWA vs WhatsApp listener vía
             # serve.chat). Ver doc en `rag.retrieve()` y commit `fd97829`.
+            #
+            # ── Feature H: scope a folder/nota ───────────────────────────
+            # `req.folder` se pasa como 4to arg posicional de
+            # `multi_retrieve`. `req.path` se aplica POST-retrieve via
+            # filtro exact-match (ver `_filter_result_by_path` abajo);
+            # mantenemos el call signature intacto para no tocar
+            # `rag.multi_retrieve` (off-limits salvo helpers nuevos).
+            # Si vienen los dos, `path` gana — pero igual respetamos el
+            # `folder` en la query inicial porque acota el set y baja
+            # latencia del rerank.
+            _scope_folder: str | None = req.folder
+            _scope_path: str | None = req.path
+            # ── /Feature H ───────────────────────────────────────────────
             result = multi_retrieve(
-                vaults, search_question, _retrieve_k, None, history, None, False,
+                vaults, search_question, _retrieve_k, _scope_folder, history, None, False,
                 multi_query=_retrieve_multi_query, auto_filter=True, date_range=None,
                 rerank_pool=_retrieve_pool, exclude_paths=_exclude,
                 exclude_path_prefixes=(
@@ -10762,6 +11070,35 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             # Defense-in-depth contra bugs en rag.py o Ollama mid-embed.
             # Ver `_validate_retrieve_result` docstring para detalle.
             result = _validate_retrieve_result(result)
+
+            # ── Feature H: filtrado post-retrieve por path ───────────────
+            # Cuando `path` viene en el request, mantenemos solo los
+            # chunks cuyo `meta.file == path` (exact match contra
+            # vault-relative). Si no quedan hits, marcamos confidence=0
+            # — el flow downstream lo trata como "vault no respondió" y
+            # devuelve un mensaje claro al user. NO hacemos 404 acá
+            # porque el cliente igual quiere el SSE stream con el done
+            # event para des-pinear el spinner.
+            if _scope_path:
+                _kept_idx = [
+                    i for i, m in enumerate(result.get("metas") or [])
+                    if (m.get("file") or "") == _scope_path
+                ]
+                _docs_in = result.get("docs") or []
+                _metas_in = result.get("metas") or []
+                _scores_in = result.get("scores") or []
+                result["docs"] = [_docs_in[i] for i in _kept_idx]
+                result["metas"] = [_metas_in[i] for i in _kept_idx]
+                result["scores"] = [_scores_in[i] for i in _kept_idx]
+                if not _kept_idx:
+                    result["confidence"] = 0.0
+                # Loggeable por separado en filters_applied para que
+                # analytics distinga "user pidió scope=path" de "auto-
+                # filter encontró un folder".
+                _fa = result.get("filters_applied") or {}
+                _fa["path_scope"] = _scope_path
+                result["filters_applied"] = _fa
+            # ── /Feature H ───────────────────────────────────────────────
             _t_retrieve_end = time.perf_counter()
         except Exception as exc:
             # 2026-04-28 wave-7: sanitizar el error message antes de emitirlo
@@ -10784,6 +11121,68 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             # user ve solo el banner de error rojo sin escape hatch.
             yield _sse("done", {"error": True, "top_score": 0.0})  # BUG #31 — emitir done
             return
+
+        # ── Feature H: short-circuit cuando path-scope no matchea nada ──
+        # Cuando el user pidió scope=path (una nota específica) y el
+        # filtrado post-retrieve dejó el set vacío, NO tiene sentido
+        # correr tools / LLM con context vacío — devolvemos un mensaje
+        # canned claro y persistimos el turno como "no_match_in_scope"
+        # para analytics. El frontend recibe el SSE stream completo
+        # (session/sources/token/done) así el spinner se libera y el
+        # user puede des-scopear y reintentar.
+        if (
+            req.path
+            and not (result.get("metas") or [])
+            and not is_propose_intent
+            and not is_metachat
+        ):
+            _scope_label = req.path
+            _msg_canned = (
+                f"No encontré contenido en `{_scope_label}` que matchee tu "
+                f"pregunta. Probá con otra nota / folder o sacá el scope "
+                f"para buscar en todo el vault."
+            )
+            turn_id = new_turn_id()
+            yield _sse("sources", {
+                "items": [], "confidence": 0.0,
+                "filters_applied": result.get("filters_applied") or {},
+                "scope": {"path": _scope_label},
+            })
+            yield _sse("status", {"stage": "generating"})
+            for i in range(0, len(_msg_canned), 40):
+                yield _sse("token", {"delta": _msg_canned[i:i+40]})
+            total_ms = int((time.perf_counter() - _t0) * 1000)
+            yield _sse("done", {
+                "turn_id": turn_id,
+                "elapsed_ms": total_ms,
+                "top_score": 0.0,
+                # `source_specific: true` apaga los CTAs de fallback al
+                # web (Google/YouTube/Wiki). El user pidió scope explícito
+                # — no querés un escape a internet.
+                "source_specific": True,
+                "scope_no_match": True,
+            })
+            try:
+                append_turn(sess, {
+                    "turn_id": turn_id, "q": question,
+                    "a": _msg_canned[:500],
+                    "scope_no_match": True,
+                    "scope_path": _scope_label,
+                })
+                save_session(sess)
+            except Exception:
+                pass
+            try:
+                log_query_event({
+                    "cmd": "web.chat.scope_no_match",
+                    "q": question[:200],
+                    "session": sess["id"], "answered": True,
+                    "t_total": round(total_ms / 1000.0, 3),
+                })
+            except Exception:
+                pass
+            return
+        # ── /Feature H ───────────────────────────────────────────────────
 
         # Pre-compute forced tools ONCE here so both the empty-bail and
         # low-conf-bypass gates below can check it without re-running

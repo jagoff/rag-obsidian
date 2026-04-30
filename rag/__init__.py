@@ -24357,6 +24357,185 @@ def push_due_reminders_to_whatsapp(
 # 2026-04-25). Re-exported at the bottom of this file.
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# Feature K — Detector inline "recordame X" para el chat web
+# ══════════════════════════════════════════════════════════════════════════
+# Helper aislado: detecta si el texto del user matchea un pattern de
+# recordatorio inline ("recordame X mañana 9am") y devuelve dict con
+# {title, due_iso, original_text} listo para pasar a `_create_reminder`.
+# Si no hay match (o el match es ambiguo — sin tiempo claro), devuelve
+# None y el chat handler hace fallback al flow normal.
+#
+# Reusamos `_parse_natural_datetime` (mismo parser que el resto del
+# pipeline NL→datetime). NO duplicamos lógica de parseo de fechas.
+#
+# Wire-up vive en `web/server.py` chat handler — ver "Feature K" allí.
+#
+# Tests: `tests/test_chat_remind_inline.py`.
+_REMIND_INTENT_RE = re.compile(
+    # Triggers (rioplatense + neutro + EN). El (?:de\s+|que\s+)? acepta
+    # "recordame DE llamar a Juan" / "recordame QUE llame" sin afectar
+    # el resto.
+    r"^\s*(?:recordame|recuerd[aáé]me|recu[eé]rdame|acordate|hac[eé]me\s+acordar|"
+    r"reminder|remember\s+me|remind\s+me|remindme)\s+"
+    r"(?:de\s+|que\s+)?(?P<rest>.+)$",
+    re.IGNORECASE,
+)
+# Marker de tiempo: si el "rest" contiene alguno de estos tokens al final
+# (palabras temporales) es probable que tenga un cuándo parseable. NO es
+# autoritativo — es un short-circuit para evitar que `_parse_natural_datetime`
+# arranque a procesar texto sin signal temporal.
+_REMIND_TIME_MARKERS_RE = re.compile(
+    r"("
+    # Day words (anchored a word boundary)
+    r"\b(?:ma[ñn]ana|hoy|pasado\s*ma[ñn]ana|tonight|tomorrow|today)\b|"
+    # Weekday names
+    r"\b(?:lunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo)\b|"
+    # "el próximo X" / "la próxima X" / "next X"
+    r"\b(?:el\s+pr[oó]ximo|la\s+pr[oó]xima|pr[oó]xim[oa]|next)\s+\w+|"
+    # "en N horas" / "dentro de N días" / "in N minutes"
+    r"\b(?:en|dentro\s+de|in)\s+\d+\s*(?:min(?:utos?)?|m|horas?|hrs?|h|d[ií]as?|days?|semanas?|weeks?|meses|months?)\b|"
+    # Clock times — require explicit prefix "a las/a la" OR a clock suffix
+    # (hs/hrs/am/pm/HH:MM). Sin esto, cualquier número de 1-2 dígitos
+    # matchearía y "llamar a Juan 5" sería false positive.
+    r"\ba\s+las?\s+\d{1,2}(?::\d{2})?\b|"
+    r"\b\d{1,2}:\d{2}\b|"
+    r"\b\d{1,2}\s*(?:hs|hrs|h(?![a-z])|am|pm)\b|"
+    # Time-of-day idioms
+    r"\b(?:al\s+)?mediod[ií]a\b|\bmedianoche\b|"
+    r"\b(?:a\s+la\s+)?(?:ma[ñn]ana|tarde|noche)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def parse_remind_intent(text: str) -> dict | None:
+    """Detect inline reminder intent in chat text.
+
+    Match flow:
+      1. Pattern `(recordame|acordate|...) [de/que] <rest>` — strict
+         leading trigger (no mid-sentence false positives).
+      2. From `<rest>`, extract the temporal portion using
+         `_parse_natural_datetime`. We try the FULL rest first; if that
+         echoes the anchor (parser failed), we try progressively
+         shorter prefixes (cutting from the start) to isolate the title.
+      3. If a future datetime is found → return
+         `{"title": <title>, "due_iso": <iso>, "original_text": <input>}`.
+      4. If trigger matched but no clear time → return None (ambiguous —
+         caller should fall back to LLM, where `propose_reminder` may
+         still ask for clarification).
+
+    `due_iso` se normaliza al mismo formato que `_validate_scheduled_for`
+    (offset Argentina `-03:00` o `+00:00` según `RAG_TIMEZONE`).
+
+    Args:
+        text: Raw chat input from the user. Typically the un-stripped
+              `request.question`.
+
+    Returns:
+        Dict `{title, due_iso, original_text}` on a clear match, else None.
+    """
+    if not text or not isinstance(text, str):
+        return None
+    s = text.strip()
+    if not s:
+        return None
+    m = _REMIND_INTENT_RE.match(s)
+    if not m:
+        return None
+    rest = (m.group("rest") or "").strip()
+    if not rest:
+        return None
+
+    # Quick gate: si NO hay marker temporal alguno, devolvemos None
+    # rápido. Sin esto, `_parse_natural_datetime("llamar a Juan")` puede
+    # devolver datetimes anclados al "now" (false positive) cuando
+    # dateparser interpreta "Juan" o "lunes mañana" implícito.
+    if not _REMIND_TIME_MARKERS_RE.search(rest):
+        return None
+
+    anchor = datetime.now()
+    best: tuple[str, datetime] | None = None
+
+    # Estrategia 1 (preferida): buscar el PRIMER marker temporal con regex
+    # search y partir título/cuándo ahí. Captura bien "llamar al doctor el
+    # viernes 18hs" → title="llamar al doctor", when="el viernes 18hs".
+    # También evita el problema de dateparser ignorando prefix non-time
+    # ("doctor el viernes 18hs" → parser hace 'el viernes 18hs', pero acá
+    # ya partimos antes con el prefix completo intacto).
+    mt = _REMIND_TIME_MARKERS_RE.search(rest)
+    if mt:
+        when_start = mt.start()
+        candidate_title = rest[:when_start].strip().rstrip(",;:")
+        candidate_when = rest[when_start:].strip()
+        # Strip de conectores ("at", "a las" — los dejamos en el when para
+        # que el parser los use de pista, pero los sacamos del title si
+        # quedaron al final). Connectors comunes: "at", "el", "la", "a",
+        # "for", "para".
+        candidate_title = re.sub(
+            r"\s+(?:at|el|la|a|para|for|to|that)\s*$",
+            "", candidate_title, flags=re.IGNORECASE,
+        ).strip()
+        # "to <X>" en EN: en "remind me to buy groceries tomorrow at 9am"
+        # el title queda "to buy groceries". Strip "to " del principio.
+        candidate_title = re.sub(r"^to\s+", "", candidate_title, flags=re.IGNORECASE).strip()
+        if candidate_title:
+            try:
+                dt = _parse_natural_datetime(candidate_when, now=anchor)
+            except Exception:
+                dt = None
+            if isinstance(dt, datetime) and abs((dt - anchor).total_seconds()) >= 30:
+                best = (candidate_title, dt)
+
+    # Estrategia 2 (fallback): iterar tail por tokens. Sirve cuando el
+    # marker está al inicio de rest (regex split deja title vacío) y
+    # necesitamos buscar tail más corta. Mantiene el comportamiento
+    # legacy de la primera versión.
+    if best is None:
+        tokens = rest.split()
+        max_tail = min(len(tokens), 8)
+        for tail_len in range(max_tail, 0, -1):
+            tail = " ".join(tokens[-tail_len:])
+            if not _REMIND_TIME_MARKERS_RE.search(tail):
+                continue
+            try:
+                dt = _parse_natural_datetime(tail, now=anchor)
+            except Exception:
+                dt = None
+            if not isinstance(dt, datetime):
+                continue
+            if abs((dt - anchor).total_seconds()) < 30:
+                continue
+            title = " ".join(tokens[:-tail_len]).strip()
+            title = re.sub(
+                r"\s+(?:at|el|la|a|para|for|to|that)\s*$",
+                "", title, flags=re.IGNORECASE,
+            ).strip()
+            title = re.sub(r"^to\s+", "", title, flags=re.IGNORECASE).strip()
+            if not title:
+                continue
+            best = (title, dt)
+            break
+
+    if best is None:
+        return None
+
+    title, dt = best
+    # ISO con offset AR — match con `_validate_scheduled_for` para que
+    # downstream (`_create_reminder`) pueda consumir directo.
+    due_iso = dt.strftime("%Y-%m-%dT%H:%M:%S") + "-03:00"
+    return {
+        "title": title.strip(),
+        "due_iso": due_iso,
+        "original_text": s,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# /Feature K
+# ══════════════════════════════════════════════════════════════════════════
+
+
 def _validate_scheduled_for(raw: object) -> str | None:
     """Validator + NL fallback parser para el campo opcional
     ``scheduled_for``. Devuelve un ISO8601 string válido si pudo

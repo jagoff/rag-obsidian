@@ -6242,3 +6242,279 @@ document.querySelectorAll(".quick-chip").forEach((chip) => {
     form.requestSubmit();
   });
 });
+
+
+// ══════════════════════════════════════════════════════════════════════════
+// Feature H — Chat scoped a nota/folder
+// ══════════════════════════════════════════════════════════════════════════
+// Estado del scope (vault entero / folder / nota), popover de autocomplete,
+// chip arriba del chat, y wire-up con el body del POST /api/chat.
+//
+// Public surface:
+//   - window.activeScope: { kind: 'note'|'folder'|null, path: string|null }
+//   - window.getActiveScopePayload(): {} | {folder:...} | {path:...}
+//   - window.setActiveScope(kind, path): aplica scope
+//   - window.clearActiveScope(): vuelve a vault entero
+//
+// El POST body se inyecta automáticamente vía monkey-patch del fetch sólo
+// cuando la URL es /api/chat (path-equality). Esto evita tener que tocar
+// el `reqBody` literal que está sepultado a 4500 lines arriba; el
+// monkey-patch es localizado y reversible.
+const SCOPE_KEY = "obsidian-rag:scope";
+window.activeScope = (function loadScope() {
+  try {
+    const raw = sessionStorage.getItem(SCOPE_KEY);
+    if (!raw) return { kind: null, path: null };
+    const obj = JSON.parse(raw);
+    if (obj && (obj.kind === "note" || obj.kind === "folder") && typeof obj.path === "string") {
+      return obj;
+    }
+  } catch (_) {}
+  return { kind: null, path: null };
+})();
+
+function _scopeChipEl()      { return document.getElementById("scope-chip"); }
+function _scopeChipValueEl() { return document.getElementById("scope-chip-value"); }
+function _scopeBtnEl()       { return document.getElementById("composer-scope-btn"); }
+function _scopePopoverEl()   { return document.getElementById("scope-popover"); }
+function _scopePopoverInputEl() { return document.getElementById("scope-popover-input"); }
+function _scopePopoverListEl()  { return document.getElementById("scope-popover-list"); }
+
+function _renderScopeChip() {
+  const chip = _scopeChipEl();
+  const valueEl = _scopeChipValueEl();
+  const btn = _scopeBtnEl();
+  if (!chip || !valueEl) return;
+  if (window.activeScope && window.activeScope.kind && window.activeScope.path) {
+    valueEl.textContent = window.activeScope.path;
+    chip.hidden = false;
+    if (btn) btn.classList.add("scope-active");
+  } else {
+    chip.hidden = true;
+    if (btn) btn.classList.remove("scope-active");
+  }
+}
+
+window.setActiveScope = function setActiveScope(kind, path) {
+  if (!kind || !path) {
+    window.clearActiveScope();
+    return;
+  }
+  if (kind !== "note" && kind !== "folder") return;
+  window.activeScope = { kind, path };
+  try { sessionStorage.setItem(SCOPE_KEY, JSON.stringify(window.activeScope)); } catch (_) {}
+  _renderScopeChip();
+};
+
+window.clearActiveScope = function clearActiveScope() {
+  window.activeScope = { kind: null, path: null };
+  try { sessionStorage.removeItem(SCOPE_KEY); } catch (_) {}
+  _renderScopeChip();
+};
+
+window.getActiveScopePayload = function getActiveScopePayload() {
+  const s = window.activeScope;
+  if (!s || !s.kind || !s.path) return {};
+  if (s.kind === "note") return { path: s.path };
+  if (s.kind === "folder") return { folder: s.path };
+  return {};
+};
+
+// ── Monkey-patch fetch para inyectar scope en /api/chat ────────────────
+// Sólo intercepta POST a /api/chat exact-match. Otros endpoints pasan
+// como están. Si algún día este monkey-patch causa friction (ej. un
+// service worker que también lo wrappea), mover la inyección al
+// reqBody literal en send() (search "/api/chat" arriba).
+(function installScopeFetchInterceptor() {
+  if (window.__SCOPE_FETCH_INTERCEPTED__) return;
+  window.__SCOPE_FETCH_INTERCEPTED__ = true;
+  const origFetch = window.fetch.bind(window);
+  window.fetch = function patchedFetch(input, init) {
+    try {
+      const url = (typeof input === "string") ? input
+                : (input && input.url) ? input.url : "";
+      const isChatPost = (
+        (init && (init.method || "").toUpperCase() === "POST")
+        && (url === "/api/chat" || url.endsWith("/api/chat"))
+      );
+      if (isChatPost && init && typeof init.body === "string") {
+        const payload = window.getActiveScopePayload();
+        if (payload.folder || payload.path) {
+          let parsed;
+          try { parsed = JSON.parse(init.body); } catch (_) { parsed = null; }
+          if (parsed && typeof parsed === "object") {
+            // Sólo inyectamos si el body NO trae ya path/folder explícito
+            // (un caller futuro podría pasarlos; respetamos su decisión).
+            if (!("path" in parsed) && payload.path) parsed.path = payload.path;
+            if (!("folder" in parsed) && payload.folder) parsed.folder = payload.folder;
+            init = Object.assign({}, init, { body: JSON.stringify(parsed) });
+          }
+        }
+      }
+    } catch (_) {
+      // Silent fail — si el monkey-patch rompe, fall-through al fetch
+      // original sin scope. Mejor que perder el turn entero.
+    }
+    return origFetch(input, init);
+  };
+})();
+
+// ── Popover wire-up ────────────────────────────────────────────────────
+// Click en #composer-scope-btn → toggle popover. El input dentro del
+// popover dispara fetch debounced al endpoint de autocomplete. Click en
+// un item → setActiveScope + cerrar popover.
+let _scopeAutocompleteTimer = null;
+let _scopeAutocompleteAborter = null;
+
+function _renderScopeItems(items) {
+  const list = _scopePopoverListEl();
+  if (!list) return;
+  // Mantener el "vault entero" item siempre presente al tope.
+  list.innerHTML = "";
+  const clearLi = document.createElement("li");
+  clearLi.className = "scope-popover-item scope-popover-vault";
+  clearLi.dataset.scopeClear = "1";
+  clearLi.tabIndex = 0;
+  clearLi.setAttribute("role", "option");
+  clearLi.innerHTML = '<span class="scope-popover-kind">📚</span><span class="scope-popover-text">vault entero (sin scope)</span>';
+  list.appendChild(clearLi);
+
+  if (!items || !items.length) {
+    const empty = document.createElement("li");
+    empty.className = "scope-popover-empty";
+    empty.textContent = "sin matches — probá con otra palabra";
+    list.appendChild(empty);
+    return;
+  }
+  for (const it of items) {
+    const li = document.createElement("li");
+    li.className = "scope-popover-item";
+    li.dataset.scopeKind = it.kind;
+    li.dataset.scopePath = it.path;
+    li.tabIndex = 0;
+    li.setAttribute("role", "option");
+    const icon = it.kind === "folder" ? "📁" : "📄";
+    li.innerHTML =
+      '<span class="scope-popover-kind">' + icon + '</span>' +
+      '<span class="scope-popover-text"></span>';
+    li.querySelector(".scope-popover-text").textContent = it.path;
+    list.appendChild(li);
+  }
+}
+
+async function _fetchScopeAutocomplete(query) {
+  if (_scopeAutocompleteAborter) {
+    try { _scopeAutocompleteAborter.abort(); } catch (_) {}
+  }
+  const ac = new AbortController();
+  _scopeAutocompleteAborter = ac;
+  const url = "/api/notes/autocomplete?q=" + encodeURIComponent(query || "") + "&limit=20";
+  try {
+    const res = await fetch(url, { signal: ac.signal });
+    if (!res.ok) {
+      _renderScopeItems([]);
+      return;
+    }
+    const data = await res.json();
+    _renderScopeItems(data.items || []);
+  } catch (err) {
+    if (err && err.name !== "AbortError") {
+      _renderScopeItems([]);
+    }
+  }
+}
+
+function _openScopePopover() {
+  const pop = _scopePopoverEl();
+  const inp = _scopePopoverInputEl();
+  if (!pop) return;
+  pop.hidden = false;
+  if (inp) {
+    inp.value = "";
+    setTimeout(() => inp.focus(), 0);
+  }
+  // Cargar el dropdown sin filtro al abrir.
+  _fetchScopeAutocomplete("");
+}
+
+function _closeScopePopover() {
+  const pop = _scopePopoverEl();
+  if (pop) pop.hidden = true;
+}
+
+function _initScopeUI() {
+  _renderScopeChip();
+  const btn = _scopeBtnEl();
+  const inp = _scopePopoverInputEl();
+  const list = _scopePopoverListEl();
+  const chipClear = document.getElementById("scope-chip-clear");
+
+  if (btn) {
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      const pop = _scopePopoverEl();
+      if (pop && !pop.hidden) {
+        _closeScopePopover();
+      } else {
+        _openScopePopover();
+      }
+    });
+  }
+
+  if (inp) {
+    inp.addEventListener("input", () => {
+      if (_scopeAutocompleteTimer) clearTimeout(_scopeAutocompleteTimer);
+      const q = inp.value || "";
+      _scopeAutocompleteTimer = setTimeout(() => {
+        _fetchScopeAutocomplete(q);
+      }, 180);
+    });
+    inp.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        _closeScopePopover();
+      }
+    });
+  }
+
+  if (list) {
+    list.addEventListener("click", (e) => {
+      const item = e.target.closest(".scope-popover-item");
+      if (!item) return;
+      if (item.dataset.scopeClear === "1") {
+        window.clearActiveScope();
+      } else {
+        const kind = item.dataset.scopeKind;
+        const path = item.dataset.scopePath;
+        if (kind && path) window.setActiveScope(kind, path);
+      }
+      _closeScopePopover();
+    });
+  }
+
+  if (chipClear) {
+    chipClear.addEventListener("click", (e) => {
+      e.preventDefault();
+      window.clearActiveScope();
+    });
+  }
+
+  // Click outside → cerrar popover. Sólo cuando está abierto.
+  document.addEventListener("click", (e) => {
+    const pop = _scopePopoverEl();
+    if (!pop || pop.hidden) return;
+    if (pop.contains(e.target)) return;
+    if (e.target === btn || (btn && btn.contains(e.target))) return;
+    _closeScopePopover();
+  });
+}
+
+// Boot — ejecutar tras DOMContentLoaded para que los IDs estén disponibles.
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", _initScopeUI);
+} else {
+  _initScopeUI();
+}
+// ══════════════════════════════════════════════════════════════════════════
+// /Feature H
+// ══════════════════════════════════════════════════════════════════════════

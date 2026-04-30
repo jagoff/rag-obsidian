@@ -321,7 +321,14 @@ def test_propose_intent_blocks_bypass(chat_env):
     chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
     chat_env.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
 
-    events, _ = _post_chat("recordame comprar pan mañana")
+    # 2026-04-29 (Feature K): cambiamos "recordame comprar pan mañana"
+    # → "anotame comprar pan para mañana" porque el primer string ahora
+    # dispara `parse_remind_intent` (Feature K), que crea el reminder
+    # directo SIN pasar por el tool loop. Este test sigue cubriendo el
+    # invariant original: propose-intent + low-conf NO bypassea el tool
+    # loop. Usamos un trigger que `_detect_propose_intent` matchea pero
+    # `parse_remind_intent` no (sin trigger "recordame").
+    events, _ = _post_chat("anotame comprar pan para mañana")
 
     assert len(mock.calls) >= 1, mock.calls
     done = next(data for ev, data in events if ev == "done")

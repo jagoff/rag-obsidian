@@ -1546,6 +1546,69 @@ Si la feature shippea junto con cambios al `rag setup` (o si el user prefiere re
 
 Excepción legítima: si la feature requiere config previo del user (ej. OAuth de Gmail, ambient.json, etc.) y el plist crashea sin eso. En ese caso, el commit msg debe decir explícitamente "el plist NO se instala automáticamente porque requiere `<X>` primero" — no "corré `rag setup` cuando puedas" sin más contexto. El [`com.fer.obsidian-rag-ingest-calendar.plist`](rag/__init__.py) es ejemplo: `rag setup` lo skipea si `~/.calendar-mcp/credentials.json` no existe.
 
+## Feature H — Chat scoped a nota / folder (2026-04-29)
+
+Selector compacto en el composer del chat web (`/chat` → [`web/static/index.html`](web/static/index.html)) que limita el retrieval a **una nota específica o un folder** en lugar de buscar en todo el vault.
+
+**Flujo end-to-end**:
+
+1. **UI** (`web/static/index.html` + `web/static/app.js`):
+   - Botón target (◉) al lado del `+` en el composer (`#composer-scope-btn`).
+   - Click → abre `#scope-popover` con un input de filtro y la lista de matches del autocomplete.
+   - Click en item → `window.setActiveScope(kind, path)` setea el scope en `sessionStorage` y muestra el chip "🎯 Limitado a: `<path>` ×" arriba del `#messages`.
+   - El `×` del chip llama `window.clearActiveScope()` y vuelve a vault entero.
+   - El JS monkey-patchea `fetch` para inyectar `path` o `folder` SÓLO en POST `/api/chat`, sin tocar el `reqBody` literal sepultado a 4500 lines arriba.
+
+2. **Backend** ([`web/server.py`](web/server.py) — buscar `# ── Feature H`):
+   - `ChatRequest` ahora acepta `folder: str | None` y `path: str | None`. Validators rechazan URI schemes y traversal (`..`).
+   - `multi_retrieve(...)` se llama pasando `folder` como 4to arg posicional (la query queda acotada al subset).
+   - Si viene `path`, **filtro post-retrieve** exact-match contra `meta.file`. Mantenemos el call signature de `multi_retrieve` intacto para no tocar `rag/__init__.py`.
+   - **Short-circuit cuando no hay matches**: emit SSE `sources(confidence=0)` + token canned ("No encontré contenido en `<path>`...") + `done(scope_no_match=True, source_specific=True)`. NO 404 — el frontend igual quiere el SSE stream completo para liberar el spinner.
+
+3. **Endpoint nuevo** `GET /api/notes/autocomplete?q=&limit=20`:
+   - Substring matching case-insensitive contra `meta.file` + `meta.note` + `meta.folder` desde `_load_corpus(get_db())`.
+   - Sortea por: exact-match → startswith → contains-en-path → contains-en-title → folder.
+   - `limit` clamped a 50. Empty corpus → `{items: [], reason: "empty_index"}`.
+   - Rate-limit reusa `_BEHAVIOR_BUCKETS` (120 req/60s).
+
+**Telemetría**: cuando viene `path` el `result["filters_applied"]["path_scope"]` queda seteado para que `rag_queries` distinga "user pidió scope=path" de "auto-filter encontró un folder". Bucket de log_query_event nuevo: `web.chat.scope_no_match`.
+
+**Tests**: [`tests/test_chat_scoped.py`](tests/test_chat_scoped.py) — 11 casos cubriendo path/folder happy path, no-match short-circuit, autocomplete (matches + clamp + empty index), validators (URI / traversal), HTML smoke test del composer.
+
+## Feature K — "Recordame X" inline en chat (2026-04-29)
+
+Detecta comandos tipo "recordame llamar a Juan mañana 9am" en el textarea del chat web y crea el reminder de Apple Reminders **automáticamente sin pasar por el LLM**, devolviendo SSE `created` event en <100ms vs 5-15s del flow LLM + tools.
+
+**Flujo end-to-end**:
+
+1. **Detector** ([`rag/__init__.py`](rag/__init__.py) — buscar `# ══ Feature K`):
+   - `parse_remind_intent(text) → dict | None`.
+   - Pattern strict-leading: `^(recordame|recuerdame|acordate|hacéme acordar|reminder|remember me|remind me) [de/que] <rest>$`.
+   - Sobre `<rest>`, busca el primer marker temporal con `_REMIND_TIME_MARKERS_RE` (mañana, lunes, "en 2 horas", "a las 9", "9am", "18hs", etc.) y parte título/cuándo ahí.
+   - Reusa `_parse_natural_datetime` (mismo parser que `_validate_scheduled_for` y `propose_reminder`) — NO duplica lógica de fecha.
+   - Anchor-echo guard: si `_parse_natural_datetime` devuelve ~now, descarta (false positive).
+   - Devuelve `{title, due_iso, original_text}` o `None` si ambiguo (sin tiempo claro).
+
+2. **Wire-up** ([`web/server.py`](web/server.py) — buscar `# ══ Feature K`):
+   - **Antes** del flow normal (`gen()`, después de yield `session`), llamamos a `parse_remind_intent(question)`.
+   - Si match → `_create_reminder(title, due_dt=...)` directo (sin tools, sin LLM, sin retrieval).
+   - Emit SSE: `sources(confidence=1, intent=remind_inline)` + `created(kind=reminder, created=True, reminder_id, fields, remind_inline=True)` + token canned "✓ Reminder creado: «...» para `<iso>`" + `done(mode=remind_inline, source_specific=True)`.
+   - Si `_create_reminder` falla → `proposal(needs_clarification=True, error=...)` para que el user reintente desde la UI.
+   - Si NO match → fall-through al flow normal (LLM + tools, donde `propose_reminder` sigue funcionando).
+
+3. **UI** ([`web/static/app.js`](web/static/app.js)):
+   - El `event === "created"` con `kind=reminder` ya estaba manejado por `appendCreatedChip()`. Reusamos. Sin cambios al JS específico para Feature K.
+
+**Telemetría**: bucket nuevo `web.chat.remind_inline` en `log_query_event`. Turn persiste con `outcome="reminder_created"` + `reminder_id`.
+
+**Cuándo NO dispara** (por diseño — fallback al LLM):
+
+- "recordame algo" → sin tiempo claro → `None` → flow normal donde `propose_reminder` hace la clarificación.
+- "qué tengo mañana?" → no hay trigger → flow normal.
+- Trigger ambiguo: "recordame llamar a Juan" → sin marker temporal → flow normal.
+
+**Tests**: [`tests/test_chat_remind_inline.py`](tests/test_chat_remind_inline.py) — 10 casos cubriendo el detector standalone (happy / ambiguo / sin-trigger / empty / question-with-temporal-word) + el wire-up end-to-end (`/api/chat` emite `created` SSE event con shape correcto, `_create_reminder` se llama con args parseados, queries normales NO disparan).
+
 ## Wave-8 gotchas — pipeline de filtros + carry-over (2026-04-28)
 
 Tres patrones que se mordieron durante la wave-8 de la eval Playwright. Documentados acá porque cualquiera de los tres puede repetirse silenciosamente y costar una sesión entera de debug.

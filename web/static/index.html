@@ -55,6 +55,102 @@
 
   <link rel="stylesheet" href="/static/style.css?v=2026-04-28-darker-bg">
   <script src="/static/pwa/register-sw.js" defer></script>
+  <!-- ══ Feature H: estilos del scope chip + popover ═════════════════════
+       Inline para evitar tocar style.css gigante (242k). Mantiene el
+       look-and-feel del resto (`.slash-popover`) reusando vars CSS
+       existentes. -->
+  <style>
+    .scope-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      margin: 0.5rem auto;
+      padding: 0.3rem 0.7rem;
+      max-width: fit-content;
+      font-size: 0.82rem;
+      background: var(--bg-elev-1, #1a1a1d);
+      border: 1px solid var(--border-subtle, #2a2a30);
+      border-radius: 999px;
+      color: var(--fg-default, #e0e0e2);
+    }
+    .scope-chip[hidden] { display: none !important; }
+    .scope-chip-icon { font-size: 0.95rem; line-height: 1; }
+    .scope-chip-label { color: var(--fg-muted, #a0a0a6); }
+    .scope-chip-value {
+      font-family: var(--font-mono, ui-monospace, monospace);
+      max-width: 32ch;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .scope-chip-clear {
+      background: transparent;
+      border: 0;
+      color: var(--fg-muted, #a0a0a6);
+      cursor: pointer;
+      font-size: 1.1rem;
+      line-height: 1;
+      padding: 0 0.2rem;
+    }
+    .scope-chip-clear:hover { color: var(--fg-default, #e0e0e2); }
+    .composer-icon-btn.scope-active { color: var(--accent, #8ab4f8); }
+    .scope-popover {
+      max-height: 360px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+    .scope-popover-head {
+      padding: 0.5rem 0.6rem;
+      border-bottom: 1px solid var(--border-subtle, #2a2a30);
+    }
+    .scope-popover-search input {
+      width: 100%;
+      background: var(--bg-elev-2, #232328);
+      border: 1px solid var(--border-subtle, #2a2a30);
+      border-radius: 6px;
+      padding: 0.35rem 0.5rem;
+      color: var(--fg-default, #e0e0e2);
+      font-size: 0.9rem;
+    }
+    .scope-popover-list {
+      list-style: none;
+      margin: 0;
+      padding: 0.3rem 0;
+      overflow-y: auto;
+      max-height: 300px;
+    }
+    .scope-popover-item {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.4rem 0.7rem;
+      cursor: pointer;
+      font-size: 0.85rem;
+    }
+    .scope-popover-item:hover,
+    .scope-popover-item.active {
+      background: var(--bg-elev-2, #232328);
+    }
+    .scope-popover-kind {
+      font-size: 0.95rem;
+      width: 1.2em;
+      text-align: center;
+    }
+    .scope-popover-text {
+      font-family: var(--font-mono, ui-monospace, monospace);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .scope-popover-empty {
+      padding: 0.6rem 0.7rem;
+      color: var(--fg-muted, #a0a0a6);
+      font-size: 0.85rem;
+      font-style: italic;
+    }
+  </style>
+  <!-- ══ /Feature H ══════════════════════════════════════════════════════ -->
 </head>
 <body>
   <a href="#chat" class="skip-link">Saltar al contenido</a>
@@ -371,6 +467,18 @@
         <kbd>/</kbd> comandos · <kbd>⌘</kbd><kbd>K</kbd> foco · <kbd>⌘</kbd><kbd>/</kbd> ayuda
       </p>
     </section>
+    <!-- ══ Feature H: chip de scope activo ════════════════════════════════
+         Visible cuando el user limitó el chat a una nota o folder. El X
+         lo cierra (vuelve al vault entero). Lo manipula app.js (ver
+         setActiveScope/clearScope). -->
+    <div id="scope-chip" class="scope-chip" hidden role="status" aria-live="polite">
+      <span class="scope-chip-icon" aria-hidden="true">🎯</span>
+      <span class="scope-chip-label">Limitado a:</span>
+      <span class="scope-chip-value" id="scope-chip-value"></span>
+      <button type="button" id="scope-chip-clear" class="scope-chip-clear"
+              aria-label="Quitar scope" title="Quitar scope (volver al vault entero)">×</button>
+    </div>
+    <!-- ══ /Feature H ══════════════════════════════════════════════════ -->
     <div id="messages"></div>
     <form id="composer" autocomplete="off">
       <div id="composer-inner">
@@ -383,6 +491,28 @@
              contract) — la única diferencia es la fuente de datos
              (fetch a /api/contacts en vez de SLASH_COMMANDS literal). -->
         <div id="contacts-popover" class="slash-popover contacts-popover" hidden role="listbox" aria-label="Contactos"></div>
+        <!-- ══ Feature H: popover de scope ═══════════════════════════════
+             Reusa el mismo styling de `.slash-popover` para coherencia
+             visual. Se abre desde el botón #composer-scope-btn y muestra
+             3 secciones: (1) "Vault entero" (clear scope), (2) input
+             para tipear filter, (3) lista de matches del autocomplete
+             endpoint. -->
+        <div id="scope-popover" class="slash-popover scope-popover" hidden role="listbox" aria-label="Scope">
+          <div class="scope-popover-head">
+            <div class="scope-popover-search">
+              <input id="scope-popover-input" type="search"
+                     placeholder="filtrar notas o folders…"
+                     aria-label="Filtrar paths del vault" autocomplete="off">
+            </div>
+          </div>
+          <ul id="scope-popover-list" class="scope-popover-list" role="list">
+            <li class="scope-popover-item scope-popover-vault" data-scope-clear="1" tabindex="0" role="option">
+              <span class="scope-popover-kind">📚</span>
+              <span class="scope-popover-text">vault entero (sin scope)</span>
+            </li>
+          </ul>
+        </div>
+        <!-- ══ /Feature H ══════════════════════════════════════════════ -->
         <!-- Composer card — layout claude.ai post-primer-mensaje:
              fila 1 textarea, fila 2 botones alineados a la derecha.
              Los IDs #input, #send-btn, #stop-btn se preservan intactos
@@ -436,6 +566,25 @@
                   <path d="M5 12h14"/>
                 </svg>
               </button>
+              <!-- ══ Feature H: botón scope ════════════════════════════
+                   Abre el popover de autocomplete de notas/folders. El
+                   estado activo se refleja con la clase `.scope-active`
+                   que cambia el color del icono. Estilizado con un
+                   target SVG (target/diana). -->
+              <button id="composer-scope-btn" type="button"
+                      class="composer-icon-btn"
+                      aria-label="Scope (limitar a nota o folder)"
+                      title="Scope: vault entero / folder / nota">
+                <svg width="16" height="16" viewBox="0 0 24 24"
+                     aria-hidden="true" fill="none" stroke="currentColor"
+                     stroke-width="2" stroke-linecap="round"
+                     stroke-linejoin="round">
+                  <circle cx="12" cy="12" r="10"/>
+                  <circle cx="12" cy="12" r="6"/>
+                  <circle cx="12" cy="12" r="2"/>
+                </svg>
+              </button>
+              <!-- ══ /Feature H ══════════════════════════════════════ -->
             </div>
             <!-- Toolbar-right: mic (placeholder para dictado,
                  "próximamente") + stop/send. El modo (auto/rápido/

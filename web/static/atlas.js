@@ -192,10 +192,20 @@ function formatCount(n) {
   return String(n);
 }
 
-// ── Entities lists con sparklines ───────────────────────────────────────
+// ── Entities lists con barra de magnitud relativa ───────────────────────
+//
+// Cada fila: [nombre] [barra horizontal de magnitud relativa al max de
+// la columna] [count]. Reemplazó las sparklines Chart.js inline (eran
+// 56x18px → tan chicas que la mitad se veían como una raya, la otra
+// mitad invisibles, terrible UX). La barra es siempre legible y deja
+// comparar magnitudes entre entidades del mismo tipo de un vistazo.
+//
+// Magnitud: `mention_count / max_in_column`. El max sale del primer
+// item de la lista (que ya viene ordenada DESC por el backend).
 function renderEntities(byType) {
-  // Destruimos sparklines previas para liberar memoria.
-  state.sparkCharts.forEach((c) => c.destroy());
+  // Liberamos sparkCharts viejas si todavía existen (compatibilidad
+  // con la versión anterior que las usaba).
+  state.sparkCharts.forEach((c) => { try { c.destroy(); } catch (e) {} });
   state.sparkCharts.clear();
 
   Object.keys(TYPE_COLORS).forEach((type) => {
@@ -208,21 +218,37 @@ function renderEntities(byType) {
       ul.innerHTML = '<li class="empty">sin datos</li>';
       return;
     }
+    // Max de la columna para escalar la barra.
+    const maxMentions = list.reduce(
+      (m, e) => Math.max(m, e.mention_count || 0),
+      1,
+    );
+    const baseColor = TYPE_COLORS[type];
+
     ul.innerHTML = "";
-    list.slice(0, 15).forEach((e) => {  // top 15 visibles por columna
+    list.slice(0, 15).forEach((e) => {
       const li = document.createElement("li");
       li.className = "ent-row";
       li.dataset.entityId = String(e.id);
       li.dataset.entityName = e.name;
       li.dataset.type = type;
       li.title = `${e.name} — ${TYPE_LABELS[type]} · ${e.mention_count} menciones totales · ${e.recent_mentions} en últimos ${state.windowDays}d${e.aliases?.length ? ` · alias: ${e.aliases.join(", ")}` : ""}\n\nClick para filtrar el grafo a notas que la mencionan.`;
+
+      const pct = Math.max(2, Math.min(100,
+        ((e.mention_count || 0) / maxMentions) * 100,
+      ));
+      // Para la entidad #1 de la columna usamos color sólido. Para el
+      // resto bajamos el opacity proporcionalmente al rank — visualmente
+      // se nota la jerarquía.
+      const fillColor = baseColor;
+      const fillOpacity = 0.55 + 0.45 * (pct / 100);
+
       li.innerHTML = `
         <span class="ent-name">${escapeHtml(e.name)}</span>
-        <canvas class="ent-spark" id="spark-${e.id}"></canvas>
+        <span class="ent-bar"><span style="width:${pct.toFixed(1)}%;background:${fillColor};opacity:${fillOpacity.toFixed(2)};"></span></span>
         <span class="ent-count">${formatCount(e.mention_count)}</span>
       `;
       li.addEventListener("click", () => {
-        // Toggle: click en la misma entity 2 veces limpia el filtro
         if (state.entityFilter && state.entityFilter.id === e.id) {
           clearEntityFilter();
         } else {
@@ -230,33 +256,6 @@ function renderEntities(byType) {
         }
       });
       ul.appendChild(li);
-      // Sparkline inline.
-      const ctx = li.querySelector("canvas");
-      if (ctx && e.sparkline?.length) {
-        const chart = new Chart(ctx, {
-          type: "line",
-          data: {
-            labels: e.sparkline.map((_, i) => String(i)),
-            datasets: [{
-              data: e.sparkline,
-              borderColor: TYPE_COLORS[type],
-              backgroundColor: TYPE_COLORS[type] + "33",
-              borderWidth: 1.4,
-              fill: true,
-              tension: 0.3,
-              pointRadius: 0,
-            }],
-          },
-          options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            animation: false,
-            plugins: { legend: { display: false }, tooltip: { enabled: false } },
-            scales: { x: { display: false }, y: { display: false, beginAtZero: true } },
-          },
-        });
-        state.sparkCharts.set(e.id, chart);
-      }
     });
   });
 }

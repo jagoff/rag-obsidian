@@ -738,14 +738,19 @@
       flex-direction: column;
       gap: 4px;
     }
+    /* ── Entity rows: estilo "most played" — name + bar horizontal de
+       magnitud relativa + count. Reemplazó las sparklines Chart.js que
+       se veían inconsistentes en 56px. La barra es siempre visible y
+       deja leer la magnitud relativa de un vistazo. */
     .ent-row {
       display: grid;
-      grid-template-columns: 1fr 56px 32px;
-      gap: 8px;
+      grid-template-columns: minmax(0, 1fr) 80px 44px;
+      gap: 10px;
       align-items: center;
-      padding: 4px 6px;
-      border-radius: 4px;
+      padding: 5px 8px;
+      border-radius: 5px;
       cursor: pointer;
+      transition: background 100ms;
     }
     .ent-row:hover { background: var(--hover); }
     .ent-row.active { background: color-mix(in srgb, var(--cyan) 14%, var(--bg-elev)); }
@@ -756,15 +761,25 @@
       text-overflow: ellipsis;
       white-space: nowrap;
     }
-    .ent-spark {
-      width: 56px;
-      height: 18px;
+    .ent-bar {
+      height: 6px;
+      background: color-mix(in srgb, var(--text-faint) 14%, transparent);
+      border-radius: 3px;
+      overflow: hidden;
+      position: relative;
+    }
+    .ent-bar > span {
+      display: block;
+      height: 100%;
+      border-radius: 3px;
+      transition: width 220ms ease-out;
     }
     .ent-count {
       font-size: 11px;
-      color: var(--text-faint);
+      color: var(--text-dim);
       font-variant-numeric: tabular-nums;
       text-align: right;
+      font-weight: 500;
     }
 
     /* ── Hot vs Stale grid ──────────────────────────────────────────── */
@@ -1055,7 +1070,7 @@
     <section class="learn-section" id="sec-entities" aria-labelledby="h-entities">
       <header class="learn-section-hdr">
         <h2 id="h-entities" title="Top entidades por menciones totales, agrupadas por tipo">Quién y qué aparece más en tus notas</h2>
-        <p class="muted">Top 50 por tipo. La línea es la frecuencia diaria en la ventana seleccionada arriba.</p>
+        <p class="muted">Top 50 por tipo. La barra es la frecuencia relativa al primero de la columna. Click filtra el grafo a las notas que la mencionan.</p>
         <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-entities" data-collapse="body-entities">−</button>
       </header>
       <div class="learn-section-body" id="body-entities">
@@ -1120,6 +1135,6 @@
 
   <span id="atlas-status" class="sr-only" role="status" aria-live="polite">Cargando datos del atlas</span>
 
-  <script src="/static/atlas.js?v=6" defer></script>
+  <script src="/static/atlas.js?v=7" defer></script>
 </body>
 </html>

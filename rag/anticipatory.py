@@ -614,6 +614,43 @@ def anticipate_run_impl(
     ]
     viable.sort(key=lambda c: c.score, reverse=True)
 
+    # Bug 2026-04-30 fix: skipear kinds que están en snooze o silenciados
+    # ANTES de seleccionar el top. Pre-fix, el scheduler elegía el top por
+    # score (siempre el mismo, ej. anticipate-commitment 1.00), llamaba a
+    # proactive_push, este chequeaba snooze y devolvía sent=False — nunca
+    # se evaluaba viable[1], viable[2]. Resultado observado en producción:
+    # 96 entries/día en rag_proactive_log con
+    # `anticipate-commitment en snooze hasta 2026-05-03`, y los otros
+    # kinds (calendar/echo/gap/dupes_pressure) NUNCA llegaban al user
+    # aunque su snooze ya hubiera vencido. Con el filtro acá, el ranking
+    # avanza al siguiente kind viable cuyo snooze esté libre.
+    #
+    # Filtramos solo snooze + silenced (state-aware), NO daily_cap ni
+    # ambient_config: esos son globales y self-resolving / orthogonales
+    # al ranking. `force=True` bypasea esto igual que bypasea dedup.
+    if not force and viable:
+        try:
+            from rag.proactive import _proactive_load_state
+            state = _proactive_load_state()
+            silenced = set(state.get("silenced", []) or [])
+            snooze_map = state.get("snooze", {}) or {}
+
+            def _kind_available(kind: str) -> bool:
+                if kind in silenced:
+                    return False
+                until_iso = snooze_map.get(kind)
+                if not until_iso:
+                    return True
+                try:
+                    until = datetime.fromisoformat(until_iso)
+                except Exception:
+                    return True
+                return until <= now
+
+            viable = [c for c in viable if _kind_available(c.kind)]
+        except Exception as exc:
+            _silent_log("anticipate_filter_snooze", exc)
+
     if not viable:
         return {
             "selected": None, "sent": False,

@@ -446,6 +446,108 @@ def test_orchestrator_signal_error_does_not_block_others(monkeypatch, state_db):
     assert res["selected"]["kind"] == "anticipate-echo"
 
 
+def test_orchestrator_skips_kinds_in_snooze_picks_next(monkeypatch, state_db, tmp_path):
+    """Bug 2026-04-30: top score siempre es el mismo kind y queda atascado en
+    snooze permanente. El scheduler debe filtrar kinds con snooze activo y
+    avanzar al siguiente del ranking."""
+    # Setup: 2 candidates. El de score más alto está snoozeado, el otro no.
+    high = rag.AnticipatoryCandidate(
+        kind="anticipate-commitment", score=1.0, message="commit-stale",
+        dedup_key="k_commit", snooze_hours=168, reason="r",
+    )
+    low = rag.AnticipatoryCandidate(
+        kind="anticipate-calendar", score=0.7, message="cal-soon",
+        dedup_key="k_cal", snooze_hours=2, reason="r",
+    )
+    monkeypatch.setattr(rag, "_ANTICIPATE_SIGNALS",
+                        (("a", lambda now: [high]),
+                         ("b", lambda now: [low])))
+    # Aislá el state file y snoozeá commitment 168h hacia adelante.
+    state_path = tmp_path / "proactive.json"
+    until = (datetime.now() + timedelta(hours=168)).isoformat(timespec="seconds")
+    state_path.write_text(
+        '{"date": "2099-01-01", "daily_count": 0, "silenced": [],'
+        ' "snooze": {"anticipate-commitment": "' + until + '"}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(rag, "PROACTIVE_STATE_PATH", state_path)
+
+    res = rag.anticipate_run_impl(dry_run=True)
+    # Pre-fix: res["selected"]["kind"] == "anticipate-commitment" (score 1.0)
+    # y queda en snooze sin avanzar. Post-fix: avanza al siguiente.
+    assert res["selected"] is not None, "should advance past snoozed top"
+    assert res["selected"]["kind"] == "anticipate-calendar"
+
+
+def test_orchestrator_skips_silenced_kind_picks_next(monkeypatch, state_db, tmp_path):
+    """Si el user silenció un kind, ese kind no debe ser elegido aunque tenga
+    el score más alto — pickeá el siguiente del ranking."""
+    high = rag.AnticipatoryCandidate(
+        kind="anticipate-commitment", score=1.0, message="m1",
+        dedup_key="k1", snooze_hours=168, reason="r",
+    )
+    low = rag.AnticipatoryCandidate(
+        kind="anticipate-echo", score=0.6, message="m2",
+        dedup_key="k2", snooze_hours=72, reason="r",
+    )
+    monkeypatch.setattr(rag, "_ANTICIPATE_SIGNALS",
+                        (("a", lambda now: [high, low]),))
+    state_path = tmp_path / "proactive.json"
+    state_path.write_text(
+        '{"date": "2099-01-01", "daily_count": 0,'
+        ' "silenced": ["anticipate-commitment"], "snooze": {}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(rag, "PROACTIVE_STATE_PATH", state_path)
+
+    res = rag.anticipate_run_impl(dry_run=True)
+    assert res["selected"]["kind"] == "anticipate-echo"
+
+
+def test_orchestrator_force_bypasses_snooze_filter(monkeypatch, state_db, tmp_path):
+    """`force=True` debe bypasear el filtro de snooze, igual que bypasea
+    dedup."""
+    cand = rag.AnticipatoryCandidate(
+        kind="anticipate-commitment", score=1.0, message="m",
+        dedup_key="k", snooze_hours=168, reason="r",
+    )
+    monkeypatch.setattr(rag, "_ANTICIPATE_SIGNALS",
+                        (("a", lambda now: [cand]),))
+    state_path = tmp_path / "proactive.json"
+    until = (datetime.now() + timedelta(hours=168)).isoformat(timespec="seconds")
+    state_path.write_text(
+        '{"date": "2099-01-01", "daily_count": 0, "silenced": [],'
+        ' "snooze": {"anticipate-commitment": "' + until + '"}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(rag, "PROACTIVE_STATE_PATH", state_path)
+
+    res = rag.anticipate_run_impl(dry_run=True, force=True)
+    assert res["selected"] is not None
+    assert res["selected"]["kind"] == "anticipate-commitment"
+
+
+def test_orchestrator_expired_snooze_does_not_filter(monkeypatch, state_db, tmp_path):
+    """Si el snooze ya venció (until < now), el kind vuelve a ser elegible."""
+    cand = rag.AnticipatoryCandidate(
+        kind="anticipate-commitment", score=1.0, message="m",
+        dedup_key="k", snooze_hours=168, reason="r",
+    )
+    monkeypatch.setattr(rag, "_ANTICIPATE_SIGNALS",
+                        (("a", lambda now: [cand]),))
+    state_path = tmp_path / "proactive.json"
+    expired = (datetime.now() - timedelta(hours=1)).isoformat(timespec="seconds")
+    state_path.write_text(
+        '{"date": "2099-01-01", "daily_count": 0, "silenced": [],'
+        ' "snooze": {"anticipate-commitment": "' + expired + '"}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(rag, "PROACTIVE_STATE_PATH", state_path)
+
+    res = rag.anticipate_run_impl(dry_run=True)
+    assert res["selected"]["kind"] == "anticipate-commitment"
+
+
 def test_orchestrator_disabled_env_returns_immediately(monkeypatch, state_db):
     monkeypatch.setenv("RAG_ANTICIPATE_DISABLED", "1")
     monkeypatch.setattr(rag, "_ANTICIPATE_SIGNALS",

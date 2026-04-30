@@ -990,6 +990,110 @@ def _correlate_mood(today_ev: dict, extras: dict) -> dict | None:
     }
 
 
+def _correlate_sleep(today_ev: dict, extras: dict) -> dict | None:
+    """Lee la última noche + comparación 7d vs histórico desde
+    `rag_sleep_sessions` (lo escribe el daemon `obsidian-rag-ingest-pillow`
+    1×/día). Devuelve un bucket con shape:
+
+        {
+            "date": str,                  # YYYY-MM-DD del end de la sesión
+            "duration_h": float,          # horas dormidas anoche
+            "quality": float | None,      # 0..1
+            "bedtime_local": str,         # "HH:MM"
+            "deep_pct": float | None,
+            "awakenings": int,
+            "delta": {                    # vs histórico
+                "duration_h": float | None,
+                "quality": float | None,
+                "deep_pct": float | None,
+                "awakenings": float | None,
+            },
+            "anomaly": str | None,        # 1 línea cuando hay algo raro
+        }
+
+    Devuelve `None` si:
+      - el módulo no está disponible (Pillow no instalado),
+      - no hay sesiones todavía (daemon nunca corrió),
+      - hubo error leyendo (silent-fail con None).
+
+    El consumer downstream (today brief prompt) decide si menciona el
+    sueño y cómo. ESTE módulo NO genera narrativa; solo expone los
+    datos como contexto cross-source. La regla "solo mencionarlo
+    cuando hay anomaly" se aplica en el prompt template, no acá.
+
+    Surface criteria — `anomaly` se llena solo cuando el delta vs
+    histórico cruza thresholds que valen la pena narrar (mismo set
+    que el `insight` del panel home, sincronizado a propósito):
+      • deep% drop ≥ 5pp y week ≤ 18%  → "deep cayó X pts esta semana"
+      • awakenings ≥ 3/noche y delta ≥ 1 → "awakenings subieron a X"
+      • quality drop ≥ 0.05 → "quality bajó X esta semana"
+      • duration drop ≥ 0.5h y week ≤ 6h → "dormiste X h menos"
+
+    Si nada cruza thresholds, `anomaly` queda en None y el prompt
+    típicamente ignora el bucket entero (sleep estable = no aporta
+    al brief).
+    """
+    try:
+        from rag.integrations.pillow_sleep import last_night, weekly_stats  # noqa: PLC0415
+    except Exception:
+        return None
+    try:
+        ln = last_night()
+    except Exception:
+        ln = None
+    if not ln:
+        return None
+    try:
+        ws = weekly_stats()
+    except Exception:
+        ws = {}
+
+    delta = ws.get("delta") or {}
+    week = ws.get("week") or {}
+
+    # Anomaly: misma lógica que `_fetch_sleep().insight` en web/server.py.
+    # Mantener acá el mismo orden de prioridad para que el panel home
+    # y el brief no contradigan: el más severo gana.
+    anomaly: str | None = None
+    if (delta.get("deep_pct") or 0) <= -5 and (week.get("deep_pct") or 100) <= 18:
+        anomaly = (
+            f"deep% cayó {abs(delta['deep_pct']):.0f} pts "
+            f"({week['deep_pct']:.0f}% esta semana vs hist)"
+        )
+    elif (delta.get("awakenings") or 0) >= 1 and (week.get("awakenings") or 0) >= 3:
+        anomaly = (
+            f"awakenings subieron a {week['awakenings']:.1f}/noche "
+            f"(+{delta['awakenings']:.1f} vs hist)"
+        )
+    elif (delta.get("quality") or 0) <= -0.05:
+        anomaly = (
+            f"quality bajó {abs(delta['quality']):.2f} esta semana "
+            f"({week.get('quality', 0):.2f} vs hist)"
+        )
+    elif (delta.get("duration_h") or 0) <= -0.5 and (week.get("duration_h") or 0) <= 6.0:
+        anomaly = (
+            f"dormiste {abs(delta['duration_h']):.1f}h menos que el promedio"
+        )
+
+    return {
+        "date": ln.get("date"),
+        "duration_h": round(ln.get("sleep_total_h") or 0, 2),
+        "quality": ln.get("quality"),
+        "bedtime_local": ln.get("bedtime_local"),
+        "deep_pct": (
+            round(ln["deep_pct"], 1) if ln.get("deep_pct") is not None else None
+        ),
+        "awakenings": ln.get("awakenings", 0),
+        "delta": {
+            "duration_h": round(delta["duration_h"], 2) if "duration_h" in delta else None,
+            "quality": round(delta["quality"], 3) if "quality" in delta else None,
+            "deep_pct": round(delta["deep_pct"], 1) if "deep_pct" in delta else None,
+            "awakenings": round(delta["awakenings"], 1) if "awakenings" in delta else None,
+        },
+        "anomaly": anomaly,
+    }
+
+
 def correlate_today_signals(today_ev: dict, extras: dict) -> dict:
     """Pre-correlate cross-source signals. Returns:
         {
@@ -998,6 +1102,7 @@ def correlate_today_signals(today_ev: dict, extras: dict) -> dict:
             "time_overlaps": [{time, items: [...], shared_tokens}, ...],
             "gaps": [{kind, person, hours_waiting, snippet, context}, ...],
             "mood": {score, trend, drift, ...} | None,  # None si feature off
+            "sleep": {date, duration_h, quality, anomaly, ...} | None,
         }
 
     Empty buckets are silently skipped — `today_ev` and `extras` can
@@ -1007,6 +1112,12 @@ def correlate_today_signals(today_ev: dict, extras: dict) -> dict:
     `mood-poll` ya escribió un row para hoy en `rag_mood_score_daily`.
     En cualquier otro caso queda `None` y el prompt downstream lo
     detecta + skipea la modulación.
+
+    `sleep` viene poblado cuando hay al menos una sesión en
+    `rag_sleep_sessions` (Pillow ingester corrió). Si no, `None`.
+    El campo `anomaly` adentro del bucket lo llenamos solo cuando
+    hay algo digno de narrar — el prompt del brief debería mencionar
+    el sueño solo si `sleep.anomaly` no es None.
     """
     return {
         "people": _correlate_people(today_ev or {}, extras or {}),
@@ -1014,4 +1125,5 @@ def correlate_today_signals(today_ev: dict, extras: dict) -> dict:
         "time_overlaps": _correlate_time_overlaps(today_ev or {}, extras or {}),
         "gaps": _correlate_gaps(today_ev or {}, extras or {}),
         "mood": _correlate_mood(today_ev or {}, extras or {}),
+        "sleep": _correlate_sleep(today_ev or {}, extras or {}),
     }

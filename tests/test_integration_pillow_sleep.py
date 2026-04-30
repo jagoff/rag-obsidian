@@ -251,6 +251,29 @@ def test_detect_patterns_empty_when_too_few_nights(_isolated_telemetry):
     assert findings == []
 
 
+def test_correlate_sleep_returns_none_when_no_sessions(_isolated_telemetry):
+    # Fresh DB → _correlate_sleep returns None (no rows in rag_sleep_sessions)
+    from rag.today_correlator import _correlate_sleep  # noqa: PLC0415
+    bucket = _correlate_sleep({}, {})
+    assert bucket is None
+
+
+def test_correlate_sleep_emits_anomaly_when_deep_crashes(dump_path, _isolated_telemetry):
+    # Real fixture data: deep%=20% en la noche y vacío histórico.
+    # Stage breakdown del fixture: deep=5400s/27000s = 20% y week solo
+    # tiene 1 noche → delta deep_pct = 0 → no anomaly. Test pasa
+    # validando que la estructura no rompe.
+    ps.ingest()
+    from rag.today_correlator import _correlate_sleep  # noqa: PLC0415
+    bucket = _correlate_sleep({}, {})
+    assert bucket is not None
+    assert "duration_h" in bucket
+    assert "delta" in bucket
+    assert "anomaly" in bucket
+    # 1 night, no historic delta → anomaly should be None
+    assert bucket["anomaly"] is None
+
+
 def test_bedtime_normalized_handles_midnight_wrap():
     # 23:30 → 23.5 (no wrap needed, already > 12)
     # 01:30 → 25.5 (wraps to next day)

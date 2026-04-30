@@ -478,7 +478,18 @@ def upsert_threads(col, threads: list[GmailThread]) -> int:
         return 0
     bodies = [_format_thread_body(t) for t in threads]
     embed_texts = [_embed_prefix(t, b) for t, b in zip(threads, bodies)]
-    embeddings = rag.embed(embed_texts)
+
+    # Retry embedding con backoff para Ollama transient errors (2026-04-30)
+    embeddings = None
+    for attempt in range(3):
+        try:
+            embeddings = rag.embed(embed_texts)
+            break
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(2 ** attempt)  # 2s, 4s
+                continue
+            raise
 
     for t in threads:
         try:

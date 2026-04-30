@@ -48073,6 +48073,213 @@ def _ingest_reminders_plist(rag_bin: str) -> str:
 """
 
 
+def _ingest_calls_plist(rag_bin: str) -> str:
+    """Ingester de Apple Calls — cada 6 horas, mantine la tabla rag_calls
+    actualizada con llamadas perdidas/entrantes/salientes del CallHistory."""
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-ingest-calls</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{rag_bin}</string>
+    <string>index</string>
+    <string>--source</string>
+    <string>calls</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict>
+      <key>Hour</key><integer>0</integer>
+      <key>Minute</key><integer>0</integer>
+    </dict>
+    <dict>
+      <key>Hour</key><integer>6</integer>
+      <key>Minute</key><integer>0</integer>
+    </dict>
+    <dict>
+      <key>Hour</key><integer>12</integer>
+      <key>Minute</key><integer>0</integer>
+    </dict>
+    <dict>
+      <key>Hour</key><integer>18</integer>
+      <key>Minute</key><integer>0</integer>
+    </dict>
+  </array>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/ingest-calls.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/ingest-calls.error.log</string>
+</dict>
+</plist>
+"""
+
+
+def _ingest_safari_plist(rag_bin: str) -> str:
+    """Ingester de Safari — cada 6 horas, mantine la tabla rag_safari
+    actualizada con history + bookmarks."""
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-ingest-safari</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{rag_bin}</string>
+    <string>index</string>
+    <string>--source</string>
+    <string>safari</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict>
+      <key>Hour</key><integer>0</integer>
+      <key>Minute</key><integer>15</integer>
+    </dict>
+    <dict>
+      <key>Hour</key><integer>6</integer>
+      <key>Minute</key><integer>15</integer>
+    </dict>
+    <dict>
+      <key>Hour</key><integer>12</integer>
+      <key>Minute</key><integer>15</integer>
+    </dict>
+    <dict>
+      <key>Hour</key><integer>18</integer>
+      <key>Minute</key><integer>15</integer>
+    </dict>
+  </array>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/ingest-safari.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/ingest-safari.error.log</string>
+</dict>
+</plist>
+"""
+
+
+def _ingest_drive_plist(rag_bin: str) -> str:
+    """Ingester de Google Drive — cada 6 horas, mantine la tabla rag_drive
+    actualizada con DAO + documentos compartidos."""
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-ingest-drive</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{rag_bin}</string>
+    <string>index</string>
+    <string>--source</string>
+    <string>drive</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict>
+      <key>Hour</key><integer>1</integer>
+      <key>Minute</key><integer>0</integer>
+    </dict>
+    <dict>
+      <key>Hour</key><integer>7</integer>
+      <key>Minute</key><integer>0</integer>
+    </dict>
+    <dict>
+      <key>Hour</key><integer>13</integer>
+      <key>Minute</key><integer>0</integer>
+    </dict>
+    <dict>
+      <key>Hour</key><integer>19</integer>
+      <key>Minute</key><integer>0</integer>
+    </dict>
+  </array>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/ingest-drive.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/ingest-drive.error.log</string>
+</dict>
+</plist>
+"""
+
+
+def _routing_rules_plist(rag_bin: str) -> str:
+    """Detector de patrones de ruteo — cada 5 minutos, analiza comportamiento
+    y sugiere nuevas rutas de queries."""
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-routing-rules</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{rag_bin}</string>
+    <string>routing-rules</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+  </dict>
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+  <key>ThrottleInterval</key><integer>300</integer>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/routing-rules.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/routing-rules.error.log</string>
+</dict>
+</plist>
+"""
+
+
+def _whisper_vocab_plist(rag_bin: str) -> str:
+    """Extractor nightly de vocabulario de transcripción WhatsApp — 03:15,
+    popula rag_whisper_vocab para mejorar el reconocimiento de Whisper."""
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-whisper-vocab</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{rag_bin}</string>
+    <string>whisper-vocab</string>
+    <string>refresh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>3</integer>
+    <key>Minute</key><integer>15</integer>
+  </dict>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/whisper-vocab.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/whisper-vocab.error.log</string>
+</dict>
+</plist>
+"""
+
+
 def _wake_up_plist(rag_bin: str) -> str:
     """Wake-up pack — 04:00 diario.
 
@@ -48352,6 +48559,27 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
         ("com.fer.obsidian-rag-ingest-calendar",
          "com.fer.obsidian-rag-ingest-calendar.plist",
          _ingest_calendar_plist(rag_bin)),
+        # Missing ingesters (2026-04-30) — calls + safari son locales,
+        # drive requiere OAuth. Completar la cobertura cross-source.
+        ("com.fer.obsidian-rag-ingest-calls",
+         "com.fer.obsidian-rag-ingest-calls.plist",
+         _ingest_calls_plist(rag_bin)),
+        ("com.fer.obsidian-rag-ingest-safari",
+         "com.fer.obsidian-rag-ingest-safari.plist",
+         _ingest_safari_plist(rag_bin)),
+        ("com.fer.obsidian-rag-ingest-drive",
+         "com.fer.obsidian-rag-ingest-drive.plist",
+         _ingest_drive_plist(rag_bin)),
+        # Routing rules detector (2026-04-30) — daemon long-running
+        # que scanea patrones de comportamiento y sugiere new routes.
+        ("com.fer.obsidian-rag-routing-rules",
+         "com.fer.obsidian-rag-routing-rules.plist",
+         _routing_rules_plist(rag_bin)),
+        # Whisper vocabulary refresh (2026-04-30) — nightly extractor
+        # para mejorar transcripción de audios WhatsApp.
+        ("com.fer.obsidian-rag-whisper-vocab",
+         "com.fer.obsidian-rag-whisper-vocab.plist",
+         _whisper_vocab_plist(rag_bin)),
         # Serve watchdog — antes en scripts/com.fer.obsidian-rag-
         # serve-watchdog.plist con paths hardcoded; migrado a generación
         # dinámica 2026-04-27. HTTP healthcheck del web server cada 60s

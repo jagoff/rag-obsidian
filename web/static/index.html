@@ -55,6 +55,10 @@
 
   <link rel="stylesheet" href="/static/style.css?v=2026-04-28-darker-bg">
   <script src="/static/pwa/register-sw.js" defer></script>
+  <!-- admin-auth: pre-fetch del Bearer token + monkey-patch fetch() para
+       inyectar Authorization en los 8 endpoints admin. NO defer porque
+       app.js puede hacer fetch admin-protegido inmediato. -->
+  <script src="/static/admin-auth.js"></script>
   <!-- ══ Feature H: estilos del scope chip + popover ═════════════════════
        Inline para evitar tocar style.css gigante (242k). Mantiene el
        look-and-feel del resto (`.slash-popover`) reusando vars CSS

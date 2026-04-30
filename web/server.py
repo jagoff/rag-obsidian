@@ -1976,6 +1976,35 @@ def _require_admin_token(request: Request) -> None:
         )
 
 
+def _is_localhost_request(request: Request) -> bool:
+    """True si el request viene de loopback (127.0.0.1, ::1, localhost).
+
+    Endpoints que sirven el admin_token al frontend confían en esto: el browser
+    del user accede vía localhost o ra.ai (mapeado a 127.0.0.1 en /etc/hosts).
+    Cualquier otro origin (LAN expose, tunnel) NO recibe el token.
+    """
+    if not request.client:
+        return False
+    host = (request.client.host or "").strip().lower()
+    return host in {"127.0.0.1", "::1", "localhost"}
+
+
+@app.get("/api/admin/token")
+def admin_token(request: Request):
+    """Devuelve el admin_token al frontend SI el request es de loopback.
+
+    El frontend (`/static/*.js`) llama este endpoint una vez al boot,
+    cachea el token en memoria y lo manda como `Authorization: Bearer X`
+    en los 8 endpoints admin (auto-fix-devin, reindex, ollama/*, etc.).
+
+    Restringido a localhost — un device remoto en LAN/tunnel NO puede leer
+    el token aunque acceda al frontend (el browser del LAN-user pegaría 403).
+    """
+    if not _is_localhost_request(request):
+        raise HTTPException(status_code=403, detail="solo accesible desde localhost")
+    return {"token": _ADMIN_TOKEN}
+
+
 # Chat model for /chat. Delegated to `resolve_chat_model()` so it tracks
 # whatever rag.py decides is best on this host (command-r > qwen2.5:14b >
 # phi4). command-r:35b prefill is slower (~5-10s on a 5k-char context)

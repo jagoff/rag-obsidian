@@ -406,6 +406,63 @@ def migrate_005_create_mood_tables(conn: sqlite3.Connection) -> None:
     )
 
 
+@migration(6, "create_sleep_sessions_table")
+def migrate_006_create_sleep_sessions_table(conn: sqlite3.Connection) -> None:
+    """Sleep tracking — tabla `rag_sleep_sessions` (Pillow ingester, 2026-04-30).
+
+    Una fila por sesión nocturna importada del export de Pillow
+    (iCloud sync `Sueño/PillowData.txt`). PRIMARY KEY uuid (= ZUNIQUEIDENTIFIER
+    del Core Data dump) hace UPSERT idempotente — re-correr el ingester
+    diariamente no duplica filas.
+
+    También está declarada en `_TELEMETRY_DDL` (rag/__init__.py) para
+    fresh installs. Esta migration es belt-and-suspenders para DBs ya
+    bootstrapped (current_version=5) que necesitan saltar a 6.
+
+    Behind ingester `obsidian-rag-ingest-pillow` — si el archivo de export
+    no existe (Pillow no instalado o iCloud no sync), la tabla queda vacía
+    sin costo.
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS rag_sleep_sessions ("
+        " pk INTEGER NOT NULL,"
+        " uuid TEXT PRIMARY KEY,"
+        " start_ts REAL NOT NULL,"
+        " end_ts REAL NOT NULL,"
+        " date TEXT NOT NULL,"
+        " is_nap INTEGER NOT NULL DEFAULT 0,"
+        " is_edited INTEGER NOT NULL DEFAULT 0,"
+        " quality REAL,"
+        " fatigue REAL,"
+        " wakeup_mood INTEGER,"
+        " awakenings INTEGER,"
+        " snoozes INTEGER,"
+        " time_awake_s REAL,"
+        " deep_s REAL,"
+        " light_s REAL,"
+        " rem_s REAL,"
+        " time_to_sleep_s REAL,"
+        " device TEXT,"
+        " used_watch INTEGER,"
+        " tz TEXT,"
+        " source_file TEXT,"
+        " ingested_at REAL NOT NULL"
+        ")"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS ix_rag_sleep_sessions_date "
+        "ON rag_sleep_sessions(date DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS ix_rag_sleep_sessions_start "
+        "ON rag_sleep_sessions(start_ts DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS ix_rag_sleep_sessions_nap_date "
+        "ON rag_sleep_sessions(is_nap, date DESC)"
+    )
+
+
 __all__ = [
     "migration",
     "current_version",

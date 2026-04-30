@@ -2043,7 +2043,7 @@ _COLLECTION_BASE = "obsidian_notes_v11"  # v11: removed temporal tokens (A/B 202
 # in docs/design-cross-source-corpus.md §10.6.
 VALID_SOURCES: frozenset[str] = frozenset(
     {"vault", "calendar", "gmail", "whatsapp", "reminders", "messages",
-     "contacts", "calls", "safari", "drive"}
+     "contacts", "calls", "safari", "drive", "pillow"}
 )
 
 # Per-source weight applied multiplicatively to the final rerank+feature
@@ -7006,6 +7006,55 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             ")",
             "CREATE INDEX IF NOT EXISTS ix_rag_mood_score_daily_updated "
             "ON rag_mood_score_daily(updated_at DESC)",
+        ),
+    ),
+    (
+        # Sleep sessions ingested from Pillow (iOS) data dump.
+        # `pk` y `uuid` vienen del Core Data export y son estables entre
+        # exports sucesivos — UPSERT por uuid permite re-correr el ingester
+        # sin duplicar filas.
+        # `date` es YYYY-MM-DD del END de la sesión (el día al que pertenece
+        # la noche, ej. dormir 23:50 lun → 07:30 mar = date "2026-04-29").
+        # Stages (deep_s, light_s, rem_s) en segundos; sumados ≈ tiempo
+        # dormido. Pillow también separa `time_awake_s` para mid-night
+        # awakenings que no contaron como sueño.
+        # `wakeup_mood` es la escala de Pillow ZWAKEUPMOOD (0=neutral,
+        # 1=:slight_smile:, 2=:smile:, 3=:laughing: aprox.). Lo normaliza
+        # a 0-1 el ingester y lo escribe a `rag_mood_signals`.
+        # Behind feature ingester `obsidian-rag-ingest-pillow` (corre 1×/día
+        # post-wake). Si el archivo de export no existe, no-op silencioso.
+        "rag_sleep_sessions",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_sleep_sessions ("
+            " pk INTEGER NOT NULL,"
+            " uuid TEXT PRIMARY KEY,"
+            " start_ts REAL NOT NULL,"
+            " end_ts REAL NOT NULL,"
+            " date TEXT NOT NULL,"
+            " is_nap INTEGER NOT NULL DEFAULT 0,"
+            " is_edited INTEGER NOT NULL DEFAULT 0,"
+            " quality REAL,"
+            " fatigue REAL,"
+            " wakeup_mood INTEGER,"
+            " awakenings INTEGER,"
+            " snoozes INTEGER,"
+            " time_awake_s REAL,"
+            " deep_s REAL,"
+            " light_s REAL,"
+            " rem_s REAL,"
+            " time_to_sleep_s REAL,"
+            " device TEXT,"
+            " used_watch INTEGER,"
+            " tz TEXT,"
+            " source_file TEXT,"
+            " ingested_at REAL NOT NULL"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_sleep_sessions_date "
+            "ON rag_sleep_sessions(date DESC)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_sleep_sessions_start "
+            "ON rag_sleep_sessions(start_ts DESC)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_sleep_sessions_nap_date "
+            "ON rag_sleep_sessions(is_nap, date DESC)",
         ),
     ),
 )
@@ -27733,9 +27782,31 @@ def _do_index(reset: bool, no_contradict: bool, source_opt: str | None,
                 ),
             ))
             return
+        if src == "pillow":
+            # Pillow (iOS sleep tracker) export → telemetry.db. Local-only,
+            # silent-fail si el archivo de iCloud no existe o el usuario
+            # no tiene Pillow Pro instalado.
+            from rag.integrations.pillow_sleep import ingest as _ingest_pillow
+            summary = _ingest_pillow()
+            if summary.get("skipped"):
+                console.print(
+                    f"[dim]pillow: {summary.get('reason', 'skipped')} "
+                    f"({summary['file']})[/dim]"
+                )
+                return
+            console.print(_fmt_ingest_summary(
+                "pillow",
+                total=summary["total_parsed"],
+                indexed=summary["ingested"],
+                deleted=0,
+                duration_s=summary["elapsed_ms"] / 1000.0,
+                dry_run=bool(dry_run),
+                extra=f"{summary['mood_signals']} mood signals",
+            ))
+            return
         console.print(
             f"[yellow]Fuente '{src}' todavía no implementada.[/yellow] "
-            f"Scope: whatsapp + calendar + gmail + reminders + contacts + calls + safari (ready)."
+            f"Scope: whatsapp + calendar + gmail + reminders + contacts + calls + safari + pillow (ready)."
         )
         return
 
@@ -48517,6 +48588,48 @@ def _ingest_drive_plist(rag_bin: str) -> str:
 """
 
 
+def _ingest_pillow_plist(rag_bin: str) -> str:
+    """Ingester de Pillow (iOS sleep tracker) — corre 1×/día a las 09:30
+    (post wake-up típico) para cargar la noche anterior. El export vive en
+    `~/Library/Mobile Documents/com~apple~CloudDocs/Sueño/PillowData.txt`,
+    sincronizado por Pillow Pro vía iCloud Drive. Silent-fail si el archivo
+    no existe.
+
+    Schedule único en lugar de cada-N-horas porque el archivo solo cambia
+    1×/día post wake-up; correr más veces sería desperdicio de wake en el
+    Mac. Si el sync de iCloud demora, el run del día siguiente lo recoge."""
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-ingest-pillow</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{rag_bin}</string>
+    <string>index</string>
+    <string>--source</string>
+    <string>pillow</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>9</integer>
+    <key>Minute</key><integer>30</integer>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/ingest-pillow.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/ingest-pillow.error.log</string>
+</dict>
+</plist>
+"""
+
+
 def _routing_rules_plist(rag_bin: str) -> str:
     """Detector de patrones de ruteo — cada 5 minutos, analiza comportamiento
     y sugiere nuevas rutas de queries."""
@@ -48870,6 +48983,12 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
         ("com.fer.obsidian-rag-ingest-drive",
          "com.fer.obsidian-rag-ingest-drive.plist",
          _ingest_drive_plist(rag_bin)),
+        # Pillow sleep tracker ingester (2026-04-30) — corre 1×/día a las
+        # 09:30 (post wake-up) para cargar la noche anterior desde el
+        # export de iCloud. Silent-fail si Pillow no instalado / no sync.
+        ("com.fer.obsidian-rag-ingest-pillow",
+         "com.fer.obsidian-rag-ingest-pillow.plist",
+         _ingest_pillow_plist(rag_bin)),
         # Routing rules detector (2026-04-30) — daemon long-running
         # que scanea patrones de comportamiento y sugiere new routes.
         ("com.fer.obsidian-rag-routing-rules",

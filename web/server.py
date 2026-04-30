@@ -1852,19 +1852,52 @@ if _allow_lan:
     )
 else:
     _cors_regex = r"^https?://(127\.0\.0\.1|localhost)(:[0-9]+)?$"
-# Cloudflare Quick Tunnel: cualquier subdominio *.trycloudflare.com sobre
-# HTTPS solamente. La URL cambia en cada restart de cloudflared pero el
-# patrón es estable — solo HTTPS, nunca HTTP (Cloudflare fuerza TLS).
+# Cloudflare Quick Tunnel: en lugar de aceptar CUALQUIER subdominio de
+# trycloudflare.com (lo que permitiría que evil.trycloudflare.com leyera
+# cookies/responses si el user visita un link malicioso), leemos el state
+# file del watcher para construir un regex literal contra ESA URL específica.
+#
+# Si el state file no existe o está vacío → fallback a allow_credentials=False
+# para el bloque tunnel (degrades gracefully sin exponer cookies).
+# La URL solo se lee al startup del server — un cambio de URL del tunnel ya
+# requiere refresh del PWA de todas formas.
+_tunnel_url: str | None = None
+_tunnel_credentials = False
 if _allow_tunnel:
-    _cors_regex = (
-        r"(?:" + _cors_regex + r")"
-        r"|^https://[a-z0-9-]+\.trycloudflare\.com$"
+    _CLOUDFLARED_URL_FILE = (
+        Path.home()
+        / ".local" / "share" / "obsidian-rag" / "cloudflared-url.txt"
     )
+    try:
+        _raw_url = _CLOUDFLARED_URL_FILE.read_text(encoding="utf-8").strip()
+        if _raw_url and re.match(r"^https://[a-z0-9-]+\.trycloudflare\.com$", _raw_url):
+            _tunnel_url = _raw_url
+            _tunnel_credentials = True
+    except Exception:
+        pass  # state file missing/unreadable → no tunnel URL in regex
+
+    if _tunnel_url:
+        # Literal-escape the URL so no regex metachar in the hostname matters.
+        _cors_regex = (
+            r"(?:" + _cors_regex + r")"
+            r"|^" + re.escape(_tunnel_url) + r"$"
+        )
+    else:
+        # State file missing/empty: extend regex with wildcard pattern so the
+        # tunnel still works from the browser, but credentials=False prevents
+        # cookies from being forwarded on cross-origin requests.
+        _cors_regex = (
+            r"(?:" + _cors_regex + r")"
+            r"|^https://[a-z0-9-]+\.trycloudflare\.com$"
+        )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=_cors_regex,
-    allow_credentials=True,
+    # allow_credentials=True solo cuando tengamos la URL literal del tunnel
+    # (o no hay tunnel). Con wildcard *.trycloudflare.com usamos False para
+    # que el browser no adjunte cookies en requests cross-origin al server.
+    allow_credentials=(False if (_allow_tunnel and not _tunnel_credentials) else True),
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )

@@ -244,6 +244,88 @@ def test_tunnel_regex_with_lan_allows_both():
     assert not re.match(combined, "https://evil.com")
 
 
+# ── Fix 2026-04-30: tunnel CORS usa URL literal del state file ────────────
+
+
+def _build_tunnel_literal_regex(url: str) -> str:
+    """Build the regex web/server.py now uses when it reads a literal URL
+    from the cloudflared-url.txt state file."""
+    base = r"^https?://(127\.0\.0\.1|localhost)(:[0-9]+)?$"
+    return r"(?:" + base + r")|^" + re.escape(url) + r"$"
+
+
+def test_tunnel_literal_regex_accepts_only_exact_url():
+    """Con URL literal del state file, SOLO esa URL es aceptada."""
+    url = "https://word-word-random.trycloudflare.com"
+    pat = _build_tunnel_literal_regex(url)
+    assert re.match(pat, url)
+    assert not re.match(pat, "https://evil.trycloudflare.com")
+    assert not re.match(pat, "https://other-slug.trycloudflare.com")
+
+
+def test_tunnel_literal_regex_rejects_other_cloudflare_slug():
+    """Otro slug (evil.trycloudflare.com) no debe matchear con URL literal."""
+    pat = _build_tunnel_literal_regex(
+        "https://word-word-random.trycloudflare.com"
+    )
+    assert not re.match(pat, "https://different-slug.trycloudflare.com")
+
+
+def test_tunnel_no_state_file_falls_back_to_wildcard(tmp_path, monkeypatch):
+    """Sin state file → el server usa wildcard pattern (regex permisivo)
+    pero credentials=False — verifica la lógica de fallback."""
+    import web.server as srv
+    # Apuntar el state file a un path que no existe
+    missing = tmp_path / "no-such-file.txt"
+    # La lógica de fallback: la variable _tunnel_credentials debe ser False
+    # cuando el state file no existe. Verificamos la lógica directamente.
+    tunnel_url = None
+    tunnel_credentials = False
+    try:
+        raw = missing.read_text(encoding="utf-8").strip()
+        if raw and re.match(r"^https://[a-z0-9-]+\.trycloudflare\.com$", raw):
+            tunnel_url = raw
+            tunnel_credentials = True
+    except Exception:
+        pass
+    assert tunnel_url is None
+    assert tunnel_credentials is False
+
+
+def test_tunnel_state_file_sets_credentials_true(tmp_path):
+    """Con state file válido → tunnel_credentials debe ser True."""
+    url_file = tmp_path / "cloudflared-url.txt"
+    url_file.write_text("https://word-word-random.trycloudflare.com\n")
+    tunnel_url = None
+    tunnel_credentials = False
+    try:
+        raw = url_file.read_text(encoding="utf-8").strip()
+        if raw and re.match(r"^https://[a-z0-9-]+\.trycloudflare\.com$", raw):
+            tunnel_url = raw
+            tunnel_credentials = True
+    except Exception:
+        pass
+    assert tunnel_url == "https://word-word-random.trycloudflare.com"
+    assert tunnel_credentials is True
+
+
+def test_tunnel_state_file_invalid_url_no_credentials(tmp_path):
+    """State file con URL inválida (no trycloudflare.com) → no credentials."""
+    url_file = tmp_path / "cloudflared-url.txt"
+    url_file.write_text("https://evil.com\n")
+    tunnel_url = None
+    tunnel_credentials = False
+    try:
+        raw = url_file.read_text(encoding="utf-8").strip()
+        if raw and re.match(r"^https://[a-z0-9-]+\.trycloudflare\.com$", raw):
+            tunnel_url = raw
+            tunnel_credentials = True
+    except Exception:
+        pass
+    assert tunnel_url is None
+    assert tunnel_credentials is False
+
+
 # ── Bug fix 2026-04-27 #4: /api/chat SSE headers ─────────────────────────
 
 

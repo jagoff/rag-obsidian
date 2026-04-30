@@ -38702,8 +38702,8 @@ def _detect_metachat_intent(q: str) -> bool:
 _SPOTIFY_NOARG_RE = re.compile(
     r"^\s*"
     r"(?P<action>"
-    # Pause / stop family.
-    r"pausa|paus[aá]|pause|stop|fren[aá]|par[aá]|det[eé]n(?:e|er)?|detener|"
+    # Pause / stop family. `parar` agregado para infinitivo "parar la música".
+    r"pausa|paus[aá]|pause|stop|fren[aá]|par[aá]|parar|det[eé]n(?:e|er)?|detener|"
     # Play / resume family (BARE only — "play" + nada, no "play X").
     r"play|reanud[aá](?:r|me)?|segu[ií](?:r)?|continu[aá](?:r|me)?|"
     # Next family.
@@ -38716,6 +38716,56 @@ _SPOTIFY_NOARG_RE = re.compile(
     r")"
     # Optional spotify suffix — "pausa spotify", "next spotify".
     r"(?:\s+(?:la\s+)?(?:m[uú]sica|spotify|el\s+tema|la\s+canci[oó]n))?"
+    r"\s*[!?.¡¿,:;]*\s*$",
+    re.IGNORECASE,
+)
+
+# Volumen: 3 patrones distintos.
+#
+# 1. Subir/bajar relativo: "subí el volumen", "bajalo", "más fuerte",
+#    "más bajito". Default step ±10. Soporta "subí mucho" / "bajá un
+#    poco" para steps custom (no implementado todav́ia, default por ahora).
+_SPOTIFY_VOL_UP_RE = re.compile(
+    r"^\s*¿?\s*"
+    r"(?:"
+    r"sub[ií](?:r|lo|le)?|aument[aá](?:r|lo)?|m[aá]s\s+(?:fuerte|alto|volumen|"
+    r"audible|sonido)|louder|volume\s+up|vol\s+up|turn\s+(?:it\s+)?up"
+    r")"
+    r"(?:\s+(?:un\s+poco|mucho|bastante|el\s+volumen|el\s+sonido|la\s+m[uú]sica))?"
+    r"\s*[!?.¡¿,:;]*\s*$",
+    re.IGNORECASE,
+)
+
+_SPOTIFY_VOL_DOWN_RE = re.compile(
+    r"^\s*¿?\s*"
+    r"(?:"
+    r"baj[aá](?:r|lo|le)?|disminu[ií](?:r|lo)?|m[aá]s\s+(?:bajo|bajito|"
+    r"suave|silencioso|tranqui)|quieter|volume\s+down|vol\s+down|"
+    r"turn\s+(?:it\s+)?down"
+    r")"
+    r"(?:\s+(?:un\s+poco|mucho|bastante|el\s+volumen|el\s+sonido|la\s+m[uú]sica))?"
+    r"\s*[!?.¡¿,:;]*\s*$",
+    re.IGNORECASE,
+)
+
+# 2. Set absoluto: "volumen 50", "volumen al 80", "vol 30%", "volume 100"
+_SPOTIFY_VOL_SET_RE = re.compile(
+    r"^\s*¿?\s*"
+    r"(?:vol(?:umen|ume)?|set\s+volume)"
+    r"\s+(?:al?\s+|en\s+)?"
+    r"(?P<level>\d{1,3})\s*%?"
+    r"\s*[!?.¡¿,:;]*\s*$",
+    re.IGNORECASE,
+)
+
+# 3. Mute / unmute (set 0 / restore previo). Por simplicidad usamos
+# set_volume(0) para mute y set_volume(50) para unmute (default).
+_SPOTIFY_MUTE_RE = re.compile(
+    r"^\s*¿?\s*"
+    r"(?:mute(?:a(?:r|lo)?)?|silenci[aá](?:r|lo)?|"
+    r"sin\s+sonido|sin\s+volumen|"
+    r"calla(?:r|te)?|callate|"
+    r"shut\s+up|silence)"
     r"\s*[!?.¡¿,:;]*\s*$",
     re.IGNORECASE,
 )
@@ -38808,6 +38858,22 @@ def _parse_spotify_command(q: str) -> dict | None:
     if _SPOTIFY_NOWPLAYING_RE.match(s):
         return {"action": "now_playing"}
 
+    # Volume — antes que noarg porque "subilo" / "bajalo" podrían
+    # potencialmente colisionar con otros patrones cortos.
+    if _SPOTIFY_MUTE_RE.match(s):
+        return {"action": "volume_set", "level": 0}
+    m = _SPOTIFY_VOL_SET_RE.match(s)
+    if m:
+        try:
+            level = int(m.group("level"))
+        except (TypeError, ValueError):
+            return None
+        return {"action": "volume_set", "level": level}
+    if _SPOTIFY_VOL_UP_RE.match(s):
+        return {"action": "volume_up"}
+    if _SPOTIFY_VOL_DOWN_RE.match(s):
+        return {"action": "volume_down"}
+
     # Try noarg (más restrictivo).
     m = _SPOTIFY_NOARG_RE.match(s)
     if m:
@@ -38897,6 +38963,58 @@ def _handle_spotify_command(q: str) -> dict | None:
     from rag.integrations import spotify_local  # noqa: PLC0415
 
     action = cmd["action"]
+
+    if action == "volume_up":
+        # Step default ±10. Si Spotify está cerrado, adjust devuelve
+        # error. Si ya está al máximo, clampea a 100 (no error).
+        res = spotify_local.adjust_volume(spotify_local._VOLUME_STEP)
+        if res.get("ok"):
+            level = res.get("level")
+            return {"ok": True, "action": "volume_up",
+                    "message": f"🔊 Volumen {level}"}
+        if "not_running" in str(res.get("error", "")):
+            return {"ok": False, "action": "volume_up",
+                    "message": "Spotify no está abierto."}
+        return {"ok": False, "action": "volume_up",
+                "message": "No pude subir el volumen.",
+                "error": str(res.get("error", ""))}
+
+    if action == "volume_down":
+        res = spotify_local.adjust_volume(-spotify_local._VOLUME_STEP)
+        if res.get("ok"):
+            level = res.get("level")
+            return {"ok": True, "action": "volume_down",
+                    "message": f"🔉 Volumen {level}"}
+        if "not_running" in str(res.get("error", "")):
+            return {"ok": False, "action": "volume_down",
+                    "message": "Spotify no está abierto."}
+        return {"ok": False, "action": "volume_down",
+                "message": "No pude bajar el volumen.",
+                "error": str(res.get("error", ""))}
+
+    if action == "volume_set":
+        level = int(cmd.get("level") or 0)
+        res = spotify_local.set_volume(level)
+        if res.get("ok"):
+            actual = res.get("level", level)
+            # Icon según rango: mute / bajo / alto.
+            if actual == 0:
+                icon = "🔇"
+                verb = "Silenciado"
+            elif actual < 50:
+                icon = "🔉"
+                verb = f"Volumen {actual}"
+            else:
+                icon = "🔊"
+                verb = f"Volumen {actual}"
+            return {"ok": True, "action": "volume_set",
+                    "message": f"{icon} {verb}"}
+        if res.get("error") == "spotify_not_running":
+            return {"ok": False, "action": "volume_set",
+                    "message": "Spotify no está abierto."}
+        return {"ok": False, "action": "volume_set",
+                "message": "No pude ajustar el volumen.",
+                "error": str(res.get("error", ""))}
 
     if action == "now_playing":
         np = spotify_local.now_playing()

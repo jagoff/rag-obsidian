@@ -28,6 +28,9 @@ required for the owner of the app" para apps de devs sin Premium —
 - `search_track(query)` — busca un track via Web API con Client Credentials
   (NO requiere Premium ni OAuth user — el gate de Premium aplica a
   `/me/*`, no a `/search`). Devuelve `{name, artist, uri}` o None.
+- `get_volume()` / `set_volume(N)` / `adjust_volume(delta)` — control del
+  volumen del app Spotify (0-100, separado del system volume de macOS).
+  AppleScript `sound volume` lee/setea el del app, no el master.
 
 ## Invariantes
 
@@ -258,6 +261,100 @@ _CONTROL_ACTIONS = {
     "next": "next track",
     "previous": "previous track",
 }
+
+
+# Step default para subir/bajar volumen — 10 puntos (escala 0-100). Da
+# ~10 niveles entre mute y max, suficiente granularidad sin requerir
+# muchos comandos para llegar a un nivel deseado.
+_VOLUME_STEP = 10
+
+
+def get_volume(timeout: float = 2.0) -> int | None:
+    """Devuelve el volumen actual de Spotify (0-100) o None si Spotify
+    está cerrado / AppleScript falla.
+
+    Spotify mantiene su propio volumen separado del system volume — el
+    AppleScript `sound volume` consulta el del app, no el master de
+    macOS. Eso es lo que el user típicamente quiere modificar (subir
+    Spotify sin tocar el resto del audio).
+    """
+    script = '''\
+if application "Spotify" is running then
+  tell application "Spotify"
+    return sound volume as string
+  end tell
+else
+  return "NOT_RUNNING"
+end if
+'''
+    try:
+        res = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+    out = (res.stdout or "").strip()
+    if not out or out == "NOT_RUNNING":
+        return None
+    try:
+        return int(float(out))
+    except (ValueError, TypeError):
+        return None
+
+
+def set_volume(level: int, timeout: float = 2.0) -> dict:
+    """Setea el volumen de Spotify a `level` (0-100). Clampea fuera de
+    rango para no fallar silencioso.
+
+    Devuelve `{ok, level?, error?}`. Si Spotify está cerrado, NO lo
+    lanza (el user pidió ajustar volumen, no abrir el app).
+    """
+    try:
+        lvl = int(level)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": f"invalid_level: {level!r}"}
+    lvl = max(0, min(100, lvl))
+    script = f'''\
+if application "Spotify" is running then
+  tell application "Spotify"
+    set sound volume to {lvl}
+    return "OK"
+  end tell
+else
+  return "NOT_RUNNING"
+end if
+'''
+    try:
+        res = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        return {"ok": False, "error": f"applescript_failed: {exc!r}"}
+    out = (res.stdout or "").strip()
+    if out == "NOT_RUNNING":
+        return {"ok": False, "error": "spotify_not_running"}
+    if res.returncode != 0:
+        return {"ok": False, "error": (res.stderr or "").strip()[:200]}
+    return {"ok": True, "level": lvl}
+
+
+def adjust_volume(delta: int, timeout: float = 2.0) -> dict:
+    """Sube/baja el volumen en `delta` puntos (positivo o negativo).
+    Lee el actual + setea el nuevo. Clampea a [0, 100].
+
+    Devuelve `{ok, level?, prev?, error?}`. Si Spotify está cerrado o
+    el get_volume falla, devuelve `{ok: False, error: ...}`.
+    """
+    current = get_volume(timeout=timeout)
+    if current is None:
+        return {"ok": False, "error": "spotify_not_running_or_unreadable"}
+    new_level = max(0, min(100, current + int(delta)))
+    res = set_volume(new_level, timeout=timeout)
+    if not res.get("ok"):
+        return res
+    return {"ok": True, "level": new_level, "prev": current}
 
 
 def control(action: str, timeout: float = 3.0) -> dict:

@@ -38730,6 +38730,41 @@ _SPOTIFY_NOARG_RE = re.compile(
 # El query (group "query") tiene cap [3,80] chars — corto rechaza matches
 # accidentales tipo "ponéle"; largo rechaza matches en oraciones largas
 # tipo "pone una alarma porque me tengo que despertar...".
+# "Qué estoy escuchando" / "qué suena" / "now playing". Devuelve el
+# track actual desde Spotify desktop via AppleScript. Es lectura pura
+# (no toca playback). Cap de 50 chars para evitar matches en queries
+# largos tipo "qué estoy escuchando es una pregunta filosófica".
+_SPOTIFY_NOWPLAYING_RE = re.compile(
+    r"^\s*¿?\s*"
+    r"(?:"
+    # "qué/que [estoy/estás/está/se está] [escuchando/sonando/tocando/poniendo]"
+    # Verb es OBLIGATORIO — sin el verb "qué tema vamos a..." matchea.
+    r"(?:qu[eé]|cu[aá]l)\s+"
+    r"(?:(?:est[aá]s?|estoy|se\s+est[aá])\s+)?"
+    r"(?:(?:m[uú]sica|tema|canci[oó]n|track)\s+)?"
+    r"(?:escuch(?:o|ando|ás|as)|suen[ae]|sona(?:ndo)?|son[ae]ndo|"
+    r"toc(?:ando|a)|pon(?:iendo|e|ién)|reproduc(?:i[eé]ndose|i[oó]n))|"
+    # "qué [tema/canción] [es esta/estoy escuchando/tengo puesta/...]"
+    # SUFIJO OBLIGATORIO — sin él se confunde con "qué tema vamos a tratar".
+    r"(?:qu[eé]|cu[aá]l)\s+(?:tema|canci[oó]n|m[uú]sica|track)"
+    r"\s+(?:es\s+(?:esta|esto|esa)|tengo\s+puesta?|"
+    r"(?:est[aá]\s+)?(?:son[ae]ndo|sue?n[ae])|"
+    r"(?:estoy|est[aá]s?)\s+escuch(?:o|ando|amos)|"
+    r"escuch(?:o|ando|amos))|"
+    # "now playing" / "what's playing" (inglés)
+    r"now\s+playing|what(?:'s|\s+is)\s+playing|"
+    # "qué está puesto" / "qué hay puesto"
+    r"qu[eé]\s+(?:est[aá]\s+puest[oa]|hay\s+puest[oa])|"
+    # "qué suena" / "qué se escucha" — formas cortas idiomáticas
+    r"qu[eé]\s+(?:suen[ae]|se\s+escucha)|"
+    # "qué hay sonando" / "ahora suena" / "ahora qué suena"
+    r"qu[eé]\s+hay\s+sonando|"
+    r"ahora\s+(?:qu[eé]\s+)?(?:suen[ae]|escucho)"
+    r")"
+    r"\s*[!?.¡¿,:;]*\s*.{0,30}$",
+    re.IGNORECASE,
+)
+
 _SPOTIFY_PLAY_RE = re.compile(
     r"^\s*"
     r"(?:"
@@ -38767,7 +38802,13 @@ def _parse_spotify_command(q: str) -> dict | None:
     if not s or len(s) > 80:
         return None
 
-    # Try noarg first (más restrictivo).
+    # Try now-playing first ("qué estoy escuchando"). Antes que noarg
+    # porque "qué tema es esta" comparte tokens con el dominio Spotify
+    # pero NO es un comando de control — es una read-query.
+    if _SPOTIFY_NOWPLAYING_RE.match(s):
+        return {"action": "now_playing"}
+
+    # Try noarg (más restrictivo).
     m = _SPOTIFY_NOARG_RE.match(s)
     if m:
         a = (m.group("action") or "").lower()
@@ -38856,6 +38897,36 @@ def _handle_spotify_command(q: str) -> dict | None:
     from rag.integrations import spotify_local  # noqa: PLC0415
 
     action = cmd["action"]
+
+    if action == "now_playing":
+        np = spotify_local.now_playing()
+        if not np:
+            return {"ok": False, "action": "now_playing",
+                    "message": "Spotify no está abierto o no hay nada cargado."}
+        name = np.get("name") or ""
+        artist = np.get("artist") or ""
+        album = np.get("album") or ""
+        state = np.get("state") or ""
+        # Icon depende del state — playing/paused/stopped tienen pictogramas
+        # distintos para que el user vea de un vistazo si la música está
+        # andando o parada.
+        if state == "playing":
+            icon = "🎵"
+            verb = "Sonando"
+        elif state == "paused":
+            icon = "⏸️"
+            verb = "Pausado"
+        else:
+            icon = "🎧"
+            verb = "Spotify"
+        # Formato: "🎵 Sonando — Track / Artist · Album" (album opcional).
+        parts = [f"{icon} {verb} — {name}"]
+        if artist:
+            parts.append(f"/ {artist}")
+        if album and album != name:
+            parts.append(f"· {album}")
+        return {"ok": True, "action": "now_playing",
+                "message": " ".join(parts)}
 
     if action == "pause":
         res = spotify_local.control("pause")

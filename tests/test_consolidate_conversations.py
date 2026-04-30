@@ -408,8 +408,10 @@ def test_run_real_promotes_and_archives(tmp_vault: Path, monkeypatch):
     # Consolidated note lives in 03-Resources (no action signals → resources).
     promoted = list((tmp_vault / "03-Resources").glob("Ikigai*.md"))
     assert len(promoted) == 1
-    # Archive got the three originals
-    archived = list((tmp_vault / "04-Archive" / "conversations").rglob("*.md"))
+    # Archive got the three originals — vive bajo `99-obsidian-system/99-AI/_archive/`
+    archived = list(
+        (tmp_vault / "04-Archive" / "99-obsidian-system" / "99-AI" / "_archive" / "conversations").rglob("*.md")
+    )
     assert len(archived) == 3
     # Singleton stayed in inbox
     remaining = list((tmp_vault / "04-Archive" / "99-obsidian-system" / "99-AI" / "conversations").glob("*.md"))

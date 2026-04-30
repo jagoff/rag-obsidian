@@ -273,15 +273,25 @@ def test_empty_inputs(monkeypatch):
     # Sin RAG_MOOD_ENABLED el bucket mood queda None.
     monkeypatch.delenv("RAG_MOOD_ENABLED", raising=False)
     result = correlate_today_signals({}, {})
-    assert result == {"people": [], "topics": [], "time_overlaps": [],
-                      "gaps": [], "mood": None}
+    # Buckets cross-source vacíos. mood None porque feature off.
+    # NB: pueden coexistir buckets adicionales (ej. `sleep` agregado por
+    # el ingester Pillow) — validamos las keys que nos importan en lugar
+    # de exact match para no acoplar tests al set entero de buckets.
+    assert result["people"] == []
+    assert result["topics"] == []
+    assert result["time_overlaps"] == []
+    assert result["gaps"] == []
+    assert result["mood"] is None
 
 
 def test_handles_none_inputs(monkeypatch):
     monkeypatch.delenv("RAG_MOOD_ENABLED", raising=False)
     result = correlate_today_signals(None, None)
-    assert result == {"people": [], "topics": [], "time_overlaps": [],
-                      "gaps": [], "mood": None}
+    assert result["people"] == []
+    assert result["topics"] == []
+    assert result["time_overlaps"] == []
+    assert result["gaps"] == []
+    assert result["mood"] is None
 
 
 # ── Self-notifications (github bot, google alerts, etc.) ───────────────────

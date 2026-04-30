@@ -72,6 +72,41 @@ _JOURNAL_MIN_CHARS_FOR_LLM = 80   # < 80 chars → solo regex, no LLM
 _JOURNAL_MAX_CHARS_FOR_LLM = 800  # truncate si la nota es muy larga (cost control)
 _JOURNAL_FOLDERS = ("00-Inbox", "02-Areas/journal", "01-Projects/journal")
 
+# WA outbound scorers
+_WA_DEFAULT_WINDOW_H = 24
+_WA_BASELINE_DAYS = 14
+_WA_MIN_MSGS_FOR_SIGNAL = 5  # < 5 mensajes en window = no datos suficientes
+
+# Queries existential scorers
+_QUERIES_DEFAULT_WINDOW_H = 24
+# Regex curado de queries que indican estado existencial / rumiación.
+# Match si la query del usuario al RAG tiene tono retrospectivo /
+# auto-evaluativo bajo. Igual que el de journal: rioplatense + neutro.
+_QUERIES_EXISTENTIAL_RE = re.compile(
+    r"\b(?:"
+    r"qu[eé]\s+hice|"
+    r"qu[eé]\s+pas[oó]\s+con|"
+    r"perd[ií]\s+(?:el\s+)?(?:control|tiempo|rumbo)|"
+    r"siempre\s+lo\s+mismo|"
+    r"no\s+avanzo|"
+    r"estoy\s+estancado|"
+    r"estoy\s+perdido|"
+    r"no\s+(?:s[eé]|s[eé]\s+qu[eé])\s+(?:hago|hacer)|"
+    r"sin\s+rumbo|"
+    r"d[oó]nde\s+estoy|"
+    r"qu[eé]\s+(?:carajo|mierda|onda)|"
+    r"todo\s+(?:mal|para\s+(?:atr[aá]s|el\s+orto))|"
+    r"para\s+qu[eé]\s+(?:sigo|hago)|"
+    r"me\s+siento\s+(?:mal|de\s+culo|cagado|para\s+atr[aá]s)|"
+    r"no\s+puedo\s+(?:m[aá]s|seguir)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Calendar density scorer
+_CALENDAR_DENSITY_THRESHOLD = 6   # ≥ N eventos hoy → signal
+_CALENDAR_BACKTOBACK_GAP_MIN = 15  # gap < N min entre eventos = back-to-back
+
 # Regex del scorer keyword_negative — palabras/expresiones argentinas y
 # neutras que indican estado bajo. NO matcheamos cosas tipo "estoy bien"
 # o "todo ok" porque generan ruido (false-positive en negaciones tipo
@@ -625,9 +660,255 @@ def score_journal_recent(
     return out
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# WhatsApp outbound scorer
+
+
+def _wa_bridge_db_path() -> Path | None:
+    """Path al SQLite del WA bridge. None si la integration no está
+    disponible o el path no existe."""
+    try:
+        from rag.integrations.whatsapp import WHATSAPP_BRIDGE_DB_PATH  # noqa: PLC0415
+    except Exception:
+        return None
+    p = Path(WHATSAPP_BRIDGE_DB_PATH)
+    return p if p.exists() else None
+
+
+def _wa_fetch_outbound_chars(
+    db_path: Path, since_ts: float, until_ts: float,
+) -> list[int]:
+    """Lee la tabla `messages` del bridge y devuelve la lista de
+    `len(content)` de mensajes con `is_from_me=1` entre los dos
+    timestamps. Silent-fail → []."""
+    import sqlite3  # noqa: PLC0415
+    since_iso = datetime.fromtimestamp(since_ts).isoformat()
+    until_iso = datetime.fromtimestamp(until_ts).isoformat()
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+    except Exception as exc:
+        _silent_log_safe("mood_wa_open_db_failed", exc)
+        return []
+    try:
+        rows = conn.execute(
+            "SELECT content FROM messages "
+            "WHERE is_from_me=1 AND timestamp >= ? AND timestamp < ?",
+            (since_iso, until_iso),
+        ).fetchall()
+    except Exception as exc:
+        _silent_log_safe("mood_wa_query_failed", exc)
+        return []
+    finally:
+        with contextlib.suppress(Exception):
+            conn.close()
+    return [len(r[0]) for r in rows if r[0]]
+
+
+def score_wa_outbound_window(
+    *,
+    now: float | None = None,
+    window_h: int = _WA_DEFAULT_WINDOW_H,
+    baseline_days: int = _WA_BASELINE_DAYS,
+    persist: bool = True,
+) -> list[dict[str, Any]]:
+    """Compara avg `chars/msg` outbound del último `window_h` con el
+    baseline de los últimos `baseline_days` días. Si el avg actual es
+    ≤ 50% del baseline (escribís más corto que normal a contactos
+    cercanos), señal -0.4 a -0.7 según el ratio.
+
+    Si hay < `_WA_MIN_MSGS_FOR_SIGNAL` mensajes outbound en la window,
+    no hay datos suficientes → no signal. Si el bridge no está
+    instalado, no signal.
+
+    Importante: NO se mira el contenido de los mensajes — solo agregados
+    estadísticos (avg chars). El feature respeta privacidad."""
+    out: list[dict[str, Any]] = []
+    ts = now if now is not None else _now_ts()
+    db = _wa_bridge_db_path()
+    if db is None:
+        return out
+
+    window_chars = _wa_fetch_outbound_chars(db, ts - window_h * 3600.0, ts)
+    if len(window_chars) < _WA_MIN_MSGS_FOR_SIGNAL:
+        return out
+
+    baseline_until = ts - window_h * 3600.0
+    baseline_since = ts - baseline_days * 86400.0
+    baseline_chars = _wa_fetch_outbound_chars(db, baseline_since, baseline_until)
+    if len(baseline_chars) < _WA_MIN_MSGS_FOR_SIGNAL * 3:
+        return out
+
+    avg_window = sum(window_chars) / len(window_chars)
+    avg_baseline = sum(baseline_chars) / len(baseline_chars)
+    if avg_baseline == 0:
+        return out
+
+    ratio = avg_window / avg_baseline
+    if ratio >= 0.6:
+        return out  # no signal — escribís normal
+
+    # ratio 0.5 → -0.4, ratio 0.3 → -0.6, ratio 0.1 → -0.8
+    intensity = min(0.8, (0.6 - ratio) * 1.5)
+    value = -intensity
+    evidence = {
+        "msgs_window": len(window_chars),
+        "msgs_baseline": len(baseline_chars),
+        "avg_chars_window": round(avg_window, 1),
+        "avg_chars_baseline": round(avg_baseline, 1),
+        "ratio": round(ratio, 2),
+    }
+    _emit(out, "wa_outbound", "tone_short", value, weight=0.5,
+          evidence=evidence, persist=persist, ts=ts)
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Queries existential scorer
+
+
+def _queries_fetch_recent(window_h: int, now_ts: float) -> list[str]:
+    """Devuelve la lista de `q` (literal user query) de `rag_queries`
+    en la window. Filtramos a `cmd IN ('query', 'chat', 'ask')` para
+    quedarnos con queries reales del user (no internal multi-query
+    expansions)."""
+    cutoff_dt = datetime.fromtimestamp(now_ts) - timedelta(hours=window_h)
+    cutoff_iso = cutoff_dt.isoformat()
+    try:
+        from rag import _ragvec_state_conn  # noqa: PLC0415
+        with _ragvec_state_conn() as conn:
+            rows = conn.execute(
+                "SELECT q FROM rag_queries "
+                "WHERE ts >= ? AND COALESCE(cmd,'') IN ('', 'query', 'chat', 'ask')",
+                (cutoff_iso,),
+            ).fetchall()
+        return [r[0] for r in rows if r[0]]
+    except Exception as exc:
+        _silent_log_safe("mood_queries_fetch_failed", exc)
+        return []
+
+
+def score_queries_existential(
+    *,
+    now: float | None = None,
+    window_h: int = _QUERIES_DEFAULT_WINDOW_H,
+    persist: bool = True,
+) -> list[dict[str, Any]]:
+    """Cuenta queries del user al RAG con patterns existenciales.
+    1 match → -0.3, 2 matches → -0.5, 3+ → -0.7.
+
+    No es un signal fuerte por sí solo (gente busca "qué hice ayer"
+    sin estar mal); el agregador lo combina con otros."""
+    out: list[dict[str, Any]] = []
+    ts = now if now is not None else _now_ts()
+    queries = _queries_fetch_recent(window_h, ts)
+    if not queries:
+        return out
+
+    matched: list[str] = []
+    for q in queries:
+        if _QUERIES_EXISTENTIAL_RE.search(q):
+            matched.append(q[:120])
+
+    if not matched:
+        return out
+
+    n = len(matched)
+    if n >= 3:
+        value = -0.7
+    elif n == 2:
+        value = -0.5
+    else:
+        value = -0.3
+    evidence = {
+        "n_matched": n,
+        "n_total_queries": len(queries),
+        "examples": matched[:3],
+    }
+    _emit(out, "queries", "existential_pattern", value, weight=0.4,
+          evidence=evidence, persist=persist, ts=ts)
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Calendar density scorer
+
+
+def _parse_event_time(s: str) -> tuple[int, int] | None:
+    """Parsea string tipo '09:30' o '9:30 AM' → (hour, minute) o None."""
+    s = s.strip()
+    m = re.match(r"^(\d{1,2}):(\d{2})\s*([AaPp][Mm])?$", s)
+    if not m:
+        return None
+    hour = int(m.group(1))
+    minute = int(m.group(2))
+    suffix = (m.group(3) or "").lower()
+    if suffix == "pm" and hour < 12:
+        hour += 12
+    elif suffix == "am" and hour == 12:
+        hour = 0
+    if not (0 <= hour < 24 and 0 <= minute < 60):
+        return None
+    return hour, minute
+
+
+def score_calendar_density(
+    *,
+    now: float | None = None,
+    persist: bool = True,
+) -> list[dict[str, Any]]:
+    """Si el calendar de hoy tiene ≥ N eventos, señal -0.3. Si además
+    hay ≥ 3 events back-to-back (gap < `_CALENDAR_BACKTOBACK_GAP_MIN`),
+    señal adicional -0.4. Stress, no bajón — el agregador lo combina
+    con los demás. NO mira contenido de los eventos (solo cantidad y
+    horarios)."""
+    out: list[dict[str, Any]] = []
+    ts = now if now is not None else _now_ts()
+    try:
+        from rag.integrations.calendar import _fetch_calendar_today  # noqa: PLC0415
+        events = _fetch_calendar_today(max_events=30)
+    except Exception as exc:
+        _silent_log_safe("mood_calendar_fetch_failed", exc)
+        return out
+
+    if not events or len(events) < _CALENDAR_DENSITY_THRESHOLD:
+        return out
+
+    # Density base signal.
+    density_value = -min(0.6, 0.3 + 0.05 * (len(events) - _CALENDAR_DENSITY_THRESHOLD))
+    _emit(out, "calendar", "density_overload", density_value, weight=0.4,
+          evidence={"n_events": len(events)}, persist=persist, ts=ts)
+
+    # Back-to-back: ordenar por start, contar gaps cortos.
+    parsed: list[tuple[int, int, int, int]] = []  # (start_h, start_m, end_h, end_m)
+    for ev in events:
+        start = _parse_event_time(ev.get("start", ""))
+        end = _parse_event_time(ev.get("end", ""))
+        if start and end:
+            parsed.append((*start, *end))
+    parsed.sort()
+
+    btb_count = 0
+    for i in range(len(parsed) - 1):
+        prev_end_min = parsed[i][2] * 60 + parsed[i][3]
+        next_start_min = parsed[i + 1][0] * 60 + parsed[i + 1][1]
+        gap = next_start_min - prev_end_min
+        if 0 <= gap < _CALENDAR_BACKTOBACK_GAP_MIN:
+            btb_count += 1
+
+    if btb_count >= 3:
+        btb_value = -min(0.6, 0.3 + 0.1 * (btb_count - 3))
+        _emit(out, "calendar", "back_to_back_meetings", btb_value, weight=0.5,
+              evidence={"n_back_to_back": btb_count, "n_events": len(events)},
+              persist=persist, ts=ts)
+    return out
+
+
 __all__ = [
     "score_spotify_window",
     "score_journal_recent",
+    "score_wa_outbound_window",
+    "score_queries_existential",
+    "score_calendar_density",
     "_is_mood_enabled",
     "_persist_signal",
     "_load_artist_mood_table",

@@ -28,6 +28,7 @@ import contextlib
 import json
 import sqlite3
 import time
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -396,3 +397,247 @@ def test_artist_table_loads_and_lowercases():
     assert mood._lookup_artist_mood("SPINETTA") == table["spinetta"]
     assert mood._lookup_artist_mood("Bizarrap") == table["bizarrap"]
     assert mood._lookup_artist_mood("Random Unknown 9000") is None
+
+
+# ─── WhatsApp outbound ─────────────────────────────────────────────────────
+
+
+_WA_MESSAGES_DDL = """
+CREATE TABLE messages (
+    id TEXT,
+    chat_jid TEXT,
+    sender TEXT,
+    content TEXT,
+    timestamp TIMESTAMP,
+    is_from_me BOOLEAN,
+    media_type TEXT,
+    filename TEXT,
+    url TEXT
+)
+"""
+
+
+@pytest.fixture
+def temp_wa_bridge(tmp_path, monkeypatch):
+    """Bridge SQLite tmp con la tabla messages; patch _wa_bridge_db_path."""
+    db = tmp_path / "messages.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(_WA_MESSAGES_DDL)
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(mood, "_wa_bridge_db_path", lambda: db)
+    return db
+
+
+def _insert_wa_msg(db: Path, content: str, ts: float, is_from_me: bool = True) -> None:
+    iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ts))
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "INSERT INTO messages(id, chat_jid, sender, content, timestamp, is_from_me) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (f"id-{ts}", "jid", "me", content, iso, 1 if is_from_me else 0),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_wa_no_bridge_no_signal(temp_db, monkeypatch, mood_enabled):
+    """Si el bridge DB no existe, score devuelve [] sin tirar."""
+    monkeypatch.setattr(mood, "_wa_bridge_db_path", lambda: None)
+    assert mood.score_wa_outbound_window(persist=False) == []
+
+
+def test_wa_too_few_msgs_no_signal(temp_db, temp_wa_bridge, mood_enabled):
+    """Con < MIN_MSGS_FOR_SIGNAL en window: no signal."""
+    now = time.time()
+    for i in range(3):
+        _insert_wa_msg(temp_wa_bridge, "hola que hace", now - 3600 + i)
+    assert mood.score_wa_outbound_window(now=now, persist=False) == []
+
+
+def test_wa_short_messages_emits_signal(temp_db, temp_wa_bridge, mood_enabled):
+    """Avg chars en window < 60% del baseline → signal negative."""
+    now = time.time()
+    # Baseline (>24h hasta 14d atrás): 30 mensajes promedio largos.
+    long_msg = "Te cuento que estuve pensando en lo que hablamos el otro día y la verdad"
+    for i in range(30):
+        _insert_wa_msg(temp_wa_bridge, long_msg, now - 86400 * 5 + i)
+    # Window (últimas 24h): 6 mensajes muy cortos.
+    for i in range(6):
+        _insert_wa_msg(temp_wa_bridge, "ok", now - 1800 + i)
+    signals = mood.score_wa_outbound_window(now=now, persist=False)
+    short = [s for s in signals if s["signal_kind"] == "tone_short"]
+    assert len(short) == 1
+    assert short[0]["value"] < 0
+    assert short[0]["evidence"]["msgs_window"] == 6
+
+
+def test_wa_normal_length_no_signal(temp_db, temp_wa_bridge, mood_enabled):
+    """Window con avg chars similar al baseline → no signal."""
+    now = time.time()
+    msg = "esto es un mensaje de longitud normal cualquiera del usuario"
+    # Baseline.
+    for i in range(20):
+        _insert_wa_msg(temp_wa_bridge, msg, now - 86400 * 5 + i)
+    # Window: misma longitud.
+    for i in range(7):
+        _insert_wa_msg(temp_wa_bridge, msg, now - 1800 + i)
+    signals = mood.score_wa_outbound_window(now=now, persist=False)
+    assert [s for s in signals if s["signal_kind"] == "tone_short"] == []
+
+
+# ─── Queries existential ───────────────────────────────────────────────────
+
+
+_QUERIES_DDL = """
+CREATE TABLE rag_queries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    trace_id TEXT,
+    cmd TEXT,
+    q TEXT NOT NULL,
+    session TEXT
+)
+"""
+
+
+@pytest.fixture
+def temp_queries_db(tmp_path, monkeypatch):
+    """Temp telemetry.db con rag_queries + rag_mood_signals + rag_spotify_log."""
+    db = tmp_path / "telemetry.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(_SPOTIFY_DDL)
+    conn.execute(_MOOD_SIGNALS_DDL)
+    conn.execute(_QUERIES_DDL)
+    conn.commit()
+    conn.close()
+
+    @contextlib.contextmanager
+    def _fake_conn():
+        c = sqlite3.connect(str(db))
+        try:
+            yield c
+            c.commit()
+        finally:
+            c.close()
+
+    monkeypatch.setattr(rag, "_ragvec_state_conn", _fake_conn)
+    yield db
+
+
+def _insert_query(db: Path, q: str, ts: float, cmd: str = "query") -> None:
+    iso = datetime.fromtimestamp(ts).isoformat()
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "INSERT INTO rag_queries(ts, cmd, q) VALUES (?, ?, ?)",
+        (iso, cmd, q),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_queries_no_existential_no_signal(temp_queries_db, mood_enabled):
+    now = time.time()
+    _insert_query(temp_queries_db, "qué dije sobre ML el mes pasado", now - 1800)
+    _insert_query(temp_queries_db, "ayer qué reuniones tuve", now - 1200)
+    signals = mood.score_queries_existential(now=now, persist=False)
+    assert signals == []
+
+
+def test_queries_existential_emits_signal(temp_queries_db, mood_enabled):
+    now = time.time()
+    _insert_query(temp_queries_db, "qué hice este mes, no avanzo", now - 1800)
+    _insert_query(temp_queries_db, "siempre lo mismo, cómo salgo", now - 1200)
+    signals = mood.score_queries_existential(now=now, persist=False)
+    exi = [s for s in signals if s["signal_kind"] == "existential_pattern"]
+    assert len(exi) == 1
+    assert exi[0]["value"] <= -0.5  # 2 matches → -0.5
+    assert exi[0]["evidence"]["n_matched"] == 2
+
+
+def test_queries_existential_3plus_stronger_signal(temp_queries_db, mood_enabled):
+    now = time.time()
+    _insert_query(temp_queries_db, "qué hice todo este tiempo", now - 1800)
+    _insert_query(temp_queries_db, "estoy estancado", now - 1500)
+    _insert_query(temp_queries_db, "no puedo más con esto", now - 1200)
+    _insert_query(temp_queries_db, "para qué sigo intentando", now - 800)
+    signals = mood.score_queries_existential(now=now, persist=False)
+    exi = [s for s in signals if s["signal_kind"] == "existential_pattern"]
+    assert len(exi) == 1
+    assert exi[0]["value"] == -0.7
+    assert exi[0]["evidence"]["n_matched"] == 4
+
+
+# ─── Calendar density ──────────────────────────────────────────────────────
+
+
+def test_calendar_few_events_no_signal(temp_db, monkeypatch, mood_enabled):
+    """≤ density_threshold-1 events: no signal."""
+    monkeypatch.setattr(
+        "rag.integrations.calendar._fetch_calendar_today",
+        lambda max_events=15: [
+            {"title": "A", "start": "09:00", "end": "10:00"},
+            {"title": "B", "start": "11:00", "end": "12:00"},
+        ],
+    )
+    assert mood.score_calendar_density(persist=False) == []
+
+
+def test_calendar_density_overload_emits_signal(temp_db, monkeypatch, mood_enabled):
+    """≥ 6 events → density_overload signal."""
+    events = [
+        {"title": f"Event {i}", "start": f"{8+i:02d}:00", "end": f"{8+i:02d}:30"}
+        for i in range(6)
+    ]
+    monkeypatch.setattr(
+        "rag.integrations.calendar._fetch_calendar_today",
+        lambda max_events=15: events,
+    )
+    signals = mood.score_calendar_density(persist=False)
+    density = [s for s in signals if s["signal_kind"] == "density_overload"]
+    assert len(density) == 1
+    assert density[0]["value"] < 0
+
+
+def test_calendar_back_to_back_emits_signal(temp_db, monkeypatch, mood_enabled):
+    """6 events back-to-back (sin gaps) → density_overload + back_to_back."""
+    events = [
+        {"title": f"E{i}", "start": f"{9+i:02d}:00", "end": f"{9+i:02d}:55"}
+        for i in range(6)
+    ]
+    monkeypatch.setattr(
+        "rag.integrations.calendar._fetch_calendar_today",
+        lambda max_events=15: events,
+    )
+    signals = mood.score_calendar_density(persist=False)
+    btb = [s for s in signals if s["signal_kind"] == "back_to_back_meetings"]
+    assert len(btb) == 1
+    assert btb[0]["evidence"]["n_back_to_back"] >= 3
+
+
+def test_calendar_no_back_to_back_when_gaps(temp_db, monkeypatch, mood_enabled):
+    """6 events con gaps amplios: density_overload sí, back_to_back no."""
+    # 9-10, 11-12, 13-14, 15-16, 17-18, 19-20 (1h gap entre cada uno)
+    events = [
+        {"title": f"E{i}", "start": f"{9+2*i:02d}:00", "end": f"{10+2*i:02d}:00"}
+        for i in range(6)
+    ]
+    monkeypatch.setattr(
+        "rag.integrations.calendar._fetch_calendar_today",
+        lambda max_events=15: events,
+    )
+    signals = mood.score_calendar_density(persist=False)
+    kinds = [s["signal_kind"] for s in signals]
+    assert "density_overload" in kinds
+    assert "back_to_back_meetings" not in kinds
+
+
+def test_parse_event_time_handles_formats():
+    assert mood._parse_event_time("09:30") == (9, 30)
+    assert mood._parse_event_time("9:30") == (9, 30)
+    assert mood._parse_event_time("9:30 AM") == (9, 30)
+    assert mood._parse_event_time("12:00 PM") == (12, 0)
+    assert mood._parse_event_time("12:00 AM") == (0, 0)
+    assert mood._parse_event_time("3:00 PM") == (15, 0)
+    assert mood._parse_event_time("garbage") is None
+    assert mood._parse_event_time("25:00") is None

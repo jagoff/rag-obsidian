@@ -2845,6 +2845,48 @@ def submit_feedback(req: FeedbackRequest) -> dict:
 # row de telemetría (UX no se rompe). El `decision` se valida contra
 # `rag._VALID_DRAFT_DECISIONS` ANTES de tocar SQL para fallar rápido.
 
+_VALID_MOOD_LABELS: frozenset[str] = frozenset({"good", "meh", "bad"})
+
+
+class MoodRequest(BaseModel):
+    mood: str = Field(..., max_length=10)
+    notes: str | None = Field(None, max_length=500)
+
+    @field_validator("mood")
+    @classmethod
+    def _check_mood(cls, v: str) -> str:
+        v = (v or "").strip().lower()
+        if v not in _VALID_MOOD_LABELS:
+            raise ValueError(f"mood must be one of {sorted(_VALID_MOOD_LABELS)}")
+        return v
+
+
+@app.post("/api/mood")
+def submit_mood(req: MoodRequest) -> dict:
+    """Record a manual self-reported mood from the home panel widget.
+
+    The user picks one of three buttons (😀 good / 😐 meh / 😞 bad) and we
+    persist a row to `rag_mood_signals` with `source="manual"`,
+    `signal_kind="self_report"`. The home panel re-loads on success and
+    shows the most recent self-report under the Sleep card so the user
+    can see "wake-up mood" + "now mood" in the same place.
+
+    Multiple reports during the day are all kept (timeline of how mood
+    changed); the panel only displays the latest one. Notes optional —
+    short free-text the user can attach for context ("after the meeting",
+    "antes de almorzar").
+
+    No auth: this is loopback-only via the FastAPI server. Cloudflare
+    tunnel exposes it but the user is the only consumer.
+    """
+    from rag.integrations.pillow_sleep import record_self_report_mood
+    notes = (req.notes or "").strip()[:500] or None
+    result = record_self_report_mood(req.mood, notes=notes)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error", "invalid mood"))
+    return result
+
+
 # Validamos `decision` contra el mismo set que el helper Python +
 # CHECK constraint de la tabla. Mantener el set en `rag` (single source
 # of truth); copiarlo acá rompería sync.
@@ -7623,6 +7665,87 @@ def _fetch_spotify(limit: int = 10) -> dict | None:
     return {"now_playing": np, "recent_today": recent}
 
 
+def _fetch_sleep() -> dict | None:
+    """Pillow sleep tracker — última noche + comparación 7d vs histórico
+    + sparkline 7d + insight automático cuando hay anomalía clara.
+
+    Source: tabla `rag_sleep_sessions` poblada por el daemon
+    `com.fer.obsidian-rag-ingest-pillow` (1×/día post wake-up). Read-only
+    desde acá; el ingester hace el laburo pesado.
+
+    También incluye el último self-report de mood (manual via /api/mood)
+    si hay uno reciente (≤12h), para que el panel pueda mostrar
+    "dormido + ahora" en una sola card sin requerir un panel separado.
+
+    Silent-fail: si la tabla no existe o está vacía → None. El frontend
+    hidea el panel completo (mismo patrón que Spotify cuando no hay data).
+
+    Returns:
+      `{last_night: dict, week: dict, hist: dict, delta: dict,
+        spark_quality_7d: list, spark_dates_7d: list, mood_now: dict|None,
+        insight: str|None}` o None.
+    """
+    try:
+        from rag.integrations.pillow_sleep import (
+            last_night, weekly_stats, latest_self_report_mood,
+        )
+    except Exception:
+        return None
+    try:
+        ln = last_night()
+    except Exception:
+        ln = None
+    if not ln:
+        return None
+    try:
+        ws = weekly_stats()
+    except Exception:
+        ws = {}
+    try:
+        mood_now = latest_self_report_mood(hours=12)
+    except Exception:
+        mood_now = None
+
+    # Insight automático — surface si hay algo destacable de la última
+    # semana vs histórico. Prioridad: deep% crash > awakenings spike >
+    # quality drop > duration drop. Sólo emitimos un insight (el
+    # más severo) para no saturar el panel.
+    insight: str | None = None
+    delta = ws.get("delta") or {}
+    week = ws.get("week") or {}
+    if (delta.get("deep_pct") or 0) <= -5 and (week.get("deep_pct") or 100) <= 18:
+        insight = (
+            f"Deep cayó {abs(delta['deep_pct']):.0f} pts "
+            f"({week['deep_pct']:.0f}% esta semana vs hist)"
+        )
+    elif (delta.get("awakenings") or 0) >= 1 and (week.get("awakenings") or 0) >= 3:
+        insight = (
+            f"Awakenings subieron a {week['awakenings']:.1f}/noche "
+            f"(+{delta['awakenings']:.1f} vs hist)"
+        )
+    elif (delta.get("quality") or 0) <= -0.05:
+        insight = (
+            f"Quality bajó {abs(delta['quality']):.2f} esta semana "
+            f"({week.get('quality', 0):.2f} vs hist)"
+        )
+    elif (delta.get("duration_h") or 0) <= -0.5 and (week.get("duration_h") or 0) <= 6.0:
+        insight = (
+            f"Dormiste {abs(delta['duration_h']):.1f}h menos que el promedio"
+        )
+
+    return {
+        "last_night": ln,
+        "week": week,
+        "hist": ws.get("hist") or {},
+        "delta": delta,
+        "spark_quality_7d": ws.get("spark_quality_7d") or [],
+        "spark_duration_7d": ws.get("spark_duration_7d") or [],
+        "spark_dates_7d": ws.get("spark_dates_7d") or [],
+        "mood_now": mood_now,
+        "insight": insight,
+    }
+
+
 def _fetch_youtube_watched(n: int = 5, hours: int = 168) -> list[dict]:
     """Most-recent YouTube video pages opened in Chrome, last `hours` window.
 
@@ -9393,6 +9516,10 @@ def _home_compute(
         # Cheap (~50ms cold) — el budget de 5s es defensivo por si el
         # AppleScript se cuelga (Spotify mid-update, etc).
         fut_spotify     = pool.submit(_timed, "spotify", _fetch_spotify, 10)
+        # Sleep: read-only desde rag_sleep_sessions (poblada 1×/día por
+        # el daemon `com.fer.obsidian-rag-ingest-pillow`). Hot path
+        # ~10ms — single SELECT + cálculo en memoria. 3s budget defensivo.
+        fut_sleep       = pool.submit(_timed, "sleep", _fetch_sleep)
 
         # Helper: wait on a future with budget, return default on timeout
         # or worker exception. Emits "timeout" progress event so the UI
@@ -9458,6 +9585,7 @@ def _home_compute(
         # (signals típicamente domina con 5-25s, así que el spotify se
         # esconde detrás de eso).
         spotify = _await("spotify", fut_spotify, 8, default=None)
+        sleep = _await("sleep", fut_sleep, 3, default=None)
 
         signals["pagerank_top"] = pagerank_top
         signals["chrome_top_week"] = chrome_top_week
@@ -9471,6 +9599,7 @@ def _home_compute(
         signals["cards"] = cards
         signals["youtube_watched"] = youtube_watched
         signals["spotify"] = spotify
+        signals["sleep"] = sleep
     finally:
         # Detach stragglers; they continue warming caches for the next call.
         # On SSE-client disconnect (cancel_event set), drop pending

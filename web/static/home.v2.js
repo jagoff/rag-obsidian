@@ -1227,4 +1227,226 @@
     load();
     setInterval(load, 5 * 60 * 1000);
   });
+
+  // ──────────────────────────────────────────────────────────────
+  // Drag-and-drop: reorder de paneles (cross-section permitido)
+  // ──────────────────────────────────────────────────────────────
+  //
+  // El user puede agarrar cualquier .panel y soltarlo en otra posición,
+  // incluso fuera de su sección original (ej. mover YouTube de
+  // "Ambiente" al top de "Accionable"). El orden se persiste en
+  // localStorage[LS_PANELS_ORDER] como un mapa
+  //   { <section-body-id>: [panel-ids...] }
+  // y se re-aplica en el próximo boot — antes de que los renderers
+  // llenen los paneles — para evitar flicker.
+  //
+  // HTML5 DnD API (desktop). En touch el browser no dispara los eventos
+  // de DnD nativo de manera consistente, así que en mobile el feature
+  // queda como no-op. El user accede a la feature desde desktop.
+
+  const LS_PANELS_ORDER = "home.v2.panels.order.v1";
+  const SECTION_BODY_IDS = ["sec-acc-body", "sec-mon-body", "sec-amb-body"];
+
+  function readSavedOrder() {
+    try {
+      const raw = localStorage.getItem(LS_PANELS_ORDER);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object") return null;
+      return parsed;
+    } catch { return null; }
+  }
+
+  function saveCurrentOrder() {
+    const order = {};
+    for (const secId of SECTION_BODY_IDS) {
+      const sec = document.getElementById(secId);
+      if (!sec) continue;
+      order[secId] = Array.from(sec.querySelectorAll(":scope > .panel"))
+        .map((p) => p.id)
+        .filter(Boolean);
+    }
+    try {
+      localStorage.setItem(LS_PANELS_ORDER, JSON.stringify(order));
+    } catch (e) {
+      console.warn("[home.v2] no pude persistir el orden de paneles:", e);
+    }
+    updateResetButtonVisibility();
+  }
+
+  function applySavedOrder() {
+    const saved = readSavedOrder();
+    if (!saved) return;
+    // Para cada sección, tomamos la lista de IDs guardados y los
+    // re-ordenamos via appendChild (mueve el nodo si ya existe).
+    // Paneles NO listados (ej. agregados en un deploy futuro) quedan
+    // en su posición default — no los tocamos.
+    for (const secId of SECTION_BODY_IDS) {
+      const sec = document.getElementById(secId);
+      if (!sec) continue;
+      const ids = Array.isArray(saved[secId]) ? saved[secId] : [];
+      for (const pid of ids) {
+        const panel = document.getElementById(pid);
+        if (!panel) continue;            // panel ya no existe (deprecated)
+        sec.appendChild(panel);          // mueve si ya está, agrega si vino de otra sección
+      }
+    }
+  }
+
+  function clearSavedOrder() {
+    try { localStorage.removeItem(LS_PANELS_ORDER); } catch {}
+    // Restore default DOM order — más simple recargar que reconstruir
+    // el orden hard-coded del HTML.
+    window.location.reload();
+  }
+
+  let _draggingPanel = null;
+
+  function onPanelDragStart(ev) {
+    const panel = ev.currentTarget;
+    _draggingPanel = panel;
+    panel.classList.add("is-dragging");
+    try {
+      ev.dataTransfer.effectAllowed = "move";
+      // Firefox necesita data seteada para que dispare drop
+      ev.dataTransfer.setData("text/plain", panel.id);
+    } catch {}
+  }
+
+  function onPanelDragEnd(ev) {
+    const panel = ev.currentTarget;
+    panel.classList.remove("is-dragging");
+    _draggingPanel = null;
+    document.querySelectorAll(".panel.drop-before, .panel.drop-after")
+      .forEach((p) => p.classList.remove("drop-before", "drop-after"));
+    document.querySelectorAll(".section-body.drop-zone")
+      .forEach((s) => s.classList.remove("drop-zone"));
+  }
+
+  function onPanelDragOver(ev) {
+    if (!_draggingPanel) return;
+    const panel = ev.currentTarget;
+    if (panel === _draggingPanel) return;
+    ev.preventDefault();
+    try { ev.dataTransfer.dropEffect = "move"; } catch {}
+    // Decidir before/after según posición del cursor relativa al panel.
+    // Si el panel es claramente más ancho que alto (desktop multi-col),
+    // usamos X; en single-col (mobile/tablet angosto) usamos Y.
+    const rect = panel.getBoundingClientRect();
+    const useX = rect.width > rect.height * 1.2;
+    const before = useX
+      ? (ev.clientX - rect.left) < rect.width / 2
+      : (ev.clientY - rect.top) < rect.height / 2;
+    panel.classList.toggle("drop-before", before);
+    panel.classList.toggle("drop-after", !before);
+  }
+
+  function onPanelDragLeave(ev) {
+    const panel = ev.currentTarget;
+    // Sólo limpiar si salimos del panel (no si entramos a un hijo)
+    if (panel.contains(ev.relatedTarget)) return;
+    panel.classList.remove("drop-before", "drop-after");
+  }
+
+  function onPanelDrop(ev) {
+    ev.preventDefault();
+    if (!_draggingPanel) return;
+    const target = ev.currentTarget;
+    if (target === _draggingPanel) return;
+    const before = target.classList.contains("drop-before");
+    target.classList.remove("drop-before", "drop-after");
+    if (before) {
+      target.parentNode.insertBefore(_draggingPanel, target);
+    } else {
+      target.parentNode.insertBefore(_draggingPanel, target.nextSibling);
+    }
+    saveCurrentOrder();
+  }
+
+  function makePanelDraggable(panel) {
+    if (panel.dataset.draggableInit === "1") return;
+    panel.dataset.draggableInit = "1";
+    panel.setAttribute("draggable", "true");
+    // Insertar el grip "⋮⋮" en el .panel-head como affordance visual
+    const head = panel.querySelector(".panel-head");
+    if (head && !head.querySelector(".drag-grip")) {
+      const grip = document.createElement("span");
+      grip.className = "drag-grip";
+      grip.setAttribute("aria-hidden", "true");
+      grip.title = "arrastrá para reordenar";
+      grip.textContent = "⋮⋮";
+      head.insertBefore(grip, head.firstChild);
+    }
+    panel.addEventListener("dragstart", onPanelDragStart);
+    panel.addEventListener("dragend", onPanelDragEnd);
+    panel.addEventListener("dragover", onPanelDragOver);
+    panel.addEventListener("dragleave", onPanelDragLeave);
+    panel.addEventListener("drop", onPanelDrop);
+  }
+
+  // Drop directo sobre la section-body (cuando arrastrás a un espacio
+  // libre fuera de cualquier panel — se appendea al final). Esto te
+  // permite mover un panel a una sección vacía o al fondo de una
+  // sección sin tener que apuntar exacto sobre otro panel.
+  function makeSectionDroppable(secId) {
+    const sec = document.getElementById(secId);
+    if (!sec) return;
+    sec.addEventListener("dragover", (ev) => {
+      if (!_draggingPanel) return;
+      if (ev.target !== sec) return;       // sólo si el cursor está sobre el grid container, no sobre un panel hijo
+      ev.preventDefault();
+      try { ev.dataTransfer.dropEffect = "move"; } catch {}
+      sec.classList.add("drop-zone");
+    });
+    sec.addEventListener("dragleave", (ev) => {
+      if (ev.target !== sec) return;
+      sec.classList.remove("drop-zone");
+    });
+    sec.addEventListener("drop", (ev) => {
+      if (!_draggingPanel) return;
+      if (ev.target !== sec) return;
+      ev.preventDefault();
+      sec.classList.remove("drop-zone");
+      sec.appendChild(_draggingPanel);
+      saveCurrentOrder();
+    });
+  }
+
+  function updateResetButtonVisibility() {
+    const btn = document.getElementById("reset-order-btn");
+    if (!btn) return;
+    btn.hidden = !readSavedOrder();
+  }
+
+  function injectResetButton() {
+    const meta = document.getElementById("topbar-meta");
+    if (!meta || document.getElementById("reset-order-btn")) return;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.id = "reset-order-btn";
+    btn.className = "reset-order-btn";
+    btn.title = "Resetear orden de los paneles al default";
+    btn.setAttribute("aria-label", "Resetear orden de los paneles");
+    btn.textContent = "↺ orden";
+    btn.hidden = !readSavedOrder();      // sólo visible si hay orden custom
+    btn.addEventListener("click", () => {
+      if (confirm("¿Resetear el orden de los paneles al default?")) {
+        clearSavedOrder();
+      }
+    });
+    meta.appendChild(btn);
+  }
+
+  document.addEventListener("DOMContentLoaded", () => {
+    // 1. Aplicar orden persistido ANTES de que los renderers escriban.
+    //    (Los renderers usan getElementById por panel-id, así que mover
+    //     el nodo en el DOM no rompe el data-binding.)
+    applySavedOrder();
+    // 2. Hacer cada panel draggable + insertar el grip
+    document.querySelectorAll(".section-body > .panel").forEach(makePanelDraggable);
+    // 3. Hacer cada section-body un drop zone para "soltar al final"
+    SECTION_BODY_IDS.forEach(makeSectionDroppable);
+    // 4. Inyectar botón reset en la topbar
+    injectResetButton();
+  });
 })();

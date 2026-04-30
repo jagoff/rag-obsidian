@@ -1149,3 +1149,129 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
   z-index: 100;
 }
 .skip-link:focus { top: 0; }
+
+
+/* ────────────────────────────────────────────────────────────
+   Drag-and-drop: reorder de paneles
+   El user puede agarrar cualquier .panel desde el grip "⋮⋮" del
+   header y soltarlo en cualquier otra posición — incluso en otra
+   sección. El orden se persiste en localStorage. Ver home.v2.js.
+   ──────────────────────────────────────────────────────────── */
+
+/* Grip visual al inicio del .panel-head — affordance discreta de
+   "este bloque se puede arrastrar". Cursor grab sobre todo el head. */
+.panel-head { cursor: grab; }
+.panel-head:active { cursor: grabbing; }
+.panel-head .drag-grip {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1;
+  color: var(--text-faint);
+  opacity: 0.35;
+  letter-spacing: -2px;
+  user-select: none;
+  margin-right: var(--space-2);
+  flex-shrink: 0;
+  transition: opacity var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out);
+}
+.panel:hover .panel-head .drag-grip {
+  opacity: 1;
+  color: var(--cyan);
+}
+
+/* Panel siendo arrastrado — fantasmal */
+.panel.is-dragging {
+  opacity: 0.35;
+  border-style: dashed;
+  border-color: var(--border-focus);
+}
+
+/* Drop indicator: línea de inserción en before/after del target */
+.panel.drop-before,
+.panel.drop-after {
+  position: relative;
+}
+.panel.drop-before::before,
+.panel.drop-after::after {
+  content: "";
+  position: absolute;
+  background: var(--cyan);
+  box-shadow: 0 0 8px rgba(121, 221, 255, 0.55);
+  pointer-events: none;
+  z-index: 5;
+}
+/* Indicador horizontal (single-col / mobile): línea arriba o abajo */
+.panel.drop-before::before {
+  left: -4px; right: -4px;
+  top: -4px;
+  height: 2px;
+  border-radius: 1px;
+}
+.panel.drop-after::after {
+  left: -4px; right: -4px;
+  bottom: -4px;
+  height: 2px;
+  border-radius: 1px;
+}
+/* Indicador vertical (desktop multi-col): línea izquierda o derecha.
+   Detectamos con media query — si la sección renderiza >1 col de panel,
+   la altura del panel es similar al ancho y la heurística JS (useX)
+   pone before/after en horizontal. Esto pinta verticales. */
+@media (min-width: 720px) {
+  .panel.drop-before::before {
+    top: -4px; bottom: -4px;
+    left: -4px;
+    width: 2px;
+    height: auto;
+    right: auto;
+    border-radius: 1px;
+  }
+  .panel.drop-after::after {
+    top: -4px; bottom: -4px;
+    right: -4px;
+    width: 2px;
+    height: auto;
+    left: auto;
+    border-radius: 1px;
+  }
+}
+
+/* Drop zone sobre toda la section-body (cuando el cursor está en un
+   espacio libre del grid, fuera de cualquier panel — appendea al final). */
+.section-body.drop-zone {
+  outline: 2px dashed var(--border-focus);
+  outline-offset: 4px;
+  border-radius: 4px;
+}
+
+/* Botón "↺ orden" en la topbar — visible sólo si hay orden custom */
+.reset-order-btn {
+  font: inherit;
+  font-size: var(--fs-mini);
+  color: var(--text-faint);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 2px 8px;
+  cursor: pointer;
+  transition: color var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out);
+}
+.reset-order-btn:hover {
+  color: var(--cyan);
+  border-color: var(--cyan-dim, var(--border-focus));
+}
+.reset-order-btn:focus-visible {
+  outline: none;
+  border-color: var(--border-focus);
+  box-shadow: var(--shadow-focus);
+}
+
+/* En reduce-motion, no animar el grip — sólo mostrar/ocultar al hover */
+@media (prefers-reduced-motion: reduce) {
+  .panel-head .drag-grip { transition: none; }
+  .panel.drop-before::before,
+  .panel.drop-after::after { box-shadow: none; }
+}

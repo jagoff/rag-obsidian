@@ -44878,9 +44878,10 @@ def _render_today_prompt(
         "(tiene subject + remitente + snippet). NO cites las notas "
         "ingester como 'tocaste una nota'.",
         "",
-        "5. **Tono**: calmo, honesto, factual. Mirás hacia atrás. NO "
-        "proyectes la agenda de mañana como tareas; solo semillas "
-        "derivadas de lo de hoy.",
+        "5. **Tono**: calmo, honesto, factual. Mirás hacia atrás. La "
+        "sección 'Para mañana' SÍ lista los eventos del calendario "
+        "que vienen — eso es referencia útil, no proyección. NO "
+        "inventes acciones que el user todavía no decidió.",
         "",
         "6. **NO especulés sobre nombres ni mensajes triviales**. Si una "
         "persona aparece SOLO en WhatsApp con un mensaje corto y trivial "
@@ -44905,9 +44906,11 @@ def _render_today_prompt(
         "la evidencia**. Si la lista de notas tocadas está vacía, NO "
         "digas \"trabajaste en X\" — decí \"hoy no editaste notas en el "
         "vault\". Si no hay queries low-conf, NO inventes preguntas "
-        "abiertas. Si no hay calendar de mañana, NO armes agenda. La "
-        "evidencia manda — si la sección no tiene material concreto, "
-        "OMITILA ENTERA (regla #4 de output).",
+        "abiertas. Si HAY calendar de mañana, listalo con su hora "
+        "(es referencia, no invención); si NO hay, simplemente omití "
+        "la sección 'Para mañana' entera. La evidencia manda — si la "
+        "sección no tiene material concreto, OMITILA ENTERA (regla "
+        "#4 de output).",
         "",
     ]
     # ── Regla #8 (mood-aware) — solo si tenemos bucket mood con datos
@@ -45192,11 +45195,19 @@ def _render_today_prompt(
         parts.append(f"## 📅 Calendario — mañana ({len(cal_tomorrow)} eventos):")
         for c in cal_tomorrow[:8]:
             title = c.get("title") or "(sin título)"
-            tr = c.get("time_range") or ""
-            parts.append(f"- {tr} — {title}")
+            tr = (c.get("time_range") or "").strip()
+            # All-day events tienen time_range vacío. Marcarlos
+            # explícitamente como "todo el día" para que el LLM no
+            # los confunda con un dato roto y los liste igual.
+            prefix = tr if tr else "todo el día"
+            parts.append(f"- {prefix} — {title}")
         parts.append(
-            "(NO armes una agenda con esto — solo úsalo para mencionar el clima "
-            "del día siguiente o conectarlo con cabos sueltos de hoy)"
+            "(LISTALOS TODOS en la sección 'Para mañana' del output — el "
+            "user los necesita ver. Cada evento es una viñeta. Los all-day "
+            "(prefix 'todo el día') TAMBIÉN cuentan — no los descartes. Si "
+            "además detectás que algún evento se conecta con cabos sueltos "
+            "de hoy, agregá una línea explicando la conexión. NO los "
+            "inventes ni adornes — citá lo literal.)"
         )
         parts.append("")
     drive_recent = extras.get("drive_recent") or []
@@ -45299,17 +45310,49 @@ def _render_today_prompt(
                 "175 a 315 palabras" if has_cross_source
                 else "105 a 175 palabras"
             )
+    # ¿Tenemos eventos en el calendario de mañana? Si sí, "Para mañana"
+    # es REQUERIDA en el output (con la lista de eventos + sus horas).
+    # Si no, es opcional como las demás. Esto se refleja en el
+    # sections_hint y en el body de la sección.
+    has_tomorrow_evs = bool(extras.get("tomorrow_calendar"))
+    tomorrow_clause = (
+        " La sección '🌅 Para mañana' ES REQUERIDA porque hay eventos "
+        "en el calendar — listalos con su hora. NO la omitás."
+        if has_tomorrow_evs else ""
+    )
     sections_hint = (
         f"## OUTPUT — formato (longitud total: {word_budget})\n\n"
-        "Empezá tu respuesta con `## 🪞 Lo que pasó hoy`. Las secciones de "
-        "abajo son OPCIONALES — si una no tiene contenido real, OMITILA "
+        "Empezá tu respuesta con `## 🪞 Lo que pasó hoy`. Las demás secciones "
+        "son OPCIONALES — si una no tiene contenido real, OMITILA "
         "ENTERA (header + body). NO escribas placeholders como "
         "'nada quedó suelto', 'no hay datos suficientes', "
         "'ninguna pregunta abierta', 'sin novedades' — preferimos un "
-        "brief más corto antes que un header con relleno" + extras_clause
+        "brief más corto antes que un header con relleno." + tomorrow_clause
+        + extras_clause
         + " Citá notas con [[Título]]. Citá personas por nombre cuando "
         "aparezcan en gmail/wa/calendar."
     )
+    if has_tomorrow_evs:
+        n_evs = len(extras.get("tomorrow_calendar") or [])
+        tomorrow_body = (
+            f"(REQUERIDA — hay {n_evs} evento(s) en el bloque "
+            "'## 📅 Calendario — mañana' arriba. Listá CADA evento como "
+            "una viñeta con su prefix exacto (formato '- 10:30 AM — "
+            "Título evento' para events con hora, '- todo el día — "
+            "Título evento' para all-day). LISTALOS TODOS, no selecciones — "
+            "el user los quiere ver SIEMPRE. NO digas 'agenda libre'. "
+            "Después, si hay action items reales (mails sin responder "
+            "relevantes a algún evento, decisiones que tocan algo de "
+            "mañana), agregá 1-2 viñetas más debajo. NUNCA omitas esta "
+            "sección si hay events.)"
+        )
+    else:
+        tomorrow_body = (
+            "(Sin eventos en el calendar de mañana. Si hay action items "
+            "concretos derivados de cabos sueltos de hoy (2-3 máximo), "
+            "listalos. SI NO HAY ACTIONS, OMITÍ LA SECCIÓN ENTERA — no "
+            "escribas el header.)"
+        )
     parts.extend([
         sections_hint,
         "",
@@ -45330,11 +45373,7 @@ def _render_today_prompt(
         "SECCIÓN ENTERA — no escribas el header.)",
         "",
         "## 🌅 Para mañana",
-        "(2-3 action items concretos derivados de cabos sueltos de hoy. "
-        "Si hay eventos en el calendario de mañana, mencionalos SOLO si "
-        "se conectan con algo de hoy — no copies la agenda. NO agenda "
-        "genérica — todo tiene que venir del contexto real. SI NO HAY "
-        "NADA accionable, OMITÍ LA SECCIÓN ENTERA — no escribas el header.)",
+        tomorrow_body,
     ])
     if has_cross_source:
         parts.extend([

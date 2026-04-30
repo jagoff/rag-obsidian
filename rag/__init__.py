@@ -38176,6 +38176,19 @@ _DAEMON_GENERATED_PREFIXES = (
     "03-Resources/YouTube/",
     "03-Resources/GoogleDrive/",
     "00-Inbox/WA-",  # 00-Inbox/WA-YYYY-MM-DD.md (whatsapp listener daily)
+    # mem-vault auto-saves: el agente escribe estas notas al cerrar tareas
+    # no-triviales (decisions, bug patterns, gotchas). Se indexan para
+    # retrieval (`is_excluded` las deja pasar arriba) pero su mtime NO es
+    # actividad del user — es output del agente. Sin este filtro, una
+    # sesión donde el agente guarda 5 memorias inflaba `recent_notes` con
+    # 5 títulos "wa_draft_cjk_leak…", "feedback_ollama_runner…", etc. y
+    # el LLM del brief intentaba narrar eso como "tu actividad".
+    "04-Archive/99-obsidian-system/99-AI/memory/",
+    # MOZE finance ETL: dumps mensuales/diarios de gastos. Ya se surfacean
+    # en su propio bucket (`💸 Finanzas`) con totales calculados — meterlas
+    # también como "notas tocadas" duplica la señal y empuja al LLM a
+    # mezclar nombres de categorías ("House", "Consumibles") en el recap.
+    "02-Areas/Personal/Finanzas/",
 )
 
 
@@ -43223,8 +43236,21 @@ def _collect_today_evidence(
                     "snippet": clean_md(raw)[:180].strip(),
                     "tags": tags,
                 })
-            if in_window and not rel.startswith(f"{MORNING_FOLDER}/") \
-                    and not rel.startswith(f"{_CAPTURE_FOLDER}/"):
+            if (
+                in_window
+                and not rel.startswith(f"{MORNING_FOLDER}/")
+                and not rel.startswith(f"{_CAPTURE_FOLDER}/")
+                # Excluir paths daemon-generated (calendar/screentime/github/
+                # gmail/chrome/youtube ingesters + memory auto-saves del
+                # agente + finance ETL). Sin esto, "Notas tocadas hoy"
+                # se llenaba de output automático y el LLM intentaba
+                # narrarlo como actividad del user. Mismo filtro que
+                # `_collect_morning_evidence` (línea ~41028) y
+                # `_fetch_vault_activity`. Bug observado 2026-04-30:
+                # 33/60 recent_notes eran auto-saves a 99-AI/memory/, 19/60
+                # eran finance ETL, 0/60 eran notas reales del user.
+                and not _is_daemon_generated_path(rel)
+            ):
                 recent.append({
                     "path": rel, "title": title,
                     "modified": mtime.isoformat(timespec="seconds"),
@@ -43381,6 +43407,33 @@ def _render_today_prompt(
         "5. **Tono**: calmo, honesto, factual. Mirás hacia atrás. NO "
         "proyectes la agenda de mañana como tareas; solo semillas "
         "derivadas de lo de hoy.",
+        "",
+        "6. **NO especulés sobre nombres ni mensajes triviales**. Si una "
+        "persona aparece SOLO en WhatsApp con un mensaje corto y trivial "
+        "(\"buenos días\", \"gracias\", \"jaja\", \"ok\"), describilo "
+        "literal o ignoralo — NO armes hipótesis sobre colaboración "
+        "futura, sinergia, intención, relación profesional, ni nada que "
+        "no esté en la evidencia. Ejemplos de errores reales que NO "
+        "tenés que repetir:",
+        "   ❌ \"Guardia Los Molinos envió un mensaje de buenos días, lo "
+        "cual podría ser un indicador de una futura colaboración o "
+        "sinergia\" (es un guarda del barrio mandando un saludo, NO un "
+        "partner — no inventes contexto).",
+        "   ❌ \"Llamar a Joana para discutir las tareas pendientes\" "
+        "cuando lo único que dice el contexto es \"Joana: Fer me podes "
+        "llamar?\" (no hay 'tareas pendientes' en la evidencia — "
+        "describí el pedido literal: \"Joana te pidió que la llames\").",
+        "   ✅ Si solo tenés UN dato sobre alguien, citá el dato y stop.",
+        "   ✅ Si NO podés explicar QUÉ aporta mencionar a alguien, mejor "
+        "no mencionarlo.",
+        "",
+        "7. **NO inventes acciones, decisiones o trabajo que no esté en "
+        "la evidencia**. Si la lista de notas tocadas está vacía, NO "
+        "digas \"trabajaste en X\" — decí \"hoy no editaste notas en el "
+        "vault\". Si no hay queries low-conf, NO inventes preguntas "
+        "abiertas. Si no hay calendar de mañana, NO armes agenda. La "
+        "evidencia manda — si la sección no tiene material concreto, "
+        "OMITILA ENTERA (regla #4 de output).",
         "",
         "## CONTEXTO DEL DÍA",
         "",
@@ -43724,11 +43777,16 @@ def _render_today_prompt(
             "— probable que el WA sea para confirmar el sync'. Para cada "
             "TEMA en ≥2 fuentes, narrá QUÉ INDICA el patrón: ej. "
             "'Ghostty aparece en youtube + notas + screentime — el deep "
-            "work del día fue tu setup de terminal'. NO inventes "
-            "conexiones fuera de ese bloque. Si el bloque está vacío, "
-            "OMITÍ esta sección entera. Cada línea debe agregar valor — "
-            "si solo podés decir 'X aparece en gmail y wa' sin un "
-            "insight derivado, mejor omitir esa línea.)",
+            "work del día fue tu setup de terminal'. **NO inventes "
+            "conexiones fuera de ese bloque** — si una persona/tema "
+            "aparece SOLO en una fuente (WA pero no en calendar, o "
+            "notas pero no en youtube), NO va a esta sección por más "
+            "que se te ocurra una hipótesis. Si el bloque está vacío, "
+            "OMITÍ esta sección entera (incluyendo el header). Cada "
+            "línea debe agregar valor — si solo podés decir 'X aparece "
+            "en gmail y wa' sin un insight derivado de la evidencia "
+            "concreta, mejor omitir esa línea. Mejor 0 líneas honestas "
+            "que 3 inventadas.)",
         ])
     if has_finance:
         parts.extend([

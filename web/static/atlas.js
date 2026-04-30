@@ -3,12 +3,18 @@
  * Tres bloques principales:
  *   1) KPIs + entidades (Chart.js sparklines)
  *   2) Hot/Stale + co-ocurrencias
- *   3) Force-directed graph estilo Obsidian (D3 v7)
+ *   3) Force-directed graph 3D (Three.js + 3d-force-graph)
  *
- * El graph usa el mismo patrón que Obsidian: forceSimulation con
- * forceLink + forceManyBody + forceCenter + forceCollide. Drag,
- * zoom y pan via d3-zoom + d3-drag. Click en un nodo highlightea
- * el subgrafo 1-hop (dim del resto).
+ * El graph usa `3d-force-graph` (Vasco Asturiano) sobre WebGL: nodos como
+ * esferas, links como cilindros, drag con orbit-controls (rotar + pan +
+ * zoom). Click en un nodo enfoca la cámara y highlightea el subgrafo
+ * 1-hop. Search + entity-filter actualizan colores reactivamente vía
+ * `Graph.nodeColor(Graph.nodeColor())` (re-trigger del accessor).
+ *
+ * Las dependencias se cargan UMD en atlas.html como globales:
+ *   - THREE        (three@0.158)
+ *   - ForceGraph3D (3d-force-graph@1.73)
+ *   - SpriteText   (three-spritetext@1.8) — labels que rotan a cámara
  */
 
 const SUN_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="M4.93 4.93l1.41 1.41"/><path d="M17.66 17.66l1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="M6.34 17.66l-1.41 1.41"/><path d="M19.07 4.93l-1.41 1.41"/></svg>';
@@ -31,22 +37,38 @@ const TYPE_LABELS = {
 const state = {
   windowDays: 30,
   payload: null,
-  graphSim: null,
-  graphSvg: null,
-  graphTransform: null,
-  showLabels: true,
-  selectedNode: null,
-  sparkCharts: new Map(),  // entity_id → Chart.js instance
+  // ── 3D Graph state ─────────────────────────────────────────────────────
+  graph3d: null,            // ForceGraph3D instance
+  graphNodes: [],           // copia del input para filter logic
+  graphLinks: [],
+  folderColors: null,       // Map<folder, hex> + ._topMap
+  showLabels: false,        // toggle aA — default off (visualmente menos cargado en 3D)
+  selectedNode: null,       // referencia al objeto nodo seleccionado
+  selectedNeighborIds: null,// Set<id> de vecinos 1-hop del seleccionado
+  selectedLinks: null,      // Set<link> que tocan al seleccionado
+  searchHits: null,         // Set<id> matches del input de búsqueda
+  entityMatches: null,      // Set<id> matches del entity filter (heurística por label)
   // Filter state — cuando el user hace click en una entidad del top-list,
-  // dimmamos los nodos del grafo cuyo path NO contiene esa entidad. Implica
-  // un fetch al endpoint /api/atlas/note por nota, pero como ya tenemos las
-  // entities por nota en el backend, lo más eficiente es hacer una consulta
-  // server-side. Por simplicidad acá lo manejamos con búsqueda fuzzy en el
-  // label (proxy razonable cuando el name de la entity matches el name
-  // de la nota — ej. "Maria" matches "Info - Maria").
-  entityFilter: null,  // { id, name, type } | null
-  searchQuery: "",     // string
+  // dimmamos los nodos del grafo cuyo path NO contiene esa entidad. Heurística
+  // en el cliente vs hit al backend: si el label de la nota INCLUYE el name
+  // de la entity (case-insensitive), match — cubre bien el caso típico del
+  // vault del user (`Info - Maria` matches `Maria`).
+  entityFilter: null,       // { id, name, type } | null
+  searchQuery: "",          // string
+  sparkCharts: new Map(),   // entity_id → Chart.js instance
 };
+
+// Colores fijos para los estados especiales del graph 3D. Solid (no rgba),
+// porque ForceGraph3D no respeta alpha en .nodeColor() — la opacidad sale
+// del material three.js, no del color string.
+const COLOR_DIM = "#3a3a40";
+const COLOR_SELECTED = "#ffd86b";  // amarillo cálido
+const COLOR_NEIGHBOR_LINK = "#79c0ff";
+// Para los links: tres.js material respeta el color (hex) pero la opacidad
+// global la maneja `linkOpacity()`. Si pasamos rgba acá la alpha se multiplica
+// y queda invisible — usar hex sólido y dejar que linkOpacity haga su parte.
+const COLOR_DEFAULT_LINK = "#a0a0aa";
+const COLOR_DIM_LINK = "#3e3e46";
 
 // Detectar mobile para cap del graph_top_notes (perf en iPhone con 250+ nodos
 // + force-sim es brutal). 720px es el breakpoint del rest del proyecto.
@@ -66,7 +88,7 @@ function toggleTheme() {
   try { localStorage.setItem("rag-theme", next); } catch (e) {}
   applyTheme();
   // El graph usa colores CSS via getComputedStyle — re-pintamos.
-  if (state.graphSvg) repaintGraphColors();
+  if (state.graph3d) repaintGraphColors();
 }
 applyTheme();
 
@@ -284,20 +306,39 @@ function renderCooc(pairs) {
   }).join("");
 }
 
-// ── Graph estilo Obsidian (D3 force-directed) ───────────────────────────
+// ── Graph 3D (Three.js + 3d-force-graph) ────────────────────────────────
 function renderGraph(graph) {
   const card = document.getElementById("graph-card");
-  const svgEl = document.getElementById("graph-svg");
+  const containerEl = document.getElementById("graph-3d");
   const stats = document.getElementById("graph-stats");
-  const tip = document.getElementById("graph-tip");
-  if (!card || !svgEl) return;
+  if (!card || !containerEl) return;
 
-  // Clear previous
-  if (state.graphSim) state.graphSim.stop();
-  d3.select(svgEl).selectAll("*").remove();
+  // Si la lib UMD no cargó (offline / CDN caída), mostrar fallback.
+  // ForceGraph3D bundlea three.js internamente, así que con esto basta.
+  if (typeof ForceGraph3D !== "function") {
+    containerEl.innerHTML = `
+      <div style="display:flex; align-items:center; justify-content:center; height:100%; color:var(--text-faint); font-size:12px; text-align:center; padding:20px;">
+        No se pudo cargar el motor 3D (3d-force-graph).<br>
+        Revisá la conexión y recargá la página.
+      </div>`;
+    return;
+  }
 
-  const nodes = (graph.nodes || []).map((n) => ({ ...n }));  // copia mutable para D3
+  const nodes = (graph.nodes || []).map((n) => ({ ...n }));
   const links = (graph.links || []).map((l) => ({ ...l }));
+
+  // Pre-procesamos vecinos 1-hop para que la lógica de selección sea O(1)
+  // por nodo (en vez de scanear `links` cada click).
+  const nodeById = new Map(nodes.map((n) => [n.id, n]));
+  nodes.forEach((n) => { n._neighbors = new Set(); n._linkRefs = []; });
+  links.forEach((l) => {
+    const sId = (typeof l.source === "object") ? l.source.id : l.source;
+    const tId = (typeof l.target === "object") ? l.target.id : l.target;
+    const s = nodeById.get(sId);
+    const t = nodeById.get(tId);
+    if (s) { s._neighbors.add(tId); s._linkRefs.push(l); }
+    if (t) { t._neighbors.add(sId); t._linkRefs.push(l); }
+  });
 
   const totalNotes = graph.total_notes || nodes.length;
   const totalEdges = graph.total_edges || links.length;
@@ -308,191 +349,209 @@ function renderGraph(graph) {
   }
 
   if (!nodes.length) {
-    d3.select(svgEl).append("text")
-      .attr("x", "50%").attr("y", "50%")
-      .attr("text-anchor", "middle")
-      .attr("fill", "var(--text-faint)")
-      .style("font-size", "13px")
-      .text("Sin notas indexadas todavía. Corré `rag index` para poblar el grafo.");
+    containerEl.innerHTML = `
+      <div style="display:flex; align-items:center; justify-content:center; height:100%; color:var(--text-faint); font-size:13px;">
+        Sin notas indexadas todavía. Corré <code>rag index</code> para poblar el grafo.
+      </div>`;
     return;
   }
-
-  const rect = card.getBoundingClientRect();
-  const width = rect.width;
-  const height = rect.height;
-
-  const svg = d3.select(svgEl)
-    .attr("viewBox", [0, 0, width, height])
-    .attr("preserveAspectRatio", "xMidYMid meet");
 
   // ─ Folder color palette: reproducible per-folder hue. Igual que Obsidian
   //   le asigna un color por carpeta/grupo si abrís Group Settings.
   const folderColors = buildFolderColorMap(nodes);
+  state.folderColors = folderColors;
 
-  // ─ Layers ────────────────────────────────────────────────
-  const root = svg.append("g").attr("class", "g-root");
-  const linkLayer = root.append("g").attr("class", "g-links").attr("stroke-linecap", "round");
-  const nodeLayer = root.append("g").attr("class", "g-nodes");
-  const labelLayer = root.append("g").attr("class", "g-labels");
+  // Tear-down previo para evitar leaks si re-renderizamos (theme switch,
+  // resize, etc.).
+  if (state.graph3d) {
+    try { state.graph3d._destructor && state.graph3d._destructor(); } catch (e) {}
+    containerEl.innerHTML = "";
+  }
 
-  // ─ Zoom + pan ────────────────────────────────────────────
-  const zoom = d3.zoom()
-    .scaleExtent([0.15, 4])
-    .on("zoom", (event) => {
-      root.attr("transform", event.transform);
-      // Mostrar labels solo en zoom-in para evitar visual overload.
-      const scale = event.transform.k;
-      const labelClass = scale < 0.7 ? "g-label hidden" : "g-label";
-      labelLayer.selectAll("text").attr("class", labelClass);
-      state.graphTransform = event.transform;
-    });
-  svg.call(zoom).on("dblclick.zoom", null);  // disable double-click zoom (interfiere con click)
+  // ─ Tamaño nodo: degree → radio (3..10). Lo usamos como `nodeVal` que
+  //   3d-force-graph mapea a sphere-size = sqrt(val) * relSize.
+  const nodeVal = (n) => Math.max(0.5, Math.min(20, (n.degree || 1)));
 
-  // ─ Force simulation ─────────────────────────────────────
-  // Parámetros calibrados para 250 nodos. Mismo perfil que Obsidian:
-  // repulsión moderada, link distance proporcional a carga, centering
-  // gravitacional débil, collide igual al radio + slack.
-  const nodeRadius = (n) => Math.max(3, Math.min(14, 3 + Math.sqrt(n.degree || 1) * 1.6));
+  // ─ Background del canvas según tema (CSS var).
+  const bg = getComputedStyle(document.documentElement).getPropertyValue("--bg").trim() || "#1a1a1f";
 
-  const sim = d3.forceSimulation(nodes)
-    .force("link", d3.forceLink(links)
-      .id((d) => d.id)
-      .distance(46)
-      .strength(0.35))
-    .force("charge", d3.forceManyBody().strength(-130))
-    .force("center", d3.forceCenter(width / 2, height / 2))
-    .force("collide", d3.forceCollide().radius((d) => nodeRadius(d) + 3))
-    .force("x", d3.forceX(width / 2).strength(0.04))
-    .force("y", d3.forceY(height / 2).strength(0.04));
+  const Graph = ForceGraph3D({ controlType: "orbit" })
+    (containerEl)
+    .backgroundColor(bg)
+    .graphData({ nodes, links })
+    .nodeId("id")
+    .nodeVal(nodeVal)
+    .nodeRelSize(7)                // bola más grande para que el color se vea sin lambert washout
+    .nodeOpacity(1.0)
+    .nodeResolution(16)            // detalle de la esfera; 16 = bola redonda
+    .nodeLabel((n) => `
+      <div style="background:#222228;border:1px solid #3e3e46;border-radius:6px;padding:6px 10px;font-size:11px;color:#ececed;font-family:'SF Mono',monospace;">
+        <div><strong>${escapeHtml(n.label || "(sin título)")}</strong></div>
+        <div style="color:#7a7a82;margin-top:2px;">${escapeHtml(n.folder || "—")}</div>
+        <div style="color:#7a7a82;">${n.degree} conexión${n.degree === 1 ? "" : "es"} · ${n.n_chunks} chunk${n.n_chunks === 1 ? "" : "s"}</div>
+      </div>`)
+    .nodeColor(graphNodeColor)
+    .linkColor(graphLinkColor)
+    .linkWidth((l) => Math.max(0.4, Math.min(2.0, Math.sqrt(l.weight || 1) * 0.6)))
+    .linkOpacity(0.4)
+    .linkDirectionalParticles(0)   // partículas las prendemos solo en links highlighted
+    .linkDirectionalParticleWidth(1.4)
+    .linkDirectionalParticleSpeed(0.006)
+    .onNodeClick((node) => {
+      // Aim camera at clicked node from outside.
+      const distance = 90;
+      const r = Math.hypot(node.x || 0, node.y || 0, node.z || 0);
+      const distRatio = r > 0 ? 1 + distance / r : 1;
+      Graph.cameraPosition(
+        { x: (node.x || 0) * distRatio, y: (node.y || 0) * distRatio, z: ((node.z || 0) * distRatio) || distance },
+        node,
+        1200
+      );
+      selectNode(node);
+    })
+    .onNodeHover((node) => {
+      document.body.style.cursor = node ? "pointer" : "";
+    })
+    .onBackgroundClick(() => clearSelection());
 
-  state.graphSim = sim;
+  // Sprite labels (opcionales) — se prenden con el botón aA.
+  applyLabelMode(Graph);
 
-  // ─ Links ────────────────────────────────────────────────
-  const linkSel = linkLayer.selectAll("line")
-    .data(links)
-    .join("line")
-    .attr("class", "g-link")
-    .attr("stroke-width", (d) => Math.max(0.6, Math.min(2.5, Math.sqrt(d.weight || 1))));
+  // Cooling más rápido para no quedar gastando CPU eternamente.
+  Graph.d3Force("charge").strength(-110);
+  Graph.d3Force("link").distance(36);
+  Graph.cooldownTicks(180);
 
-  // ─ Nodes ────────────────────────────────────────────────
-  const nodeSel = nodeLayer.selectAll("circle")
-    .data(nodes, (d) => d.id)
-    .join("circle")
-    .attr("class", "g-node")
-    .attr("r", nodeRadius)
-    .attr("fill", (d) => folderColors.get(d.folder) || "var(--text-faint)")
-    .call(makeDrag(sim))
-    .on("mouseenter", (event, d) => onNodeHover(d, event))
-    .on("mouseleave", () => onNodeLeave())
-    .on("click", (event, d) => {
-      event.stopPropagation();
-      selectNode(d);
-    });
-
-  // ─ Labels ───────────────────────────────────────────────
-  const labelSel = labelLayer.selectAll("text")
-    .data(nodes, (d) => d.id)
-    .join("text")
-    .attr("class", "g-label")
-    .attr("dx", 8)
-    .attr("dy", "0.32em")
-    .text((d) => d.label || "(sin título)");
-
-  // ─ Click en background = clear selection ────────────────
-  svg.on("click", () => clearSelection());
-
-  // Guardamos refs a las selecciones para que las funciones de filter
-  // (search, entity-filter) puedan re-aplicar clases sin re-render.
-  state.graphLinks = links;
+  state.graph3d = Graph;
   state.graphNodes = nodes;
-  state.nodeSel = nodeSel;
-  state.linkSel = linkSel;
-  state.labelSel = labelSel;
-  state.zoom = zoom;
-  state.svg = svg;
-
-  // ─ Tick handler ─────────────────────────────────────────
-  sim.on("tick", () => {
-    linkSel
-      .attr("x1", (d) => d.source.x)
-      .attr("y1", (d) => d.source.y)
-      .attr("x2", (d) => d.target.x)
-      .attr("y2", (d) => d.target.y);
-    nodeSel
-      .attr("cx", (d) => d.x)
-      .attr("cy", (d) => d.y);
-    labelSel
-      .attr("x", (d) => d.x)
-      .attr("y", (d) => d.y);
-  });
-
-  // Stop after enough ticks — force layouts converge fast.
-  setTimeout(() => sim.alphaTarget(0).alpha(0).stop(), 8000);
+  state.graphLinks = links;
 
   // ─ Legend ───────────────────────────────────────────────
   renderGraphLegend(folderColors);
 
-  // ─ Controls ─────────────────────────────────────────────
-  document.getElementById("graph-zoom-in").onclick = () => svg.transition().duration(220).call(zoom.scaleBy, 1.4);
-  document.getElementById("graph-zoom-out").onclick = () => svg.transition().duration(220).call(zoom.scaleBy, 1 / 1.4);
-  document.getElementById("graph-reset").onclick = () => svg.transition().duration(280).call(zoom.transform, d3.zoomIdentity);
+  // ─ Controls (zoom in/out/reset/toggle labels) ───────────
+  document.getElementById("graph-zoom-in").onclick = () => zoomCamera(0.7);
+  document.getElementById("graph-zoom-out").onclick = () => zoomCamera(1.4);
+  document.getElementById("graph-reset").onclick = () => Graph.zoomToFit(600, 60);
   document.getElementById("graph-toggle-labels").onclick = () => {
     state.showLabels = !state.showLabels;
-    labelLayer.style("display", state.showLabels ? null : "none");
+    applyLabelMode(state.graph3d);
   };
 
-  // Tooltips wiring — atado al SVG container para coords correctas.
-  function onNodeHover(d, event) {
-    if (!tip) return;
-    tip.innerHTML = `
-      <div><strong>${escapeHtml(d.label || "(sin título)")}</strong></div>
-      <div class="tip-folder">${escapeHtml(d.folder || "—")}</div>
-      <div class="tip-folder">${d.degree} conexión${d.degree === 1 ? "" : "es"} · ${d.n_chunks} chunk${d.n_chunks === 1 ? "" : "s"}</div>
-    `;
-    const rect = card.getBoundingClientRect();
-    tip.style.left = `${event.clientX - rect.left + 14}px`;
-    tip.style.top = `${event.clientY - rect.top + 14}px`;
-    tip.classList.add("show");
+  // Resize handler propio (3d-force-graph se resizea solo cuando le pasamos
+  // width/height, lo hacemos con auto-detect del bounding rect).
+  function resize() {
+    const r = containerEl.getBoundingClientRect();
+    if (r.width > 0 && r.height > 0) {
+      Graph.width(r.width).height(r.height);
+    }
   }
-  function onNodeLeave() {
-    if (tip) tip.classList.remove("show");
-  }
+  resize();
+  // ResizeObserver es más confiable que window resize para el caso del card
+  // que cambia con el side-panel toggle.
+  const ro = new ResizeObserver(resize);
+  ro.observe(containerEl);
+  state._resizeObs = ro;
 
-  function selectNode(d) {
-    state.selectedNode = d;
-    const neighborIds = new Set([d.id]);
-    links.forEach((l) => {
-      const sId = (typeof l.source === "object") ? l.source.id : l.source;
-      const tId = (typeof l.target === "object") ? l.target.id : l.target;
-      if (sId === d.id) neighborIds.add(tId);
-      if (tId === d.id) neighborIds.add(sId);
-    });
-    nodeSel.classed("dim", (n) => !neighborIds.has(n.id));
-    linkSel.classed("hl", (l) => {
-      const sId = (typeof l.source === "object") ? l.source.id : l.source;
-      const tId = (typeof l.target === "object") ? l.target.id : l.target;
-      return sId === d.id || tId === d.id;
-    });
-    linkSel.classed("dim", (l) => {
-      const sId = (typeof l.source === "object") ? l.source.id : l.source;
-      const tId = (typeof l.target === "object") ? l.target.id : l.target;
-      return sId !== d.id && tId !== d.id;
-    });
-    labelSel.classed("hidden", (n) => !neighborIds.has(n.id));
-    labelSel.classed("hl", (n) => n.id === d.id);
-    // Side-panel con detalle de la nota.
-    openSidePanel(d);
+  // ZoomToFit cuando la simulación se calmó — encuadra todo el grafo en el
+  // primer paint sin que el user tenga que hacerlo a mano.
+  setTimeout(() => Graph.zoomToFit(900, 60), 1500);
+}
+
+// ─── Color accessors (re-evaluados en cada frame por 3d-force-graph) ────
+
+function graphNodeColor(node) {
+  if (!state.folderColors) return "#a0a0a6";
+  const baseColor = state.folderColors.get(node.folder) || "#a0a0a6";
+  // Selected node — always bright.
+  if (state.selectedNode && state.selectedNode.id === node.id) return COLOR_SELECTED;
+  // Selected mode: dim non-neighbors.
+  if (state.selectedNode && state.selectedNeighborIds && !state.selectedNeighborIds.has(node.id)) {
+    return COLOR_DIM;
   }
-  function clearSelection() {
-    state.selectedNode = null;
-    nodeSel.classed("dim", false);
-    linkSel.classed("dim", false).classed("hl", false);
-    labelSel.classed("hidden", false).classed("hl", false);
-    closeSidePanel();
-    // Re-aplicar entity filter si está activo (clearSelection no debe
-    // limpiar el filter, son cosas independientes).
-    if (state.entityFilter) applyEntityFilter(state.entityFilter);
+  // Search-active: yellow on hits, dim on misses.
+  if (state.searchHits) {
+    return state.searchHits.has(node.id) ? COLOR_SELECTED : COLOR_DIM;
   }
+  // Entity-filter: dim non-matches.
+  if (state.entityMatches && !state.entityMatches.has(node.id)) return COLOR_DIM;
+  return baseColor;
+}
+
+function graphLinkColor(link) {
+  if (state.selectedLinks && state.selectedLinks.has(link)) return COLOR_NEIGHBOR_LINK;
+  if (state.selectedNode || state.searchHits || state.entityMatches) return COLOR_DIM_LINK;
+  return COLOR_DEFAULT_LINK;
+}
+
+// Forzar re-evaluación de los accessors (los re-set triggea un re-paint).
+function refreshGraphVisuals() {
+  if (!state.graph3d) return;
+  state.graph3d.nodeColor(graphNodeColor).linkColor(graphLinkColor);
+  // Highlight: prendemos partículas solo en los links del subgrafo seleccionado.
+  if (state.selectedNode) {
+    state.graph3d.linkDirectionalParticles((l) => state.selectedLinks?.has(l) ? 3 : 0);
+  } else {
+    state.graph3d.linkDirectionalParticles(0);
+  }
+}
+
+function applyLabelMode(Graph) {
+  if (!Graph) return;
+  if (state.showLabels && typeof SpriteText === "function") {
+    Graph.nodeThreeObject((node) => {
+      const sprite = new SpriteText(node.label || "");
+      sprite.material.depthWrite = false;            // siempre visible aunque se solape
+      sprite.color = "#ececed";
+      sprite.textHeight = 3.2;
+      sprite.padding = 1;
+      sprite.position.set(0, nodeRadiusFor(node) + 4, 0);
+      return sprite;
+    }).nodeThreeObjectExtend(true);
+  } else {
+    // Quitar labels: forzamos accessor que retorne null + flag de "no extender"
+    // para que three-force-graph use el sphere default sin el sprite.
+    Graph.nodeThreeObject(() => null).nodeThreeObjectExtend(false);
+  }
+}
+
+function nodeRadiusFor(node) {
+  // Aprox del radio que 3d-force-graph dibuja con .nodeRelSize(4.5) y nodeVal(degree).
+  const v = Math.max(0.5, Math.min(20, node.degree || 1));
+  return Math.cbrt(v) * 4.5 * 0.5;
+}
+
+function zoomCamera(factor) {
+  if (!state.graph3d) return;
+  const cur = state.graph3d.cameraPosition();
+  state.graph3d.cameraPosition(
+    { x: cur.x * factor, y: cur.y * factor, z: cur.z * factor },
+    undefined,
+    300
+  );
+}
+
+// ─── Selección + clear ────────────────────────────────────────────────
+
+function selectNode(node) {
+  if (!state.graph3d) return;
+  state.selectedNode = node;
+  // Vecinos ya están pre-computados en n._neighbors / n._linkRefs.
+  state.selectedNeighborIds = new Set([node.id, ...(node._neighbors || [])]);
+  state.selectedLinks = new Set(node._linkRefs || []);
+  refreshGraphVisuals();
+  openSidePanel(node);
+}
+
+function clearSelection() {
+  state.selectedNode = null;
+  state.selectedNeighborIds = null;
+  state.selectedLinks = null;
+  closeSidePanel();
+  refreshGraphVisuals();
+  // Re-aplicar entity filter si está activo (clearSelection no debe
+  // limpiar el filter, son cosas independientes).
+  if (state.entityFilter) applyEntityFilter(state.entityFilter);
 }
 
 // ── Side-panel: detalle de una nota seleccionada ────────────────────────
@@ -507,13 +566,7 @@ async function openSidePanel(node) {
     <div class="gp-folder">${escapeHtml(node.folder || "—")}</div>
     <div class="gp-loading">Cargando detalle…</div>
   `;
-  document.getElementById("gp-close").addEventListener("click", () => {
-    if (state.nodeSel) state.nodeSel.classed("dim", false);
-    if (state.linkSel) state.linkSel.classed("dim", false).classed("hl", false);
-    if (state.labelSel) state.labelSel.classed("hidden", false).classed("hl", false);
-    state.selectedNode = null;
-    closeSidePanel();
-  });
+  document.getElementById("gp-close").addEventListener("click", () => clearSelection());
 
   // Fetch detalle.
   let detail;
@@ -574,13 +627,7 @@ async function openSidePanel(node) {
     ${neighborsBlock}
   `;
 
-  document.getElementById("gp-close").addEventListener("click", () => {
-    if (state.nodeSel) state.nodeSel.classed("dim", false);
-    if (state.linkSel) state.linkSel.classed("dim", false).classed("hl", false);
-    if (state.labelSel) state.labelSel.classed("hidden", false).classed("hl", false);
-    state.selectedNode = null;
-    closeSidePanel();
-  });
+  document.getElementById("gp-close").addEventListener("click", () => clearSelection());
 
   // Click en entidad del panel → filter del grafo.
   inner.querySelectorAll(".gp-list-row[data-entity-id]").forEach((row) => {
@@ -598,9 +645,17 @@ async function openSidePanel(node) {
       const path = row.dataset.neighborPath;
       if (!state.graphNodes) return;
       const target = state.graphNodes.find((n) => n.id === path);
-      if (target && state.nodeSel) {
-        // Trigger del mismo handler que un click en el SVG.
-        state.nodeSel.filter((n) => n.id === path).dispatch("click");
+      if (target && state.graph3d) {
+        // Mismo flujo que un click en una esfera del 3D.
+        const distance = 90;
+        const r = Math.hypot(target.x || 0, target.y || 0, target.z || 0);
+        const distRatio = r > 0 ? 1 + distance / r : 1;
+        state.graph3d.cameraPosition(
+          { x: (target.x || 0) * distRatio, y: (target.y || 0) * distRatio, z: ((target.z || 0) * distRatio) || distance },
+          target,
+          1200
+        );
+        selectNode(target);
       }
     });
   });
@@ -617,23 +672,14 @@ function applyEntityFilter(entity) {
   // Heurística sin hit al backend: si el label de la nota INCLUYE el name
   // de la entity (case-insensitive), la consideramos match. Cubre los casos
   // típicos del vault del user (`Info - Maria` matches `Maria`,
-  // `Moka - 1 a 1` matches `Moka`, etc.). Para el caso general donde el name
-  // de la entity NO está en el label, igual el visual feedback es útil
-  // (muestra qué notas TIENEN la entity en el título).
+  // `Moka - 1 a 1` matches `Moka`, etc.).
   const needle = entity.name.toLowerCase();
-  if (!state.nodeSel || !state.linkSel) return;
   const matchIds = new Set();
-  state.graphNodes.forEach((n) => {
+  (state.graphNodes || []).forEach((n) => {
     if ((n.label || "").toLowerCase().includes(needle)) matchIds.add(n.id);
   });
-  state.nodeSel.classed("dim", (n) => !matchIds.has(n.id));
-  state.linkSel.classed("dim", (l) => {
-    const sId = (typeof l.source === "object") ? l.source.id : l.source;
-    const tId = (typeof l.target === "object") ? l.target.id : l.target;
-    return !matchIds.has(sId) && !matchIds.has(tId);
-  });
-  state.linkSel.classed("hl", false);
-  state.labelSel.classed("hidden", (n) => !matchIds.has(n.id));
+  state.entityMatches = matchIds;
+  refreshGraphVisuals();
   // Banner explicativo.
   const banner = document.getElementById("graph-filter-banner");
   if (banner) {
@@ -651,57 +697,57 @@ function applyEntityFilter(entity) {
 
 function clearEntityFilter() {
   state.entityFilter = null;
-  if (state.nodeSel) state.nodeSel.classed("dim", false);
-  if (state.linkSel) state.linkSel.classed("dim", false).classed("hl", false);
-  if (state.labelSel) state.labelSel.classed("hidden", false);
+  state.entityMatches = null;
   document.querySelectorAll(".ent-row").forEach((row) => row.classList.remove("active"));
   const banner = document.getElementById("graph-filter-banner");
   if (banner) banner.hidden = true;
   const clearBtn = document.getElementById("graph-clear-filter");
   if (clearBtn) clearBtn.hidden = true;
-  // Re-aplicar selección de nodo si hay una activa.
-  if (state.selectedNode && state.nodeSel) {
-    state.nodeSel.filter((n) => n.id === state.selectedNode.id).dispatch("click");
-  }
+  refreshGraphVisuals();
 }
 
 // ── Buscador del grafo — input en el header del card ────────────────────
 function applySearch(query) {
   state.searchQuery = (query || "").trim().toLowerCase();
-  if (!state.nodeSel || !state.labelSel) return;
   if (!state.searchQuery) {
-    state.nodeSel.classed("search-hit", false);
+    state.searchHits = null;
+    refreshGraphVisuals();
     return;
   }
   // Match: substring del label (case-insensitive). Sirve también para folders
   // (ej. buscar "01-Projects" highlightea todas las notas en proyectos).
   const matchIds = new Set();
-  state.graphNodes.forEach((n) => {
+  (state.graphNodes || []).forEach((n) => {
     const hay = ((n.label || "") + " " + (n.folder || "")).toLowerCase();
     if (hay.includes(state.searchQuery)) matchIds.add(n.id);
   });
-  state.nodeSel.classed("search-hit", (n) => matchIds.has(n.id));
-  // Forzar labels visibles para los hits.
-  state.labelSel.classed("hidden", (n) => !matchIds.has(n.id));
-  // Centrar el zoom en el primer hit (si hay).
-  if (matchIds.size > 0 && matchIds.size <= 5 && state.zoom && state.svg) {
+  state.searchHits = matchIds;
+  refreshGraphVisuals();
+  // Centrar la cámara en el primer hit (si hay 1-5 matches — más es ruido).
+  if (matchIds.size > 0 && matchIds.size <= 5 && state.graph3d) {
     const firstHit = state.graphNodes.find((n) => matchIds.has(n.id));
     if (firstHit && firstHit.x != null) {
-      const rect = document.getElementById("graph-main").getBoundingClientRect();
-      const scale = 1.6;
-      const tx = rect.width / 2 - firstHit.x * scale;
-      const ty = rect.height / 2 - firstHit.y * scale;
-      state.svg.transition().duration(420).call(
-        state.zoom.transform,
-        d3.zoomIdentity.translate(tx, ty).scale(scale)
+      const distance = 80;
+      const r = Math.hypot(firstHit.x || 0, firstHit.y || 0, firstHit.z || 0);
+      const distRatio = r > 0 ? 1 + distance / r : 1;
+      state.graph3d.cameraPosition(
+        { x: (firstHit.x || 0) * distRatio, y: (firstHit.y || 0) * distRatio, z: ((firstHit.z || 0) * distRatio) || distance },
+        firstHit,
+        900
       );
     }
   }
 }
 
 function repaintGraphColors() {
-  // Forzar re-render del graph con la nueva paleta del tema.
-  if (state.payload) renderGraph(state.payload.graph || { nodes: [], links: [] });
+  // En 3D el background del canvas no se actualiza solo cuando cambia el tema
+  // — hay que mandárselo de nuevo. Los colores per-nodo salen del accessor
+  // así que con un refresh basta.
+  if (state.graph3d) {
+    const bg = getComputedStyle(document.documentElement).getPropertyValue("--bg").trim() || "#1a1a1f";
+    state.graph3d.backgroundColor(bg);
+    refreshGraphVisuals();
+  }
 }
 
 function buildFolderColorMap(nodes) {
@@ -756,27 +802,6 @@ function renderGraphLegend(folderColors) {
   `).join("");
 }
 
-function makeDrag(sim) {
-  function dragstarted(event, d) {
-    if (!event.active) sim.alphaTarget(0.3).restart();
-    d.fx = d.x;
-    d.fy = d.y;
-  }
-  function dragged(event, d) {
-    d.fx = event.x;
-    d.fy = event.y;
-  }
-  function dragended(event, d) {
-    if (!event.active) sim.alphaTarget(0);
-    d.fx = null;
-    d.fy = null;
-  }
-  return d3.drag()
-    .on("start", dragstarted)
-    .on("drag", dragged)
-    .on("end", dragended);
-}
-
 // ── helpers ─────────────────────────────────────────────────────────────
 function escapeHtml(s) {
   if (s == null) return "";
@@ -818,8 +843,7 @@ window.addEventListener("DOMContentLoaded", () => {
       } else if (state.entityFilter) {
         clearEntityFilter();
       } else if (state.selectedNode) {
-        // Trigger clearSelection via background-svg click handler.
-        if (state.svg) state.svg.dispatch("click");
+        clearSelection();
       }
     }
   });

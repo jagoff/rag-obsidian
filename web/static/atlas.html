@@ -32,10 +32,23 @@
   <script src="/static/pwa/register-sw.js" defer></script>
   <!-- Chart.js para sparklines de entidades. Misma versión que dashboard/finance. -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js" defer></script>
-  <!-- D3 v7 para el force-directed graph estilo Obsidian. Solo módulo "force"
-       + "selection" + "drag" + "zoom" alcanzaría, pero el bundle full es ~280
-       KB gzip y nos ahorra trabajo de cherry-pick. -->
-  <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js" defer></script>
+  <!-- ── 3D force-directed graph (Vasco Asturiano + three.js) ─────────
+       three@0.149 es la última versión que expone `window.THREE` como
+       global UMD — three deprecó UMD en r150+ y la r160 lo sacó del
+       todo. three-spritetext y otras libs UMD upstream necesitan el
+       global. Pinear acá hasta migrar todo el bundle a ESM/importmap.
+       Carga sequence:
+         1. three@0.149 → window.THREE
+         2. 3d-force-graph (UMD) → ForceGraph3D factory (bundlea su
+            propia copia de three internamente; queda harmless warning
+            "Multiple instances" en consola — no afecta render).
+         3. three-spritetext → SpriteText (usa window.THREE para
+            LinearFilter al construir el canvas-texture del label).
+       Total ~700 KB gzip; cargado solo en /atlas, otros dashboards no
+       pagan. NO defer porque atlas.js los usa al boot vía global. -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.149.0/build/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/3d-force-graph@1.73.4/dist/3d-force-graph.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three-spritetext@1.8.2/dist/three-spritetext.min.js"></script>
   <style>
     :root {
       --bg: #1a1a1f;
@@ -295,9 +308,10 @@
     .collapse-btn:hover { color: var(--text); border-color: var(--border-strong); }
     .learn-section-body.collapsed { display: none; }
 
-    /* ── Graph estilo Obsidian ───────────────────────────────────────
-       Contenedor SVG que ocupa ancho completo y se redibuja al resize.
-       Force-directed layout via D3. */
+    /* ── Graph 3D ────────────────────────────────────────────────────
+       Contenedor `<div id="graph-3d">` que aloja el canvas WebGL del
+       ForceGraph3D (three.js). Drag para rotar, scroll para zoom,
+       middle-click para pan. */
     .graph-card {
       background: var(--bg-card);
       border: 1px solid var(--border);
@@ -449,13 +463,15 @@
       font-size: 12px;
       font-style: italic;
     }
-    .graph-card svg {
-      display: block;
-      width: 100%;
-      height: 100%;
+    /* Contenedor 3D del ForceGraph3D — el canvas WebGL lo agrega 3d-force-graph
+       como hijo de este div al boot. */
+    #graph-3d {
+      position: absolute;
+      inset: 0;
       cursor: grab;
     }
-    .graph-card svg:active { cursor: grabbing; }
+    #graph-3d:active { cursor: grabbing; }
+    #graph-3d canvas { display: block; }
     .graph-controls {
       position: absolute;
       top: 12px;
@@ -554,40 +570,6 @@
       color: var(--text-faint);
       margin-top: 2px;
     }
-
-    /* SVG nodes / links / labels */
-    .g-node {
-      cursor: pointer;
-      stroke: var(--bg);
-      stroke-width: 1.2px;
-      transition: opacity 120ms, stroke-width 120ms;
-    }
-    .g-node.dim { opacity: 0.18; }
-    /* Search hit — pulso cyan que destaca al matchear el input de búsqueda */
-    .g-node.search-hit {
-      stroke: var(--cyan);
-      stroke-width: 2.6px;
-    }
-    .g-link {
-      stroke: var(--border-strong);
-      stroke-opacity: 0.45;
-      transition: stroke-opacity 120ms;
-    }
-    .g-link.dim { stroke-opacity: 0.06; }
-    .g-link.hl { stroke: var(--cyan); stroke-opacity: 0.85; }
-    .g-label {
-      font-family: inherit;
-      font-size: 10px;
-      fill: var(--text-dim);
-      pointer-events: none;
-      user-select: none;
-      paint-order: stroke;
-      stroke: var(--bg);
-      stroke-width: 3px;
-      stroke-linejoin: round;
-    }
-    .g-label.hidden { display: none; }
-    .g-label.hl { fill: var(--cyan); }
 
     /* ── Top entities grid (4 columnas: person/location/org/event) ─── */
     .ents-grid {
@@ -888,8 +870,8 @@
     <!-- ── 1. GRAFO DE NOTAS (estilo Obsidian) ───────────────────── -->
     <section class="learn-section" id="sec-graph" aria-labelledby="h-graph">
       <header class="learn-section-hdr">
-        <h2 id="h-graph" title="Force-directed graph igual al graph view de Obsidian">Mapa de conexiones entre notas</h2>
-        <p class="muted">Cada círculo es una nota; las líneas son wikilinks <code>[[...]]</code>. Tamaño = cantidad de conexiones. Color = carpeta. Click en una nota para resaltar sus vecinos.</p>
+        <h2 id="h-graph" title="Force-directed graph 3D — drag para rotar, scroll para zoom">Mapa de conexiones entre notas (3D)</h2>
+        <p class="muted">Cada esfera es una nota; las líneas son wikilinks <code>[[...]]</code>. Tamaño = cantidad de conexiones. Color = carpeta. <strong>Drag</strong> para rotar, <strong>scroll</strong> para zoom, <strong>click</strong> en una nota para resaltar sus vecinos.</p>
         <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-graph" data-collapse="body-graph">−</button>
       </header>
       <div class="learn-section-body" id="body-graph">
@@ -905,7 +887,7 @@
               <button class="btn-icon" id="graph-toggle-labels" type="button" title="Mostrar/ocultar etiquetas">aA</button>
               <button class="btn-icon" id="graph-clear-filter" type="button" title="Limpiar filtro de entidad" hidden>×</button>
             </div>
-            <svg id="graph-svg" role="img" aria-label="Graph view: notas como círculos, wikilinks como líneas"></svg>
+            <div id="graph-3d" role="img" aria-label="Graph 3D: notas como esferas en el espacio, wikilinks como líneas. Drag para rotar, scroll para zoom."></div>
             <div class="graph-tip" id="graph-tip" role="tooltip"></div>
             <div class="graph-legend" id="graph-legend"></div>
             <div class="graph-filter-banner" id="graph-filter-banner" hidden></div>

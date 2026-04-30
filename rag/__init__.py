@@ -31569,6 +31569,189 @@ def migrations_bootstrap_cmd(plain: bool) -> None:
         conn.close()
 
 
+# ─── mood CLI group ─────────────────────────────────────────────────────────
+
+
+def _mood_score_color(score: float) -> str:
+    """Color Rich según signo + magnitud del score."""
+    if score <= -0.5:
+        return "bright_red"
+    if score <= -0.2:
+        return "yellow"
+    if score >= 0.5:
+        return "bright_green"
+    if score >= 0.2:
+        return "green"
+    return "white"
+
+
+def _mood_score_bar(score: float, *, width: int = 7) -> str:
+    """Glyph para sparkline de un día. Score → caracter Unicode block.
+    score ≈ 0 → ─, negativo → bloques inferiores, positivo → superiores."""
+    # 8-step scale from -1 to +1.
+    glyphs = "▁▂▃▄▅▆▇█"
+    if score == 0:
+        return "─"
+    # Map score [-1, 1] → idx [0, 7]. score=-1 → ▁ (más bajo).
+    idx = max(0, min(7, int(round((score + 1.0) * 3.5))))
+    return glyphs[idx]
+
+
+@cli.group("mood", invoke_without_command=False)
+def mood_group() -> None:
+    """Mood tracking — score diario sobre Spotify + journal + WA + queries
+    + calendar. Behind flag RAG_MOOD_ENABLED=1.
+
+    Subcomandos:
+
+    - rag mood show [--days N]    sparkline + score actual
+    - rag mood explain [--date D] señales del día con evidence
+    - rag mood compute [--date D] re-corre el agregador (UPSERT)
+    """
+
+
+@mood_group.command("show")
+@click.option("--days", default=14, type=int, help="Días para sparkline (default 14)")
+@click.option("--plain", is_flag=True, help="Output mínimo, sin Rich")
+def mood_show_cmd(days: int, plain: bool) -> None:
+    """Muestra sparkline ASCII + score actual + drift status."""
+    from rag import mood as _mood  # noqa: PLC0415
+    if not _mood._is_mood_enabled():
+        click.echo("mood feature off (set RAG_MOOD_ENABLED=1)")
+        return
+    rows = _mood.get_recent_scores(days=days)
+    drift = _mood.recent_drift(days=7)
+    today_row = _mood.get_score_for_date(_mood._today_local())
+
+    if plain:
+        if not rows:
+            click.echo("no_data")
+            return
+        for r in reversed(rows):
+            click.echo(f"{r['date']}\t{r['score']:+.2f}\tn={r['n_signals']}")
+        if today_row:
+            click.echo(f"today\tscore={today_row['score']:+.2f}\tn={today_row['n_signals']}\tsources={today_row['sources_used']}")
+        click.echo(f"drift\tdrifting={drift['drifting']}\tconsec={drift['n_consecutive']}\treason={drift.get('reason') or 'streak_active'}")
+        return
+
+    if not rows:
+        console.print("[dim]no hay scores todavía. Corré `rag mood compute` después de que el daemon junte señales.[/dim]")
+        return
+
+    # Sparkline cronológico (oldest → newest).
+    spark_chars: list[str] = []
+    spark_dates: list[str] = []
+    for r in reversed(rows):
+        if r["n_signals"] == 0:
+            spark_chars.append("·")
+        else:
+            color = _mood_score_color(r["score"])
+            spark_chars.append(f"[{color}]{_mood_score_bar(r['score'])}[/{color}]")
+        spark_dates.append(r["date"][-5:])  # MM-DD
+
+    console.print(f"\n[bold]mood — last {days} days[/bold]")
+    console.print(" ".join(spark_chars))
+    console.print("[dim]" + " ".join(spark_dates) + "[/dim]")
+
+    if today_row and today_row["n_signals"] > 0:
+        color = _mood_score_color(today_row["score"])
+        console.print(f"\nhoy: [{color}]{today_row['score']:+.2f}[/{color}] "
+                      f"({today_row['n_signals']} señales · sources: {', '.join(today_row['sources_used'])})")
+        for s in (today_row["top_evidence"] or [])[:3]:
+            ev = s.get("evidence", {})
+            ev_str = ", ".join(f"{k}={v}" for k, v in list(ev.items())[:3])
+            console.print(f"  [dim]· {s['source']}/{s['signal_kind']}[/] "
+                          f"[{_mood_score_color(s['value'])}]{s['value']:+.2f}[/] [dim]{ev_str}[/dim]")
+    else:
+        console.print("\n[dim]hoy: sin score computado todavía (corré `rag mood compute`)[/dim]")
+
+    # Drift status.
+    if drift["drifting"]:
+        console.print(f"\n[bright_red]⚠ drift detectado:[/bright_red] "
+                      f"{drift['n_consecutive']} días consecutivos con score ≤ -0.4 "
+                      f"(avg {drift['avg_score']:+.2f})")
+        console.print(f"[dim]  fechas: {', '.join(drift['dates'])}[/dim]")
+    else:
+        if drift["n_consecutive"] > 0:
+            console.print(f"\n[dim]racha actual: {drift['n_consecutive']} días bajo threshold "
+                          f"(reason: {drift.get('reason') or 'n/a'})[/dim]")
+        else:
+            console.print("\n[green]sin racha negativa activa[/green]")
+
+
+@mood_group.command("explain")
+@click.option("--date", default=None, help="YYYY-MM-DD (default: hoy)")
+@click.option("--plain", is_flag=True)
+def mood_explain_cmd(date: str | None, plain: bool) -> None:
+    """Lista las señales del día con evidence completa."""
+    from rag import mood as _mood  # noqa: PLC0415
+    if not _mood._is_mood_enabled():
+        click.echo("mood feature off (set RAG_MOOD_ENABLED=1)")
+        return
+    target = date or _mood._today_local()
+    signals = _mood._read_signals_for_date(target)
+    score_row = _mood.get_score_for_date(target)
+
+    if plain:
+        click.echo(f"date={target}")
+        if score_row:
+            click.echo(f"score={score_row['score']:+.3f} n={score_row['n_signals']} "
+                       f"sources={','.join(score_row['sources_used'])}")
+        else:
+            click.echo("score=none (run `rag mood compute`)")
+        for s in signals:
+            ev_short = json.dumps(s["evidence"], ensure_ascii=False)[:120]
+            click.echo(f"  {s['source']}/{s['signal_kind']}\tval={s['value']:+.2f}\tw={s['weight']:.1f}\tev={ev_short}")
+        return
+
+    console.print(f"\n[bold]mood signals — {target}[/bold]")
+    if score_row:
+        color = _mood_score_color(score_row["score"])
+        console.print(f"score: [{color}]{score_row['score']:+.3f}[/] "
+                      f"({score_row['n_signals']} señales · "
+                      f"sources: {', '.join(score_row['sources_used'])})\n")
+    else:
+        console.print("[yellow]score no computado todavía. Corré `rag mood compute --date " + target + "`[/yellow]\n")
+
+    if not signals:
+        console.print("[dim]no hay señales para esta fecha[/dim]")
+        return
+
+    for s in signals:
+        color = _mood_score_color(s["value"])
+        console.print(f"[bold]{s['source']}/{s['signal_kind']}[/]  "
+                      f"[{color}]{s['value']:+.2f}[/]  [dim]w={s['weight']:.1f}[/dim]")
+        ev = s.get("evidence") or {}
+        for k, v in ev.items():
+            v_str = json.dumps(v, ensure_ascii=False) if not isinstance(v, str) else v
+            if len(v_str) > 100:
+                v_str = v_str[:97] + "..."
+            console.print(f"  [dim]{k}:[/dim] {v_str}")
+        console.print()
+
+
+@mood_group.command("compute")
+@click.option("--date", default=None, help="YYYY-MM-DD (default: hoy)")
+@click.option("--plain", is_flag=True)
+def mood_compute_cmd(date: str | None, plain: bool) -> None:
+    """Re-computa el score diario (UPSERT en rag_mood_score_daily)."""
+    from rag import mood as _mood  # noqa: PLC0415
+    if not _mood._is_mood_enabled():
+        click.echo("mood feature off (set RAG_MOOD_ENABLED=1)")
+        return
+    result = _mood.compute_daily_score(date)
+    if plain:
+        click.echo(f"date={result['date']} score={result['score']:+.3f} "
+                   f"n={result['n_signals']} sources={','.join(result['sources_used'])}")
+        return
+    color = _mood_score_color(result["score"])
+    console.print(f"[bold]{result['date']}[/]  "
+                  f"score: [{color}]{result['score']:+.3f}[/]  "
+                  f"({result['n_signals']} señales)")
+    if result["sources_used"]:
+        console.print(f"sources: {', '.join(result['sources_used'])}")
+
+
 @cli.command("state")
 @click.argument("text", required=False)
 @click.option("--clear", is_flag=True, help="Borra el estado actual")

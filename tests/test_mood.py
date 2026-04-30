@@ -641,3 +641,293 @@ def test_parse_event_time_handles_formats():
     assert mood._parse_event_time("3:00 PM") == (15, 0)
     assert mood._parse_event_time("garbage") is None
     assert mood._parse_event_time("25:00") is None
+
+
+# ─── Aggregator + drift ────────────────────────────────────────────────────
+
+
+_SCORE_DAILY_DDL = """
+CREATE TABLE rag_mood_score_daily (
+    date TEXT PRIMARY KEY,
+    score REAL NOT NULL,
+    n_signals INTEGER NOT NULL,
+    sources_used TEXT,
+    top_evidence TEXT,
+    updated_at REAL NOT NULL
+)
+"""
+
+
+@pytest.fixture
+def temp_full_db(tmp_path, monkeypatch):
+    """Temp DB con todas las tablas que usan el agregador + scorers."""
+    db = tmp_path / "telemetry.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(_SPOTIFY_DDL)
+    conn.execute(_MOOD_SIGNALS_DDL)
+    conn.execute(_QUERIES_DDL)
+    conn.execute(_SCORE_DAILY_DDL)
+    conn.commit()
+    conn.close()
+
+    @contextlib.contextmanager
+    def _fake_conn():
+        c = sqlite3.connect(str(db))
+        try:
+            yield c
+            c.commit()
+        finally:
+            c.close()
+
+    monkeypatch.setattr(rag, "_ragvec_state_conn", _fake_conn)
+    yield db
+
+
+def _insert_signal(
+    db: Path, *, date: str, source: str, kind: str,
+    value: float, weight: float = 1.0, evidence: dict | None = None,
+    ts: float | None = None,
+) -> None:
+    ts = ts if ts is not None else time.time()
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "INSERT INTO rag_mood_signals(ts, date, source, signal_kind, "
+        "value, weight, evidence) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (ts, date, source, kind, value, weight,
+         json.dumps(evidence or {})),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_compute_daily_score_no_signals_writes_empty_row(temp_full_db, mood_enabled):
+    """Sin señales: UPSERT escribe row con n_signals=0 score=0."""
+    today = mood._today_local()
+    res = mood.compute_daily_score(today)
+    assert res["score"] == 0.0
+    assert res["n_signals"] == 0
+    row = mood.get_score_for_date(today)
+    assert row is not None
+    assert row["score"] == 0.0
+    assert row["n_signals"] == 0
+
+
+def test_compute_daily_score_weighted_avg(temp_full_db, mood_enabled):
+    """3 señales con distintos weights: score = sum(v*w) / sum(w)."""
+    today = mood._today_local()
+    _insert_signal(temp_full_db, date=today, source="spotify",
+                   kind="artist_mood_lookup", value=-0.6, weight=1.0)
+    _insert_signal(temp_full_db, date=today, source="journal",
+                   kind="keyword_negative", value=-0.5, weight=1.0)
+    _insert_signal(temp_full_db, date=today, source="calendar",
+                   kind="density_overload", value=-0.3, weight=0.4)
+    res = mood.compute_daily_score(today)
+    # (-0.6*1 + -0.5*1 + -0.3*0.4) / 2.4 = -1.22/2.4 ≈ -0.508
+    assert res["score"] == pytest.approx(-0.508, abs=0.01)
+    assert res["n_signals"] == 3
+    assert "spotify" in res["sources_used"]
+    assert "journal" in res["sources_used"]
+    assert "calendar" in res["sources_used"]
+
+
+def test_compute_daily_score_top_evidence_ranked_by_contribution(temp_full_db, mood_enabled):
+    """Top evidence devuelve las 3 señales por |value*weight| descendente."""
+    today = mood._today_local()
+    _insert_signal(temp_full_db, date=today, source="spotify",
+                   kind="artist_mood_lookup", value=-0.4, weight=1.0)  # |contrib|=0.4
+    _insert_signal(temp_full_db, date=today, source="journal",
+                   kind="keyword_negative", value=-0.9, weight=1.0)    # |contrib|=0.9
+    _insert_signal(temp_full_db, date=today, source="calendar",
+                   kind="density_overload", value=-0.3, weight=0.4)    # |contrib|=0.12
+    _insert_signal(temp_full_db, date=today, source="queries",
+                   kind="existential_pattern", value=-0.7, weight=0.4) # |contrib|=0.28
+    res = mood.compute_daily_score(today)
+    top = res["top_evidence"]
+    assert len(top) == 3
+    # Top 1 = journal (0.9), top 2 = spotify (0.4), top 3 = queries (0.28).
+    assert top[0]["source"] == "journal"
+    assert top[1]["source"] == "spotify"
+    assert top[2]["source"] == "queries"
+
+
+def test_compute_daily_score_idempotent_upsert(temp_full_db, mood_enabled):
+    """Llamar compute_daily_score 2 veces para la misma fecha no
+    duplica filas en rag_mood_score_daily (UPSERT por date PK)."""
+    today = mood._today_local()
+    _insert_signal(temp_full_db, date=today, source="spotify",
+                   kind="artist_mood_lookup", value=-0.6, weight=1.0)
+    mood.compute_daily_score(today)
+    # Insertar otra señal y recompute → score actualizado, 1 sola row.
+    _insert_signal(temp_full_db, date=today, source="journal",
+                   kind="keyword_negative", value=-0.4, weight=1.0)
+    mood.compute_daily_score(today)
+    conn = sqlite3.connect(str(temp_full_db))
+    n = conn.execute("SELECT COUNT(*) FROM rag_mood_score_daily WHERE date=?",
+                     (today,)).fetchone()[0]
+    conn.close()
+    assert n == 1
+    row = mood.get_score_for_date(today)
+    assert row["n_signals"] == 2
+
+
+def test_compute_daily_score_flag_off_returns_zero(temp_full_db, monkeypatch):
+    """Con RAG_MOOD_ENABLED off, no escribe en DB y devuelve score 0."""
+    monkeypatch.delenv("RAG_MOOD_ENABLED", raising=False)
+    today = mood._today_local()
+    res = mood.compute_daily_score(today)
+    assert res["score"] == 0.0
+    assert res["n_signals"] == 0
+    # Nada escrito.
+    assert mood.get_score_for_date(today) is None
+
+
+def _insert_score_row(
+    db: Path, *, date: str, score: float, n_signals: int,
+    sources: list | None = None, top_evidence: list | None = None,
+) -> None:
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "INSERT INTO rag_mood_score_daily(date, score, n_signals, "
+        "sources_used, top_evidence, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (date, score, n_signals,
+         json.dumps(sources or []),
+         json.dumps(top_evidence or []),
+         time.time()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_recent_drift_no_data(temp_full_db, mood_enabled):
+    res = mood.recent_drift()
+    assert res["drifting"] is False
+    assert res["reason"] == "no_data"
+
+
+def test_recent_drift_3_consecutive_under_threshold(temp_full_db, mood_enabled):
+    """3 días consecutivos terminando hoy con score ≤ -0.4 → drift."""
+    today_ts = time.time()
+    for offset in (2, 1, 0):
+        date = time.strftime("%Y-%m-%d", time.localtime(today_ts - offset * 86400))
+        _insert_score_row(temp_full_db, date=date, score=-0.5, n_signals=3)
+    res = mood.recent_drift(min_consecutive=3)
+    assert res["drifting"] is True
+    assert res["n_consecutive"] == 3
+    assert res["avg_score"] == pytest.approx(-0.5)
+
+
+def test_recent_drift_streak_broken_in_middle(temp_full_db, mood_enabled):
+    """Si hay 2 días bajo, 1 día por encima, 1 día bajo → no drift
+    (racha actual = 1)."""
+    today_ts = time.time()
+    scores = [-0.5, -0.5, +0.1, -0.5]  # offset 3, 2, 1, 0 (today)
+    for i, sc in enumerate(scores):
+        offset = len(scores) - 1 - i
+        date = time.strftime("%Y-%m-%d", time.localtime(today_ts - offset * 86400))
+        _insert_score_row(temp_full_db, date=date, score=sc, n_signals=2)
+    res = mood.recent_drift(min_consecutive=3)
+    assert res["drifting"] is False
+    # La racha actual termina en today con 1 día — n_consecutive=1
+    # (la racha "más larga" son 2 al inicio, pero esa terminó hace mucho).
+    assert res["n_consecutive"] in (1, 2)
+
+
+def test_recent_drift_stale_streak_does_not_trigger(temp_full_db, mood_enabled):
+    """Una racha larga que terminó hace 3 días NO es drift (no avisamos
+    bajones viejos)."""
+    today_ts = time.time()
+    # offset 5,4,3 = bajo. offset 2,1,0 = alto.
+    for offset in (5, 4, 3):
+        date = time.strftime("%Y-%m-%d", time.localtime(today_ts - offset * 86400))
+        _insert_score_row(temp_full_db, date=date, score=-0.6, n_signals=3)
+    for offset in (2, 1, 0):
+        date = time.strftime("%Y-%m-%d", time.localtime(today_ts - offset * 86400))
+        _insert_score_row(temp_full_db, date=date, score=+0.2, n_signals=3)
+    res = mood.recent_drift(days=10, min_consecutive=3)
+    assert res["drifting"] is False
+
+
+def test_recent_drift_ignores_zero_signal_days(temp_full_db, mood_enabled):
+    """Días con n_signals=0 NO cuentan para la racha (aunque el score
+    grabado sea 0 por default — no hay evidence real)."""
+    today_ts = time.time()
+    for offset in (3, 2, 1, 0):
+        date = time.strftime("%Y-%m-%d", time.localtime(today_ts - offset * 86400))
+        # Todos los 4 días tienen score=-0.5 PERO n_signals=0 → ignorar.
+        _insert_score_row(temp_full_db, date=date, score=-0.5, n_signals=0)
+    res = mood.recent_drift(min_consecutive=3)
+    assert res["drifting"] is False
+
+
+def test_get_recent_scores_returns_descending(temp_full_db, mood_enabled):
+    today_ts = time.time()
+    for offset in (5, 3, 1, 0):
+        date = time.strftime("%Y-%m-%d", time.localtime(today_ts - offset * 86400))
+        _insert_score_row(temp_full_db, date=date, score=-0.1 * offset, n_signals=2)
+    rows = mood.get_recent_scores(days=14)
+    assert len(rows) == 4
+    # Ordenado date DESC: el primero es el de hoy (offset=0).
+    assert rows[0]["date"] >= rows[-1]["date"]
+
+
+def test_score_glyph_mapping():
+    """Sanity check del helper para sparkline."""
+    assert rag._mood_score_bar(-1.0) == "▁"
+    assert rag._mood_score_bar(1.0) == "█"
+    assert rag._mood_score_bar(0.0) == "─"
+    assert rag._mood_score_bar(-0.5) in "▁▂▃"
+    assert rag._mood_score_bar(0.5) in "▆▇█"
+
+
+# ─── CLI smoke ─────────────────────────────────────────────────────────────
+
+
+def test_cli_mood_show_with_data(temp_full_db, mood_enabled):
+    today_ts = time.time()
+    for offset in (2, 1, 0):
+        date = time.strftime("%Y-%m-%d", time.localtime(today_ts - offset * 86400))
+        _insert_score_row(temp_full_db, date=date, score=-0.5, n_signals=3,
+                          sources=["spotify"])
+
+    from click.testing import CliRunner
+    runner = CliRunner()
+    result = runner.invoke(rag.cli, ["mood", "show", "--days", "5", "--plain"])
+    assert result.exit_code == 0, result.output
+    # Contiene fechas + score + drift line.
+    assert "drift" in result.output
+    today_str = time.strftime("%Y-%m-%d", time.localtime(today_ts))
+    assert today_str in result.output
+
+
+def test_cli_mood_show_flag_off(temp_full_db, monkeypatch):
+    monkeypatch.delenv("RAG_MOOD_ENABLED", raising=False)
+    from click.testing import CliRunner
+    runner = CliRunner()
+    result = runner.invoke(rag.cli, ["mood", "show", "--plain"])
+    assert result.exit_code == 0
+    assert "feature off" in result.output
+
+
+def test_cli_mood_compute(temp_full_db, mood_enabled):
+    today = mood._today_local()
+    _insert_signal(temp_full_db, date=today, source="spotify",
+                   kind="artist_mood_lookup", value=-0.5, weight=1.0)
+    from click.testing import CliRunner
+    runner = CliRunner()
+    result = runner.invoke(rag.cli, ["mood", "compute", "--plain"])
+    assert result.exit_code == 0, result.output
+    assert "score=" in result.output
+    assert "spotify" in result.output
+
+
+def test_cli_mood_explain(temp_full_db, mood_enabled):
+    today = mood._today_local()
+    _insert_signal(temp_full_db, date=today, source="journal",
+                   kind="keyword_negative", value=-0.6, weight=1.0,
+                   evidence={"keywords": ["bajón"], "n_matches": 1})
+    from click.testing import CliRunner
+    runner = CliRunner()
+    result = runner.invoke(rag.cli, ["mood", "explain", "--plain"])
+    assert result.exit_code == 0, result.output
+    assert "journal" in result.output
+    assert "keyword_negative" in result.output

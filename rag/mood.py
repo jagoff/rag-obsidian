@@ -903,12 +903,248 @@ def score_calendar_density(
     return out
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Daily aggregator + drift detection
+
+
+def _read_signals_for_date(date: str) -> list[dict[str, Any]]:
+    """Lee todas las señales de un día desde `rag_mood_signals`.
+    Devuelve `[{source, signal_kind, value, weight, evidence}, ...]`.
+    `evidence` ya parseado a dict (era JSON). Silent-fail → []."""
+    try:
+        from rag import _ragvec_state_conn  # noqa: PLC0415
+        with _ragvec_state_conn() as conn:
+            rows = conn.execute(
+                "SELECT source, signal_kind, value, weight, evidence "
+                "FROM rag_mood_signals WHERE date = ? ORDER BY ts ASC",
+                (date,),
+            ).fetchall()
+    except Exception as exc:
+        _silent_log_safe("mood_aggregator_read_failed", exc)
+        return []
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        try:
+            evidence = json.loads(r[4]) if r[4] else {}
+        except Exception:
+            evidence = {}
+        out.append({
+            "source": r[0],
+            "signal_kind": r[1],
+            "value": float(r[2]),
+            "weight": float(r[3]),
+            "evidence": evidence,
+        })
+    return out
+
+
+def compute_daily_score(date: str | None = None) -> dict[str, Any]:
+    """Lee `rag_mood_signals` para `date` (YYYY-MM-DD, default = hoy local),
+    computa weighted-avg, y UPSERT en `rag_mood_score_daily`.
+
+    Algoritmo:
+      score = sum(value_i * weight_i) / sum(weight_i)
+    si total_weight = 0 → score 0 con n_signals=0 (caso "sin datos
+    todavía hoy"). El UPSERT escribe igual para que el consumer pueda
+    distinguir "no corrió aún" (no row) de "corrió y no había datos"
+    (row con n_signals=0).
+
+    Devuelve dict `{date, score, n_signals, sources_used, top_evidence}`
+    con el resultado. Top_evidence = top 3 señales por |value*weight|
+    (las que más contribuyen al score), serializado como list de dicts
+    `{source, signal_kind, value, weight, evidence}`."""
+    if not _is_mood_enabled():
+        return {"date": date or _today_local(), "score": 0.0, "n_signals": 0,
+                "sources_used": [], "top_evidence": []}
+
+    date = date or _today_local()
+    signals = _read_signals_for_date(date)
+
+    if signals:
+        total_weight = sum(s["weight"] for s in signals)
+        if total_weight > 0:
+            score = sum(s["value"] * s["weight"] for s in signals) / total_weight
+        else:
+            score = 0.0
+        sources_used = sorted({s["source"] for s in signals})
+        # Top evidence por |contribution| = |value * weight|.
+        ranked = sorted(
+            signals, key=lambda s: abs(s["value"] * s["weight"]), reverse=True,
+        )[:3]
+        top_evidence = [
+            {
+                "source": s["source"],
+                "signal_kind": s["signal_kind"],
+                "value": s["value"],
+                "weight": s["weight"],
+                "evidence": s["evidence"],
+            }
+            for s in ranked
+        ]
+    else:
+        score = 0.0
+        sources_used = []
+        top_evidence = []
+
+    n_signals = len(signals)
+    updated_at = _now_ts()
+    try:
+        from rag import _ragvec_state_conn  # noqa: PLC0415
+        with _ragvec_state_conn() as conn:
+            conn.execute(
+                "INSERT INTO rag_mood_score_daily "
+                "(date, score, n_signals, sources_used, top_evidence, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(date) DO UPDATE SET "
+                "  score=excluded.score, n_signals=excluded.n_signals, "
+                "  sources_used=excluded.sources_used, "
+                "  top_evidence=excluded.top_evidence, "
+                "  updated_at=excluded.updated_at",
+                (
+                    date, float(score), int(n_signals),
+                    json.dumps(sources_used, ensure_ascii=False),
+                    json.dumps(top_evidence, ensure_ascii=False),
+                    updated_at,
+                ),
+            )
+    except Exception as exc:
+        _silent_log_safe("mood_aggregator_upsert_failed", exc)
+
+    return {
+        "date": date, "score": score, "n_signals": n_signals,
+        "sources_used": sources_used, "top_evidence": top_evidence,
+    }
+
+
+def get_score_for_date(date: str) -> dict[str, Any] | None:
+    """Lee row de `rag_mood_score_daily` para una fecha. None si no hay
+    row (no se computó todavía o el feature está off)."""
+    try:
+        from rag import _ragvec_state_conn  # noqa: PLC0415
+        with _ragvec_state_conn() as conn:
+            row = conn.execute(
+                "SELECT date, score, n_signals, sources_used, top_evidence, updated_at "
+                "FROM rag_mood_score_daily WHERE date = ?",
+                (date,),
+            ).fetchone()
+    except Exception as exc:
+        _silent_log_safe("mood_get_score_failed", exc)
+        return None
+    if not row:
+        return None
+    try:
+        sources = json.loads(row[3]) if row[3] else []
+    except Exception:
+        sources = []
+    try:
+        evidence = json.loads(row[4]) if row[4] else []
+    except Exception:
+        evidence = []
+    return {
+        "date": row[0],
+        "score": float(row[1]),
+        "n_signals": int(row[2]),
+        "sources_used": sources,
+        "top_evidence": evidence,
+        "updated_at": float(row[5]),
+    }
+
+
+def get_recent_scores(days: int = 14) -> list[dict[str, Any]]:
+    """Devuelve hasta `days` filas de `rag_mood_score_daily` ordenadas
+    por date DESC (más reciente primero). Útil para sparkline en CLI."""
+    try:
+        from rag import _ragvec_state_conn  # noqa: PLC0415
+        with _ragvec_state_conn() as conn:
+            rows = conn.execute(
+                "SELECT date, score, n_signals FROM rag_mood_score_daily "
+                "ORDER BY date DESC LIMIT ?",
+                (int(days),),
+            ).fetchall()
+    except Exception as exc:
+        _silent_log_safe("mood_get_recent_failed", exc)
+        return []
+    return [
+        {"date": r[0], "score": float(r[1]), "n_signals": int(r[2])}
+        for r in rows
+    ]
+
+
+def recent_drift(
+    *,
+    days: int = 7,
+    threshold: float = -0.4,
+    min_consecutive: int = 3,
+) -> dict[str, Any]:
+    """Detecta racha sostenida de score ≤ `threshold` en los últimos
+    `days`. Una racha es ≥ `min_consecutive` días consecutivos
+    (terminando hoy o ayer — toleramos un día sin data).
+
+    Devuelve `{drifting: bool, n_consecutive: int, dates: list[str],
+    avg_score: float, reason: str|None}`. `drifting=True` solo si la
+    racha ≥ min_consecutive Y termina hoy o ayer (no detectamos bajones
+    históricos viejos).
+
+    Threshold conservador (-0.4) intencional — evita falsos positivos
+    en días con un solo signal moderado."""
+    rows = get_recent_scores(days=days + 1)
+    if not rows:
+        return {"drifting": False, "n_consecutive": 0, "dates": [],
+                "avg_score": 0.0, "reason": "no_data"}
+
+    today = _today_local()
+    yesterday = _today_local(_now_ts() - 86400)
+
+    # Ordenar ascendente por date para iterar cronológicamente.
+    rows = sorted(rows, key=lambda r: r["date"])
+
+    # Buscar la racha más reciente que termine en today o yesterday.
+    best_run: list[dict[str, Any]] = []
+    current_run: list[dict[str, Any]] = []
+    for r in rows:
+        if r["score"] <= threshold and r["n_signals"] > 0:
+            current_run.append(r)
+        else:
+            if len(current_run) >= len(best_run):
+                best_run = list(current_run)
+            current_run = []
+    # Capturar racha final si terminó en el último row.
+    if len(current_run) >= len(best_run):
+        best_run = list(current_run)
+
+    if not best_run:
+        return {"drifting": False, "n_consecutive": 0, "dates": [],
+                "avg_score": 0.0, "reason": "no_streak"}
+
+    last_date = best_run[-1]["date"]
+    if last_date not in (today, yesterday):
+        return {"drifting": False, "n_consecutive": len(best_run),
+                "dates": [r["date"] for r in best_run],
+                "avg_score": sum(r["score"] for r in best_run) / len(best_run),
+                "reason": f"stale_streak_ended_{last_date}"}
+
+    n_consec = len(best_run)
+    avg = sum(r["score"] for r in best_run) / n_consec
+    drifting = n_consec >= min_consecutive
+    return {
+        "drifting": drifting,
+        "n_consecutive": n_consec,
+        "dates": [r["date"] for r in best_run],
+        "avg_score": avg,
+        "reason": None if drifting else f"only_{n_consec}_days_under_threshold",
+    }
+
+
 __all__ = [
     "score_spotify_window",
     "score_journal_recent",
     "score_wa_outbound_window",
     "score_queries_existential",
     "score_calendar_density",
+    "compute_daily_score",
+    "get_score_for_date",
+    "get_recent_scores",
+    "recent_drift",
     "_is_mood_enabled",
     "_persist_signal",
     "_load_artist_mood_table",

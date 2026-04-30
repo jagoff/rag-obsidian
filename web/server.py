@@ -13088,6 +13088,35 @@ def atlas_note_api(path: str) -> dict:
     return note_detail(path=path)
 
 
+class SemanticLayoutRequest(BaseModel):
+    """Body del POST /api/atlas/semantic-layout.
+
+    Mandamos la lista de paths visibles en el grafo (top-N) para que el
+    backend solo proyecte ESOS — si proyectamos las 5000 notas del vault
+    perdemos los puntos del top-N en el cluster general.
+    """
+    paths: list[str]
+
+
+@app.post("/api/atlas/semantic-layout")
+def atlas_semantic_layout_api(req: SemanticLayoutRequest) -> dict:
+    """Proyecta los embeddings bge-m3 de las notas dadas a 3D via PCA.
+
+    Devuelve `{path: [x, y, z]}` que el frontend usa como posiciones fijas
+    del grafo (re-layout por similitud conceptual en vez de wikilinks).
+
+    El cómputo es ~300ms para 500 notas, cacheado 24h por (paths_hash,
+    vault_path). En cache hit < 1ms. Detalle de la implementación PCA en
+    `web.atlas_dashboard.semantic_layout`.
+    """
+    paths = req.paths or []
+    # Caps defensivos: > 2000 paths es un cliente buggeado o abusivo.
+    if len(paths) > 2000:
+        paths = paths[:2000]
+    from web.atlas_dashboard import semantic_layout
+    return semantic_layout(paths=paths)
+
+
 # ── /transcripts — dashboard de telemetría del whisper learning loop ─────────
 # Phase 2 Step 3.b. Página HTML server-rendered (no SPA) con stats agregadas
 # de las transcripciones de audio, correcciones acumuladas, y top vocab terms

@@ -609,6 +609,29 @@
       z-index: 5;
     }
     .graph-controls .btn-icon { padding: 4px 8px; font-size: 11px; }
+
+    /* Toggle estructural ↔ semántico — dos botones unidos como segmented
+       control. La segmentación visual ayuda a leer "esto es UNA opción
+       con dos estados" en vez de "dos botones separados". */
+    .graph-mode-toggle {
+      display: inline-flex;
+      gap: 0;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+    .graph-mode-toggle .btn-icon {
+      border: none;
+      border-radius: 0;
+      padding: 4px 10px;
+    }
+    .graph-mode-toggle .btn-icon + .btn-icon {
+      border-left: 1px solid var(--border);
+    }
+    .graph-mode-toggle .btn-icon.active {
+      background: color-mix(in srgb, var(--cyan) 22%, var(--bg-elev));
+      color: var(--cyan);
+    }
     .graph-search-input {
       background: color-mix(in srgb, var(--bg-card) 88%, transparent);
       border: 1px solid var(--border);
@@ -738,19 +761,14 @@
       flex-direction: column;
       gap: 4px;
     }
-    /* ── Entity rows: estilo "most played" — name + bar horizontal de
-       magnitud relativa + count. Reemplazó las sparklines Chart.js que
-       se veían inconsistentes en 56px. La barra es siempre visible y
-       deja leer la magnitud relativa de un vistazo. */
     .ent-row {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) 80px 44px;
-      gap: 10px;
+      grid-template-columns: 1fr 56px 32px;
+      gap: 8px;
       align-items: center;
-      padding: 5px 8px;
-      border-radius: 5px;
+      padding: 4px 6px;
+      border-radius: 4px;
       cursor: pointer;
-      transition: background 100ms;
     }
     .ent-row:hover { background: var(--hover); }
     .ent-row.active { background: color-mix(in srgb, var(--cyan) 14%, var(--bg-elev)); }
@@ -761,25 +779,15 @@
       text-overflow: ellipsis;
       white-space: nowrap;
     }
-    .ent-bar {
-      height: 6px;
-      background: color-mix(in srgb, var(--text-faint) 14%, transparent);
-      border-radius: 3px;
-      overflow: hidden;
-      position: relative;
-    }
-    .ent-bar > span {
-      display: block;
-      height: 100%;
-      border-radius: 3px;
-      transition: width 220ms ease-out;
+    .ent-spark {
+      width: 56px;
+      height: 18px;
     }
     .ent-count {
       font-size: 11px;
-      color: var(--text-dim);
+      color: var(--text-faint);
       font-variant-numeric: tabular-nums;
       text-align: right;
-      font-weight: 500;
     }
 
     /* ── Hot vs Stale grid ──────────────────────────────────────────── */
@@ -1045,6 +1053,14 @@
             <div class="graph-controls">
               <input type="search" id="graph-search" class="graph-search-input"
                      placeholder="buscar nota…" aria-label="Buscar nota por nombre">
+              <div class="graph-mode-toggle" role="tablist" aria-label="Layout del grafo">
+                <button class="btn-icon mode-btn active" id="graph-mode-structural" type="button"
+                        role="tab" aria-selected="true"
+                        title="Posiciones por wikilinks — cómo vos linkeaste tus notas">🔗 estructural</button>
+                <button class="btn-icon mode-btn" id="graph-mode-semantic" type="button"
+                        role="tab" aria-selected="false"
+                        title="Posiciones por similitud conceptual — embeddings bge-m3 proyectados a 3D">🧠 semántico</button>
+              </div>
               <button class="btn-icon" id="graph-zoom-in" type="button" title="Acercar">+</button>
               <button class="btn-icon" id="graph-zoom-out" type="button" title="Alejar">−</button>
               <button class="btn-icon" id="graph-reset" type="button" title="Recentrar">⟲</button>
@@ -1070,7 +1086,7 @@
     <section class="learn-section" id="sec-entities" aria-labelledby="h-entities">
       <header class="learn-section-hdr">
         <h2 id="h-entities" title="Top entidades por menciones totales, agrupadas por tipo">Quién y qué aparece más en tus notas</h2>
-        <p class="muted">Top 50 por tipo. La barra es la frecuencia relativa al primero de la columna. Click filtra el grafo a las notas que la mencionan.</p>
+        <p class="muted">Top 50 por tipo. La línea es la frecuencia diaria en la ventana seleccionada arriba.</p>
         <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-entities" data-collapse="body-entities">−</button>
       </header>
       <div class="learn-section-body" id="body-entities">
@@ -1135,6 +1151,6 @@
 
   <span id="atlas-status" class="sr-only" role="status" aria-live="polite">Cargando datos del atlas</span>
 
-  <script src="/static/atlas.js?v=7" defer></script>
+  <script src="/static/atlas.js?v=8" defer></script>
 </body>
 </html>

@@ -28,6 +28,7 @@ import json
 import re
 import sqlite3
 import threading
+import time
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -791,6 +792,26 @@ def snapshot(
 
     graph = _build_graph(meta_table, ragvec_db, graph_top_notes)
 
+    # Enriquecer cada nodo con `vault_uri` (deep link `obsidian://`) para que
+    # el frontend pueda abrir la nota directo en Obsidian al click sin
+    # tener que hacer un fetch extra a /api/atlas/note. Mismo formato que
+    # genera `note_detail()` arriba.
+    try:
+        from urllib.parse import quote as _quote
+        _vault_name = Path(vault_path).name if vault_path else ""
+        if _vault_name:
+            for n in graph.get("nodes", []) or []:
+                p = n.get("id") or ""
+                if p:
+                    n["vault_uri"] = (
+                        f"obsidian://open?vault={_quote(_vault_name, safe='')}"
+                        f"&file={_quote(p, safe='')}"
+                    )
+    except Exception:
+        # Si falla el quote por algún path raro, los demás nodos siguen
+        # funcionando — el frontend chequea `vault_uri` opcional.
+        pass
+
     payload = {
         "meta": {
             "generated_at": now.isoformat(timespec="seconds"),
@@ -818,5 +839,187 @@ def snapshot(
     with _DASHBOARD_CACHE_LOCK:
         _DASHBOARD_CACHE["key"] = cache_key
         _DASHBOARD_CACHE["payload"] = payload
+
+    return payload
+
+
+# ── Semantic layout (PCA 1024d → 3D) ────────────────────────────────────
+#
+# Proyecta los embeddings bge-m3 de cada nota a 3 coordenadas via PCA
+# (NumPy SVD). Resultado: el frontend recibe `{path: [x, y, z]}` y los
+# usa como posiciones fijas para que las notas se agrupen por SIMILITUD
+# CONCEPTUAL en vez de por wikilinks.
+#
+# Por qué PCA y no UMAP:
+#   - umap-learn pesa ~200 MB de deps (numba + llvmlite) — no vale la
+#     pena para v1, el repo es local-first y queremos arranque rápido.
+#   - PCA con SVD es O(n × d²) — para 500 notas × 1024 dims tarda ~300 ms,
+#     aceptable para un endpoint con cache 24h.
+#   - PCA pierde estructura local (UMAP la preserva mejor) pero captura
+#     bien los ejes de máxima varianza, suficiente para que el ojo vea
+#     clusters temáticos. Si el user pide "más fidelidad", v2 = UMAP.
+#
+# Cache: in-memory dict con clave = (paths_hash, vault_path), TTL 24h.
+# El cómputo PCA es determinístico dado los embeddings, así que el cache
+# solo invalida cuando la lista de paths cambia (nuevas notas indexadas).
+
+_SEMANTIC_LAYOUT_CACHE: dict = {}
+_SEMANTIC_LAYOUT_LOCK = threading.Lock()
+_SEMANTIC_LAYOUT_TTL = 86400.0  # 24h
+
+
+def semantic_layout(
+    *,
+    paths: list[str],
+    vault_path: Path | None = None,
+) -> dict:
+    """Proyecta embeddings de las notas dadas a 3D via PCA.
+
+    Args:
+        paths: lista de paths del vault (relativos) que queremos posicionar.
+            Típicamente vienen del `graph.nodes` que retorna `snapshot()`.
+        vault_path: override del vault activo (mismo patrón que `snapshot`).
+
+    Returns:
+        Dict con shape:
+        {
+            "layout": {path: [x, y, z]},  # solo paths que tienen embeddings
+            "method": "pca",
+            "n_notes": int,                # cuántos paths fueron proyectados
+            "explained_variance_ratio": [float, float, float],  # de PC1, PC2, PC3
+            "missing": [path],             # paths sin embedding (no chunks)
+        }
+    """
+    if not paths:
+        return {
+            "layout": {},
+            "method": "pca",
+            "n_notes": 0,
+            "explained_variance_ratio": [],
+            "missing": [],
+        }
+
+    # Cache key: hash del set de paths (orden no importa) + vault.
+    # Los paths suelen venir del top-N por degree, que cambia poco entre
+    # invocaciones consecutivas → muchos cache hits.
+    paths_set = frozenset(paths)
+    import hashlib as _hashlib
+    paths_hash = _hashlib.sha1(
+        ",".join(sorted(paths_set)).encode("utf-8"),
+    ).hexdigest()[:16]
+
+    try:
+        from rag import VAULT_PATH  # type: ignore
+    except Exception:
+        VAULT_PATH = None  # type: ignore[assignment]
+
+    if vault_path is None:
+        vault_path = VAULT_PATH
+    cache_key = (paths_hash, str(vault_path) if vault_path else "")
+
+    now_ts = time.time()
+    with _SEMANTIC_LAYOUT_LOCK:
+        hit = _SEMANTIC_LAYOUT_CACHE.get(cache_key)
+        if hit and now_ts - hit[0] < _SEMANTIC_LAYOUT_TTL:
+            return hit[1]
+
+    # Cargar embeddings via _note_centroids (mean-pool por archivo + L2-norm).
+    try:
+        from rag import _note_centroids, get_db_for, get_db  # type: ignore
+        col = get_db_for(vault_path) if vault_path else get_db()
+        files_all, _metas, embed_arr = _note_centroids(col, vault_only=True)
+    except Exception as exc:
+        # Si falla, devolvemos vacío silencioso — el frontend cae al modo
+        # estructural sin que el user note el error.
+        return {
+            "layout": {},
+            "method": "pca",
+            "n_notes": 0,
+            "explained_variance_ratio": [],
+            "missing": list(paths_set),
+            "error": f"embed_load_failed:{exc}",
+        }
+
+    # Filtrar a las paths pedidas (puede haber notas indexadas que no están
+    # en el top-N del grafo — las descartamos).
+    keep_idx = [i for i, f in enumerate(files_all) if f in paths_set]
+    files_kept = [files_all[i] for i in keep_idx]
+
+    if not keep_idx:
+        return {
+            "layout": {},
+            "method": "pca",
+            "n_notes": 0,
+            "explained_variance_ratio": [],
+            "missing": list(paths_set),
+        }
+
+    import numpy as _np
+    arr = _np.asarray([embed_arr[i] for i in keep_idx], dtype="float32")
+
+    # PCA via SVD: U @ diag(S) @ Vt = arr_centered.
+    # Tomamos las 3 componentes principales (top 3 singular vectors).
+    mean = arr.mean(axis=0, keepdims=True)
+    centered = arr - mean
+    try:
+        # full_matrices=False → economy SVD: faster + same result for top-K.
+        _U, S, Vt = _np.linalg.svd(centered, full_matrices=False)
+    except _np.linalg.LinAlgError as exc:
+        return {
+            "layout": {},
+            "method": "pca",
+            "n_notes": 0,
+            "explained_variance_ratio": [],
+            "missing": list(paths_set),
+            "error": f"svd_failed:{exc}",
+        }
+
+    # Proyección a 3D: arr_centered @ V[:, :3]  (= centered @ Vt[:3].T).
+    n_components = min(3, Vt.shape[0])
+    coords_3d = centered @ Vt[:n_components].T  # shape (N, 3) o menos
+
+    # Si nos quedaron < 3 componentes (caso patológico: <3 notas), pad con 0.
+    if coords_3d.shape[1] < 3:
+        pad = _np.zeros((coords_3d.shape[0], 3 - coords_3d.shape[1]), dtype="float32")
+        coords_3d = _np.hstack([coords_3d, pad])
+
+    # Escalar a un rango comparable al output del force-sim 3D del frontend
+    # (~±200 unidades). Normalizamos por std-dev → multiplicamos por 80
+    # (≈ 95% de los puntos quedan en ±160). Empíricamente queda parecido
+    # al spread del grafo estructural.
+    std = coords_3d.std(axis=0, ddof=1)
+    std[std < 1e-9] = 1.0
+    coords_3d = (coords_3d / std) * 80.0
+
+    # Explained variance ratio (cuánto explica cada PC).
+    total_var = float((S ** 2).sum())
+    evr = ((S[:n_components] ** 2) / total_var).tolist() if total_var > 0 else []
+    while len(evr) < 3:
+        evr.append(0.0)
+
+    layout = {
+        f: [float(c[0]), float(c[1]), float(c[2])]
+        for f, c in zip(files_kept, coords_3d)
+    }
+    missing = sorted(paths_set - set(files_kept))
+
+    payload = {
+        "layout": layout,
+        "method": "pca",
+        "n_notes": len(files_kept),
+        "explained_variance_ratio": evr,
+        "missing": missing,
+    }
+
+    with _SEMANTIC_LAYOUT_LOCK:
+        _SEMANTIC_LAYOUT_CACHE[cache_key] = (now_ts, payload)
+        # GC: si el cache crece > 64 entradas (paranoia), borrar las más
+        # viejas. 64 keys × ~50 KB JSON cada una ≈ 3 MB, fine.
+        if len(_SEMANTIC_LAYOUT_CACHE) > 64:
+            oldest_key = min(
+                _SEMANTIC_LAYOUT_CACHE.keys(),
+                key=lambda k: _SEMANTIC_LAYOUT_CACHE[k][0],
+            )
+            _SEMANTIC_LAYOUT_CACHE.pop(oldest_key, None)
 
     return payload

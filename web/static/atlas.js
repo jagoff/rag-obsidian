@@ -54,6 +54,18 @@ const state = {
   selectedLinks: null,      // Set<link> que tocan al seleccionado
   searchHits: null,         // Set<id> matches del input de búsqueda
   entityMatches: null,      // Set<id> matches del entity filter (heurística por label)
+  // Layout mode — "structural" (default) usa wikilinks vía force-sim;
+  // "semantic" pide al backend `/api/atlas/semantic-layout` que devuelve
+  // {path: [x,y,z]} de PCA(embeddings) y los aplicamos como fx/fy/fz.
+  // Persistimos a localStorage para que el toggle sobreviva reloads.
+  layoutMode: (() => {
+    try {
+      const m = localStorage.getItem("atlas-layout-mode");
+      return m === "semantic" ? "semantic" : "structural";
+    } catch (e) { return "structural"; }
+  })(),
+  semanticLayoutCache: null,  // {path: [x,y,z]} cacheado client-side
+  semanticLayoutMeta: null,   // {n_notes, explained_variance_ratio, missing}
   // Filter state — cuando el user hace click en una entidad del top-list,
   // dimmamos los nodos del grafo cuyo path NO contiene esa entidad. Heurística
   // en el cliente vs hit al backend: si el label de la nota INCLUYE el name
@@ -451,7 +463,7 @@ async function renderGraph(graph) {
     .linkDirectionalParticles(0)   // partículas las prendemos solo en links highlighted
     .linkDirectionalParticleWidth(1.4)
     .linkDirectionalParticleSpeed(0.006)
-    .onNodeClick((node) => {
+    .onNodeClick((node, event) => {
       // Aim camera at clicked node from outside.
       const distance = 90;
       const r = Math.hypot(node.x || 0, node.y || 0, node.z || 0);
@@ -462,6 +474,14 @@ async function renderGraph(graph) {
         1200
       );
       selectNode(node);
+      // Abrir la nota en Obsidian. Cmd/Ctrl+click NO abre (fallback para
+      // cuando el user solo quiere explorar sin que la app se le abra
+      // sola). Si el server no nos pasó vault_uri (vault_path no
+      // configurado), no hacemos nada.
+      const skipOpen = event && (event.metaKey || event.ctrlKey);
+      if (!skipOpen && node.vault_uri) {
+        openInObsidian(node.vault_uri);
+      }
     })
     .onNodeHover((node) => {
       document.body.style.cursor = node ? "pointer" : "";
@@ -726,6 +746,178 @@ function nodeRadiusFor(node) {
   // nodeVal(degree). cbrt porque 3d-force-graph usa volumen ∝ val.
   const v = Math.max(0.5, Math.min(20, node.degree || 1));
   return Math.cbrt(v) * 7 * 0.5;
+}
+
+// ── Click en nodo → abrir nota en Obsidian ──────────────────────────────
+//
+// `vault_uri` viene en cada nodo del payload de /api/atlas (ej.
+// "obsidian://open?vault=Notes&file=01-Projects/X.md"). Lo disparamos
+// via `<a>.click()` en vez de `window.open`/`location.href` porque:
+//   - Los browsers tratan el click programático en un anchor con href
+//     custom-protocol como "user-initiated" → no triggea popup blocker.
+//   - location.href disrumpe la página actual si el SO no maneja el
+//     protocol (raro, pero seguro defensivo).
+function openInObsidian(uri) {
+  if (!uri || typeof uri !== "string") return;
+  if (!uri.startsWith("obsidian://")) return;
+  try {
+    const a = document.createElement("a");
+    a.href = uri;
+    a.rel = "noopener noreferrer";
+    a.style.display = "none";
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => a.remove(), 100);
+  } catch (e) {
+    // Fallback: navegación directa. El browser puede mostrar prompt
+    // "esta página intenta abrir Obsidian" la primera vez.
+    try { window.location.href = uri; } catch (e2) {}
+  }
+}
+
+// ── Layout modes: estructural (wikilinks) ↔ semántico (PCA embeddings) ──
+//
+// Estructural: usa los wikilinks como atracciones del force-sim → notas
+// linkeadas se acercan, otras se alejan. Es la vista "cómo vos linkeaste".
+//
+// Semántico: pide a `/api/atlas/semantic-layout` el resultado del PCA
+// 1024d→3D sobre los embeddings bge-m3 mean-pool por nota. Aplica las
+// coords como `fx/fy/fz` (posiciones fijas en force-sim → no se mueven).
+// El force-sim sigue corriendo solo para colisión + leve perturbación,
+// pero la posición principal queda anchored.
+
+async function setLayoutMode(mode) {
+  const newMode = mode === "semantic" ? "semantic" : "structural";
+  if (state.layoutMode === newMode) {
+    // Asegurarnos de que los botones reflejen el estado actual aunque
+    // sea un no-op (ej. al boot).
+    _refreshModeButtons();
+    return;
+  }
+  state.layoutMode = newMode;
+  try { localStorage.setItem("atlas-layout-mode", newMode); } catch (e) {}
+  _refreshModeButtons();
+
+  if (newMode === "semantic") {
+    await applySemanticLayout();
+  } else {
+    applyStructuralLayout();
+  }
+}
+
+function _refreshModeButtons() {
+  const sBtn = document.getElementById("graph-mode-structural");
+  const mBtn = document.getElementById("graph-mode-semantic");
+  if (sBtn) {
+    sBtn.classList.toggle("active", state.layoutMode === "structural");
+    sBtn.setAttribute("aria-selected", state.layoutMode === "structural" ? "true" : "false");
+  }
+  if (mBtn) {
+    mBtn.classList.toggle("active", state.layoutMode === "semantic");
+    mBtn.setAttribute("aria-selected", state.layoutMode === "semantic" ? "true" : "false");
+  }
+}
+
+async function applySemanticLayout() {
+  if (!state.graph3d || !state.graphNodes || !state.graphNodes.length) return;
+  const stats = document.getElementById("graph-stats");
+
+  // Cache hit del cliente: si ya pedimos este conjunto de paths, reusamos.
+  const paths = state.graphNodes.map((n) => n.id);
+  const pathsKey = paths.slice().sort().join("|");
+  let layout = null;
+  let meta = null;
+  if (state.semanticLayoutCache && state._semanticLayoutPathsKey === pathsKey) {
+    layout = state.semanticLayoutCache;
+    meta = state.semanticLayoutMeta;
+  } else {
+    if (stats) stats.textContent = "calculando layout semántico…";
+    try {
+      const r = await fetch("/api/atlas/semantic-layout", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ paths }),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = await r.json();
+      layout = data.layout || {};
+      meta = {
+        n_notes: data.n_notes || 0,
+        explained_variance_ratio: data.explained_variance_ratio || [],
+        missing: data.missing || [],
+      };
+      state.semanticLayoutCache = layout;
+      state.semanticLayoutMeta = meta;
+      state._semanticLayoutPathsKey = pathsKey;
+    } catch (e) {
+      console.error("[atlas-semantic] fetch failed", e);
+      if (stats) stats.textContent = "no se pudo calcular layout semántico — quedó estructural";
+      // Fallback: revert a estructural sin rebote infinito.
+      state.layoutMode = "structural";
+      try { localStorage.setItem("atlas-layout-mode", "structural"); } catch (e2) {}
+      _refreshModeButtons();
+      return;
+    }
+  }
+
+  // Aplicar coords como fx/fy/fz para que el force-sim los respete.
+  // Cada nodo que tiene entrada en `layout` queda anchored ahí; los que
+  // NO tienen (caso raro: nota nueva sin embedding aún) quedan libres.
+  let pinned = 0;
+  for (const n of state.graphNodes) {
+    const xyz = layout[n.id];
+    if (xyz && xyz.length === 3) {
+      n.fx = xyz[0];
+      n.fy = xyz[1];
+      n.fz = xyz[2];
+      pinned++;
+    } else {
+      n.fx = n.fy = n.fz = undefined;
+    }
+  }
+
+  // Re-heat la simulación para que los nodos se muevan a sus nuevas
+  // posiciones con animación suave (no salto duro).
+  try { state.graph3d.d3ReheatSimulation(); } catch (e) {}
+
+  // Actualizar stats del grafo. Mostramos el % de varianza explicada por
+  // las 3 PCs — > 30% típicamente significa que el layout es coherente.
+  if (stats) {
+    const evr = (meta?.explained_variance_ratio || []).slice(0, 3);
+    const totalVar = evr.reduce((s, v) => s + v, 0);
+    const pct = (totalVar * 100).toFixed(0);
+    stats.textContent = `🧠 semántico · ${pinned} notas posicionadas por similitud · ${pct}% varianza explicada`;
+  }
+
+  // Re-fit de la cámara después de un delay para que la simulación se
+  // estabilice antes del zoomToFit.
+  setTimeout(() => {
+    if (state.graph3d) state.graph3d.zoomToFit(900, 80);
+  }, 800);
+}
+
+function applyStructuralLayout() {
+  if (!state.graph3d || !state.graphNodes) return;
+  // Liberar todos los pins → el force-sim vuelve a posicionar por links.
+  for (const n of state.graphNodes) {
+    n.fx = n.fy = n.fz = undefined;
+  }
+  try { state.graph3d.d3ReheatSimulation(); } catch (e) {}
+  const stats = document.getElementById("graph-stats");
+  if (stats && state.payload) {
+    // Restaurar el texto original del modo estructural.
+    const g = state.payload.graph || {};
+    const n = (g.nodes || []).length;
+    const l = (g.links || []).length;
+    const totalNotes = g.total_notes || n;
+    const totalEdges = g.total_edges || l;
+    stats.textContent = g.truncated
+      ? `${n} de ${totalNotes} notas · ${l} de ${totalEdges} conexiones (top por degree)`
+      : `${n} notas · ${l} conexiones`;
+  }
+  setTimeout(() => {
+    if (state.graph3d) state.graph3d.zoomToFit(900, 60);
+  }, 800);
 }
 
 function zoomCamera(factor) {
@@ -1235,6 +1427,26 @@ window.addEventListener("DOMContentLoaded", () => {
   // Botón × para limpiar el entity filter.
   const clearBtn = document.getElementById("graph-clear-filter");
   if (clearBtn) clearBtn.addEventListener("click", () => clearEntityFilter());
+
+  // Toggle estructural ↔ semántico.
+  const sBtn = document.getElementById("graph-mode-structural");
+  const mBtn = document.getElementById("graph-mode-semantic");
+  if (sBtn) sBtn.addEventListener("click", () => setLayoutMode("structural"));
+  if (mBtn) mBtn.addEventListener("click", () => setLayoutMode("semantic"));
+  // Si la preferencia guardada es semántico, aplicarla apenas el grafo
+  // termine de hacer el primer render (el state.graphNodes se llena en
+  // renderGraph). Espero 3s para que el initial zoomToFit + animation
+  // de cámara terminen antes de re-layout.
+  if (state.layoutMode === "semantic") {
+    setTimeout(() => {
+      if (state.graphNodes && state.graphNodes.length) {
+        applySemanticLayout();
+      }
+      _refreshModeButtons();
+    }, 3500);
+  } else {
+    _refreshModeButtons();
+  }
 
   // ── Ask vault: input + botón + Enter para submit ────────────────────────
   const askInput = document.getElementById("ask-vault-input");

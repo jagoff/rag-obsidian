@@ -345,6 +345,25 @@ _IBERIAN_LEAK_REPLACEMENTS: tuple[tuple[str, str], ...] = (
     (r"\bestão\b", "están"),
     (r"\bmelhor\b", "mejor"),
     (r"\bpior\b", "peor"),
+    # 2026-04-30: leaks observados sobre query "ideas para landing pages"
+    # → "usar testeomiento de um cliente real acima do fold, não mais de
+    # 2 linhas". Estos tokens NO existían en el filter:
+    #
+    # - `acima` (pt) → "arriba" (es). En es no existe esa grafía.
+    # - `abaixo` (pt) → "abajo" (es).
+    # - `mais` (pt: adverbio comparativo) → "más" (es). En español SIEMPRE
+    #   lleva tilde; "mais" suelto NUNCA aparece en es nativo.
+    # - `linha` / `linhas` (pt) → "línea" / "líneas" (es). La grafía con
+    #   `nh` SOLO existe en pt — en es es `ñ` o sin nasal.
+    # - `sítio` (pt: con tilde nasal en la 'í') → "sitio" (es: sin tilde).
+    #   La grafía con tilde nasal sólo existe en pt.
+    (r"\bacima\b", "arriba"),
+    (r"\babaixo\b", "abajo"),
+    (r"\bmais\b", "más"),
+    (r"\blinha\b", "línea"),
+    (r"\blinhas\b", "líneas"),
+    (r"\bsítio\b", "sitio"),
+    (r"\bsítios\b", "sitios"),
     # ── Verbos de movimiento/uso (pt → es) ──────────────────────
     (r"\bajudar\b", "ayudar"),
     (r"\bajuda\b", "ayuda"),

@@ -50130,7 +50130,18 @@ def serve(host: str, port: int):
         ):
             parts.append(chunk.message.content)
         t_gen = time.perf_counter() - t_gen0
-        answer = convert_obsidian_links("".join(parts))
+        # Aplicar `replace_iberian_leaks` ANTES de convert_obsidian_links —
+        # el endpoint `/query` es el path principal del WhatsApp listener +
+        # web UI. Los otros handlers (chat, brief, repair, crit, summarise)
+        # ya lo aplican (líneas 33316, 37836, 42154, 58970, 59030); este
+        # se quedó afuera y dejaba pasar leaks pt al user. Reportado el
+        # 2026-04-30 con repro real: query "qué notas tengo sobre ideas
+        # para landing pages?" devolvía "...usar testeomiento de um cliente
+        # real acima do fold, não mais de 2 linhas". Bug intermitente
+        # (depende del sampling), pero el filter es la última barrera —
+        # debe correr siempre, igual que los otros handlers.
+        from rag.iberian_leak_filter import replace_iberian_leaks
+        answer = convert_obsidian_links(replace_iberian_leaks("".join(parts)))
 
         # Session persist
         if sess:

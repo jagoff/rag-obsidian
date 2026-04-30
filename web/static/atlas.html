@@ -609,6 +609,29 @@
       z-index: 5;
     }
     .graph-controls .btn-icon { padding: 4px 8px; font-size: 11px; }
+
+    /* Toggle estructural ↔ semántico — dos botones unidos como segmented
+       control. La segmentación visual ayuda a leer "esto es UNA opción
+       con dos estados" en vez de "dos botones separados". */
+    .graph-mode-toggle {
+      display: inline-flex;
+      gap: 0;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+    .graph-mode-toggle .btn-icon {
+      border: none;
+      border-radius: 0;
+      padding: 4px 10px;
+    }
+    .graph-mode-toggle .btn-icon + .btn-icon {
+      border-left: 1px solid var(--border);
+    }
+    .graph-mode-toggle .btn-icon.active {
+      background: color-mix(in srgb, var(--cyan) 22%, var(--bg-elev));
+      color: var(--cyan);
+    }
     .graph-search-input {
       background: color-mix(in srgb, var(--bg-card) 88%, transparent);
       border: 1px solid var(--border);
@@ -1030,6 +1053,14 @@
             <div class="graph-controls">
               <input type="search" id="graph-search" class="graph-search-input"
                      placeholder="buscar nota…" aria-label="Buscar nota por nombre">
+              <div class="graph-mode-toggle" role="tablist" aria-label="Layout del grafo">
+                <button class="btn-icon mode-btn active" id="graph-mode-structural" type="button"
+                        role="tab" aria-selected="true"
+                        title="Posiciones por wikilinks — cómo vos linkeaste tus notas">🔗 estructural</button>
+                <button class="btn-icon mode-btn" id="graph-mode-semantic" type="button"
+                        role="tab" aria-selected="false"
+                        title="Posiciones por similitud conceptual — embeddings bge-m3 proyectados a 3D">🧠 semántico</button>
+              </div>
               <button class="btn-icon" id="graph-zoom-in" type="button" title="Acercar">+</button>
               <button class="btn-icon" id="graph-zoom-out" type="button" title="Alejar">−</button>
               <button class="btn-icon" id="graph-reset" type="button" title="Recentrar">⟲</button>
@@ -1120,6 +1151,6 @@
 
   <span id="atlas-status" class="sr-only" role="status" aria-live="polite">Cargando datos del atlas</span>
 
-  <script src="/static/atlas.js?v=5" defer></script>
+  <script src="/static/atlas.js?v=8" defer></script>
 </body>
 </html>

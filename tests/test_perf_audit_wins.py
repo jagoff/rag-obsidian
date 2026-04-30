@@ -190,3 +190,37 @@ def test_local_embed_enabled_has_cache():
         "Falta helper _freeze_local_embed_enabled() que se llame al final "
         "del warmup para congelar el flag"
     )
+
+
+def test_freeze_local_embed_enabled_caches_value(monkeypatch):
+    """Fix 6: _freeze_local_embed_enabled persiste (env_raw, decision)."""
+    # Reset
+    rag._LOCAL_EMBED_ENABLED_CACHED = None
+    monkeypatch.setenv("RAG_LOCAL_EMBED", "1")
+    rag._freeze_local_embed_enabled()
+    cached = rag._LOCAL_EMBED_ENABLED_CACHED
+    assert isinstance(cached, tuple) and len(cached) == 2, (
+        f"Cache debe ser tupla (env_raw, bool), fue {cached!r}"
+    )
+    assert cached == ("1", True), f"Cache esperado ('1', True), fue {cached!r}"
+    # Mientras la env var sea la misma, el cache hit.
+    assert rag._local_embed_enabled() is True
+    # Si la env var cambia, el cache se invalida automáticamente.
+    monkeypatch.setenv("RAG_LOCAL_EMBED", "0")
+    assert rag._local_embed_enabled() is False, (
+        "Cache invalidation: cambiar la env var debería re-evaluar"
+    )
+    # Reset para no contaminar otros tests
+    rag._LOCAL_EMBED_ENABLED_CACHED = None
+
+
+def test_local_embed_enabled_falls_back_to_env_when_uncached(monkeypatch):
+    """Fix 6: sin cache, _local_embed_enabled lee env var (back-compat)."""
+    rag._LOCAL_EMBED_ENABLED_CACHED = None
+    monkeypatch.setenv("RAG_LOCAL_EMBED", "1")
+    assert rag._local_embed_enabled() is True
+    monkeypatch.setenv("RAG_LOCAL_EMBED", "0")
+    assert rag._local_embed_enabled() is False
+    monkeypatch.delenv("RAG_LOCAL_EMBED", raising=False)
+    assert rag._local_embed_enabled() is False
+    rag._LOCAL_EMBED_ENABLED_CACHED = None

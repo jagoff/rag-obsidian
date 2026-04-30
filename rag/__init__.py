@@ -13250,11 +13250,12 @@ _local_embedder_ready = threading.Event()
 
 
 # Post-warmup cached value — `_freeze_local_embed_enabled()` lo setea cuando
-# el warmup completa (o cuando el CLI group dispatchea con la decision ya
-# tomada). En ese momento la env var no va a cambiar más en el proceso
-# (CLI group ya corrió, daemon ya arrancó). Releer la env var por cada
-# query es overhead innecesario en hot path. None = no cacheado todavía.
-_LOCAL_EMBED_ENABLED_CACHED: bool | None = None
+# el warmup completa. El cache guarda `(env_raw, computed_bool)`; si la env
+# var cambia después (típico en tests con monkeypatch.setenv) re-evaluamos.
+# En producción la env var no cambia post-startup así que el cache hit es
+# permanente y saltamos el `.strip().lower() not in (...)` en cada query.
+# None = no cacheado todavía.
+_LOCAL_EMBED_ENABLED_CACHED: tuple[str, bool] | None = None
 
 
 def _local_embed_enabled() -> bool:
@@ -13262,30 +13263,30 @@ def _local_embed_enabled() -> bool:
     RAG_LOCAL_EMBED before subcommands dispatch (module-level constants baked
     the value at import, which broke the auto-enable heuristic below).
 
-    Post-warmup el valor se cachea via `_freeze_local_embed_enabled()` para
-    saltar el `os.environ.get` por cada query embed.
+    Post-warmup cacheamos `(env_raw, decision)` para evitar recalcular el
+    `.strip().lower() not in (...)` en cada query embed. El cache se
+    invalida automáticamente si la env var cambia (importante para tests
+    con monkeypatch.setenv).
     """
-    if _LOCAL_EMBED_ENABLED_CACHED is not None:
-        return _LOCAL_EMBED_ENABLED_CACHED
-    return os.environ.get("RAG_LOCAL_EMBED", "").strip().lower() not in (
-        "", "0", "false", "no",
-    )
+    raw = os.environ.get("RAG_LOCAL_EMBED", "")
+    if _LOCAL_EMBED_ENABLED_CACHED is not None and _LOCAL_EMBED_ENABLED_CACHED[0] == raw:
+        return _LOCAL_EMBED_ENABLED_CACHED[1]
+    return raw.strip().lower() not in ("", "0", "false", "no")
 
 
 def _freeze_local_embed_enabled() -> None:
     """Cachear la decision actual de _local_embed_enabled() en memoria.
 
-    Llamado al final de `_warmup_local_embedder` (path long-running serve/web)
-    y desde el CLI group una vez que decide auto-enabled. Subsecuentes
-    invocaciones de `_local_embed_enabled()` saltan el os.environ lookup.
+    Llamado al final de `_warmup_local_embedder` (path long-running serve/web).
+    Subsecuentes invocaciones de `_local_embed_enabled()` saltan el
+    `.strip().lower()` cuando la env var no cambió.
 
     Idempotente: re-llamar sólo refresca el cache.
     """
     global _LOCAL_EMBED_ENABLED_CACHED
-    _LOCAL_EMBED_ENABLED_CACHED = (
-        os.environ.get("RAG_LOCAL_EMBED", "").strip().lower()
-        not in ("", "0", "false", "no")
-    )
+    raw = os.environ.get("RAG_LOCAL_EMBED", "")
+    decision = raw.strip().lower() not in ("", "0", "false", "no")
+    _LOCAL_EMBED_ENABLED_CACHED = (raw, decision)
 
 
 # Kept for backwards compatibility with external code referencing the old

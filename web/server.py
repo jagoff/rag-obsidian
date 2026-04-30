@@ -9682,7 +9682,13 @@ def _home_compute(
         + len(today_ev.get("low_conf_queries") or [])
     )
 
-    narrative = "" if today_total == 0 else (_today_cached_narrative(date_label) or "")
+    # Siempre intentar servir el brief cached del día si existe — incluso
+    # cuando `today_total == 0` (el user pudo no haber tocado el vault hoy
+    # pero recibió mails/WA/calendar events que el brief de la mañana ya
+    # narró). El bug previo era `"" if today_total == 0 else ...` que
+    # descartaba el cached en ese caso, dejando el hero del home en blanco
+    # toda la tarde aunque el archivo `YYYY-MM-DD-evening.md` existiera.
+    narrative = _today_cached_narrative(date_label) or ""
     narrative_source = "cached" if narrative else "none"
     # Default correlations: el path de cache (no-regenerate) NO corre el
     # correlator por costo. Si la UI quiere pintar el panel "🔗 Patrones
@@ -9690,9 +9696,11 @@ def _home_compute(
     # patrones ya quedan visibles en el narrative del brief cacheado.
     today_correlations: dict | None = None
     # Only call the LLM when the caller explicitly asks. Default path stays
-    # fast — if no cached brief exists yet, the UI shows "pendiente" and
-    # offers a button that re-hits with regenerate=true.
-    if today_total > 0 and regenerate:
+    # fast — if no cached brief exists yet, the UI shows "pendiente" y el
+    # user clickea ↻ que pega con regenerate=true. Aun cuando today_total==0
+    # (vault sin tocar) regeneramos: el LLM va a escribir basado en señales
+    # cross-source (gmail/WA/calendar/YouTube TODAY-only) que SÍ existen.
+    if regenerate:
         # Inject the monthly MOZE snapshot so the LLM narrative can cite
         # cuánto gastaste este mes — otherwise it refuses ("no encontré
         # finanzas") even though the home panel renders the numbers.

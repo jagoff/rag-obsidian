@@ -38709,7 +38709,11 @@ _SPOTIFY_NOARG_RE = re.compile(
     # playback". Solo dejamos los pause "puros" acá.
     r"pausa|paus[aá]|pause|stop|fren[aá]|"
     # Play / resume family (BARE only — "play" + nada, no "play X").
+    # `reproduc[ií](?:r|me|lo)?` también está en `_SPOTIFY_PLAY_RE` para
+    # "reproducí <query>"; acá cubre el bare "reproducí" / "reproduci"
+    # / "reproducir" como resume.
     r"play|reanud[aá](?:r|me)?|segu[ií](?:r)?|continu[aá](?:r|me)?|"
+    r"reproduc[ií](?:r|me|lo)?|"
     # Next family.
     r"siguiente(?:\s+(?:tema|canci[oó]n|track))?|next|salt[aá](?:r|me|alo)?|"
     r"skip(?:e[aá]r?)?|pr[oó]xim[ao](?:\s+(?:tema|canci[oó]n))?|"
@@ -38904,7 +38908,7 @@ def _parse_spotify_command(q: str) -> dict | None:
         # — ver comentario en `_SPOTIFY_NOARG_RE` arriba.
         if a.startswith(("pausa", "paus", "pause", "stop", "fren")):
             return {"action": "pause"}
-        if a.startswith(("play", "reanud", "segu", "continu")):
+        if a.startswith(("play", "reanud", "segu", "continu", "reproduc")):
             return {"action": "play"}
         if a.startswith(("siguiente", "next", "salt", "skip", "próxim",
                          "proxim", "otra", "otro", "cambi")):

@@ -12,6 +12,7 @@ import asyncio
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import threading
@@ -70,7 +71,7 @@ try:
 except ImportError:
     _HEIC_AVAILABLE = False
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
@@ -1902,6 +1903,79 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Admin token — protege endpoints de pánico / destructivos ─────────────────
+# Los endpoints tipo /api/reindex, /api/ollama/restart, /api/auto-fix-devin, etc.
+# no tienen auth. Con LAN-expose encendido, cualquier device en el WiFi puede
+# dispararlos. Este helper requiere un Bearer token que vive en un archivo 0o600
+# generado automáticamente al primer startup.
+#
+# Uso desde el cliente:
+#   curl -X POST http://localhost:8765/api/reindex \
+#        -H "Authorization: Bearer <token>"
+#
+# El token se imprime UNA vez al stderr al startup para que el user lo copie.
+# También está en ~/.config/obsidian-rag/admin_token.txt (0o600).
+
+_ADMIN_TOKEN_PATH = Path.home() / ".config" / "obsidian-rag" / "admin_token.txt"
+
+
+def _load_or_create_admin_token() -> str:
+    """Lee el token de _ADMIN_TOKEN_PATH o lo genera (write-once, chmod 600).
+
+    Se llama una vez al import — el resultado queda en _ADMIN_TOKEN.
+    """
+    try:
+        _ADMIN_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if _ADMIN_TOKEN_PATH.exists():
+            token = _ADMIN_TOKEN_PATH.read_text(encoding="utf-8").strip()
+            if token:
+                return token
+        # Generar token nuevo
+        token = secrets.token_urlsafe(32)
+        # Escribir con tmp+replace para atomicidad
+        tmp = _ADMIN_TOKEN_PATH.with_suffix(".tmp")
+        tmp.write_text(token + "\n", encoding="utf-8")
+        tmp.chmod(0o600)
+        tmp.replace(_ADMIN_TOKEN_PATH)
+        # Print al stderr UNA sola vez para que el user lo vea en el log
+        sys.stderr.write(
+            f"\n[obsidian-rag] Admin token generado: {token}\n"
+            f"  Guardado en: {_ADMIN_TOKEN_PATH}\n"
+            f"  Usar en: Authorization: Bearer {token}\n\n"
+        )
+        return token
+    except Exception as exc:
+        # Fallback: token en memoria (no persistido). Suficiente para la sesión.
+        sys.stderr.write(
+            f"[obsidian-rag] WARNING: no pude escribir admin_token ({exc}); "
+            "usando token efímero en memoria.\n"
+        )
+        return secrets.token_urlsafe(32)
+
+
+_ADMIN_TOKEN: str = _load_or_create_admin_token()
+
+
+def _require_admin_token(request: Request) -> None:
+    """FastAPI dependency — 401 si el request no trae el Bearer token correcto.
+
+    Usar como: `@app.post("/api/...", dependencies=[Depends(_require_admin_token)])`.
+    Compara con `secrets.compare_digest` para evitar timing attacks.
+    """
+    auth = request.headers.get("Authorization", "")
+    scheme, _, provided = auth.partition(" ")
+    if scheme.lower() != "bearer" or not secrets.compare_digest(
+        provided.encode(), _ADMIN_TOKEN.encode()
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "Se requiere Authorization: Bearer <admin_token>. "
+                "El token está en ~/.config/obsidian-rag/admin_token.txt"
+            ),
+        )
+
+
 # Chat model for /chat. Delegated to `resolve_chat_model()` so it tracks
 # whatever rag.py decides is best on this host (command-r > qwen2.5:14b >
 # phi4). command-r:35b prefill is slower (~5-10s on a 5k-char context)
@@ -3565,7 +3639,7 @@ def _ollama_restart_if_stuck() -> bool:
     return False
 
 
-@app.post("/api/ollama/restart")
+@app.post("/api/ollama/restart", dependencies=[Depends(_require_admin_token)])
 def ollama_restart() -> dict:
     """Panic button #2: brew-services-restart the ollama daemon. Use when
     /api/chat is hanging forever (stuck-load state: daemon accepts HTTP
@@ -3575,7 +3649,7 @@ def ollama_restart() -> dict:
     return {"ok": ok, "alive": _ollama_alive()}
 
 
-@app.post("/api/ollama/unload")
+@app.post("/api/ollama/unload", dependencies=[Depends(_require_admin_token)])
 def ollama_unload() -> dict:
     """Panic button: evict every loaded model from ollama + drop the
     reranker from MPS. Frees 15-25 GB of wired unified memory in one
@@ -5077,7 +5151,7 @@ def save_conversation(req: SaveRequest) -> dict:
     return {"ok": True, "path": rel}
 
 
-@app.post("/api/reindex")
+@app.post("/api/reindex", dependencies=[Depends(_require_admin_token)])
 def trigger_reindex() -> dict:
     """Fire-and-forget incremental reindex. `--reset` not exposed via web."""
     try:
@@ -5923,7 +5997,7 @@ def get_chat_model() -> dict:
     }
 
 
-@app.post("/api/chat/model")
+@app.post("/api/chat/model", dependencies=[Depends(_require_admin_token)])
 def set_chat_model(req: ChatModelRequest) -> dict:
     """Switch the chat model at runtime. Persisted to disk.
 
@@ -14567,7 +14641,7 @@ class StatusActionRequest(BaseModel):
     action: str  # "start" | "stop"
 
 
-@app.post("/api/status/action")
+@app.post("/api/status/action", dependencies=[Depends(_require_admin_token)])
 def status_action(req: StatusActionRequest) -> dict:
     """Disparar o parar un servicio launchd controlado. Whitelist-only."""
     label = (req.label or "").strip()
@@ -17065,7 +17139,7 @@ class _DiagnoseExecuteRequest(BaseModel):
     command: str = Field(..., description="Comando shell que el LLM sugirió")
 
 
-@app.post("/api/diagnose-error/execute")
+@app.post("/api/diagnose-error/execute", dependencies=[Depends(_require_admin_token)])
 def diagnose_error_execute(req: _DiagnoseExecuteRequest, request: Request) -> dict:
     """Auto-ejecutar un comando del LLM, validado contra una whitelist.
 
@@ -17319,7 +17393,7 @@ def _execute_whitelisted_command(cmd_str: str) -> dict:
     }
 
 
-@app.post("/api/auto-fix")
+@app.post("/api/auto-fix", dependencies=[Depends(_require_admin_token)])
 def auto_fix(req: _AutoFixRequest, request: Request) -> StreamingResponse:
     """Agent loop que diagnostica + resuelve el error solo.
 
@@ -17558,7 +17632,7 @@ def _build_devin_prompt(req: "_AutoFixRequest") -> str:
     return " ".join(parts)
 
 
-@app.post("/api/auto-fix-devin")
+@app.post("/api/auto-fix-devin", dependencies=[Depends(_require_admin_token)])
 def auto_fix_devin(req: _AutoFixRequest, request: Request) -> StreamingResponse:
     """Delegar la resolución del error al agente Devin (CLI `devin -p`).
 

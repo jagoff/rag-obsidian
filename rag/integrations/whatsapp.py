@@ -1067,6 +1067,28 @@ def _append_contact_observation(
     }
 
 
+# ── AppleScript injection guard (local a whatsapp.py) ────────────────────────
+# Misma lógica que _sanitize_applescript_string en rag/__init__.py.
+# Duplicado en lugar de importar para evitar imports circulares.
+_WA_APPLESCRIPT_SAFE_RE = re.compile(
+    r"^[\w \-_'.@#+À-ɏ]{1,200}$"
+)
+
+
+def _wa_sanitize_applescript_string(value: str) -> "str | None":
+    """Sanitiza un valor para interpolación segura en osascript (whatsapp.py).
+
+    Retorna la versión escapada si es seguro, o None si contiene chars
+    peligrosos para inyección. Misma semántica que _sanitize_applescript_string
+    en rag/__init__.py — mantener en sync si se modifica la allowlist.
+    """
+    if not value:
+        return ""
+    if not _WA_APPLESCRIPT_SAFE_RE.match(value):
+        return None
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
 def _exact_contact_lookup(person_name: str) -> dict | None:
     """Buscar un contacto en Apple Contacts por nombre EXACTO (case-
     insensitive).
@@ -1082,7 +1104,9 @@ def _exact_contact_lookup(person_name: str) -> dict | None:
     """
     if not person_name or not person_name.strip():
         return None
-    safe = person_name.replace('"', '\\"')
+    safe = _wa_sanitize_applescript_string(person_name.strip())
+    if safe is None:
+        return None  # input peligroso — abortar silenciosamente
     script = f'''tell application "Contacts"
   set _out to ""
   try

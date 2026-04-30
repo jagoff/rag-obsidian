@@ -1532,9 +1532,14 @@ Lista de plists registrados (cualquier `obsidian-rag-*` que `launchctl list` mue
 | `com.fer.obsidian-rag-cloudflare-tunnel` | KeepAlive | `cloudflared tunnel` | HTTPS público via Cloudflare Quick Tunnel |
 | `com.fer.obsidian-rag-cloudflare-tunnel-watcher` | daemon | `scripts/cloudflared_watcher.sh` | Monitor de túnel + notificación de URL |
 | `com.fer.obsidian-rag-serve-watchdog` | daemon | Monitor de `com.fer.obsidian-rag-serve` | Watchdog para reiniciar serve si cae |
+| `com.fer.obsidian-rag-active-learning-nudge` | lunes 10:00 | `rag active-learning nudge --json` | Envía nudge WA cuando hay queries low-confidence acumuladas para labeling activo |
+| `com.fer.obsidian-rag-brief-auto-tune` | Domingo 03:00 | `rag brief schedule auto-tune --apply` | **(nuevo 2026-04-29)** Auto-tune del horario de los briefs (morning/today/digest) basado en `rag_brief_feedback` |
+| `com.fer.obsidian-rag-lgbm-train` | Domingo 02:30 | `rag tune-lambdarank --apply` | Entrena el ranker LightGBM (distinto del nightly online-tune lineal) |
+| `com.fer.obsidian-rag-paraphrases-train` | Domingo 04:30 | `rag paraphrases train --since 90` | Lee `rag_feedback rating=1` y upsertea `rag_learned_paraphrases`; acelera `expand_queries()` |
+| `com.fer.obsidian-rag-spotify-poll` | cada 60s + RunAtLoad | `scripts/spotify_poll.py` | Registra track actual de Spotify en `rag_spotify_log`; reemplaza la API HTTP cerrada 2026-04-30 |
+| `com.fer.obsidian-rag-synth-refresh` | Sábado 22:00 | `rag synth-queries generate --apply && rag synth-queries mine-negatives --apply` | Feeder del lgbm-train: genera queries sintéticas + mina hard-negatives |
 | `com.fer.obsidian-rag-vault-cleanup` | nightly | `rag vault-cleanup` | Limpieza de carpetas transitorias |
 | `com.fer.obsidian-rag-whisper-vocab` | 03:15 | `rag whisper-vocab refresh` | Extracción nightly de vocab WhatsApp |
-| `com.fer.obsidian-rag-brief-auto-tune` | Domingo 03:00 | `rag brief schedule auto-tune --apply` | **(nuevo 2026-04-29)** Auto-tune del horario de los briefs (morning/today/digest) basado en `rag_brief_feedback` |
 
 Si el listado anterior queda desactualizado, el source de verdad es la lista de tuplas en [`rag/__init__.py:39190+`](rag/__init__.py) (función `_plists_to_install` o similar — `grep "_plists" rag/__init__.py`).
 

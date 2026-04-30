@@ -341,6 +341,71 @@ def migrate_004_index_rag_queries_trace_id(conn: sqlite3.Connection) -> None:
     )
 
 
+@migration(version=5, name="create_mood_tables")
+def migrate_005_create_mood_tables(conn: sqlite3.Connection) -> None:
+    """Mood tracking tables (Fase A del pipeline mood, 2026-04-30).
+
+    Dos tablas:
+
+    - `rag_mood_signals` — append-only, una fila por señal individual
+      capturada por los scorers en `rag/mood.py` (Spotify artist-mood,
+      compulsive-repeat, late-night-listening, journal keyword-negative,
+      journal note-sentiment, wa-outbound tone, queries existential,
+      calendar density). Granularidad fina para auditar después qué
+      señales movieron el score diario.
+
+    - `rag_mood_score_daily` — una fila por día con el weighted-avg
+      computado por `compute_daily_score()`. PRIMARY KEY date para que
+      el agregador haga UPSERT idempotente (recalcular un día no
+      duplica filas).
+
+    Ambas tablas también están declaradas en `_TELEMETRY_DDL` (CREATE
+    TABLE IF NOT EXISTS en boot). Esta migration es belt-and-suspenders
+    para DBs ya bootstrapped (current_version=4) que necesitan saltar a 5.
+
+    Behind flag `RAG_MOOD_ENABLED` — las tablas se crean siempre (cheap)
+    pero los writers de `rag/mood.py` exit-early si el flag está off.
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS rag_mood_signals ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " ts REAL NOT NULL,"
+        " date TEXT NOT NULL,"
+        " source TEXT NOT NULL,"
+        " signal_kind TEXT NOT NULL,"
+        " value REAL NOT NULL,"
+        " weight REAL NOT NULL DEFAULT 1.0,"
+        " evidence TEXT"
+        ")"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS ix_rag_mood_signals_date "
+        "ON rag_mood_signals(date)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS ix_rag_mood_signals_ts "
+        "ON rag_mood_signals(ts DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS ix_rag_mood_signals_source_date "
+        "ON rag_mood_signals(source, date)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS rag_mood_score_daily ("
+        " date TEXT PRIMARY KEY,"
+        " score REAL NOT NULL,"
+        " n_signals INTEGER NOT NULL,"
+        " sources_used TEXT,"
+        " top_evidence TEXT,"
+        " updated_at REAL NOT NULL"
+        ")"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS ix_rag_mood_score_daily_updated "
+        "ON rag_mood_score_daily(updated_at DESC)"
+    )
+
+
 __all__ = [
     "migration",
     "current_version",

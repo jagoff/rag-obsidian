@@ -6958,6 +6958,56 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             "ON rag_spotify_log(last_seen DESC)",
         ),
     ),
+    (
+        # Mood signals — append-only log de señales individuales capturadas
+        # por los scorers en `rag/mood.py`. El daemon `com.fer.obsidian-rag-
+        # mood-poll` (Fase C, todavía no cableado) corre cada 30min y
+        # persiste señales aquí. El agregador `compute_daily_score()` lee
+        # estas filas + escribe el score diario en `rag_mood_score_daily`.
+        # Behind flag `RAG_MOOD_ENABLED` — las tablas existen siempre pero
+        # los writers exit-early si el flag está off, así que en una DB
+        # con el feature desactivado quedan vacías sin costo.
+        "rag_mood_signals",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_mood_signals ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts REAL NOT NULL,"
+            " date TEXT NOT NULL,"
+            " source TEXT NOT NULL,"
+            " signal_kind TEXT NOT NULL,"
+            " value REAL NOT NULL,"
+            " weight REAL NOT NULL DEFAULT 1.0,"
+            " evidence TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_mood_signals_date "
+            "ON rag_mood_signals(date)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_mood_signals_ts "
+            "ON rag_mood_signals(ts DESC)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_mood_signals_source_date "
+            "ON rag_mood_signals(source, date)",
+        ),
+    ),
+    (
+        # Mood score diario agregado — UPSERT por date PK, recalculable
+        # idempotente. Lo escribe `compute_daily_score()` en `rag/mood.py`
+        # y lo leen los consumers (today_correlator bucket `mood_today`,
+        # tier `signal_mood_drift` en anticipatory). `top_evidence` es
+        # JSON con las top-3 señales del día para que el panel home /
+        # CLI puedan mostrar evidence sin re-query a `rag_mood_signals`.
+        "rag_mood_score_daily",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_mood_score_daily ("
+            " date TEXT PRIMARY KEY,"
+            " score REAL NOT NULL,"
+            " n_signals INTEGER NOT NULL,"
+            " sources_used TEXT,"
+            " top_evidence TEXT,"
+            " updated_at REAL NOT NULL"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_mood_score_daily_updated "
+            "ON rag_mood_score_daily(updated_at DESC)",
+        ),
+    ),
 )
 
 

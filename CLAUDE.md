@@ -1,12 +1,12 @@
 # CLAUDE.md
 
-Local RAG over an Obsidian vault. Single-file: `rag.py` (54.5k lines as of 2026-04-27 — drift +56% vs prior 32.7k snapshot, package-split is now an open discussion not a settled "no") + `mcp_server.py` (thin wrapper, 662 lines) + `web/` (FastAPI `web/server.py` 17.6k lines + ~7.7k JS/HTML/CSS) + `tests/` (6,072 tests, 337 files).
+Local RAG over an Obsidian vault. Single-file: `rag.py` (61.2k lines as of 2026-04-30 — drift +87% vs prior 32.7k snapshot, package-split is now an open discussion not a settled "no") + `mcp_server.py` (thin wrapper, 662 lines) + `web/` (FastAPI `web/server.py` 20.6k lines + ~7.7k JS/HTML/CSS) + `tests/` (6,031 tests, 395 files).
 
 Entry points (both installed via `uv tool install --editable '.[entities]'` — incluye el extra `entities` para que gliner se instale en el uv tool venv y la feature de entity-aware retrieval quede activa de fábrica; sin el extra los 5 ingesters loggean `dep \`gliner\` not available` cada corrida y la feature corre desactivada silenciosamente):
 - `rag` — CLI for indexing, querying, chat, productivity, automation
 - `obsidian-rag-mcp` — MCP server (`rag_query`, `rag_read_note`, `rag_list_notes`, `rag_links`, `rag_stats`)
 
-Fully local: Sqlite-vec + Ollama + sentence-transformers. **Exception**: Gmail + Calendar cross-source ingesters (Phase 1.b/c, pending) use OAuth Google via the Claude harness MCP — user override 2026-04-20, see `docs/design-cross-source-corpus.md §10.6`. WhatsApp + Reminders stay local (bridge SQLite + EventKit).
+Fully local por default sobre el VAULT y los corpus locales (sqlite-vec + Ollama + sentence-transformers). Cross-source ingesters cloud (Gmail/Calendar/Drive) están instalados en `_services_spec()` pero requieren credentials OAuth en `~/.{gmail,calendar,gdrive}-mcp/` — sin esas credenciales el ingester silent-fails y el corpus local sigue funcionando. WhatsApp + Reminders stay local (bridge SQLite + EventKit).
 
 ## Idioma — español rioplatense (Argentina) por default
 
@@ -104,7 +104,7 @@ mcp_call_tool(
 
 **`auto_extract=false`** (default) — el body crudo es lo que quiero indexar, no una versión resumida por LLM.
 
-**Por qué importa especialmente en este repo**: `rag/__init__.py` tiene 54.5k líneas y muchas funciones con sufijos similares (`_pp_task_repair`, `_pp_task_critique`, `_pp_format_critique`, ...). Sin memoria persistente de qué wrapper hace qué, en 2 sesiones futuras vuelvo a romper el filter chain o a re-descubrir un truco. Las memorias quedan searchable semánticamente y sobreviven al context-compaction.
+**Por qué importa especialmente en este repo**: `rag/__init__.py` tiene 61.2k líneas y muchas funciones con sufijos similares (`_pp_task_repair`, `_pp_task_critique`, `_pp_format_critique`, ...). Sin memoria persistente de qué wrapper hace qué, en 2 sesiones futuras vuelvo a romper el filter chain o a re-descubrir un truco. Las memorias quedan searchable semánticamente y sobreviven al context-compaction.
 
 ## Auto-pull + commit + push rule
 
@@ -914,6 +914,14 @@ rag routing-rules [--reset --debug --json]  # descriptor de rutas + patterns det
 rag whisper-vocab [--refresh --show --source X --limit N]  # manejo de vocabulario de transcripción WhatsApp
 rag vault-cleanup [--dry-run --apply --force]  # limpia carpetas transitorias del vault
 rag ingest-drive [--reset --dry-run --json]  # Google Drive ingester — busca DAO + documentos compartidos
+rag health [--since HOURS --as-json]     # dashboard unificado de salud del sistema
+rag ask "pregunta" [--quick --source S --session ID --continue --plain]  # alias minimalista de rag query
+rag trends [--days N --top N --as-json]  # análisis temático de queries recientes (folders, tags, horas)
+rag hygiene [--empty-threshold N --stale-days N --sample N --as-json]  # reporte de notas vacías / stale
+rag state [texto] [--clear --plain]      # lee/escribe estado del usuario (cansado, inspirado…) — TTL 24h
+rag config [--only-set --filter PATTERN --as-json]  # catálogo de env vars configurables del sistema
+rag pendientes [--days N --plain]        # resumen de pendientes activos del vault + Reminders
+rag contact-note NOMBRE OBSERVACION [--category X --source-kind X]  # anota info viva sobre un contacto en su nota del vault
 
 
 # Automation
@@ -1540,8 +1548,10 @@ Lista de plists registrados (cualquier `obsidian-rag-*` que `launchctl list` mue
 | `com.fer.obsidian-rag-synth-refresh` | Sábado 22:00 | `rag synth-queries generate --apply && rag synth-queries mine-negatives --apply` | Feeder del lgbm-train: genera queries sintéticas + mina hard-negatives |
 | `com.fer.obsidian-rag-vault-cleanup` | nightly | `rag vault-cleanup` | Limpieza de carpetas transitorias |
 | `com.fer.obsidian-rag-whisper-vocab` | 03:15 | `rag whisper-vocab refresh` | Extracción nightly de vocab WhatsApp |
+| `com.fer.obsidian-rag-ingest-calls` | cada 6h | `rag index --source calls` | Apple CallHistory ingester — llamadas perdidas/entrantes/salientes |
+| `com.fer.obsidian-rag-ingest-safari` | cada 6h 15min | `rag index --source safari` | Safari History + Bookmarks + Reading List ingester |
 
-Si el listado anterior queda desactualizado, el source de verdad es la lista de tuplas en [`rag/__init__.py:39190+`](rag/__init__.py) (función `_plists_to_install` o similar — `grep "_plists" rag/__init__.py`).
+Si el listado anterior queda desactualizado, el source de verdad es la lista de tuplas en [`rag/__init__.py`](rag/__init__.py) función `_services_spec()` — `grep -n "_services_spec\|com.fer.obsidian-rag-" rag/__init__.py | head -80`.
 
 ### Bypass: `rag setup` también funciona
 

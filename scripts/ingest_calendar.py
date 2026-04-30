@@ -271,8 +271,10 @@ def list_calendars(svc) -> list[tuple[str, str]]:
                 continue
             name = item.get("summaryOverride") or item.get("summary") or cid
             out.append((cid, str(name)))
-    except Exception:
-        pass
+    except Exception as e:
+        # Log OAuth/auth errors explicitly to help debug token issues
+        import sys
+        print(f"[error] list_calendars failed: {e}", file=sys.stderr)
     return out
 
 

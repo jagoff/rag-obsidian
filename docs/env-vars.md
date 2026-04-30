@@ -225,6 +225,7 @@ Las del último audit de seguridad/perf. Citadas explícitamente porque son las 
 |---|---|---|---|
 | `HF_HUB_OFFLINE` | (recomendado `1`) | (HuggingFace lib) | Reranker se carga del caché local de HuggingFace, sin tocar la red. |
 | `TRANSFORMERS_OFFLINE` | (recomendado `1`) | (HuggingFace lib) | Idem para `transformers`. |
+| `FASTEMBED_CACHE_PATH` | `~/.cache/fastembed` | `rag/__init__.py:44`, plists | Directorio persistente para los modelos ONNX que carga `fastembed` (usado por `mem0` para BM25 sparse vectors / hybrid search en Qdrant). El default upstream es `tempfile.gettempdir()/fastembed_cache` → en macOS resuelve a `/var/folders/.../T/fastembed_cache`, que el SO limpia periódicamente. Pinearlo a `$HOME` evita que `HF_HUB_OFFLINE=1` + cache miss tras GC dejen al encoder sin poder cargar (ver web.error.log 2026-04-29). Población inicial: `python -c 'from fastembed import SparseTextEmbedding; SparseTextEmbedding("Qdrant/bm25")'` con offline mode desactivado. |
 | `RAG_FT_DEVICE` | `cpu` | `scripts/finetune_reranker.py:238` | Device para entrenar el cross-encoder fine-tuned. `cpu`/`mps`/`cuda`. |
 | `RAG_FINETUNE_MIN_CORRECTIVES` | `20` | `scripts/finetune_reranker.py:481` | Cap mínimo de feedback rows correctivos para que el fine-tune dispare. Gate GC#2.C. |
 | `RAG_AUTO_HARVEST_MIN_CONF` | `0.8` | `rag/__init__.py:48936` | Confidence mínimo del LLM-as-judge para aceptar una query low-conf como label en el auto-harvest nightly. |

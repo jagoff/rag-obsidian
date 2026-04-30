@@ -28,6 +28,20 @@ for _k, _v in {
     "TRANSFORMERS_NO_ADVISORY_WARNINGS": "1",
     "TRANSFORMERS_VERBOSITY": "error",
     "TQDM_DISABLE": "1",
+    # mem0's qdrant vector store lazy-loads `fastembed.SparseTextEmbedding(
+    # model_name="Qdrant/bm25")` for hybrid keyword search. fastembed's
+    # default cache dir is `tempfile.gettempdir()/fastembed_cache`, which
+    # on macOS resolves to `/var/folders/.../T/fastembed_cache` — and macOS
+    # periodically GC's that path. Combined with HF_HUB_OFFLINE=1 above, a
+    # cache miss after the GC means fastembed can't redownload the model
+    # and the encoder fails to initialise (see web.error.log 2026-04-29:
+    # `Could not find the model tar.gz file at /var/folders/.../T/
+    # fastembed_cache/bm25 and local_files_only=True`). Pinning the cache
+    # to ~/.cache/fastembed (HOME-relative, never GC'd) is the persistent
+    # fix; one-time download via `python -c 'from fastembed import
+    # SparseTextEmbedding; SparseTextEmbedding("Qdrant/bm25")'` (with
+    # offline mode disabled) populates the dir.
+    "FASTEMBED_CACHE_PATH": os.path.join(os.path.expanduser("~"), ".cache", "fastembed"),
 }.items():
     os.environ.setdefault(_k, _v)
 del _k, _v
@@ -45869,6 +45883,7 @@ def _serve_plist(rag_bin: str) -> str:
     <key>RAG_STATE_SQL</key><string>1</string>
     <key>HF_HUB_OFFLINE</key><string>1</string>
     <key>TRANSFORMERS_OFFLINE</key><string>1</string>
+    <key>FASTEMBED_CACHE_PATH</key><string>{Path.home()}/.cache/fastembed</string>
     <key>RAG_MEMORY_PRESSURE_INTERVAL</key><string>20</string>
   </dict>
   <key>RunAtLoad</key><true/>
@@ -45965,6 +45980,7 @@ def _web_plist(rag_bin: str) -> str:
     <key>RAG_STATE_SQL</key><string>1</string>
     <key>HF_HUB_OFFLINE</key><string>1</string>
     <key>TRANSFORMERS_OFFLINE</key><string>1</string>
+    <key>FASTEMBED_CACHE_PATH</key><string>{Path.home()}/.cache/fastembed</string>
     <key>RAG_MEMORY_PRESSURE_INTERVAL</key><string>20</string>
     <key>RAG_MEMORY_PRESSURE_THRESHOLD</key><string>80</string>
     <key>RAG_AUTO_FIX_WORKER</key><string>1</string>

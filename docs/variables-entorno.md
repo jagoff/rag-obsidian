@@ -324,6 +324,32 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 ```
 
+### `FASTEMBED_CACHE_PATH=$HOME/.cache/fastembed`
+Pinea el cache de [fastembed](https://github.com/qdrant/fastembed) (usado por
+`mem0` para BM25 sparse / hybrid search en Qdrant) a un directorio persistente.
+El default upstream es `tempfile.gettempdir()/fastembed_cache` que en macOS cae
+en `/var/folders/.../T/fastembed_cache` y el SO lo limpia cada tanto. Combinado
+con `HF_HUB_OFFLINE=1`, una limpieza del tmpdir deja al encoder sin poder
+descargar el modelo de nuevo y `mem0` cae a búsqueda sólo-semántica:
+
+```text
+ERROR fastembed.common.model_management:retrieve_model_gcs:362 - Could not
+find the model tar.gz file at /var/folders/.../T/fastembed_cache/bm25 and
+local_files_only=True.
+Failed to load BM25 encoder: Could not load model Qdrant/bm25 from any source.
+```
+
+Población inicial (corré una vez con offline mode apagado):
+
+```bash
+HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 \
+  python -c 'from fastembed import SparseTextEmbedding; SparseTextEmbedding("Qdrant/bm25")'
+```
+
+`rag/__init__.py` ya hace `setdefault` con `~/.cache/fastembed` y los plists
+(`com.fer.obsidian-rag-web`, `com.fer.obsidian-rag-serve`) lo exportan
+explícitamente para evitar la race con el módulo init.
+
 ---
 
 ## Resumen: qué setear según tu caso

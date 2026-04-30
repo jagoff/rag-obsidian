@@ -106,6 +106,26 @@ def test_web_plist_has_transformers_offline():
         "sentence_transformers inherits this flag; without it the HEAD probe still fires"
 
 
+def test_web_plist_has_fastembed_cache_path():
+    """Pin fastembed's model cache to ~/.cache/fastembed.
+
+    Default upstream cache is `tempfile.gettempdir()/fastembed_cache` which on
+    macOS resolves to `/var/folders/.../T/fastembed_cache`, a path the OS GCs.
+    Combined with `HF_HUB_OFFLINE=1` (above) a cache miss after the GC means
+    `fastembed.SparseTextEmbedding('Qdrant/bm25')` (loaded by mem0's qdrant
+    vector store for hybrid keyword search) can't redownload and the encoder
+    fails. See web.error.log 2026-04-29:
+        Could not find the model tar.gz file at /var/folders/.../T/
+        fastembed_cache/bm25 and local_files_only=True
+    """
+    d = _parse(rag_module._web_plist(RAG_BIN))
+    env = d["EnvironmentVariables"]
+    cache = env.get("FASTEMBED_CACHE_PATH", "")
+    home = str(Path.home())
+    assert cache.startswith(home) and cache.endswith(".cache/fastembed"), \
+        f"FASTEMBED_CACHE_PATH should be HOME/.cache/fastembed (persistent), got {cache!r}"
+
+
 def test_web_plist_has_rag_memory_pressure_interval_20():
     d = _parse(rag_module._web_plist(RAG_BIN))
     env = d["EnvironmentVariables"]
@@ -168,6 +188,16 @@ def test_serve_plist_has_transformers_offline():
     d = _parse(rag_module._serve_plist(RAG_BIN))
     env = d["EnvironmentVariables"]
     assert env.get("TRANSFORMERS_OFFLINE") == "1"
+
+
+def test_serve_plist_has_fastembed_cache_path():
+    """Same rationale as the web plist version — see that test for context."""
+    d = _parse(rag_module._serve_plist(RAG_BIN))
+    env = d["EnvironmentVariables"]
+    cache = env.get("FASTEMBED_CACHE_PATH", "")
+    home = str(Path.home())
+    assert cache.startswith(home) and cache.endswith(".cache/fastembed"), \
+        f"FASTEMBED_CACHE_PATH should be HOME/.cache/fastembed (persistent), got {cache!r}"
 
 
 def test_serve_plist_has_rag_memory_pressure_interval_20():

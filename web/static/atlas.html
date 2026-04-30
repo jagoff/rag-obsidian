@@ -308,6 +308,125 @@
     .collapse-btn:hover { color: var(--text); border-color: var(--border-strong); }
     .learn-section-body.collapsed { display: none; }
 
+    /* ── Ask-vault: input conversacional que ata el chat al grafo 3D ──
+       Es la diferencia entre "viewer" (solo mirás) y "buscador
+       conversacional con vista 3D" (preguntás → notas relevantes
+       brillan en amarillo + cámara vuela al cluster). */
+    .ask-vault {
+      max-width: 1280px;
+      margin: 0 auto 24px;
+      padding: 0 24px;
+    }
+    .ask-vault-row {
+      display: flex;
+      gap: 8px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 8px;
+      transition: border-color 120ms;
+    }
+    .ask-vault-row:focus-within {
+      border-color: var(--cyan);
+    }
+    .ask-vault-input {
+      flex: 1;
+      background: transparent;
+      border: none;
+      color: var(--text);
+      font-family: inherit;
+      font-size: 14px;
+      padding: 8px 12px;
+      outline: none;
+    }
+    .ask-vault-input::placeholder { color: var(--text-faint); }
+    .ask-vault-btn {
+      background: var(--cyan);
+      color: var(--bg);
+      border: none;
+      border-radius: 8px;
+      padding: 8px 16px;
+      font-family: inherit;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: filter 120ms;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 110px;
+      justify-content: center;
+    }
+    .ask-vault-btn:hover { filter: brightness(1.1); }
+    .ask-vault-btn:disabled { cursor: not-allowed; opacity: 0.6; }
+    .ask-vault-answer {
+      margin-top: 12px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--cyan);
+      border-radius: 10px;
+      padding: 14px 16px;
+      position: relative;
+      max-height: 320px;
+      overflow-y: auto;
+    }
+    .ask-vault-question {
+      font-size: 11px;
+      color: var(--text-faint);
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      margin-bottom: 8px;
+      padding-right: 32px;
+    }
+    .ask-vault-question::before {
+      content: "Pregunta: ";
+      color: var(--cyan);
+    }
+    .ask-vault-text {
+      font-size: 13px;
+      color: var(--text);
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .ask-vault-text .cursor {
+      display: inline-block;
+      width: 7px;
+      height: 14px;
+      background: var(--cyan);
+      vertical-align: text-bottom;
+      animation: ask-blink 1s steps(2) infinite;
+      margin-left: 2px;
+    }
+    @keyframes ask-blink { 50% { opacity: 0.2; } }
+    .ask-vault-meta {
+      margin-top: 10px;
+      padding-top: 8px;
+      border-top: 1px solid var(--sep);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 10px;
+      color: var(--text-faint);
+    }
+    .ask-vault-status { letter-spacing: 0.04em; }
+    .ask-vault-clear {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+      width: 24px;
+      height: 24px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 13px;
+      line-height: 1;
+    }
+    .ask-vault-clear:hover { color: var(--text); border-color: var(--border-strong); }
+
     /* ── Graph 3D ────────────────────────────────────────────────────
        Contenedor `<div id="graph-3d">` que aloja el canvas WebGL del
        ForceGraph3D (three.js). Drag para rotar, scroll para zoom,
@@ -867,11 +986,33 @@
       </div>
     </section>
 
+    <!-- ── 0. PREGUNTALE AL VAULT — chat conversacional con highlight 3D ── -->
+    <section class="ask-vault" id="ask-vault" aria-labelledby="h-ask">
+      <h2 id="h-ask" class="ask-vault-title" hidden>Preguntale a tu vault</h2>
+      <div class="ask-vault-row">
+        <input type="search" id="ask-vault-input" class="ask-vault-input"
+               placeholder="Preguntale a tu vault — ej. ¿qué pensaba sobre Astor el último mes?"
+               aria-label="Pregunta sobre tu vault" autocomplete="off">
+        <button id="ask-vault-btn" type="button" class="ask-vault-btn" aria-label="Enviar pregunta al vault">
+          <span class="ask-vault-btn-text">↗ preguntar</span>
+          <span class="ask-vault-btn-spinner" hidden>⏳</span>
+        </button>
+      </div>
+      <div class="ask-vault-answer" id="ask-vault-answer" hidden>
+        <div class="ask-vault-question" id="ask-vault-question"></div>
+        <div class="ask-vault-text" id="ask-vault-text"></div>
+        <div class="ask-vault-meta" id="ask-vault-meta">
+          <span class="ask-vault-status" id="ask-vault-status"></span>
+          <button type="button" class="ask-vault-clear" id="ask-vault-clear" aria-label="Cerrar respuesta">×</button>
+        </div>
+      </div>
+    </section>
+
     <!-- ── 1. GRAFO DE NOTAS (estilo Obsidian) ───────────────────── -->
     <section class="learn-section" id="sec-graph" aria-labelledby="h-graph">
       <header class="learn-section-hdr">
         <h2 id="h-graph" title="Force-directed graph 3D — drag para rotar, scroll para zoom">Mapa de conexiones entre notas (3D)</h2>
-        <p class="muted">Cada esfera es una nota; las líneas son wikilinks <code>[[...]]</code>. Tamaño = cantidad de conexiones. Color = carpeta. <strong>Drag</strong> para rotar, <strong>scroll</strong> para zoom, <strong>click</strong> en una nota para resaltar sus vecinos.</p>
+        <p class="muted">Cada esfera es una nota; las líneas son wikilinks <code>[[...]]</code>. Tamaño = cantidad de conexiones. Color = carpeta. <strong>Drag</strong> para rotar, <strong>scroll</strong> para zoom, <strong>click</strong> en una nota para resaltar sus vecinos. Tip: usá la barra de arriba para preguntarle algo al vault — las notas relevantes se prenden en amarillo y la cámara se mueve sola.</p>
         <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-graph" data-collapse="body-graph">−</button>
       </header>
       <div class="learn-section-body" id="body-graph">
@@ -971,6 +1112,6 @@
 
   <span id="atlas-status" class="sr-only" role="status" aria-live="polite">Cargando datos del atlas</span>
 
-  <script src="/static/atlas.js?v=2" defer></script>
+  <script src="/static/atlas.js?v=4" defer></script>
 </body>
 </html>

@@ -70,10 +70,13 @@ const COLOR_NEIGHBOR_LINK = "#79c0ff";
 const COLOR_DEFAULT_LINK = "#a0a0aa";
 const COLOR_DIM_LINK = "#3e3e46";
 
-// Detectar mobile para cap del graph_top_notes (perf en iPhone con 250+ nodos
-// + force-sim es brutal). 720px es el breakpoint del rest del proyecto.
+// Detectar mobile para cap del graph_top_notes (perf en iPhone con 500+ nodos
+// + force-sim 3D es pesado). 720px es el breakpoint del rest del proyecto.
+// Subimos el cap desktop a 500 para que el "preguntale al vault" pueda
+// matchear más fuentes contra el grafo visible — three.js maneja 500
+// esferas + 1000 links sin sudar en una Mac de los últimos 5 años.
 const IS_MOBILE = window.matchMedia("(max-width: 720px)").matches;
-const GRAPH_TOP_NOTES = IS_MOBILE ? 150 : 250;
+const GRAPH_TOP_NOTES = IS_MOBILE ? 200 : 500;
 
 // ── Theme toggle (mismo patrón que dashboard/finance) ────────────────────
 function applyTheme() {
@@ -420,16 +423,20 @@ async function renderGraph(graph) {
     .graphData({ nodes, links })
     .nodeId("id")
     .nodeVal(nodeVal)
-    .nodeRelSize(7)                // bola más grande para que el color se vea sin lambert washout
+    .nodeRelSize(7)
     .nodeOpacity(1.0)
-    .nodeResolution(16)            // detalle de la esfera; 16 = bola redonda
     .nodeLabel((n) => `
       <div style="background:#222228;border:1px solid #3e3e46;border-radius:6px;padding:6px 10px;font-size:11px;color:#ececed;font-family:'SF Mono',monospace;">
         <div><strong>${escapeHtml(n.label || "(sin título)")}</strong></div>
         <div style="color:#7a7a82;margin-top:2px;">${escapeHtml(n.folder || "—")}</div>
         <div style="color:#7a7a82;">${n.degree} conexión${n.degree === 1 ? "" : "es"} · ${n.n_chunks} chunk${n.n_chunks === 1 ? "" : "s"}</div>
       </div>`)
-    .nodeColor(graphNodeColor)
+    // Reemplazamos la mesh default (MeshLambertMaterial) por una mesh
+    // BasicMaterial sin lighting — así los colores de carpeta no se
+    // lavan por la luz ambient/directional. Los re-coloreamos cheap
+    // mutando `node._material.color` desde refreshGraphVisuals().
+    .nodeThreeObject(buildNodeObject)
+    .nodeThreeObjectExtend(false)
     .linkColor(graphLinkColor)
     .linkWidth((l) => Math.max(0.4, Math.min(2.0, Math.sqrt(l.weight || 1) * 0.6)))
     .linkOpacity(0.4)
@@ -523,11 +530,53 @@ function graphLinkColor(link) {
   return COLOR_DEFAULT_LINK;
 }
 
-// Forzar re-evaluación de los accessors (los re-set triggea un re-paint).
+// Construye la mesh 3D de un nodo: SphereGeometry + MeshBasicMaterial
+// (sin lighting, color puro). Guardamos referencia al material en
+// `node._material` para poder mutarle el color barato sin recrear la
+// geometry en cada cambio de estado (highlight, dim, selección, etc.).
+//
+// Si los labels están on, agregamos el SpriteText como child de la mesh
+// para que se mueva junto con la esfera durante el force-sim.
+function buildNodeObject(node) {
+  const radius = nodeRadiusFor(node);
+  const geo = new THREE.SphereGeometry(radius, 14, 14);
+  const mat = new THREE.MeshBasicMaterial({
+    color: new THREE.Color(graphNodeColor(node)),
+    transparent: false,
+  });
+  const sphere = new THREE.Mesh(geo, mat);
+  node._material = mat;            // ref para refreshGraphVisuals()
+  node._radius = radius;            // ref para position-y del label
+
+  if (state.showLabels && typeof SpriteText === "function") {
+    const sprite = new SpriteText(node.label || "");
+    sprite.material.depthWrite = false;
+    sprite.color = "#ececed";
+    sprite.textHeight = 3.2;
+    sprite.padding = 1;
+    sprite.position.set(0, radius + 4, 0);
+    sphere.add(sprite);
+  }
+  return sphere;
+}
+
+// Forzar re-paint visual: mutamos el color de cada material directamente
+// (cheap — no recrea geometries) + re-set del accessor de links + toggle
+// de partículas direccionales en el subgrafo seleccionado.
 function refreshGraphVisuals() {
   if (!state.graph3d) return;
-  state.graph3d.nodeColor(graphNodeColor).linkColor(graphLinkColor);
-  // Highlight: prendemos partículas solo en los links del subgrafo seleccionado.
+  // Node colors: mutación in-place del material (NO recreates geometry).
+  if (state.graphNodes) {
+    for (const n of state.graphNodes) {
+      if (n._material) {
+        n._material.color.set(graphNodeColor(n));
+      }
+    }
+  }
+  // Link colors: re-trigger del accessor (la lib evalúa cada frame).
+  state.graph3d.linkColor(graphLinkColor);
+  // Highlight: partículas direccionales solo en los links del subgrafo
+  // seleccionado para llamar la atención sin saturar el resto.
   if (state.selectedNode) {
     state.graph3d.linkDirectionalParticles((l) => state.selectedLinks?.has(l) ? 3 : 0);
   } else {
@@ -535,29 +584,20 @@ function refreshGraphVisuals() {
   }
 }
 
+// Toggle aA: prende/apaga los SpriteText labels. Reconstruye los meshes
+// (no podemos add/remove sprites individuales sin saber qué nodos tienen
+// label actualmente — más simple regenerar). 500 nodos * (geo+mat alloc)
+// tarda ~80ms en una Mac M-series, aceptable para un toggle manual.
 function applyLabelMode(Graph) {
   if (!Graph) return;
-  if (state.showLabels && typeof SpriteText === "function") {
-    Graph.nodeThreeObject((node) => {
-      const sprite = new SpriteText(node.label || "");
-      sprite.material.depthWrite = false;            // siempre visible aunque se solape
-      sprite.color = "#ececed";
-      sprite.textHeight = 3.2;
-      sprite.padding = 1;
-      sprite.position.set(0, nodeRadiusFor(node) + 4, 0);
-      return sprite;
-    }).nodeThreeObjectExtend(true);
-  } else {
-    // Quitar labels: forzamos accessor que retorne null + flag de "no extender"
-    // para que three-force-graph use el sphere default sin el sprite.
-    Graph.nodeThreeObject(() => null).nodeThreeObjectExtend(false);
-  }
+  Graph.nodeThreeObject(buildNodeObject).nodeThreeObjectExtend(false);
 }
 
 function nodeRadiusFor(node) {
-  // Aprox del radio que 3d-force-graph dibuja con .nodeRelSize(4.5) y nodeVal(degree).
+  // Aprox del radio que 3d-force-graph dibuja con .nodeRelSize(7) y
+  // nodeVal(degree). cbrt porque 3d-force-graph usa volumen ∝ val.
   const v = Math.max(0.5, Math.min(20, node.degree || 1));
-  return Math.cbrt(v) * 4.5 * 0.5;
+  return Math.cbrt(v) * 7 * 0.5;
 }
 
 function zoomCamera(factor) {
@@ -849,6 +889,193 @@ function escapeHtml(s) {
   }[c]));
 }
 
+// ── Ask-vault: chat conversacional con highlight 3D ─────────────────────
+//
+// Flow:
+//   1. user tipea pregunta + Enter / click → askVault(q)
+//   2. POST /api/chat (mismo endpoint del chat principal) con SSE
+//   3. Cuando llega el evento `sources`, mapeamos los paths a node IDs
+//      del grafo y los prendemos en amarillo via state.searchHits.
+//   4. Cámara vuela al centroide de los nodos resaltados.
+//   5. Tokens del LLM se accumulan en el panel de respuesta arriba.
+//
+// Limitación: la API de /atlas devuelve los top-N notas (default 500);
+// si el chat cita una nota fuera de ese set, no la podemos highlightear
+// — se cuenta en el footer pero no brilla.
+
+function _askSessionId() {
+  if (!state._askSessionId) {
+    state._askSessionId = "atlas-" + Date.now().toString(36) +
+      "-" + Math.random().toString(36).slice(2, 8);
+  }
+  return state._askSessionId;
+}
+
+async function askVault(question) {
+  const q = (question || "").trim();
+  if (!q) return;
+  if (state._askInFlight) return;
+
+  const panel = document.getElementById("ask-vault-answer");
+  const qEl = document.getElementById("ask-vault-question");
+  const tEl = document.getElementById("ask-vault-text");
+  const stEl = document.getElementById("ask-vault-status");
+  const btn = document.getElementById("ask-vault-btn");
+  const btnText = btn?.querySelector(".ask-vault-btn-text");
+  const btnSpin = btn?.querySelector(".ask-vault-btn-spinner");
+
+  state._askInFlight = true;
+  state._askAnswer = "";
+  state._askSourcePaths = [];
+  if (qEl) qEl.textContent = q;
+  if (tEl) tEl.innerHTML = '<span class="cursor"></span>';
+  if (stEl) stEl.textContent = "buscando en el vault…";
+  if (panel) panel.hidden = false;
+  if (btn) btn.disabled = true;
+  if (btnText) btnText.hidden = true;
+  if (btnSpin) btnSpin.hidden = false;
+
+  // Limpiar cualquier filtro o selección previa para que el highlight
+  // del ask sea claro.
+  state.selectedNode = null;
+  state.selectedNeighborIds = null;
+  state.selectedLinks = null;
+  state.entityFilter = null;
+  state.entityMatches = null;
+
+  let aborted = false;
+  try {
+    const t0 = performance.now();
+    const res = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        question: q,
+        session_id: _askSessionId(),
+        vault_scope: null,
+        mode: "default",
+      }),
+    });
+    if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buffer.indexOf("\n\n")) !== -1) {
+        const raw = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        _handleAskEvent(raw);
+      }
+    }
+    const dt = ((performance.now() - t0) / 1000).toFixed(1);
+    const matched = state._askMatchedCount || 0;
+    const total = state._askSourcePaths.length;
+    const offGraph = total - matched;
+    let footer = `${dt}s · ${total} fuente${total === 1 ? "" : "s"}`;
+    if (matched > 0) footer += ` · ${matched} en el grafo`;
+    if (offGraph > 0) footer += ` · ${offGraph} fuera del top visible`;
+    if (stEl) stEl.textContent = footer;
+  } catch (e) {
+    aborted = true;
+    if (tEl) tEl.textContent = "Error: " + (e.message || e);
+    if (stEl) stEl.textContent = "falló — revisá la consola";
+    console.error("[ask-vault]", e);
+  } finally {
+    state._askInFlight = false;
+    if (btn) btn.disabled = false;
+    if (btnText) btnText.hidden = false;
+    if (btnSpin) btnSpin.hidden = true;
+    if (!aborted && tEl) {
+      const cur = tEl.querySelector(".cursor");
+      if (cur) cur.remove();
+    }
+  }
+}
+
+function _handleAskEvent(raw) {
+  const lines = raw.split("\n");
+  let event = "message";
+  let data = "";
+  for (const line of lines) {
+    if (line.startsWith("event: ")) event = line.slice(7).trim();
+    else if (line.startsWith("data: ")) data += line.slice(6);
+  }
+  if (!data) return;
+  let parsed;
+  try { parsed = JSON.parse(data); } catch { return; }
+
+  if (event === "sources") {
+    const items = parsed.items || [];
+    const paths = items.map((i) => i && i.file).filter(Boolean);
+    state._askSourcePaths = paths;
+    _highlightAskNodes(paths);
+    const stEl = document.getElementById("ask-vault-status");
+    if (stEl) stEl.textContent = `pensando… ${paths.length} fuente${paths.length === 1 ? "" : "s"} encontrada${paths.length === 1 ? "" : "s"}`;
+  } else if (event === "token") {
+    const delta = parsed.delta || "";
+    state._askAnswer += delta;
+    const tEl = document.getElementById("ask-vault-text");
+    if (tEl) {
+      tEl.innerHTML = escapeHtml(state._askAnswer) +
+        '<span class="cursor"></span>';
+      const panel = document.getElementById("ask-vault-answer");
+      if (panel) panel.scrollTop = panel.scrollHeight;
+    }
+  } else if (event === "status") {
+    const stEl = document.getElementById("ask-vault-status");
+    if (stEl && parsed.stage) {
+      stEl.textContent = `${parsed.stage}…`;
+    }
+  }
+}
+
+function _highlightAskNodes(paths) {
+  if (!state.graph3d || !state.graphNodes) return;
+  const pathSet = new Set(paths);
+  const matches = new Set();
+  let cx = 0, cy = 0, cz = 0, count = 0;
+  state.graphNodes.forEach((n) => {
+    if (pathSet.has(n.id)) {
+      matches.add(n.id);
+      if (n.x != null && n.y != null && n.z != null) {
+        cx += n.x; cy += n.y; cz += n.z; count++;
+      }
+    }
+  });
+  state._askMatchedCount = matches.size;
+  state.searchHits = matches;       // reuso del visual del search local
+  refreshGraphVisuals();
+
+  if (count > 0) {
+    cx /= count; cy /= count; cz /= count;
+    const distance = matches.size === 1 ? 70 : 140;
+    const r = Math.hypot(cx, cy, cz);
+    const distRatio = r > 0 ? 1 + distance / r : 1;
+    state.graph3d.cameraPosition(
+      { x: cx * distRatio, y: cy * distRatio, z: (cz * distRatio) || distance },
+      { x: cx, y: cy, z: cz },
+      1500
+    );
+  }
+}
+
+function clearAskVault() {
+  const panel = document.getElementById("ask-vault-answer");
+  const input = document.getElementById("ask-vault-input");
+  if (panel) panel.hidden = true;
+  if (input) input.value = "";
+  state._askAnswer = "";
+  state._askSourcePaths = [];
+  state._askMatchedCount = 0;
+  state.searchHits = null;
+  refreshGraphVisuals();
+}
+
 // ── Boot ────────────────────────────────────────────────────────────────
 window.addEventListener("DOMContentLoaded", () => {
   // Re-fit the graph on resize (debounced).
@@ -873,9 +1100,29 @@ window.addEventListener("DOMContentLoaded", () => {
   const clearBtn = document.getElementById("graph-clear-filter");
   if (clearBtn) clearBtn.addEventListener("click", () => clearEntityFilter());
 
-  // Esc cierra el side-panel.
+  // ── Ask vault: input + botón + Enter para submit ────────────────────────
+  const askInput = document.getElementById("ask-vault-input");
+  const askBtn = document.getElementById("ask-vault-btn");
+  const askClear = document.getElementById("ask-vault-clear");
+  if (askBtn && askInput) {
+    askBtn.addEventListener("click", () => askVault(askInput.value));
+    askInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        askVault(askInput.value);
+      }
+    });
+  }
+  if (askClear) askClear.addEventListener("click", () => clearAskVault());
+
+  // Esc cierra: ask-vault → search → entity filter → side-panel.
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
+      const askPanel = document.getElementById("ask-vault-answer");
+      if (askPanel && !askPanel.hidden) {
+        clearAskVault();
+        return;
+      }
       if (state.searchQuery) {
         if (searchInput) searchInput.value = "";
         applySearch("");

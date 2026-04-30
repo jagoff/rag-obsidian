@@ -32,7 +32,7 @@
 
 // Bump cuando cambie el shell / la estrategia. El activate handler borra
 // todo cache que no matchee esta versión, así no se acumulan huérfanos.
-const CACHE_VERSION = "rag-pwa-v23-2026-04-29-atlas-3d-robust";
+const CACHE_VERSION = "rag-pwa-v24-2026-04-29-atlas-ask-vault-colors";
 const SHELL_CACHE = `${CACHE_VERSION}-shell`;
 const STATIC_CACHE = `${CACHE_VERSION}-static`;
 

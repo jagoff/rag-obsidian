@@ -48272,7 +48272,8 @@ def _routing_rules_plist(rag_bin: str) -> str:
   <key>ProgramArguments</key>
   <array>
     <string>{rag_bin}</string>
-    <string>routing-rules</string>
+    <string>routing</string>
+    <string>extract-rules</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
@@ -48281,9 +48282,8 @@ def _routing_rules_plist(rag_bin: str) -> str:
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
   </dict>
-  <key>KeepAlive</key><true/>
-  <key>RunAtLoad</key><true/>
-  <key>ThrottleInterval</key><integer>300</integer>
+  <key>StartInterval</key><integer>300</integer>
+  <key>RunAtLoad</key><false/>
   <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/routing-rules.log</string>
   <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/routing-rules.error.log</string>
 </dict>
@@ -50546,6 +50546,55 @@ def serve(host: str, port: int):
             if not force:
                 _cache_put(cache_key, finance_payload)
             return finance_payload
+
+        # Spotify control short-circuit — comandos directos de playback
+        # ("pausa", "siguiente", "dale play", "pone X", "qué estoy
+        # escuchando", "subí el volumen"). Determinístico vía AppleScript
+        # local + Spotify Web API search. Pre-fix, estos queries caían
+        # al retrieve + LLM y el LLM hallucinaba "según las notas no hay
+        # información sobre qué música estás reproduciendo...".
+        #
+        # Va ANTES de metachat porque "play" bare podría confundirse con
+        # saludo (defense in depth). Mismo handler que /api/chat — solo
+        # cambia el output (JSON HTTP en vez de SSE).
+        if not retrieve_only and _detect_spotify_command_intent(question):
+            t_s0 = time.perf_counter()
+            spotify_res = _handle_spotify_command(question)
+            if spotify_res is not None:
+                reply = spotify_res.get("message") or "(sin respuesta)"
+                query_turn_id = new_turn_id()
+                t_s = time.perf_counter() - t_s0
+                if sess:
+                    try:
+                        append_turn(sess, {
+                            "q": question, "a": reply,
+                            "paths": [], "top_score": 0.0,
+                            "turn_id": query_turn_id, "mode": "spotify",
+                            "spotify_action": spotify_res.get("action"),
+                            "spotify_ok": bool(spotify_res.get("ok")),
+                        })
+                        save_session(sess)
+                    except Exception:
+                        pass
+                try:
+                    log_query_event({
+                        "cmd": "serve.spotify",
+                        "turn_id": query_turn_id,
+                        "session": sid, "q": question[:200],
+                        "t_retrieve": 0.0, "t_gen": round(t_s, 3),
+                        "intent": "spotify_control",
+                        "spotify_action": spotify_res.get("action"),
+                        "spotify_ok": bool(spotify_res.get("ok")),
+                    })
+                except Exception:
+                    pass
+                return {
+                    "answer": reply, "sources": [], "mode": "spotify",
+                    "t_retrieve": 0.0, "t_gen": round(t_s, 3),
+                    "turn_id": query_turn_id,
+                    "spotify_action": spotify_res.get("action"),
+                    "spotify_ok": bool(spotify_res.get("ok")),
+                }
 
         # Metachat short-circuit — greetings / thanks / "qué podés hacer".
         # Matches the regex-based detector from rag.py:26314 (also used by

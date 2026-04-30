@@ -56130,18 +56130,29 @@ def _behavior_backfill_find_match(
     Returns dict or None. Dict shape: ``{query_id, ts, q, session,
     match_policy: "same_session"|"path_match"|"time_nearest", delta_s: int}``.
     """
+    # Range bounds en `ts` permiten que SQLite use ix_rag_queries_ts /
+    # ix_rag_queries_session_ts. Antes el WHERE envolvía ts en
+    # ABS(strftime(...)) que es función → full scan obligado. Sólo el
+    # ORDER BY mantiene función — afecta sort de resultset chico, no scan.
+    window_seconds = int(window_minutes) * 60
     try:
         with _ragvec_state_conn() as conn:
+            ts_lo = (
+                f"datetime(?, '-{window_seconds} seconds')"
+            )
+            ts_hi = (
+                f"datetime(?, '+{window_seconds} seconds')"
+            )
             # Policy 1: same-session
             if orphan_session:
                 row = conn.execute(
-                    "SELECT id, ts, q, session FROM rag_queries"
-                    " WHERE session = ?"
-                    " AND ABS(strftime('%s', ts) - strftime('%s', ?)) <= ?"
-                    " ORDER BY ABS(strftime('%s', ts) - strftime('%s', ?)) ASC"
-                    " LIMIT 1",
-                    (orphan_session, orphan_ts,
-                     int(window_minutes) * 60, orphan_ts),
+                    f"SELECT id, ts, q, session FROM rag_queries"
+                    f" WHERE session = ?"
+                    f" AND ts >= {ts_lo}"
+                    f" AND ts <= {ts_hi}"
+                    f" ORDER BY ABS(strftime('%s', ts) - strftime('%s', ?)) ASC"
+                    f" LIMIT 1",
+                    (orphan_session, orphan_ts, orphan_ts, orphan_ts),
                 ).fetchone()
                 if row:
                     return {
@@ -56153,34 +56164,37 @@ def _behavior_backfill_find_match(
                         "delta_s": _behavior_delta_seconds(orphan_ts, row[1]),
                     }
 
-            # Policy 2: any session within window, path match.
+            # Policy 2: any session within window, path match. Range bounds
+            # primero (índice por ts), filtro paths_json en Python sobre el
+            # resultset chico (ventana ±N min × frecuencia de queries).
             if orphan_path:
-                row = conn.execute(
-                    "SELECT id, ts, q, session FROM rag_queries"
-                    " WHERE ABS(strftime('%s', ts) - strftime('%s', ?)) <= ?"
-                    " AND paths_json LIKE ?"
-                    " ORDER BY ABS(strftime('%s', ts) - strftime('%s', ?)) ASC"
-                    " LIMIT 1",
-                    (orphan_ts, int(window_minutes) * 60,
-                     f"%{orphan_path}%", orphan_ts),
-                ).fetchone()
-                if row:
-                    return {
-                        "query_id": int(row[0]),
-                        "ts": row[1],
-                        "q": row[2],
-                        "session": row[3],
-                        "match_policy": "path_match",
-                        "delta_s": _behavior_delta_seconds(orphan_ts, row[1]),
-                    }
+                rows = conn.execute(
+                    f"SELECT id, ts, q, session, paths_json FROM rag_queries"
+                    f" WHERE ts >= {ts_lo}"
+                    f" AND ts <= {ts_hi}"
+                    f" ORDER BY ABS(strftime('%s', ts) - strftime('%s', ?)) ASC",
+                    (orphan_ts, orphan_ts, orphan_ts),
+                ).fetchall()
+                for r in rows:
+                    paths_raw = r[4] or ""
+                    if orphan_path in paths_raw:
+                        return {
+                            "query_id": int(r[0]),
+                            "ts": r[1],
+                            "q": r[2],
+                            "session": r[3],
+                            "match_policy": "path_match",
+                            "delta_s": _behavior_delta_seconds(orphan_ts, r[1]),
+                        }
 
             # Policy 3: any session within window, closest by time.
             row = conn.execute(
-                "SELECT id, ts, q, session FROM rag_queries"
-                " WHERE ABS(strftime('%s', ts) - strftime('%s', ?)) <= ?"
-                " ORDER BY ABS(strftime('%s', ts) - strftime('%s', ?)) ASC"
-                " LIMIT 1",
-                (orphan_ts, int(window_minutes) * 60, orphan_ts),
+                f"SELECT id, ts, q, session FROM rag_queries"
+                f" WHERE ts >= {ts_lo}"
+                f" AND ts <= {ts_hi}"
+                f" ORDER BY ABS(strftime('%s', ts) - strftime('%s', ?)) ASC"
+                f" LIMIT 1",
+                (orphan_ts, orphan_ts, orphan_ts),
             ).fetchone()
             if row:
                 return {

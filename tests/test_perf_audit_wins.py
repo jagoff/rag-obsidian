@@ -55,16 +55,68 @@ def test_collect_ranker_features_single_count_call():
     )
 
 
-def test_orphan_backfill_sql_uses_range_bounds():
-    """Fix 3: backfill_orphan_behavior SQL usa ts >= ? AND ts <= ? (no ABS+strftime)."""
-    if not hasattr(rag, "backfill_orphan_behavior"):
-        return  # función puede tener otro nombre — el SQL test está en otro lado
-    src = inspect.getsource(rag.backfill_orphan_behavior)
-    # El predicado viejo era ABS(strftime('%s', ts) - strftime('%s', ?)) <= N
-    # — eso fuerza full scan. El nuevo usa rangos explícitos.
-    assert "ABS(strftime" not in src, (
-        "El WHERE no debe envolver ts en ABS(strftime(...)) — fuerza full scan; "
-        "usar ts >= datetime(?, ...) AND ts <= datetime(?, ...)"
+def test_behavior_backfill_match_uses_range_bounds():
+    """Fix 3: _behavior_backfill_find_match SQL usa ts >= datetime(?, ...) range bounds.
+
+    Antes el WHERE envolvía ts en ABS(strftime(...)) — fuerza full scan
+    de ix_rag_queries_ts (SCAN COVERING INDEX). Con range bounds explícitos
+    el plan pasa a SEARCH USING COVERING INDEX (ts>? AND ts<?).
+    """
+    src = inspect.getsource(rag._behavior_backfill_find_match)
+    # El WHERE no debe usar ABS(strftime(...)) — eso fuerza full scan.
+    # Permitimos ABS(strftime(...)) en el ORDER BY (afecta sort de resultset
+    # chico, no el scan). Para distinguir: contamos solo apariciones en
+    # líneas que tengan WHERE / AND.
+    bad_where_lines = [
+        line for line in src.splitlines()
+        if ("WHERE" in line or " AND " in line)
+        and "ABS(strftime" in line
+        and "ORDER BY" not in line
+    ]
+    assert not bad_where_lines, (
+        f"El WHERE/AND no debe envolver ts en ABS(strftime(...)): "
+        f"{bad_where_lines}"
+    )
+    # Y debe haber range bounds explícitos (datetime con +N/-N seconds).
+    assert "datetime(?" in src or "datetime(?, '" in src, (
+        "Falta range bound tipo datetime(?, '-N seconds') / datetime(?, '+N seconds')"
+    )
+
+
+def test_behavior_backfill_query_plan_uses_index():
+    """Fix 3: EXPLAIN QUERY PLAN del SQL nuevo confirma SEARCH (range bounds)."""
+    import sqlite3
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE rag_queries (id INTEGER PRIMARY KEY, ts TEXT, "
+        "q TEXT, session TEXT, paths_json TEXT)"
+    )
+    conn.execute("CREATE INDEX ix_rag_queries_ts ON rag_queries(ts)")
+    conn.execute(
+        "CREATE INDEX ix_rag_queries_session_ts "
+        "ON rag_queries(session, ts)"
+    )
+    plan = list(conn.execute(
+        "EXPLAIN QUERY PLAN SELECT id FROM rag_queries "
+        "WHERE ts >= datetime(?, '-600 seconds') "
+        "AND ts <= datetime(?, '+600 seconds')",
+        ("2026-04-30T10:00", "2026-04-30T10:00"),
+    ))
+    plan_str = " ".join(str(r) for r in plan)
+    assert "SEARCH" in plan_str and "ts>" in plan_str.lower() or "ts >" in plan_str, (
+        f"Plan esperado SEARCH con range bounds, fue: {plan_str}"
+    )
+    # Same-session debe usar ix_rag_queries_session_ts.
+    plan_session = list(conn.execute(
+        "EXPLAIN QUERY PLAN SELECT id FROM rag_queries "
+        "WHERE session = ? "
+        "AND ts >= datetime(?, '-600 seconds') "
+        "AND ts <= datetime(?, '+600 seconds')",
+        ("s1", "2026-04-30T10:00", "2026-04-30T10:00"),
+    ))
+    plan_session_str = " ".join(str(r) for r in plan_session)
+    assert "ix_rag_queries_session_ts" in plan_session_str, (
+        f"Same-session debería usar ix_rag_queries_session_ts: {plan_session_str}"
     )
 
 

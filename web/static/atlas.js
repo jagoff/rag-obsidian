@@ -307,20 +307,59 @@ function renderCooc(pairs) {
 }
 
 // ── Graph 3D (Three.js + 3d-force-graph) ────────────────────────────────
-function renderGraph(graph) {
+async function renderGraph(graph) {
   const card = document.getElementById("graph-card");
   const containerEl = document.getElementById("graph-3d");
   const stats = document.getElementById("graph-stats");
   if (!card || !containerEl) return;
 
-  // Si la lib UMD no cargó (offline / CDN caída), mostrar fallback.
-  // ForceGraph3D bundlea three.js internamente, así que con esto basta.
-  if (typeof ForceGraph3D !== "function") {
+  // Esperar hasta 3s a que ForceGraph3D / THREE estén disponibles. Defensivo
+  // contra: red lenta, CDN tardando en responder, cache stale del SW que
+  // sirvió HTML viejo con orden de scripts diferente, etc. Reintenta cada
+  // 100ms (30 intentos = 3s total).
+  const libsReady = async () => {
+    for (let i = 0; i < 30; i++) {
+      if (typeof ForceGraph3D === "function" && typeof THREE !== "undefined") return true;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    return false;
+  };
+  if (!(await libsReady())) {
+    // Fallback con botón para forzar reload sin caché. Diagnóstico fino:
+    // distinguimos si falló three.js o 3d-force-graph para que en consola
+    // quede claro qué bundle no llegó.
+    const missing = [];
+    if (typeof THREE === "undefined") missing.push("three.js");
+    if (typeof ForceGraph3D !== "function") missing.push("3d-force-graph");
+    const what = missing.join(" + ");
+    console.error("[atlas-3d] motor 3D no cargó: faltan globals →", what);
     containerEl.innerHTML = `
-      <div style="display:flex; align-items:center; justify-content:center; height:100%; color:var(--text-faint); font-size:12px; text-align:center; padding:20px;">
-        No se pudo cargar el motor 3D (3d-force-graph).<br>
-        Revisá la conexión y recargá la página.
+      <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; color:var(--text-dim); font-size:12px; text-align:center; padding:20px; gap:14px;">
+        <div>
+          No se pudo cargar el motor 3D (${what}).<br>
+          Probablemente el browser sirvió una versión cacheada vieja del PWA.
+        </div>
+        <button type="button" id="atlas-reload-nocache" class="btn-icon" style="padding:6px 14px; font-size:12px; cursor:pointer;">
+          Recargar sin caché
+        </button>
+        <div style="color:var(--text-faint); font-size:10px; max-width:420px;">
+          También podés DevTools → Application → Service Workers → Unregister, o cerrar todas las tabs de localhost y abrir una nueva.
+        </div>
       </div>`;
+    document.getElementById("atlas-reload-nocache")?.addEventListener("click", async () => {
+      // Unregister + clear caches + reload — equivalente al hard-reload.
+      try {
+        if (navigator.serviceWorker) {
+          const regs = await navigator.serviceWorker.getRegistrations();
+          for (const r of regs) await r.unregister();
+        }
+        if (window.caches) {
+          const keys = await caches.keys();
+          for (const k of keys) await caches.delete(k);
+        }
+      } catch (e) { console.warn("[atlas-3d] cleanup falló", e); }
+      location.reload();
+    });
     return;
   }
 

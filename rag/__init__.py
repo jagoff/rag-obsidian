@@ -50973,130 +50973,19 @@ def open_cmd(
         )
 
 
-@cli.group()
-def vault():
-    """Multi-vault: registrar / cambiar / listar vaults de Obsidian.
-
-    El registry vive en ~/.config/obsidian-rag/vaults.json. Cada vault
-    obtiene su propia colección de sqlite-vec automáticamente (namespacing
-    por hash del path) — switchear no contamina ni cruza datos.
-
-    Precedencia para resolver el vault activo:
-      1. OBSIDIAN_RAG_VAULT env var (override per-invocación, gana siempre).
-      2. `vault use <name>` (el "current" del registry, persistente).
-      3. Default iCloud Notes (legacy, para usuarios single-vault).
-    """
-
-
-@vault.command("add")
-@click.argument("name")
-@click.argument("path", type=click.Path(
-    exists=True, file_okay=False, dir_okay=True, resolve_path=True,
-))
-def vault_add(name: str, path: str):
-    """Registrar un vault con un nombre. Si es el primero, queda activo."""
-    cfg = _load_vaults_config()
-    if name in cfg["vaults"] and cfg["vaults"][name] != path:
-        console.print(
-            f"[yellow]Sobreescribiendo[/yellow] '{name}': "
-            f"{cfg['vaults'][name]} → {path}"
-        )
-    cfg["vaults"][name] = path
-    if not cfg["current"]:
-        cfg["current"] = name
-        marker = " (activo)"
-    else:
-        marker = ""
-    _save_vaults_config(cfg)
-    console.print(f"[green]✓[/green] vault [bold]{name}[/bold] → {path}{marker}")
-
-
-@vault.command("list")
-def vault_list():
-    """Listar vaults registrados, marcando el activo."""
-    cfg = _load_vaults_config()
-    if not cfg["vaults"]:
-        console.print(
-            "[dim]Sin vaults registrados.[/dim] "
-            "Usá [bold]rag vault add <name> <path>[/bold] para empezar."
-        )
-        console.print(f"[dim]Default actual: {_DEFAULT_VAULT}[/dim]")
-        return
-    cur = cfg["current"]
-    env = os.environ.get("OBSIDIAN_RAG_VAULT")
-    for name, path in cfg["vaults"].items():
-        marker = "[green]→[/green]" if name == cur else "  "
-        console.print(f"  {marker} [bold]{name}[/bold]  [dim]{path}[/dim]")
-    if env:
-        console.print(
-            f"\n[yellow]⚠ OBSIDIAN_RAG_VAULT está seteado[/yellow] "
-            f"[dim]({env})[/dim] — overridea el registry."
-        )
-
-
-@vault.command("use")
-@click.argument("name")
-def vault_use(name: str):
-    """Cambiar al vault NAME (persistente). Afecta a futuras invocaciones."""
-    cfg = _load_vaults_config()
-    if name not in cfg["vaults"]:
-        registered = ", ".join(cfg["vaults"]) or "(ninguno)"
-        console.print(
-            f"[red]vault '{name}' no registrado.[/red] "
-            f"Registrados: {registered}"
-        )
-        return
-    cfg["current"] = name
-    _save_vaults_config(cfg)
-    path = cfg["vaults"][name]
-    console.print(f"[green]✓[/green] vault activo: [bold]{name}[/bold]  [dim]({path})[/dim]")
-    if os.environ.get("OBSIDIAN_RAG_VAULT"):
-        console.print(
-            "[yellow]⚠[/yellow] OBSIDIAN_RAG_VAULT está seteado — "
-            "lo seguirá overrideando hasta que lo desetees."
-        )
-
-
-@vault.command("current")
-def vault_current():
-    """Mostrar el vault que se va a usar y por qué."""
-    env = os.environ.get("OBSIDIAN_RAG_VAULT")
-    if env:
-        console.print(f"[bold]env[/bold] OBSIDIAN_RAG_VAULT → [cyan]{env}[/cyan]")
-        return
-    cfg = _load_vaults_config()
-    cur = cfg["current"]
-    if cur and cur in cfg["vaults"]:
-        console.print(
-            f"[bold]registry[/bold] [bold]{cur}[/bold] → "
-            f"[cyan]{cfg['vaults'][cur]}[/cyan]"
-        )
-        return
-    console.print(f"[bold]default[/bold] → [cyan]{_DEFAULT_VAULT}[/cyan]")
-
-
-@vault.command("remove")
-@click.argument("name")
-def vault_remove(name: str):
-    """Quitar un vault del registry. NO borra archivos del disco."""
-    cfg = _load_vaults_config()
-    if name not in cfg["vaults"]:
-        console.print(f"[red]vault '{name}' no registrado.[/red]")
-        return
-    del cfg["vaults"][name]
-    if cfg["current"] == name:
-        cfg["current"] = next(iter(cfg["vaults"]), None)
-    _save_vaults_config(cfg)
-    if cfg["current"]:
-        console.print(
-            f"[green]✓[/green] '{name}' removido. "
-            f"Activo ahora: [bold]{cfg['current']}[/bold]"
-        )
-    else:
-        console.print(
-            f"[green]✓[/green] '{name}' removido. "
-            f"Sin current — caerá al default."
-        )
+# ── ``rag vault`` group: extraído a rag/cli/vault.py el 2026-04-29 ──────────
+# Sub-chunk 1.1 del package-split CLI. El grupo ``vault`` y sus 5
+# subcomandos (``add``, ``list``, ``use``, ``current``, ``remove``) viven
+# ahora en ``rag/cli/vault.py``. Los helpers compartidos
+# (``_load_vaults_config``, ``_save_vaults_config``, ``_resolve_vault_path``,
+# ``_DEFAULT_VAULT``, ``VAULTS_CONFIG_PATH``) **siguen acá** porque también
+# los usan retrieve / index / anticipatory / pendientes — moverlos
+# requeriría refactor más amplio fuera de scope del piloto.
+#
+# El re-export ``rag.vault`` (que tests existentes usan vía
+# ``runner.invoke(rag.vault, [...])``) se hace en el shim al pie del
+# módulo ("CLI sub-package re-export shim"), después de que el bootstrap
+# del monolito está completo.
 
 
 @cli.group()
@@ -60283,3 +60172,34 @@ from rag.integrations.weather import (  # noqa: E402, F401
     _fetch_weather_rain,
     _weather_comment,
 )
+
+
+# ── CLI sub-package re-export shim (2026-04-29) ──────────────────────────────
+# Sub-chunk 1.1 del package-split: el grupo ``rag vault`` (CLI) se mudó a
+# ``rag/cli/vault.py``. El import vive ACÁ — al final del módulo — porque
+# el submódulo necesita que ``rag._DEFAULT_VAULT`` /
+# ``_load_vaults_config`` / ``_save_vaults_config`` / ``console`` estén
+# bound; todos ellos quedan listos arriba (líneas 621-3118).
+#
+# **Truco del rebind**: ``from rag.cli.vault import ...`` carga
+# ``rag.cli`` (el sub-package) y, como side-effect del import system,
+# **rebinda** la attribute ``rag.cli`` al objeto package — pisando al
+# ``Click.Group`` que viene viviendo como ``rag.cli`` desde
+# ``@click.group()`` (línea ~23031). Como tests existentes (y el plan de
+# producción) acceden ``rag.cli`` esperando el Group, después del import
+# restauramos la attribute y registramos el grupo extraído manualmente.
+# El sub-package sigue accesible vía ``sys.modules['rag.cli']`` (lo que
+# permite ``from rag.cli.vault import vault``), sólo perdemos la
+# attribute access ``rag.cli`` como sub-package — que nadie usa.
+_cli_group_root = cli  # pin la referencia al ``Click.Group`` raíz
+from rag.cli.vault import (  # noqa: E402, F401
+    vault,
+    vault_add,
+    vault_current,
+    vault_list,
+    vault_remove,
+    vault_use,
+)
+cli = _cli_group_root  # restaurar attribute (sub-package quedó en sys.modules)
+del _cli_group_root
+cli.add_command(vault)  # registrar el grupo extraído manualmente

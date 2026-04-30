@@ -7688,6 +7688,7 @@ def _fetch_sleep() -> dict | None:
     try:
         from rag.integrations.pillow_sleep import (
             last_night, weekly_stats, latest_self_report_mood,
+            patterns_summary,
         )
     except Exception:
         return None
@@ -7705,6 +7706,14 @@ def _fetch_sleep() -> dict | None:
         mood_now = latest_self_report_mood(hours=12)
     except Exception:
         mood_now = None
+    try:
+        # Top correlations across all-time history. Cached implicit by
+        # row count — `detect_patterns()` re-computes each call but the
+        # query path is single SELECT + Pearson en memoria, ~30ms para
+        # ~600 noches. No vale la pena memoizar todavía.
+        patterns = patterns_summary(top=3)
+    except Exception:
+        patterns = {"n_findings": 0, "top": []}
 
     # Insight automático — surface si hay algo destacable de la última
     # semana vs histórico. Prioridad: deep% crash > awakenings spike >
@@ -7743,6 +7752,7 @@ def _fetch_sleep() -> dict | None:
         "spark_dates_7d": ws.get("spark_dates_7d") or [],
         "mood_now": mood_now,
         "insight": insight,
+        "patterns": patterns,
     }
 
 

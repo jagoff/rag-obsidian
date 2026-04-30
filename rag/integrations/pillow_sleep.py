@@ -627,6 +627,150 @@ def record_self_report_mood(mood: str, notes: str | None = None) -> dict[str, An
     return {"ok": True, "ts": now, "value": value, "label": mood}
 
 
+# ─── Correlation / pattern detection ──────────────────────────────────
+
+
+def _pearson(xs: list[float], ys: list[float]) -> tuple[float, int]:
+    """Pearson correlation coefficient r ∈ [-1, +1]. Returns (r, n_pairs).
+    `n_pairs` is the count of (x, y) tuples where neither is None.
+    Returns (0.0, n) when n < 3 or variance is zero — caller should
+    interpret r=0 with n<3 as "not enough data" rather than "no
+    correlation".
+    """
+    pairs = [(x, y) for x, y in zip(xs, ys) if x is not None and y is not None]
+    n = len(pairs)
+    if n < 3:
+        return 0.0, n
+    mean_x = sum(p[0] for p in pairs) / n
+    mean_y = sum(p[1] for p in pairs) / n
+    sx = sum((p[0] - mean_x) ** 2 for p in pairs)
+    sy = sum((p[1] - mean_y) ** 2 for p in pairs)
+    if sx <= 0 or sy <= 0:
+        return 0.0, n
+    cov = sum((p[0] - mean_x) * (p[1] - mean_y) for p in pairs)
+    return cov / (sx * sy) ** 0.5, n
+
+
+def _bedtime_normalized(start_ts: float, tz_name: str) -> float:
+    """Bedtime as hours-after-noon (so 22:00 → 22, 01:00 → 25). Local TZ.
+
+    Returning a continuous scalar makes Pearson tractable across the
+    midnight wraparound — without it, a 23:30 / 00:30 pair would look
+    23-hour-apart instead of 1-hour-apart.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(tz_name) if tz_name else None
+    except Exception:
+        tz = None
+    dt = datetime.fromtimestamp(start_ts, tz=tz) if tz else datetime.fromtimestamp(start_ts)
+    h = dt.hour + dt.minute / 60.0
+    return h + 24 if h < 12 else h
+
+
+def detect_patterns(min_n: int = 14, min_abs_r: float = 0.3) -> list[dict[str, Any]]:
+    """Compute correlations on the user's whole sleep history and return
+    the strongest findings as a list of dicts ready to render in the UI
+    or feed the brief.
+
+    Each finding has:
+      `{kind, description, r, n, severity}`
+    where severity is "weak" (|r|<0.3), "moderate" (<0.5) or "strong" (≥0.5).
+
+    Filters:
+      - n ≥ `min_n` (default 14 — at least 2 weeks of data)
+      - |r| ≥ `min_abs_r` (default 0.3 — drop weak noise)
+
+    Returns empty list if there aren't enough sessions yet.
+    """
+    with _telemetry_conn() as conn:
+        import sqlite3
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM rag_sleep_sessions WHERE is_nap=0 ORDER BY end_ts ASC"
+        ).fetchall()
+    if len(rows) < min_n:
+        return []
+    nights = [_row_to_dict(r) for r in rows]
+
+    # Para bedtime usamos el normalizado continuo en lugar del raw clock.
+    bedtimes = [_bedtime_normalized(n["start_ts"], n.get("tz", "")) for n in nights]
+    qualities = [n.get("quality") for n in nights]
+    deeps = [n.get("deep_pct") for n in nights]
+    rems = [n.get("rem_pct") for n in nights]
+    awakenings = [n.get("awakenings") for n in nights]
+    durations = [n.get("sleep_total_h") for n in nights]
+    moods = [n.get("wakeup_mood") for n in nights]
+
+    # Cross-source mood signals — manual self-reports en `rag_mood_signals`.
+    # Asociamos cada sesión a su date para correlar wakeup_quality vs
+    # mood manual del mismo día.
+    with _telemetry_conn() as conn:
+        import sqlite3
+        conn.row_factory = sqlite3.Row
+        manual_rows = conn.execute(
+            "SELECT date, AVG(value) AS avg_mood, COUNT(*) AS n "
+            " FROM rag_mood_signals "
+            " WHERE source='manual' AND signal_kind='self_report' "
+            " GROUP BY date"
+        ).fetchall()
+    manual_by_date: dict[str, float] = {r["date"]: r["avg_mood"] for r in manual_rows}
+    manual_moods = [manual_by_date.get(n["date"]) for n in nights]
+
+    candidates = [
+        ("bedtime↔quality", "bedtime más tarde → quality {direction}",
+         bedtimes, qualities),
+        ("bedtime↔deep_pct", "bedtime más tarde → deep% {direction}",
+         bedtimes, deeps),
+        ("duration↔quality", "más horas dormidas → quality {direction}",
+         durations, qualities),
+        ("awakenings↔quality", "más awakenings → quality {direction}",
+         awakenings, qualities),
+        ("deep_pct↔wakeup_mood", "más deep → mood al despertar {direction}",
+         deeps, moods),
+        ("quality↔wakeup_mood", "quality alta → mood al despertar {direction}",
+         qualities, moods),
+        ("rem_pct↔wakeup_mood", "más REM → mood al despertar {direction}",
+         rems, moods),
+        ("quality↔manual_mood", "quality alta → mood manual del día {direction}",
+         qualities, manual_moods),
+    ]
+
+    findings: list[dict[str, Any]] = []
+    for kind, template, xs, ys in candidates:
+        r, n = _pearson(xs, ys)
+        if n < min_n or abs(r) < min_abs_r:
+            continue
+        direction = "sube" if r > 0 else "baja"
+        severity = (
+            "strong" if abs(r) >= 0.5
+            else "moderate" if abs(r) >= 0.4
+            else "weak"
+        )
+        findings.append({
+            "kind": kind,
+            "description": template.format(direction=direction),
+            "r": round(r, 2),
+            "n": n,
+            "severity": severity,
+        })
+
+    # Sort by strength (|r|) descending — strongest patterns first.
+    findings.sort(key=lambda f: -abs(f["r"]))
+    return findings
+
+
+def patterns_summary(top: int = 3) -> dict[str, Any]:
+    """Lightweight wrapper for the home panel: top N patterns + counts.
+
+    Returns:
+      `{n_findings, top: list[finding]}`
+    or `{n_findings: 0, top: []}` if there aren't enough nights yet.
+    """
+    findings = detect_patterns()
+    return {"n_findings": len(findings), "top": findings[:top]}
+
+
 __all__ = [
     "SleepSession",
     "parse_pillow_dump",
@@ -636,4 +780,6 @@ __all__ = [
     "weekly_stats",
     "latest_self_report_mood",
     "record_self_report_mood",
+    "detect_patterns",
+    "patterns_summary",
 ]

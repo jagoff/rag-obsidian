@@ -226,6 +226,47 @@ def test_weekly_stats_smoke(dump_path, _isolated_telemetry):
     assert not_none[0] == pytest.approx(0.85, abs=1e-2)
 
 
+def test_pearson_returns_zero_with_few_pairs(_isolated_telemetry):
+    r, n = ps._pearson([1.0, 2.0], [1.0, 2.0])
+    assert r == 0.0
+    assert n == 2
+
+
+def test_pearson_perfect_positive_correlation(_isolated_telemetry):
+    r, n = ps._pearson([1.0, 2.0, 3.0, 4.0, 5.0], [1.0, 2.0, 3.0, 4.0, 5.0])
+    assert r == pytest.approx(1.0)
+    assert n == 5
+
+
+def test_pearson_skips_none_pairs(_isolated_telemetry):
+    r, n = ps._pearson([1.0, None, 2.0, 3.0], [1.0, 2.0, None, 3.0])
+    # Only (1,1) and (3,3) are valid pairs → n=2 → returns (0.0, 2)
+    assert n == 2
+    assert r == 0.0
+
+
+def test_detect_patterns_empty_when_too_few_nights(_isolated_telemetry):
+    # Fresh DB → no rows → detect_patterns returns []
+    findings = ps.detect_patterns()
+    assert findings == []
+
+
+def test_bedtime_normalized_handles_midnight_wrap():
+    # 23:30 → 23.5 (no wrap needed, already > 12)
+    # 01:30 → 25.5 (wraps to next day)
+    # 14:00 → 14 (afternoon, > 12)
+    # The TZ doesn't matter for the wrap logic itself.
+    from datetime import datetime, timezone
+    # Build a timestamp at exactly 23:30 UTC (no tz given → uses system tz,
+    # but we test the math directly with utc to isolate from system TZ).
+    ts_2330 = datetime(2026, 4, 30, 23, 30, tzinfo=timezone.utc).timestamp()
+    ts_0130 = datetime(2026, 4, 30, 1, 30, tzinfo=timezone.utc).timestamp()
+    h_2330 = ps._bedtime_normalized(ts_2330, "UTC")
+    h_0130 = ps._bedtime_normalized(ts_0130, "UTC")
+    assert h_2330 == pytest.approx(23.5)
+    assert h_0130 == pytest.approx(25.5)
+
+
 @pytest.fixture
 def _isolated_telemetry(tmp_path, monkeypatch):
     """Each test gets its own telemetry.db so ingest UPSERTs / mood inserts

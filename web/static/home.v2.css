@@ -1405,6 +1405,55 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 .sleep-delta .delta-down { color: var(--red); }
 .sleep-delta .delta-flat { color: var(--text-faint); }
 
+/* Patterns disclosure — collapsed by default, click summary para expand.
+   Lista los findings de detect_patterns() filtrados (skip trivial). */
+.sleep-patterns {
+  font-size: var(--fs-mini);
+  color: var(--text-dim);
+}
+
+.sleep-patterns summary {
+  cursor: pointer;
+  color: var(--text-faint);
+  user-select: none;
+  padding: 2px 0;
+}
+
+.sleep-patterns summary:hover { color: var(--text-dim); }
+
+.sleep-patterns ul {
+  list-style: none;
+  margin: 4px 0 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.sleep-patterns li {
+  display: flex;
+  gap: var(--space-2);
+  align-items: baseline;
+  padding-left: var(--space-2);
+  border-left: 2px solid var(--border-subtle);
+}
+
+.sleep-patterns li.sev-strong { border-left-color: var(--amber); }
+.sleep-patterns li.sev-moderate { border-left-color: var(--text-dim); }
+
+.sleep-patterns .desc { flex: 1; color: var(--text-dim); }
+.sleep-patterns .r {
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+.sleep-patterns .sev {
+  color: var(--text-faint);
+  text-transform: lowercase;
+  flex-shrink: 0;
+}
+.sleep-patterns li.sev-strong .sev { color: var(--amber); }
+
 /* Mood input widget — 3 botones emoji + label "ahora". */
 .sleep-mood {
   display: flex;

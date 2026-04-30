@@ -1237,6 +1237,28 @@
       ? `<div class="sleep-insight" role="status">⚠ ${escapeHTML(sleep.insight)}</div>`
       : "";
 
+    // Patterns (correlations Pearson r ≥ 0.3 sobre todo el histórico).
+    // Filtramos los obvios (duration↔quality es trivial: dormir más
+    // duerme mejor) para que el panel resalte solo lo no-obvio.
+    const TRIVIAL_KINDS = new Set(["duration↔quality"]);
+    const patternsTop = (sleep.patterns?.top || [])
+      .filter((p) => !TRIVIAL_KINDS.has(p.kind))
+      .slice(0, 3);
+    const patternsHTML = patternsTop.length
+      ? `<details class="sleep-patterns">
+          <summary>${patternsTop.length} patrones (n=${sleep.patterns.top[0].n})</summary>
+          <ul>${patternsTop.map((p) => {
+            const sevCls = `sev-${p.severity}`;
+            const rSign = p.r > 0 ? "+" : "";
+            return `<li class="${sevCls}">
+              <span class="desc">${escapeHTML(p.description)}</span>
+              <span class="r">r=${rSign}${p.r.toFixed(2)}</span>
+              <span class="sev">${p.severity}</span>
+            </li>`;
+          }).join("")}</ul>
+        </details>`
+      : "";
+
     const body = panel.querySelector("[data-body]");
     body.innerHTML = `
       <div class="sleep-summary">
@@ -1261,6 +1283,7 @@
         </div>
         ${deltaParts.length ? `<div class="sleep-delta">vs hist: ${deltaParts.join(" ")}</div>` : ""}
         ${insightHTML}
+        ${patternsHTML}
         <div class="sleep-mood" data-mood-widget>
           <span class="mood-label">ahora:</span>
           ${moodBtns}

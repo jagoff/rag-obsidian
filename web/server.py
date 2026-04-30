@@ -13117,6 +13117,176 @@ def atlas_semantic_layout_api(req: SemanticLayoutRequest) -> dict:
     return semantic_layout(paths=paths)
 
 
+# ── Memory Pulse — recency overlay del grafo + live wave on retrieval ────
+#
+# Idea: el `/atlas` por default muestra notas como esferas de color
+# carpeta. Con el toggle "💓 pulso" prendido, las esferas se re-pintan
+# por RECENCIA DE ACCESO:
+#   tier 3 (rojo)    → última query en < 24h
+#   tier 2 (naranja) → < 7d
+#   tier 1 (amarillo)→ < 30d
+#   tier 0 (gris)    → > 30d o nunca
+# El user ve "qué está vivo en su cabeza ahora mismo". Las zonas
+# dormidas del vault se distinguen visualmente de las activas.
+#
+# Plus: polling live a `/api/atlas/pulse-recent?since_id=X` cada 2s.
+# Cuando hay queries nuevas, el frontend dispara una wave animation
+# en cada path retrieved → el grafo "late" en tiempo real mientras
+# vos chatás en otra pestaña.
+#
+# Data source: tabla `rag_queries.paths_json` de la telemetry DB. No
+# necesitamos una tabla nueva; el dato ya está. El paths_json es JSON
+# de la lista de paths citados en esa query.
+
+
+class PulseDataRequest(BaseModel):
+    """Body del POST /api/atlas/pulse-data."""
+    paths: list[str]
+
+
+def _query_pulse_recencies(paths_filter: set[str] | None = None) -> dict[str, float]:
+    """Devuelve {path → unix_ts_seconds} con el ts más reciente que
+    citó esa path. Si `paths_filter` viene set, solo retorna paths
+    de ese set (cheap si el grafo es chico y el log enorme).
+
+    Solo lee los últimos 90d del log — paths sin actividad en >90d
+    no aparecen en el dict (= tier 0 en el frontend).
+    """
+    import json as _json
+    import sqlite3
+    from datetime import datetime as _dt, timedelta, timezone
+    try:
+        import rag as _rag_mod
+        telemetry_db = Path(_rag_mod.DB_PATH) / _rag_mod._TELEMETRY_DB_FILENAME
+    except Exception:
+        return {}
+    if not telemetry_db.exists():
+        return {}
+
+    cutoff = (_dt.now(timezone.utc) - timedelta(days=90)).isoformat(timespec="seconds")
+    out: dict[str, float] = {}
+    try:
+        conn = sqlite3.connect(f"file:{telemetry_db}?mode=ro", uri=True, timeout=10.0)
+        rows = conn.execute(
+            "SELECT ts, paths_json FROM rag_queries "
+            "WHERE ts >= ? AND paths_json IS NOT NULL AND paths_json != ''",
+            (cutoff,),
+        ).fetchall()
+        conn.close()
+    except sqlite3.OperationalError:
+        return {}
+
+    for ts_str, pjson in rows:
+        try:
+            ts_dt = _dt.fromisoformat(ts_str)
+            if ts_dt.tzinfo is None:
+                ts_dt = ts_dt.replace(tzinfo=timezone.utc)
+            ts_unix = ts_dt.timestamp()
+        except Exception:
+            continue
+        try:
+            paths = _json.loads(pjson)
+        except Exception:
+            continue
+        if not isinstance(paths, list):
+            continue
+        for p in paths:
+            if not isinstance(p, str) or not p:
+                continue
+            if paths_filter is not None and p not in paths_filter:
+                continue
+            cur = out.get(p, 0.0)
+            if ts_unix > cur:
+                out[p] = ts_unix
+    return out
+
+
+@app.post("/api/atlas/pulse-data")
+def atlas_pulse_data_api(req: PulseDataRequest) -> dict:
+    """Recencia de acceso para cada path del grafo visible.
+
+    Returns:
+        {
+          "recency": {path: unix_ts_seconds},  # solo paths con actividad <90d
+          "now": unix_ts_seconds,              # para que el cliente compute tiers
+        }
+
+    El cliente computa los tiers ((now - ts) < umbral) — más fácil de
+    tunear sin redesplegar.
+    """
+    paths_filter = set(req.paths or [])
+    if len(paths_filter) > 2000:
+        # Cap defensivo. Si el grafo tiene > 2000 nodos, cortar.
+        paths_filter = set(list(paths_filter)[:2000])
+    if not paths_filter:
+        return {"recency": {}, "now": time.time()}
+    recency = _query_pulse_recencies(paths_filter=paths_filter)
+    return {"recency": recency, "now": time.time()}
+
+
+@app.get("/api/atlas/pulse-recent")
+def atlas_pulse_recent_api(since_id: int = 0, limit: int = 30) -> dict:
+    """Polling endpoint para wave animation live.
+
+    Devuelve queries con id > since_id (las nuevas desde el último poll).
+    El cliente dispara una wave por cada path del campo `paths`.
+
+    Returns:
+        {
+          "events": [{"id": int, "ts": float, "paths": [str, ...]}, ...],
+          "last_id": int,  # max id retornado, lo manda el cliente next
+        }
+    """
+    import json as _json
+    import sqlite3
+    from datetime import datetime as _dt, timezone
+    try:
+        import rag as _rag_mod
+        telemetry_db = Path(_rag_mod.DB_PATH) / _rag_mod._TELEMETRY_DB_FILENAME
+    except Exception:
+        return {"events": [], "last_id": since_id}
+    if not telemetry_db.exists():
+        return {"events": [], "last_id": since_id}
+
+    limit = max(1, min(limit, 100))
+    try:
+        conn = sqlite3.connect(f"file:{telemetry_db}?mode=ro", uri=True, timeout=10.0)
+        rows = conn.execute(
+            "SELECT id, ts, paths_json FROM rag_queries "
+            "WHERE id > ? AND paths_json IS NOT NULL AND paths_json != '' "
+            "ORDER BY id ASC LIMIT ?",
+            (since_id, limit),
+        ).fetchall()
+        conn.close()
+    except sqlite3.OperationalError:
+        return {"events": [], "last_id": since_id}
+
+    events = []
+    last_id = since_id
+    for qid, ts_str, pjson in rows:
+        try:
+            ts_dt = _dt.fromisoformat(ts_str)
+            if ts_dt.tzinfo is None:
+                ts_dt = ts_dt.replace(tzinfo=timezone.utc)
+            ts_unix = ts_dt.timestamp()
+        except Exception:
+            continue
+        try:
+            paths = _json.loads(pjson)
+        except Exception:
+            continue
+        if not isinstance(paths, list):
+            continue
+        events.append({
+            "id": int(qid),
+            "ts": ts_unix,
+            "paths": [p for p in paths if isinstance(p, str) and p][:8],
+        })
+        if int(qid) > last_id:
+            last_id = int(qid)
+    return {"events": events, "last_id": last_id}
+
+
 # ── /transcripts — dashboard de telemetría del whisper learning loop ─────────
 # Phase 2 Step 3.b. Página HTML server-rendered (no SPA) con stats agregadas
 # de las transcripciones de audio, correcciones acumuladas, y top vocab terms

@@ -66,6 +66,18 @@ const state = {
   })(),
   semanticLayoutCache: null,  // {path: [x,y,z]} cacheado client-side
   semanticLayoutMeta: null,   // {n_notes, explained_variance_ratio, missing}
+  // Memory Pulse — overlay de recencia de acceso. Cuando está on,
+  // las esferas se re-pintan por tier (rojo/naranja/amarillo/gris)
+  // y polling live a /pulse-recent dispara wave animations.
+  pulseEnabled: (() => {
+    try { return localStorage.getItem("atlas-pulse") === "1"; }
+    catch (e) { return false; }
+  })(),
+  pulseRecency: null,        // {path: unix_ts}
+  pulseNow: 0,               // unix_ts del último fetch (para tier calc)
+  pulseLastEventId: 0,       // último id de query que vimos
+  pulseRecentTimer: null,    // setInterval handle para polling live
+  pulseDataTimer: null,      // setInterval handle para refresh de recency
   // Filter state — cuando el user hace click en una entidad del top-list,
   // dimmamos los nodos del grafo cuyo path NO contiene esa entidad. Heurística
   // en el cliente vs hit al backend: si el label de la nota INCLUYE el name
@@ -87,6 +99,20 @@ const COLOR_NEIGHBOR_LINK = "#79c0ff";
 // y queda invisible — usar hex sólido y dejar que linkOpacity haga su parte.
 const COLOR_DEFAULT_LINK = "#a0a0aa";
 const COLOR_DIM_LINK = "#3e3e46";
+
+// Memory Pulse — colores por tier de recencia. Tres tiers "vivos" + un
+// dim default. Saturación alta para que destaquen contra el grafo gris.
+const PULSE_COLORS = {
+  3: "#ff5050",   // <24h  → rojo intenso (working memory)
+  2: "#ff9c50",   // <7d   → naranja
+  1: "#f5d35c",   // <30d  → amarillo
+  0: "#3a3a40",   // dormida (>30d o nunca queryed)
+};
+const PULSE_THRESHOLDS = [
+  [24 * 3600, 3],
+  [7 * 24 * 3600, 2],
+  [30 * 24 * 3600, 1],
+];
 
 // Detectar mobile para cap del graph_top_notes (perf en iPhone con 500+ nodos
 // + force-sim 3D es pesado). 720px es el breakpoint del rest del proyecto.
@@ -638,8 +664,7 @@ function scheduleResumeAutoRotate(delay) {
 
 function graphNodeColor(node) {
   if (!state.folderColors) return "#a0a0a6";
-  const baseColor = state.folderColors.get(node.folder) || "#a0a0a6";
-  // Selected node — always bright.
+  // Selected node — always bright (overrides everything).
   if (state.selectedNode && state.selectedNode.id === node.id) return COLOR_SELECTED;
   // Selected mode: dim non-neighbors.
   if (state.selectedNode && state.selectedNeighborIds && !state.selectedNeighborIds.has(node.id)) {
@@ -651,7 +676,23 @@ function graphNodeColor(node) {
   }
   // Entity-filter: dim non-matches.
   if (state.entityMatches && !state.entityMatches.has(node.id)) return COLOR_DIM;
-  return baseColor;
+  // Pulse mode: override folder color con tier de recencia.
+  if (state.pulseEnabled && state.pulseRecency) {
+    return PULSE_COLORS[_pulseTier(node.id)] || COLOR_DIM;
+  }
+  // Default: color por carpeta.
+  return state.folderColors.get(node.folder) || "#a0a0a6";
+}
+
+// Tier 0-3 según cuánto hace que la nota fue retrievada.
+function _pulseTier(path) {
+  const ts = state.pulseRecency?.[path];
+  if (!ts) return 0;
+  const age = (state.pulseNow || (Date.now() / 1000)) - ts;
+  for (const [thresh, tier] of PULSE_THRESHOLDS) {
+    if (age < thresh) return tier;
+  }
+  return 0;
 }
 
 function graphLinkColor(link) {
@@ -678,6 +719,7 @@ function buildNodeObject(node) {
   });
   const sphere = new THREE.Mesh(geo, mat);
   node._material = mat;            // ref para refreshGraphVisuals()
+  node._sphere = sphere;            // ref para _pulseWave (scale animation)
   node._radius = radius;            // ref para position-y del label
 
   if (typeof SpriteText === "function") {
@@ -894,6 +936,174 @@ async function applySemanticLayout() {
   setTimeout(() => {
     if (state.graph3d) state.graph3d.zoomToFit(900, 80);
   }, 800);
+}
+
+// ── Memory Pulse: recency overlay + live wave on retrieval ─────────────
+//
+// Click en 💓 prende el modo: las esferas se re-pintan por tier de
+// recencia (rojo <24h, naranja <7d, amarillo <30d, gris dormida).
+// Mientras está prendido, polling a /api/atlas/pulse-recent cada 2s
+// para detectar queries nuevas → wave animation en cada path retrieved.
+// El user ve "qué está vivo en su cabeza ahora mismo" + pulso en
+// tiempo real cuando se chatea desde otra pestaña.
+
+async function togglePulse() {
+  state.pulseEnabled = !state.pulseEnabled;
+  try {
+    localStorage.setItem("atlas-pulse", state.pulseEnabled ? "1" : "0");
+  } catch (e) {}
+  _refreshPulseButton();
+  if (state.pulseEnabled) {
+    await _fetchPulseData();
+    _startPulsePolling();
+  } else {
+    _stopPulsePolling();
+    state.pulseRecency = null;
+    refreshGraphVisuals();
+  }
+}
+
+function _refreshPulseButton() {
+  const btn = document.getElementById("graph-toggle-pulse");
+  if (!btn) return;
+  btn.classList.toggle("active", !!state.pulseEnabled);
+  btn.setAttribute("aria-pressed", state.pulseEnabled ? "true" : "false");
+  btn.title = state.pulseEnabled
+    ? "Apagar pulso (volver a colores por carpeta)"
+    : "Pulso: pintá las notas por recencia de acceso (rojo = últimas 24h)";
+}
+
+async function _fetchPulseData() {
+  if (!state.graphNodes || !state.graphNodes.length) return;
+  const paths = state.graphNodes.map((n) => n.id);
+  try {
+    const r = await fetch("/api/atlas/pulse-data", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paths }),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    state.pulseRecency = data.recency || {};
+    state.pulseNow = data.now || (Date.now() / 1000);
+    refreshGraphVisuals();
+    // Inicializar el last_id al máximo actual para que el polling solo
+    // capture queries que vengan DESPUÉS de prender el toggle (sin
+    // disparar waves del histórico).
+    if (state.pulseLastEventId === 0) {
+      try {
+        const r2 = await fetch("/api/atlas/pulse-recent?since_id=0&limit=1");
+        const d2 = await r2.json();
+        state.pulseLastEventId = d2.last_id || 0;
+      } catch (e) {}
+    }
+  } catch (e) {
+    console.error("[atlas-pulse] fetch failed", e);
+  }
+}
+
+function _startPulsePolling() {
+  _stopPulsePolling();
+  // Polling de eventos nuevos cada 2s — barato (un SELECT con index sobre
+  // id > last_seen).
+  state.pulseRecentTimer = setInterval(_pollPulseRecent, 2000);
+  // Refresh de la matriz de recencia cada 60s (los tiers van
+  // "envejeciendo" — una nota tier-3 puede pasar a tier-2 sin nuevos
+  // queries, simplemente porque pasaron las 24h).
+  state.pulseDataTimer = setInterval(_fetchPulseData, 60000);
+}
+
+function _stopPulsePolling() {
+  if (state.pulseRecentTimer) {
+    clearInterval(state.pulseRecentTimer);
+    state.pulseRecentTimer = null;
+  }
+  if (state.pulseDataTimer) {
+    clearInterval(state.pulseDataTimer);
+    state.pulseDataTimer = null;
+  }
+}
+
+async function _pollPulseRecent() {
+  if (!state.pulseEnabled) return _stopPulsePolling();
+  try {
+    const r = await fetch(
+      `/api/atlas/pulse-recent?since_id=${state.pulseLastEventId}&limit=20`,
+    );
+    if (!r.ok) return;
+    const data = await r.json();
+    const events = data.events || [];
+    if (data.last_id) state.pulseLastEventId = data.last_id;
+    if (!events.length) return;
+
+    // Por cada evento, animá una wave en cada path retrieved. Si hay
+    // múltiples eventos en el mismo poll (debería ser raro porque
+    // pollámos cada 2s), las desfasamos 100ms entre sí para que la
+    // animación no se pise.
+    let delay = 0;
+    for (const ev of events) {
+      for (const p of (ev.paths || [])) {
+        setTimeout(() => _pulseWave(p), delay);
+        delay += 80;
+      }
+    }
+    // Refresh de recency: si hay queries nuevas, los tiers cambiaron.
+    // No refetcheamos pulse-data acá (es caro y el setInterval lo cubre);
+    // mutamos directo el dict con los ts del evento más reciente.
+    let touched = false;
+    for (const ev of events) {
+      for (const p of (ev.paths || [])) {
+        if ((state.pulseRecency?.[p] || 0) < ev.ts) {
+          if (!state.pulseRecency) state.pulseRecency = {};
+          state.pulseRecency[p] = ev.ts;
+          touched = true;
+        }
+      }
+    }
+    if (touched) {
+      state.pulseNow = Date.now() / 1000;
+      refreshGraphVisuals();
+    }
+  } catch (e) {
+    // Silencioso — los polls fallidos no spamean la consola.
+  }
+}
+
+// Wave animation: el sphere de un path retrieved se hincha brevemente
+// (de scale 1.0 → 1.8 → 1.0 en 800ms con curva de easing), llamando la
+// atención del user al instante. Side-effect: si el nodo no era visible
+// (estaba dimmed por search/entity filter), se ve igual porque el
+// scale se aplica al material que SIEMPRE renderiza.
+function _pulseWave(path) {
+  const node = state.graphNodes?.find?.((n) => n.id === path);
+  if (!node || !node._material) return;
+  // Buscar el sphere mesh — three.js lo tiene como parent del material.
+  // Más simple: lo guardamos en buildNodeObject vía node._sphere.
+  const sphere = node._sphere;
+  if (!sphere) return;
+  const startTs = performance.now();
+  const dur = 800;       // ms total
+  const peak = 0.25;     // peak en t=0.25 (200ms in)
+  const peakScale = 1.8;
+  const tick = (now) => {
+    const t = (now - startTs) / dur;
+    if (t >= 1) {
+      sphere.scale.setScalar(1.0);
+      return;
+    }
+    let s;
+    if (t < peak) {
+      // Ramp up: linear from 1.0 to peakScale.
+      s = 1.0 + (peakScale - 1.0) * (t / peak);
+    } else {
+      // Decay: ease-out cubic from peakScale to 1.0.
+      const k = (t - peak) / (1 - peak);
+      s = peakScale - (peakScale - 1.0) * (1 - Math.pow(1 - k, 3));
+    }
+    sphere.scale.setScalar(s);
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
 }
 
 function applyStructuralLayout() {
@@ -1433,6 +1643,23 @@ window.addEventListener("DOMContentLoaded", () => {
   const mBtn = document.getElementById("graph-mode-semantic");
   if (sBtn) sBtn.addEventListener("click", () => setLayoutMode("structural"));
   if (mBtn) mBtn.addEventListener("click", () => setLayoutMode("semantic"));
+
+  // Toggle pulse mode.
+  const pulseBtn = document.getElementById("graph-toggle-pulse");
+  if (pulseBtn) pulseBtn.addEventListener("click", () => togglePulse());
+  _refreshPulseButton();
+  // Si el user había dejado pulse on, esperamos a que el grafo cargue +
+  // pequeña espera adicional para que el initial render termine, después
+  // fetcheamos data y arrancamos polling. Si NO había nada guardado,
+  // pulseEnabled queda false y este bloque no hace nada.
+  if (state.pulseEnabled) {
+    setTimeout(async () => {
+      if (state.graphNodes && state.graphNodes.length) {
+        await _fetchPulseData();
+        _startPulsePolling();
+      }
+    }, 4000);
+  }
   // Si la preferencia guardada es semántico, aplicarla apenas el grafo
   // termine de hacer el primer render (el state.graphNodes se llena en
   // renderGraph). Espero 3s para que el initial zoomToFit + animation

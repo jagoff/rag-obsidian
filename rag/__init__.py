@@ -31752,6 +31752,112 @@ def mood_compute_cmd(date: str | None, plain: bool) -> None:
         console.print(f"sources: {', '.join(result['sources_used'])}")
 
 
+@mood_group.command("enable")
+@click.option("--plain", is_flag=True)
+def mood_enable_cmd(plain: bool) -> None:
+    """Activa el daemon mood-poll (crea el state file).
+
+    Después de esto, el plist `com.fer.obsidian-rag-mood-poll` (cargado
+    por `rag setup`) empieza a juntar señales cada 30min. Si el plist
+    no está cargado, ejecutar `rag setup` primero."""
+    from rag import mood as _mood  # noqa: PLC0415
+    was_enabled = _mood.is_daemon_enabled()
+    _mood.enable_daemon()
+    state_path = _mood._daemon_state_file()
+    if plain:
+        click.echo(f"daemon=enabled state_file={state_path} was_already_enabled={was_enabled}")
+        return
+    if was_enabled:
+        console.print(f"[dim]ya estaba enabled[/dim] · {state_path}")
+    else:
+        console.print(f"[green]✓ daemon mood-poll enabled[/green]")
+        console.print(f"[dim]state file: {state_path}[/dim]")
+        console.print("[dim]el próximo tick (≤30min) va a empezar a juntar señales.[/dim]")
+        console.print("[dim]forzar tick ahora: launchctl kickstart -k gui/$(id -u)/com.fer.obsidian-rag-mood-poll[/dim]")
+
+
+@mood_group.command("disable")
+@click.option("--plain", is_flag=True)
+def mood_disable_cmd(plain: bool) -> None:
+    """Desactiva el daemon mood-poll (borra el state file).
+
+    El plist sigue cargado pero los ticks de 30min hacen exit-early
+    (1 stat() syscall + return). Para des-cargar el plist completamente
+    usar `launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.fer.obsidian-rag-mood-poll.plist`."""
+    from rag import mood as _mood  # noqa: PLC0415
+    was_enabled = _mood.is_daemon_enabled()
+    _mood.disable_daemon()
+    if plain:
+        click.echo(f"daemon=disabled was_enabled={was_enabled}")
+        return
+    if was_enabled:
+        console.print("[yellow]daemon mood-poll disabled[/yellow]")
+        console.print("[dim]los datos ya recolectados quedan intactos en rag_mood_signals + rag_mood_score_daily.[/dim]")
+    else:
+        console.print("[dim]ya estaba disabled[/dim]")
+
+
+@mood_group.command("status")
+@click.option("--plain", is_flag=True)
+def mood_status_cmd(plain: bool) -> None:
+    """Muestra estado del feature: env flag + daemon state."""
+    from rag import mood as _mood  # noqa: PLC0415
+    flag_on = _mood._is_mood_enabled()
+    daemon_on = _mood.is_daemon_enabled()
+    state_path = _mood._daemon_state_file()
+    if plain:
+        click.echo(f"env_flag={'on' if flag_on else 'off'} "
+                   f"daemon={'enabled' if daemon_on else 'disabled'} "
+                   f"state_file={state_path} state_exists={state_path.exists()}")
+        return
+    flag_label = "[green]on[/green]" if flag_on else "[red]off[/red]"
+    daemon_label = "[green]enabled[/green]" if daemon_on else "[yellow]disabled[/yellow]"
+    console.print(f"env flag (RAG_MOOD_ENABLED): {flag_label}")
+    console.print(f"daemon state:                {daemon_label}")
+    console.print(f"[dim]state file: {state_path} (exists={state_path.exists()})[/dim]")
+    if not flag_on:
+        console.print("[dim]→ exportá RAG_MOOD_ENABLED=1 para usar la CLI[/dim]")
+    if not daemon_on:
+        console.print("[dim]→ corré `rag mood enable` para que el daemon junte señales[/dim]")
+
+
+@mood_group.command("poll")
+@click.option("--no-llm", is_flag=True, help="Saltea la rama LLM (journal sentiment) — barato")
+@click.option("--dry-run", is_flag=True, help="Corre los scorers pero NO persiste señales ni recompute")
+@click.option("--plain", is_flag=True)
+def mood_poll_cmd(no_llm: bool, dry_run: bool, plain: bool) -> None:
+    """Dispara un cycle del daemon manualmente (útil para debugging
+    sin esperar 30min).
+
+    Por defecto persiste señales en `rag_mood_signals` y recomputa el
+    score diario en `rag_mood_score_daily`. `--dry-run` los inhibe."""
+    from rag import mood as _mood  # noqa: PLC0415
+    if not _mood._is_mood_enabled():
+        click.echo("mood feature off (set RAG_MOOD_ENABLED=1)")
+        return
+    result = _mood.run_poll_cycle(use_llm=not no_llm, persist=not dry_run)
+    if plain:
+        click.echo(json.dumps(result, ensure_ascii=False))
+        return
+    if result.get("reason"):
+        console.print(f"[yellow]skipped:[/yellow] {result['reason']}")
+        return
+    console.print(f"[bold]mood poll cycle[/bold] · "
+                  f"{result['n_signals_emitted']} señales · "
+                  f"elapsed {result.get('elapsed_s', 0):.2f}s")
+    for source, n in result.get("scorers", {}).items():
+        if n == "error":
+            console.print(f"  [red]{source}: error[/red]")
+        else:
+            color = "green" if n > 0 else "dim"
+            console.print(f"  [{color}]{source}: {n} señal(es)[/{color}]")
+    score = result.get("score")
+    if isinstance(score, dict):
+        c = _mood_score_color(score["value"])
+        console.print(f"\nscore hoy: [{c}]{score['value']:+.3f}[/] "
+                      f"({score['n_signals']} señales · sources: {', '.join(score['sources_used'])})")
+
+
 @cli.command("state")
 @click.argument("text", required=False)
 @click.option("--clear", is_flag=True, help="Borra el estado actual")
@@ -48813,6 +48919,65 @@ def _ingest_pillow_plist(rag_bin: str) -> str:
 """
 
 
+def _mood_poll_plist(rag_bin: str) -> str:
+    """Mood signal poller — corre `scripts/mood_poll.py` cada 30 min para
+    juntar señales de Spotify + journal + WA outbound + queries +
+    calendar y recomputar el score diario.
+
+    Behind opt-in explícito: el plist tiene `RAG_MOOD_ENABLED=1` pero
+    el script sale silently si el state file `~/.local/share/obsidian-
+    rag/mood_enabled` no existe. Toggle:
+
+      rag mood enable    # crea state file → daemon activo
+      rag mood disable   # borra state file → daemon dormant
+
+    Mientras el daemon está disabled, los ticks de 30min son un
+    `os.path.exists` + return — costo despreciable. Si el user nunca
+    opt-in, la presencia del plist no contamina nada.
+
+    Costo en producción (daemon enabled): ~200ms por ciclo en un día
+    típico (5 scorers + 1 LLM call si hay journal nota nueva), ~6
+    minutos de CPU/día acumulado. El LLM call más caro (qwen2.5:3b)
+    está cacheado por (path, mtime) así que solo se dispara la primera
+    vez que ve una nota nueva.
+
+    `RunAtLoad=true` para que un `rag mood enable` recién hecho dispare
+    un cycle inmediato sin esperar 30min.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    poll_script = repo_root / "scripts" / "mood_poll.py"
+    # Reuso del mismo Python del uv tool venv que usa spotify-poll.
+    uv_python = Path.home() / ".local/share/uv/tools/obsidian-rag/bin/python3"
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-mood-poll</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{uv_python}</string>
+    <string>{poll_script}</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>RAG_MOOD_ENABLED</key><string>1</string>
+    <key>RAG_STATE_SQL</key><string>1</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+  </dict>
+  <key>StartInterval</key><integer>1800</integer>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><false/>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/mood-poll.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/mood-poll.error.log</string>
+  <key>ThrottleInterval</key><integer>60</integer>
+</dict>
+</plist>
+"""
+
+
 def _routing_rules_plist(rag_bin: str) -> str:
     """Detector de patrones de ruteo — cada 5 minutos, analiza comportamiento
     y sugiere nuevas rutas de queries."""
@@ -49172,6 +49337,15 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
         ("com.fer.obsidian-rag-ingest-pillow",
          "com.fer.obsidian-rag-ingest-pillow.plist",
          _ingest_pillow_plist(rag_bin)),
+        # Mood signal poller (2026-04-30) — cada 30min junta señales de
+        # Spotify + journal + WA outbound + queries + calendar y
+        # recomputa el score diario. Behind opt-in: el plist se carga
+        # siempre pero el script exit-early si el state file
+        # ~/.local/share/obsidian-rag/mood_enabled no existe.
+        # Toggle con `rag mood enable` / `rag mood disable`.
+        ("com.fer.obsidian-rag-mood-poll",
+         "com.fer.obsidian-rag-mood-poll.plist",
+         _mood_poll_plist(rag_bin)),
         # Routing rules detector (2026-04-30) — daemon long-running
         # que scanea patrones de comportamiento y sugiere new routes.
         ("com.fer.obsidian-rag-routing-rules",

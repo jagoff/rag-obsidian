@@ -151,9 +151,45 @@ _SENTIMENT_LLM_CACHE: dict[tuple[str, float], float] = {}
 
 
 def _is_mood_enabled() -> bool:
-    """True si `RAG_MOOD_ENABLED` está prendido. Default False."""
+    """True si `RAG_MOOD_ENABLED` está prendido. Default False.
+
+    Chequea env var. NO chequea state file — esa es responsabilidad
+    de `is_daemon_enabled()` (chequeo separado para que el daemon corra
+    o no según opt-in explícito del user vía `rag mood enable`)."""
     val = os.environ.get(_RAG_MOOD_FLAG, "0").strip().lower()
     return val in ("1", "true", "yes", "on")
+
+
+def _daemon_state_file() -> Path:
+    """Path al state file que controla si el daemon mood-poll corre.
+    Existe = daemon ON. No existe = daemon OFF."""
+    return Path.home() / ".local" / "share" / "obsidian-rag" / "mood_enabled"
+
+
+def is_daemon_enabled() -> bool:
+    """True si el state file `~/.local/share/obsidian-rag/mood_enabled`
+    existe. Lo crea `rag mood enable`, lo borra `rag mood disable`.
+
+    Independiente del env var `RAG_MOOD_ENABLED` — el plist puede tener
+    el env var seteado en 1 pero si el user no opt-inó al daemon, el
+    script `mood_poll.py` exit-early. Eso evita que un `rag setup`
+    instalando todos los plists prenda silenciosamente la recolección
+    de mood signals sin consentimiento explícito."""
+    return _daemon_state_file().exists()
+
+
+def enable_daemon() -> None:
+    """Crea el state file. `rag mood enable` la llama."""
+    f = _daemon_state_file()
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.touch(exist_ok=True)
+
+
+def disable_daemon() -> None:
+    """Borra el state file (idempotente)."""
+    f = _daemon_state_file()
+    if f.exists():
+        f.unlink()
 
 
 def _now_ts() -> float:
@@ -1135,6 +1171,80 @@ def recent_drift(
     }
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Daemon orchestration
+
+
+def run_poll_cycle(
+    *,
+    use_llm: bool = True,
+    persist: bool = True,
+) -> dict[str, Any]:
+    """Una iteración del daemon `mood-poll`. Llama los 5 scorers en
+    secuencia + recomputa el score diario. Devuelve dict-resumen para
+    el log del daemon.
+
+    Silent-fail por scorer — si uno tira, los demás siguen. El
+    agregador SIEMPRE corre al final aunque algún scorer haya fallado
+    (lee lo que haya quedado en `rag_mood_signals` para hoy).
+
+    Si `_is_mood_enabled()` es False, exit-early con resumen vacío. Esto
+    cubre el caso del daemon que se carga sin RAG_MOOD_ENABLED en el
+    plist (regresión de `rag setup`)."""
+    started_at = _now_ts()
+    summary: dict[str, Any] = {
+        "started_at": started_at,
+        "enabled": _is_mood_enabled(),
+        "daemon_enabled": is_daemon_enabled(),
+        "n_signals_emitted": 0,
+        "scorers": {},
+        "score": None,
+    }
+    if not _is_mood_enabled():
+        summary["reason"] = "feature_off"
+        return summary
+    if not is_daemon_enabled():
+        summary["reason"] = "daemon_disabled"
+        return summary
+
+    scorers: list[tuple[str, Any]] = [
+        ("spotify", lambda: score_spotify_window(now=started_at, persist=persist)),
+        ("journal", lambda: score_journal_recent(now=started_at, persist=persist, use_llm=use_llm)),
+        ("wa_outbound", lambda: score_wa_outbound_window(now=started_at, persist=persist)),
+        ("queries", lambda: score_queries_existential(now=started_at, persist=persist)),
+        ("calendar", lambda: score_calendar_density(now=started_at, persist=persist)),
+    ]
+
+    total = 0
+    for name, fn in scorers:
+        try:
+            sigs = fn()
+            n = len(sigs)
+            summary["scorers"][name] = n
+            total += n
+        except Exception as exc:
+            _silent_log_safe(f"mood_poll_scorer_failed:{name}", exc)
+            summary["scorers"][name] = "error"
+
+    summary["n_signals_emitted"] = total
+
+    # Recompute aggregate score (idempotent UPSERT).
+    try:
+        agg = compute_daily_score()
+        summary["score"] = {
+            "date": agg["date"],
+            "value": round(agg["score"], 3),
+            "n_signals": agg["n_signals"],
+            "sources_used": agg["sources_used"],
+        }
+    except Exception as exc:
+        _silent_log_safe("mood_poll_aggregate_failed", exc)
+        summary["score"] = "error"
+
+    summary["elapsed_s"] = round(_now_ts() - started_at, 3)
+    return summary
+
+
 __all__ = [
     "score_spotify_window",
     "score_journal_recent",
@@ -1145,6 +1255,10 @@ __all__ = [
     "get_score_for_date",
     "get_recent_scores",
     "recent_drift",
+    "run_poll_cycle",
+    "is_daemon_enabled",
+    "enable_daemon",
+    "disable_daemon",
     "_is_mood_enabled",
     "_persist_signal",
     "_load_artist_mood_table",

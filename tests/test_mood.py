@@ -931,3 +931,214 @@ def test_cli_mood_explain(temp_full_db, mood_enabled):
     assert result.exit_code == 0, result.output
     assert "journal" in result.output
     assert "keyword_negative" in result.output
+
+
+# ─── Daemon state file + run_poll_cycle ────────────────────────────────────
+
+
+@pytest.fixture
+def daemon_state_dir(tmp_path, monkeypatch):
+    """Patch _daemon_state_file → tmp_path/mood_enabled. Default: file
+    NO existe (daemon disabled)."""
+    state = tmp_path / "mood_enabled"
+    monkeypatch.setattr(mood, "_daemon_state_file", lambda: state)
+    return state
+
+
+def test_daemon_disabled_by_default(daemon_state_dir):
+    assert mood.is_daemon_enabled() is False
+
+
+def test_daemon_enable_creates_state_file(daemon_state_dir):
+    mood.enable_daemon()
+    assert daemon_state_dir.exists()
+    assert mood.is_daemon_enabled() is True
+
+
+def test_daemon_enable_idempotent(daemon_state_dir):
+    mood.enable_daemon()
+    mood.enable_daemon()
+    assert daemon_state_dir.exists()
+    assert mood.is_daemon_enabled() is True
+
+
+def test_daemon_disable_removes_state_file(daemon_state_dir):
+    mood.enable_daemon()
+    assert mood.is_daemon_enabled() is True
+    mood.disable_daemon()
+    assert daemon_state_dir.exists() is False
+    assert mood.is_daemon_enabled() is False
+
+
+def test_daemon_disable_idempotent(daemon_state_dir):
+    """Llamar disable cuando ya estaba off no tira."""
+    mood.disable_daemon()
+    mood.disable_daemon()
+    assert mood.is_daemon_enabled() is False
+
+
+def test_run_poll_cycle_feature_off_returns_early(temp_full_db, daemon_state_dir, monkeypatch):
+    """Sin RAG_MOOD_ENABLED, run_poll_cycle no llama scorers."""
+    monkeypatch.delenv("RAG_MOOD_ENABLED", raising=False)
+    result = mood.run_poll_cycle(persist=False, use_llm=False)
+    assert result["reason"] == "feature_off"
+    assert result["n_signals_emitted"] == 0
+    assert result["scorers"] == {}
+
+
+def test_run_poll_cycle_daemon_disabled_returns_early(
+    temp_full_db, daemon_state_dir, mood_enabled,
+):
+    """Con env var ON pero state file ausente, scorers no corren."""
+    assert not daemon_state_dir.exists()
+    result = mood.run_poll_cycle(persist=False, use_llm=False)
+    assert result["reason"] == "daemon_disabled"
+    assert result["n_signals_emitted"] == 0
+
+
+def test_run_poll_cycle_runs_all_scorers_when_enabled(
+    temp_full_db, daemon_state_dir, mood_enabled, monkeypatch,
+):
+    """Con feature on + daemon enabled, los 5 scorers se llaman.
+    Sin data real, todos devuelven []. El cycle igual recompute el
+    aggregate (UPSERT empty row con n=0)."""
+    mood.enable_daemon()
+
+    # Mockear scorers que dependen de WA bridge / icalBuddy / Spotify
+    # AppleScript, devuelven [] sin tocar IO real.
+    monkeypatch.setattr(mood, "_wa_bridge_db_path", lambda: None)
+    monkeypatch.setattr(
+        "rag.integrations.calendar._fetch_calendar_today",
+        lambda max_events=15: [],
+    )
+
+    result = mood.run_poll_cycle(persist=True, use_llm=False)
+    assert result.get("reason") is None
+    assert result["enabled"] is True
+    assert result["daemon_enabled"] is True
+    assert set(result["scorers"].keys()) == {
+        "spotify", "journal", "wa_outbound", "queries", "calendar",
+    }
+    # Cada scorer devuelve int (0 si nada) o "error" (si tira).
+    for n in result["scorers"].values():
+        assert isinstance(n, int) or n == "error"
+    # El aggregate corrió (aunque sea con 0 signals).
+    assert isinstance(result["score"], dict)
+    assert result["score"]["n_signals"] == 0
+
+
+def test_run_poll_cycle_isolates_failing_scorer(
+    temp_full_db, daemon_state_dir, mood_enabled, monkeypatch,
+):
+    """Si un scorer tira excepción, los demás siguen y el aggregate
+    corre. El scorer fallante queda como 'error' en el summary."""
+    mood.enable_daemon()
+
+    def _broken(*args, **kwargs):
+        raise RuntimeError("simulated calendar failure")
+
+    monkeypatch.setattr(mood, "score_calendar_density", _broken)
+    monkeypatch.setattr(mood, "_wa_bridge_db_path", lambda: None)
+
+    result = mood.run_poll_cycle(persist=False, use_llm=False)
+    assert result["scorers"]["calendar"] == "error"
+    # Los demás scorers se llamaron sin tirar.
+    assert isinstance(result["scorers"]["spotify"], int)
+    assert isinstance(result["scorers"]["queries"], int)
+
+
+# ─── CLI enable/disable/status/poll ────────────────────────────────────────
+
+
+def test_cli_mood_status_off_by_default(daemon_state_dir, monkeypatch):
+    """Sin env var ni state file: status muestra ambos off."""
+    monkeypatch.delenv("RAG_MOOD_ENABLED", raising=False)
+    from click.testing import CliRunner
+    runner = CliRunner()
+    result = runner.invoke(rag.cli, ["mood", "status", "--plain"])
+    assert result.exit_code == 0, result.output
+    assert "env_flag=off" in result.output
+    assert "daemon=disabled" in result.output
+
+
+def test_cli_mood_enable_then_status(daemon_state_dir, mood_enabled):
+    from click.testing import CliRunner
+    runner = CliRunner()
+    runner.invoke(rag.cli, ["mood", "enable", "--plain"])
+    result = runner.invoke(rag.cli, ["mood", "status", "--plain"])
+    assert "daemon=enabled" in result.output
+    assert daemon_state_dir.exists()
+
+
+def test_cli_mood_enable_idempotent(daemon_state_dir, mood_enabled):
+    from click.testing import CliRunner
+    runner = CliRunner()
+    r1 = runner.invoke(rag.cli, ["mood", "enable", "--plain"])
+    assert "was_already_enabled=False" in r1.output
+    r2 = runner.invoke(rag.cli, ["mood", "enable", "--plain"])
+    assert "was_already_enabled=True" in r2.output
+    assert daemon_state_dir.exists()
+
+
+def test_cli_mood_disable_after_enable(daemon_state_dir, mood_enabled):
+    from click.testing import CliRunner
+    runner = CliRunner()
+    runner.invoke(rag.cli, ["mood", "enable", "--plain"])
+    result = runner.invoke(rag.cli, ["mood", "disable", "--plain"])
+    assert result.exit_code == 0
+    assert "was_enabled=True" in result.output
+    assert not daemon_state_dir.exists()
+
+
+def test_cli_mood_poll_skipped_when_disabled(temp_full_db, daemon_state_dir, mood_enabled):
+    """`rag mood poll` con daemon disabled: sale como 'skipped'."""
+    from click.testing import CliRunner
+    runner = CliRunner()
+    result = runner.invoke(rag.cli, ["mood", "poll", "--plain", "--dry-run"])
+    assert result.exit_code == 0
+    payload = json.loads(result.output.strip())
+    assert payload["reason"] == "daemon_disabled"
+
+
+def test_cli_mood_poll_runs_when_enabled(
+    temp_full_db, daemon_state_dir, mood_enabled, monkeypatch,
+):
+    """Con daemon enabled, poll corre los scorers."""
+    mood.enable_daemon()
+    monkeypatch.setattr(mood, "_wa_bridge_db_path", lambda: None)
+    monkeypatch.setattr(
+        "rag.integrations.calendar._fetch_calendar_today",
+        lambda max_events=15: [],
+    )
+    from click.testing import CliRunner
+    runner = CliRunner()
+    result = runner.invoke(rag.cli, ["mood", "poll", "--plain", "--dry-run", "--no-llm"])
+    assert result.exit_code == 0
+    payload = json.loads(result.output.strip())
+    assert payload.get("reason") is None
+    assert "scorers" in payload
+    assert set(payload["scorers"].keys()) == {
+        "spotify", "journal", "wa_outbound", "queries", "calendar",
+    }
+
+
+# ─── _services_spec includes mood-poll plist ──────────────────────────────
+
+
+def test_services_spec_includes_mood_poll():
+    """El plist mood-poll está registrado en _services_spec — `rag setup`
+    lo va a generar + cargar."""
+    spec = rag._services_spec("/fake/path/to/rag")
+    labels = {label for label, _, _ in spec}
+    assert "com.fer.obsidian-rag-mood-poll" in labels
+
+
+def test_mood_poll_plist_has_required_fields():
+    """El XML del plist contiene Label, ProgramArguments, RAG_MOOD_ENABLED=1,
+    StartInterval=1800."""
+    xml = rag._mood_poll_plist("/fake/rag")
+    assert "<string>com.fer.obsidian-rag-mood-poll</string>" in xml
+    assert "<key>RAG_MOOD_ENABLED</key><string>1</string>" in xml
+    assert "<key>StartInterval</key><integer>1800</integer>" in xml
+    assert "mood_poll.py" in xml
+    assert "<key>RunAtLoad</key><true/>" in xml

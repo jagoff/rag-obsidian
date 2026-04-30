@@ -570,10 +570,12 @@
     }
   });
 
-  // Refresh manual del brief (regenerate=true → LLM corre síncrono ~30-45s
-  // con qwen2.5:7b warm). Durante el wait mostramos un progress bar ASCII
-  // que avanza en steps fijos cada 3s. NO es real — el endpoint no expone
-  // SSE de progreso; es una indicación visual de "todavía vivo".
+  // Refresh manual del brief (regenerate=true → compute síncrono ~6-15s
+  // típicamente; hasta ~30s si dispara LLM brief con today_total > 0).
+  // Durante el wait mostramos un progress bar ASCII que avanza cada 1s
+  // sumando 5%, llegando a 95% en ~19s. NO es real — el endpoint no expone
+  // SSE de progreso; es una indicación visual de "todavía vivo". Si el
+  // compute termina antes, stopProgress lo corta y oculta la barra.
   document.addEventListener("DOMContentLoaded", () => {
     const refreshBtn = document.getElementById("brief-refresh");
     if (!refreshBtn) return;
@@ -599,16 +601,20 @@
       progressBar.textContent =
         `[${"░".repeat(totalBlocks)}] 0%`;
       progressLabel.textContent = labels[0];
+      // Tick cada 1s, +5%/tick. Llega a 95% en ~19s. Cambio de label
+      // cada ~3-4s para que se sienta movimiento aunque el compute real
+      // sea más rápido que las 6 etapas listadas.
       progressTimer = setInterval(() => {
-        pct = Math.min(95, pct + 3);
+        pct = Math.min(95, pct + 5);
         const filled = Math.round((pct / 100) * totalBlocks);
         const bar = "█".repeat(filled) + "░".repeat(totalBlocks - filled);
         progressBar.textContent = `[${bar}] ${pct}%`;
-        if (pct % 15 === 0) {
-          labelIdx = Math.min(labels.length - 1, labelIdx + 1);
+        // Avanzar label cada ~15% (~3 ticks). 0/15/30/45/60/75 → 6 etapas.
+        if (pct >= (labelIdx + 1) * 15 && labelIdx < labels.length - 1) {
+          labelIdx++;
           progressLabel.textContent = labels[labelIdx];
         }
-      }, 1500);
+      }, 1000);
     }
 
     function stopProgress() {

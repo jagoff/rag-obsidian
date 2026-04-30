@@ -8660,7 +8660,13 @@ def _fetch_credit_cards(now: datetime | None = None) -> list[dict]:  # noqa: ARG
 import threading
 from fastapi.responses import Response
 
-_HOME_LOCK = threading.Lock()
+# Condition (no Lock) para que cuando un thread esté computing, otro caller
+# pueda hacer wait_for(... computing == False ...) en lugar de retornar
+# inmediato. Necesario para que `regenerate=True` no devuelva cache stale
+# cuando el prewarmer ya está corriendo un compute (bug histórico:
+# barra de progreso del frontend se clavaba en 9% porque el GET resolvía
+# en milisegundos en vez de esperar al LLM real).
+_HOME_LOCK = threading.Condition()
 # Cache serialized bytes too — `/api/home` then becomes a raw bytes write
 # (no per-request 35KB json.dumps under the GIL).
 _HOME_STATE: dict = {
@@ -8668,6 +8674,9 @@ _HOME_STATE: dict = {
     "body": None,
     "ts": 0.0,
     "computing": False,
+    # True si el compute en curso fue lanzado por un user-regen
+    # (regenerate=True). Lo usamos para decidir piggyback vs recompute.
+    "computing_regenerate": False,
 }
 _HOME_SOFT_TTL = 120.0      # serve cached without bg-refresh under this age
 # Pre-warmer cadence — bumped 25s → 300s on 2026-04-17 after chat latency
@@ -8860,27 +8869,66 @@ _WARMING_BODY = json.dumps({
 
 
 def _home_refresh(regenerate: bool = False) -> None:
-    """Compute + publish under lock; never run two computes in parallel.
+    """Compute + publish under condition; never run two computes in parallel.
     Silent-fail keeps last good payload visible if a fetcher dependency
     (icalBuddy, whisper, ollama) is momentarily down.
+
+    Concurrency:
+    - Si NO hay otro compute en curso: tomamos el slot y computamos.
+    - Si hay otro compute en curso (prewarmer / SWR / otro user-regen):
+      * `regenerate=False` (prewarmer/SWR): salimos sin sumar trabajo,
+        otro thread ya está cubriendo el refresh.
+      * `regenerate=True` (user click ↻): esperamos al thread en curso
+        (timeout 120s). Si ese thread era user-regen también, su resultado
+        nos sirve y volvemos sin recomputar (piggyback). Si era prewarmer
+        / SWR (`regenerate=False`), recomputamos nosotros para que el
+        LLM brief refleje el regen explícito que el user pidió.
+
+    Sin esta lógica, un click en ↻ del frontend que cae justo cuando el
+    prewarmer tiene el slot devuelve cache stale en milisegundos y la
+    barra de progreso del cliente se clava en 9%. Ver commit del fix.
     """
-    with _HOME_LOCK:
-        if _HOME_STATE["computing"]:
-            return
-        _HOME_STATE["computing"] = True
+    while True:
+        with _HOME_LOCK:
+            if _HOME_STATE["computing"]:
+                if not regenerate:
+                    return  # otro está, no me sumo
+                was_regen = bool(_HOME_STATE.get("computing_regenerate"))
+                ok = _HOME_LOCK.wait_for(
+                    lambda: not _HOME_STATE["computing"],
+                    timeout=120.0,
+                )
+                if not ok:
+                    return  # timeout — abortar para no colgar al cliente
+                if was_regen:
+                    return  # piggyback: el otro user-regen ya publicó fresh
+                continue   # el otro era prewarmer; ahora SÍ regen yo
+            _HOME_STATE["computing"] = True
+            _HOME_STATE["computing_regenerate"] = bool(regenerate)
+            break
+
     t0 = time.time()
     try:
         payload = _home_compute(regenerate)
         body = json.dumps(payload, default=str).encode()
     except Exception:
-        return
-    finally:
         with _HOME_LOCK:
             _HOME_STATE["computing"] = False
+            _HOME_STATE["computing_regenerate"] = False
+            _HOME_LOCK.notify_all()
+        return
+
     now = time.time()
-    _HOME_STATE["payload"] = payload
-    _HOME_STATE["body"] = body
-    _HOME_STATE["ts"] = now
+    # Publicar payload + body + ts ATÓMICAMENTE con la liberación del slot,
+    # así los waiters (que despiertan al notify_all) ven el estado fresco.
+    with _HOME_LOCK:
+        _HOME_STATE["payload"] = payload
+        _HOME_STATE["body"] = body
+        _HOME_STATE["ts"] = now
+        _HOME_STATE["computing"] = False
+        _HOME_STATE["computing_regenerate"] = False
+        _HOME_LOCK.notify_all()
+
     elapsed = now - t0
     _record_home_compute_total(elapsed)
     print(f"[home-refresh] compute={elapsed:.2f}s regen={regenerate}", file=sys.stderr)

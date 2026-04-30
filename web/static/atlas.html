@@ -213,6 +213,14 @@
       font-family: inherit;
     }
     .btn-icon:hover { border-color: var(--border-strong); color: var(--text); }
+    /* Estado activo (ej. aA con labels prendidos) — feedback visual claro
+       de que la opción está on. */
+    .btn-icon.active,
+    .btn-icon[aria-pressed="true"] {
+      background: color-mix(in srgb, var(--cyan) 20%, var(--bg-elev));
+      border-color: var(--cyan);
+      color: var(--cyan);
+    }
 
     .hdr-nav { display: inline-flex; gap: 4px; flex-wrap: wrap; }
     .hdr-nav a {
@@ -1112,6 +1120,6 @@
 
   <span id="atlas-status" class="sr-only" role="status" aria-live="polite">Cargando datos del atlas</span>
 
-  <script src="/static/atlas.js?v=4" defer></script>
+  <script src="/static/atlas.js?v=5" defer></script>
 </body>
 </html>

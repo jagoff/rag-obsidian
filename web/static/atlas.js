@@ -42,7 +42,13 @@ const state = {
   graphNodes: [],           // copia del input para filter logic
   graphLinks: [],
   folderColors: null,       // Map<folder, hex> + ._topMap
-  showLabels: false,        // toggle aA — default off (visualmente menos cargado en 3D)
+  // Toggle aA — labels persisten entre visitas via localStorage. Default
+  // off porque con 500 nodos la pantalla queda cargada; el user los prende
+  // cuando quiere leer los nombres.
+  showLabels: (() => {
+    try { return localStorage.getItem("atlas-show-labels") === "1"; }
+    catch (e) { return false; }
+  })(),
   selectedNode: null,       // referencia al objeto nodo seleccionado
   selectedNeighborIds: null,// Set<id> de vecinos 1-hop del seleccionado
   selectedLinks: null,      // Set<link> que tocan al seleccionado
@@ -417,7 +423,10 @@ async function renderGraph(graph) {
   // ─ Background del canvas según tema (CSS var).
   const bg = getComputedStyle(document.documentElement).getPropertyValue("--bg").trim() || "#1a1a1f";
 
-  const Graph = ForceGraph3D({ controlType: "orbit" })
+  // Trackball controls: drag rota libremente en los 3 ejes (X, Y, Z),
+  // a diferencia de "orbit" que solo deja 2 ejes. Más freedom = se siente
+  // 3D de verdad cuando manipulás la cámara.
+  const Graph = ForceGraph3D({ controlType: "trackball" })
     (containerEl)
     .backgroundColor(bg)
     .graphData({ nodes, links })
@@ -499,9 +508,22 @@ async function renderGraph(graph) {
   ro.observe(containerEl);
   state._resizeObs = ro;
 
-  // ZoomToFit cuando la simulación se calmó — encuadra todo el grafo en el
-  // primer paint sin que el user tenga que hacerlo a mano.
-  setTimeout(() => Graph.zoomToFit(900, 60), 1500);
+  // ZoomToFit + ángulo inicial 3D. Después del zoomToFit (que apunta de
+  // frente al centro, vista plana), inclinamos la cámara hacia arriba y
+  // un poco al costado para que el primer paint MUESTRE perspectiva 3D
+  // (desde un ángulo aéreo el ojo lee profundidad inmediatamente).
+  setTimeout(() => {
+    Graph.zoomToFit(900, 60);
+    setTimeout(() => {
+      const cam = Graph.cameraPosition();
+      const dist = Math.hypot(cam.x || 0, cam.y || 0, cam.z || 0) || 250;
+      Graph.cameraPosition(
+        { x: dist * 0.55, y: dist * 0.45, z: dist * 0.7 },
+        { x: 0, y: 0, z: 0 },
+        1800
+      );
+    }, 1100);
+  }, 1500);
 }
 
 // ─── Color accessors (re-evaluados en cada frame por 3d-force-graph) ────
@@ -535,8 +557,10 @@ function graphLinkColor(link) {
 // `node._material` para poder mutarle el color barato sin recrear la
 // geometry en cada cambio de estado (highlight, dim, selección, etc.).
 //
-// Si los labels están on, agregamos el SpriteText como child de la mesh
-// para que se mueva junto con la esfera durante el force-sim.
+// El SpriteText con el nombre se crea SIEMPRE como child de la mesh y
+// solo se prende/apaga vía `sprite.visible`. Así el toggle aA es
+// instantáneo (no recrea geometries) y los labels se mueven naturalmente
+// con la esfera durante el force-sim.
 function buildNodeObject(node) {
   const radius = nodeRadiusFor(node);
   const geo = new THREE.SphereGeometry(radius, 14, 14);
@@ -548,14 +572,16 @@ function buildNodeObject(node) {
   node._material = mat;            // ref para refreshGraphVisuals()
   node._radius = radius;            // ref para position-y del label
 
-  if (state.showLabels && typeof SpriteText === "function") {
+  if (typeof SpriteText === "function") {
     const sprite = new SpriteText(node.label || "");
     sprite.material.depthWrite = false;
     sprite.color = "#ececed";
     sprite.textHeight = 3.2;
     sprite.padding = 1;
     sprite.position.set(0, radius + 4, 0);
+    sprite.visible = !!state.showLabels;
     sphere.add(sprite);
+    node._labelSprite = sprite;     // ref para applyLabelMode() instantáneo
   }
   return sphere;
 }
@@ -584,13 +610,27 @@ function refreshGraphVisuals() {
   }
 }
 
-// Toggle aA: prende/apaga los SpriteText labels. Reconstruye los meshes
-// (no podemos add/remove sprites individuales sin saber qué nodos tienen
-// label actualmente — más simple regenerar). 500 nodos * (geo+mat alloc)
-// tarda ~80ms en una Mac M-series, aceptable para un toggle manual.
-function applyLabelMode(Graph) {
-  if (!Graph) return;
-  Graph.nodeThreeObject(buildNodeObject).nodeThreeObjectExtend(false);
+// Toggle aA: prende/apaga los SpriteText labels. Como cada nodo guarda
+// su sprite en `n._labelSprite`, solo flip de `.visible` — instantáneo,
+// no recrea geometries. También persistimos al localStorage para que el
+// estado dure entre visitas.
+// `Graph` queda como argumento por compatibilidad pero ya no se usa.
+function applyLabelMode(_Graph) {
+  if (!state.graphNodes) return;
+  for (const n of state.graphNodes) {
+    if (n._labelSprite) n._labelSprite.visible = !!state.showLabels;
+  }
+  // Persistir preferencia.
+  try {
+    localStorage.setItem("atlas-show-labels", state.showLabels ? "1" : "0");
+  } catch (e) {}
+  // Visual feedback en el botón.
+  const btn = document.getElementById("graph-toggle-labels");
+  if (btn) {
+    btn.setAttribute("aria-pressed", state.showLabels ? "true" : "false");
+    btn.classList.toggle("active", state.showLabels);
+    btn.title = state.showLabels ? "Ocultar nombres de notas" : "Mostrar nombres de notas";
+  }
 }
 
 function nodeRadiusFor(node) {

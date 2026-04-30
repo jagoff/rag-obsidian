@@ -130,6 +130,54 @@ def test_scan_queries_log_has_limit():
     )
 
 
+def test_turn_id_expression_index_in_ddl():
+    """Fix 4: DDL de rag_queries incluye índice sobre json_extract(extra_json, '$.turn_id')."""
+    ddl = "\n".join(
+        s for table_name, stmts in rag._TELEMETRY_DDL
+        for s in stmts
+    )
+    assert "ix_rag_queries_turn_id" in ddl, (
+        "Falta índice ix_rag_queries_turn_id sobre json_extract(extra_json, '$.turn_id')"
+    )
+    assert "json_extract(extra_json, '$.turn_id')" in ddl, (
+        "El índice debe ser exactamente sobre la expresión que la query usa"
+    )
+
+
+def test_corrective_path_expression_index_in_ddl():
+    """Fix 4: DDL de rag_feedback incluye índice sobre json_extract corrective_path."""
+    ddl = "\n".join(
+        s for table_name, stmts in rag._TELEMETRY_DDL
+        for s in stmts
+    )
+    assert "ix_rag_feedback_corrective" in ddl, (
+        "Falta índice ix_rag_feedback_corrective sobre json_extract(extra_json, '$.corrective_path')"
+    )
+
+
+def test_expression_index_actually_used_by_planner():
+    """Fix 4: SQLite usa el expression index en EXPLAIN QUERY PLAN."""
+    import sqlite3
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE rag_queries (id INTEGER PRIMARY KEY, ts TEXT, "
+        "q TEXT, session TEXT, extra_json TEXT)"
+    )
+    conn.execute(
+        "CREATE INDEX ix_rag_queries_turn_id "
+        "ON rag_queries(json_extract(extra_json, '$.turn_id'))"
+    )
+    plan = list(conn.execute(
+        "EXPLAIN QUERY PLAN SELECT q FROM rag_queries "
+        "WHERE json_extract(extra_json, '$.turn_id') = ?",
+        ("abc",),
+    ))
+    plan_str = " ".join(str(r) for r in plan)
+    assert "ix_rag_queries_turn_id" in plan_str, (
+        f"Plan debería usar ix_rag_queries_turn_id, fue: {plan_str}"
+    )
+
+
 def test_local_embed_enabled_has_cache():
     """Fix 6: _local_embed_enabled tiene caché lazy post-warmup."""
     # El cache se setea cuando warmup completa. Acá sólo verificamos que

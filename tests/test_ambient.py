@@ -289,6 +289,7 @@ def test_whatsapp_send_prefixes_antiloop_marker(monkeypatch):
         captured["body"] = json.loads(req.data.decode("utf-8"))
         return FakeResp()
 
+    monkeypatch.delenv("RAG_DISABLE_WHATSAPP_SEND", raising=False)
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
     ok = rag._ambient_whatsapp_send("120@g.us", "hola mundo")
     assert ok is True
@@ -300,6 +301,7 @@ def test_whatsapp_send_prefixes_antiloop_marker(monkeypatch):
 
 def test_whatsapp_send_does_not_double_prefix(monkeypatch):
     """Si el texto ya arranca con U+200B, no re-prefixar."""
+    monkeypatch.delenv("RAG_DISABLE_WHATSAPP_SEND", raising=False)
     captured: dict = {}
 
     class FakeResp:
@@ -317,8 +319,11 @@ def test_whatsapp_send_does_not_double_prefix(monkeypatch):
 
 
 def test_whatsapp_send_returns_false_on_network_error(monkeypatch):
+    monkeypatch.delenv("RAG_DISABLE_WHATSAPP_SEND", raising=False)
+
     def boom(req, timeout):
         raise OSError("bridge down")
+
     monkeypatch.setattr("urllib.request.urlopen", boom)
     assert rag._ambient_whatsapp_send("120@g.us", "x") is False
 

@@ -5182,10 +5182,20 @@ _corpus_hash_lock = threading.Lock()
 # 30 SEMANTIC PUT events en web.log con 24 hashes distintos → cache nunca
 # hiteaba porque cada lookup venía con un corpus_hash recién minteado y no
 # había rows con ese hash. Con bucket=100 y ~8K chunks, agregar/borrar 50
-# notas no invalida el cache; agregar 100 sí. Tradeoff aceptable: el
-# per-entry staleness check (ver `_cached_entry_is_stale`) ya cubre edits
-# a las paths citadas; los chunks nuevos NO citados no hacen mal a un hit.
-_CORPUS_HASH_BUCKET = 100
+# notas no invalida el cache; agregar 100 sí.
+#
+# 2026-04-30 audit: bucket=100 seguía causando 0% hit-rate. El corpus
+# tiene 3595 chunks y los ingesters (WA hourly, Calendar 6h, Reminders 6h)
+# agregan ~30-80 chunks por run → 2-3 cruzadas de bucket por día → 3
+# hashes distintos en 24h (medido: rag_response_cache muestra c6c1ba/
+# 98a50f/2907da en el mismo día). Ninguna query lookup-ea con el mismo hash
+# que el que se usó para el store. Fix: subir a 500 chunks por bucket.
+# Con corpus de ~3600 chunks, un bucket cubre el 14% del corpus — cruzar
+# requiere agregar 500 chunks netos (~1 `rag index --reset` o ~1 semana
+# de ingesters incrementales). Tradeoff aceptable: el per-entry staleness
+# check (ver `_cached_entry_is_stale`) ya cubre edits a paths citadas.
+# Override: RAG_CORPUS_HASH_BUCKET=N env var.
+_CORPUS_HASH_BUCKET: int = int(os.environ.get("RAG_CORPUS_HASH_BUCKET", "500"))
 
 
 # 2026-04-28 wave-7: filter version baked into the corpus hash. Bump cuando
@@ -5206,25 +5216,26 @@ def _hash_chunk_count(chunk_count: int) -> str:
 
 
 def _compute_corpus_hash(col) -> str:
-    """Cheap fingerprint of the current corpus. sha256 of `chunk_count // 100`.
+    """Cheap fingerprint of the current corpus. sha256 of `chunk_count // _CORPUS_HASH_BUCKET`.
 
-    Returns "" if col is unavailable. Post 2026-04-24 buckets the count by
-    `_CORPUS_HASH_BUCKET` (default 100) en vez de usar el exact count.
-    Rationale:
+    Returns "" if col is unavailable. Buckets the count by
+    `_CORPUS_HASH_BUCKET` (default 500, override RAG_CORPUS_HASH_BUCKET)
+    en vez de usar el exact count. Rationale:
 
-    - El cambio anterior (sólo `count`, sin mtimes) seguía invalidando el
-      cache cada vez que cualquier ingester escribía un chunk. Audit
-      2026-04-24 sobre el web.log mostró 30 PUT events con 24 corpus_hashes
-      DISTINTOS — el cache nunca hiteaba porque cada query reseteaba el
-      hash. Bucket=100 hace que el hash sólo cambie tras +/-100 chunks
-      netos, dejando que el cache sobreviva a la rotación normal de
-      ingesters.
+    - Audit 2026-04-24: bucket=100 aún causaba 3 hashes distintos por día
+      con el corpus de ~3600 chunks, porque los ingesters hourly (WA,
+      Calendar, Reminders) agregan ~30-80 chunks por run y cruzan el
+      bucket 2-3 veces diarias. Resultado: 0% hit-rate medido en 7d
+      (rag_response_cache con 24 rows, 307 queries elegibles, 0 hits).
+      Fix 2026-04-30: bucket=500 → cruzar requiere +500 chunks netos
+      (~14% del corpus actual, equivale a ~1 semana de ingesters o un
+      `rag index --reset`).
 
     - Per-entry freshness se enforce en `semantic_cache_lookup` comparando
       cada entry's `paths[]` contra su mtime actual; cualquier edit a una
       nota citada salta la row, sin tirar el cache entero.
 
-    - New/removed notes en bulk (>100 net) sí invalidan — correcta
+    - New/removed notes en bulk (>500 net) sí invalidan — correcta
       invariante (corpus cambió suficiente como para esperar retrieval
       diferente).
     """
@@ -20120,21 +20131,38 @@ def reformulate_query(
     # `_generate_synthetic_questions`, etc.) ya envuelven en try/except.
     # En error: devolver la pregunta original — pierde el rewrite del
     # historial pero el retrieve sigue funcionando.
-    try:
-        resp = _helper_client().chat(
-            model=HELPER_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            options={**HELPER_OPTIONS, "num_ctx": 2048},
-            keep_alive=OLLAMA_KEEP_ALIVE,
-        )
-        raw = resp.message.content.strip().strip('"')
-        return _postprocess_reformulation(question, raw, history)
-    except Exception as exc:
+    #
+    # 2026-04-30: 99 reformulate_query_failed en 48h (67x timeout, 32x
+    # HTTP 503 "server busy"). Causas:
+    #   - Timeout: cold-load de qwen2.5:3b bajo contención (chat+reranker
+    #     pineados en MPS, el helper necesita >30s para cargar). Fix:
+    #     1 retry con 3s de backoff para dar tiempo al cold-load.
+    #   - 503: OLLAMA_MAX_LOADED_MODELS=2 saturado, Ollama rechaza. Fix:
+    #     mismo retry (los 503 se resuelven en <1s al liberar slot).
+    # El retry es conservador: solo 1 intento, no loop — si el segundo
+    # falla también, se degrada a la pregunta original como antes.
+    _last_exc: Exception | None = None
+    for _attempt in range(2):  # intento 0 (normal) + intento 1 (retry)
+        if _attempt > 0:
+            import time as _time
+            _time.sleep(3.0)  # backoff fijo: tiempo suficiente para cold-load
         try:
-            _silent_log("reformulate_query_failed", exc)
-        except Exception:
-            pass
-        return question
+            resp = _helper_client().chat(
+                model=HELPER_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                options={**HELPER_OPTIONS, "num_ctx": 2048},
+                keep_alive=OLLAMA_KEEP_ALIVE,
+            )
+            raw = resp.message.content.strip().strip('"')
+            return _postprocess_reformulation(question, raw, history)
+        except Exception as exc:
+            _last_exc = exc
+    # Ambos intentos fallaron — loguear y degradar
+    try:
+        _silent_log("reformulate_query_failed", _last_exc)
+    except Exception:
+        pass
+    return question
 
 
 def _compress_turns(turns: list[dict]) -> str:
@@ -52878,7 +52906,9 @@ def _sql_rotate_log_tables(*, dry_run: bool = False,
             ).fetchall()
         }
 
-        for table, days in _SQL_ROTATION_POLICY:
+        for entry in _SQL_ROTATION_POLICY:
+            table, days = entry[0], entry[1]
+            time_col = entry[2] if len(entry) > 2 else "ts"
             if table not in existing:
                 continue
             cutoff_iso = _dt.fromtimestamp(now - days * 86400).isoformat(
@@ -52886,12 +52916,13 @@ def _sql_rotate_log_tables(*, dry_run: bool = False,
             )
             if dry_run:
                 row = conn.execute(
-                    f"SELECT COUNT(*) FROM {table} WHERE ts < ?", (cutoff_iso,)
+                    f"SELECT COUNT(*) FROM {table} WHERE {time_col} < ?",
+                    (cutoff_iso,),
                 ).fetchone()
                 out["rows_deleted"][table] = int(row[0] if row else 0)
             else:
                 cur = conn.execute(
-                    f"DELETE FROM {table} WHERE ts < ?", (cutoff_iso,)
+                    f"DELETE FROM {table} WHERE {time_col} < ?", (cutoff_iso,)
                 )
                 out["rows_deleted"][table] = cur.rowcount or 0
 

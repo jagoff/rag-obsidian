@@ -242,6 +242,109 @@ def test_rotation_vacuum_gated_by_delta(sql_env, monkeypatch):
     assert out2["vacuum_ran"] is False
 
 
+def test_rotation_whatsapp_scheduled_uses_created_at(sql_env):
+    """Regresión: rag_whatsapp_scheduled tiene `created_at`, NO `ts`.
+    El loop no debe abortar mid-run ni omitir las tablas siguientes.
+    """
+    import sqlite3 as _sqlite
+    db_path = sql_env["db_path"]
+    conn = _sqlite.connect(str(db_path))
+    now = time.time()
+    try:
+        # Crear la tabla con el DDL real (created_at, sin columna ts).
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS rag_whatsapp_scheduled ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  created_at TEXT NOT NULL,"
+            "  scheduled_for_utc TEXT NOT NULL DEFAULT '',"
+            "  jid TEXT NOT NULL DEFAULT '',"
+            "  message_text TEXT NOT NULL DEFAULT '',"
+            "  status TEXT NOT NULL DEFAULT 'pending'"
+            ")"
+        )
+        # Seed 2 rows: una antigua (40d, debe borrarse con retention=30) y una reciente.
+        old_ts = _iso_days_ago(40, now)
+        new_ts = _iso_days_ago(5, now)
+        conn.execute(
+            "INSERT INTO rag_whatsapp_scheduled (created_at, scheduled_for_utc, jid, message_text)"
+            " VALUES (?, '', '', '')", (old_ts,)
+        )
+        conn.execute(
+            "INSERT INTO rag_whatsapp_scheduled (created_at, scheduled_for_utc, jid, message_text)"
+            " VALUES (?, '', '', '')", (new_ts,)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # No debe lanzar excepción y debe reportar 1 row deleted (no 0 ni abortar).
+    out = rag._sql_rotate_log_tables(dry_run=False, now_ts=now)
+    assert "rag_whatsapp_scheduled" in out["rows_deleted"], (
+        "La tabla rag_whatsapp_scheduled no apareció en rows_deleted — "
+        "posiblemente el loop abortó antes de llegar a ella."
+    )
+    assert out["rows_deleted"]["rag_whatsapp_scheduled"] == 1, (
+        "Esperaba 1 row deletada (la antigua de 40d con retention=30d) "
+        f"pero got {out['rows_deleted']['rag_whatsapp_scheduled']}"
+    )
+    # Verificar que el row reciente sobrevivió.
+    conn = _sqlite.connect(str(db_path))
+    try:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM rag_whatsapp_scheduled"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert count == 1, f"Esperaba 1 row sobreviviente, got {count}"
+
+
+def test_rotation_no_abort_on_custom_time_col(sql_env):
+    """Con una tabla custom (time_col != ts), las tablas SIGUIENTES también rotan.
+    Verifica que el loop no se interrumpa: rag_synthetic_queries (que SÍ usa ts)
+    debe rotarse aunque rag_whatsapp_scheduled esté presente antes de ella.
+    """
+    import sqlite3 as _sqlite
+    db_path = sql_env["db_path"]
+    conn = _sqlite.connect(str(db_path))
+    now = time.time()
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS rag_whatsapp_scheduled ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  created_at TEXT NOT NULL,"
+            "  scheduled_for_utc TEXT NOT NULL DEFAULT '',"
+            "  jid TEXT NOT NULL DEFAULT '',"
+            "  message_text TEXT NOT NULL DEFAULT '',"
+            "  status TEXT NOT NULL DEFAULT 'pending'"
+            ")"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS rag_synthetic_queries ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  ts TEXT NOT NULL,"
+            "  query TEXT NOT NULL DEFAULT '',"
+            "  source_path TEXT NOT NULL DEFAULT ''"
+            ")"
+        )
+        # Rows antiguos en ambas tablas.
+        old_ts = _iso_days_ago(100, now)
+        conn.execute(
+            "INSERT INTO rag_whatsapp_scheduled (created_at, scheduled_for_utc, jid, message_text)"
+            " VALUES (?, '', '', '')", (old_ts,)
+        )
+        conn.execute(
+            "INSERT INTO rag_synthetic_queries (ts, query) VALUES (?, 'q')", (old_ts,)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    out = rag._sql_rotate_log_tables(dry_run=False, now_ts=now)
+    # Ambas tablas deben aparecer y tener 1 delete cada una.
+    assert out["rows_deleted"].get("rag_whatsapp_scheduled") == 1
+    assert out["rows_deleted"].get("rag_synthetic_queries") == 1
+
+
 # ── .bak cleanup ────────────────────────────────────────────────────────────
 
 def test_bak_cleanup_purges_old(sql_env):

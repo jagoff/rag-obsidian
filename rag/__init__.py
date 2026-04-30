@@ -5652,6 +5652,25 @@ RAG_STATE_SQL = os.environ.get("RAG_STATE_SQL", "").strip() == "1"
 
 _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
+        # Versioned schema migrations registry — drives `rag.migrations`.
+        # Each row = una migration aplicada (version monotónica + name +
+        # applied_at + hash sha1 del cuerpo). Matar la clase de bugs
+        # `CREATE TABLE IF NOT EXISTS` no aplica ALTER en DBs viejas:
+        # ahora cada cambio de schema vive como `migrate_NNN_*` en
+        # `rag/migrations.py` y se aplica explícitamente bajo SAVEPOINT.
+        # Los `_migrate_*` legacy siguen corriendo en `_ensure_telemetry_tables`
+        # como guard belt-and-suspenders mientras se transicionan.
+        "rag_schema_migrations",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_schema_migrations ("
+            " version INTEGER PRIMARY KEY,"
+            " name TEXT NOT NULL,"
+            " applied_at TEXT NOT NULL,"
+            " hash TEXT"
+            ")",
+        ),
+    ),
+    (
         "rag_queries",
         (
             "CREATE TABLE IF NOT EXISTS rag_queries ("
@@ -7147,6 +7166,35 @@ def _ensure_telemetry_tables(conn) -> None:
             try:
                 _silent_log("migration_trace_id_failed", _migrate_exc)
             except Exception:  # pragma: no cover
+                pass
+        # Versioned schema migrations (2026-04-29). Single source of truth para
+        # cambios de schema futuros — los `_migrate_*` helpers de arriba son
+        # legacy belt-and-suspenders mientras se transicionan. Bootstrap si la
+        # DB es preexistente con todas las migrations ya aplicadas via los
+        # helpers legacy (heurística: rag_queries.trace_id ya existe). Después
+        # apply_pending_migrations es idempotente — un solo SELECT MAX cuando
+        # estamos up-to-date. Wrapped en try/except con _silent_log: si una
+        # migration tira, app sigue degradada en vez de crashear el boot.
+        try:
+            from rag import migrations as _migrations  # noqa: PLC0415
+            try:
+                _migrations.bootstrap_existing_db(conn)
+            except Exception as _boot_exc:
+                try:
+                    _silent_log("schema_migrations_bootstrap_failed", _boot_exc)
+                except Exception:  # pragma: no cover
+                    pass
+            try:
+                _migrations.apply_pending_migrations(conn)
+            except Exception as _apply_exc:
+                try:
+                    _silent_log("schema_migrations_apply_failed", _apply_exc)
+                except Exception:  # pragma: no cover
+                    pass
+        except Exception as _mig_import_exc:  # pragma: no cover
+            try:
+                _silent_log("schema_migrations_import_failed", _mig_import_exc)
+            except Exception:
                 pass
         if db_path:
             _TELEMETRY_DDL_ENSURED_PATHS.add(db_path)
@@ -30829,6 +30877,201 @@ def brief_schedule_auto_tune(dry_run: bool, apply_flag: bool, lookback_days: int
     if not any_shift:
         msg = "nada para aplicar — todos los kinds en zona buena"
         click.echo(msg) if plain else console.print(f"[green]{msg}[/green]")
+
+
+# ── `rag migrations` — schema migrations explícitas ─────────────────────
+#
+# CLI thin wrapper sobre `rag.migrations`. Operaciones:
+#   - `rag migrations status`  → version actual + pending count
+#   - `rag migrations list`    → todas las conocidas (applied | pending)
+#   - `rag migrations apply`   → aplica pending hasta --target N (--dry-run)
+#   - `rag migrations bootstrap` → registra todas como aplicadas sin correrlas
+#
+# Todas operan contra `telemetry.db` (DB_PATH / telemetry.db). Las commands
+# abren su propia conn raw — NO pasan por `_ragvec_state_conn` para evitar
+# que `_ensure_telemetry_tables` corra `apply_pending_migrations` antes de
+# que el user pueda inspeccionar el estado.
+
+
+def _migrations_open_conn():
+    """Abre una conn directa a telemetry.db sin disparar el wiring de
+    `_ensure_telemetry_tables`. Solo crea la tabla `rag_schema_migrations`
+    si no existe — el resto del DDL queda intacto para no enmascarar
+    estados de DBs viejas."""
+    import sqlite3 as _sqlite3
+    DB_PATH.mkdir(parents=True, exist_ok=True)
+    db_file = DB_PATH / _TELEMETRY_DB_FILENAME
+    conn = _sqlite3.connect(str(db_file), isolation_level=None,
+                            check_same_thread=False, timeout=30.0)
+    conn.execute("PRAGMA busy_timeout=30000")
+    return conn
+
+
+@cli.group("migrations")
+def migrations_group() -> None:
+    """Schema migrations versionadas para telemetry.db.
+
+    Mata la clase de bugs `CREATE TABLE IF NOT EXISTS no aplica ALTER en
+    DBs viejas`. Cada migration vive como `migrate_NNN_*` en
+    `rag/migrations.py` y se aplica explícitamente bajo SAVEPOINT.
+    """
+
+
+@migrations_group.command("status")
+@click.option("--plain", is_flag=True, help="Output mínimo, sin Rich")
+def migrations_status_cmd(plain: bool) -> None:
+    """Muestra version actual + count de pending."""
+    from rag import migrations as _m  # noqa: PLC0415
+    conn = _migrations_open_conn()
+    try:
+        cur = _m.current_version(conn)
+        all_known = _m.known_migrations()
+        pending = [v for v, _, _ in all_known if v > cur]
+        max_known = max((v for v, _, _ in all_known), default=0)
+    finally:
+        conn.close()
+    if plain:
+        click.echo(f"current_version={cur} max_known={max_known} pending={len(pending)}")
+        return
+    console.print(f"[cyan]current version:[/cyan] [bold]{cur}[/bold]")
+    console.print(f"[cyan]max known:[/cyan]       [bold]{max_known}[/bold]")
+    if pending:
+        console.print(f"[yellow]pending:[/yellow]         {len(pending)} ({pending})")
+    else:
+        console.print("[green]up to date — no pending migrations[/green]")
+
+
+@migrations_group.command("list")
+@click.option("--applied", "filter_applied", is_flag=True, help="Solo migrations aplicadas")
+@click.option("--pending", "filter_pending", is_flag=True, help="Solo migrations pending")
+@click.option("--plain", is_flag=True)
+def migrations_list_cmd(filter_applied: bool, filter_pending: bool, plain: bool) -> None:
+    """Lista todas las migrations conocidas + estado."""
+    from rag import migrations as _m  # noqa: PLC0415
+    conn = _migrations_open_conn()
+    try:
+        applied = _m.applied_versions(conn)
+        rows = _m.known_migrations()
+    finally:
+        conn.close()
+    for v, name, _fn in rows:
+        is_applied = v in applied
+        if filter_applied and not is_applied:
+            continue
+        if filter_pending and is_applied:
+            continue
+        status = "applied" if is_applied else "pending"
+        if plain:
+            click.echo(f"{v}\t{status}\t{name}")
+        else:
+            color = "green" if is_applied else "yellow"
+            console.print(f"[{color}]{v:>3} {status:<8}[/] {name}")
+
+
+@migrations_group.command("apply")
+@click.option("--target", type=int, default=None,
+              help="Aplica solo hasta esta version (default: todas las pending)")
+@click.option("--dry-run", is_flag=True, help="Lista qué se aplicaría sin tocar la DB")
+@click.option("--plain", is_flag=True)
+def migrations_apply_cmd(target: int | None, dry_run: bool, plain: bool) -> None:
+    """Aplica pending migrations. `--target N` limita; `--dry-run` no escribe."""
+    from rag import migrations as _m  # noqa: PLC0415
+    conn = _migrations_open_conn()
+    try:
+        cur = _m.current_version(conn)
+        pending = [(v, name) for v, name, _ in _m.known_migrations() if v > cur]
+        if target is not None:
+            pending = [(v, name) for v, name in pending if v <= target]
+        if not pending:
+            msg = "no pending migrations"
+            click.echo(msg) if plain else console.print(f"[green]{msg}[/green]")
+            return
+        if dry_run:
+            for v, name in pending:
+                if plain:
+                    click.echo(f"would apply {v} {name}")
+                else:
+                    console.print(f"[yellow]would apply[/yellow] [bold]{v}[/bold] {name}")
+            return
+        # Filter the pending list down to target before calling apply_pending_migrations.
+        # apply_pending_migrations doesn't take a target; emulate by registering
+        # the higher-version skips temporarily — simpler: aplicar en loop manual.
+        applied_now: list[int] = []
+        for v, name, fn in _m.known_migrations():
+            if v <= cur:
+                continue
+            if target is not None and v > target:
+                break
+            sp = f"migration_{v}"
+            try:
+                conn.execute(f"SAVEPOINT {sp}")
+                fn(conn)
+                conn.execute(
+                    "INSERT OR REPLACE INTO rag_schema_migrations(version, name, applied_at, hash)"
+                    " VALUES(?, ?, ?, ?)",
+                    (v, name, _m._now_iso(), _m._migration_hash(fn)),
+                )
+                conn.execute(f"RELEASE SAVEPOINT {sp}")
+                applied_now.append(v)
+            except Exception as exc:
+                try:
+                    conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+                    conn.execute(f"RELEASE SAVEPOINT {sp}")
+                except Exception:
+                    pass
+                if plain:
+                    click.echo(f"FAILED at {v} {name}: {exc!r}")
+                else:
+                    console.print(f"[red]FAILED at {v} {name}:[/red] {exc!r}")
+                raise click.exceptions.Exit(1)
+        if plain:
+            click.echo(f"applied {applied_now}")
+        else:
+            console.print(f"[green]applied:[/green] {applied_now}")
+    finally:
+        conn.close()
+
+
+@migrations_group.command("bootstrap")
+@click.option("--plain", is_flag=True)
+def migrations_bootstrap_cmd(plain: bool) -> None:
+    """Registra todas las migrations conocidas como aplicadas SIN correrlas.
+
+    Pensado para DBs preexistentes que ya tienen las columnas/índices que
+    las migrations harían (porque los `_migrate_*` legacy corrieron en
+    boots previos). Solo bootstrappea si la tabla está vacía.
+    """
+    from rag import migrations as _m  # noqa: PLC0415
+    conn = _migrations_open_conn()
+    try:
+        cur = _m.current_version(conn)
+        if cur > 0:
+            msg = f"history no vacía (version={cur}) — no bootstrap"
+            click.echo(msg) if plain else console.print(f"[yellow]{msg}[/yellow]")
+            return
+        # Forzamos aún si la heurística falla — el user pidió explícitamente.
+        # Pero si el DB no tiene rag_queries.trace_id, la app va a fallar
+        # en cuanto intente escribir; lo correcto sería primero `apply`.
+        # Acá simplemente registramos las versions sin correr el body.
+        from datetime import datetime as _dt, timezone as _tz
+        now = _dt.now(_tz.utc).isoformat(timespec="seconds")
+        registered: list[int] = []
+        for v, name, fn in _m.known_migrations():
+            try:
+                conn.execute(
+                    "INSERT OR IGNORE INTO rag_schema_migrations(version, name, applied_at, hash)"
+                    " VALUES(?, ?, ?, ?)",
+                    (v, name, now, _m._migration_hash(fn)),
+                )
+                registered.append(v)
+            except Exception:
+                continue
+        if plain:
+            click.echo(f"bootstrapped {registered}")
+        else:
+            console.print(f"[green]bootstrapped:[/green] {registered}")
+    finally:
+        conn.close()
 
 
 @cli.command("state")

@@ -840,3 +840,127 @@ def test_strip_drops_multiple_placeholder_sections():
     assert "📥 Sin procesar" not in out
     assert "🔍 Preguntas abiertas" not in out
     assert "🌅 Para mañana" not in out
+
+
+# ── _render_today_prompt — mood modulation ─────────────────────────────────
+
+
+def _mood_bucket(score: float, *, drifting: bool = False, trend: str = "stable",
+                 n_signals: int = 4):
+    """Helper: bucket mood con shape igual al que devuelve _correlate_mood."""
+    return {
+        "score": score,
+        "n_signals": n_signals,
+        "sources_used": ["spotify", "journal"],
+        "trend": trend,
+        "week_avg": -0.1,
+        "drift": {"drifting": drifting, "n_consecutive": 3 if drifting else 1,
+                  "avg_score": score},
+        "top_evidence": [],
+    }
+
+
+def test_prompt_no_mood_rule_when_bucket_absent():
+    """Sin bucket mood (feature off o daemon no corrió), no aparece
+    la regla #8."""
+    prompt = rag._render_today_prompt("2026-04-21", _ev_minimal())
+    assert "Modo prioridad reducida" not in prompt
+    assert "8. **" not in prompt
+
+
+def test_prompt_no_mood_rule_when_too_few_signals():
+    """Bucket presente pero n_signals < 2: NO aplicamos modulación
+    (1 señal no es suficiente como evidencia para cambiar tono)."""
+    extras = {"correlations": {
+        "people": [], "topics": [], "time_overlaps": [], "gaps": [],
+        "mood": _mood_bucket(score=-0.6, drifting=True, trend="declining",
+                             n_signals=1),
+    }}
+    prompt = rag._render_today_prompt("2026-04-21", _ev_minimal(), extras=extras)
+    assert "Modo prioridad reducida" not in prompt
+
+
+def test_prompt_low_mood_adds_priority_reduced_rule():
+    """Mood low (drifting) → regla #8 aparece con prohibición de
+    verbalizar mood + tope de prioridades."""
+    extras = {"correlations": {
+        "people": [], "topics": [], "time_overlaps": [], "gaps": [],
+        "mood": _mood_bucket(score=-0.6, drifting=True, trend="declining"),
+    }}
+    prompt = rag._render_today_prompt("2026-04-21", _ev_minimal(), extras=extras)
+    assert "8. **Modo prioridad reducida**" in prompt
+    assert "PROHIBIDO mencionar mood" in prompt
+    assert "MÁXIMO 2 cosas" in prompt
+    # Word budget reducido 30%.
+    assert "175 a 315 palabras" in prompt or "105 a 175 palabras" in prompt
+
+
+def test_prompt_low_mood_via_score_only():
+    """Score ≤ -0.4 (sin drift activo) también activa la regla."""
+    extras = {"correlations": {
+        "people": [], "topics": [], "time_overlaps": [], "gaps": [],
+        "mood": _mood_bucket(score=-0.45, drifting=False, trend="stable"),
+    }}
+    prompt = rag._render_today_prompt("2026-04-21", _ev_minimal(), extras=extras)
+    assert "Modo prioridad reducida" in prompt
+
+
+def test_prompt_high_mood_adds_normal_tone_rule():
+    """Score ≥ +0.4 + improving → regla #8 con instrucción de
+    NO halagar pero sí mencionar evidence positiva literal."""
+    extras = {"correlations": {
+        "people": [], "topics": [], "time_overlaps": [], "gaps": [],
+        "mood": _mood_bucket(score=+0.5, drifting=False, trend="improving"),
+    }}
+    prompt = rag._render_today_prompt("2026-04-21", _ev_minimal(), extras=extras)
+    assert "Tono normal" in prompt
+    assert "no agregues alabanzas" in prompt
+    assert "PROHIBIDO inferir mood" in prompt
+
+
+def test_prompt_stable_mood_no_extra_rule():
+    """Mood stable cerca de 0 + suficientes señales: NO aparece la
+    regla #8 (default normal behavior)."""
+    extras = {"correlations": {
+        "people": [], "topics": [], "time_overlaps": [], "gaps": [],
+        "mood": _mood_bucket(score=-0.05, drifting=False, trend="stable"),
+    }}
+    prompt = rag._render_today_prompt("2026-04-21", _ev_minimal(), extras=extras)
+    # Ni rule #8 low ni rule #8 high.
+    assert "Modo prioridad reducida" not in prompt
+    assert "8. **Tono normal**" not in prompt
+
+
+def test_prompt_low_mood_never_includes_score_or_evidence():
+    """Critical: el prompt NO contiene el float del score ni la palabra
+    'mood' como dato — esa es la regla de oro del feature (no verbalizar
+    al user, solo modular)."""
+    extras = {"correlations": {
+        "people": [], "topics": [], "time_overlaps": [], "gaps": [],
+        "mood": _mood_bucket(score=-0.65, drifting=True, trend="declining"),
+    }}
+    prompt = rag._render_today_prompt("2026-04-21", _ev_minimal(), extras=extras)
+    # El número del score NO aparece en el prompt.
+    assert "-0.65" not in prompt
+    assert "score:" not in prompt
+    # La palabra mood SOLO aparece en la PROHIBICIÓN (regla negativa),
+    # NO como label de un dato.
+    # Validamos que no haya un payload tipo "mood_score=" o similar.
+    assert "mood_score" not in prompt
+    assert "trend=declining" not in prompt
+    assert "drift=" not in prompt
+
+
+def test_prompt_low_mood_word_budget_reduced():
+    """Word budget reducido cuando mood low. Sin cross-source.
+    Default sin mood: '150 a 250 palabras'. Con mood low: '105 a 175'."""
+    # Sin mood, baseline.
+    base = rag._render_today_prompt("2026-04-21", _ev_minimal())
+    assert "150 a 250 palabras" in base
+    # Con mood low.
+    extras = {"correlations": {
+        "people": [], "topics": [], "time_overlaps": [], "gaps": [],
+        "mood": _mood_bucket(score=-0.5, drifting=False, trend="declining"),
+    }}
+    low = rag._render_today_prompt("2026-04-21", _ev_minimal(), extras=extras)
+    assert "105 a 175 palabras" in low

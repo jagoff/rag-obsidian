@@ -44697,9 +44697,62 @@ def _render_today_prompt(
         "evidencia manda — si la sección no tiene material concreto, "
         "OMITILA ENTERA (regla #4 de output).",
         "",
+    ]
+    # ── Regla #8 (mood-aware) — solo si tenemos bucket mood con datos
+    # reales. La idea es modular tono + cantidad de prioridades sin
+    # NUNCA verbalizar el score al usuario. Eso sería paternalista
+    # ("noté que estás triste") y violaría la confianza implícita del
+    # feature. El LLM solo recibe la INSTRUCCIÓN de cómo escribir, no
+    # un payload "mood_score=-0.6 trend=declining" para narrar.
+    mood_bucket = (extras.get("correlations") or {}).get("mood")
+    if mood_bucket and mood_bucket.get("n_signals", 0) >= 2:
+        score = mood_bucket.get("score", 0.0)
+        trend = mood_bucket.get("trend", "stable")
+        drifting = (mood_bucket.get("drift") or {}).get("drifting", False)
+        # Tres regímenes: low (drift activo o score muy bajo), high
+        # (improving claro), stable (default, no aplica regla extra).
+        is_low = drifting or score <= -0.4 or trend == "declining"
+        is_high = score >= 0.4 and trend == "improving"
+        if is_low:
+            parts8 = [
+                "8. **Modo prioridad reducida**. Priorizá MÁXIMO 2 cosas "
+                "concretas en `## 🌅 Para mañana` (en lugar de las 2-3 "
+                "habituales). Tono calmo + breve. Cero exceso de "
+                "engagement performativo. PROHIBIDO mencionar mood, "
+                "estado anímico, energía, ánimo, cansancio, frase tipo "
+                "\"venís cansado\", \"viste de bajón\", o cualquier "
+                "alusión a cómo te sentís — vos NO sos terapeuta. "
+                "PROHIBIDO sugerir 'tomate un día', 'descansá', "
+                "'respirá', 'hablalo con alguien'. Esas frases violan "
+                "la confianza del feature. Solo: data hard del día + "
+                "items críticos. Tope longitud 30% más corto que "
+                "default — los headers vacíos los omitís igual (regla "
+                "#7).",
+                "",
+            ]
+            parts.extend(parts8)
+        elif is_high:
+            parts8 = [
+                "8. **Tono normal** — no agregues alabanzas ni "
+                "celebraciones (\"¡qué buen día!\"). Cuando una "
+                "fuente concreta del bloque ENTIDADES CROSS-SOURCE "
+                "muestra evidencia positiva (ej. dormiste bien según "
+                "evidence de pillow, escuchaste artistas que "
+                "energizan según evidence de spotify), podés "
+                "MENCIONARLA LITERAL como observación factual — "
+                "NO como halago. PROHIBIDO inferir mood del usuario. "
+                "Igual que en cualquier brief: la evidencia manda.",
+                "",
+            ]
+            parts.extend(parts8)
+        # Si stable y score modesto, no agregamos regla #8 — el brief
+        # se comporta default. Pero registramos en el cross-source
+        # block que el feature está activo (no afecta tono).
+
+    parts.extend([
         "## CONTEXTO DEL DÍA",
         "",
-    ]
+    ])
     # ── ENTIDADES CROSS-SOURCE (pre-correlated en Python por
     # `rag.today_correlator`). Personas + temas que YA aparecen en ≥2
     # fuentes — no las tiene que descubrir el LLM. Esta sección va PRIMERA
@@ -44991,6 +45044,18 @@ def _render_today_prompt(
         "250 a 450 palabras" if has_cross_source
         else "150 a 250 palabras"
     )
+    # Mood low → reducir budget 30% (regla #8 ya pidió tono más corto;
+    # el budget hace que el LLM no se exceda igualmente).
+    _mood_bucket_for_budget = (extras.get("correlations") or {}).get("mood")
+    if _mood_bucket_for_budget and _mood_bucket_for_budget.get("n_signals", 0) >= 2:
+        _score = _mood_bucket_for_budget.get("score", 0.0)
+        _trend = _mood_bucket_for_budget.get("trend", "stable")
+        _drifting = (_mood_bucket_for_budget.get("drift") or {}).get("drifting", False)
+        if _drifting or _score <= -0.4 or _trend == "declining":
+            word_budget = (
+                "175 a 315 palabras" if has_cross_source
+                else "105 a 175 palabras"
+            )
     sections_hint = (
         f"## OUTPUT — formato (longitud total: {word_budget})\n\n"
         "Empezá tu respuesta con `## 🪞 Lo que pasó hoy`. Las secciones de "

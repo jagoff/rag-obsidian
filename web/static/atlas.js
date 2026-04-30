@@ -508,10 +508,11 @@ async function renderGraph(graph) {
   ro.observe(containerEl);
   state._resizeObs = ro;
 
-  // ZoomToFit + ángulo inicial 3D. Después del zoomToFit (que apunta de
-  // frente al centro, vista plana), inclinamos la cámara hacia arriba y
-  // un poco al costado para que el primer paint MUESTRE perspectiva 3D
-  // (desde un ángulo aéreo el ojo lee profundidad inmediatamente).
+  // ZoomToFit + ángulo inicial 3D + auto-rotate. Después del zoomToFit
+  // (que apunta de frente al centro, vista plana), inclinamos la cámara
+  // hacia arriba y al costado para que el primer paint MUESTRE perspectiva
+  // 3D. Cuando termina la transición (~1.8s), arrancamos el auto-rotate
+  // — el grafo orbita lento alrededor del eje Y como un planeta.
   setTimeout(() => {
     Graph.zoomToFit(900, 60);
     setTimeout(() => {
@@ -522,8 +523,96 @@ async function renderGraph(graph) {
         { x: 0, y: 0, z: 0 },
         1800
       );
+      // Esperamos a que termine la animación de la cámara antes de
+      // empezar la órbita, si no la pelea con el cameraPosition
+      // intermedio del flight.
+      setTimeout(() => startAutoRotate(), 2000);
     }, 1100);
   }, 1500);
+
+  // Pausar auto-rotate cuando el user interactúa con el canvas; reanudar
+  // después de 8s de inactividad. Listeners pasivos para no bloquear scroll.
+  const onUserInteraction = () => {
+    pauseAutoRotate();
+    scheduleResumeAutoRotate(8000);
+  };
+  containerEl.addEventListener("mousedown", onUserInteraction, { passive: true });
+  containerEl.addEventListener("wheel", onUserInteraction, { passive: true });
+  containerEl.addEventListener("touchstart", onUserInteraction, { passive: true });
+}
+
+// ── Auto-rotate de la cámara: physics-feel sin física real ─────────────
+//
+// Calculamos un orbit lento alrededor del eje Y manteniendo la altura y
+// el radio de la cámara constantes. requestAnimationFrame loop con dt
+// real para que la velocidad sea independiente del framerate. Pausa
+// cooperativa via state._autoRotatePaused — sale del loop cuando la
+// flag se prende, no hace polling.
+//
+// Por qué no usar `controls.autoRotate` de three.js: TrackballControls no
+// tiene esa property (solo OrbitControls). Implementarlo a mano nos
+// da control fino sobre la velocidad y la curva, además de poder
+// integrarlo con la pausa-en-interacción sin pelearse con los controls.
+
+function startAutoRotate() {
+  if (!state.graph3d) return;
+  if (state._autoRotateRaf) return;  // ya corriendo
+
+  state._autoRotatePaused = false;
+  let lastTs = null;
+  // Velocidad: 1 revolución cada ~60s (rotSpeed * 60_000ms ≈ 2π).
+  // Lento como un planeta — el ojo nota el 3D sin marearse.
+  const rotSpeed = (2 * Math.PI) / 60000;
+
+  const tick = (ts) => {
+    if (state._autoRotatePaused || !state.graph3d) {
+      state._autoRotateRaf = null;
+      return;
+    }
+    if (lastTs === null) lastTs = ts;
+    const dt = ts - lastTs;
+    lastTs = ts;
+
+    const cam = state.graph3d.cameraPosition();
+    const radius = Math.hypot(cam.x, cam.z);
+    const angle = Math.atan2(cam.z, cam.x) + dt * rotSpeed;
+    const newX = radius * Math.cos(angle);
+    const newZ = radius * Math.sin(angle);
+    state.graph3d.cameraPosition(
+      { x: newX, y: cam.y, z: newZ },
+      undefined,
+      0
+    );
+
+    state._autoRotateRaf = requestAnimationFrame(tick);
+  };
+  state._autoRotateRaf = requestAnimationFrame(tick);
+}
+
+function pauseAutoRotate() {
+  state._autoRotatePaused = true;
+  if (state._autoRotateRaf) {
+    cancelAnimationFrame(state._autoRotateRaf);
+    state._autoRotateRaf = null;
+  }
+}
+
+function scheduleResumeAutoRotate(delay) {
+  if (state._autoRotateResumeTimer) {
+    clearTimeout(state._autoRotateResumeTimer);
+  }
+  state._autoRotateResumeTimer = setTimeout(() => {
+    state._autoRotateResumeTimer = null;
+    // No reanudar si el user prendió pausa permanente o si hay una
+    // respuesta del ask-vault streameando (no queremos marear).
+    if (state._autoRotateUserPaused) return;
+    if (state._askInFlight) {
+      // Re-checkear cuando termine el ask.
+      scheduleResumeAutoRotate(2000);
+      return;
+    }
+    startAutoRotate();
+  }, delay || 8000);
 }
 
 // ─── Color accessors (re-evaluados en cada frame por 3d-force-graph) ────
@@ -975,6 +1064,11 @@ async function askVault(question) {
   if (btnText) btnText.hidden = true;
   if (btnSpin) btnSpin.hidden = false;
 
+  // Pausamos el auto-rotate mientras hay una respuesta en streaming —
+  // la cámara va a volar al cluster de fuentes y no queremos que la
+  // órbita la pelée.
+  pauseAutoRotate();
+
   // Limpiar cualquier filtro o selección previa para que el highlight
   // del ask sea claro.
   state.selectedNode = null;
@@ -1034,6 +1128,9 @@ async function askVault(question) {
       const cur = tEl.querySelector(".cursor");
       if (cur) cur.remove();
     }
+    // Reanudar auto-rotate después de 12s — le da tiempo al user a leer
+    // la respuesta antes de que la cámara empiece a moverse de nuevo.
+    scheduleResumeAutoRotate(12000);
   }
 }
 

@@ -3282,7 +3282,7 @@ def _summary_client() -> "_TimedOllamaProxy":
 
 
 def _helper_client() -> "_TimedOllamaProxy":
-    """Cached proxy with a 30s timeout for quick helper-model calls
+    """Cached proxy with a 60s timeout for quick helper-model calls
     (reformulate_query, expand_queries, _judge_sufficiency,
     _generate_synthetic_questions, HyDE). Monkey-patch-compatible — see
     _TimedOllamaProxy docstring.
@@ -3290,10 +3290,17 @@ def _helper_client() -> "_TimedOllamaProxy":
     Uses _HELPER_SEM to cap concurrent qwen2.5:3b calls and prevent
     ReadTimeout errors when multiple daemons (morning, anticipate,
     followup, chat) hit the helper simultaneously.
+
+    Bumped 30s → 60s tras audit 2026-04-30: con qwen2.5:7b + bge-reranker
+    pineados en MPS y `OLLAMA_MAX_LOADED_MODELS=2`, el helper qwen2.5:3b
+    sufre unload/reload bajo presión y el cold-load tarda 30+s en CPU. El
+    timeout viejo timeaba EN el borde, generando ~85 ReadTimeout/24h aún
+    con el retry de `reformulate_query`. 60s da headroom para cold-load
+    sin enmascarar latencia real (queries normales tardan <500ms).
     """
     global _HELPER_CLIENT
     if _HELPER_CLIENT is None:
-        _HELPER_CLIENT = _TimedOllamaProxy(timeout=30.0, semaphore=_HELPER_SEM)
+        _HELPER_CLIENT = _TimedOllamaProxy(timeout=60.0, semaphore=_HELPER_SEM)
     return _HELPER_CLIENT
 
 

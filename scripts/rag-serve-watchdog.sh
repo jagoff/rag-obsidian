@@ -38,8 +38,13 @@ set -u
 
 URL="${RAG_SERVE_HEALTH_URL:-http://127.0.0.1:7832/health}"
 TIMEOUT="${RAG_SERVE_HEALTH_TIMEOUT:-3}"
-FAIL_THRESHOLD="${RAG_SERVE_FAIL_THRESHOLD:-2}"
-COOLDOWN_SEC="${RAG_SERVE_COOLDOWN_SEC:-300}"
+# FAIL_THRESHOLD subido de 2→8 el 2026-04-30 después de un episodio donde
+# el warmup en frío (bge-m3 + BM25 corpus + qwen2.5:7b) tardaba ~5min y el
+# watchdog mataba el proceso justo antes de que termine, generando un loop
+# de 8 restarts en 30min. 8 ticks × 60s = 8min de paciencia antes de
+# considerar un restart. El cooldown subió en paralelo (300→900).
+FAIL_THRESHOLD="${RAG_SERVE_FAIL_THRESHOLD:-8}"
+COOLDOWN_SEC="${RAG_SERVE_COOLDOWN_SEC:-900}"
 LABEL="com.fer.obsidian-rag-serve"
 
 UID_VAL="$(id -u)"

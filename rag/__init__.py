@@ -2873,11 +2873,16 @@ def is_excluded(rel_path: str) -> bool:
     if rel_path.startswith("00-Inbox/conversations/"):
         return True
     # Consolidated episodic-memory originals (Phase 2). The consolidator
-    # moves files from the conversations folder to `04-Archive/conversations/
-    # YYYY-MM/` after promoting a cluster to PARA. Without this exclusion
-    # the archived raw conversations leak back into retrieval and compete
-    # with the curated consolidated note — same feedback loop we avoided
-    # at the inbox stage.
+    # moves files from the conversations folder to
+    # `04-Archive/99-obsidian-system/99-AI/_archive/conversations/YYYY-MM/`
+    # after promoting a cluster to PARA. Esa ruta ya queda excluida por
+    # el prefix general `04-Archive/99-obsidian-system/` de arriba, pero
+    # mantenemos este check específico para archivos legacy que vivan
+    # todavía en la ruta vieja `04-Archive/conversations/` (pre-2026-04-30,
+    # cuando el archive estaba fuera del paraguas `99-obsidian-system/`
+    # — ver `scripts/consolidate_conversations.py` para el contexto del
+    # rename). Sin esta exclusión los archived raw conversations leakean
+    # de vuelta a retrieval y compiten con la consolidated note curada.
     if rel_path.startswith("04-Archive/conversations/"):
         return True
     # 03-Resources/WhatsApp/<chat>/<YYYY-MM>.md: monthly roll-up files

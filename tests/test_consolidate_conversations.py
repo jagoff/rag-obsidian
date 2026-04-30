@@ -6,7 +6,8 @@ Covers the pure-Python pieces end-to-end without touching ollama:
   - classify_target_folder distinguishes project vs resource
   - promote() + archive_originals() + render frontmatter + wikilinks
   - _unique_path collision handling
-  - is_excluded gates 04-Archive/conversations/
+  - is_excluded gates 04-Archive/99-obsidian-system/99-AI/_archive/conversations/
+    (path nuevo) y la ruta legacy 04-Archive/conversations/ (defense-in-depth)
   - run() end-to-end with monkeypatched embed + synthesise
 """
 from __future__ import annotations
@@ -250,7 +251,7 @@ def test_promote_writes_frontmatter_and_origin_wikilinks(tmp_vault: Path):
     assert "Body de prueba con [[Coaching]]." in text
     # Archive wikilinks present
     assert "## Conversaciones originales" in text
-    assert "[[04-Archive/conversations/" in text
+    assert "[[04-Archive/99-obsidian-system/99-AI/_archive/conversations/" in text
     # Sources referenciadas
     assert "[[02-Areas/Foo]]" in text
     assert "[[02-Areas/Bar]]" in text
@@ -266,8 +267,8 @@ def test_archive_moves_originals_into_monthly_folder(tmp_vault: Path):
     assert len(moved) == 2
     for m in moved:
         assert m.exists()
-        # Under 04-Archive/conversations/YYYY-MM/
-        assert "04-Archive/conversations" in str(m)
+        # Under 04-Archive/99-obsidian-system/99-AI/_archive/conversations/YYYY-MM/
+        assert "04-Archive/99-obsidian-system/99-AI/_archive/conversations" in str(m)
     # Originals gone
     assert not p1.exists()
     assert not p2.exists()
@@ -290,6 +291,17 @@ def test_unique_path_returns_candidate_if_free(tmp_vault: Path):
 # ── Index exclusion ───────────────────────────────────────────────────────
 
 def test_is_excluded_covers_archived_conversations():
+    # Nuevo path post-2026-04-30: archive vive bajo `99-obsidian-system/99-AI/_archive/`
+    # — queda excluido por el prefix general `04-Archive/99-obsidian-system/`
+    # (no por la rama defensiva legacy).
+    assert rag.is_excluded(
+        "04-Archive/99-obsidian-system/99-AI/_archive/conversations/2026-04/foo.md"
+    ) is True
+    assert rag.is_excluded(
+        "04-Archive/99-obsidian-system/99-AI/_archive/conversations/2025-12/bar.md"
+    ) is True
+    # Path legacy pre-2026-04-30: rama defensiva específica para archivos
+    # que el user no haya migrado todavía.
     assert rag.is_excluded("04-Archive/conversations/2026-04/foo.md") is True
     assert rag.is_excluded("04-Archive/conversations/2025-12/bar.md") is True
     # Sibling archive folders stay indexed

@@ -66,14 +66,21 @@
         console.warn("[pwa] SW register failed:", err);
       });
 
-    // Cuando el SW activo cambia (post skipWaiting), el próximo reload
-    // usa el shell nuevo. Podríamos auto-reload acá pero es agresivo;
-    // dejamos que el user refresque cuando quiera.
-    //
-    // Opcional: descomentar si queremos refresh forzado post-deploy:
-    // navigator.serviceWorker.addEventListener("controllerchange", () => {
-    //   window.location.reload();
-    // });
+    // Auto-reload cuando el SW activo cambia (post skipWaiting) — el
+    // browser ya tiene el shell nuevo cacheado, recargamos para que el
+    // user vea los assets actualizados sin tener que refrescar a mano.
+    // El comentario previo decía "es agresivo, dejamos que el user
+    // refresque cuando quiera" — pero esto causaba bugs invisibles:
+    // fixes deployados al frontend no llegaban al user que tenía la
+    // tab abierta porque el JS viejo seguía corriendo aunque el shell
+    // ya estuviera actualizado en cache. Mejor un reload silencioso
+    // (~200ms) que dejar fixes sin propagar.
+    let _swRefreshing = false;
+    navigator.serviceWorker.addEventListener("controllerchange", () => {
+      if (_swRefreshing) return;
+      _swRefreshing = true;
+      window.location.reload();
+    });
   });
 
   // ── iOS add-to-home-screen hint ────────────────────────────────────

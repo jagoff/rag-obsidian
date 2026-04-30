@@ -32,7 +32,7 @@
 
 // Bump cuando cambie el shell / la estrategia. El activate handler borra
 // todo cache que no matchee esta versión, así no se acumulan huérfanos.
-const CACHE_VERSION = "rag-pwa-v30-2026-04-30-network-first-shell";
+const CACHE_VERSION = "rag-pwa-v31-2026-04-30-force-reload-on-update";
 const SHELL_CACHE = `${CACHE_VERSION}-shell`;
 const STATIC_CACHE = `${CACHE_VERSION}-static`;
 
@@ -95,6 +95,20 @@ self.addEventListener("activate", (event) => {
         names
           .filter((n) => !n.startsWith(CACHE_VERSION))
           .map((n) => caches.delete(n))
+      );
+
+      // Forzar reload de las tabs ya abiertas. Necesario cuando el SW
+      // anterior no tenía el `controllerchange` listener (deploys
+      // pre-v31): el JS cargado de esas tabs no sabe que el SW se
+      // actualizó, y a menos que el user refresque manualmente, sigue
+      // corriendo con assets stale. `client.navigate(client.url)` lo
+      // recarga desde el SW directamente. Wrap en try/catch porque
+      // navigate() puede rebotar si la URL cambió mid-flight (rarísimo).
+      const wins = await self.clients.matchAll({ type: "window" });
+      await Promise.all(
+        wins.map(async (win) => {
+          try { await win.navigate(win.url); } catch (_) {}
+        })
       );
     })()
   );

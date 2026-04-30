@@ -678,23 +678,69 @@ Total estimado: ~560 LOC prod + ~530 LOC tests + ~150 prose docs.
 
 ---
 
-## Fase 2 (NO ejecutada ahora)
+## Fase 2 (✅ COMPLETED 2026-04-29)
 
-### 2.A — Feedback loop
-El listener de WhatsApp (whatsapp-listener proyecto separado) detecta replies tipo `👍`/`👎`/`🔇` a mensajes que tengan el prefix de anticipate (ej. emoji 📅🔮⏰ + `dedup_key` en header oculto). Escribe a tabla `rag_anticipate_feedback` que incluye `dedup_key + rating`. Un scorer nuevo penaliza kinds con rating negativo acumulado.
+Phase 2 convierte el agent de "manda según pesos hardcoded" a "aprende del user
+y se ajusta solo". Sub-features 2.A, 2.B, 2.D wireadas; 2.C (voice brief) ya
+quedó shipiado en una sesión separada (`rag/voice_brief.py`, ver
+[`docs/voice-brief.md`](../docs/voice-brief.md)).
 
-### 2.B — Quiet hours contextuales
-- Nocturno: 22h → 8h default → no push excepto calendar crítico (<20min)
-- "En reunión": si `_fetch_calendar_today()` muestra evento AHORA → diferir push 15min post-evento
-- `rag state focus-code` → silent por TTL del state
+### 2.A — Feedback loop ✅
+- Módulo: [`rag_anticipate/feedback_tuning.py`](../rag_anticipate/feedback_tuning.py)
+- Función pública: `compute_kind_threshold_adjustment(kind: str) -> float`.
+- Heurística: ratio mute/(mute+positive) en 30d. >0.5 con ≥3 mutes → +delta
+  (más estricto). <0.2 con ≥3 positives → -delta (más permisivo). Cap a ±0.2.
+- Cache 1h en memoria (`_CACHE_TTL_SECONDS=3600`); reset_cache() para tests.
+- Wire-up en `anticipate_run_impl`: `score >= _ANTICIPATE_MIN_SCORE + delta(kind)`.
+- Default ON. Kill-switch: `RAG_ANTICIPATE_FEEDBACK_TUNING=0`.
+- Silent-fail: cualquier excepción del query (DB lock, schema corrupto) → 0.
+- CLI: `rag anticipate feedback stats [--days 30] [--plain]`.
+- Tests: T1-T4 + disabled-via-env en `tests/test_anticipate_phase2.py`.
 
-### 2.C — Voice brief matinal
-- `morning` ya genera brief. Nuevo: reproducirlo vía TTS (`/api/tts` ya existe) + enviar audio file a WA en lugar de texto.
-- Hace el brief consumible sin mirar pantalla (manejando, auriculares).
+### 2.B — Quiet hours contextuales ✅
+- Módulo: [`rag_anticipate/quiet_hours.py`](../rag_anticipate/quiet_hours.py)
+- API nueva: `is_in_quiet_hours(now=None) -> tuple[bool, str | None]`.
+- Reasons (machine-readable): `"nighttime"` / `"in_meeting"` / `"focus_code"`.
+- Env vars:
+  - `RAG_QUIET_HOURS_NIGHTTIME=23-7` (default `23-7`, hard rule, wrap-around).
+  - `RAG_QUIET_HOURS_MEETINGS=1` (default ON).
+  - `RAG_QUIET_HOURS_FOCUS_CODE=0` (default OFF — heurística experimental
+    `pgrep -lf "Code Helper|cursor|nvim|vim|jetbrains|..." + ps -o etime` con
+    threshold 120s).
+- Wire-up en `anticipate_run_impl`: si `is_in_quiet_hours(now)` y no es
+  `force/dry_run` → log selected=1/sent=0 + return `skip_reason="quiet_hours: <reason>"`.
+- Bypass total: `RAG_ANTICIPATE_BYPASS_QUIET=1`. Conftest global lo setea
+  por default para evitar flakes nocturnos en CI.
+- API legacy `is_quiet_now` se mantiene intacta para no romper tests Phase 1.
+- CLI: `rag anticipate quiet-hours status`.
+- Tests: T5, T6 + meeting-active en `tests/test_anticipate_phase2.py` +
+  cobertura full de la API legacy en `tests/test_anticipate_quiet_hours.py`.
 
-### 2.D — User-configurable weights
-- CLI `rag anticipate weights --kind anticipate-echo --weight 0.5` ajusta boost per-kind
-- Persist en `~/.local/share/obsidian-rag/anticipate_weights.json`
+### 2.C — Voice brief matinal ✅ (shipped en otra sesión)
+- Módulo: `rag/voice_brief.py` (no tocado en esta sesión, ver commits previos).
+
+### 2.D — User-configurable weights ✅
+- Módulo: [`rag_anticipate/kind_weights.py`](../rag_anticipate/kind_weights.py).
+- Tabla SQL nueva: `rag_anticipate_kind_weights(kind PK, weight REAL, last_updated TEXT)`.
+  DDL on-demand desde el módulo (no toca `rag/__init__.py`).
+- Range cap: `[0.0, 5.0]` por weight; producto `score * weight` clamea a `[0, 1]`.
+- Wire-up en `anticipate_run_impl`: re-buildar cada candidate con
+  `score *= apply_kind_weight(kind, score)` antes de loguear + filter.
+- Fallback al JSON legacy [`rag_anticipate/weights.py`](../rag_anticipate/weights.py)
+  cuando no hay row SQL para el kind — Phase 1 sigue funcionando.
+- Default OFF (no hay overrides hasta que el user los seté con CLI).
+- CLI: `rag anticipate weights {set, list, reset --kind X}`.
+- Tests: T7, T8 + CLI list-empty en `tests/test_anticipate_phase2.py`.
+
+### Fixture global de conftest
+
+Phase 2.B agrega un autouse fixture en [`tests/conftest.py`](../tests/conftest.py)
+(`_bypass_anticipate_quiet_hours`) que setea `RAG_ANTICIPATE_BYPASS_QUIET=1`
+por default. Sin él, los tests existentes de `test_anticipate_agent.py` que
+ejercen el happy path con `dry_run=False` rompen cuando la suite corre durante
+horario nocturno (ej. CI a las 3 a.m.). Tests que ejercen explícitamente la
+lógica de quiet hours hacen `monkeypatch.delenv` para deshacer el bypass en
+su scope.
 
 ---
 

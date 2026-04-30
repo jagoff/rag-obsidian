@@ -19827,6 +19827,71 @@ def system_metrics_api(hours: int = 24) -> dict:
     return {"hours": hours, "cpu": cpu_rows, "memory": mem_rows}
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# ── Vault health card (rag-vault-health agent, 2026-04-29) ──────────────
+# ─────────────────────────────────────────────────────────────────────────
+#
+# Endpoint que alimenta la card "Vault health" del dashboard. La lógica
+# de cálculo vive en `rag.vault_health` para que el endpoint sea un
+# wrapper fino y la lógica sea testeable sin levantar FastAPI.
+#
+# Cache: 5min TTL en memoria (módulo `rag.vault_health`). Llamadas
+# concurrentes dentro de la ventana retornan el mismo dict sin re-pegarle
+# a SQL. Ver `rag/vault_health.py:_compute` para la implementación.
+#
+# Fail-safe: cualquier excepción se atrapa acá y se devuelve un JSON
+# parseable con `score=null` + `error` poblado, HTTP 200. El frontend
+# tiene que poder parsear siempre sin crashear.
+#
+# Off switch: `OBSIDIAN_RAG_VAULT_HEALTH=0` deshabilita el cálculo (el
+# módulo retorna `{score: null, error: "disabled"}`). Útil si el cómputo
+# resulta caro contra un vault gigante.
+
+@app.get("/api/vault/health")
+def vault_health_api() -> dict:
+    """Health score 0-100 del vault del usuario.
+
+    Output (siempre HTTP 200, incluso en fallas):
+        {
+          "score": int | null,                     # null si error/disabled
+          "components": {
+              "tags_pct": int, "backlinks_pct": int,
+              "orphans": int, "contradictions": int,
+              "dupes": int, "dead_notes": int,
+              "total_notes": int,
+              "sub_scores": {key: float, ...},
+              "descriptions": {key: str, ...},
+          },
+          "weights":         {key: float, ...},   # pesos del weighted sum
+          "last_calculated": "ISO ts",
+          "ttl_seconds":     300,
+          "error":           null | "<msg>",
+        }
+    """
+    try:
+        from rag.vault_health import compute_vault_health  # noqa: PLC0415
+        return compute_vault_health()
+    except Exception as exc:
+        # Defensa de último recurso — el módulo NUNCA debería raisear,
+        # pero el endpoint promete HTTP 200 + JSON parseable a la UI.
+        try:
+            from rag.vault_health import WEIGHTS as _W  # noqa: PLC0415
+            weights = dict(_W)
+        except Exception:
+            weights = {}
+        return {
+            "score":           None,
+            "components":      {},
+            "weights":         weights,
+            "last_calculated": datetime.now().isoformat(timespec="seconds"),
+            "ttl_seconds":     300,
+            "error":           f"{type(exc).__name__}: {exc}",
+        }
+
+
+# ── Fin Vault health card ───────────────────────────────────────────────
+
+
 if __name__ == "__main__":
     import uvicorn
     # Bind host: default 127.0.0.1 (localhost-only, el estándar). Para

@@ -291,6 +291,26 @@ def _disable_semantic_response_cache(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _bypass_anticipate_quiet_hours(monkeypatch):
+    """Phase 2.B (2026-04-29): el orchestrator `anticipate_run_impl`
+    ahora tiene un gate global de quiet hours (`is_in_quiet_hours`)
+    que bloquea el push si es nighttime / hay meeting / focus_code.
+
+    Sin bypass, los tests de `test_anticipate_agent.py` que ejercen el
+    happy path con `dry_run=False` rompen cuando la suite corre durante
+    horario nocturno (ej. CI a las 3am). La env var
+    `RAG_ANTICIPATE_BYPASS_QUIET=1` también shortcircuitea la API legacy
+    `is_quiet_now`, así que es el escape hatch consistente.
+
+    Tests específicos de quiet hours (`test_anticipate_quiet_hours.py`,
+    `test_anticipate_phase2.py`) usan su propio autouse fixture que
+    hace `delenv` para deshacer este override en su scope.
+    """
+    monkeypatch.setenv("RAG_ANTICIPATE_BYPASS_QUIET", "1")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _disable_incremental_tune_trigger(monkeypatch):
     """B6 (2026-04-29): `record_feedback` triggers an incremental tune
     via `_maybe_trigger_incremental_tune` when ≥10 feedbacks pile up

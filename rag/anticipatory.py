@@ -515,6 +515,30 @@ _ANTICIPATE_SIGNALS: tuple[tuple[str, "Callable[[datetime], list[AnticipatoryCan
 )
 
 
+def _phase2_apply_kind_weight(kind: str, score: float) -> float:
+    """Phase 2.D wire-up: multiplica `score` por el weight per-kind
+    (default 1.0). Silent-fail si el módulo no carga (tests aislados,
+    schema corrupto): retorna `score` sin tocar."""
+    try:
+        from rag_anticipate.kind_weights import apply_kind_weight
+        return apply_kind_weight(kind, score)
+    except Exception:
+        return score
+
+
+def _phase2_kind_threshold(kind: str) -> float:
+    """Phase 2.A wire-up: threshold base + delta per-kind del feedback
+    tuning. Silent-fail al threshold base si el módulo no carga."""
+    try:
+        from rag_anticipate.feedback_tuning import (
+            compute_kind_threshold_adjustment,
+        )
+        delta = compute_kind_threshold_adjustment(kind)
+    except Exception:
+        delta = 0.0
+    return float(_ANTICIPATE_MIN_SCORE) + float(delta)
+
+
 def anticipate_run_impl(
     *, dry_run: bool = False, explain: bool = False, force: bool = False,
     now: datetime | None = None,
@@ -523,9 +547,19 @@ def anticipate_run_impl(
         - selected: dict del candidate elegido (o None)
         - sent: bool — si proactive_push lo envió de verdad
         - all: list[dict] de TODOS los candidates (para tests + --explain)
+        - skip_reason: si no se envió, motivo (quiet hours, no viable, etc.)
 
     `force=True` bypassa dedup + daily_cap (debug/manual). `dry_run=True`
     evalúa + loguea pero NO empuja a WA.
+
+    Phase 2 changes (2026-04-29):
+      - Aplica `apply_kind_weight(kind, score)` antes de filtrar por
+        threshold (Phase 2.D, weights configurables).
+      - Aplica `compute_kind_threshold_adjustment(kind)` para subir/bajar
+        el threshold según feedback acumulado del user (Phase 2.A).
+      - Gate global de `is_in_quiet_hours(now)` antes de pushear; si
+        retorna `(True, reason)` no se envía y se setea
+        `skip_reason="quiet_hours: <reason>"` (Phase 2.B).
     """
     # Resolve via `rag` so tests can monkeypatch.setattr(rag, "_ANTICIPATE_SIGNALS", ...)
     # and (rag, "_anticipate_dedup_seen", ...) and (rag, "proactive_push", ...).
@@ -541,6 +575,26 @@ def anticipate_run_impl(
         except Exception as exc:
             _silent_log(f"anticipate_signal_{label}_failed", exc)
 
+    # Phase 2.D: apply per-kind weight to score IN-PLACE (re-build
+    # candidates with weighted score). The weight defaults to 1.0 when
+    # no override is configured, so this is a no-op for users who
+    # haven't tuned anything.
+    weighted_candidates: list[AnticipatoryCandidate] = []
+    for c in all_candidates:
+        weighted_score = _phase2_apply_kind_weight(c.kind, c.score)
+        if weighted_score == c.score:
+            weighted_candidates.append(c)
+        else:
+            weighted_candidates.append(AnticipatoryCandidate(
+                kind=c.kind,
+                score=weighted_score,
+                message=c.message,
+                dedup_key=c.dedup_key,
+                snooze_hours=c.snooze_hours,
+                reason=f"{c.reason} | weight*={weighted_score / max(c.score, 1e-9):.2f}",
+            ))
+    all_candidates = weighted_candidates
+
     # Log all (selected=False, sent=False inicialmente).
     for c in all_candidates:
         try:
@@ -551,9 +605,11 @@ def anticipate_run_impl(
     if not all_candidates:
         return {"selected": None, "sent": False, "all": []}
 
+    # Phase 2.A: el threshold ya no es global; sube/baja per-kind según
+    # la ratio de mute/positive del user. Default 0 si no hay feedback.
     viable = [
         c for c in all_candidates
-        if c.score >= _ANTICIPATE_MIN_SCORE
+        if c.score >= _phase2_kind_threshold(c.kind)
         and (force or not _rag._anticipate_dedup_seen(c.dedup_key))
     ]
     viable.sort(key=lambda c: c.score, reverse=True)
@@ -567,6 +623,29 @@ def anticipate_run_impl(
     top = viable[0]
     sent = False
     skip_reason: str | None = None
+
+    # Phase 2.B: quiet hours gate. Si estamos en horario "no molestar"
+    # no se envía pero igual logueamos el candidate como `selected=True,
+    # sent=False` para que `rag anticipate log` lo muestre.
+    if not dry_run and not force:
+        try:
+            from rag_anticipate.quiet_hours import is_in_quiet_hours
+            quiet, reason = is_in_quiet_hours(now)
+        except Exception as exc:
+            _silent_log("anticipate_quiet_hours", exc)
+            quiet, reason = False, None
+        if quiet:
+            try:
+                _anticipate_log_candidate(top, selected=True, sent=False)
+            except Exception as exc:
+                _silent_log("anticipate_log_selected", exc)
+            return {
+                "selected": _anticipate_candidate_to_dict(top),
+                "sent": False,
+                "skip_reason": f"quiet_hours: {reason}",
+                "all": [_anticipate_candidate_to_dict(c) for c in all_candidates],
+            }
+
     if not dry_run:
         try:
             # Pasamos `dedup_key` para que `proactive_push` sufije el body
@@ -744,3 +823,181 @@ def anticipate_explain_cmd():
         f"\n[dim]Threshold actual: {_ANTICIPATE_MIN_SCORE:.2f}. "
         f"Override con RAG_ANTICIPATE_MIN_SCORE.[/dim]"
     )
+
+
+# ── Phase 2 CLI subcommands ──────────────────────────────────────────────────
+# `feedback stats`, `quiet-hours status`, `weights {set, list, reset}`.
+# Cada uno delega al módulo correspondiente en `rag_anticipate.*` y
+# renderiza vía Rich. Todos importan deferred — si los módulos no están
+# disponibles (env no instalado, schema corrupto), el import-time del CLI
+# no se rompe y solo el subcomando específico falla con un mensaje claro.
+
+
+@anticipate.group("feedback")
+def anticipate_feedback_group():
+    """Feedback loop del agent (Phase 2.A) — engagement del user.
+
+    Subcomandos:
+      stats   Distribución mute/positive/negative por kind + delta del threshold.
+    """
+
+
+@anticipate_feedback_group.command("stats")
+@click.option("--days", type=int, default=30,
+                help="Ventana hacia atrás en días (default 30).")
+@click.option("--plain", is_flag=True,
+                help="Output sin tabla Rich (1 línea per kind, parseable).")
+def anticipate_feedback_stats(days: int, plain: bool):
+    """Distribución de feedback por kind con delta de threshold computed."""
+    from rag_anticipate.feedback_tuning import all_kinds_feedback_summary
+    summaries = all_kinds_feedback_summary()
+    if not summaries:
+        console.print(
+            "[dim]sin feedback registrado todavía. "
+            "El user empieza a reaccionar con 👍/👎/🔇 a los pushes "
+            "y este comando va a mostrar la distribución.[/dim]"
+        )
+        return
+
+    if plain:
+        for s in summaries:
+            console.print(
+                f"{s['kind']}\tpos={s['positive']}\tneg={s['negative']}\t"
+                f"mute={s['mute']}\tratio={s['mute_ratio']:.2f}\t"
+                f"delta={s['delta']:+.2f}"
+            )
+        return
+
+    from rich.table import Table
+    t = Table(title=f"Feedback por kind (últimos {days} días)")
+    t.add_column("kind")
+    t.add_column("positive", justify="right")
+    t.add_column("negative", justify="right")
+    t.add_column("mute", justify="right")
+    t.add_column("total", justify="right")
+    t.add_column("mute_ratio", justify="right")
+    t.add_column("Δ threshold", justify="right")
+    for s in summaries:
+        delta = s["delta"]
+        delta_str = f"{delta:+.2f}"
+        if delta > 0:
+            delta_str = f"[red]{delta_str}[/red]"  # más estricto = menos volumen
+        elif delta < 0:
+            delta_str = f"[green]{delta_str}[/green]"  # más volumen
+        t.add_row(
+            s["kind"],
+            str(s["positive"]),
+            str(s["negative"]),
+            str(s["mute"]),
+            str(s["total"]),
+            f"{s['mute_ratio']:.2f}",
+            delta_str,
+        )
+    console.print(t)
+    console.print(
+        f"\n[dim]Threshold base: {_ANTICIPATE_MIN_SCORE:.2f}. "
+        f"Δ se suma al base por kind. "
+        f"Disable con RAG_ANTICIPATE_FEEDBACK_TUNING=0.[/dim]"
+    )
+
+
+@anticipate.group("quiet-hours")
+def anticipate_quiet_hours_group():
+    """Quiet hours del agent (Phase 2.B) — gate de no-molestar.
+
+    Subcomandos:
+      status   Muestra si AHORA estás en quiet hours y por qué.
+    """
+
+
+@anticipate_quiet_hours_group.command("status")
+def anticipate_quiet_hours_status():
+    """Imprime el estado actual del gate quiet hours."""
+    from datetime import datetime as _dt
+    from rag_anticipate.quiet_hours import is_in_quiet_hours
+    now = _dt.now()
+    quiet, reason = is_in_quiet_hours(now)
+    if quiet:
+        console.print(
+            f"[yellow]🤫 quiet hours[/yellow] @ {now.strftime('%H:%M:%S')} — "
+            f"reason: [bold]{reason}[/bold]"
+        )
+        if reason == "nighttime":
+            band = os.environ.get("RAG_QUIET_HOURS_NIGHTTIME", "23-7")
+            console.print(f"   ventana nocturna: {band} (override con RAG_QUIET_HOURS_NIGHTTIME)")
+        elif reason == "in_meeting":
+            console.print("   evento de calendario en curso (icalBuddy)")
+        elif reason == "focus_code":
+            console.print(
+                "   proceso IDE recién abierto (<2 min). "
+                "Disable con RAG_QUIET_HOURS_FOCUS_CODE=0"
+            )
+    else:
+        console.print(
+            f"[green]✓ open[/green] @ {now.strftime('%H:%M:%S')} — "
+            f"el agent puede pushear ahora."
+        )
+    bypass = os.environ.get("RAG_ANTICIPATE_BYPASS_QUIET", "").strip().lower()
+    if bypass in ("1", "true", "yes", "on"):
+        console.print("[dim](bypass activo: RAG_ANTICIPATE_BYPASS_QUIET=1)[/dim]")
+
+
+@anticipate.group("weights")
+def anticipate_weights_group():
+    """Multiplicadores per-kind del score base (Phase 2.D).
+
+    Subcomandos:
+      set     Set/update el weight de un kind.
+      list    Lista todos los overrides configurados.
+      reset   Borra el override de un kind (vuelve al default 1.0).
+    """
+
+
+@anticipate_weights_group.command("set")
+@click.option("--kind", required=True,
+                help="Ej. anticipate-calendar, anticipate-echo, anticipate-commitment")
+@click.option("--weight", type=float, required=True,
+                help="Float ∈ [0.0, 5.0]. 1.0 = no-op. <1 desprioriza, >1 prioriza.")
+def anticipate_weights_set_cmd(kind: str, weight: float):
+    """UPSERT del weight de `kind` en SQL (Phase 2.D)."""
+    from rag_anticipate.kind_weights import set_kind_weight
+    if not set_kind_weight(kind, weight):
+        console.print(
+            f"[red]error[/red]: weight {weight} fuera de rango [0.0, 5.0] "
+            f"o write a SQL falló para kind={kind!r}."
+        )
+        raise SystemExit(2)
+    console.print(f"[green]✓[/green] {kind} → weight {weight:.2f}")
+
+
+@anticipate_weights_group.command("list")
+def anticipate_weights_list_cmd():
+    """Tabla de todos los overrides configurados."""
+    from rag_anticipate.kind_weights import list_kind_weights
+    rows = list_kind_weights()
+    if not rows:
+        console.print(
+            "[dim]sin overrides — todos los kinds usan weight 1.0 (default).[/dim]\n"
+            "Set con: [bold]rag anticipate weights set --kind <X> --weight <W>[/bold]"
+        )
+        return
+    from rich.table import Table
+    t = Table(title=f"kind weights overrides ({len(rows)})")
+    t.add_column("kind")
+    t.add_column("weight", justify="right")
+    t.add_column("last_updated")
+    for r in rows:
+        t.add_row(r["kind"], f"{r['weight']:.2f}", r["last_updated"])
+    console.print(t)
+
+
+@anticipate_weights_group.command("reset")
+@click.option("--kind", required=True,
+                help="Kind cuyo weight querés borrar (vuelve a default 1.0).")
+def anticipate_weights_reset_cmd(kind: str):
+    """Borra el override del kind. Idempotente — si no había, igual OK."""
+    from rag_anticipate.kind_weights import reset_kind_weight
+    if not reset_kind_weight(kind):
+        console.print(f"[red]error[/red]: write falló para kind={kind!r}")
+        raise SystemExit(2)
+    console.print(f"[green]✓[/green] {kind} → weight reset a 1.0 (default)")

@@ -273,6 +273,7 @@ async function load(showSkeleton) {
       memInit();
       cpuInit();
       waInit();
+      vhInit();
     }
     refresh(d);
     announceStatus(`Datos del dashboard actualizados (${d.kpis.total_queries} queries en ${state.days} días)`);
@@ -419,6 +420,19 @@ function buildLayout(d) {
       </div>
     </section>
     <section class="health" id="health" aria-label="Salud del sistema"></section>
+
+    <section class="chart-card wide" id="card-vault-health" aria-labelledby="sec-vault-health">
+      <div class="vh-head">
+        <h2 id="sec-vault-health" style="margin-bottom:0">Vault health <span class="vh-meta" id="vh-meta">—</span></h2>
+        <div class="vh-actions">
+          <span class="vh-meta" id="vh-updated"></span>
+          <button type="button" class="vh-refresh" id="vh-refresh" title="Recalcular ahora (igual al auto-refresh cada 5 minutos)" aria-label="Recalcular vault health">↻</button>
+        </div>
+      </div>
+      <div id="vh-body">
+        <div class="vh-empty">cargando…</div>
+      </div>
+    </section>
 
     <div class="charts">
       <section class="chart-card wide" id="card-memory" aria-labelledby="sec-memory">
@@ -2408,4 +2422,172 @@ function waIsoToLocalInput(iso) {
 function waDateToLocalInput(d) {
   const pad = (n) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────
+// ── Vault health card (rag-vault-health agent, 2026-04-29) ──────────────
+// ─────────────────────────────────────────────────────────────────────────
+//
+// Card que consume `/api/vault/health`. Es independiente del polling de
+// `/api/dashboard` — tiene su propio loop de auto-refresh cada 5min
+// (matchea el TTL del cache server-side, no tiene sentido pegarle más
+// seguido). El botón ↻ fuerza un fetch inmediato saltando el throttle
+// cliente, pero el server sigue respetando su TTL: cuando ya hay un
+// resultado fresco, devuelve el mismo dict cacheado en <1ms.
+//
+// Cero frameworks reactivos: lo build-eamos a mano por consistencia con
+// el resto del dashboard. Lectura: vhInit() arma listeners + dispara
+// el primer fetch; vhRefresh() es el ciclo de fetch+render; vhRender()
+// pinta el DOM en su contenedor `#vh-body`.
+
+const VH_AUTO_REFRESH_MS = 300_000;  // 5 min — matchea TTL del server cache.
+const VH = { timer: null, inFlight: false, lastTs: 0 };
+
+function vhInit() {
+  const btn = document.getElementById("vh-refresh");
+  if (btn && !btn.dataset.bound) {
+    btn.addEventListener("click", () => vhRefresh(true));
+    btn.dataset.bound = "1";
+  }
+  vhRefresh(false);
+  vhSchedule();
+}
+
+function vhSchedule() {
+  if (VH.timer) { clearTimeout(VH.timer); VH.timer = null; }
+  VH.timer = setTimeout(() => vhRefresh(false), VH_AUTO_REFRESH_MS);
+}
+
+async function vhRefresh(manual) {
+  if (VH.inFlight) return;
+  VH.inFlight = true;
+  const btn = document.getElementById("vh-refresh");
+  if (btn) {
+    btn.disabled = true;
+    btn.classList.add("spin");
+  }
+  try {
+    const res = await fetch("/api/vault/health", { cache: "no-store" });
+    let data = null;
+    try { data = await res.json(); } catch (_) { data = null; }
+    if (!res.ok || !data) {
+      vhRender({ score: null, error: `HTTP ${res.status}`, components: {}, weights: {} });
+      return;
+    }
+    vhRender(data);
+    VH.lastTs = Date.now();
+  } catch (err) {
+    vhRender({ score: null, error: String(err && err.message || err), components: {}, weights: {} });
+  } finally {
+    VH.inFlight = false;
+    if (btn) {
+      btn.disabled = false;
+      btn.classList.remove("spin");
+    }
+    vhSchedule();
+  }
+}
+
+function vhScoreClass(s) {
+  if (s == null) return "bad";
+  if (s >= 80) return "good";
+  if (s >= 60) return "mid";
+  return "bad";
+}
+
+// Componentes "higher is better" tienen colors aplicados sobre el sub_score
+// (% notas con tag, % notas con backlink). Componentes "lower is better"
+// (orphans, contradictions, dupes, dead_notes) usan el sub_score (que ya
+// es 0-100 con higher=better) para definir color.
+function vhCompClass(subScore) {
+  if (subScore == null) return "";
+  if (subScore >= 80) return "good";
+  if (subScore >= 50) return "mid";
+  return "bad";
+}
+
+function vhFmtPct(n) { return `${Math.round(n)}%`; }
+
+function vhRender(data) {
+  const body = document.getElementById("vh-body");
+  const meta = document.getElementById("vh-meta");
+  const updated = document.getElementById("vh-updated");
+  if (!body) return;
+
+  const score = data && data.score;
+  const comps = (data && data.components) || {};
+  const sub   = comps.sub_scores || {};
+  const desc  = comps.descriptions || {};
+  const w     = (data && data.weights) || {};
+  const err   = data && data.error;
+
+  if (meta) {
+    if (comps.total_notes != null) {
+      meta.textContent = `${Number(comps.total_notes).toLocaleString()} notas · cache 5min`;
+    } else {
+      meta.textContent = "cache 5min";
+    }
+  }
+  if (updated) {
+    if (data && data.last_calculated) {
+      const t = new Date(data.last_calculated);
+      const hh = String(t.getHours()).padStart(2, "0");
+      const mm = String(t.getMinutes()).padStart(2, "0");
+      updated.textContent = `actualizado ${hh}:${mm}`;
+    } else {
+      updated.textContent = "";
+    }
+  }
+
+  if (score == null) {
+    body.innerHTML = `
+      <div class="vh-empty">No se pudo calcular el health score.</div>
+      ${err ? `<div class="vh-error">${escapeHtml(err)}</div>` : ""}
+    `;
+    return;
+  }
+
+  // Lista de componentes en el orden de presentación. `value` es el
+  // valor crudo (% o count); `sub` es el sub-score 0-100; `weight` es
+  // el peso en el agregado. Tooltip = descripción + peso + sub-score.
+  const items = [
+    { key: "tags_pct",       label: "Tags",            fmt: vhFmtPct,                 isPct: true,  value: comps.tags_pct },
+    { key: "backlinks_pct",  label: "Backlinks",       fmt: vhFmtPct,                 isPct: true,  value: comps.backlinks_pct },
+    { key: "orphans",        label: "Orphans",         fmt: (n) => Number(n).toLocaleString(), isPct: false, value: comps.orphans },
+    { key: "contradictions", label: "Contradicciones", fmt: (n) => Number(n).toLocaleString(), isPct: false, value: comps.contradictions },
+    { key: "dupes",          label: "Dupes",           fmt: (n) => Number(n).toLocaleString(), isPct: false, value: comps.dupes },
+    { key: "dead_notes",     label: "Dead",            fmt: (n) => Number(n).toLocaleString(), isPct: false, value: comps.dead_notes },
+  ];
+
+  const compsHtml = items.map((it) => {
+    const subScore = sub[it.key];
+    const cls = vhCompClass(subScore);
+    const weight = w[it.key];
+    const weightPct = weight != null ? `${Math.round(weight * 100)}%` : "?";
+    const subStr = subScore != null ? Math.round(subScore) : "?";
+    const descTxt = desc[it.key] || "";
+    // title (tooltip nativo) = descripción + peso + sub-score.
+    const tooltip = `${descTxt}\nPeso: ${weightPct} · sub-score: ${subStr}/100`;
+    return `
+      <div class="vh-comp ${cls}" title="${escapeHtml(tooltip)}">
+        <span class="vh-comp-label">${escapeHtml(it.label)}</span>
+        <span class="vh-comp-value">${escapeHtml(it.fmt(it.value || 0))}</span>
+        <span class="vh-comp-sub">peso ${weightPct}</span>
+      </div>
+    `;
+  }).join("");
+
+  body.innerHTML = `
+    <div style="display:flex;align-items:baseline;gap:14px;margin-top:6px">
+      <span class="vh-score ${vhScoreClass(score)}" aria-label="Health score ${score} de 100">
+        ${score}<span class="vh-score-suffix">/100</span>
+      </span>
+      <span class="vh-meta">weighted sum sobre 6 señales del vault</span>
+    </div>
+    <div class="vh-components" role="list" aria-label="Sub-componentes del health score">
+      ${compsHtml}
+    </div>
+    ${err ? `<div class="vh-error">${escapeHtml(err)}</div>` : ""}
+  `;
 }

@@ -661,6 +661,111 @@
     .health-verdict.mid { background: color-mix(in srgb, var(--yellow) 12%, transparent); color: var(--yellow); border: 1px solid color-mix(in srgb, var(--yellow) 25%, transparent); }
     .health-verdict.bad { background: color-mix(in srgb, var(--red) 12%, transparent); color: var(--red); border: 1px solid color-mix(in srgb, var(--red) 25%, transparent); }
 
+    /* ── Vault health card (rag-vault-health, 2026-04-29) ───────────────
+       Card propia con score grande + sub-componentes. Vive como
+       `chart-card` extra dentro de la grilla `.charts`, así matchea el
+       padding/border/radius del resto sin crear su propio sistema.
+       Variantes de color por threshold (≥80 verde, 60-79 amarillo,
+       <60 rojo). Tooltip nativo via `title` en cada componente. */
+    .vh-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .vh-score {
+      font-size: 48px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      line-height: 1;
+      letter-spacing: -0.02em;
+    }
+    .vh-score.good { color: var(--green); }
+    .vh-score.mid  { color: var(--yellow); }
+    .vh-score.bad  { color: var(--red); }
+    .vh-score-suffix {
+      font-size: 14px;
+      font-weight: 500;
+      color: var(--text-faint);
+      margin-left: 4px;
+    }
+    .vh-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .vh-meta {
+      font-size: 11px;
+      color: var(--text-faint);
+      font-variant-numeric: tabular-nums;
+    }
+    .vh-refresh {
+      background: transparent;
+      color: var(--text-faint);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 4px 10px;
+      font-family: inherit;
+      font-size: 13px;
+      cursor: pointer;
+      line-height: 1;
+    }
+    .vh-refresh:hover { color: var(--text); border-color: var(--border-strong); }
+    .vh-refresh:disabled { opacity: 0.5; cursor: progress; }
+    .vh-refresh.spin { animation: vh-spin 0.7s linear infinite; }
+    @keyframes vh-spin {
+      from { transform: rotate(0deg); }
+      to   { transform: rotate(360deg); }
+    }
+    .vh-components {
+      list-style: none;
+      margin-top: 14px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+      gap: 8px 14px;
+    }
+    .vh-comp {
+      display: flex;
+      flex-direction: column;
+      gap: 1px;
+      padding: 6px 8px;
+      border: 1px solid var(--sep);
+      border-radius: 6px;
+      background: color-mix(in srgb, var(--bg-elev) 60%, transparent);
+      cursor: help;
+    }
+    .vh-comp .vh-comp-label {
+      font-size: 10px;
+      color: var(--text-faint);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .vh-comp .vh-comp-value {
+      font-size: 16px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      color: var(--text);
+    }
+    .vh-comp.good .vh-comp-value { color: var(--green); }
+    .vh-comp.mid  .vh-comp-value { color: var(--yellow); }
+    .vh-comp.bad  .vh-comp-value { color: var(--red); }
+    .vh-comp .vh-comp-sub {
+      font-size: 10px;
+      color: var(--text-faint);
+      font-variant-numeric: tabular-nums;
+    }
+    .vh-error {
+      color: var(--red);
+      font-size: 12px;
+      margin-top: 8px;
+    }
+    .vh-empty {
+      color: var(--text-faint);
+      font-size: 12px;
+      padding: 10px 0;
+    }
+
     /* Tune history */
     .tune-row {
       display: flex;

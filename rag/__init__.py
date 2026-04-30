@@ -38749,10 +38749,14 @@ _SPOTIFY_NOARG_RE = re.compile(
     # / "reproducir" como resume.
     r"play|reanud[aá](?:r|me)?|segu[ií](?:r)?|continu[aá](?:r|me)?|"
     r"reproduc[ií](?:r|me|lo)?|"
-    # Next family.
+    # Next family. `pas[aá](?:la|lo|me)?` agregado 2026-04-30 — el user
+    # usa "pasala" / "pasame" / "pasalo" como sinónimo rioplatense de
+    # "siguiente" (pasar a la siguiente canción). Sin este, caía al RAG
+    # y disparaba el watchdog del rag serve → 502.
     r"siguiente(?:\s+(?:tema|canci[oó]n|track))?|next|salt[aá](?:r|me|alo)?|"
     r"skip(?:e[aá]r?)?|pr[oó]xim[ao](?:\s+(?:tema|canci[oó]n))?|"
     r"otra(?:\s+(?:canci[oó]n|tema))?|otro\s+tema|cambi[aá]\s+(?:de\s+)?canci[oó]n|"
+    r"pas[aá](?:la|lo|me|nos)?|"
     # Previous family.
     r"anterior(?:\s+(?:tema|canci[oó]n))?|previous|prev|atr[aá]s|volv[eé](?:r)?|"
     r"tema\s+anterior|canci[oó]n\s+anterior"
@@ -38962,7 +38966,7 @@ def _parse_spotify_command(q: str) -> dict | None:
         if a.startswith(("play", "reanud", "segu", "continu", "reproduc")):
             return {"action": "play"}
         if a.startswith(("siguiente", "next", "salt", "skip", "próxim",
-                         "proxim", "otra", "otro", "cambi")):
+                         "proxim", "otra", "otro", "cambi", "pas")):
             return {"action": "next"}
         if a.startswith(("anterior", "previous", "prev", "atr", "volv", "tema", "canci")):
             return {"action": "previous"}

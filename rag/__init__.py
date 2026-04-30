@@ -8848,7 +8848,13 @@ class SqliteVecClient:
         sqlite_vec.load(self._db)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=NORMAL")
-        self._db.execute("PRAGMA busy_timeout=10000")
+        # busy_timeout 60s (era 10s pre-2026-04-30): bajo bursts concurrentes
+        # de ingesters (calls + safari + drive disparados al mismo tiempo
+        # tras `rag setup` o recovery), 10s no bastaba — los procesos hijos
+        # tiraban `database is locked` y exit=1, dejando el plist en estado
+        # error hasta el próximo schedule. 60s es el mismo orden que
+        # telemetry.db y suficiente para cualquier contención normal.
+        self._db.execute("PRAGMA busy_timeout=60000")
         self._db.execute(
             "CREATE TABLE IF NOT EXISTS rag_schema_version ("
             " table_name TEXT PRIMARY KEY, "

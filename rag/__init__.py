@@ -38702,8 +38702,12 @@ def _detect_metachat_intent(q: str) -> bool:
 _SPOTIFY_NOARG_RE = re.compile(
     r"^\s*"
     r"(?P<action>"
-    # Pause / stop family. `parar` agregado para infinitivo "parar la música".
-    r"pausa|paus[aá]|pause|stop|fren[aá]|par[aá]|parar|det[eé]n(?:e|er)?|detener|"
+    # Pause / stop family. NOTA: `par[aá]` / `parar` / `det[eé]ner?` se
+    # MOVIERON a `_SPOTIFY_MUTE_RE` por preferencia del user (2026-04-30):
+    # esos verbos ahora silencian (vol=0, track sigue corriendo) en vez
+    # de pausar — el user los siente más cerca de "callar" que de "parar
+    # playback". Solo dejamos los pause "puros" acá.
+    r"pausa|paus[aá]|pause|stop|fren[aá]|"
     # Play / resume family (BARE only — "play" + nada, no "play X").
     r"play|reanud[aá](?:r|me)?|segu[ií](?:r)?|continu[aá](?:r|me)?|"
     # Next family.
@@ -38759,13 +38763,30 @@ _SPOTIFY_VOL_SET_RE = re.compile(
 )
 
 # 3. Mute / unmute (set 0 / restore previo). Por simplicidad usamos
-# set_volume(0) para mute y set_volume(50) para unmute (default).
+# set_volume(0) para mute. Verbos `par[aá]` / `parar` / `det[eé]n[eé]?` /
+# `detener` / `cort[aá]` / `cortar` se trataron históricamente como pause
+# pero se movieron acá por preferencia del user (2026-04-30) — el user
+# los siente más cerca de "callar" que de "parar playback". `mutea[lo]`
+# agregado en la misma pasada.
 _SPOTIFY_MUTE_RE = re.compile(
     r"^\s*¿?\s*"
-    r"(?:mute(?:a(?:r|lo)?)?|silenci[aá](?:r|lo)?|"
+    r"(?:"
+    # Originales: mute/silenciá/calla/shut up/etc.
+    r"mute(?:a(?:r|lo|me)?)?|silenci[aá](?:r|lo)?|"
     r"sin\s+sonido|sin\s+volumen|"
     r"calla(?:r|te)?|callate|"
-    r"shut\s+up|silence)"
+    r"shut\s+up|silence|"
+    # Nuevos (movidos de pause): para/pará/parar/detené/detene/detener/
+    # corta/cortá/cortar/cortalo. NO ambig con "para" preposicional
+    # ("para mañana") por el length cap + sufijo opcional restrictivo.
+    r"par[aá]|parar|"
+    r"det[eé]n(?:[eé]|er)?|detener|"
+    r"cort[aá](?:r|lo|le)?|cortar"
+    r")"
+    # Sufijo opcional "la música" / "el sonido" / "spotify" — para
+    # frases idiomáticas tipo "parar la música" / "cortá el sonido".
+    r"(?:\s+(?:la\s+)?(?:m[uú]sica|spotify|el\s+sonido|el\s+volumen|"
+    r"el\s+tema|la\s+canci[oó]n))?"
     r"\s*[!?.¡¿,:;]*\s*$",
     re.IGNORECASE,
 )
@@ -38879,7 +38900,9 @@ def _parse_spotify_command(q: str) -> dict | None:
     if m:
         a = (m.group("action") or "").lower()
         # Normalizar a {pause, play, next, previous}.
-        if a.startswith(("pausa", "paus", "pause", "stop", "fren", "par", "det")):
+        # NOTA: "par" y "det" salieron de pause y se movieron a mute
+        # — ver comentario en `_SPOTIFY_NOARG_RE` arriba.
+        if a.startswith(("pausa", "paus", "pause", "stop", "fren")):
             return {"action": "pause"}
         if a.startswith(("play", "reanud", "segu", "continu")):
             return {"action": "play"}

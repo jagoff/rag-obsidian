@@ -1276,7 +1276,7 @@ Never claim improvement without re-running `rag eval`. Helper LLM calls (`expand
 
 The corpus is no longer vault-only. Per `docs/design-cross-source-corpus.md` + §10 user decisions, `retrieve()` is now source-aware and the sqlite-vec collection holds chunks from multiple sources via a `source` metadata discriminator. Collection stays at `obsidian_notes_v11` (no rename / no re-embed) — legacy vault rows without `source` are read as `"vault"` via `normalize_source()`.
 
-**Constants** (`rag.py:~1288`): `VALID_SOURCES` (frozenset of 6), `SOURCE_WEIGHTS` (vault 1.00 → WA 0.75), `SOURCE_RECENCY_HALFLIFE_DAYS` (None for vault/calendar, 30d for WA/messages, 90d for reminders, 180d for gmail), `SOURCE_RETENTION_DAYS` (None for vault/calendar/reminders, 180 for WA/messages, 365 for gmail).
+**Constants** (`rag.py:~1288`): `VALID_SOURCES` (frozenset of 11 — vault + calendar + gmail + whatsapp + reminders + messages + contacts + calls + safari + drive + pillow), `SOURCE_WEIGHTS` (vault 1.00 → WA 0.75), `SOURCE_RECENCY_HALFLIFE_DAYS` (None for vault/calendar, 30d for WA/messages, 90d for reminders, 180d for gmail), `SOURCE_RETENTION_DAYS` (None for vault/calendar/reminders, 180 for WA/messages, 365 for gmail). `pillow` es source local-only (no entra al corpus vectorial — los datos viven en `rag_sleep_sessions` y se consumen via panel home + brief, no via retrieve).
 
 **Helpers**: `normalize_source(v, default="vault")` → safe legacy-row read; `source_weight(src)` → lookup + 0.50 fallback; `source_recency_multiplier(src, created_ts, now)` → exponential decay `2**-(age/halflife)` in [0,1], accepts epoch float or ISO-8601 string (Zulu Z), clamps future-ts at 1.0, None-halflife short-circuits to 1.0.
 
@@ -1550,7 +1550,7 @@ Lista de plists registrados (cualquier `obsidian-rag-*` que `launchctl list` mue
 | `com.fer.obsidian-rag-whisper-vocab` | 03:15 | `rag whisper-vocab refresh` | Extracción nightly de vocab WhatsApp |
 | `com.fer.obsidian-rag-ingest-calls` | cada 6h | `rag index --source calls` | Apple CallHistory ingester — llamadas perdidas/entrantes/salientes |
 | `com.fer.obsidian-rag-ingest-safari` | cada 6h 15min | `rag index --source safari` | Safari History + Bookmarks + Reading List ingester |
-| `com.fer.obsidian-rag-ingest-pillow` | cada 6h (ver plist) | `rag index --source pillow` | Pillow ingester (Apple Sleep / Health) |
+| `com.fer.obsidian-rag-ingest-pillow` | 1×/día 09:30 | `rag index --source pillow` | Pillow ingester — sleep tracker iOS, lee `~/Library/Mobile Documents/com~apple~CloudDocs/Sueño/PillowData.txt` (Core Data dump sync iCloud) → `rag_sleep_sessions`. Silent-fail si Pillow no está instalado / sync roto. CLI: `rag sleep show/patterns/ingest` |
 | `com.fer.obsidian-rag-mood-poll` | cada 30min | `rag mood-poll` | Mood poll daemon — **UI no cableada** (mood signals NO se renderizan en home.v2 actualmente) |
 
 **Nota 2026-04-30**: los daemons `cloudflare-tunnel`, `cloudflare-tunnel-watcher`, `lgbm-train`, `paraphrases-train`, `synth-refresh` están instalados manualmente — no son regenerados por `rag setup` (no figuran en `_services_spec()`). Si necesitás reinstalarlos, copialos de tu backup o regenerá manualmente desde el código que los originó.

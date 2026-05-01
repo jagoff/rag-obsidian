@@ -178,16 +178,27 @@ def test_services_spec_includes_online_tune():
     assert "com.fer.obsidian-rag-online-tune" in labels
 
 
-def test_services_spec_includes_serve():
-    """rag serve is the hot path for WhatsApp — must ship with `rag setup`.
+def test_services_spec_excludes_serve_and_serve_watchdog():
+    """rag serve y serve-watchdog DEPRECADOS desde 2026-05-01.
 
-    Regression guard: the plist used to be hand-installed and got out of
-    sync (corrupted, unregistered). Registering it in _services_spec() is
-    the fix; this test prevents it from being accidentally removed again.
+    Histórico (revertido): el plist se hand-installeaba y se desincronizaba
+    del código; el fix anterior fue registrarlo en `_services_spec`. Pero
+    en producción coexistía con `com.fer.obsidian-rag-web` (FastAPI port
+    8765) — los dos peleaban por VRAM bajo memory pressure y el `rag serve`
+    crash-loopeaba en `embed(["warmup"])` con `httpx.RemoteProtocolError`.
+
+    Decisión 2026-05-01: el FastAPI cubre todos los endpoints reales del
+    chat web. El WhatsApp listener tiene fallback a subprocess
+    (`rag query`, ~5-10s cold start) cuando :7832 no responde — flow
+    confirmado en `whatsapp-listener/listener.ts:1652`.
+
+    Si volvés a agregar el plist al spec, este test va a fallar — es
+    intencional. Re-leé el doc-block en `_services_spec` antes de revertir.
     """
     specs = rag_module._services_spec(RAG_BIN)
     labels = [s[0] for s in specs]
-    assert "com.fer.obsidian-rag-serve" in labels
+    assert "com.fer.obsidian-rag-serve" not in labels
+    assert "com.fer.obsidian-rag-serve-watchdog" not in labels
 
 
 @requires_plutil
@@ -234,11 +245,13 @@ def test_serve_plist_warm_model_env():
 def test_services_spec_total_count():
     specs = rag_module._services_spec(RAG_BIN)
     # Roster actualizado al 2026-05-01. Drift desde el last assert
-    # (28 → 35): se sumaron 7 plists post-2026-04-29 que la nota previa
-    # no contemplaba.
+    # (35 → 33): se removieron `com.fer.obsidian-rag-serve` y
+    # `com.fer.obsidian-rag-serve-watchdog` por el split-brain con el
+    # FastAPI web server (ver test_services_spec_excludes_serve_and_
+    # serve_watchdog para el rationale).
     #
-    # Base infra (24):
-    #   watch, serve, web (agregado 2026-04-22 — pre-fix estaba instalado
+    # Base infra (22):
+    #   watch, web (agregado 2026-04-22 — pre-fix estaba instalado
     #   manualmente fuera de setup), digest, morning, today, wake-up
     #   (2026-04-24 — orquestador nocturno 04:00), emergent, patterns,
     #   archive, wa-tasks, reminder-wa-push (cron 5min para disparar
@@ -251,10 +264,9 @@ def test_services_spec_total_count():
     #   auto-aprendizaje), online-tune, calibrate (2026-04-23 —
     #   per-source isotonic regression re-entrenada con feedback),
     #   maintenance (2026-04-21 hardening), consolidate, vault-cleanup
-    #   (2026-04-27), anticipate (2026-04-24), serve-watchdog
-    #   (2026-04-27 — HTTP healthcheck del web server cada 60s),
-    #   brief-auto-tune (2026-04-29 — Sunday 03:00 shift de morning/
-    #   today/digest si el user mutea consistentemente).
+    #   (2026-04-27), anticipate (2026-04-24), brief-auto-tune
+    #   (2026-04-29 — Sunday 03:00 shift de morning/today/digest si el
+    #   user mutea consistentemente).
     #
     # Cross-source ingesters (7):
     #   ingest-whatsapp, ingest-gmail, ingest-reminders, ingest-calendar
@@ -272,8 +284,8 @@ def test_services_spec_total_count():
     #   vocab nightly 03:15 con cmd `whisper vocab refresh` post
     #   2026-05-01).
     #
-    # Total: 24 base + 7 ingesters + 4 helpers = 35.
-    assert len(specs) == 35
+    # Total: 22 base + 7 ingesters + 4 helpers = 33.
+    assert len(specs) == 33
 
 
 def test_services_spec_includes_maintenance():

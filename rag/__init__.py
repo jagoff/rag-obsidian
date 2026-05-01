@@ -48551,7 +48551,14 @@ def _watch_plist(rag_bin: str) -> str:
 
 
 def _serve_plist(rag_bin: str) -> str:
-    """Persistent `rag serve` HTTP query server on port 7832.
+    """[DEPRECATED 2026-05-01] Persistent `rag serve` HTTP query server on port 7832.
+
+    NO instalado por `rag setup` desde 2026-05-01 — ver doc-block en
+    `_services_spec` para el rationale completo (split-brain con
+    `com.fer.obsidian-rag-web` + crash-loop bajo memory pressure). La
+    función queda en el módulo para retrocompat de tests
+    (`test_plist_web_serve.py`, `test_setup_online_tune.py`) y para que
+    el user pueda re-instalar manualmente si tiene una razón fuerte.
 
     This is the hot path for the WhatsApp listener (and any other bot
     integration): it keeps the reranker, bge-m3 embedder, BM25 corpus, and
@@ -50092,7 +50099,14 @@ def _wake_up_plist(rag_bin: str) -> str:
 
 
 def _serve_watchdog_plist(rag_bin: str) -> str:  # noqa: ARG001 (rag_bin no usado)
-    """Watchdog del web server — corre cada 60s, healthcheck HTTP +
+    """[DEPRECATED 2026-05-01] Watchdog del `rag serve` (port 7832).
+
+    NO instalado por `rag setup` desde 2026-05-01 — ver doc-block en
+    `_services_spec` para el rationale (deprecación de `rag serve`).
+    La función queda para retrocompat; el script `rag-serve-watchdog.sh`
+    sigue en el repo por la misma razón.
+
+    Watchdog del web server — corre cada 60s, healthcheck HTTP +
     catchup de plists nightly que se saltearon su window por Mac dormida.
 
     Originalmente vivía en `scripts/com.fer.obsidian-rag-serve-watchdog.plist`
@@ -50228,8 +50242,35 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
     return [
         ("com.fer.obsidian-rag-watch", "com.fer.obsidian-rag-watch.plist",
          _watch_plist(rag_bin)),
-        ("com.fer.obsidian-rag-serve", "com.fer.obsidian-rag-serve.plist",
-         _serve_plist(rag_bin)),
+        # ── DEPRECATED 2026-05-01: `com.fer.obsidian-rag-serve` removido ─────
+        # Histórico: `rag serve --port 7832` corría un BaseHTTPServer simple
+        # como hot-path para el WhatsApp listener. Coexistía con
+        # `com.fer.obsidian-rag-web` (FastAPI port 8765) — los dos plists
+        # peleaban por VRAM (cada uno carga qwen2.5:7b chat + qwen2.5:3b
+        # lookup + bge-m3 embedder + bge-reranker-v2-m3) bajo memory
+        # pressure. Resultado observado el 2026-05-01: el `rag serve` se
+        # colgaba en el `embed(["warmup"])` con `httpx.RemoteProtocolError`
+        # mientras el FastAPI consumía el slot de ollama, crash-loopeaba via
+        # `KeepAlive=true`, y degradaba al `BaseHTTPServer` que sólo
+        # responde `/health` (404 a `/api/*`).
+        #
+        # Decisión: el FastAPI (`com.fer.obsidian-rag-web`) cubre todos los
+        # endpoints reales (chat web + frontend + cloudflare tunnel). El
+        # WhatsApp listener tiene fallback a subprocess (`rag query`,
+        # ~5-10s cold start por mensaje) cuando :7832 no responde — flow
+        # confirmado en `whatsapp-listener/listener.ts:1652` ("Server down
+        # — fall through to subprocess"). El cost extra es aceptable
+        # mientras eliminamos el split-brain de servers + el loop crash.
+        #
+        # Re-activación: si en el futuro hay razón fuerte para tener un
+        # endpoint sync JSON dedicado (ej. otro bot con SLA <2s/query), la
+        # opción más limpia es agregar un `POST /api/query` al FastAPI con
+        # el mismo wire-format que el legacy `/query` del rag serve, y
+        # apuntar el listener a `:8765` con `RAG_SERVE_URL=http://127.0.0.1:8765`.
+        # Mientras tanto, `_serve_plist` + `_serve_watchdog_plist` siguen
+        # como funciones (los tests `test_plist_web_serve.py` validan su
+        # shape) pero NO se instalan por `rag setup`.
+        # ────────────────────────────────────────────────────────────────────
         # Web UI daemon — previously installed manually outside `rag setup`
         # (Apr 2026), which left HF_HUB_OFFLINE + RAG_MEMORY_PRESSURE_INTERVAL
         # missing in the actual plist and produced 64× [local-embed] falls +
@@ -50359,13 +50400,13 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
         ("com.fer.obsidian-rag-whisper-vocab",
          "com.fer.obsidian-rag-whisper-vocab.plist",
          _whisper_vocab_plist(rag_bin)),
-        # Serve watchdog — antes en scripts/com.fer.obsidian-rag-
-        # serve-watchdog.plist con paths hardcoded; migrado a generación
-        # dinámica 2026-04-27. HTTP healthcheck del web server cada 60s
-        # + catchup de plists nightly que se saltearon (Mac dormida).
-        ("com.fer.obsidian-rag-serve-watchdog",
-         "com.fer.obsidian-rag-serve-watchdog.plist",
-         _serve_watchdog_plist(rag_bin)),
+        # ── DEPRECATED 2026-05-01: `com.fer.obsidian-rag-serve-watchdog` ──
+        # Servía para healthcheck del `rag serve` (port 7832), removido
+        # cuando bajamos `com.fer.obsidian-rag-serve`. Ver doc-block
+        # extenso arriba donde se quita el entry de `serve` para el
+        # rationale completo. Si re-activás el `serve`, también re-agregá
+        # este watchdog.
+        # ────────────────────────────────────────────────────────────────
         # Brief schedule auto-tune (2026-04-29) — Sunday 03:00 reads
         # rag_brief_feedback last 30d, decides whether to shift any of
         # morning/today/digest plists' StartCalendarInterval forward

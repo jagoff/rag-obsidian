@@ -139,6 +139,72 @@ def test_peek_holder_returns_empty_when_empty_file(tmp_path, monkeypatch):
     assert _peek_index_lock_holder() == ""
 
 
+# ── wait_seconds mode (2026-05-01: serializa ingesters cron concurrentes) ──
+
+def test_wait_seconds_zero_acts_as_legacy_nb(isolated_lock_path):
+    """`wait_seconds=0` ≡ `wait_seconds=None` — non-blocking, falla rápido."""
+    with _index_process_lock():
+        with pytest.raises(BlockingIOError):
+            with _index_process_lock(wait_seconds=0):
+                pass
+
+
+def test_wait_seconds_acquires_when_holder_releases_within_window(isolated_lock_path):
+    """Si el primer holder libera dentro de la ventana de espera, el segundo
+    lo agarra sin error. Ése es el caso real: dos ingesters cron solapados
+    pero uno termina en <30s, el otro lo toma."""
+    import time as _time
+    holding = threading.Event()
+    released = threading.Event()
+    second_acquired = threading.Event()
+
+    def hold_briefly():
+        with _index_process_lock():
+            holding.set()
+            _time.sleep(0.5)  # holder corto
+        released.set()
+
+    def try_with_wait():
+        holding.wait(timeout=5)
+        with _index_process_lock(wait_seconds=5.0):
+            second_acquired.set()
+
+    t1 = threading.Thread(target=hold_briefly)
+    t2 = threading.Thread(target=try_with_wait)
+    t1.start()
+    t2.start()
+    second_acquired.wait(timeout=5)
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+    assert released.is_set(), "Holder nunca soltó"
+    assert second_acquired.is_set(), "Segundo nunca agarró tras soltarse el primero"
+
+
+def test_wait_seconds_times_out_when_holder_persists(isolated_lock_path):
+    """Si el holder sigue después del timeout, el segundo levanta
+    `BlockingIOError` igual que el modo legacy."""
+    import time as _time
+    holding = threading.Event()
+    blocked = threading.Event()
+
+    def hold_long():
+        with _index_process_lock():
+            holding.set()
+            blocked.wait(timeout=5)  # release on signal, no auto
+
+    t1 = threading.Thread(target=hold_long)
+    t1.start()
+    holding.wait(timeout=5)
+    t0 = _time.monotonic()
+    with pytest.raises(BlockingIOError):
+        with _index_process_lock(wait_seconds=2.0):
+            pass
+    elapsed = _time.monotonic() - t0
+    assert 1.5 <= elapsed <= 4.5, f"Timeout debería ser ~2s, got {elapsed:.2f}s"
+    blocked.set()  # liberá el primer thread
+    t1.join(timeout=5)
+
+
 class TestIndexEmbedClient:
     """`_index_embed_client()` cachea un `ollama.Client(timeout=120)` para
     los embeddings del index pipeline. El timeout existe para que un Ollama

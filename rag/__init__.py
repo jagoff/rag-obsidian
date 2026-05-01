@@ -27889,12 +27889,21 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
 
 
 @contextlib.contextmanager
-def _index_process_lock():
+def _index_process_lock(*, wait_seconds: float | None = None):
     """Context manager around `INDEX_PROCESS_LOCK` (process-level mutex).
 
-    Acquires `fcntl.flock(LOCK_EX | LOCK_NB)` on `~/.local/share/obsidian-rag/index.lock`.
-    If another `rag index` is already running, raises `BlockingIOError` so
-    the CLI handler can print a clear message and abort fast.
+    Acquires `fcntl.flock(LOCK_EX)` on `~/.local/share/obsidian-rag/index.lock`.
+
+    Two modes:
+
+    - `wait_seconds=None` (legacy, default): non-blocking — `LOCK_NB` levanta
+      `BlockingIOError` inmediato si otro `rag index` lo está holdeando.
+      El CLI handler imprime un mensaje y sale.
+    - `wait_seconds=N` (>0): polling cada 1s hasta agarrar el lock o vencer
+      el timeout. Útil para ingesters cron solapados (calendar / gmail /
+      whatsapp / safari arrancan a horas redondas y caen al mismo tiempo;
+      antes safari abortaba sistemáticamente cuando otro estaba corriendo).
+      Si el timeout vence, levanta `BlockingIOError` igual que el modo legacy.
 
     Writes the holder's PID + ISO timestamp to the lock file (best-effort,
     not load-bearing) so an operator running `cat ~/.local/share/obsidian-rag/index.lock`
@@ -27911,7 +27920,19 @@ def _index_process_lock():
     # al try/finally del cleanup porque el fh ya está cerrado y el
     # `flock(LOCK_UN)` del finally tira ValueError sobre file cerrado.
     try:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if wait_seconds is None or wait_seconds <= 0:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:
+            import time as _time
+            deadline = _time.monotonic() + float(wait_seconds)
+            while True:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if _time.monotonic() >= deadline:
+                        raise
+                    _time.sleep(1.0)
     except BlockingIOError:
         fh.close()
         raise
@@ -27995,16 +28016,24 @@ def index(reset: bool, no_contradict: bool, source_opt: str | None,
     # web/chat sin Ollama. Con esto, el segundo `rag index` falla en <1s
     # con un mensaje claro y exit code 1 (para que los wrappers tipo
     # `if rag index ...; then ...` se enteren).
+    # Wait-with-timeout (default 300s) — los ingesters cron (calendar, gmail,
+    # whatsapp, safari) caen al mismo slot horario y antes safari abortaba
+    # sistemáticamente. Con la espera, los ingesters se serializan natural-
+    # mente. Override con env var para tests / debug rápido.
     try:
-        _index_lock_ctx = _index_process_lock()
+        _wait_s = float(os.environ.get("RAG_INDEX_LOCK_WAIT_SECONDS", "300"))
+    except (TypeError, ValueError):
+        _wait_s = 300.0
+    try:
+        _index_lock_ctx = _index_process_lock(wait_seconds=_wait_s)
         _index_lock_ctx.__enter__()
     except BlockingIOError:
         holder = _peek_index_lock_holder()
         msg = (
             "[yellow]Otro `rag index` ya está activo[/yellow] "
-            f"(holder: {holder or 'desconocido'}). Abortando para no duplicar carga "
-            f"sobre Ollama. Probá de nuevo cuando termine, o liberá el lock con "
-            f"`rm {INDEX_PROCESS_LOCK}` si sabés que el holder murió mal."
+            f"(holder: {holder or 'desconocido'}). Esperé {_wait_s:.0f}s y no "
+            f"liberó el lock. Probá de nuevo cuando termine, o liberá el lock "
+            f"con `rm {INDEX_PROCESS_LOCK}` si sabés que el holder murió mal."
         )
         console.print(msg)
         sys.exit(1)

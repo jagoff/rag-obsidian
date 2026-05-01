@@ -398,3 +398,140 @@ def test_patterns_summary_with_real_data(tmp_telemetry):
     assert summary["n_findings"] >= 1
     assert ("sleep_quality", 25) in summary["metrics_with_data"] or \
            ("mood_score", 25) in summary["metrics_with_data"]
+
+
+# ── Endpoint /api/patterns ───────────────────────────────────────────────
+
+
+@pytest.fixture
+def patterns_client():
+    from web.server import app
+    from fastapi.testclient import TestClient
+    return TestClient(app)
+
+
+def test_patterns_endpoint_returns_summary(patterns_client, monkeypatch):
+    """GET /api/patterns devuelve la misma shape que `patterns_summary`."""
+    from rag import cross_source_patterns as _csp
+    monkeypatch.setattr(_csp, "patterns_summary", lambda **kw: {
+        "n_findings": 2,
+        "top": [
+            {"pair": ("a", "b"), "lag": 0, "r": 0.7, "n": 25, "p": 0.001,
+             "severity": "strong", "description": "x"},
+        ],
+        "by_severity": {"strong": 1, "moderate": 1, "weak": 0},
+        "metrics_with_data": [("a", 25), ("b", 25)],
+        "days_range": kw.get("days", 30),
+        "lags_tested": list(kw.get("lags", (0, 1, 7))),
+    })
+    r = patterns_client.get("/api/patterns?days=30")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["n_findings"] == 2
+    assert data["days_range"] == 30
+    assert data["lags_tested"] == [0, 1, 7]
+
+
+def test_patterns_endpoint_clamps_days(patterns_client, monkeypatch):
+    """`days` clampeado a [7, 90]."""
+    from rag import cross_source_patterns as _csp
+    captured = {}
+    monkeypatch.setattr(_csp, "patterns_summary", lambda **kw: (
+        captured.update(kw) or {
+            "n_findings": 0, "top": [], "by_severity": {},
+            "metrics_with_data": [], "days_range": kw.get("days"),
+            "lags_tested": list(kw.get("lags", ())),
+        }
+    ))
+    patterns_client.get("/api/patterns?days=999")
+    assert captured["days"] == 90
+    captured.clear()
+    patterns_client.get("/api/patterns?days=2")
+    assert captured["days"] == 7
+
+
+def test_patterns_endpoint_parses_lags_csv(patterns_client, monkeypatch):
+    """`lags=0,1,3` se parsea a tuple correctamente."""
+    from rag import cross_source_patterns as _csp
+    captured = {}
+    monkeypatch.setattr(_csp, "patterns_summary", lambda **kw: (
+        captured.update(kw) or {
+            "n_findings": 0, "top": [], "by_severity": {},
+            "metrics_with_data": [], "days_range": kw.get("days"),
+            "lags_tested": list(kw.get("lags", ())),
+        }
+    ))
+    patterns_client.get("/api/patterns?lags=0,1,3")
+    assert captured["lags"] == (0, 1, 3)
+
+
+def test_patterns_endpoint_silent_fail_on_exception(patterns_client, monkeypatch):
+    """Si patterns_summary tira, el endpoint devuelve estructura vacía
+    (NO 500) — el frontend muestra empty state."""
+    from rag import cross_source_patterns as _csp
+    def _broken(**kw):
+        raise RuntimeError("DB locked")
+    monkeypatch.setattr(_csp, "patterns_summary", _broken)
+    r = patterns_client.get("/api/patterns?days=30")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["n_findings"] == 0
+    assert data["top"] == []
+
+
+# ── CLI smoke ────────────────────────────────────────────────────────────
+
+
+def test_cli_patterns_show_no_data(monkeypatch, tmp_path):
+    """`rag patterns show` sin data en DB → mensaje "sin findings".
+    NB: usamos --days 7 para forzar el min_n=21 a no satisfacerse."""
+    monkeypatch.setattr(
+        "rag.cross_source_patterns.patterns_summary",
+        lambda **kw: {
+            "n_findings": 0, "top": [], "by_severity": {},
+            "metrics_with_data": [],
+            "days_range": kw.get("days", 30),
+            "lags_tested": list(kw.get("lags", (0,))),
+        },
+    )
+    from click.testing import CliRunner
+    runner = CliRunner()
+    result = runner.invoke(rag.cli, ["patterns", "show", "--plain"])
+    assert result.exit_code == 0, result.output
+    assert "n_findings=0" in result.output
+
+
+def test_cli_patterns_metrics_lists_collectors(monkeypatch):
+    """`rag patterns metrics` lista los 12 collectors core."""
+    from rag import cross_source_patterns as _csp
+    monkeypatch.setattr(
+        _csp, "collect_daily_metrics",
+        lambda **kw: {name: {} for name in _csp.known_metrics()},
+    )
+    from click.testing import CliRunner
+    runner = CliRunner()
+    result = runner.invoke(rag.cli, ["patterns", "metrics", "--plain"])
+    assert result.exit_code == 0
+    # Cada collector core aparece en el output.
+    for name in _csp.known_metrics():
+        assert name in result.output
+
+
+def test_cli_patterns_explain_pair(monkeypatch):
+    """`rag patterns explain --pair a,b` corre Pearson sobre data
+    inyectada y muestra r/n/p."""
+    from rag import cross_source_patterns as _csp
+    series_a = {f"2026-04-{i:02d}": float(i) for i in range(1, 26)}
+    series_b = {f"2026-04-{i:02d}": float(i * 2) for i in range(1, 26)}
+    monkeypatch.setattr(_csp, "collect_daily_metrics", lambda **kw: {
+        "mood_score": series_a, "sleep_quality": series_b,
+    })
+    from click.testing import CliRunner
+    runner = CliRunner()
+    result = runner.invoke(rag.cli, [
+        "patterns", "explain",
+        "--pair", "mood_score,sleep_quality", "--lag", "0", "--plain",
+    ])
+    assert result.exit_code == 0, result.output
+    assert "r=+1.000" in result.output  # perfect correlation
+    assert "n=25" in result.output

@@ -2910,6 +2910,63 @@ def submit_mood(req: MoodRequest) -> dict:
     return result
 
 
+@app.get("/api/patterns")
+def cross_source_patterns(
+    days: int = 30,
+    lags: str = "0,1,7",
+    top: int = 10,
+) -> dict:
+    """Findings cross-source — Pearson sobre todas las pairs de
+    métricas diarias × lags.
+
+    Lazy-loaded por el panel `p-patterns` y el modal de detalle.
+    NO viene en `/api/home` (no engordamos critical path con cómputo
+    estadístico).
+
+    Args:
+      days: rango histórico, máximo 90.
+      lags: lista coma-separada de lags en días. Default "0,1,7"
+        (mismo día + día siguiente + 1 semana después).
+      top: número máximo de findings a devolver en `top` (sin
+        afectar `n_findings` total).
+
+    Returns:
+      `{n_findings, top: [...], by_severity, metrics_with_data,
+        days_range, lags_tested}`.
+    """
+    try:
+        d = int(days) if days is not None else 30
+    except (TypeError, ValueError):
+        d = 30
+    days_clamped = max(7, min(d, 90))
+    try:
+        lag_list = tuple(sorted(set(
+            max(0, min(int(x.strip()), 14))
+            for x in lags.split(",") if x.strip()
+        ))) or (0,)
+    except (TypeError, ValueError):
+        lag_list = (0, 1, 7)
+    try:
+        top_clamped = max(1, min(int(top), 50))
+    except (TypeError, ValueError):
+        top_clamped = 10
+
+    try:
+        from rag.cross_source_patterns import patterns_summary
+        return patterns_summary(
+            days=days_clamped, top=top_clamped, lags=lag_list,
+        )
+    except Exception as exc:
+        # Silent-fail: el frontend muestra empty state en lugar de
+        # error 500. No queremos que un bug en patterns rompa el panel.
+        print(f"[patterns] failed: {exc}", file=sys.stderr)
+        return {
+            "n_findings": 0, "top": [], "by_severity": {},
+            "metrics_with_data": [], "days_range": days_clamped,
+            "lags_tested": list(lag_list),
+        }
+
+
 @app.get("/api/mood/history")
 def mood_history(days: int = 30) -> dict:
     """Detalle granular del mood para el modal "Ver historial".
@@ -10173,37 +10230,6 @@ def _home_compute(
         print(f"[today-correlator] failed: {exc}", file=sys.stderr)
         today_correlations = {"people": [], "topics": [], "time_overlaps": []}
 
-    # Highlights: stats sintéticos que el frontend rendea como fila de
-    # chips arriba del prose narrativo en "Lo que pasó hoy". Todo
-    # derivado — sin IO, sin LLM. Si un bucket está vacío, el frontend
-    # oculta el chip correspondiente.
-    _wa_chats = signals_dict_lite.get("whatsapp") or []
-    _gmail_bucket = signals_dict_lite.get("gmail") or {}
-    _cal_today = signals_dict_lite.get("calendar") or []
-    _yt_today = signals_dict_lite.get("youtube_watched") or []
-    _people = (today_correlations or {}).get("people") or []
-    _topics = (today_correlations or {}).get("topics") or []
-    today_highlights: dict = {
-        "wa_top_chat": _wa_chats[0] if _wa_chats else None,
-        "wa_total_msgs": sum(int(c.get("count") or 0) for c in _wa_chats),
-        "wa_active_chats": len(_wa_chats),
-        "gmail_unread": int(_gmail_bucket.get("unread_count") or 0),
-        "gmail_starred": int(_gmail_bucket.get("starred") or 0)
-            if isinstance(_gmail_bucket.get("starred"), (int, float))
-            else len(_gmail_bucket.get("starred") or []),
-        "gmail_awaiting_reply": int(_gmail_bucket.get("awaiting_reply") or 0)
-            if isinstance(_gmail_bucket.get("awaiting_reply"), (int, float))
-            else len(_gmail_bucket.get("awaiting_reply") or []),
-        "calendar_events": len(_cal_today),
-        "youtube_videos": len(_yt_today),
-        "vault_notes_today": len(today_ev.get("recent_notes") or []),
-        "top_person": _people[0] if _people else None,
-        "top_topic": _topics[0] if _topics else None,
-        "people_cross_source": len(_people),
-        "topics_cross_source": len(_topics),
-        "gaps_count": len((today_correlations or {}).get("gaps") or []),
-    }
-
     # Only call the LLM when the caller explicitly asks. Default path stays
     # fast — if no cached brief exists yet, the UI shows "pendiente" y el
     # user clickea ↻ que pega con regenerate=true. Aun cuando today_total==0
@@ -10275,6 +10301,39 @@ def _home_compute(
         narrative_source = "generated" if narrative else "error"
         if narrative:
             _persist_today_brief(date_label, narrative)
+
+    # Highlights: stats sintéticos que el frontend rendea como fila de
+    # chips arriba del prose narrativo en "Lo que pasó hoy". Computado
+    # DESPUÉS del posible regenerate para que use el correlator final
+    # (TODAY-strict cuando regen=true, lite cuando es cache path). Todo
+    # derivado — sin IO, sin LLM. Si un bucket está vacío, el frontend
+    # oculta el chip correspondiente.
+    _wa_chats = signals_dict_lite.get("whatsapp") or []
+    _gmail_bucket = signals_dict_lite.get("gmail") or {}
+    _cal_today = signals_dict_lite.get("calendar") or []
+    _yt_today = signals_dict_lite.get("youtube_watched") or []
+    _people = (today_correlations or {}).get("people") or []
+    _topics = (today_correlations or {}).get("topics") or []
+    today_highlights: dict = {
+        "wa_top_chat": _wa_chats[0] if _wa_chats else None,
+        "wa_total_msgs": sum(int(c.get("count") or 0) for c in _wa_chats),
+        "wa_active_chats": len(_wa_chats),
+        "gmail_unread": int(_gmail_bucket.get("unread_count") or 0),
+        "gmail_starred": int(_gmail_bucket.get("starred") or 0)
+            if isinstance(_gmail_bucket.get("starred"), (int, float))
+            else len(_gmail_bucket.get("starred") or []),
+        "gmail_awaiting_reply": int(_gmail_bucket.get("awaiting_reply") or 0)
+            if isinstance(_gmail_bucket.get("awaiting_reply"), (int, float))
+            else len(_gmail_bucket.get("awaiting_reply") or []),
+        "calendar_events": len(_cal_today),
+        "youtube_videos": len(_yt_today),
+        "vault_notes_today": len(today_ev.get("recent_notes") or []),
+        "top_person": _people[0] if _people else None,
+        "top_topic": _topics[0] if _topics else None,
+        "people_cross_source": len(_people),
+        "topics_cross_source": len(_topics),
+        "gaps_count": len((today_correlations or {}).get("gaps") or []),
+    }
 
     brief_rel: str | None = None
     path = VAULT_PATH / MORNING_FOLDER / f"{date_label}-evening.md"

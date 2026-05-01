@@ -210,6 +210,7 @@ def test_every_telemetry_table_has_at_least_one_index(telemetry_db):
         "rag_feedback_golden_meta", # state by id
         "rag_conversations_index",  # state by id
         "rag_schema_version",       # state by table_name
+        "rag_schema_migrations",    # state by id (migration log, append-only)
         "rag_score_calibration",    # state by version
         "rag_response_cache",       # cache by hash
         "rag_ocr_cache",            # cache by hash

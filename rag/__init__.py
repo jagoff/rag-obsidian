@@ -4037,15 +4037,30 @@ def _load_behavior_priors() -> dict:
     with _behavior_priors_lock:
         # Wave1 (2026-04-29) TTL fast-path. Pre-fix cada call abría conn +
         # leía MAX(ts) aunque los priors fueran ~idénticos. Post-fix: si
-        # el cache es fresh dentro del TTL, no tocamos SQL. Es el path
-        # dominante (>90% de calls bajo carga normal — retrieve corre por
-        # cada query del web/CLI). monotonic clock — inmune a NTP jumps.
+        # 2026-04-30 BUG FIX: el TTL early-return previo skipeaba la
+        # verificación de max_ts → si llegaba nueva row a `rag_behavior`
+        # dentro de 60s, el cache devolvía data stale (test
+        # test_reader_cache_invalidates_on_new_max_ts confirma). Ahora
+        # hacemos un cheap `_sql_max_ts` check (~1ms con índice ts en
+        # rag_behavior) ANTES del TTL: si max_ts no cambió, cache sigue
+        # válido independiente del TTL → refresh loaded_at + return.
+        # Si max_ts cambió, caemos al rebuild path. Si SQL falla, fallback
+        # al TTL early-return original (mejor stale que romper retrieve).
         if (
             _behavior_priors_cache is not None
             and _behavior_priors_cache_loaded_at is not None
-            and (time.monotonic() - _behavior_priors_cache_loaded_at) < _BEHAVIOR_PRIORS_TTL_SECONDS
         ):
-            return _behavior_priors_cache
+            try:
+                with _ragvec_state_conn() as _conn_ttl:
+                    _curr_max_ts = _sql_max_ts(_conn_ttl, "rag_behavior")
+                if _curr_max_ts == _behavior_priors_cache_key_sql:
+                    _behavior_priors_cache_loaded_at = time.monotonic()
+                    return _behavior_priors_cache
+                # max_ts cambió → cache stale, fall through al rebuild path
+            except Exception:
+                # SQL down → fallback al TTL fast-path (stale > broken)
+                if (time.monotonic() - _behavior_priors_cache_loaded_at) < _BEHAVIOR_PRIORS_TTL_SECONDS:
+                    return _behavior_priors_cache
 
         def _read_priors():
             with _ragvec_state_conn() as conn:
@@ -5974,6 +5989,149 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             "CREATE INDEX IF NOT EXISTS ix_rag_wa_tasks_ts ON rag_wa_tasks(ts)",
         ),
     ),
+    # NOTA 2026-04-30: las 5 tablas siguientes (rag_promises,
+    # rag_negotiations*, rag_style_fingerprints, rag_behavior_priors_wa)
+    # son features SCAFFOLDEADAS — código existe (rag_negotiations/crud.py,
+    # signal modules) pero no hay daemon activo en `_services_spec()`. Las
+    # mantenemos en el DDL para que la infraestructura esté lista cuando
+    # se quiera activar la feature, y para que los tests unitarios que
+    # cubren el CRUD sigan pasando. Si tras 6+ meses inactivos
+    # querés ahorrar bytes, podés removerlas + dropear los tests.
+    (
+        "rag_promises",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_promises ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " contact_jid TEXT NOT NULL,"
+            " contact_name TEXT,"
+            " promise_text TEXT NOT NULL,"
+            " direction TEXT NOT NULL,"
+            " due_ts TEXT,"
+            " due_confidence REAL,"
+            " source_msg_id TEXT,"
+            " source_chat_jid TEXT,"
+            " status TEXT NOT NULL DEFAULT 'pending',"
+            " reminder_sent_ts TEXT,"
+            " closed_ts TEXT,"
+            " closed_reason TEXT,"
+            " extra_json TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_promises_ts ON rag_promises(ts)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_promises_due_ts ON rag_promises(due_ts)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_promises_status ON rag_promises(status)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_promises_contact ON rag_promises(contact_jid)",
+        ),
+    ),
+    (
+        "rag_negotiations",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_negotiations ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " trace_id TEXT,"
+            " user_intent TEXT NOT NULL,"
+            " target_jid TEXT NOT NULL,"
+            " target_name TEXT,"
+            " status TEXT NOT NULL,"
+            " created_at TEXT NOT NULL,"
+            " updated_at TEXT NOT NULL,"
+            " closed_at TEXT,"
+            " perimeter_json TEXT NOT NULL,"
+            " confidence_threshold REAL,"
+            " max_messages INTEGER,"
+            " messages_sent INTEGER DEFAULT 0,"
+            " messages_received INTEGER DEFAULT 0,"
+            " last_message_id TEXT,"
+            " closure_type TEXT,"
+            " closure_summary TEXT,"
+            " side_effect_json TEXT,"
+            " style_seed_jid TEXT,"
+            " style_examples_count INTEGER,"
+            " cost_estimate_cents INTEGER,"
+            " user_overrode_count INTEGER DEFAULT 0"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_negotiations_status_updated "
+            "ON rag_negotiations(status, updated_at DESC)",
+            "CREATE INDEX IF NOT EXISTS ix_negotiations_target_jid "
+            "ON rag_negotiations(target_jid, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS ix_negotiations_trace_id "
+            "ON rag_negotiations(trace_id) WHERE trace_id IS NOT NULL",
+        ),
+    ),
+    (
+        "rag_negotiation_turns",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_negotiation_turns ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " negotiation_id INTEGER NOT NULL"
+            "   REFERENCES rag_negotiations(id) ON DELETE CASCADE,"
+            " ts TEXT NOT NULL,"
+            " direction TEXT NOT NULL,"
+            " content TEXT NOT NULL,"
+            " classifier_confidence REAL,"
+            " classifier_reasoning TEXT,"
+            " pause_simulated_ms INTEGER,"
+            " bridge_message_id TEXT,"
+            " escalated_at TEXT,"
+            " user_response_text TEXT,"
+            " user_response_at TEXT,"
+            " user_overrode INTEGER"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_negotiation_turns_neg_ts "
+            "ON rag_negotiation_turns(negotiation_id, ts)",
+        ),
+    ),
+    (
+        "rag_negotiation_pending_sends",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_negotiation_pending_sends ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " negotiation_id INTEGER NOT NULL"
+            "   REFERENCES rag_negotiations(id) ON DELETE CASCADE,"
+            " content TEXT NOT NULL,"
+            " typing_simulation_ms INTEGER,"
+            " send_after_ts REAL NOT NULL,"
+            " queued_at TEXT NOT NULL,"
+            " attempts INTEGER DEFAULT 0,"
+            " last_attempt_ts TEXT,"
+            " status TEXT NOT NULL"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_pending_sends_due "
+            "ON rag_negotiation_pending_sends(status, send_after_ts)",
+            "CREATE INDEX IF NOT EXISTS ix_pending_sends_neg "
+            "ON rag_negotiation_pending_sends(negotiation_id, queued_at DESC)",
+        ),
+    ),
+    (
+        "rag_style_fingerprints",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_style_fingerprints ("
+            " target_jid TEXT PRIMARY KEY,"
+            " fingerprint_json TEXT NOT NULL,"
+            " messages_analyzed INTEGER NOT NULL,"
+            " computed_at TEXT NOT NULL"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_style_fingerprints_computed "
+            "ON rag_style_fingerprints(computed_at DESC)",
+        ),
+    ),
+    (
+        "rag_behavior_priors_wa",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_behavior_priors_wa ("
+            " target_jid TEXT PRIMARY KEY,"
+            " response_lag_mu REAL,"
+            " response_lag_sigma REAL,"
+            " avg_msg_length_words REAL,"
+            " msg_per_response REAL,"
+            " emoji_freq REAL,"
+            " samples_n INTEGER,"
+            " computed_at TEXT NOT NULL"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_behavior_priors_wa_computed "
+            "ON rag_behavior_priors_wa(computed_at DESC)",
+        ),
+    ),
     (
         "rag_archive_log",
         (
@@ -7134,13 +7292,22 @@ def _ensure_telemetry_tables(conn) -> None:
     requerido) y skip el DDL.
     """
     import sqlite3 as _sqlite3
-    conn.execute("PRAGMA synchronous=NORMAL")
+    # 2026-04-30: PRAGMAs defensivos — si el conn entró ya en transacción
+    # (callers que abren BEGIN antes de invocar), `PRAGMA synchronous` tira
+    # "Safety level may not be changed inside a transaction". Skip silent.
     # Audit R2-7 #5: foreign_keys=ON requerido para que los `REFERENCES
     # ... ON DELETE CASCADE` declarados en el schema (ej.
     # rag_entity_mentions → rag_entities) se enforcen. SQLite por
     # default los IGNORA — borrar una entity dejaba rows huérfanas en
     # mentions hasta el prune. Pragma es per-connection.
-    conn.execute("PRAGMA foreign_keys=ON")
+    try:
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except _sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("PRAGMA foreign_keys=ON")
+    except _sqlite3.OperationalError:
+        pass
     # Identificar la DB por su file path. `database` columna del
     # `database_list` PRAGMA da el path absoluto del main db (vacío para
     # in-memory, en cuyo caso nunca cacheamos — siempre re-ensure).
@@ -27398,7 +27565,22 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
         indexed_files.add(doc_id_prefix)
 
     # Orphan cleanup: files in DB that no longer exist on disk
-    orphan_files = set(file_to_chunks.keys()) - indexed_files
+    # 2026-04-30 BUG FIX: cross-source chunks (whatsapp://X, calendar://Y, etc.)
+    # tienen `file` con URI scheme — NO son paths del vault rglob, así que el
+    # set difference los marcaba a TODOS como huérfanos y los borraba en cada
+    # `rag maintenance`. Filtramos los URI schemes para que solo los chunks
+    # source=vault sean candidatos a orphan cleanup. Los ingesters dedicados
+    # (`scripts/ingest_*.py`) son los únicos dueños de los chunks cross-source
+    # y manejan su propio stale-detect via state cursor (`rag_*_state` tables).
+    _CROSS_SOURCE_PREFIXES = (
+        "whatsapp://", "calendar://", "gmail://", "reminders://",
+        "calls://", "safari://", "contacts://", "gdrive://", "messages://",
+    )
+    orphan_files_raw = set(file_to_chunks.keys()) - indexed_files
+    orphan_files = {
+        f for f in orphan_files_raw
+        if not any(f.startswith(p) for p in _CROSS_SOURCE_PREFIXES)
+    }
     orphan_ids: list[str] = []
     for f in orphan_files:
         orphan_ids.extend(eid for eid, _ in file_to_chunks[f])
@@ -53868,6 +54050,7 @@ _SQL_ROTATION_POLICY: tuple[tuple, ...] = (
     ("rag_ambient", 60),
     ("rag_brief_written", 60),
     ("rag_wa_tasks", 60),
+    ("rag_promises", 90),
     ("rag_archive_log", 60),
     ("rag_filing_log", 60),
     ("rag_eval_runs", 60),

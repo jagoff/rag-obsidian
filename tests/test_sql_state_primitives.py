@@ -98,39 +98,25 @@ def test_ensure_telemetry_tables_idempotent(tmp_path):
     # 1 anticipate feedback (rag_anticipate_feedback, 2026-04-30 — movida
     # de DDL standalone en rag_anticipate/feedback.py al DDL central para
     # que aparezca en schema checks y rollback loop) =
-    # 47 tables total. Nota: 6 tablas ghost removidas 2026-04-30
-    # (rag_promises, rag_negotiations, rag_negotiation_turns,
-    # rag_negotiation_pending_sends, rag_style_fingerprints,
-    # rag_behavior_priors_wa — sin daemon activo en _services_spec).
-    # Los módulos rag_negotiations/crud.py siguen vivos; si se activa el
-    # daemon, los módulos recrean las tablas vía CREATE TABLE IF NOT EXISTS.
+    # 53 tables total tras restaurar las 5 dormant (rag_promises,
+    # rag_negotiations*, rag_style_fingerprints, rag_behavior_priors_wa)
+    # + agregar rag_anticipate_feedback al DDL central. Las dormant
+    # mantienen la infra de tabla para que tests del CRUD pasen y la
+    # feature pueda activarse en el futuro sin migration manual; el
+    # daemon-activation gate vive en `_services_spec()`.
     expected = {name for name, _ in rag._TELEMETRY_DDL}
     assert expected.issubset(after)
     # Sanity floor: si esto baja accidentalmente, alguien borró tablas en
     # _TELEMETRY_DDL sin migration. El upper bound no se trackea acá — la
     # lista crece naturalmente con cada feature nueva.
-    assert len(expected) >= 47, (
-        f"_TELEMETRY_DDL bajó de 47 tablas (ahora {len(expected)}) — "
+    assert len(expected) >= 53, (
+        f"_TELEMETRY_DDL bajó de 53 tablas (ahora {len(expected)}) — "
         "verificar que ninguna feature perdió su tabla"
     )
     # Fix #2 — rag_anticipate_feedback debe estar en el DDL central
     assert "rag_anticipate_feedback" in expected, (
         "rag_anticipate_feedback debe estar en _TELEMETRY_DDL"
     )
-    # Tablas ghost eliminadas 2026-04-30 — si vuelven a aparecer, el audit
-    # las detectará como surplus en lugar de como ghost.
-    for _ghost in (
-        "rag_promises",
-        "rag_negotiations",
-        "rag_negotiation_turns",
-        "rag_negotiation_pending_sends",
-        "rag_style_fingerprints",
-        "rag_behavior_priors_wa",
-    ):
-        assert _ghost not in expected, (
-            f"{_ghost} es una tabla ghost — fue removida de _TELEMETRY_DDL; "
-            "no re-agregarla sin un daemon activo en _services_spec()"
-        )
     c.close()
 
 

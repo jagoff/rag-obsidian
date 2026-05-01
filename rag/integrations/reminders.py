@@ -31,7 +31,47 @@ because each call re-resolves the attribute on the `rag` module.
 
 from __future__ import annotations
 
+import os
+import threading
+import time
 from datetime import datetime, timedelta
+
+
+# 2026-05-01: TTL cache para `_fetch_reminders_due`. El osascript itera
+# todas las listas de Reminders + todos los items con `completed is false`
+# — observado 2.1s p50 en producción ([chat-timing] tool_ms=2153 dominado
+# por reminders, otros tools del bucket paralelo en 240-300ms). Como el
+# pre-router web dispara reminders + calendar + whatsapp_pending en
+# paralelo, reminders es el "long pole" del wall-clock del chat web.
+#
+# Impacto: el user que hace varias preguntas seguidas ("qué tengo hoy"
+# → "y mañana?" → "y la semana que viene?") en <30s reusa el resultado
+# cacheado en vez de re-ejecutar osascript. Latencia del bucket paralelo
+# baja de ~2s a ~300ms (calendario via icalBuddy) en hits subsiguientes.
+#
+# TTL 30s es seguro: si el user crea un reminder nuevo en Reminders.app
+# durante el chat, lo verá en máx 30s. Conservador comparado con la
+# semántica del agent (las queries del chat se procesan en horizonte de
+# segundos, no de tiempo real).
+#
+# Override via env: `RAG_REMINDERS_CACHE_TTL=N` (segundos). 0 desactiva.
+# Tests usan 0 para evitar cross-test pollution.
+_REMINDERS_CACHE_LOCK = threading.Lock()
+# Tuple: (timestamp_mono, raw_osascript_output). None when not yet populated.
+_REMINDERS_CACHE: dict[str, tuple[float, str]] = {}
+
+
+def _reminders_cache_ttl() -> float:
+    try:
+        return float(os.environ.get("RAG_REMINDERS_CACHE_TTL", "30"))
+    except (ValueError, TypeError):
+        return 30.0
+
+
+def _reminders_cache_clear() -> None:
+    """Test helper — wipes the cache between cases."""
+    with _REMINDERS_CACHE_LOCK:
+        _REMINDERS_CACHE.clear()
 
 
 _REMINDERS_SCRIPT = '''
@@ -87,11 +127,34 @@ def _fetch_reminders_due(now: datetime, horizon_days: int = 1, max_items: int = 
     reminders without any due date. Splits into buckets: ``overdue`` / ``today``
     / ``upcoming`` (dated) and ``undated`` (no due). Undated reminders land at
     the bottom of the sort order — still actionable but not time-sensitive.
+
+    The raw osascript output is cached with TTL `RAG_REMINDERS_CACHE_TTL`
+    (default 30s) — see module-level docstring. Filtering by `now` /
+    `horizon_days` / `max_items` always runs fresh against the cached
+    output, so changing those args produces correct results within the
+    TTL window.
     """
     from rag import _apple_enabled, _osascript, _parse_applescript_date
     if not _apple_enabled():
         return []
-    out = _osascript(_REMINDERS_SCRIPT, timeout=45.0)
+    # TTL cache lookup (key independiente de args — el script siempre
+    # devuelve TODOS los reminders incompletos; el filter por horizon/
+    # now/max corre Python-side abajo).
+    _ttl = _reminders_cache_ttl()
+    out: str = ""
+    _now_mono = time.monotonic()
+    if _ttl > 0:
+        with _REMINDERS_CACHE_LOCK:
+            _entry = _REMINDERS_CACHE.get("raw")
+            if _entry is not None and (_now_mono - _entry[0]) < _ttl:
+                out = _entry[1]
+    if not out:
+        out = _osascript(_REMINDERS_SCRIPT, timeout=45.0)
+        if _ttl > 0 and out:
+            with _REMINDERS_CACHE_LOCK:
+                # Guardamos el raw script output (no la lista filtrada) —
+                # así callers con horizon_days distintos comparten el cache.
+                _REMINDERS_CACHE["raw"] = (_now_mono, out)
     if not out:
         return []
     today = now.replace(hour=0, minute=0, second=0, microsecond=0)

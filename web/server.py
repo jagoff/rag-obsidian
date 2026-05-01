@@ -7581,7 +7581,12 @@ def _fetch_calendar_ahead(days_ahead: int, max_events: int = 40) -> list[dict]:
             stripped,
         )
         if m:
-            current["time_range"] = f"{m.group(1)}–{m.group(2)}"
+            # Normalizamos a 24h para que el LLM no aluzine con AM/PM —
+            # ver _normalize_time_range_to_24h docstring para repro.
+            from rag.integrations.calendar import _normalize_time_range_to_24h
+            current["time_range"] = _normalize_time_range_to_24h(
+                f"{m.group(1)}–{m.group(2)}"
+            )
             # date label is everything before the "at HH:MM" span
             label = stripped.split(" at ", 1)[0].strip()
             if label and label != stripped:
@@ -12502,10 +12507,50 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         _reform_fired = False
         _reform_used_concat = False
         _reform_used_llm = False
+        _reform_skipped_reason = ""
         last_user_q = next(
             (m["content"] for m in reversed(history) if m.get("role") == "user"),
             None,
         ) if history else None
+
+        # 2026-05-01 fix: si el pre-router (regex puro, sub-millisecond)
+        # ya va a forzar tools deterministas (reminders_due / calendar_
+        # ahead / whatsapp_pending / weather / etc.), el `search_question`
+        # se va a usar para retrieve() pero ese retrieve se reemplaza
+        # entero por el output de los tools (línea ~13586). El reform LLM
+        # acá es desperdicio puro — y peor, bajo presión de Ollama puede
+        # quedar 60-180s esperando un slot del _HELPER_SEM. Log real
+        # 2026-05-01: query "qué tengo hoy" (q_words=3, cosine=0.471 →
+        # banda borderline path c) → reform=174289ms con tools
+        # whatsapp_pending+calendar_ahead+reminders_due ya forzados,
+        # mientras el watchdog ollama logueaba `restart_skipped_in_flight`
+        # con p95_recent=291498ms vs baseline=52134ms (5.59x). Skipear el
+        # reform en ese caso ahorra todo ese wait — el retrieve va a ser
+        # secundario al tool output igual.
+        #
+        # try/except defensivo: el SEGUNDO call site de `_detect_tool_intent`
+        # en este turn vive más abajo (~12838) con su propio try/except y
+        # cubre el contrato SSE error+done. Acá es read-only y un crash
+        # del regex no debe abortar el chat ni saltearse el path (a/c) —
+        # fallback safe = asumir "no forced tools" y seguir.
+        try:
+            _pre_router_will_force_tools = bool(_detect_tool_intent(question))
+        except Exception:
+            _pre_router_will_force_tools = False
+
+        # 2026-05-01 fix: queries cortas autónomas sin pronombres
+        # ("qué tengo hoy", "clima en BA") caen en banda borderline cosine
+        # cuando el turno previo era de otro tema, pero NO necesitan
+        # reform LLM — son self-contained. El path (c) original se diseñó
+        # para queries con elipsis ("y cómo las indexás") donde el regex
+        # de path (a) no engancha. Acá agregamos una guarda extra:
+        # queries de ≤3 palabras sin pronombres anaphoricos no se
+        # benefician del reform y sí pagan la latencia.
+        from rag import _TOPIC_SHIFT_FOLLOWUP_RE as _RAG_FOLLOWUP_RE
+        _q_words = len(question.split())
+        _has_anaphora_cue = bool(_RAG_FOLLOWUP_RE.search(question))
+        _query_likely_autonomous = (_q_words <= 3 and not _has_anaphora_cue)
+
         if history and last_user_q:
             if _looks_like_followup(question):
                 # (a) Regex match → concat (cheap, 0ms).
@@ -12515,6 +12560,8 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             elif (
                 _topic_shift_cosine is not None
                 and TOPIC_SHIFT_COSINE <= _topic_shift_cosine < REFORM_COSINE_HIGH
+                and not _pre_router_will_force_tools
+                and not _query_likely_autonomous
             ):
                 # (c) Borderline cosine band → reform LLM.
                 try:
@@ -12532,6 +12579,21 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     search_question = f"{last_user_q} {question}"
                     _reform_fired = True
                     _reform_used_concat = True
+            elif (
+                _topic_shift_cosine is not None
+                and TOPIC_SHIFT_COSINE <= _topic_shift_cosine < REFORM_COSINE_HIGH
+                and _pre_router_will_force_tools
+            ):
+                # Banda borderline pero pre-router forzó tools → skip
+                # reform por completo, raw query es suficiente (el retrieve
+                # va a quedar reemplazado por tool output igual).
+                _reform_skipped_reason = "forced_tools"
+            elif (
+                _topic_shift_cosine is not None
+                and TOPIC_SHIFT_COSINE <= _topic_shift_cosine < REFORM_COSINE_HIGH
+                and _query_likely_autonomous
+            ):
+                _reform_skipped_reason = "short_autonomous"
             # else (d): high cosine ≥ 0.7 or cosine=None (anaphoric/short/
             # person already handled above) → raw query is fine.
         _t_reform_end = time.perf_counter()
@@ -14268,6 +14330,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         _reform_outcome = (
             "concat" if _reform_used_concat
             else "rewritten" if _reform_fired
+            else f"skipped_{_reform_skipped_reason}" if _reform_skipped_reason
             else "skipped"
         )
         _tool_names_str = ",".join(tool_names_called)

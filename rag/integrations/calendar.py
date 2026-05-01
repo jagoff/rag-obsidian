@@ -38,6 +38,55 @@ from __future__ import annotations
 import re
 
 
+# 2026-05-01: convertir el time-range de icalBuddy de 12h (AM/PM) a 24h
+# antes de inyectarlo al CONTEXTO del LLM. Repro user 2026-05-01: query
+# "qué tengo hoy" devolvió `Entrega llave casa (10:30 AM–en en:00 AM)` —
+# el modelo (qwen2.5:7b bajo presión de Ollama) confundió "11" con "en"
+# al renderizar, probablemente por interacción rara entre los tokens
+# "AM"/"PM" y los dígitos cuando el modelo está cold-loading. 24h sin
+# sufijos AM/PM es robusto: el user lee igual de bien "10:30–11:00" y
+# el LLM no tiene tokens espurios que confundir.
+_TIME_12H_RE = re.compile(r"^\s*(\d{1,2}):(\d{2})\s*([AaPp][Mm])\s*$")
+
+
+def _normalize_time_to_24h(raw: str) -> str:
+    """Convierte '10:30 AM' → '10:30', '11:00 PM' → '23:00'.
+
+    Pasa-through inputs ya en 24h ('10:30', '23:00') o malformed.
+    """
+    if not raw:
+        return ""
+    raw = raw.strip()
+    m = _TIME_12H_RE.match(raw)
+    if not m:
+        return raw  # ya es 24h o malformed — no tocar
+    hour = int(m.group(1))
+    minute = m.group(2)
+    suffix = m.group(3).upper()
+    if suffix == "AM":
+        hour = 0 if hour == 12 else hour
+    else:  # PM
+        hour = 12 if hour == 12 else hour + 12
+    return f"{hour:02d}:{minute}"
+
+
+def _normalize_time_range_to_24h(time_range: str) -> str:
+    """'10:30 AM-11:00 AM' → '10:30-11:00'. Acepta separador `-` o `–`."""
+    if not time_range:
+        return ""
+    # Split en cualquier dash (ASCII o em-dash). La función de upstream
+    # mete em-dash; mantenemos compat con ambos.
+    for sep in ("–", "-"):
+        if sep in time_range:
+            parts = time_range.split(sep, 1)
+            if len(parts) == 2:
+                left = _normalize_time_to_24h(parts[0])
+                right = _normalize_time_to_24h(parts[1])
+                if left and right:
+                    return f"{left}–{right}"
+    return time_range
+
+
 def _fetch_calendar_today(max_events: int = 15) -> list[dict]:
     """Events scheduled for today via icalBuddy. Returns [] if icalBuddy is
     not installed — the user can `brew install ical-buddy` to enable.
@@ -95,8 +144,8 @@ def _fetch_calendar_today(max_events: int = 15) -> list[dict]:
         # or bare "09:30 - 10:00"
         m = re.search(r"(\d{1,2}:\d{2}(?:\s*[AaPp][Mm])?)\s*-\s*(\d{1,2}:\d{2}(?:\s*[AaPp][Mm])?)", stripped)
         if m:
-            current["start"] = m.group(1)
-            current["end"] = m.group(2)
+            current["start"] = _normalize_time_to_24h(m.group(1))
+            current["end"] = _normalize_time_to_24h(m.group(2))
     if current and current.get("title"):
         events.append(current)
     events.sort(key=lambda e: e["start"] or "99:99")
@@ -142,7 +191,9 @@ def _fetch_calendar_ahead(days_ahead: int, max_events: int = 40) -> list[dict]:
             stripped,
         )
         if m:
-            current["time_range"] = f"{m.group(1)}–{m.group(2)}"
+            current["time_range"] = _normalize_time_range_to_24h(
+                f"{m.group(1)}–{m.group(2)}"
+            )
             label = stripped.split(" at ", 1)[0].strip()
             if label and label != stripped:
                 current["date_label"] = label

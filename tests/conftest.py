@@ -125,6 +125,34 @@ def _block_real_whatsapp_send(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_reminders_cache(request, monkeypatch):
+    """2026-05-01: el TTL cache de `_fetch_reminders_due` (rag/integrations/
+    reminders.py) puede compartir el mismo raw output de `_osascript` entre
+    tests si éstos no isolan el state. Repro: `test_fetch_reminders_skips_
+    items_without_parseable_date` falla en full-suite run (pasa en isolation)
+    porque un test anterior cacheó otro fixture y el TTL default de 30s
+    sobrevive.
+
+    Fix: setear `RAG_REMINDERS_CACHE_TTL=0` por default en tests + clear
+    explícito del cache al teardown. Tests que quieren ejercitar el cache
+    real (`test_chat_latency_fixes_2026_05_01.py::test_reminders_cache_*`)
+    seteán la env var con `monkeypatch.setenv` que gana sobre este default.
+    """
+    monkeypatch.setenv("RAG_REMINDERS_CACHE_TTL", "0")
+    try:
+        from rag.integrations import reminders as _reminders_mod
+        _reminders_mod._reminders_cache_clear()
+    except Exception:
+        pass
+    yield
+    try:
+        from rag.integrations import reminders as _reminders_mod
+        _reminders_mod._reminders_cache_clear()
+    except Exception:
+        pass
+
+
+@pytest.fixture(autouse=True)
 def _isolate_apple_integrations(request, monkeypatch):
     """Safety-critical: bloquear escrituras a Apple Reminders / Calendar /
     Contacts reales durante los tests.

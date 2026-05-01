@@ -2874,6 +2874,7 @@ def is_excluded(rel_path: str) -> bool:
     if rel_path.startswith(system_prefix) and not (
         rel_path.startswith(system_prefix + "99-Mentions/")
         or rel_path.startswith(system_prefix + "99-AI/memory/")
+        or rel_path.startswith(system_prefix + "99-AI/external-ingest/")
     ):
         return True
     claude_prefix = "03-Resources/Claude/"
@@ -13690,7 +13691,11 @@ _corpus_cache_lock = threading.RLock()
 # BM25 concurrency guard — see CLAUDE.md invariant "BM25 GIL-serialised — do NOT
 # parallelise" (measured 3× slower when wrapped in ThreadPoolExecutor on M3 Max).
 # Lock() (not RLock) is intentional: even nested calls from the same thread must
-# fail fast, because nesting would indicate a latent parallelism bug in retrieve().
+# wait — nesting would indicate a latent parallelism bug in retrieve().
+#
+# Política 2026-05-01: `bm25_search` usa `acquire(timeout=30.0)`. El segundo
+# caller espera al primero (legítimo en /api/chat concurrente del web server)
+# en vez de fallar. Ver doc-string de `bm25_search` para el rationale.
 _bm25_inflight_lock = threading.Lock()
 
 
@@ -14978,16 +14983,34 @@ def bm25_search(
     """Keyword search using BM25 over the full collection.
 
     GIL-serialised by design — CLAUDE.md invariant (measured 3× slower when
-    parallelised on M3 Max). A non-blocking lock guards against accidental
-    ThreadPoolExecutor wrapping: raises RuntimeError immediately instead of
-    silently serialising, which would hide the bug and make the invariant
-    impossible to detect from a stack trace.
+    parallelised on M3 Max). El lock garantiza que un solo `bm25_search`
+    corre a la vez y mantiene el invariante de la regla.
+
+    Política de contención (2026-05-01):
+    - `acquire(timeout=30.0)`: si llegan dos requests legítimos concurrentes
+      al server (caso real: dos /api/chat seguidos del mismo user, o doble-
+      fetch del frontend), el segundo ESPERA al primero en lugar de fallar.
+      BM25 sobre el corpus actual mide ~30ms warm; la espera real es <1s
+      en condiciones normales. El timeout 30s solo se gatilla si hay un
+      wedge real (corpus rebuild colgado, MPS contention severa, etc.) —
+      ahí sí queremos fail-fast con stack trace para no quedar pegados.
+    - Si el `acquire` timeoutea: `RuntimeError` con mensaje detallado +
+      el caller upstream (web server) loggea el traceback completo para
+      poder identificar quién está sosteniendo el lock.
+
+    Pre-fix (commit anterior) era `blocking=False` → `raise inmediato`.
+    Eso fallaba TODOS los retries del user con `bm25_search llamado en
+    paralelo` aunque la "paralelización" fuera dos requests legítimos
+    secuenciales con apenas overlap. El user veía "No pude buscar en
+    el vault" en cada reintento (logs 2026-05-01 ~15:14, líneas 37643-
+    37645 de web.log). Ver stack en `[chat-error-sanitized]`.
     """
-    if not _bm25_inflight_lock.acquire(blocking=False):
+    if not _bm25_inflight_lock.acquire(timeout=30.0):
         raise RuntimeError(
-            "bm25_search llamado en paralelo — es GIL-serialised por diseño "
-            "(CLAUDE.md línea 126, medido 3× slower paralelo en M3 Max). "
-            "Revisá el stack si vino de un ThreadPoolExecutor."
+            "bm25_search lock timeout (30s) — algo está sosteniendo el "
+            "lock más de lo esperado (corpus rebuild colgado, MPS "
+            "contention severa, o un caller con bug que no liberó). "
+            "Revisá el stack y `_load_corpus`."
         )
     try:
         c = _load_corpus(col)
@@ -20497,11 +20520,28 @@ def reformulate_query(
     # se libere un slot en la queue. El cap acumulado de 21s es seguro
     # porque el caller (retrieve()) ya tiene timeout total de 60s y
     # degrada a la pregunta original si todo falla.
+    #
+    # 2026-05-01 (afternoon): el blanket-retry de cualquier Exception era
+    # catastrófico para ReadTimeout — el helper hung 60s por attempt × 4
+    # attempts + 21s backoffs = 261s de wait observados en producción
+    # (`reform=261773ms reform_outcome=rewritten` en chat-timing log).
+    # Para ReadTimeout/RemoteProtocolError el retry NO ayuda: el helper
+    # está colgado, retra-nundolo paga otros 60s por nada. Para 503
+    # ("server busy") sí ayuda — resuelve en <1s al liberar un slot
+    # del queue de Ollama. Fix: split el retry policy por tipo de error.
+    #
+    #   - 503 ResponseError → retry rápido (1s/2s/4s, 3 attempts max,
+    #     max wait acumulado 7s)
+    #   - ReadTimeout / RemoteProtocolError → NO retry, fail fast a la
+    #     pregunta original (retry no resuelve un cold-load hung)
+    #   - Otras Exception → no retry tampoco (defensivo)
+    #
+    # P99 reform observado pre-fix: 30s. Post-fix esperado: <2s.
     _last_exc: Exception | None = None
-    _backoffs = (0.0, 3.0, 6.0, 12.0)  # 3 retries + intento inicial
-    for _attempt, _wait in enumerate(_backoffs):
+    _retry_503_backoffs = (0.0, 1.0, 2.0, 4.0)  # only used for 503s
+    import time as _time
+    for _attempt, _wait in enumerate(_retry_503_backoffs):
         if _wait > 0:
-            import time as _time
             _time.sleep(_wait)
         try:
             resp = _helper_client().chat(
@@ -20514,6 +20554,21 @@ def reformulate_query(
             return _postprocess_reformulation(question, raw, history)
         except Exception as exc:
             _last_exc = exc
+            _exc_str = str(exc).lower()
+            # 503 detection by message (más robusto que matchear el
+            # type — los tests usan plain Exception y los daemons reales
+            # pueden envolver ResponseError en otras clases). El mensaje
+            # de ollama 503 siempre contiene "503", "server busy" o
+            # "maximum pending requests exceeded".
+            _is_503 = (
+                "503" in _exc_str
+                or "server busy" in _exc_str
+                or "maximum pending" in _exc_str
+            )
+            if not _is_503:
+                # Hung helper / connection issue / other — retry no
+                # resuelve nada. Romper el loop y degradar inmediatamente.
+                break
     # Todos los intentos fallaron — loguear y degradar.
     try:
         _silent_log("reformulate_query_failed", _last_exc)
@@ -23416,6 +23471,14 @@ def multi_retrieve(
     filters_applied: dict = {}
     _mv_contradiction_count_acc = 0
     _mv_mmr_count_acc = 0
+    # 2026-05-01 (afternoon): probé paralelizar per-vault con
+    # ThreadPoolExecutor y rebotó contra `_bm25_inflight_lock` que es
+    # GIL-serialised by design (CLAUDE.md línea 126 — paralelizar BM25
+    # midió 3× más lento en M3 Max). El loop secuencial es la opción
+    # correcta hasta que se haga un per-vault BM25 cache que no
+    # comparta lock global. Para multi-vault scenarios el costo
+    # secuencial se mitiga via Fix #2 (rerank_pool más chico) +
+    # Fix #4 (embedder pre-warm) que reducen el costo POR vault.
     for name, path in vaults:
         col = get_db_for(path)
         if col.count() == 0:

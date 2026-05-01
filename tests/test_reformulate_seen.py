@@ -97,11 +97,14 @@ def _make_fake_resp(content: str):
     return _Resp(content)
 
 
-def test_reformulate_retries_once_on_timeout(monkeypatch):
-    """Primer timeout → 1 retry con 3s sleep → éxito en el segundo intento.
+def test_reformulate_no_retry_on_timeout(monkeypatch):
+    """Timeout → fail-fast, sin retry, degrada a la pregunta original.
 
-    Fix 2026-04-30: 67 timeouts de cold-load de qwen2.5:3b en 48h.
-    El retry da tiempo al cold-load y convierte la mayoría en éxitos.
+    Fix 2026-05-01 (afternoon): el blanket-retry de cualquier Exception
+    multiplicaba el wait en ReadTimeout (60s × 4 attempts = 240s+ observado
+    en `reform=261773ms` en chat-timing log). Para ReadTimeout retra-
+    nundo NO ayuda — el helper está hung, paga otros 60s por nada.
+    Sólo retra-mos en 503 ("server busy") que resuelve en <1s.
     """
     import rag
 
@@ -113,23 +116,20 @@ def test_reformulate_retries_once_on_timeout(monkeypatch):
 
     def _fake_chat(model, messages, **kwargs):
         calls["n"] += 1
-        if calls["n"] == 1:
-            raise Exception("timed out")
-        return _make_fake_resp("pregunta reformulada")
+        raise Exception("timed out")
 
     monkeypatch.setattr(rag.ollama, "chat", _fake_chat)
     monkeypatch.setattr(rag, "_postprocess_reformulation",
                         lambda q, raw, hist: raw)
-    import rag as _rag_mod
-    # Patch time.sleep inside the rag module namespace
     import unittest.mock as mock
     with mock.patch("time.sleep", side_effect=_fake_sleep):
         history = [{"role": "user", "content": "pregunta anterior"}]
         result = rag.reformulate_query("y eso?", history)
 
-    assert result == "pregunta reformulada"
-    assert calls["n"] == 2, "debe haber exactamente 2 intentos"
-    assert slept["total"] >= 3.0, "debe dormir >= 3s entre intentos"
+    # Devuelve la pregunta original (degradación), 1 call sólo (no retry).
+    assert result == "y eso?"
+    assert calls["n"] == 1, "timeout NO debe disparar retry — fail fast"
+    assert slept["total"] == 0.0, "no sleep cuando no hay retry"
 
 
 def test_reformulate_retries_once_on_503(monkeypatch):
@@ -159,13 +159,16 @@ def test_reformulate_retries_once_on_503(monkeypatch):
     assert calls["n"] == 2
 
 
-def test_reformulate_degrades_after_all_failures(monkeypatch):
-    """Todos los intentos fallan → devuelve la pregunta original sin crashear.
+def test_reformulate_degrades_after_503_failures(monkeypatch):
+    """Todos los 503 fallan → devuelve la pregunta original sin crashear.
 
-    2026-05-01: subimos de 2 a 4 intentos (1 + 3 retries con backoff
-    exponencial 3s/6s/12s) tras un burst de 32×503 cuando online-tune
-    catchup disparó el eval saturando Ollama. Total worst-case wait
-    21s, dentro del cap de 60s del retrieve() caller.
+    2026-05-01 (afternoon): el retry policy se splitteó por tipo de error.
+    Para 503 ("server busy") seguimos haciendo 4 attempts con backoff
+    exponencial (1s/2s/4s, total worst-case 7s acumulado, mucho más
+    barato que el viejo 21s pero suficiente — un slot de Ollama se
+    libera en <1s al terminar el call que lo tenía). Para no-503
+    (ReadTimeout, RemoteProtocolError, etc.) NO retra-mos, se rompe
+    el loop tras la primera Exception y se degrada.
     """
     import rag
 
@@ -174,22 +177,56 @@ def test_reformulate_degrades_after_all_failures(monkeypatch):
 
     def _fake_chat(model, messages, **kwargs):
         calls["n"] += 1
-        raise Exception("timed out")
+        raise Exception("server busy, please try again. maximum pending requests exceeded (status code: 503)")
 
     def _fake_silent_log(where, exc, **kw):
         logged["exc"] = exc
 
+    # _silent_log se invoca como _silent_log(where, exc) — aceptar **kw
+    # defensivo. Real signature: _silent_log(where: str, exc: Exception | None).
     monkeypatch.setattr(rag.ollama, "chat", _fake_chat)
     monkeypatch.setattr(rag, "_silent_log", _fake_silent_log)
+    # Hack: el monkeypatch de _silent_log con _fake_silent_log no respeta
+    # la signature real (sólo 2 args). El módulo lo invoca con 2 args
+    # positional, así que el lambda con **kw está fine.
     import unittest.mock as mock
     with mock.patch("time.sleep"):
         history = [{"role": "user", "content": "contexto"}]
         result = rag.reformulate_query("pregunta original", history)
 
     assert result == "pregunta original"
-    # 1 intento inicial + 3 retries con backoff exponencial = 4 calls
-    assert calls["n"] == 4, "exactamente 4 intentos (no loop infinito)"
+    # 503 retries: 1 intento inicial + 3 retries = 4 calls totales.
+    assert calls["n"] == 4, "exactamente 4 intentos para 503 (no loop infinito)"
     assert logged["exc"] is not None, "debe loguear la excepción del último intento"
+
+
+def test_reformulate_no_retry_on_non_503(monkeypatch):
+    """Cualquier Exception que NO sea 503 → 1 call sin retry, degrada.
+
+    Cubre el cambio de semántica del 2026-05-01 (afternoon): el blanket-
+    retry causaba reform=261s (4× 60s ReadTimeout). Ahora ReadTimeout +
+    RemoteProtocolError + cualquier otra Exception salen del loop tras
+    el 1er intento y devuelven la pregunta original.
+    """
+    import rag
+
+    for exc_msg in ("timed out", "Server disconnected without sending a response.",
+                    "Connection refused", "some other unexpected error"):
+        calls = {"n": 0}
+
+        def _fake_chat(model, messages, **kwargs):
+            calls["n"] += 1
+            raise Exception(exc_msg)
+
+        monkeypatch.setattr(rag.ollama, "chat", _fake_chat)
+        monkeypatch.setattr(rag, "_silent_log", lambda *a, **k: None)
+        import unittest.mock as mock
+        with mock.patch("time.sleep"):
+            history = [{"role": "user", "content": "contexto"}]
+            result = rag.reformulate_query("pregunta original", history)
+
+        assert result == "pregunta original", f"degrada en exc={exc_msg!r}"
+        assert calls["n"] == 1, f"sin retry para exc={exc_msg!r} (calls={calls['n']})"
 
 
 def test_reformulate_succeeds_on_third_retry(monkeypatch):

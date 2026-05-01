@@ -2579,6 +2579,54 @@ def _warmup() -> None:
 
     threading.Thread(target=_do_warmup, daemon=True).start()
 
+    # 2026-05-01 (afternoon): bloquear el startup hook hasta que
+    # `_local_embedder_ready` Event esté set (o un cap de 20s
+    # elapse) cuando RAG_LOCAL_EMBED=1. Pre-fix, los primeros 5-6
+    # /api/chat post-restart pagaban embed_ms = 4-7s porque el
+    # warmup async todavía no había seteado el Event y el path
+    # de retrieve esperaba 6s antes de fallback-ear a ollama
+    # (que ALSO arrancaba cold en algunos casos). El user veía
+    # las primeras búsquedas post-restart muy lentas.
+    #
+    # Trade-off: el daemon tarda 5-15s más en arrancar (el
+    # `_warmup_local_embedder()` carga bge-m3 SentenceTransformer
+    # + 1 dummy encode = ~5s en M3 Max warm disk). Acceptable —
+    # el daemon ya tiene `ThrottleInterval=30s` en el plist así
+    # que no rebota tan rápido. Skip via env si hace falta:
+    # `RAG_WEB_BLOCK_ON_EMBED_WARMUP=0` restaura el legacy
+    # non-blocking startup.
+    _block_embed_str = os.environ.get(
+        "RAG_WEB_BLOCK_ON_EMBED_WARMUP", "1"
+    ).strip().lower()
+    if (
+        _block_embed_str not in ("0", "false", "no")
+        and os.environ.get("RAG_LOCAL_EMBED", "").strip()
+            not in ("", "0", "false", "no")
+    ):
+        try:
+            from rag import _local_embedder_ready
+            _t0_embed_block = time.perf_counter()
+            _ready = _local_embedder_ready.wait(timeout=20.0)
+            _block_ms = int((time.perf_counter() - _t0_embed_block) * 1000)
+            if _ready:
+                print(
+                    f"[warmup] embedder ready in {_block_ms}ms — "
+                    f"first query will skip cold-load",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[warmup] embedder NOT ready after {_block_ms}ms — "
+                    f"continuing anyway, first queries may pay cold-load tax",
+                    flush=True,
+                )
+        except Exception as _exc:
+            print(
+                f"[warmup] embedder block-on-warmup skipped: "
+                f"{type(_exc).__name__}: {_exc}",
+                flush=True,
+            )
+
     def _idle_sweeper() -> None:
         """Evict the reranker from MPS after `_RERANKER_IDLE_TTL` of no
         activity. Keeps the Mac responsive when the user walks away from
@@ -12286,7 +12334,28 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             # 12+ resultados puede iterar pidiendo "más" en el chat.
             _is_list_intent = bool(_LIST_INTENT_RE.search(search_question))
             _retrieve_k = 8 if _is_list_intent else 4
-            _retrieve_pool = 15 if _is_list_intent else 5
+            # 2026-05-01 (afternoon): bajamos rerank_pool default 5→3 para
+            # non-list intent. Telemetría real (`rag_queries.extra_json.timing`,
+            # 30 últimas web queries): rerank_ms p50=1392, p95=14329, max=20974.
+            # 5 pares × ~50ms expected = 250ms warm. La realidad es 1.5-4s/par
+            # bajo MPS contention con qwen2.5:7b — el sistema corre al 97% de
+            # RAM (35/36 GB usados, 15 GB en compresor) y el cross-encoder
+            # MPS pelea slots con el chat model.
+            #
+            # Bajar a 3 candidatos ahorra ~40% del rerank time (avg) sin
+            # afectar recall — el RRF top-3 ya cubre la inmensa mayoría de
+            # los hits que llegan a top-k=4 en el final result. List-intent
+            # queries (que piden múltiples resultados explícitamente) se
+            # mantienen en pool=15 para no degradar recall en exploración.
+            #
+            # Override via env var para A/B test sin redeploy:
+            #   RAG_WEB_RERANK_POOL=5 → vuelve al comportamiento legacy
+            #   RAG_WEB_RERANK_POOL=2 → más agresivo si hace falta
+            try:
+                _default_pool = int(os.environ.get("RAG_WEB_RERANK_POOL", "3"))
+            except ValueError:
+                _default_pool = 3
+            _retrieve_pool = 15 if _is_list_intent else _default_pool
             _retrieve_multi_query = _is_list_intent
             # `caller="web"` (2026-04-28): impressions del chat web son
             # user-initiated (cada vez que el user manda un mensaje al

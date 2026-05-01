@@ -23144,17 +23144,30 @@ def fine_tunning_queue(limit: int = 20) -> dict:
                 import json as _json_pp
                 for row in cur.fetchall():
                     pid, kind, reason, extra_json, ts_p = row
-                    label_short = (reason or kind or "(sin reason)")[:80]
                     extra = {}
                     if extra_json:
                         try:
                             extra = _json_pp.loads(extra_json) or {}
                         except Exception:
                             extra = {}
+                    # El label TIENE que mostrar el contenido real del push
+                    # para que el user pueda puntuar con sentido. Bug
+                    # observado 2026-05-01: cuando `reason` era null y no
+                    # leíamos `extra.message_preview`, terminaba como
+                    # `[anticipate-orphan_surface] anticipate-orphan_surface`
+                    # — el kind repetido. Con el preview ahora se ve algo
+                    # como "🔗 Nota nueva sin links: [[2026-04-30]] · 0 wikilinks…".
+                    preview = (extra.get("message_preview") or "").strip()
+                    if preview:
+                        label_main = preview[:200]
+                    elif reason:
+                        label_main = reason[:200]
+                    else:
+                        label_main = "(sin contenido — kind genérico, ver meta)"
                     items.append({
                         "item_id": str(pid),
                         "stream": "proactive_push",
-                        "label": f"[{kind}] {label_short}",
+                        "label": label_main,
                         "ts": ts_p,
                         "meta": {"kind": kind, "reason": reason, **extra},
                     })
@@ -23331,7 +23344,171 @@ async def fine_tunning_rate(req: FineTunningRateRequest) -> dict:
     except Exception as exc:
         _silent_log("fine_tunning_queue_state_upsert_failed", str(exc))
 
+    # ── Fan-out a tablas downstream — cierra el loop de aprendizaje ─────
+    # Hasta 2026-05-01, los thumbs del panel SÓLO caían a `rag_ft_panel_ratings`
+    # y nadie los leía downstream para CAMBIAR comportamiento. El user tenía
+    # razón: aunque el label fuera informativo, el voto NO movía nada del
+    # ranker / Anticipatory / brief schedule. Este fan-out arregla eso para
+    # los 7 streams populated del panel:
+    #
+    #   retrieval / retrieval_answer / draft_wa / whatsapp_msg
+    #     → rag_feedback (consumido por `rag tune --online` nightly que tunea
+    #       el ranker LGBM + por `load_feedback_golden` en runtime).
+    #
+    #   anticipate
+    #     → rag_anticipate_feedback (consumido por threshold tuning per-kind
+    #       del Anticipatory Agent).
+    #
+    #   proactive_push
+    #     → rag_anticipate_feedback con dedup_key sintético `proactive:<id>`
+    #       para distinguir del bucket anticipate y permitir tunings separados.
+    #
+    #   brief
+    #     → rag_brief_feedback (consumido por brief_schedule.py para ajustar
+    #       horarios de envío + brief_auto_tune).
+    #
+    # Errores son silent-fail: si la escritura downstream falla, el rating
+    # ya quedó en rag_ft_panel_ratings (visible al user, pero no aprendido).
+    # Loggeamos el detalle con `_silent_log` para grep posterior.
+    try:
+        _fanout_ft_rating_to_downstream(req)
+    except Exception as exc_fanout:
+        _silent_log(
+            "fine_tunning_rate_fanout_failed",
+            f"stream={req.stream} item={req.item_id}: {exc_fanout!r}",
+        )
+
     return {"ok": True}
+
+
+def _fanout_ft_rating_to_downstream(req) -> None:
+    """Best-effort fan-out del thumbs del panel a la tabla que el sistema
+    YA consume. Cualquier excepción se propaga al caller para `_silent_log`.
+
+    Mapeo concreto:
+
+        retrieval / retrieval_answer / whatsapp_msg / draft_wa
+          → rag_feedback (turn_id=`fine_tunning:<item>`, scope=stream literal,
+            paths del rag_queries row si retrieval_*; sino [item_id] para WA;
+            sino [] para draft).
+
+        anticipate
+          → rag_anticipate_feedback (dedup_key=item_id, rating string,
+            source='panel').
+
+        proactive_push
+          → rag_anticipate_feedback con dedup_key=`proactive:<item_id>` para
+            distinguir del bucket anticipate y permitir consumers separados.
+
+        brief
+          → rag_brief_feedback (rating string, dedup_key=item_id, source='panel').
+
+    Los streams style/tool_routing/read_summary están registrados como
+    válidos pero todavía no se populan en /queue — agregar branch acá
+    cuando se implementen.
+
+    Idempotencia (retrieval_*): si ya existe row reciente en rag_feedback
+    con la misma `q` (dentro de 1 día), skip — evita doble-conteo si el
+    panel rerollea el mismo item.
+    """
+    from rag import _ragvec_state_conn, record_feedback  # noqa: PLC0415
+    from rag_anticipate import feedback as _anticipate_fb  # noqa: PLC0415
+    import datetime as _dt  # noqa: PLC0415
+    import json as _j  # noqa: PLC0415
+
+    stream = req.stream
+    item_id = req.item_id
+    rating_int = int(req.rating)
+    rating_str = (
+        "positive" if rating_int > 0 else "negative" if rating_int < 0 else "mute"
+    )
+    reason = (req.comment or "").strip() or None
+
+    if stream in ("retrieval", "retrieval_answer", "whatsapp_msg", "draft_wa"):
+        q_text = (req.label or "").strip()
+        paths: list[str] = []
+        ts_q: str | None = None
+        session_id: str | None = getattr(req, "session_id", None)
+        if stream in ("retrieval", "retrieval_answer") and item_id and item_id.isdigit():
+            try:
+                with _ragvec_state_conn() as conn:
+                    cur = conn.execute(
+                        "SELECT q, paths_json, ts, session FROM rag_queries "
+                        "WHERE id = ? LIMIT 1",
+                        (int(item_id),),
+                    )
+                    row = cur.fetchone()
+                    if row is not None:
+                        qtext, paths_json, ts_q, session_db = row
+                        if qtext:
+                            q_text = qtext
+                        if paths_json:
+                            try:
+                                p = _j.loads(paths_json)
+                                if isinstance(p, list):
+                                    paths = [str(x) for x in p if isinstance(x, str)]
+                            except Exception:
+                                pass
+                        if not session_id:
+                            session_id = session_db
+                        if ts_q:
+                            cur_dup = conn.execute(
+                                "SELECT 1 FROM rag_feedback "
+                                "WHERE q = ? AND ABS(julianday(ts) - julianday(?)) < 1.0 "
+                                "LIMIT 1",
+                                (q_text, ts_q),
+                            )
+                            if cur_dup.fetchone() is not None:
+                                return  # ya escrito, skip
+            except Exception:
+                pass
+        elif stream == "whatsapp_msg":
+            paths = [item_id] if item_id else []
+        # Para draft_wa: q = el body del draft (label), paths = [].
+
+        record_feedback(
+            turn_id=f"fine_tunning:{item_id}",
+            rating=rating_int,
+            q=q_text,
+            paths=paths,
+            reason=reason,
+            scope=stream,
+            session_id=session_id,
+        )
+        return
+
+    if stream == "anticipate":
+        _anticipate_fb.record_feedback(
+            dedup_key=item_id,
+            rating=rating_str,
+            reason=reason or "",
+            source="panel",
+        )
+        return
+
+    if stream == "proactive_push":
+        _anticipate_fb.record_feedback(
+            dedup_key=f"proactive:{item_id}",
+            rating=rating_str,
+            reason=reason or "",
+            source="panel",
+        )
+        return
+
+    if stream == "brief":
+        ts = _dt.datetime.now().isoformat(timespec="seconds")
+        with _ragvec_state_conn() as conn:
+            conn.execute(
+                "INSERT INTO rag_brief_feedback "
+                "(ts, dedup_key, rating, reason, source) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (ts, item_id, rating_str, reason, "panel"),
+            )
+            conn.commit()
+        return
+
+    # style / tool_routing / read_summary: aún no implementados — el rating
+    # queda solo en rag_ft_panel_ratings hasta agregar branch acá.
 
 
 @app.post("/api/fine_tunning/snooze")

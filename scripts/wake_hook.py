@@ -70,10 +70,14 @@ def _write_state(state: dict) -> None:
 
 def _last_display_on() -> str | None:
     """Última fecha de "Display is turned on" en pmset log. None si no hay."""
+    # Timeout 30s: en idle `pmset -g log` tarda ~4.5s sobre 116k líneas,
+    # pero post-wake con IO contention y daemons fork-bombing en paralelo
+    # puede pasar de 15s. Subir a 30s mantiene el silent-fail como red
+    # de seguridad sin que se gatille por load transitorio normal.
     try:
         proc = subprocess.run(
             ["pmset", "-g", "log"],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, timeout=30,
         )
     except (subprocess.TimeoutExpired, OSError) as exc:
         LOG.warning("pmset failed: %s", exc)

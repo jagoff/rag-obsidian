@@ -791,6 +791,21 @@ BRIEF_STATE_PATH = Path.home() / ".local/share/obsidian-rag/brief_state.jsonl"
 COLLECTION_WRITE_LOCK = Path.home() / ".local/share/obsidian-rag/collection_write.lock"
 COLLECTION_OPS_LOG = Path.home() / ".local/share/obsidian-rag/collection_ops.log"
 COLLECTION_RESET_SENTINEL = Path.home() / ".local/share/obsidian-rag/collection_reset_at"
+# Process-level mutex acquired at the top of `rag index` (CLI entry, line
+# ~27815). Prevents two `rag index` invocations from racing for Ollama
+# embeddings and the sqlite-vec write lock at the same time. Backed by
+# `fcntl.flock(LOCK_EX | LOCK_NB)` — non-blocking, so the second caller
+# fails fast with a clear message instead of doubling Ollama load.
+#
+# Why this exists: 2026-05-01 incident where a parallel devin session
+# kept a `rag index --no-contradict` retry loop alive for 3h. While the
+# index hung in `recvfrom`, the launchd plist for `ingest-safari`
+# scheduled at 12:15 / 18:15 spawned a SECOND `rag index --source safari`
+# that piled on top, doubling Ollama pressure. Net effect: web/chat
+# starved for any Ollama-backed call (semantic + LLM both queued behind
+# the indices). With this lock, the second `rag index` aborts in <1s
+# with `Otro rag index activo`, and the chat keeps flowing.
+INDEX_PROCESS_LOCK = Path.home() / ".local/share/obsidian-rag/index.lock"
 # Sink for exceptions that used to be `except Exception: pass`. See
 # `_silent_log()` below — only called from sites where a silent failure
 # could mask a real bug (corrupt cache, data-loss adjacent, reranker
@@ -3206,12 +3221,19 @@ def _save_context_cache() -> None:
 
 _SUMMARY_CLIENT: "_TimedOllamaProxy | None" = None
 _INDEX_CHAT_CLIENT: ollama.Client | None = None
+_INDEX_EMBED_CLIENT: ollama.Client | None = None
 _HELPER_CLIENT: "_TimedOllamaProxy | None" = None
 _CHAT_CAPPED_CLIENT: "_TimedOllamaProxy | None" = None
 
 # Capture the original `ollama.chat` at import time so _TimedOllamaProxy
 # can detect monkey-patches (tests replace `rag.ollama.chat` with mocks).
 _ORIGINAL_OLLAMA_CHAT = ollama.chat
+# Same trick for `ollama.embed`. Tests in test_query_caches.py replace
+# `rag.ollama.embed` to count calls and feed deterministic vectors —
+# routing through `Client(timeout=...).embed` bypasses the mock. So in
+# `embed()` we check identity and only force the timeout-bearing client
+# when the symbol is the original (production path).
+_ORIGINAL_OLLAMA_EMBED = ollama.embed
 
 # Semaphore that caps concurrent qwen2.5:3b (HELPER_MODEL) calls.
 # Ollama serialises at the GPU level but each blocked Python thread holds
@@ -3275,6 +3297,39 @@ def _index_chat_client() -> ollama.Client:
     if _INDEX_CHAT_CLIENT is None:
         _INDEX_CHAT_CLIENT = ollama.Client(timeout=120.0)
     return _INDEX_CHAT_CLIENT
+
+
+def _index_embed_client() -> ollama.Client:
+    """Cached `ollama.Client(timeout=120)` for index-time embeddings.
+
+    Mirrors `_index_chat_client` but for the per-chunk `ollama.embed(...)`
+    call inside `embed()`. The vanilla `ollama.embed(...)` module helper
+    uses the default httpx client without any read timeout — if Ollama is
+    saturated (another consumer pinning the GPU, model unload/reload mid
+    embed batch, daemon hung) the call sits in `recvfrom` indefinitely
+    and the whole `rag index` rglob freezes. The web/chat handler then
+    queues behind it forever because every chat path eventually calls
+    `embed()` for the query.
+
+    Empirical foot-gun observed 2026-05-01: a zombie `rag index --no-contradict`
+    spawned by a parallel devin session sat in `__recvfrom` for 1.5h
+    (verified with `sample <pid> 1`). The watchdog (`_ollama_health.py`)
+    correctly refused to restart Ollama because `in_flight=2` (chat + the
+    zombie), preserving stream integrity at the cost of letting the chat
+    starve. With this 120s ceiling, the zombie raises `httpx.ReadTimeout`
+    after 2 minutes, releases the connection, and the existing 4-attempt
+    retry in `embed()` either recovers or surfaces the failure — instead
+    of the index hanging forever and dragging the chat down with it.
+
+    The 120s value matches `_index_chat_client` (and is well above the
+    p99 cold-load for bge-m3 ~6-8s on Apple Silicon). Tests that mock
+    `rag.ollama.embed` continue to bypass this client — see the identity
+    check in `embed()` against `_ORIGINAL_OLLAMA_EMBED`.
+    """
+    global _INDEX_EMBED_CLIENT
+    if _INDEX_EMBED_CLIENT is None:
+        _INDEX_EMBED_CLIENT = ollama.Client(timeout=120.0)
+    return _INDEX_EMBED_CLIENT
 
 
 def _summary_client() -> "_TimedOllamaProxy":
@@ -6389,6 +6444,32 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
     (
+        # Control-plane log para el daemon manager (`rag daemons`).
+        # Append-only: cada status_check, bootstrap, bootout, kickstart,
+        # reconcile o retry escribe una fila. Permite analytics tipo
+        # "cuántos restarts tuvo com.fer.obsidian-rag-web en 24h" o
+        # "qué daemons estaban fuera de estado ayer a las 3am".
+        # Retention 90d via _sql_rotate_log_tables (mismo bucket que
+        # rag_queries y rag_behavior — el más largo de los log tables).
+        "rag_daemon_runs",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_daemon_runs ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " label TEXT NOT NULL,"
+            " action TEXT NOT NULL,"
+            " prev_state TEXT,"
+            " new_state TEXT,"
+            " exit_code INTEGER,"
+            " reason TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_daemon_runs_ts"
+            " ON rag_daemon_runs(ts)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_daemon_runs_label"
+            " ON rag_daemon_runs(label)",
+        ),
+    ),
+    (
         "rag_cpu_metrics",
         (
             "CREATE TABLE IF NOT EXISTS rag_cpu_metrics ("
@@ -8419,6 +8500,54 @@ def _record_brief_feedback(
         _silent_log("brief_feedback_helper", exc)
         return None
     return holder["id"]
+
+
+def _log_daemon_run_event(
+    label: str,
+    action: str,
+    *,
+    prev_state: str | None = None,
+    new_state: str | None = None,
+    exit_code: int | None = None,
+    reason: str | None = None,
+) -> None:
+    """Append a daemon-run event to rag_daemon_runs. Silent-fail on SQL error.
+
+    Args:
+        label:      Nombre del servicio launchd (ej.
+                    "com.fer.obsidian-rag-web").
+        action:     Tipo de acción; uno de "status_check", "bootstrap",
+                    "bootout", "kickstart", "reconcile_dry_run",
+                    "reconcile_apply", "retry".
+        prev_state: Estado previo del daemon antes de la acción (ej.
+                    "running", "not running", "missing", "error").
+        new_state:  Estado posterior a la acción.
+        exit_code:  Último exit code de launchctl (None si no aplica).
+        reason:     Texto libre con el motivo de la acción (ej.
+                    "last_exit=1 runs<3", "overdue 2x cadence").
+
+    Contract: nunca raisea. Los errores SQL van a sql_state_errors.jsonl
+    vía _log_sql_state_error (que ya llama a _bump_silent_log_counter
+    internamente — no se duplica el call).
+    """
+    row = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "label": label,
+        "action": action,
+        "prev_state": prev_state,
+        "new_state": new_state,
+        "exit_code": exit_code,
+        "reason": reason,
+    }
+
+    def _do() -> None:
+        with _ragvec_state_conn() as conn:
+            _sql_append_event(conn, "rag_daemon_runs", row)
+
+    try:
+        _sql_write_with_retry(_do, "daemon_runs_sql_write_failed")
+    except Exception as exc:  # pragma: no cover - retry helper ya silencia
+        _silent_log("daemon_runs_writer", exc)
 
 
 def _map_cpu_row(ev: dict) -> dict:
@@ -13348,9 +13477,20 @@ def embed(texts: list[str]) -> list[list[float]]:
     _last_exc: Exception | None = None
     for attempt in range(4):
         try:
-            resp = ollama.embed(
-                model=EMBED_MODEL, input=missing_texts, keep_alive=OLLAMA_KEEP_ALIVE,
-            )
+            # Production path: use the cached `Client(timeout=120)` so a
+            # stuck Ollama can't wedge the embed call in `recvfrom`
+            # forever (see `_index_embed_client` docstring for the
+            # 2026-05-01 incident that motivated this). Test path:
+            # honour the module-level monkeypatch so test_query_caches
+            # mocks intercept correctly.
+            if ollama.embed is _ORIGINAL_OLLAMA_EMBED:
+                resp = _index_embed_client().embed(
+                    model=EMBED_MODEL, input=missing_texts, keep_alive=OLLAMA_KEEP_ALIVE,
+                )
+            else:
+                resp = ollama.embed(
+                    model=EMBED_MODEL, input=missing_texts, keep_alive=OLLAMA_KEEP_ALIVE,
+                )
             break
         except ConnectionError as exc:
             _last_exc = exc
@@ -27741,6 +27881,71 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
     }
 
 
+@contextlib.contextmanager
+def _index_process_lock():
+    """Context manager around `INDEX_PROCESS_LOCK` (process-level mutex).
+
+    Acquires `fcntl.flock(LOCK_EX | LOCK_NB)` on `~/.local/share/obsidian-rag/index.lock`.
+    If another `rag index` is already running, raises `BlockingIOError` so
+    the CLI handler can print a clear message and abort fast.
+
+    Writes the holder's PID + ISO timestamp to the lock file (best-effort,
+    not load-bearing) so an operator running `cat ~/.local/share/obsidian-rag/index.lock`
+    can see who's holding it. Cleared on release. NOT cleared on hard
+    crash (kill -9), but flock is OS-managed: when the process dies, the
+    kernel drops the lock automatically — the next `rag index` re-acquires
+    immediately, even if the file still has stale text.
+
+    See `INDEX_PROCESS_LOCK` docstring for the 2026-05-01 incident.
+    """
+    INDEX_PROCESS_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(INDEX_PROCESS_LOCK, "a+")
+    # Acquisition path: si flock falla, cerrá el fh y propagá. NO entres
+    # al try/finally del cleanup porque el fh ya está cerrado y el
+    # `flock(LOCK_UN)` del finally tira ValueError sobre file cerrado.
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        raise
+    # Stamp PID + start time for human introspection. Best-effort —
+    # truncate first so stale text from a crashed prior holder doesn't
+    # accumulate.
+    try:
+        fh.seek(0)
+        fh.truncate()
+        fh.write(f"{os.getpid()} {datetime.now(timezone.utc).isoformat()}\n")
+        fh.flush()
+    except OSError:
+        pass
+    try:
+        yield fh
+    finally:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            fh.close()
+        except OSError:
+            pass
+
+
+def _peek_index_lock_holder() -> str:
+    """Best-effort: read the holder line stamped in the lock file.
+
+    Returns the trimmed first line ("PID ISO_TS") or an empty string if
+    the file is missing or empty. Pure introspection helper for the
+    error message — never raises.
+    """
+    try:
+        text = INDEX_PROCESS_LOCK.read_text(encoding="utf-8", errors="replace")
+    except (OSError, FileNotFoundError):
+        return ""
+    line = text.strip().splitlines()[0] if text.strip() else ""
+    return line.strip()
+
+
 @cli.command()
 @click.option("--reset", is_flag=True, help="Borrar índice antes de reindexar")
 @click.option("--no-contradict", is_flag=True, help="Saltear el check de contradicciones en notas nuevas/modificadas")
@@ -27777,35 +27982,57 @@ def index(reset: bool, no_contradict: bool, source_opt: str | None,
     gatean por vault — solo corren en el target canónico para no
     contaminar vaults secundarios con notas MOZE/WA/Gmail/etc.
     """
+    # Process-level mutex: aborta limpio si ya hay otro `rag index` activo.
+    # El `--no-contradict` zombie del 2026-05-01 + el plist `ingest-safari`
+    # disparándose en paralelo era la combinación tóxica que dejaba al
+    # web/chat sin Ollama. Con esto, el segundo `rag index` falla en <1s
+    # con un mensaje claro y exit code 1 (para que los wrappers tipo
+    # `if rag index ...; then ...` se enteren).
+    try:
+        _index_lock_ctx = _index_process_lock()
+        _index_lock_ctx.__enter__()
+    except BlockingIOError:
+        holder = _peek_index_lock_holder()
+        msg = (
+            "[yellow]Otro `rag index` ya está activo[/yellow] "
+            f"(holder: {holder or 'desconocido'}). Abortando para no duplicar carga "
+            f"sobre Ollama. Probá de nuevo cuando termine, o liberá el lock con "
+            f"`rm {INDEX_PROCESS_LOCK}` si sabés que el holder murió mal."
+        )
+        console.print(msg)
+        sys.exit(1)
     # --vault resolution: validar + swap VAULT_PATH globals via _with_vault.
     # Aplica tanto al path `--source` (cross-source ingesters: el ingester
     # escribe al vault target en lugar del activo) como al vault-index path
     # de más abajo. Debe ejecutarse ANTES del source_opt branch para que
     # el swap esté vigente dentro del ingester.
     _vault_ctx = None
-    if vault_scope:
-        names = [n.strip() for n in vault_scope.split(",") if n.strip()]
-        if len(names) != 1 or names[0] == "all":
-            console.print(
-                "[red]--vault en `rag index` solo acepta UN vault por invocación.[/red] "
-                "Para multi-vault, corré `rag index --vault X` por cada uno."
-            )
-            return
-        resolved = resolve_vault_paths(names)
-        if not resolved:
-            console.print(
-                f"[red]--vault '{vault_scope}' no resolvió ningún vault registrado.[/red] "
-                "Revisá `rag vault list`."
-            )
-            return
-        _, _vault_path = resolved[0]
-        _vault_ctx = _with_vault(_vault_path)
-        _vault_ctx.__enter__()
     try:
-        _do_index(reset, no_contradict, source_opt, since_opt, dry_run, max_chats)
+        if vault_scope:
+            names = [n.strip() for n in vault_scope.split(",") if n.strip()]
+            if len(names) != 1 or names[0] == "all":
+                console.print(
+                    "[red]--vault en `rag index` solo acepta UN vault por invocación.[/red] "
+                    "Para multi-vault, corré `rag index --vault X` por cada uno."
+                )
+                return
+            resolved = resolve_vault_paths(names)
+            if not resolved:
+                console.print(
+                    f"[red]--vault '{vault_scope}' no resolvió ningún vault registrado.[/red] "
+                    "Revisá `rag vault list`."
+                )
+                return
+            _, _vault_path = resolved[0]
+            _vault_ctx = _with_vault(_vault_path)
+            _vault_ctx.__enter__()
+        try:
+            _do_index(reset, no_contradict, source_opt, since_opt, dry_run, max_chats)
+        finally:
+            if _vault_ctx is not None:
+                _vault_ctx.__exit__(None, None, None)
     finally:
-        if _vault_ctx is not None:
-            _vault_ctx.__exit__(None, None, None)
+        _index_lock_ctx.__exit__(None, None, None)
 
 
 def _fmt_ingest_summary(
@@ -45925,10 +46152,22 @@ def _render_today_prompt(
     # Si no, es opcional como las demás. Esto se refleja en el
     # sections_hint y en el body de la sección.
     has_tomorrow_evs = bool(extras.get("tomorrow_calendar"))
+    # ¿Tenemos eventos en el calendario de hoy? Si sí, "Para hoy"
+    # es REQUERIDA — el user los quiere ver listados separados de mañana.
+    # `calendar_today` viene en `extras` con shape {title, start, end}
+    # (de `_fetch_calendar_today`). El bloque markdown que el LLM ve
+    # arriba es "## 📅 Calendar — eventos de HOY".
+    has_today_evs = bool(extras.get("calendar_today"))
     tomorrow_clause = (
         " La sección '🌅 Para mañana' ES REQUERIDA porque hay eventos "
         "en el calendar — listalos con su hora. NO la omitás."
         if has_tomorrow_evs else ""
+    )
+    today_clause = (
+        " La sección '🌅 Para hoy' ES REQUERIDA porque hay eventos "
+        "del día en el calendar — listalos con su hora separados de mañana. "
+        "NO mezcles eventos de hoy con los de mañana — son secciones distintas."
+        if has_today_evs else ""
     )
     sections_hint = (
         f"## OUTPUT — formato (longitud total: {word_budget})\n\n"
@@ -45937,11 +46176,29 @@ def _render_today_prompt(
         "ENTERA (header + body). NO escribas placeholders como "
         "'nada quedó suelto', 'no hay datos suficientes', "
         "'ninguna pregunta abierta', 'sin novedades' — preferimos un "
-        "brief más corto antes que un header con relleno." + tomorrow_clause
+        "brief más corto antes que un header con relleno." + today_clause + tomorrow_clause
         + extras_clause
         + " Citá notas con [[Título]]. Citá personas por nombre cuando "
         "aparezcan en gmail/wa/calendar."
     )
+    if has_today_evs:
+        n_today = len(extras.get("calendar_today") or [])
+        today_body = (
+            f"(REQUERIDA — hay {n_today} evento(s) en el bloque "
+            "'## 📅 Calendar — eventos de HOY' arriba. Listá CADA evento como "
+            "una viñeta con su prefix exacto (formato '- 10:30 — Título evento' "
+            "con la hora 24h del evento). LISTALOS TODOS — el user los necesita "
+            "ver. SOLO eventos del calendar de HOY, NO de mañana. Si hay "
+            "reminders due hoy en el contexto, agregalos abajo de los events "
+            "como '📌 título reminder'. NUNCA omitas esta sección si hay "
+            "events de hoy.)"
+        )
+    else:
+        today_body = (
+            "(Sin eventos en el calendar de hoy. Si hay reminders due hoy "
+            "concretos, listalos. SI NO HAY NADA HOY, OMITÍ LA SECCIÓN "
+            "ENTERA — no escribas el header.)"
+        )
     if has_tomorrow_evs:
         n_evs = len(extras.get("tomorrow_calendar") or [])
         tomorrow_body = (
@@ -45951,10 +46208,11 @@ def _render_today_prompt(
             "Título evento' para events con hora, '- todo el día — "
             "Título evento' para all-day). LISTALOS TODOS, no selecciones — "
             "el user los quiere ver SIEMPRE. NO digas 'agenda libre'. "
-            "Después, si hay action items reales (mails sin responder "
-            "relevantes a algún evento, decisiones que tocan algo de "
-            "mañana), agregá 1-2 viñetas más debajo. NUNCA omitas esta "
-            "sección si hay events.)"
+            "SOLO eventos del calendar de MAÑANA, NO los de hoy (esos van "
+            "en '🌅 Para hoy'). Después, si hay action items reales (mails "
+            "sin responder relevantes a algún evento, decisiones que tocan "
+            "algo de mañana), agregá 1-2 viñetas más debajo. NUNCA omitas "
+            "esta sección si hay events.)"
         )
     else:
         tomorrow_body = (
@@ -45981,6 +46239,9 @@ def _render_today_prompt(
         "(queries low-confidence de hoy → notas que podrías escribir; "
         "citá las preguntas literales. SI NO HUBO NINGUNA, OMITÍ LA "
         "SECCIÓN ENTERA — no escribas el header.)",
+        "",
+        "## 🌅 Para hoy",
+        today_body,
         "",
         "## 🌅 Para mañana",
         tomorrow_body,
@@ -50437,6 +50698,258 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
     ]
 
 
+def _services_spec_manual() -> list[dict]:
+    """Daemons launchd que existen en disco pero NO tienen factory en código.
+    Instalados a mano por el usuario. `rag setup` no los toca; el control
+    plane (`rag daemons status / reconcile`) los monitorea pero no los
+    regenera. Si alguno se rompe, el fix es manual (re-copiar plist desde
+    backup o regenerarlo en su repo origen).
+    """
+    return [
+        {"label": "com.fer.obsidian-rag-cloudflare-tunnel", "category": "manual_keep"},
+        {"label": "com.fer.obsidian-rag-cloudflare-tunnel-watcher", "category": "manual_keep"},
+        {"label": "com.fer.obsidian-rag-lgbm-train", "category": "manual_keep"},
+        {"label": "com.fer.obsidian-rag-paraphrases-train", "category": "manual_keep"},
+        {"label": "com.fer.obsidian-rag-synth-refresh", "category": "manual_keep"},
+        {"label": "com.fer.obsidian-rag-spotify-poll", "category": "manual_keep"},
+        {"label": "com.fer.obsidian-rag-log-rotate", "category": "manual_keep"},
+    ]
+
+
+def _parse_launchctl_print(stdout: str) -> dict:
+    """Parse output de `launchctl print gui/<uid>/<label>`.
+
+    Extrae state, runs y last_exit. Devuelve un dict con las 3 claves;
+    valores no encontrados quedan None.
+
+    Nota: el output de `launchctl print` puede tener sub-secciones con
+    `state = active` para procesos hijos. Capturamos solo la PRIMERA
+    ocurrencia de cada clave para evitar sobreescribir con sub-estados.
+    """
+    import re
+    result: dict = {"state": None, "runs": None, "last_exit": None}
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        if result["state"] is None:
+            m = re.match(r"state\s*=\s*(.+)", stripped)
+            if m:
+                result["state"] = m.group(1).strip()
+                continue
+        if result["runs"] is None:
+            m = re.match(r"runs\s*=\s*(\d+)", stripped)
+            if m:
+                result["runs"] = int(m.group(1))
+                continue
+        if result["last_exit"] is None:
+            m = re.match(r"last exit code\s*=\s*(.+)", stripped)
+            if m:
+                raw = m.group(1).strip()
+                try:
+                    result["last_exit"] = int(raw)
+                except ValueError:
+                    result["last_exit"] = raw
+        # Early exit when all 3 fields are filled
+        if all(v is not None for v in result.values()):
+            break
+    return result
+
+
+def _plist_cadence_seconds(label: str) -> int | None:
+    """Lee el plist en ~/Library/LaunchAgents/<label>.plist y extrae la
+    cadencia esperada en segundos.
+
+    - StartInterval → el valor directamente (segundos).
+    - StartCalendarInterval → 86400 (24h como aproximación).
+    - KeepAlive sin StartInterval → None (no aplica overdue).
+    - Archivo no existe → None.
+    """
+    import re
+    plist_path = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+    if not plist_path.exists():
+        return None
+    try:
+        content = plist_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    # StartInterval
+    m = re.search(
+        r"<key>StartInterval</key>\s*<integer>(\d+)</integer>",
+        content,
+    )
+    if m:
+        return int(m.group(1))
+    # StartCalendarInterval → tratar como 24h
+    if "<key>StartCalendarInterval</key>" in content:
+        return 86400
+    return None
+
+
+def _daemon_log_path(label: str) -> Path:
+    """Heurística: ~/.local/share/obsidian-rag/<slug>.log."""
+    slug = label.replace("com.fer.obsidian-rag-", "")
+    return _RAG_LOG_DIR / f"{slug}.log"
+
+
+def _gather_daemon_status(label: str, category: str) -> dict:
+    """Recolecta estado de un daemon: launchctl print + mtime log + overdue."""
+    import subprocess
+    uid = os.getuid()
+    try:
+        proc = subprocess.run(
+            ["launchctl", "print", f"gui/{uid}/{label}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        proc = None  # type: ignore[assignment]
+
+    if proc is None or (proc.returncode != 0 and (
+        "Could not find service" in (proc.stderr or "")
+        or proc.returncode == 113
+    )):
+        parsed = {"state": "missing", "runs": None, "last_exit": None}
+    elif proc.returncode != 0:
+        parsed = {"state": "unknown", "runs": None, "last_exit": None}
+    else:
+        parsed = _parse_launchctl_print(proc.stdout)
+        if parsed["state"] is None:
+            parsed["state"] = "unknown"
+
+    # Last tick via logfile mtime
+    log_path = _daemon_log_path(label)
+    last_tick_iso: str | None = None
+    if log_path.exists():
+        try:
+            ts = datetime.fromtimestamp(log_path.stat().st_mtime)
+            last_tick_iso = ts.isoformat(timespec="seconds")
+        except OSError:
+            pass
+
+    # Overdue check
+    expected_cadence_s = _plist_cadence_seconds(label)
+    overdue = False
+    if expected_cadence_s and last_tick_iso:
+        try:
+            last_dt = datetime.fromisoformat(last_tick_iso)
+            age_s = (datetime.now() - last_dt).total_seconds()
+            overdue = age_s > 2 * expected_cadence_s
+        except Exception:
+            pass
+
+    return {
+        "label": label,
+        "category": category,
+        "state": parsed["state"],
+        "runs": parsed["runs"],
+        "last_exit": parsed["last_exit"],
+        "last_tick_iso": last_tick_iso,
+        "overdue": overdue,
+        "expected_cadence_s": expected_cadence_s,
+    }
+
+
+@cli.group("daemons")
+def daemons_group():
+    """Control plane de los daemons launchd del proyecto."""
+    pass
+
+
+@daemons_group.command("status")
+@click.option("--json", "as_json", is_flag=True,
+              help="Emite JSON en vez de tabla Rich.")
+@click.option("--unhealthy-only", is_flag=True,
+              help="Solo mostrar daemons con drift (no running, overdue o exit≠0).")
+def daemons_status(as_json: bool, unhealthy_only: bool):
+    """Estado de cada daemon launchd: state, runs, last_exit, last_tick, overdue."""
+    import json as _json
+    rag_bin = _rag_binary()
+
+    # Managed: extraer label de cada tupla (label, fname, xml)
+    managed_rows = [
+        _gather_daemon_status(label, "managed")
+        for (label, _fname, _xml) in _services_spec(rag_bin)
+    ]
+    # Manual
+    manual_rows = [
+        _gather_daemon_status(spec["label"], spec["category"])
+        for spec in _services_spec_manual()
+    ]
+    all_rows = managed_rows + manual_rows
+
+    # Filtrar
+    def _is_unhealthy(row: dict) -> bool:
+        if row["state"] not in ("running", None):
+            if row["state"] != "running":
+                return True
+        last_exit = row["last_exit"]
+        if isinstance(last_exit, int) and last_exit != 0:
+            return True
+        if row["overdue"]:
+            return True
+        return False
+
+    if unhealthy_only:
+        all_rows = [r for r in all_rows if _is_unhealthy(r)]
+
+    unhealthy_count = sum(1 for r in all_rows if _is_unhealthy(r))
+
+    if as_json:
+        click.echo(_json.dumps(all_rows, indent=2))
+    else:
+        table = Table(title="Daemons launchd", show_lines=False, header_style="bold")
+        table.add_column("Label", style="dim", no_wrap=True)
+        table.add_column("Cat", no_wrap=True)
+        table.add_column("State", no_wrap=True)
+        table.add_column("Runs", justify="right")
+        table.add_column("LastExit", justify="right")
+        table.add_column("LastTick", no_wrap=True)
+        table.add_column("Overdue")
+
+        for row in all_rows:
+            state = row["state"] or "unknown"
+            if state == "running":
+                state_text = f"[green]{state}[/green]"
+            elif state == "missing":
+                state_text = f"[red]{state}[/red]"
+            else:
+                state_text = state
+
+            last_exit = row["last_exit"]
+            if isinstance(last_exit, int) and last_exit != 0:
+                exit_text = f"[red]{last_exit}[/red]"
+            elif last_exit is None:
+                exit_text = "-"
+            else:
+                exit_text = str(last_exit)
+
+            overdue_text = "[yellow]sí[/yellow]" if row["overdue"] else "no"
+
+            slug = row["label"].replace("com.fer.obsidian-rag-", "")
+            last_tick = row["last_tick_iso"] or "-"
+
+            table.add_row(
+                slug,
+                row["category"].replace("manual_keep", "manual").replace("managed", "mgd"),
+                state_text,
+                str(row["runs"]) if row["runs"] is not None else "-",
+                exit_text,
+                last_tick,
+                overdue_text,
+            )
+
+        console.print(table)
+        if unhealthy_count:
+            console.print(f"[yellow]{unhealthy_count} daemon(s) con drift[/yellow]")
+
+    # Telemetría: una row por run
+    _log_daemon_run_event(
+        label="<status_run>",
+        action="status_check",
+        reason=f"unhealthy={unhealthy_count}",
+    )
+
+
 @cli.command()
 @click.option("--remove", is_flag=True,
               help="Desinstalar los servicios en lugar de instalarlos")
@@ -54658,6 +55171,9 @@ _SQL_ROTATION_POLICY: tuple[tuple, ...] = (
     # generosa.
     ("rag_synthetic_queries", 90),
     ("rag_synthetic_negatives", 90),
+    # Control-plane log del daemon manager — 90d es el mismo bucket que
+    # rag_queries/rag_behavior (el más largo de los log tables).
+    ("rag_daemon_runs", 90),
     # rag_whatsapp_scheduled usa `created_at` como columna timestamp — el DDL
     # original (wa_scheduled.py) eligió ese nombre; aquí se declara explícito
     # para que el loop no aborte con "no such column: ts".

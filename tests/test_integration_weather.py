@@ -27,6 +27,16 @@ import pytest
 from rag.integrations import weather as weather_mod
 
 
+@pytest.fixture(autouse=True)
+def _clear_wttr_cache_between_tests():
+    """Drop the shared wttr.in cache before each test so mocks don't leak
+    between tests. The cache (added 2026-04-30) deduplicates HTTP for the
+    home panel but breaks test isolation if not reset."""
+    weather_mod._clear_wttr_cache()
+    yield
+    weather_mod._clear_wttr_cache()
+
+
 # ── Helper para mockear urlopen ─────────────────────────────────────────────
 
 
@@ -297,3 +307,51 @@ def test_fetch_weather_openmeteo_text_summary_format():
     assert "Quito" in out["text_summary"]
     assert "18" in out["text_summary"]
     assert "°C" in out["text_summary"]
+
+
+def test_wttr_cache_dedupes_http_between_rain_and_forecast():
+    """Bug fix 2026-04-30: el panel home corría signals.weather +
+    forecast en paralelo, ambos haciendo el mismo HTTP a wttr.in. Ahora
+    comparten cache via `_fetch_wttr_raw`. Test: 2 calls = 1 request HTTP."""
+    payload = {
+        "current_condition": [{"weatherDesc": [{"value": "Sunny"}], "temp_C": "20"}],
+        "weather": [
+            {"date": "2026-04-30", "mintempC": "10", "maxtempC": "20",
+             "avgtempC": "15", "hourly": [
+                 {"time": "1200", "weatherDesc": [{"value": "Sunny"}],
+                  "chanceofrain": "0", "chanceofthunder": "0"},
+             ]},
+        ],
+    }
+    with patch("urllib.request.urlopen", return_value=_mock_urlopen_ctx(payload)) as mock_urlopen:
+        # Primero rain, después forecast — segundo call debe usar cache.
+        rain = weather_mod._fetch_weather_rain("CacheTest")
+        forecast = weather_mod._fetch_weather_forecast("CacheTest")
+        # 1 sola llamada HTTP — el cache absorbió la segunda.
+        assert mock_urlopen.call_count == 1
+    # Ambos fetchers retornaron data válida desde la misma respuesta cached.
+    assert rain is None  # Sunny → no rain alert
+    assert forecast is not None
+    assert forecast["location"] == "CacheTest"
+
+
+def test_wttr_cache_expires_after_ttl(monkeypatch):
+    """El cache invalida después de `_WTTR_CACHE_TTL` segundos. Forzamos el
+    timestamp del cache hacia atrás para simular expiración."""
+    weather_mod._clear_wttr_cache()
+    payload = {
+        "current_condition": [{"weatherDesc": [{"value": "Sunny"}], "temp_C": "20"}],
+        "weather": [{"date": "2026-04-30", "mintempC": "10", "maxtempC": "20",
+                     "avgtempC": "15", "hourly": []}],
+    }
+    with patch("urllib.request.urlopen", return_value=_mock_urlopen_ctx(payload)) as mock_urlopen:
+        weather_mod._fetch_wttr_raw("ExpireTest")
+        assert mock_urlopen.call_count == 1
+        # Manualmente envejecemos el cache: ts hacia atrás más allá del TTL.
+        ts, parsed = weather_mod._WTTR_CACHE["ExpireTest"]
+        weather_mod._WTTR_CACHE["ExpireTest"] = (
+            ts - weather_mod._WTTR_CACHE_TTL - 10, parsed,
+        )
+        # Re-llamar → cache expirado → segunda HTTP.
+        weather_mod._fetch_wttr_raw("ExpireTest")
+        assert mock_urlopen.call_count == 2

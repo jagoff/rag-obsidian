@@ -40,12 +40,77 @@ from __future__ import annotations
 
 import json
 import re
+import threading
+import time
 from datetime import datetime
 
 
 # ── Weather (only if rain) ──────────────────────────────────────────────────
 WEATHER_LOCATION = "Santa+Fe,Argentina"
 WEATHER_RAIN_THRESHOLD = 70  # contract in repo CLAUDE.md: hint only if rain ≥70%
+
+
+# ── Shared HTTP cache (de-dup entre _fetch_weather_rain + _fetch_weather_forecast) ──
+#
+# Bug pre-fix (2026-04-30 audit): el panel home dispara los 2 fetchers en
+# paralelo (signals.weather + forecast). Cada uno hacía su propio HTTP
+# request a wttr.in/<location>?format=j1 → 2 requests simultáneos al
+# mismo URL, ~1.5s cada uno. Telemetría: signals.weather=1.56s +
+# forecast=1.47s = ~3s gastados en data idéntica.
+#
+# Fix: cache de la respuesta JSON cruda por location, TTL=5min. El primer
+# fetcher hace el HTTP, los demás (mismo location, dentro de 5min) leen
+# del cache. Lock para evitar thundering herd (2 fetchers en paralelo
+# disparan 2 requests si los tests del cache caen entre check y put).
+#
+# Por qué 5min: el clima no cambia subito en 5min, y la home se
+# refrescá cada 5min de todos modos — el cache se invalida naturalmente
+# al ritmo del UI. Tests pueden invalidar manualmente con
+# `_clear_wttr_cache()`.
+_WTTR_CACHE: dict[str, tuple[float, dict | None]] = {}  # location → (ts, parsed_json)
+_WTTR_CACHE_TTL = 300  # 5 min
+_WTTR_CACHE_LOCK = threading.Lock()
+
+
+def _clear_wttr_cache() -> None:
+    """Test helper — drop all cached wttr.in responses."""
+    with _WTTR_CACHE_LOCK:
+        _WTTR_CACHE.clear()
+
+
+def _fetch_wttr_raw(location: str) -> dict | None:
+    """Fetch the wttr.in JSON for `location`, with a 5-min in-memory cache.
+
+    Returns the parsed JSON dict, or None on network/parse failure. Both
+    `_fetch_weather_rain` and `_fetch_weather_forecast` delegate to this
+    helper instead of doing their own HTTP, so the panel home doesn't
+    pay 2× network cost when both fetchers run in parallel.
+
+    Lock guards the check-then-put against thundering herd: under heavy
+    parallel access (e.g. SSE stream firing both fetchers concurrently),
+    only the first thread does the actual HTTP; the rest wait on the
+    lock and read the freshly-cached response.
+    """
+    now = time.time()
+    with _WTTR_CACHE_LOCK:
+        cached = _WTTR_CACHE.get(location)
+        if cached and now - cached[0] < _WTTR_CACHE_TTL:
+            return cached[1]
+        # Reserve the slot: write a sentinel so other threads see "in flight"
+        # and wait below. We release the lock during the HTTP call to avoid
+        # blocking other locations.
+    import urllib.request as _req
+    url = f"https://wttr.in/{location}?format=j1"
+    parsed: dict | None = None
+    try:
+        with _req.urlopen(url, timeout=8.0) as resp:
+            raw = resp.read()
+        parsed = json.loads(raw)
+    except Exception:
+        parsed = None
+    with _WTTR_CACHE_LOCK:
+        _WTTR_CACHE[location] = (now, parsed)
+    return parsed
 
 
 # 2026-04-28 wave-8: traducir descripciones de wttr.in al español. Sin
@@ -128,17 +193,13 @@ def _fetch_weather_rain(location: str = WEATHER_LOCATION) -> dict | None:
     for today (chance ≥ WEATHER_RAIN_THRESHOLD in any upcoming 3h block, or
     current condition is raining). Returns ``None`` otherwise. Silent on any
     network error.
+
+    Uses `_fetch_wttr_raw` para compartir el HTTP con `_fetch_weather_forecast`
+    (ambos hacen el mismo URL) — sin el cache, el panel home hacía 2× la
+    misma request en paralelo.
     """
-    import urllib.request as _req
-    url = f"https://wttr.in/{location}?format=j1"
-    try:
-        with _req.urlopen(url, timeout=8.0) as resp:
-            raw = resp.read()
-    except Exception:
-        return None
-    try:
-        data = json.loads(raw)
-    except Exception:
+    data = _fetch_wttr_raw(location)
+    if data is None:
         return None
 
     # Current conditions: "Rain", "Light rain", "Thunderstorm", etc.
@@ -307,16 +368,13 @@ def _fetch_weather_forecast(location: str = WEATHER_LOCATION) -> dict | None:
     Returns dict with keys: location, current, days (list of up to 3 day
     forecasts with date, minC, maxC, avgC, description, chanceofrain,
     chanceofthunder). Returns None on network/parse errors from both sources.
-    """
-    import urllib.request as _req
 
-    # Primary: wttr.in
-    url = f"https://wttr.in/{location}?format=j1"
-    try:
-        with _req.urlopen(url, timeout=8.0) as resp:
-            raw = resp.read()
-        data = json.loads(raw)
-    except Exception:
+    Uses `_fetch_wttr_raw` para compartir HTTP con `_fetch_weather_rain` —
+    si signals.weather corrió segundos antes, esto es 0ms (cache hit).
+    """
+    # Primary: wttr.in (via shared cache)
+    data = _fetch_wttr_raw(location)
+    if data is None:
         return _fetch_weather_openmeteo(location)
 
     # Current conditions

@@ -243,14 +243,20 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
   z-index: 2;
 }
 
-/* ── Command bar (4 KPIs en fila — top de la página) ────── */
+/* ── Command bar (KPIs en fila — top de la página) ─────────
+   auto-fit en vez de repeat(N, 1fr) para que cuando algunos KPIs
+   tengan valor 0 (y JS los oculta con `hidden`), los visibles se
+   redistribuyan llenando el espacio en vez de dejar huecos. */
 
 .cmdbar {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: var(--space-3);
   margin-bottom: var(--space-5);
 }
+/* Si el JS escondió la cmdbar entera (todos los KPIs en 0) la regla
+   `[hidden]` del browser ya hace lo suyo, pero igual asegurámonos. */
+.cmdbar[hidden] { display: none; }
 .kpi {
   background: var(--bg-elev-1);
   border: 1px solid var(--border);

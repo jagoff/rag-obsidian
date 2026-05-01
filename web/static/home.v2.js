@@ -264,6 +264,19 @@
   function setKPI(id, { value, label, meta, tone, trend }) {
     const el = document.getElementById(id);
     if (!el) return;
+    // Hide cards con valor 0 / vacío / "—" — el user los considera
+    // ruido visual ("Reminders hoy: 0 tranquilo" no aporta info, mejor
+    // sacar la caja entera y dejar más aire para los KPIs activos).
+    // Si después llega un valor no-cero, el toggle de `hidden` lo
+    // muestra de nuevo automáticamente.
+    const numeric = Number(value);
+    const isZeroOrEmpty =
+      value == null ||
+      value === "" ||
+      value === "—" ||
+      (Number.isFinite(numeric) && numeric === 0);
+    el.hidden = isZeroOrEmpty;
+    if (isZeroOrEmpty) return;
     el.classList.remove("is-critical", "is-warning", "is-ok");
     if (tone === "critical") el.classList.add("is-critical");
     else if (tone === "warning") el.classList.add("is-warning");
@@ -323,6 +336,15 @@
             loops.length === 1 ? "1 loop STALE" :
             `${loops.length} loops STALE`,
     });
+
+    // Si todos los KPIs quedaron ocultos (todo en 0), ocultar la
+    // cmdbar entera para que no quede una banda vacía con su gap +
+    // margin-bottom comiendo espacio del hero.
+    const cmdbar = document.querySelector(".cmdbar");
+    if (cmdbar) {
+      const visibleKpis = cmdbar.querySelectorAll(".kpi:not([hidden])");
+      cmdbar.hidden = visibleKpis.length === 0;
+    }
   }
 
   function renderInbox(payload) {

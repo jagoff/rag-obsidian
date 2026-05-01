@@ -15749,7 +15749,7 @@ def generate_draft_preview(
     if model is None or tokenizer is None:
         return bot_draft_baseline
     try:
-        import torch  # noqa: F401
+        import torch
         prompt = (
             f"{original_conversation}\n\n"
             f"## Borrador del bot:\n"
@@ -15758,6 +15758,16 @@ def generate_draft_preview(
         )
         inp = tokenizer(prompt, return_tensors="pt", truncation=True,
                         max_length=1024)
+        # Move inputs al device del modelo. Sin esto, en MPS / CUDA, el
+        # forward pass crashea con `RuntimeError: Placeholder storage has
+        # not been allocated on MPS device` porque el tokenizer retorna
+        # tensores en CPU y `generate` no auto-convierte (transformers
+        # 5.1.0). Bug observado el 2026-05-01 con LoRA adapter en M3 Max.
+        try:
+            model_device = next(model.parameters()).device
+        except StopIteration:
+            model_device = torch.device("cpu")
+        inp = {k: v.to(model_device) for k, v in inp.items()}
         out = model.generate(
             **inp, max_new_tokens=max_new_tokens, do_sample=False,
             pad_token_id=tokenizer.eos_token_id,

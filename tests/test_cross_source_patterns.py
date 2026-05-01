@@ -561,6 +561,263 @@ def test_home_v2_html_has_correlations_modal():
     assert 'data-patterns-modal-close' in html
 
 
+# ── predict_mood_tomorrow ────────────────────────────────────────────────
+
+
+def test_predict_mood_returns_none_with_insufficient_data():
+    """< _PREDICT_MIN_DAYS rows entrenables → None."""
+    metrics = {
+        "mood_score": {f"2026-04-{i:02d}": 0.5 for i in range(1, 10)},
+        "sleep_quality": {f"2026-04-{i:02d}": 0.7 for i in range(1, 10)},
+    }
+    result = csp.predict_mood_tomorrow(metrics=metrics)
+    assert result is None
+
+
+def test_predict_mood_with_synthetic_correlated_data():
+    """Construir 30 días con sleep_quality[t-1] perfectamente
+    correlacionado con mood_score[t]. Predicción debe usar sleep como
+    feature dominante."""
+    today = datetime.now()
+    sleep_series = {}
+    mood_series = {}
+    for offset in range(30, -1, -1):
+        date = (today - timedelta(days=offset)).strftime("%Y-%m-%d")
+        # sleep[t] = oscilación 0.4 a 0.9
+        sleep_q = 0.4 + (offset % 7) * 0.05
+        sleep_series[date] = sleep_q
+        # mood[t] = sleep[t-1] * 1.5 - 0.5 (mapping aprox a [-0.5, 0.7])
+        # Mood NO está en t=hoy hasta t=ayer (correlación con t-1).
+        prev_date = (today - timedelta(days=offset + 1)).strftime("%Y-%m-%d")
+        if prev_date in sleep_series:
+            mood_series[date] = sleep_series[prev_date] * 1.5 - 0.5
+    metrics = {
+        "mood_score": mood_series,
+        "sleep_quality": sleep_series,
+        "sleep_duration_h": sleep_series,  # duplicate, no importa
+        "sleep_awakenings": {d: 2.0 for d in sleep_series},
+        "wakeup_mood": sleep_series,
+        "spotify_minutes": {d: 30.0 for d in sleep_series},
+        "spotify_distinct_tracks": {d: 5.0 for d in sleep_series},
+        "queries_total": {d: 10.0 for d in sleep_series},
+        "queries_existential": {d: 0.0 for d in sleep_series},
+        "wa_outbound_avg_chars": {d: 50.0 for d in sleep_series},
+        "mood_self_report": {},  # vacío — no debe romper
+    }
+
+    result = csp.predict_mood_tomorrow(metrics=metrics, days=60)
+    assert result is not None
+    # n_training_days >= MIN
+    assert result["n_training_days"] >= csp._PREDICT_MIN_DAYS
+    # Confidence alta porque la correlación es perfecta.
+    assert result["confidence"] >= 0.8
+    # Top features incluye sleep_quality (la real feature predictiva).
+    feature_names = [f["feature"] for f in result["top_features"]]
+    assert "sleep_quality" in feature_names
+
+
+def test_predict_mood_top_features_ordered_by_contribution():
+    today = datetime.now()
+    series = {(today - timedelta(days=i)).strftime("%Y-%m-%d"): float(i)
+              for i in range(0, 30)}
+    metrics = {
+        "mood_score": series,
+        "sleep_quality": series,
+        "sleep_duration_h": {d: 0.0 for d in series},  # zero contribution
+        "sleep_awakenings": {d: 1.0 for d in series},
+        "wakeup_mood": {d: 1.0 for d in series},
+        "spotify_minutes": {d: 1.0 for d in series},
+        "spotify_distinct_tracks": {d: 1.0 for d in series},
+        "queries_total": {d: 1.0 for d in series},
+        "queries_existential": {d: 0.0 for d in series},
+        "wa_outbound_avg_chars": {d: 1.0 for d in series},
+        "mood_self_report": {},
+    }
+    result = csp.predict_mood_tomorrow(metrics=metrics, days=30)
+    if result is None or result.get("prediction") is None:
+        pytest.skip("not enough data after alignment")
+    contribs = [abs(f["contribution"]) for f in result["top_features"]]
+    assert contribs == sorted(contribs, reverse=True)
+
+
+def test_predict_mood_silent_fail_when_no_target():
+    """Sin mood_score como métrica, devuelve None."""
+    metrics = {
+        "sleep_quality": {f"2026-04-{i:02d}": 0.5 for i in range(1, 30)},
+    }
+    result = csp.predict_mood_tomorrow(metrics=metrics)
+    assert result is None
+
+
+# ── CLI rag mood predict ─────────────────────────────────────────────────
+
+
+def test_cli_mood_predict_no_data(monkeypatch):
+    """`rag mood predict` sin data → mensaje de feature off o
+    insufficient data."""
+    monkeypatch.setenv("RAG_MOOD_ENABLED", "1")
+    from rag import cross_source_patterns as _csp
+    monkeypatch.setattr(_csp, "predict_mood_tomorrow", lambda **kw: None)
+    from click.testing import CliRunner
+    runner = CliRunner()
+    result = runner.invoke(rag.cli, ["mood", "predict", "--plain"])
+    assert result.exit_code == 0
+    assert "insufficient_data" in result.output or "prediction=none" in result.output
+
+
+def test_cli_mood_predict_with_result(monkeypatch):
+    """`rag mood predict` con result válido → muestra prediction +
+    confidence + top features."""
+    monkeypatch.setenv("RAG_MOOD_ENABLED", "1")
+    from rag import cross_source_patterns as _csp
+    monkeypatch.setattr(_csp, "predict_mood_tomorrow", lambda **kw: {
+        "prediction": -0.42, "confidence": 0.65, "n_training_days": 28,
+        "target_date": "2026-05-01", "based_on_date": "2026-04-30",
+        "top_features": [
+            {"feature": "sleep_quality", "coef": 1.5,
+             "value_today": 0.6, "contribution": 0.9},
+            {"feature": "spotify_minutes", "coef": -0.01,
+             "value_today": 30.0, "contribution": -0.3},
+        ],
+    })
+    from click.testing import CliRunner
+    runner = CliRunner()
+    result = runner.invoke(rag.cli, ["mood", "predict", "--plain"])
+    assert result.exit_code == 0
+    assert "prediction=-0.420" in result.output
+    assert "confidence=0.650" in result.output
+    assert "sleep_quality" in result.output
+
+
+# ── Hook today_correlator → bucket cross_patterns ────────────────────────
+
+
+def test_correlate_cross_patterns_returns_none_when_no_findings(monkeypatch):
+    """Sin findings strong/moderate y sin prediction → bucket None."""
+    from rag import today_correlator as _tc
+    from rag import cross_source_patterns as _csp
+    monkeypatch.setattr(_csp, "patterns_summary", lambda **kw: {
+        "n_findings": 0, "top": [], "by_severity": {},
+        "metrics_with_data": [], "days_range": 30, "lags_tested": [0],
+    })
+    monkeypatch.setattr(_csp, "predict_mood_tomorrow", lambda **kw: None)
+    result = _tc._correlate_cross_patterns({}, {})
+    assert result is None
+
+
+def test_correlate_cross_patterns_filters_weak(monkeypatch):
+    """Findings con severity=weak NO se incluyen (evita ruido)."""
+    from rag import today_correlator as _tc
+    from rag import cross_source_patterns as _csp
+    monkeypatch.setattr(_csp, "patterns_summary", lambda **kw: {
+        "n_findings": 3, "by_severity": {},
+        "metrics_with_data": [], "days_range": 30, "lags_tested": [0],
+        "top": [
+            {"description": "strong x", "r": 0.7, "n": 25,
+             "lag": 0, "severity": "strong",
+             "pair": ("a", "b")},
+            {"description": "weak y", "r": 0.32, "n": 25,
+             "lag": 1, "severity": "weak",
+             "pair": ("c", "d")},
+            {"description": "moderate z", "r": 0.5, "n": 25,
+             "lag": 7, "severity": "moderate",
+             "pair": ("e", "f")},
+        ],
+    })
+    monkeypatch.setattr(_csp, "predict_mood_tomorrow", lambda **kw: None)
+    result = _tc._correlate_cross_patterns({}, {})
+    assert result is not None
+    descriptions = [f["description"] for f in result["top_findings"]]
+    assert "strong x" in descriptions
+    assert "moderate z" in descriptions
+    assert "weak y" not in descriptions
+    assert result["n_findings_total"] == 3
+
+
+def test_correlate_cross_patterns_includes_prediction(monkeypatch):
+    """Si prediction está, viene en el bucket."""
+    from rag import today_correlator as _tc
+    from rag import cross_source_patterns as _csp
+    monkeypatch.setattr(_csp, "patterns_summary", lambda **kw: {
+        "n_findings": 0, "top": [], "by_severity": {},
+        "metrics_with_data": [], "days_range": 30, "lags_tested": [0],
+    })
+    monkeypatch.setattr(_csp, "predict_mood_tomorrow", lambda **kw: {
+        "prediction": 0.3, "confidence": 0.55, "n_training_days": 25,
+        "target_date": "2026-05-01", "based_on_date": "2026-04-30",
+        "top_features": [],
+    })
+    result = _tc._correlate_cross_patterns({}, {})
+    assert result is not None
+    assert result["prediction"]["prediction"] == 0.3
+    assert result["prediction"]["confidence"] == 0.55
+
+
+# ── Today prompt rule #9 ────────────────────────────────────────────────
+
+
+def test_today_prompt_includes_rule_9_when_cross_patterns_present():
+    """Cuando extras.correlations.cross_patterns tiene findings, la
+    regla #9 aparece en el prompt."""
+    extras = {"correlations": {
+        "people": [], "topics": [], "time_overlaps": [], "gaps": [],
+        "mood": None, "sleep": None,
+        "cross_patterns": {
+            "top_findings": [
+                {"description": "sleep alta → mood sube (mismo día)",
+                 "r": 0.65, "n": 25, "lag": 0, "severity": "strong"},
+            ],
+            "prediction": None,
+            "n_findings_total": 1,
+        },
+    }}
+    ev = {"recent_notes": [{"title": "n", "path": "02-Areas/n.md", "snippet": "x"}],
+          "inbox_today": [], "todos": [], "new_contradictions": [],
+          "low_conf_queries": [], "wa_scheduled_today_pending": []}
+    prompt = rag._render_today_prompt("2026-04-30", ev, extras=extras)
+    assert "Patrones cross-source" in prompt
+    assert "sleep alta → mood sube" in prompt
+    assert "PROHIBIDO afirmar causalidad" in prompt
+
+
+def test_today_prompt_omits_rule_9_when_no_cross_patterns():
+    """Sin bucket cross_patterns o vacío → regla #9 ausente."""
+    extras = {"correlations": {
+        "people": [], "topics": [], "time_overlaps": [], "gaps": [],
+        "cross_patterns": None,
+    }}
+    ev = {"recent_notes": [{"title": "n", "path": "02-Areas/n.md", "snippet": "x"}],
+          "inbox_today": [], "todos": [], "new_contradictions": [],
+          "low_conf_queries": [], "wa_scheduled_today_pending": []}
+    prompt = rag._render_today_prompt("2026-04-30", ev, extras=extras)
+    assert "Patrones cross-source" not in prompt
+    assert "9. **Patrones" not in prompt
+
+
+def test_today_prompt_includes_prediction_with_confidence_label():
+    """Prediction con confidence alta → label "alta" en el prompt."""
+    extras = {"correlations": {
+        "people": [], "topics": [], "time_overlaps": [], "gaps": [],
+        "cross_patterns": {
+            "top_findings": [],
+            "prediction": {
+                "prediction": -0.5, "confidence": 0.7,
+                "target_date": "2026-05-01",
+                "n_training_days": 25, "based_on_date": "2026-04-30",
+                "top_features": [],
+            },
+            "n_findings_total": 0,
+        },
+    }}
+    ev = {"recent_notes": [{"title": "n", "path": "02-Areas/n.md", "snippet": "x"}],
+          "inbox_today": [], "todos": [], "new_contradictions": [],
+          "low_conf_queries": [], "wa_scheduled_today_pending": []}
+    prompt = rag._render_today_prompt("2026-04-30", ev, extras=extras)
+    assert "predicción mañana" in prompt
+    assert "confianza alta" in prompt
+    assert "tendencia bajo" in prompt  # -0.5 → bajo
+
+
 def test_home_v2_bundle_includes_render_correlations():
     """El JS bundle tiene `renderCorrelations` (no `renderPatterns`)
     para evitar shadowing con el render existente del panel

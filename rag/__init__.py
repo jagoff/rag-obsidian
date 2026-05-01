@@ -32018,6 +32018,97 @@ def mood_poll_cmd(no_llm: bool, dry_run: bool, plain: bool) -> None:
                       f"({score['n_signals']} señales · sources: {', '.join(score['sources_used'])})")
 
 
+@mood_group.command("predict")
+@click.option("--days", default=60, type=int, help="Histórico para entrenar (default 60)")
+@click.option("--plain", is_flag=True)
+def mood_predict_cmd(days: int, plain: bool) -> None:
+    """Predicción del mood de mañana via LinearRegression.
+
+    Entrena con features de los últimos N días (lag-1: features[t-1] →
+    mood[t]), aplica al estado de hoy, devuelve un valor en [-1, +1] +
+    confidence (R²) + top features que más contribuyen.
+
+    Importante: NO es verdad — es estimación basada en patrones
+    recientes que pueden cambiar. Si el R² es bajo (<0.3), el modelo
+    está adivinando — desconfiá del número y mirá las features."""
+    from rag import mood as _mood  # noqa: PLC0415
+    from rag.cross_source_patterns import predict_mood_tomorrow  # noqa: PLC0415
+    if not _mood._is_mood_enabled():
+        click.echo("mood feature off (set RAG_MOOD_ENABLED=1)")
+        return
+    days_clamped = max(21, min(int(days), 90))
+    result = predict_mood_tomorrow(days=days_clamped)
+
+    if result is None:
+        if plain:
+            click.echo(
+                f"prediction=none reason=insufficient_data "
+                f"min_required=21 days_tried={days_clamped}"
+            )
+            return
+        console.print(
+            "[yellow]sin data suficiente para predecir[/] "
+            f"[dim](mínimo 21 días con mood + features alineadas; "
+            f"intentamos {days_clamped})[/dim]"
+        )
+        return
+
+    pred = result.get("prediction")
+    conf = result.get("confidence", 0.0)
+    n = result.get("n_training_days", 0)
+    target = result.get("target_date")
+    top = result.get("top_features") or []
+
+    if pred is None:
+        # Modelo entrenado pero no podemos predecir hoy → mañana por
+        # missing features de hoy.
+        reason = result.get("reason", "missing_features_today")
+        if plain:
+            click.echo(f"prediction=none reason={reason} confidence={conf}")
+            return
+        console.print(f"[yellow]modelo entrenado (R²={conf:+.2f}, n={n}) "
+                      f"pero falta data de HOY para predecir mañana[/]")
+        console.print(f"[dim]reason: {reason}[/]")
+        return
+
+    if plain:
+        click.echo(
+            f"prediction={pred:+.3f} confidence={conf:.3f} "
+            f"n_training={n} target_date={target}"
+        )
+        for f in top:
+            click.echo(
+                f"  feature={f['feature']} coef={f['coef']:+.4f} "
+                f"value_today={f['value_today']:+.3f} "
+                f"contribution={f['contribution']:+.3f}"
+            )
+        return
+
+    color = _mood_score_color(pred)
+    conf_color = (
+        "green" if conf >= 0.5 else "yellow" if conf >= 0.3 else "red"
+    )
+    sign = "+" if pred > 0 else ""
+    console.print(f"\n[bold]predicción mood mañana ({target})[/]")
+    console.print(f"  [{color}]{sign}{pred:.2f}[/]  "
+                  f"confianza R² [{conf_color}]{conf:.2f}[/] "
+                  f"[dim](n={n} días entrenamiento)[/]")
+    if conf < 0.3:
+        console.print("[dim]⚠ R² bajo — el modelo está adivinando. "
+                      "Mirá los features individuales más que el número.[/dim]")
+    if top:
+        console.print("\n[dim]top features que mueven la predicción:[/]")
+        for f in top:
+            contrib = f["contribution"]
+            c = "bright_red" if abs(contrib) >= 0.3 else "yellow" if abs(contrib) >= 0.1 else "white"
+            sign_c = "+" if contrib > 0 else ""
+            console.print(
+                f"  [{c}]{f['feature']:<28}[/] "
+                f"[dim]coef={f['coef']:+.3f} hoy={f['value_today']:+.2f}[/] "
+                f"[{c}]→ {sign_c}{contrib:.2f}[/]"
+            )
+
+
 @cli.group("sleep", invoke_without_command=False)
 def sleep_group() -> None:
     """Sleep tracking — métricas de Pillow (iOS) sincronizadas via iCloud.
@@ -45302,6 +45393,73 @@ def _render_today_prompt(
         # Si stable y score modesto, no agregamos regla #8 — el brief
         # se comporta default. Pero registramos en el cross-source
         # block que el feature está activo (no afecta tono).
+
+    # ── Regla #9 (cross-patterns + prediction) — solo si el bucket
+    # `cross_patterns` tiene findings strong/moderate o una prediction
+    # válida. La regla le da al LLM permiso para mencionar las
+    # correlaciones FACTUALMENTE como observación, sin afirmar
+    # causalidad. Y la predicción del mood SOLO como heurística
+    # ("según patrones recientes podría tender a X"), nunca como
+    # certeza.
+    cross_patterns = (extras.get("correlations") or {}).get("cross_patterns")
+    if cross_patterns and (
+        cross_patterns.get("top_findings")
+        or cross_patterns.get("prediction") is not None
+    ):
+        findings_lines = []
+        for f in (cross_patterns.get("top_findings") or [])[:3]:
+            desc = f.get("description") or ""
+            r = f.get("r")
+            sev = f.get("severity")
+            if desc and r is not None:
+                findings_lines.append(
+                    f"      - {desc} (r={r:+.2f}, {sev})"
+                )
+
+        prediction = cross_patterns.get("prediction") or {}
+        pred_val = prediction.get("prediction") if prediction else None
+        pred_conf = prediction.get("confidence") if prediction else None
+        pred_target = prediction.get("target_date") if prediction else None
+        pred_line = ""
+        if pred_val is not None and pred_conf is not None:
+            pred_label = (
+                "alto" if pred_val >= 0.4
+                else "tibio-positivo" if pred_val >= 0.1
+                else "neutro" if pred_val > -0.1
+                else "tibio-negativo" if pred_val > -0.4
+                else "bajo"
+            )
+            conf_label = (
+                "alta" if pred_conf >= 0.5
+                else "media" if pred_conf >= 0.3
+                else "baja"
+            )
+            pred_line = (
+                f"   predicción mañana ({pred_target}): "
+                f"tendencia {pred_label} (R²={pred_conf:.2f}, "
+                f"confianza {conf_label})"
+            )
+
+        rule9_parts = [
+            "9. **Patrones cross-source (lectura factual, NO causalidad)**. "
+            "Los datos de los últimos días sugieren las siguientes "
+            "RELACIONES OBSERVADAS — podés mencionarlas como "
+            "observación factual SIN afirmar que una causa la otra:",
+            *findings_lines,
+        ]
+        if pred_line:
+            rule9_parts.extend(["", pred_line])
+        rule9_parts.extend([
+            "",
+            "   PROHIBIDO afirmar causalidad ('X causa Y'). Usar "
+            "lenguaje de relación: 'cuando X tiende a estar alto, "
+            "Y suele estar...'. Si la confianza es baja o el R² es "
+            "bajo, NO mencionar la predicción — preferimos silencio "
+            "antes que un número malo.",
+            "",
+        ])
+        if findings_lines or pred_line:
+            parts.extend(rule9_parts)
 
     parts.extend([
         "## CONTEXTO DEL DÍA",

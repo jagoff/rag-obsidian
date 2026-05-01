@@ -1094,6 +1094,74 @@ def _correlate_sleep(today_ev: dict, extras: dict) -> dict | None:
     }
 
 
+def _correlate_cross_patterns(today_ev: dict, extras: dict) -> dict | None:
+    """Lee findings de Pearson cross-source de
+    `rag.cross_source_patterns.patterns_summary` + predicción del mood
+    de mañana. Devuelve un bucket con las top correlaciones STRONG y
+    la predicción para que el today brief pueda mencionarlas
+    factualmente (sin afirmar causalidad).
+
+    Shape:
+
+        {
+            "top_findings": [{description, r, severity, lag, ...}, ...],
+            "prediction": {prediction, confidence, top_features} | None,
+            "n_findings_total": int,
+        }
+
+    Devuelve None cuando:
+      - El módulo `cross_source_patterns` no carga.
+      - No hay findings strong (no exponemos noise al brief).
+      - Falla silenciosamente la query.
+
+    Threshold: solo findings con `severity in {strong, moderate}` y r
+    significativo. Excluimos `weak` para no contaminar el prompt con
+    correlaciones débiles que el LLM podría sobre-interpretar."""
+    try:
+        from rag.cross_source_patterns import (  # noqa: PLC0415
+            patterns_summary, predict_mood_tomorrow,
+        )
+    except Exception:
+        return None
+
+    try:
+        summary = patterns_summary(days=30, top=10, lags=(0, 1, 7))
+    except Exception:
+        summary = None
+
+    top_findings: list[dict] = []
+    n_findings_total = 0
+    if summary:
+        n_findings_total = summary.get("n_findings", 0)
+        # Filtrar a strong + moderate solamente (descarta weak para no
+        # ruido el brief).
+        for f in summary.get("top", []):
+            if f.get("severity") in ("strong", "moderate"):
+                top_findings.append({
+                    "description": f.get("description"),
+                    "r": f.get("r"),
+                    "n": f.get("n"),
+                    "lag": f.get("lag"),
+                    "severity": f.get("severity"),
+                })
+            if len(top_findings) >= 5:
+                break
+
+    try:
+        prediction = predict_mood_tomorrow(days=60)
+    except Exception:
+        prediction = None
+
+    if not top_findings and prediction is None:
+        return None
+
+    return {
+        "top_findings": top_findings,
+        "prediction": prediction,
+        "n_findings_total": n_findings_total,
+    }
+
+
 def correlate_today_signals(today_ev: dict, extras: dict) -> dict:
     """Pre-correlate cross-source signals. Returns:
         {
@@ -1126,4 +1194,9 @@ def correlate_today_signals(today_ev: dict, extras: dict) -> dict:
         "gaps": _correlate_gaps(today_ev or {}, extras or {}),
         "mood": _correlate_mood(today_ev or {}, extras or {}),
         "sleep": _correlate_sleep(today_ev or {}, extras or {}),
+        # Cross-source statistical patterns (Pearson + lag) +
+        # mood prediction for tomorrow. Read-only desde
+        # cross_source_patterns. None if engine fails / no findings
+        # / no prediction (mismo patrón que `mood`).
+        "cross_patterns": _correlate_cross_patterns(today_ev or {}, extras or {}),
     }

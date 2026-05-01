@@ -639,13 +639,194 @@ def patterns_summary(
     }
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Mood prediction (LinearRegression con lag-1)
+
+
+_PREDICT_MIN_DAYS = 21
+_PREDICT_TARGET = "mood_score"
+# Features a usar como predictoras (lag-1). NO incluyen mood_score
+# mismo (eso seria autocorrelation y daria 1.0 trivial).
+_PREDICT_FEATURES = [
+    "sleep_quality", "sleep_duration_h", "sleep_awakenings",
+    "wakeup_mood", "spotify_minutes", "spotify_distinct_tracks",
+    "queries_total", "queries_existential", "wa_outbound_avg_chars",
+    "mood_self_report",
+]
+
+
+def _build_training_data(
+    metrics: dict[str, dict[str, float]],
+    *,
+    target: str = _PREDICT_TARGET,
+    features: list[str] | None = None,
+    lag: int = 1,
+) -> tuple[list[list[float]], list[float], list[str], list[str]]:
+    """Arma matriz X (rows = días, cols = features) + vector y (target).
+
+    Para cada día `t` donde `target[t]` y TODAS las features en `t-lag`
+    existen, agregamos una row a X y un valor a y. Días con missing
+    en cualquier feature se saltean (no imputamos para no contaminar
+    con guesses).
+
+    Returns: `(X, y, feature_names, target_dates)`.
+    """
+    feature_names = features or _PREDICT_FEATURES
+    # Una feature solo es "available" si está en metrics Y tiene
+    # data en al menos algún día. Features registradas pero
+    # ENTERAMENTE vacías se saltean — sino bloqueamos el training
+    # cuando agregamos una métrica nueva que aún no recolectó nada.
+    available_features = [
+        f for f in feature_names
+        if f in metrics and len(metrics[f]) > 0
+    ]
+    X: list[list[float]] = []
+    y: list[float] = []
+    target_dates: list[str] = []
+    target_series = metrics.get(target, {})
+    for date_b, val_y in target_series.items():
+        try:
+            db_dt = datetime.strptime(date_b, "%Y-%m-%d")
+        except ValueError:
+            continue
+        date_lag = (db_dt - timedelta(days=lag)).strftime("%Y-%m-%d")
+        row: list[float] = []
+        complete = True
+        for fname in available_features:
+            v = metrics[fname].get(date_lag)
+            if v is None:
+                complete = False
+                break
+            row.append(float(v))
+        if not complete:
+            continue
+        X.append(row)
+        y.append(float(val_y))
+        target_dates.append(date_b)
+    return X, y, available_features, target_dates
+
+
+def predict_mood_tomorrow(
+    *,
+    days: int = 60,
+    metrics: dict[str, dict[str, float]] | None = None,
+    target: str = _PREDICT_TARGET,
+    features: list[str] | None = None,
+) -> dict[str, Any] | None:
+    """Predice `mood_score` de mañana usando LinearRegression sobre las
+    features (con lag-1) de los últimos `days` días + features de hoy
+    como input.
+
+    Algoritmo:
+      1. Colectar métricas de los últimos `days` días.
+      2. Build training data: cada row es (features[t-1] → mood[t]).
+      3. Si tenemos < `_PREDICT_MIN_DAYS` rows entrenables, devolver None.
+      4. Fit `LinearRegression`.
+      5. Tomar features de HOY (que predicen MAÑANA).
+      6. Predecir + calcular R² como confidence.
+      7. Devolver top features por |coef * value| (qué features
+         contribuyen más a la predicción específica de mañana).
+
+    Returns:
+      `{prediction: float (-1..+1), confidence: float (0..1, R²),
+        n_training_days: int, target_date: str (mañana),
+        based_on_date: str (hoy), top_features: [(name, coef, value, contrib), ...]}`
+      o `None` si no hay enough data.
+
+    Importante: NO interpretar como verdad — la regresión asume
+    estabilidad de patrones que pueden cambiar. UI debe marcar como
+    "estimación basada en patrones recientes".
+    """
+    if metrics is None:
+        metrics = collect_daily_metrics(days=days)
+
+    X, y, feature_names, _dates = _build_training_data(
+        metrics, target=target, features=features, lag=1,
+    )
+    if len(X) < _PREDICT_MIN_DAYS:
+        return None
+
+    try:
+        from sklearn.linear_model import LinearRegression  # noqa: PLC0415
+        import numpy as np  # noqa: PLC0415
+    except Exception as exc:
+        _silent_log_safe("xspat_predict_sklearn_failed", exc)
+        return None
+
+    try:
+        X_np = np.array(X, dtype=float)
+        y_np = np.array(y, dtype=float)
+        model = LinearRegression()
+        model.fit(X_np, y_np)
+        # R² del fit. NO es validación cross-fold (eso seria mas
+        # honest pero overkill para un MVP). Para >=21 days es OK.
+        confidence = float(model.score(X_np, y_np))
+    except Exception as exc:
+        _silent_log_safe("xspat_predict_fit_failed", exc)
+        return None
+
+    # Features de HOY (las del último día disponible). Esas predicen
+    # MAÑANA bajo la asumción de que los patrones de los últimos días
+    # se mantienen.
+    today_str = _today_str()
+    target_date = (datetime.strptime(today_str, "%Y-%m-%d")
+                   + timedelta(days=1)).strftime("%Y-%m-%d")
+    today_features = []
+    for fname in feature_names:
+        v = metrics.get(fname, {}).get(today_str)
+        if v is None:
+            # Sin features de hoy completas, no podemos predecir mañana.
+            return {
+                "prediction": None,
+                "confidence": round(confidence, 3),
+                "n_training_days": len(X),
+                "target_date": target_date,
+                "based_on_date": today_str,
+                "top_features": [],
+                "reason": f"missing_feature_today:{fname}",
+            }
+        today_features.append(float(v))
+
+    try:
+        prediction = float(model.predict(np.array([today_features]))[0])
+        # Clamp a [-1, +1] que es el rango natural del mood_score.
+        prediction = max(-1.0, min(1.0, prediction))
+    except Exception as exc:
+        _silent_log_safe("xspat_predict_inference_failed", exc)
+        return None
+
+    # Top features por |coef * value| (qué movió más la predicción).
+    coefs = model.coef_.tolist()
+    contributions = []
+    for fname, coef, value in zip(feature_names, coefs, today_features):
+        contrib = coef * value
+        contributions.append({
+            "feature": fname,
+            "coef": round(float(coef), 4),
+            "value_today": round(value, 3),
+            "contribution": round(contrib, 3),
+        })
+    contributions.sort(key=lambda x: -abs(x["contribution"]))
+
+    return {
+        "prediction": round(prediction, 3),
+        "confidence": round(confidence, 3),
+        "n_training_days": len(X),
+        "target_date": target_date,
+        "based_on_date": today_str,
+        "top_features": contributions[:5],
+    }
+
+
 __all__ = [
     "collect_daily_metrics",
     "compute_correlations",
     "patterns_summary",
+    "predict_mood_tomorrow",
     "register_metric",
     "known_metrics",
     "metric_label",
     "_pearson",
     "_align_series",
+    "_build_training_data",
 ]

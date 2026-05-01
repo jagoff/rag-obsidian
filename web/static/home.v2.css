@@ -838,6 +838,171 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 }
 .hero-section .prose li.reminder-created::before { content: "✓"; color: var(--phosphor); }
 
+/* ── Highlights chips: fila de stats sintéticos arriba del prose en
+      "Lo que pasó hoy". Cada chip = mini stat (Top WA · Mails · Top
+      persona · Tema). Wrap natural en columnas estrechas (1/4 del hero
+      en desktop). Backend: `today.highlights` — `home.v2.js:renderHighlights`. */
+.hero-highlights {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 0 0 var(--space-3);
+  padding-bottom: var(--space-2);
+  border-bottom: 1px dashed var(--border);
+}
+.hl-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 7px;
+  font-size: var(--fs-mini);
+  background: var(--bg-elev-3);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  max-width: 100%;
+  text-decoration: none;
+  transition: background var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out);
+}
+.hl-chip.is-link { cursor: pointer; }
+.hl-chip.is-link:hover {
+  background: rgba(121, 221, 255, 0.08);
+  border-color: var(--cyan-dim);
+}
+.hl-chip .hl-icon { font-size: 12px; line-height: 1; flex-shrink: 0; }
+.hl-chip .hl-label {
+  color: var(--text);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.hl-chip .hl-value {
+  color: var(--cyan);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+.hl-chip .hl-meta {
+  color: var(--text-faint);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  margin-left: 2px;
+}
+/* Variants — color del label por tipo (persona = phosphor, tema = magenta).
+   El value mantiene cyan para coherencia visual del "número del chip". */
+.hl-chip--persona .hl-label { color: var(--phosphor); }
+.hl-chip--persona .hl-icon { color: var(--phosphor); }
+.hl-chip--topic .hl-label { color: var(--magenta); }
+.hl-chip--topic .hl-icon { color: var(--magenta); }
+
+/* ── Hero prose wrapper: contenido narrativo del LLM (o fallback). El
+      prose va entre los chips de highlights y el sub-bloque de patterns.
+      Mantiene el espaciado del .hero-section .prose original. */
+.hero-prose { font-size: var(--fs-base); color: var(--text); line-height: 1.55; }
+.hero-prose p { margin: 0 0 var(--space-2); }
+.hero-prose p:last-child { margin-bottom: 0; }
+.hero-prose ul, .hero-prose ol {
+  list-style: none; margin: 0; padding: 0;
+}
+.hero-prose li {
+  position: relative;
+  padding: var(--space-1) 0 var(--space-1) var(--space-3);
+  font-size: var(--fs-base);
+  border-bottom: 1px dashed var(--border);
+}
+.hero-prose li:last-child { border-bottom: none; }
+.hero-prose li::before {
+  content: "·";
+  position: absolute;
+  left: 0;
+  color: var(--text-faint);
+  font-weight: 700;
+}
+.hero-prose strong { color: var(--text); font-weight: 700; }
+.hero-prose em { color: var(--cyan); font-style: normal; }
+.hero-prose a { color: var(--cyan); border-bottom: 1px dotted var(--cyan-dim); }
+
+/* ── Patterns sub-block: detecciones automáticas debajo del prose.
+      Cada `.ptn-card` es una sub-sección con border-left color por tipo
+      (spike=amber, silence=magenta, concentration=cyan, gap=red). El
+      contenedor `.hero-patterns` es grid auto para apilar las cards
+      verticalmente sin importar cuántas haya (0-4). Backend: `today.
+      patterns` — `home.v2.js:renderPatterns`. */
+.hero-patterns {
+  margin-top: var(--space-3);
+  padding-top: var(--space-2);
+  border-top: 1px dashed var(--border);
+  display: grid;
+  gap: var(--space-2);
+}
+.ptn-card {
+  padding: var(--space-2) var(--space-2) var(--space-2) var(--space-3);
+  background: rgba(255, 255, 255, 0.02);
+  border-left: 2px solid var(--cyan-dim);
+  border-radius: 0 2px 2px 0;
+}
+.ptn-card--spike { border-left-color: var(--amber); }
+.ptn-card--silence { border-left-color: var(--magenta); }
+.ptn-card--concentration { border-left-color: var(--cyan); }
+.ptn-card--gap { border-left-color: var(--red, #ff5c5c); }
+.ptn-card h4 {
+  margin: 0 0 var(--space-1);
+  font-size: var(--fs-mini);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  font-weight: 600;
+  display: flex;
+  gap: 5px;
+  align-items: center;
+}
+.ptn-card--spike h4 { color: var(--amber); }
+.ptn-card--silence h4 { color: var(--magenta); }
+.ptn-card--concentration h4 { color: var(--cyan); }
+.ptn-card--gap h4 { color: var(--red, #ff5c5c); }
+.ptn-card ul { list-style: none; margin: 0; padding: 0; }
+.ptn-card li {
+  padding: 3px 0;
+  font-size: var(--fs-mini);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 5px;
+  border-bottom: 1px dashed var(--border);
+}
+.ptn-card li:last-child { border-bottom: none; }
+.ptn-card li a {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 5px;
+  width: 100%;
+  text-decoration: none;
+  color: inherit;
+  transition: background var(--dur-fast) var(--ease-out);
+}
+.ptn-card li a:hover {
+  background: rgba(121, 221, 255, 0.05);
+}
+.ptn-card strong {
+  color: var(--text);
+  font-weight: 600;
+  font-size: var(--fs-base);
+}
+.ptn-num {
+  color: var(--amber);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.ptn-meta {
+  color: var(--text-faint);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  margin-left: auto;
+}
+
 /* Tablet: 2x2 */
 @media (max-width: 1100px) {
   .today-hero-body { grid-template-columns: repeat(2, 1fr); }
@@ -2316,6 +2481,290 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 @media (prefers-reduced-motion: reduce) {
   .mood-hist-row .hist-bar,
   .mood-modal-close {
+    transition: none;
+  }
+}
+
+/* ────────────────────────────────────────────────────────────
+   Correlations panel — top Pearson cross-source. Layout
+   compacto: lista de top 3 findings con r value coloreado por
+   severity + lag badge. Footer con button "ver todos" → modal.
+   Usa class `.panel-correlations` (no `.panel-patterns` porque
+   ese ya está tomado por el panel pre-existente de entidades
+   cross-source). */
+.panel-correlations .patterns-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.patterns-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: var(--space-2);
+  align-items: center;
+  padding: 4px 0;
+  font-size: var(--fs-mini);
+  font-variant-numeric: tabular-nums;
+  border-bottom: 1px solid var(--bg-elev-2);
+}
+
+.patterns-row:last-child {
+  border-bottom: none;
+}
+
+.patterns-pair {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.patterns-pair .metric {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.patterns-sep {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.patterns-lag {
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.patterns-r {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  text-align: right;
+  min-width: 50px;
+}
+
+/* Severity coloring para el value de r — coherente con el resto del
+   sistema (rojo=strong, ámbar=moderate, gris=weak). */
+.patterns-strong .patterns-r {
+  color: var(--bright-red, var(--red));
+}
+
+.patterns-moderate .patterns-r {
+  color: var(--amber);
+}
+
+.patterns-weak .patterns-r {
+  color: var(--text-dim);
+}
+
+/* Empty state cuando todavía no hay enough data. Mensaje neutral
+   sin paniquear ("acumulando data") + hint del estado. */
+.patterns-empty {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: var(--fs-mini);
+}
+
+.patterns-empty p {
+  margin: 0;
+}
+
+.patterns-empty-hint {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+/* Footer button — mismo styling que mood-history-btn pero variant. */
+.patterns-history-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent, var(--text-strong));
+  font-size: var(--fs-mini);
+  font-family: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, var(--accent, var(--text-strong)) 30%, transparent);
+  text-underline-offset: 2px;
+  touch-action: manipulation;
+  transition: text-decoration-color var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out);
+}
+
+.patterns-history-btn:hover {
+  text-decoration-color: var(--accent, var(--text-strong));
+}
+
+.patterns-history-btn:focus-visible {
+  outline: 2px solid var(--accent, var(--text-strong));
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* ────────────────────────────────────────────────────────────
+   Patterns modal — full detail. Reusa estructura de mood-modal
+   (background, head, body, close button) cambiando solo el
+   contenido interno. */
+.patterns-full-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.patterns-full-row {
+  display: grid;
+  grid-template-columns: 12px 1fr auto 56px 110px;
+  gap: var(--space-2);
+  align-items: center;
+  padding: 6px 0;
+  font-size: var(--fs-mini);
+  font-variant-numeric: tabular-nums;
+  border-bottom: 1px solid var(--bg-elev-2);
+}
+
+.patterns-full-row:last-child {
+  border-bottom: none;
+}
+
+.patterns-sev-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin: 0 auto;
+}
+
+.patterns-strong .patterns-sev-dot {
+  background: var(--bright-red, var(--red));
+}
+
+.patterns-moderate .patterns-sev-dot {
+  background: var(--amber);
+}
+
+.patterns-weak .patterns-sev-dot {
+  background: var(--text-faint);
+}
+
+.patterns-full-pair {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.patterns-full-lag {
+  font-size: 11px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.patterns-full-r {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  text-align: right;
+}
+
+.patterns-full-row.patterns-strong .patterns-full-r {
+  color: var(--bright-red, var(--red));
+}
+
+.patterns-full-row.patterns-moderate .patterns-full-r {
+  color: var(--amber);
+}
+
+.patterns-full-meta {
+  font-size: 11px;
+  text-align: right;
+}
+
+.patterns-full-desc {
+  grid-column: 2 / -1;
+  font-size: 11px;
+  font-style: italic;
+  color: var(--text-faint);
+  padding-top: 2px;
+}
+
+/* Cobertura por métrica — una row con bar horizontal + n_days. */
+.patterns-coverage {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.patterns-cov-row {
+  display: grid;
+  grid-template-columns: 140px 1fr 50px;
+  gap: var(--space-2);
+  align-items: center;
+  padding: 3px 0;
+  font-size: var(--fs-mini);
+  font-variant-numeric: tabular-nums;
+}
+
+.patterns-cov-row .cov-name {
+  color: var(--text-dim);
+}
+
+.patterns-cov-row .cov-bar-wrap {
+  display: block;
+  height: 8px;
+  background: var(--bg-elev-2);
+  border-radius: 1px;
+  overflow: hidden;
+}
+
+.patterns-cov-row .cov-bar {
+  display: block;
+  height: 100%;
+  border-radius: 1px;
+  transition: width var(--dur-base, 200ms) var(--ease-out);
+}
+
+.patterns-cov-row.ready .cov-bar {
+  background: var(--green);
+}
+
+.patterns-cov-row.partial .cov-bar {
+  background: var(--amber);
+}
+
+.patterns-cov-row.low .cov-bar {
+  background: var(--text-faint);
+  opacity: 0.5;
+}
+
+.patterns-cov-row .cov-n {
+  text-align: right;
+  color: var(--text-dim);
+}
+
+@media (max-width: 600px) {
+  .patterns-full-row {
+    grid-template-columns: 12px 1fr 50px;
+  }
+  .patterns-full-lag,
+  .patterns-full-meta {
+    display: none;
+  }
+  .patterns-cov-row {
+    grid-template-columns: 100px 1fr 40px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .patterns-cov-row .cov-bar,
+  .patterns-history-btn {
     transition: none;
   }
 }

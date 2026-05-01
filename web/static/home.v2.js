@@ -695,6 +695,224 @@
     return out;
   }
 
+  // ──────────────────────────────────────────────────────────────
+  // Highlights — fila de chips arriba del prose en "Lo que pasó hoy"
+  // que sintetiza la actividad cross-source del día sin esperar al
+  // LLM. Cada chip es un mini-stat clickeable cuando aplica (top WA
+  // chat → abre el chat, top persona → abre WA si tiene jid, etc.).
+  // El backend (`web/server.py:_home_compute`) garantiza que estos
+  // valores estén SIEMPRE disponibles, no solo cuando regenerate=true.
+  // Inputs: `payload.today.highlights` (ver schema en server.py).
+  // Output: HTML string. Si no hay highlights, retorna "" para que el
+  // contenedor no rendee espacio vacío.
+  // ──────────────────────────────────────────────────────────────
+  function renderHighlights(h) {
+    if (!h || typeof h !== "object") return "";
+    const chips = [];
+    const truncate = (s, n) => (s || "").length > n ? (s || "").slice(0, n) + "…" : (s || "");
+
+    // Chip 1: Top WhatsApp chat del día — clickeable al chat.
+    if (h.wa_top_chat && h.wa_top_chat.count > 0) {
+      const c = h.wa_top_chat;
+      const url = whatsappUrl(c.jid);
+      const inner = `
+        <span class="hl-icon">💬</span>
+        <span class="hl-label">${escapeHTML(c.name || "?")}</span>
+        <span class="hl-value">${c.count}</span>
+      `;
+      chips.push(url
+        ? `<a class="hl-chip is-link" href="${escapeHTML(url)}" title="${escapeHTML(c.last_snippet || "")}">${inner}</a>`
+        : `<div class="hl-chip" title="${escapeHTML(c.last_snippet || "")}">${inner}</div>`);
+    }
+
+    // Chip 2: total mensajes WA del día (resumen volumen).
+    if ((h.wa_total_msgs || 0) > 0 && (h.wa_active_chats || 0) > 1) {
+      chips.push(`
+        <div class="hl-chip" title="suma de inbound en los chats activos del día">
+          <span class="hl-icon">📊</span>
+          <span class="hl-label">${h.wa_active_chats} chats</span>
+          <span class="hl-value">${h.wa_total_msgs}</span>
+        </div>`);
+    }
+
+    // Chip 3: gmail unread + awaiting reply.
+    const gmailTotal = (h.gmail_unread || 0) + (h.gmail_awaiting_reply || 0);
+    if (gmailTotal > 0) {
+      const parts = [];
+      if (h.gmail_unread) parts.push(`${h.gmail_unread} sin leer`);
+      if (h.gmail_awaiting_reply) parts.push(`${h.gmail_awaiting_reply} esperan resp`);
+      chips.push(`
+        <a class="hl-chip is-link" href="https://mail.google.com/mail/u/0/#inbox" target="_blank" rel="noopener" title="${escapeHTML(parts.join(" · "))}">
+          <span class="hl-icon">📧</span>
+          <span class="hl-label">Mails</span>
+          <span class="hl-value">${gmailTotal}</span>
+        </a>`);
+    }
+
+    // Chip 4: meetings del día.
+    if ((h.calendar_events || 0) > 0) {
+      chips.push(`
+        <div class="hl-chip">
+          <span class="hl-icon">📅</span>
+          <span class="hl-label">Reuniones</span>
+          <span class="hl-value">${h.calendar_events}</span>
+        </div>`);
+    }
+
+    // Chip 5: videos vistos.
+    if ((h.youtube_videos || 0) > 0) {
+      chips.push(`
+        <div class="hl-chip">
+          <span class="hl-icon">📺</span>
+          <span class="hl-label">YouTube</span>
+          <span class="hl-value">${h.youtube_videos}</span>
+        </div>`);
+    }
+
+    // Chip 6: notas del vault tocadas hoy.
+    if ((h.vault_notes_today || 0) > 0) {
+      chips.push(`
+        <div class="hl-chip">
+          <span class="hl-icon">📝</span>
+          <span class="hl-label">Notas</span>
+          <span class="hl-value">${h.vault_notes_today}</span>
+        </div>`);
+    }
+
+    // Chip 7: top persona cross-source. Construimos URL si la persona
+    // aparece en WA (extraemos jid del bucket whatsapp en signals).
+    if (h.top_person && h.top_person.sources_count >= 2) {
+      const p = h.top_person;
+      const sources = (p.appearances || []).map((a) => a.source).join(" + ");
+      // Buscar jid en appearances source=whatsapp para hacerlo clickeable
+      const waApp = (p.appearances || []).find((a) => a.source === "whatsapp");
+      let waJid = null;
+      if (waApp) {
+        const waList = _currentPayload?.signals?.whatsapp || [];
+        const match = waList.find((w) => w.name === waApp.display_name);
+        if (match) waJid = match.jid;
+      }
+      const url = waJid ? whatsappUrl(waJid) : null;
+      const inner = `
+        <span class="hl-icon">👥</span>
+        <span class="hl-label">${escapeHTML(p.name)}</span>
+        <span class="hl-meta">${escapeHTML(sources)}</span>
+      `;
+      chips.push(url
+        ? `<a class="hl-chip hl-chip--persona is-link" href="${escapeHTML(url)}" title="aparece en ${escapeHTML(sources)}">${inner}</a>`
+        : `<div class="hl-chip hl-chip--persona" title="aparece en ${escapeHTML(sources)}">${inner}</div>`);
+    }
+
+    // Chip 8: top topic cross-source.
+    if (h.top_topic && (h.top_topic.sources_count || (h.top_topic.sources || []).length) >= 2) {
+      const t = h.top_topic;
+      const sources = (t.sources || []).join(" + ");
+      chips.push(`
+        <div class="hl-chip hl-chip--topic" title="tema en ${escapeHTML(sources)}">
+          <span class="hl-icon">🎯</span>
+          <span class="hl-label">${escapeHTML(t.topic)}</span>
+          <span class="hl-meta">${escapeHTML(sources)}</span>
+        </div>`);
+    }
+
+    if (!chips.length) return "";
+    return `<div class="hero-highlights">${chips.join("")}</div>`;
+  }
+
+  // ──────────────────────────────────────────────────────────────
+  // Patterns — sub-bloque debajo del prose con detecciones automáticas:
+  //   - spikes: chats WA con activity ≥2.5× su baseline 7d
+  //   - silences: chats que escribían mucho la semana pasada y hoy 0
+  //   - concentrations: temas que aparecen en ≥3 fuentes
+  //   - gaps: personas que te escribieron y no aparecen mañana
+  // Backend en `rag/today_patterns.py`. Cada lista vacía oculta su
+  // sub-card. Si nada hay nada, retornamos "" y no rendea el bloque.
+  // ──────────────────────────────────────────────────────────────
+  function renderPatterns(p) {
+    if (!p || typeof p !== "object") return "";
+    const cards = [];
+    const truncate = (s, n) => (s || "").length > n ? (s || "").slice(0, n) + "…" : (s || "");
+
+    // Spikes — chats WA hot del día.
+    if ((p.spikes || []).length) {
+      const items = p.spikes.map((s) => {
+        const url = whatsappUrl(s.jid);
+        const inner = `
+          <strong>${escapeHTML(s.name)}</strong>
+          <span class="ptn-num">${s.today}</span>
+          <span class="ptn-meta">vs ${s.avg_7d}/d · ×${s.ratio}</span>
+        `;
+        return url
+          ? `<li><a href="${escapeHTML(url)}" title="${escapeHTML(s.last_snippet || "")}">${inner}</a></li>`
+          : `<li>${inner}</li>`;
+      }).join("");
+      cards.push(`
+        <div class="ptn-card ptn-card--spike">
+          <h4><span>⚡</span> Activity alta</h4>
+          <ul>${items}</ul>
+        </div>`);
+    }
+
+    // Silencios — gente que escribía y hoy no.
+    if ((p.silences || []).length) {
+      const items = p.silences.map((s) => {
+        const url = whatsappUrl(s.jid);
+        const hours = s.hours_silent;
+        const ago = hours == null ? ""
+          : hours < 24 ? `${Math.round(hours)}h`
+          : `${(hours / 24).toFixed(1)}d`;
+        const inner = `
+          <strong>${escapeHTML(s.name)}</strong>
+          <span class="ptn-meta">${s.msgs_7d}msg/7d · silente ${ago}</span>
+        `;
+        return url
+          ? `<li><a href="${escapeHTML(url)}">${inner}</a></li>`
+          : `<li>${inner}</li>`;
+      }).join("");
+      cards.push(`
+        <div class="ptn-card ptn-card--silence">
+          <h4><span>🔇</span> Silencios</h4>
+          <ul>${items}</ul>
+        </div>`);
+    }
+
+    // Concentraciones — temas en ≥3 fuentes.
+    if ((p.concentrations || []).length) {
+      const items = p.concentrations.map((c) => `
+        <li>
+          <strong>${escapeHTML(c.topic)}</strong>
+          <span class="ptn-meta">${escapeHTML((c.sources || []).join(" + "))}</span>
+        </li>`).join("");
+      cards.push(`
+        <div class="ptn-card ptn-card--concentration">
+          <h4><span>🎯</span> Concentración temática</h4>
+          <ul>${items}</ul>
+        </div>`);
+    }
+
+    // Gaps — gente que te escribió y no tenés slot mañana.
+    if ((p.gaps || []).length) {
+      const items = p.gaps.slice(0, 4).map((g) => {
+        const hours = g.hours_waiting || 0;
+        const ago = hours < 24 ? `${Math.round(hours)}h`
+          : `${(hours / 24).toFixed(1)}d`;
+        return `
+          <li>
+            <strong>${escapeHTML(g.person || "?")}</strong>
+            <span class="ptn-meta">hace ${ago} · "${escapeHTML(truncate(g.snippet || "", 60))}"</span>
+          </li>`;
+      }).join("");
+      cards.push(`
+        <div class="ptn-card ptn-card--gap">
+          <h4><span>❗</span> Sin slot mañana</h4>
+          <ul>${items}</ul>
+        </div>`);
+    }
+
+    if (!cards.length) return "";
+    return `<div class="hero-patterns">${cards.join("")}</div>`;
+  }
+
   function renderTodayHero(payload) {
     const dateEl = document.getElementById("hero-date");
     const countsEl = document.getElementById("hero-counts");
@@ -750,11 +968,18 @@
       ? ` <span class="vault-tag">[${escapeHTML(item.vault)}]</span>`
       : "";
 
-    // Sub-section: 🪞 "Lo que pasó hoy" — si el LLM no escribió, armamos
-    // un summary derivado de signals (notas + gmail + WA + youtube).
-    let narrativeHTML = "";
+    // Sub-section: 🪞 "Lo que pasó hoy" — estructura final:
+    //   1. Fila de chips de highlights (Top WA · Mails · Meetings · YT · Persona · Tema)
+    //   2. Prose narrativo del LLM (o fallback derivado de signals)
+    //   3. Sub-bloque "Patrones" (spikes · silencios · concentraciones · gaps)
+    // Cada bloque se oculta si no tiene data; el prose siempre intenta
+    // rendear algo (LLM cached o fallback).
+    const highlights = payload.today?.highlights || {};
+    const patterns = payload.today?.patterns || {};
+    let narrativeHTML = renderHighlights(highlights);
+
     if (split.narrative) {
-      narrativeHTML = mdToHTML(split.narrative);
+      narrativeHTML += `<div class="hero-prose">${mdToHTML(split.narrative)}</div>`;
     } else {
       const lines = [];
       const recent = (evidence.recent_notes || []).slice(0, 3);
@@ -781,8 +1006,11 @@
           return `<li>${url ? `<a href="${escapeHTML(url)}" target="_blank" rel="noopener">${inner}</a>` : inner}</li>`;
         }).join("") + "</ul>");
       }
-      narrativeHTML = lines.join("");
+      if (lines.length) {
+        narrativeHTML += `<div class="hero-prose">${lines.join("")}</div>`;
+      }
     }
+    narrativeHTML += renderPatterns(patterns);
 
     // Sub-section: 📥 "Sin procesar" — inbox vault + mails VIP +
     // WhatsApp esperando + mails Apple sin leer. El user los necesita
@@ -2469,6 +2697,288 @@
     `;
   }
 
+  // ── Cross-source patterns panel ──────────────────────────────────────
+  // Lazy-load: el panel hace su propio fetch al primer render, no
+  // viene en /api/home. Cache simple por session.
+  let _patternsCache = null;
+  let _patternsFetching = false;
+
+  function patternsSeverityClass(severity) {
+    if (severity === "strong") return "patterns-strong";
+    if (severity === "moderate") return "patterns-moderate";
+    return "patterns-weak";
+  }
+
+  function patternsLagLabel(lag) {
+    if (lag === 0) return "mismo día";
+    if (lag === 1) return "+1 día";
+    if (lag === 7) return "+1 semana";
+    return `+${lag}d`;
+  }
+
+  // Friendly label para metric_name que espeja `metric_label` del
+  // backend. Si el server agrega métricas nuevas, este map queda corto
+  // y caemos al raw name (acceptable hasta que actualicemos).
+  const PATTERNS_METRIC_LABELS = {
+    mood_score: "mood",
+    mood_self_report: "mood self-report",
+    sleep_quality: "sleep quality",
+    sleep_duration_h: "sleep horas",
+    sleep_awakenings: "awakenings",
+    sleep_deep_pct: "sleep deep%",
+    wakeup_mood: "wake-up mood",
+    spotify_minutes: "spotify min",
+    spotify_distinct_tracks: "spotify tracks",
+    queries_total: "queries total",
+    queries_existential: "queries existencial",
+    wa_outbound_avg_chars: "WA chars/msg",
+  };
+
+  function patternsLabel(metricName) {
+    return PATTERNS_METRIC_LABELS[metricName] || metricName;
+  }
+
+  async function fetchPatterns(force = false) {
+    if (_patternsCache && !force) return _patternsCache;
+    if (_patternsFetching) {
+      // Wait for in-flight request.
+      while (_patternsFetching) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      return _patternsCache;
+    }
+    _patternsFetching = true;
+    try {
+      const r = await fetch("/api/patterns?days=30&top=20");
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      _patternsCache = await r.json();
+      return _patternsCache;
+    } catch (err) {
+      console.error("patterns fetch failed", err);
+      return null;
+    } finally {
+      _patternsFetching = false;
+    }
+  }
+
+  async function renderCorrelations(_payload) {
+    // El panel se llama "p-correlations" en el DOM porque el
+    // nombre "p-patterns" ya estaba tomado por otro panel
+    // pre-existente (cross-source de entidades). La función también
+    // se llama renderCorrelations (no renderPatterns) para evitar
+    // shadowing con la función pre-existente que renderea
+    // `p-patterns` (entidades). Bug histórico: ambas se llamaban
+    // renderPatterns, JS hoist la última y mi función nunca corría.
+    const panel = document.getElementById("p-correlations");
+    if (!panel) return;
+    // Show panel immediately con "computando…" mientras el endpoint
+    // procesa (cómputo Pearson sobre 200 pairs es <1s pero cold-load
+    // del módulo Python puede ser hasta 3s en el primer hit).
+    panel.hidden = false;
+    const body = panel.querySelector("[data-body]");
+
+    const data = await fetchPatterns();
+    if (!data) {
+      // Error fetching → mostrar mensaje no-paniconante.
+      body.innerHTML = `<div class="empty">no se pudo cargar los patrones</div>`;
+      return;
+    }
+
+    const findings = data.top || [];
+    const bySev = data.by_severity || {};
+    const metricsWithData = data.metrics_with_data || [];
+    const metricsWithEnoughData = metricsWithData.filter(([_, n]) => n >= 21).length;
+
+    if (findings.length === 0) {
+      // Empty state: explicar por qué (no hay enough data probablemente).
+      const totalMetrics = metricsWithData.length;
+      panel.hidden = false;
+      body.innerHTML = `
+        <div class="patterns-empty">
+          <p class="muted">sin patrones detectados todavía</p>
+          <p class="patterns-empty-hint">
+            ${metricsWithEnoughData}/${totalMetrics} métricas tienen ≥21 días
+            (mínimo para correlación significativa).
+          </p>
+        </div>
+      `;
+      const countEl = panel.querySelector("[data-count]");
+      if (countEl) countEl.textContent = "0";
+      const foot = panel.querySelector("[data-foot]");
+      if (foot) {
+        foot.innerHTML = `<span class="muted">esperando data · <code>rag patterns metrics</code></span>`;
+      }
+      return;
+    }
+
+    // Top 3 findings inline en el panel + button para ver todos.
+    const top3 = findings.slice(0, 3);
+    const itemsHTML = top3.map((f) => {
+      const [a, b] = f.pair;
+      const sevCls = patternsSeverityClass(f.severity);
+      const lagLbl = patternsLagLabel(f.lag);
+      const rSign = f.r > 0 ? "+" : "";
+      return `<li class="patterns-row ${sevCls}">
+        <span class="patterns-pair">
+          <span class="metric">${escapeHTML(patternsLabel(a))}</span>
+          <span class="patterns-sep" aria-hidden="true">×</span>
+          <span class="metric">${escapeHTML(patternsLabel(b))}</span>
+        </span>
+        <span class="patterns-lag muted">${escapeHTML(lagLbl)}</span>
+        <span class="patterns-r" title="Pearson r=${f.r}, n=${f.n}, p=${f.p}">
+          ${rSign}${f.r.toFixed(2)}
+        </span>
+      </li>`;
+    }).join("");
+
+    body.innerHTML = `
+      <div class="patterns-summary">
+        <ul class="patterns-list">${itemsHTML}</ul>
+      </div>
+    `;
+
+    const countEl = panel.querySelector("[data-count]");
+    if (countEl) countEl.textContent = String(findings.length);
+
+    const foot = panel.querySelector("[data-foot]");
+    if (foot) {
+      const sevSummary = [];
+      if (bySev.strong) sevSummary.push(`${bySev.strong} strong`);
+      if (bySev.moderate) sevSummary.push(`${bySev.moderate} moderate`);
+      foot.innerHTML = `
+        <button type="button" class="patterns-history-btn"
+                aria-label="ver todos los patrones detallados"
+                data-patterns-history-open>
+          ver todos (${findings.length})
+        </button>
+        ${sevSummary.length ? `<span class="muted">· ${sevSummary.join(" · ")}</span>` : ""}
+      `;
+      const openBtn = foot.querySelector("[data-patterns-history-open]");
+      openBtn?.addEventListener("click", () => openPatternsModal());
+    }
+
+    // Fade-in animation primera vez, mismo patron que p-mood.
+    if (!panel.dataset.firstShown) {
+      panel.dataset.firstShown = "1";
+      panel.classList.add("mood-fade-in");
+      setTimeout(() => panel.classList.remove("mood-fade-in"), 600);
+    }
+  }
+
+  // ── Patterns modal — full detail ────────────────────────────────────
+  function openPatternsModal() {
+    const dlg = document.getElementById("patterns-modal");
+    if (!dlg) return;
+    const body = dlg.querySelector("[data-patterns-modal-body]");
+    if (!body) return;
+
+    if (typeof dlg.showModal === "function") {
+      dlg.showModal();
+    } else {
+      dlg.setAttribute("open", "");
+    }
+
+    // Wire close button + backdrop click (idempotente).
+    const closeBtn = dlg.querySelector("[data-patterns-modal-close]");
+    if (closeBtn && !closeBtn.dataset.wired) {
+      closeBtn.dataset.wired = "1";
+      closeBtn.addEventListener("click", () => dlg.close());
+    }
+    if (!dlg.dataset.backdropWired) {
+      dlg.dataset.backdropWired = "1";
+      dlg.addEventListener("click", (e) => {
+        const rect = dlg.getBoundingClientRect();
+        const inDialog = e.clientX >= rect.left && e.clientX <= rect.right
+                       && e.clientY >= rect.top && e.clientY <= rect.bottom;
+        if (!inDialog) dlg.close();
+      });
+    }
+
+    body.innerHTML = `<div class="empty">cargando…</div>`;
+    fetchPatterns().then((data) => {
+      if (!data) {
+        body.innerHTML = `<div class="empty">no se pudo cargar los patrones</div>`;
+        return;
+      }
+      renderPatternsModal(data, body);
+    });
+  }
+
+  function renderPatternsModal(data, body) {
+    const findings = data.top || [];
+    const bySev = data.by_severity || {};
+    const metrics = data.metrics_with_data || [];
+    const lagsTested = data.lags_tested || [];
+    const range = data.days_range || 30;
+
+    // Sección 1: summary stats.
+    const summaryHTML = `
+      <p class="mood-modal-summary muted">
+        ${data.n_findings} correlaciones · ${range} días · lags
+        ${lagsTested.join(", ")} · ${metrics.length} métricas con data
+      </p>
+    `;
+
+    // Sección 2: lista completa de findings.
+    const findingsHTML = findings.length
+      ? `<section class="mood-modal-section" aria-labelledby="patterns-findings-title">
+          <h3 id="patterns-findings-title">correlaciones detectadas</h3>
+          <ul class="patterns-full-list">${findings.map((f) => {
+            const [a, b] = f.pair;
+            const sevCls = patternsSeverityClass(f.severity);
+            const lagLbl = patternsLagLabel(f.lag);
+            const rSign = f.r > 0 ? "+" : "";
+            return `<li class="patterns-full-row ${sevCls}">
+              <span class="patterns-sev-dot" aria-hidden="true"></span>
+              <span class="patterns-full-pair">
+                <span class="metric">${escapeHTML(patternsLabel(a))}</span>
+                <span class="patterns-sep" aria-hidden="true">×</span>
+                <span class="metric">${escapeHTML(patternsLabel(b))}</span>
+              </span>
+              <span class="patterns-full-lag">${escapeHTML(lagLbl)}</span>
+              <span class="patterns-full-r">${rSign}${f.r.toFixed(2)}</span>
+              <span class="patterns-full-meta muted">
+                n=${f.n} · p=${f.p.toFixed(3)}
+              </span>
+              <span class="patterns-full-desc muted">
+                ${escapeHTML(f.description)}
+              </span>
+            </li>`;
+          }).join("")}</ul>
+        </section>`
+      : `<div class="mood-modal-empty">
+          <p>sin correlaciones detectadas</p>
+          <p class="muted">necesitás ≥21 días de data en ≥2 métricas + |r|≥0.4 + p<0.05.</p>
+        </div>`;
+
+    // Sección 3: cobertura por métrica.
+    const coverageHTML = metrics.length
+      ? `<section class="mood-modal-section" aria-labelledby="patterns-coverage-title">
+          <h3 id="patterns-coverage-title">cobertura por métrica · ${range}d</h3>
+          <ul class="patterns-coverage">${metrics.map(([name, n]) => {
+            const ready = n >= 21;
+            const cls = ready ? "ready" : (n >= 7 ? "partial" : "low");
+            const w = Math.min(100, (n / range) * 100);
+            return `<li class="patterns-cov-row ${cls}">
+              <span class="cov-name">${escapeHTML(patternsLabel(name))}</span>
+              <span class="cov-bar-wrap" aria-hidden="true">
+                <span class="cov-bar" style="width: ${w}%"></span>
+              </span>
+              <span class="cov-n">${n}d</span>
+            </li>`;
+          }).join("")}</ul>
+        </section>`
+      : "";
+
+    body.innerHTML = `
+      <div class="mood-modal-content">
+        ${summaryHTML}
+        ${findingsHTML}
+        ${coverageHTML}
+      </div>
+    `;
+  }
+
   function renderSleep(payload) {
     const sleep = payload.signals?.sleep;
     const panel = document.getElementById("p-sleep");
@@ -2828,6 +3338,11 @@
     renderSpotify(payload);
     renderSleep(payload);
     renderMood(payload);
+    renderPatterns(payload);
+    // renderCorrelations: panel `p-correlations` (Pearson cross-source
+    // entre métricas diarias). Distinto del panel `p-patterns`
+    // (entidades cross-source) que rendea renderPatterns.
+    renderCorrelations(payload);
   }
 
   // Auto-refresh cada 5 min

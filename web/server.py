@@ -10302,6 +10302,27 @@ def _home_compute(
         if narrative:
             _persist_today_brief(date_label, narrative)
 
+    # Patterns: spikes (chats WA con activity ≥2.5× su baseline 7d) +
+    # silencios (chats que escribían mucho la semana pasada y hoy 0 msgs)
+    # + concentraciones (temas que cruzan ≥3 fuentes) + gaps. Único IO
+    # extra: 1 query agregada al WA bridge (~50ms). El detector silent-
+    # falla si el bridge no está, payload sigue válido sin el bucket.
+    today_patterns: dict = {
+        "spikes": [], "silences": [], "concentrations": [], "gaps": [],
+    }
+    try:
+        from rag.today_patterns import detect_today_patterns as _patterns
+        import rag as _rag_mod
+        today_patterns = _patterns(
+            today_correlations,
+            signals_dict_lite.get("whatsapp") or [],
+            _rag_mod.WHATSAPP_DB_PATH,
+            _rag_mod.WHATSAPP_BOT_JID,
+            now=now if isinstance(now, datetime) else None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[today-patterns] failed: {exc}", file=sys.stderr)
+
     # Highlights: stats sintéticos que el frontend rendea como fila de
     # chips arriba del prose narrativo en "Lo que pasó hoy". Computado
     # DESPUÉS del posible regenerate para que use el correlator final
@@ -10372,6 +10393,11 @@ def _home_compute(
             # correlations — sin fetch nuevo, sin LLM. Los campos vacíos
             # los filtra el frontend para no rendear chips placeholder.
             "highlights": today_highlights,
+            # Patrones detectados (spikes WA · silencios WA · concentraciones
+            # de tema cross-source · gaps personas-sin-slot). Cada lista
+            # vacía hace que el frontend oculte la sub-card correspondiente.
+            # El detector spikes consulta el WA bridge SQLite (1 query, ~50ms).
+            "patterns": today_patterns,
         },
         "urgent": urgent,
         "signals": signals,

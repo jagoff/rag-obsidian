@@ -2908,7 +2908,13 @@ def mood_history(days: int = 30) -> dict:
     Args:
       days: rango histórico, máximo 90. Default 30 cubre 1 mes.
     """
-    days = max(1, min(int(days or 30), 90))
+    # Clamp explícito sin `days or 30` (que trataría 0 como falsy
+    # y usaría 30 en lugar de clampar a 1).
+    try:
+        d = int(days) if days is not None else 30
+    except (TypeError, ValueError):
+        d = 30
+    days = max(1, min(d, 90))
     try:
         from rag import mood as _mood
     except Exception:
@@ -2919,21 +2925,35 @@ def mood_history(days: int = 30) -> dict:
     except Exception:
         recent = []
 
+    # Construir el rango completo de N días (oldest → newest) para que
+    # el frontend tenga gaps visuales en los días sin data en lugar de
+    # un array irregular. Days que no tienen row en `rag_mood_score_daily`
+    # se llenan con n_signals=0.
+    from datetime import datetime as _dt, timedelta as _td
+    today_str = _mood._today_local()
+    today_dt = _dt.strptime(today_str, "%Y-%m-%d")
+    by_date_map = {r.get("date"): r for r in recent if r.get("date")}
+
     daily: list[dict] = []
     histogram_acc: dict[str, dict[str, float]] = {}
-    for row in recent:
-        date = row.get("date")
-        if not date:
+    for offset in range(days - 1, -1, -1):
+        date = (today_dt - _td(days=offset)).strftime("%Y-%m-%d")
+        row = by_date_map.get(date)
+        if row is None or row.get("n_signals", 0) == 0:
+            # No data para este día — gap visual.
+            daily.append({
+                "date": date,
+                "score": float(row.get("score", 0.0)) if row else 0.0,
+                "n_signals": 0, "sources_used": [], "by_source": [],
+            })
             continue
         try:
             signals = _mood._read_signals_for_date(date)
         except Exception:
             signals = []
         if not signals:
-            # Día sin data — lo dejamos en el array para que el modal
-            # muestre gap visual sin tener que reconstruir fechas.
             daily.append({
-                "date": date, "score": row.get("score", 0.0),
+                "date": date, "score": float(row.get("score", 0.0)),
                 "n_signals": 0, "sources_used": [], "by_source": [],
             })
             continue
@@ -3002,9 +3022,8 @@ def mood_history(days: int = 30) -> dict:
         })
     histogram.sort(key=lambda x: abs(x["total_contrib"]), reverse=True)
 
-    # Sort daily oldest → newest así el frontend lo pinta de izquierda
-    # a derecha (matching el sparkline del panel principal).
-    daily.sort(key=lambda x: x["date"])
+    # `daily` ya viene ordenado oldest → newest por construcción
+    # (offset descendente desde days-1 hasta 0). No re-sort.
 
     return {
         "days": daily,

@@ -2168,7 +2168,10 @@
         </div>`
       : "";
 
-    // Top evidence colapsable.
+    // Top evidence colapsable. Cada signal muestra el value crudo + el
+    // % de contribución al score del día (mide qué tan fuerte movió la
+    // señal el agregado vs los otros). El backend computa pct con
+    // |value*weight| / total — consistente con /api/mood/history.
     const topEvidence = m.top_evidence || [];
     const evidenceHTML = topEvidence.length
       ? `<details class="mood-evidence">
@@ -2183,10 +2186,16 @@
                        : "flat";
             const kindHuman = MOOD_KIND_LABEL[e.signal_kind] || e.signal_kind;
             const srcEmoji = MOOD_SOURCE_EMOJI[e.source] || "·";
+            // % contribución (default 0 si el backend no lo manda — tests
+            // viejos pueden no incluirlo).
+            const pctTxt = (e.pct != null && isFinite(e.pct))
+              ? `<span class="pct muted">${e.pct.toFixed(0)}%</span>`
+              : "";
             return `<li>
               <span class="src" aria-hidden="true">${srcEmoji}</span>
               <span class="kind">${escapeHTML(kindHuman)}</span>
               <span class="val ${vCls}">${vSign}${v.toFixed(2)}</span>
+              ${pctTxt}
             </li>`;
           }).join("")}</ul>
         </details>`
@@ -2276,13 +2285,188 @@
     const countEl = panel.querySelector("[data-count]");
     if (countEl) countEl.textContent = m.n_signals;
 
-    // Footer: link a docs (CLI) para que el user pueda investigar más.
+    // Footer: button "ver historial" que abre el modal con timeline 30d
+    // + histograma por source + breakdown granular. Mantiene también el
+    // hint CLI por si el user prefiere drill-down via terminal.
     const foot = panel.querySelector("[data-foot]");
     if (foot) {
-      foot.innerHTML = `<span class="muted">
-        detalle: <code>rag mood explain</code>
-      </span>`;
+      foot.innerHTML = `
+        <button type="button" class="mood-history-btn"
+                aria-label="ver historial detallado del mood"
+                data-mood-history-open>
+          ver historial 30d
+        </button>
+        <span class="muted">o <code>rag mood explain</code></span>
+      `;
+      const openBtn = foot.querySelector("[data-mood-history-open]");
+      openBtn?.addEventListener("click", () => openMoodHistoryModal());
     }
+
+    // Fade-in animation cuando el panel pasa de hidden a visible — solo
+    // primera vez por session. Honor prefers-reduced-motion (CSS lo
+    // decide via @media). Marcamos con data attribute para que la regla
+    // CSS aplique solo el primer render.
+    if (!panel.dataset.firstShown) {
+      panel.dataset.firstShown = "1";
+      panel.classList.add("mood-fade-in");
+      // Removemos la clase después de la animación para no acumular
+      // estados que afecten re-renders.
+      setTimeout(() => panel.classList.remove("mood-fade-in"), 600);
+    }
+  }
+
+  // ── Mood history modal ────────────────────────────────────────────
+  // Lazy-load: fetch /api/mood/history?days=30 solo cuando el user
+  // abre el modal (no en cada home refresh). Cache simple por
+  // requestId — si el user re-abre dentro de la misma sesión, reusamos.
+  let _moodHistoryCache = null;
+  let _moodHistoryFetching = false;
+
+  async function openMoodHistoryModal() {
+    const dlg = document.getElementById("mood-history-modal");
+    if (!dlg) return;
+    const body = dlg.querySelector("[data-mood-modal-body]");
+    if (!body) return;
+
+    // Mostrar el dialog antes de fetchear (better perceived perf — el
+    // user ve algo inmediatamente).
+    if (typeof dlg.showModal === "function") {
+      dlg.showModal();
+    } else {
+      // Fallback para browsers sin <dialog> (raros en 2026).
+      dlg.setAttribute("open", "");
+    }
+
+    // Wire close button + escape (escape ya viene gratis con <dialog>).
+    const closeBtn = dlg.querySelector("[data-mood-modal-close]");
+    if (closeBtn && !closeBtn.dataset.wired) {
+      closeBtn.dataset.wired = "1";
+      closeBtn.addEventListener("click", () => dlg.close());
+    }
+    // Click en backdrop cierra (UX standard de modales).
+    if (!dlg.dataset.backdropWired) {
+      dlg.dataset.backdropWired = "1";
+      dlg.addEventListener("click", (e) => {
+        const rect = dlg.getBoundingClientRect();
+        const inDialog = e.clientX >= rect.left && e.clientX <= rect.right
+                       && e.clientY >= rect.top && e.clientY <= rect.bottom;
+        if (!inDialog) dlg.close();
+      });
+    }
+
+    // Cache hit: render rápido sin re-fetch.
+    if (_moodHistoryCache) {
+      renderMoodHistory(_moodHistoryCache, body);
+      return;
+    }
+    if (_moodHistoryFetching) return;  // race protection
+    _moodHistoryFetching = true;
+    body.innerHTML = `<div class="empty">cargando…</div>`;
+    try {
+      const r = await fetch("/api/mood/history?days=30");
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = await r.json();
+      _moodHistoryCache = data;
+      renderMoodHistory(data, body);
+    } catch (err) {
+      console.error("mood history fetch failed", err);
+      body.innerHTML = `<div class="empty">no se pudo cargar el historial — reintentá más tarde</div>`;
+    } finally {
+      _moodHistoryFetching = false;
+    }
+  }
+
+  function renderMoodHistory(data, body) {
+    const days = data.days || [];
+    const histogram = data.histogram || [];
+    const totalDays = data.total_days_with_data || 0;
+    const range = data.range_days || 30;
+
+    if (totalDays === 0) {
+      body.innerHTML = `
+        <div class="mood-modal-empty">
+          <p>todavía no hay data acumulada de mood.</p>
+          <p class="muted">activá el daemon con <code>rag mood enable</code>
+          y esperá unas horas para que junte señales.</p>
+        </div>
+      `;
+      return;
+    }
+
+    // Histogram horizontal: cada source es una bar con su % de
+    // contribución total + cantidad de días activos. La idea es ver
+    // de un vistazo qué source domina la señal.
+    const histHTML = histogram.length
+      ? `<section class="mood-modal-section" aria-labelledby="mood-hist-title">
+          <h3 id="mood-hist-title">contribución por source · ${range}d</h3>
+          <ul class="mood-histogram">${histogram.map((h) => {
+            const sign = h.total_contrib > 0 ? "+" : "";
+            const sigCls = h.total_contrib > 0 ? "pos" : h.total_contrib < 0 ? "neg" : "flat";
+            const emoji = MOOD_SOURCE_EMOJI[h.source] || "·";
+            // Bar width = % del total. Min 2% para que se vea aunque
+            // contribuya casi nada.
+            const w = Math.max(2, h.pct);
+            return `<li class="mood-hist-row">
+              <span class="hist-src">
+                <span aria-hidden="true">${emoji}</span>
+                <span>${escapeHTML(h.source)}</span>
+              </span>
+              <span class="hist-bar-wrap" aria-hidden="true">
+                <span class="hist-bar ${sigCls}" style="width: ${w}%"></span>
+              </span>
+              <span class="hist-pct">${h.pct.toFixed(0)}%</span>
+              <span class="hist-contrib ${sigCls}">${sign}${h.total_contrib.toFixed(2)}</span>
+              <span class="hist-meta muted">${h.days_active}d · ${h.n_signals} sig</span>
+            </li>`;
+          }).join("")}</ul>
+        </section>`
+      : "";
+
+    // Timeline diario: una row por día con sparkbar + breakdown chips.
+    // Días sin data se ven como gap (background apagado).
+    const timelineHTML = `
+      <section class="mood-modal-section" aria-labelledby="mood-timeline-title">
+        <h3 id="mood-timeline-title">timeline ${range}d</h3>
+        <ul class="mood-timeline">${days.map((d) => {
+          const hasData = d.n_signals > 0;
+          const score = d.score || 0;
+          const sign = score > 0 ? "+" : "";
+          const scoreCls = moodScoreClass(score);
+          // Bar height proporcional a |score|. -1 = full down, +1 = full up.
+          // Centro = neutral.
+          const barH = Math.abs(score) * 100;
+          const barDir = score < 0 ? "neg" : "pos";
+          const sourcesShort = (d.by_source || [])
+            .slice(0, 3)
+            .map((s) => `<span class="ts-src" title="${escapeHTML(s.source)}: ${s.contrib > 0 ? '+' : ''}${s.contrib.toFixed(2)} (${s.pct.toFixed(0)}%)">${MOOD_SOURCE_EMOJI[s.source] || "·"}</span>`)
+            .join("");
+          // Date display: solo MM-DD para no saturar.
+          const dateShort = (d.date || "").slice(5);
+          return `<li class="mood-tl-row ${hasData ? '' : 'no-data'}">
+            <span class="tl-date muted">${dateShort}</span>
+            <span class="tl-bar-cell" aria-hidden="true">
+              ${hasData ? `<span class="tl-bar ${barDir} ${scoreCls}"
+                style="height: ${barH}%"></span>` : ''}
+            </span>
+            <span class="tl-score ${hasData ? scoreCls : ''}">
+              ${hasData ? `${sign}${score.toFixed(2)}` : '—'}
+            </span>
+            <span class="tl-srcs" aria-hidden="true">${sourcesShort}</span>
+            <span class="tl-n muted">${hasData ? `${d.n_signals} sig` : ''}</span>
+          </li>`;
+        }).join("")}</ul>
+      </section>
+    `;
+
+    body.innerHTML = `
+      <div class="mood-modal-content">
+        <p class="mood-modal-summary muted">
+          ${totalDays} de ${range} días con data · ${histogram.length} sources activas
+        </p>
+        ${histHTML}
+        ${timelineHTML}
+      </div>
+    `;
   }
 
   function renderSleep(payload) {

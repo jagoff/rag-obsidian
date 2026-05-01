@@ -319,26 +319,231 @@ def test_home_v2_css_honors_reduced_motion():
 
     El home.v2 ya tiene un `@media (prefers-reduced-motion: reduce)`
     global que aplica `transition-duration: 0.01ms !important` a `*` —
-    eso de por sí cubre los buttons. Pero como buena práctica, el
+    eso de por sí cubre los buttons. Pero como buena práctica el
     bloque CSS específico de `.mood-self-btn` también declara su
-    propio media query. Buscamos el último para no chocar con el
-    global."""
+    propio media query."""
     css_path = Path(__file__).resolve().parent.parent / "web" / "static" / "home.v2.css"
     css = css_path.read_text(encoding="utf-8")
     assert "@media (prefers-reduced-motion: reduce)" in css
-    # Hay 2+ media queries — buscar el ÚLTIMO que es el específico
-    # del mood (el primero es global, el segundo el del panel).
-    pos = css.rfind("@media (prefers-reduced-motion: reduce)")
-    block = css[pos:pos + 600]
-    assert ".mood-self-btn" in block, (
-        "último @media reduced-motion no incluye .mood-self-btn"
+    # Buscar el bloque que contiene .mood-self-btn (no necesariamente
+    # el último — pueden haber otros más específicos para el modal).
+    has_btn_in_reduce = False
+    pos = 0
+    while True:
+        pos = css.find("@media (prefers-reduced-motion: reduce)", pos)
+        if pos < 0:
+            break
+        block = css[pos:pos + 600]
+        if ".mood-self-btn" in block:
+            has_btn_in_reduce = True
+            break
+        pos += 1
+    assert has_btn_in_reduce, (
+        "ningún @media reduced-motion incluye .mood-self-btn"
     )
-    # `transition: all` está prohibido por web guidelines — verificamos
-    # que NO usemos esa shortcut en .mood-self-btn.
+    # `transition: all` está prohibido por web guidelines.
     btn_pos = css.index(".mood-self-btn {")
     btn_block = css[btn_pos:btn_pos + 800]
-    assert "transition: all" not in btn_block, (
-        ".mood-self-btn usa `transition: all` (prohibido por guidelines)"
-    )
-    # Y `touch-action: manipulation` está (mejora touch-screens).
+    assert "transition: all" not in btn_block
     assert "touch-action: manipulation" in btn_block
+
+
+# ── Endpoint /api/mood/history ───────────────────────────────────────────
+
+
+@pytest.fixture
+def mood_history_client():
+    """Lazy import del FastAPI app para usar TestClient."""
+    from web.server import app
+    from fastapi.testclient import TestClient
+    return TestClient(app)
+
+
+def test_mood_history_returns_full_range_with_gaps(mood_history_client, monkeypatch):
+    """El endpoint devuelve siempre `range_days` entries en `days[]`,
+    rellenando con `n_signals=0` los días sin data. Sin esto el frontend
+    no puede mostrar gaps visuales en el timeline."""
+    from rag import mood as _mood
+    from datetime import datetime as _dt, timedelta as _td
+
+    today = _dt.now().strftime("%Y-%m-%d")
+    yesterday = (_dt.now() - _td(days=1)).strftime("%Y-%m-%d")
+
+    # Solo 2 días con data (today + yesterday) en un range de 30 días.
+    monkeypatch.setattr(_mood, "_today_local", lambda *_: today)
+    monkeypatch.setattr(_mood, "get_recent_scores", lambda days=30: [
+        {"date": today, "score": -0.5, "n_signals": 4},
+        {"date": yesterday, "score": +0.2, "n_signals": 2},
+    ])
+    monkeypatch.setattr(_mood, "_read_signals_for_date", lambda date: [
+        {"source": "spotify", "signal_kind": "artist_mood_lookup",
+         "value": -0.6, "weight": 1.0, "evidence": {}},
+        {"source": "journal", "signal_kind": "keyword_negative",
+         "value": -0.4, "weight": 1.0, "evidence": {}},
+    ] if date == today else [
+        {"source": "spotify", "signal_kind": "artist_mood_lookup",
+         "value": +0.2, "weight": 1.0, "evidence": {}},
+    ] if date == yesterday else [])
+    monkeypatch.setattr(_mood, "recent_drift", lambda **kw: {
+        "drifting": False, "n_consecutive": 0, "avg_score": 0.0,
+    })
+
+    r = mood_history_client.get("/api/mood/history?days=30")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["range_days"] == 30
+    assert len(data["days"]) == 30  # CRITICAL: gaps incluidos
+    # Las primeras 28 entries son gaps (no_data).
+    no_data_count = sum(1 for d in data["days"] if d["n_signals"] == 0)
+    assert no_data_count == 28
+    # Los últimos 2 entries tienen data (n_signals viene de score_daily,
+    # NO del count de signals individuales — matchea el mock).
+    assert data["days"][-1]["date"] == today
+    assert data["days"][-1]["n_signals"] == 4
+    assert data["days"][-2]["date"] == yesterday
+    assert data["days"][-2]["n_signals"] == 2
+    # by_source breakdown del último día tiene spotify + journal.
+    by_src_today = {b["source"] for b in data["days"][-1]["by_source"]}
+    assert by_src_today == {"spotify", "journal"}
+    # Histogram aggregate incluye spotify + journal.
+    sources = {h["source"] for h in data["histogram"]}
+    assert "spotify" in sources
+    assert "journal" in sources
+
+
+def test_mood_history_clamps_days_param(mood_history_client, monkeypatch):
+    """El param `days` debe estar clampeado a [1, 90] para evitar
+    queries gigantes."""
+    from rag import mood as _mood
+    monkeypatch.setattr(_mood, "_today_local",
+                        lambda *_: _dt_now_str())
+    monkeypatch.setattr(_mood, "get_recent_scores", lambda days=30: [])
+    monkeypatch.setattr(_mood, "recent_drift", lambda **kw: {
+        "drifting": False, "n_consecutive": 0, "avg_score": 0.0,
+    })
+
+    # Demasiado alto → clamp a 90.
+    r = mood_history_client.get("/api/mood/history?days=999")
+    assert r.status_code == 200
+    assert r.json()["range_days"] == 90
+
+    # Demasiado bajo → clamp a 1.
+    r = mood_history_client.get("/api/mood/history?days=0")
+    assert r.status_code == 200
+    assert r.json()["range_days"] == 1
+
+
+def test_mood_history_returns_empty_when_no_data(mood_history_client, monkeypatch):
+    """Sin filas en `rag_mood_score_daily`, el endpoint devuelve
+    estructura vacía (no 404). El frontend muestra empty state."""
+    from rag import mood as _mood
+    monkeypatch.setattr(_mood, "_today_local", lambda *_: _dt_now_str())
+    monkeypatch.setattr(_mood, "get_recent_scores", lambda days=30: [])
+    monkeypatch.setattr(_mood, "recent_drift", lambda **kw: {
+        "drifting": False, "n_consecutive": 0, "avg_score": 0.0,
+    })
+
+    r = mood_history_client.get("/api/mood/history")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["total_days_with_data"] == 0
+    # Sigue habiendo 30 entries en days[] (todas con n_signals=0).
+    assert len(data["days"]) == 30
+    assert data["histogram"] == []
+
+
+def test_mood_history_pct_sums_to_approximately_100(mood_history_client, monkeypatch):
+    """Las % por source en el histograma deben sumar ~100% (allowing
+    rounding floor)."""
+    from rag import mood as _mood
+    today = _dt_now_str()
+    monkeypatch.setattr(_mood, "_today_local", lambda *_: today)
+    monkeypatch.setattr(_mood, "get_recent_scores", lambda days=30: [
+        {"date": today, "score": -0.5, "n_signals": 3},
+    ])
+    monkeypatch.setattr(_mood, "_read_signals_for_date", lambda date: [
+        {"source": "spotify", "signal_kind": "x",
+         "value": -0.5, "weight": 1.0, "evidence": {}},
+        {"source": "journal", "signal_kind": "y",
+         "value": -0.3, "weight": 1.0, "evidence": {}},
+        {"source": "calendar", "signal_kind": "z",
+         "value": -0.2, "weight": 0.5, "evidence": {}},
+    ] if date == today else [])
+    monkeypatch.setattr(_mood, "recent_drift", lambda **kw: {
+        "drifting": False, "n_consecutive": 0, "avg_score": 0.0,
+    })
+
+    r = mood_history_client.get("/api/mood/history?days=30")
+    assert r.status_code == 200
+    data = r.json()
+    pct_sum = sum(h["pct"] for h in data["histogram"])
+    assert 99.0 <= pct_sum <= 101.0, f"pct sum out of range: {pct_sum}"
+
+
+def test_top_evidence_includes_pct(mood_history_client, monkeypatch):
+    """`_fetch_mood` (panel principal) debe incluir `pct` en cada
+    item de top_evidence — el frontend lo muestra como chip al lado
+    del value."""
+    from web.server import _fetch_mood
+    from rag import mood as _mood
+    monkeypatch.setattr(_mood, "_today_local", lambda *_: _dt_now_str())
+    monkeypatch.setattr(_mood, "get_score_for_date", lambda _d: {
+        "date": _dt_now_str(), "score": -0.5, "n_signals": 3,
+        "sources_used": ["journal", "spotify"],
+        "top_evidence": [
+            {"source": "journal", "signal_kind": "keyword_negative",
+             "value": -0.7, "weight": 1.0, "evidence": {}},
+            {"source": "spotify", "signal_kind": "artist_mood_lookup",
+             "value": -0.4, "weight": 1.0, "evidence": {}},
+        ],
+        "updated_at": 0,
+    })
+    monkeypatch.setattr(_mood, "get_recent_scores", lambda days=14: [
+        {"date": _dt_now_str(), "score": -0.5, "n_signals": 3},
+    ])
+    monkeypatch.setattr(_mood, "recent_drift", lambda **kw: {
+        "drifting": False, "n_consecutive": 0, "avg_score": 0.0,
+    })
+
+    result = _fetch_mood()
+    assert result is not None
+    for ev in result["top_evidence"]:
+        assert "pct" in ev
+        assert 0 <= ev["pct"] <= 100
+    # journal (|0.7|) > spotify (|0.4|) → mayor %
+    assert result["top_evidence"][0]["pct"] > result["top_evidence"][1]["pct"]
+
+
+def _dt_now_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+# ── Frontend bundle: modal + histogram + timeline ────────────────────────
+
+
+def test_home_v2_bundle_includes_modal_logic():
+    """El bundle JS debe contener el código del modal de historial."""
+    js_path = Path(__file__).resolve().parent.parent / "web" / "static" / "home.v2.js"
+    js = js_path.read_text(encoding="utf-8")
+    for sym in (
+        "openMoodHistoryModal",
+        "renderMoodHistory",
+        "/api/mood/history",
+        "mood-history-btn",
+        "data-mood-modal-body",
+        "mood-fade-in",
+        "mood-histogram",
+        "mood-timeline",
+        "tl-bar",  # timeline bars con zero baseline
+    ):
+        assert sym in js, f"missing JS symbol: {sym}"
+
+
+def test_home_v2_html_has_dialog_modal():
+    """El HTML debe declarar el <dialog> del modal con aria-labelledby."""
+    html_path = Path(__file__).resolve().parent.parent / "web" / "static" / "home.v2.html"
+    html = html_path.read_text(encoding="utf-8")
+    assert '<dialog id="mood-history-modal"' in html
+    assert 'aria-labelledby="mood-modal-title"' in html
+    assert 'data-mood-modal-close' in html
+    assert 'data-mood-modal-body' in html

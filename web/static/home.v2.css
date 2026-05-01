@@ -1967,4 +1967,355 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
   .mood-self-btn.selected {
     transform: none;
   }
+  .mood-fade-in {
+    animation: none;
+  }
+}
+
+/* % contribución en top_evidence — chip discreto al lado del value.
+   Default text-faint para no competir con el value coloreado. */
+.mood-evidence li .pct {
+  font-size: var(--fs-mini);
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  margin-left: 4px;
+}
+
+/* "Ver historial 30d" button en el footer. Linka inline, sin
+   border, hover subtle. Discreto pero clickeable. */
+.mood-history-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent, var(--text-strong));
+  font-size: var(--fs-mini);
+  font-family: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, var(--accent, var(--text-strong)) 30%, transparent);
+  text-underline-offset: 2px;
+  touch-action: manipulation;
+  transition: text-decoration-color var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out);
+}
+
+.mood-history-btn:hover {
+  text-decoration-color: var(--accent, var(--text-strong));
+}
+
+.mood-history-btn:focus-visible {
+  outline: 2px solid var(--accent, var(--text-strong));
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* Fade-in animation cuando el panel aparece por primera vez en la
+   sesión. Solo se aplica si NO está prefers-reduced-motion. */
+.mood-fade-in {
+  animation: mood-fade-in 350ms var(--ease-out) both;
+}
+
+@keyframes mood-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* ────────────────────────────────────────────────────────────
+   Mood history modal — opens when user clicks "ver historial 30d".
+   <dialog> nativo, sin libs. Layout: histogram horizontal por
+   source arriba, timeline diaria abajo. */
+.mood-modal {
+  width: min(720px, 92vw);
+  max-height: 88vh;
+  padding: 0;
+  border: 1px solid var(--border-strong, var(--bg-elev-2));
+  border-radius: 6px;
+  background: var(--bg-base);
+  color: var(--text);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+  /* Web guidelines: overscroll-behavior contain en modales. */
+  overscroll-behavior: contain;
+}
+
+.mood-modal::backdrop {
+  background: rgba(8, 12, 24, 0.6);
+  backdrop-filter: blur(2px);
+}
+
+.mood-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--bg-elev-2);
+  background: var(--bg-elev-1, var(--bg-base));
+}
+
+.mood-modal-title {
+  margin: 0;
+  font-size: var(--fs-base);
+  font-weight: 600;
+  color: var(--text-strong);
+  text-wrap: balance;
+}
+
+.mood-modal-close {
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  width: 28px;
+  height: 28px;
+  font-size: 20px;
+  line-height: 1;
+  color: var(--text-dim);
+  cursor: pointer;
+  touch-action: manipulation;
+  transition: background var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out);
+}
+
+.mood-modal-close:hover {
+  background: var(--bg-elev-2);
+  color: var(--text-strong);
+}
+
+.mood-modal-close:focus-visible {
+  outline: none;
+  border-color: var(--accent, var(--text-strong));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent, var(--text-strong)) 25%, transparent);
+}
+
+.mood-modal-body {
+  padding: var(--space-3) var(--space-4);
+  max-height: calc(88vh - 60px);
+  overflow-y: auto;
+}
+
+.mood-modal-content {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.mood-modal-summary {
+  font-size: var(--fs-mini);
+  margin: 0;
+}
+
+.mood-modal-section h3 {
+  margin: 0 0 var(--space-2);
+  font-size: var(--fs-small);
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.mood-modal-empty {
+  padding: var(--space-4) 0;
+  text-align: center;
+  color: var(--text-dim);
+}
+
+.mood-modal-empty code {
+  font-family: var(--font-mono);
+  background: var(--bg-elev-2);
+  padding: 1px 4px;
+  border-radius: 2px;
+  color: var(--text-strong);
+}
+
+/* Histograma horizontal — una row por source, bar con width =
+   % de contribución total. La direccion del color (pos/neg)
+   ayuda a identificar qué sources empujan score positivo vs
+   negativo en el período. */
+.mood-histogram {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.mood-hist-row {
+  display: grid;
+  grid-template-columns: 90px 1fr 38px 50px 70px;
+  gap: var(--space-2);
+  align-items: center;
+  font-size: var(--fs-mini);
+  font-variant-numeric: tabular-nums;
+  padding: 4px 0;
+}
+
+.mood-hist-row .hist-src {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-dim);
+}
+
+.mood-hist-row .hist-bar-wrap {
+  display: block;
+  height: 10px;
+  background: var(--bg-elev-2);
+  border-radius: 1px;
+  position: relative;
+  overflow: hidden;
+}
+
+.mood-hist-row .hist-bar {
+  display: block;
+  height: 100%;
+  border-radius: 1px;
+  transition: width var(--dur-base, 200ms) var(--ease-out);
+}
+
+.mood-hist-row .hist-bar.pos {
+  background: var(--green);
+}
+
+.mood-hist-row .hist-bar.neg {
+  background: var(--red);
+}
+
+.mood-hist-row .hist-bar.flat {
+  background: var(--text-faint);
+}
+
+.mood-hist-row .hist-pct {
+  text-align: right;
+  color: var(--text-dim);
+}
+
+.mood-hist-row .hist-contrib {
+  text-align: right;
+  font-family: var(--font-mono);
+}
+
+.mood-hist-row .hist-contrib.pos { color: var(--green); }
+.mood-hist-row .hist-contrib.neg { color: var(--red); }
+.mood-hist-row .hist-contrib.flat { color: var(--text-faint); }
+
+.mood-hist-row .hist-meta {
+  font-size: var(--fs-mini);
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* Timeline: una row por día. Bar centrada (zero baseline) con
+   height = |score|. Color por severidad. Días sin data atenuados. */
+.mood-timeline {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.mood-tl-row {
+  display: grid;
+  grid-template-columns: 56px 60px 56px 1fr 60px;
+  gap: var(--space-2);
+  align-items: center;
+  padding: 3px 0;
+  font-size: var(--fs-mini);
+  font-variant-numeric: tabular-nums;
+  border-bottom: 1px solid var(--bg-elev-2);
+}
+
+.mood-tl-row.no-data {
+  opacity: 0.4;
+}
+
+.mood-tl-row .tl-date {
+  font-family: var(--font-mono);
+}
+
+.mood-tl-row .tl-bar-cell {
+  /* Container que centra la bar verticalmente con zero baseline en
+     el medio. Bars positivas crecen hacia arriba, negativas hacia abajo. */
+  position: relative;
+  height: 28px;
+  background: linear-gradient(to bottom,
+    transparent 0%, transparent calc(50% - 0.5px),
+    var(--text-faint) calc(50% - 0.5px), var(--text-faint) calc(50% + 0.5px),
+    transparent calc(50% + 0.5px), transparent 100%);
+  background-size: 100% 100%;
+  background-blend-mode: normal;
+}
+
+.mood-tl-row .tl-bar {
+  position: absolute;
+  left: 50%;
+  width: 6px;
+  transform: translateX(-50%);
+  border-radius: 1px;
+  max-height: 14px;
+}
+
+.mood-tl-row .tl-bar.pos {
+  bottom: 50%;
+  background: var(--green);
+}
+
+.mood-tl-row .tl-bar.neg {
+  top: 50%;
+  background: var(--red);
+}
+
+.mood-tl-row .tl-bar.mood-score-low { background: var(--red); }
+.mood-tl-row .tl-bar.mood-score-tepid { background: var(--amber); }
+.mood-tl-row .tl-bar.mood-score-up,
+.mood-tl-row .tl-bar.mood-score-high { background: var(--green); }
+
+.mood-tl-row .tl-score {
+  text-align: right;
+  font-family: var(--font-mono);
+}
+
+.mood-tl-row .tl-srcs {
+  display: inline-flex;
+  gap: 2px;
+  font-size: 14px;
+  cursor: help;
+}
+
+.mood-tl-row .tl-n {
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* Mobile — modal full-screen. */
+@media (max-width: 600px) {
+  .mood-modal {
+    width: 100vw;
+    max-width: none;
+    max-height: 100vh;
+    height: 100vh;
+    border-radius: 0;
+  }
+  .mood-hist-row {
+    grid-template-columns: 70px 1fr 36px 50px;
+  }
+  .mood-hist-row .hist-meta {
+    display: none;
+  }
+}
+
+/* prefers-reduced-motion para el modal — desactiva transiciones de
+   bars + cualquier animación de entrada. */
+@media (prefers-reduced-motion: reduce) {
+  .mood-hist-row .hist-bar,
+  .mood-modal-close {
+    transition: none;
+  }
 }

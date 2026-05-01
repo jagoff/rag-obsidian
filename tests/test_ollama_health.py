@@ -331,6 +331,14 @@ class TestEscalateKillRagIndex:
 
         monkeypatch.setattr(health, "_kill_stuck_rag_index_clients", fake_kill)
         monkeypatch.setattr(health, "ESCALATE_KILL_AFTER_SKIPS", 5)
+        # Mock health-check para evitar HTTP real durante tests. Devolver
+        # healthy=True hace que la rama force_restart NO se active y la
+        # escalación caiga al kill legacy de rag_index — comportamiento
+        # original del test.
+        monkeypatch.setattr(
+            health, "_quick_generate_health_check",
+            lambda **kw: (True, "ok"),
+        )
 
         # 4 skips: counter sube, NO escala
         for _ in range(4):
@@ -347,6 +355,129 @@ class TestEscalateKillRagIndex:
         assert "prev_action=restart_skipped_in_flight" in result["reason"]
         # Counter reset post-escalation
         assert health._consecutive_degraded_skips == 0
+
+    def test_force_restart_when_health_check_fails_in_cooldown(self, monkeypatch):
+        """Fix #1: si la escalación se dispara post-`restart_skipped_cooldown`
+        Y el health-check directo a /api/generate falla, el watchdog
+        BYPASEA el cooldown y fuerza `_restart_ollama_daemon`. Esto ataca
+        el caso real del 2026-05-01 donde Ollama estaba wedged y los 30min
+        de cooldown bloqueaban el único restart útil."""
+        # Setup: degradado + sin in_flight (para que caiga en cooldown gate)
+        # + cooldown activo (last_restart muy reciente).
+        monkeypatch.setattr(
+            health, "_read_recent_query_latencies",
+            lambda window_minutes: ([200_000] * 10, [50_000] * 50),
+        )
+        monkeypatch.setattr(health, "_in_flight_count", 0)
+        monkeypatch.setattr(health, "_last_restart_ts", time.time())
+        monkeypatch.setattr(health, "ESCALATE_KILL_AFTER_SKIPS", 3)
+        # Health-check responde unhealthy (Ollama hung).
+        monkeypatch.setattr(
+            health, "_quick_generate_health_check",
+            lambda **kw: (False, "url_error_TimeoutError"),
+        )
+        # Mock restart + persistir (silent-fail OK).
+        restart_calls: dict[str, int] = {"count": 0}
+        def fake_restart():
+            restart_calls["count"] += 1
+            return True, "kickstarted_homebrew"
+        monkeypatch.setattr(health, "_restart_ollama_daemon", fake_restart)
+        monkeypatch.setattr(health, "_persist_restart_ts", lambda ts: None)
+        # kill_rag_index NO debería invocarse en este path.
+        kill_calls: dict[str, int] = {"count": 0}
+        monkeypatch.setattr(
+            health, "_kill_stuck_rag_index_clients",
+            lambda: (kill_calls.update({"count": kill_calls["count"] + 1}) or (0, [])),
+        )
+
+        # 2 skips: counter sube
+        for _ in range(2):
+            r = health._latency_degradation_check(
+                threshold=1.8, cooldown_seconds=1800,
+            )
+            assert r["action"] == "restart_skipped_cooldown"
+        # 3er skip: hits threshold → fuerza restart porque health falla
+        result = health._latency_degradation_check(
+            threshold=1.8, cooldown_seconds=1800,
+        )
+        assert result["action"] == "escalated_force_restart_unhealthy"
+        assert restart_calls["count"] == 1
+        assert kill_calls["count"] == 0  # legacy path NO se ejecutó
+        assert "url_error_TimeoutError" in result["reason"]
+        assert "restart_ok=True" in result["reason"]
+        assert "prev_action=restart_skipped_cooldown" in result["reason"]
+        assert health._consecutive_degraded_skips == 0
+
+    def test_legacy_kill_when_health_check_passes(self, monkeypatch):
+        """Fix #1: si el health-check responde OK pero p95 sigue alto, el
+        diagnóstico es 'consumer pegado a Ollama, no Ollama wedged' →
+        comportamiento legacy (kill rag_index zombies). NO bypass."""
+        monkeypatch.setattr(
+            health, "_read_recent_query_latencies",
+            lambda window_minutes: ([200_000] * 10, [50_000] * 50),
+        )
+        monkeypatch.setattr(health, "_in_flight_count", 0)
+        monkeypatch.setattr(health, "_last_restart_ts", time.time())
+        monkeypatch.setattr(health, "ESCALATE_KILL_AFTER_SKIPS", 2)
+        # Health-check responde HEALTHY → no force restart.
+        monkeypatch.setattr(
+            health, "_quick_generate_health_check",
+            lambda **kw: (True, "ok"),
+        )
+        restart_calls: dict[str, int] = {"count": 0}
+        monkeypatch.setattr(
+            health, "_restart_ollama_daemon",
+            lambda: (restart_calls.update({"count": restart_calls["count"] + 1}) or (True, "mock")),
+        )
+        monkeypatch.setattr(
+            health, "_kill_stuck_rag_index_clients",
+            lambda: (3, [101, 102, 103]),
+        )
+
+        # 1 skip + 2do dispara escalación
+        health._latency_degradation_check(threshold=1.8, cooldown_seconds=1800)
+        result = health._latency_degradation_check(
+            threshold=1.8, cooldown_seconds=1800,
+        )
+        assert result["action"] == "escalated_killed_rag_index"
+        assert restart_calls["count"] == 0  # NO force restart
+        assert "killed=3" in result["reason"]
+        assert "health=ok" in result["reason"]
+
+    def test_force_restart_only_in_cooldown_path(self, monkeypatch):
+        """Fix #1: el bypass de cooldown SOLO se activa cuando
+        `prev_action == 'restart_skipped_cooldown'`. Si el bloqueo viene
+        del gate de in_flight (chat streamando), NUNCA bypass — el
+        usuario en vivo es prioridad sobre el bypass."""
+        monkeypatch.setattr(
+            health, "_read_recent_query_latencies",
+            lambda window_minutes: ([200_000] * 10, [50_000] * 50),
+        )
+        monkeypatch.setattr(health, "_in_flight_count", 1)  # chat activo
+        monkeypatch.setattr(health, "_last_restart_ts", 0.0)
+        monkeypatch.setattr(health, "ESCALATE_KILL_AFTER_SKIPS", 2)
+        # Health-check unhealthy (Ollama wedged).
+        monkeypatch.setattr(
+            health, "_quick_generate_health_check",
+            lambda **kw: (False, "url_error_TimeoutError"),
+        )
+        restart_calls: dict[str, int] = {"count": 0}
+        monkeypatch.setattr(
+            health, "_restart_ollama_daemon",
+            lambda: (restart_calls.update({"count": restart_calls["count"] + 1}) or (True, "mock")),
+        )
+        monkeypatch.setattr(
+            health, "_kill_stuck_rag_index_clients",
+            lambda: (1, [9999]),
+        )
+
+        health._latency_degradation_check(threshold=1.8)
+        result = health._latency_degradation_check(threshold=1.8)
+        # Caso in_flight: NO bypass aunque el daemon esté roto. Cae al
+        # kill legacy. El user en streaming gana.
+        assert result["action"] == "escalated_killed_rag_index"
+        assert restart_calls["count"] == 0
+        assert "prev_action=restart_skipped_in_flight" in result["reason"]
 
     def test_restart_attempted_resets_counter(self, monkeypatch):
         """Si los gates eventualmente liberan y el restart se ejecuta,
@@ -367,6 +498,103 @@ class TestEscalateKillRagIndex:
         assert result["action"] == "restart_attempted"
         # Counter reset post-restart real
         assert health._consecutive_degraded_skips == 0
+
+
+class TestQuickGenerateHealthCheck:
+    """`_quick_generate_health_check()` pega POST /api/generate con
+    timeout corto y devuelve (healthy, detail). Se usa en la escalación
+    para decidir si bypassear el cooldown o no."""
+
+    def test_healthy_when_done_true(self, monkeypatch):
+        import io as _io
+        import urllib.request
+
+        body = b'{"model":"qwen2.5:7b","response":"x","done":true}'
+        class FakeResp:
+            status = 200
+            def read(self):
+                return body
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout):
+            return FakeResp()
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        ok, detail = health._quick_generate_health_check(timeout_s=5.0)
+        assert ok is True
+        assert detail == "ok"
+
+    def test_unhealthy_on_timeout(self, monkeypatch):
+        import urllib.error
+        import urllib.request
+        import socket
+
+        def fake_urlopen(req, timeout):
+            raise urllib.error.URLError(socket.timeout("timed out"))
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        ok, detail = health._quick_generate_health_check(timeout_s=1.0)
+        assert ok is False
+        assert "url_error_" in detail
+
+    def test_unhealthy_on_http_404_model_not_found(self, monkeypatch):
+        import urllib.error
+        import urllib.request
+
+        def fake_urlopen(req, timeout):
+            raise urllib.error.HTTPError(
+                url="http://x", code=404,
+                msg="Not Found", hdrs=None, fp=None,
+            )
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        ok, detail = health._quick_generate_health_check(timeout_s=1.0)
+        assert ok is False
+        assert "http_error_404" in detail
+
+    def test_unhealthy_on_server_error_in_body(self, monkeypatch):
+        import urllib.request
+
+        body = b'{"error":"model qwen2.5:99b not found, try pulling it first"}'
+        class FakeResp:
+            status = 200
+            def read(self):
+                return body
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        monkeypatch.setattr(
+            urllib.request, "urlopen",
+            lambda req, timeout: FakeResp(),
+        )
+        ok, detail = health._quick_generate_health_check(timeout_s=1.0)
+        assert ok is False
+        assert "server_error" in detail
+
+    def test_unhealthy_on_non_json_body(self, monkeypatch):
+        import urllib.request
+
+        class FakeResp:
+            status = 200
+            def read(self):
+                return b"<html>not json</html>"
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        monkeypatch.setattr(
+            urllib.request, "urlopen",
+            lambda req, timeout: FakeResp(),
+        )
+        ok, detail = health._quick_generate_health_check(timeout_s=1.0)
+        assert ok is False
+        assert detail == "non_json_response"
 
 
 class TestListOllamaClients:

@@ -19,6 +19,42 @@ ENV VARS para tunear:
 - RAG_LATENCY_WATCHDOG_MIN_RECENT=5 (cantidad mínima de queries en ventana para evaluar — evita false positives con poca data)
 - RAG_LATENCY_WATCHDOG_COOLDOWN=1800 (segundos entre restarts permitidos — evita
   thrashing; 1800s=30min reemplazó 300s el 2026-05-01 — ver Trade-off abajo)
+- RAG_LATENCY_WATCHDOG_HEALTH_TIMEOUT=5 (segundos para el health-check
+  directo a `/api/generate` durante la escalación — ver Fix #1 abajo)
+- RAG_LATENCY_WATCHDOG_HEALTH_MODEL=qwen2.5:7b (modelo usado para el
+  health-check; debe estar pulled localmente)
+
+Fix #1 escalación con bypass de cooldown (2026-05-01):
+  Antes: cuando el watchdog detectaba degradación sostenida pero quedaba
+  bloqueado por cooldown_seconds (default 30min), la única escalación era
+  `_kill_stuck_rag_index_clients()`. Si NO había `rag index` corriendo
+  (caso típico hoy — el indexer es event-driven, no daemon), la
+  escalación era no-op (`killed=0 pids=[]`) y el sistema quedaba
+  degradado los 30 minutos completos. El watchdog externo
+  `com.fer.obsidian-rag-ollama-watchdog` (generate-health-based,
+  separado) eventualmente recuperaba pero tardaba ~5 min adicionales.
+
+  Síntoma observado 2026-05-01 ~18:46: user mandó audio a RagNet, el
+  listener TS quedó bloqueado en `/query` (que necesita embed bge-m3 de
+  Ollama), Ollama estaba wedged, watchdog interno spam-loggeaba
+  `restart_skipped_cooldown ratio=5.22` y `escalated_killed_rag_index
+  killed=0 pids=[]` durante 12 minutos hasta que el watchdog externo
+  finalmente bouncea los runners.
+
+  Fix: durante la escalación, el watchdog ahora pega un health-check
+  directo a `POST /api/generate` con `num_predict=1` + timeout 5s. Si
+  el endpoint NO responde (HTTP 000 / timeout / 5xx), Ollama está
+  efectivamente roto y el cooldown está protegiendo un restart anterior
+  que NO funcionó. En ese caso, la escalación BYPASEA el cooldown y
+  fuerza `_restart_ollama_daemon()` directo. Si el health-check sí
+  responde, la escalación cae al comportamiento legacy (kill rag_index
+  zombies si los hay) — la asunción es "Ollama responde lento pero
+  responde, no es wedge real, es saturación por consumer pegado".
+
+  Tunable: `RAG_LATENCY_WATCHDOG_HEALTH_TIMEOUT` (default 5s) y
+  `RAG_LATENCY_WATCHDOG_HEALTH_MODEL` (default qwen2.5:7b). Si el modelo
+  default no está pulled, el health-check loggea el detalle pero no
+  rompe — se cae al comportamiento legacy.
 
 Trade-off threshold + cooldown (2026-05-01):
   El watchdog usa `pkill -9 -f ollama` que mata el daemon + sus runners,
@@ -353,6 +389,73 @@ def _kill_stuck_rag_index_clients() -> tuple[int, list[int]]:
     return len(targets), targets
 
 
+def _quick_generate_health_check(
+    *,
+    timeout_s: float = 5.0,
+    model: str = "qwen2.5:7b",
+    base_url: str = "http://127.0.0.1:11434",
+) -> tuple[bool, str]:
+    """Pega un POST /api/generate con num_predict=1 y timeout corto.
+
+    Devuelve `(healthy, detail)`. `healthy=True` solo si Ollama respondió
+    HTTP 2xx con un body parseable y `done=True` (o sea, el round-trip
+    completo) dentro del timeout. Si falla la conexión, hay timeout, o
+    el body no es JSON válido, devuelve `(False, "...")` con el detail.
+
+    Diseño: usa `urllib.request` (stdlib) para no agregar deps. El body
+    pide `num_predict=1` para minimizar el costo del check — un token
+    de output basta para confirmar que el runner está vivo y sirviendo.
+
+    Si el modelo no existe localmente, Ollama responde HTTP 404 con
+    `{"error":"model 'X' not found"}`. Eso lo contamos como UNHEALTHY
+    (el watchdog asume `qwen2.5:7b` por default; si fue removido, el
+    user debería override via `RAG_LATENCY_WATCHDOG_HEALTH_MODEL`). Lo
+    importante es no devolver `True` falsamente — preferimos cooldown
+    legacy a un bypass injustificado.
+    """
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    url = base_url.rstrip("/") + "/api/generate"
+    payload = _json.dumps({
+        "model": model,
+        "prompt": "health",
+        "stream": False,
+        "options": {"num_predict": 1},
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            body = resp.read()
+            status = getattr(resp, "status", 200)
+    except urllib.error.HTTPError as exc:
+        return False, f"http_error_{exc.code}"
+    except urllib.error.URLError as exc:
+        # Timeout / connection refused / DNS — todos URLError.
+        reason = getattr(exc, "reason", exc)
+        return False, f"url_error_{type(reason).__name__}"
+    except Exception as exc:
+        return False, f"exception_{type(exc).__name__}"
+    if status >= 500:
+        return False, f"http_5xx_{status}"
+    try:
+        data = _json.loads(body.decode("utf-8"))
+    except Exception:
+        return False, "non_json_response"
+    # Algunos errores vienen con HTTP 2xx + {"error":"..."} en el body.
+    if isinstance(data, dict) and data.get("error"):
+        return False, f"server_error: {str(data.get('error'))[:80]}"
+    if isinstance(data, dict) and data.get("done") is True:
+        return True, "ok"
+    return False, "missing_done_flag"
+
+
 def _restart_ollama_daemon() -> tuple[bool, str]:
     """Reinicia el daemon ollama. Retorna (ok, detail).
 
@@ -433,6 +536,7 @@ def _latency_degradation_check(
 
     Esta es la función testeable. El loop la llama cada N segundos.
     """
+    global _consecutive_degraded_skips, _last_restart_ts
     out: dict = {
         "action": "skip",
         "reason": "",
@@ -462,7 +566,6 @@ def _latency_degradation_check(
     out["ratio"] = round(ratio, 2)
     if ratio < threshold:
         # Ollama está sano — resetear contador de skips sostenidos.
-        global _consecutive_degraded_skips
         with _consecutive_skips_lock:
             _consecutive_degraded_skips = 0
         out["action"] = "ok"
@@ -480,7 +583,6 @@ def _latency_degradation_check(
         out["reason"] = f"in_flight={n_in_flight}"
     else:
         # Gate (b): cooldown.
-        global _last_restart_ts
         with _last_restart_lock:
             now_t = time.time()
             if now_t - _last_restart_ts < cooldown_seconds:
@@ -511,12 +613,44 @@ def _latency_degradation_check(
             _consecutive_degraded_skips = 0  # reset post-escalation
     if should_escalate:
         prev_action = out["action"]  # captura antes de reasignar
-        n_killed, pids = _kill_stuck_rag_index_clients()
-        out["action"] = "escalated_killed_rag_index"
-        out["reason"] = (
-            f"degraded_skips={skips} prev_action={prev_action} "
-            f"killed={n_killed} pids={pids}"
+        # Fix #1 (2026-05-01): antes de caer al kill legacy de `rag index`
+        # (que es no-op si no hay un index zombie), pegar un health-check
+        # directo a /api/generate. Si Ollama NO responde, el cooldown
+        # está protegiendo un restart anterior que claramente NO funcionó
+        # → bypass + force restart. Si Ollama SÍ responde, comportamiento
+        # legacy. Ver doc del módulo "Fix #1 escalación con bypass".
+        try:
+            health_timeout = float(
+                os.environ.get("RAG_LATENCY_WATCHDOG_HEALTH_TIMEOUT", "5")
+            )
+        except ValueError:
+            health_timeout = 5.0
+        health_model = os.environ.get(
+            "RAG_LATENCY_WATCHDOG_HEALTH_MODEL", "qwen2.5:7b"
         )
+        healthy, health_detail = _quick_generate_health_check(
+            timeout_s=health_timeout, model=health_model,
+        )
+        if not healthy and prev_action == "restart_skipped_cooldown":
+            # Bypass cooldown — el daemon está roto, los 30min de cooldown
+            # están bloqueando exactamente el restart que necesitamos.
+            with _last_restart_lock:
+                _last_restart_ts = time.time()
+                _persist_restart_ts(_last_restart_ts)
+            ok, detail = _restart_ollama_daemon()
+            out["action"] = "escalated_force_restart_unhealthy"
+            out["reason"] = (
+                f"degraded_skips={skips} prev_action={prev_action} "
+                f"health={health_detail} restart_ok={ok} detail={detail}"
+            )
+        else:
+            n_killed, pids = _kill_stuck_rag_index_clients()
+            out["action"] = "escalated_killed_rag_index"
+            out["reason"] = (
+                f"degraded_skips={skips} prev_action={prev_action} "
+                f"health={'ok' if healthy else health_detail} "
+                f"killed={n_killed} pids={pids}"
+            )
     else:
         # Stamp el counter en la reason para visibilidad en logs sin
         # cambiar el action (queda como `restart_skipped_*`).
@@ -545,6 +679,7 @@ def _watchdog_loop(
                 "restart_skipped_cooldown",
                 "restart_skipped_in_flight",
                 "escalated_killed_rag_index",
+                "escalated_force_restart_unhealthy",
             ):
                 print(
                     f"[ollama-health-watchdog] {result['action']}: "

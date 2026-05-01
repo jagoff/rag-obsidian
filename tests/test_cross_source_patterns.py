@@ -217,7 +217,7 @@ def test_compute_correlations_caches():
 
 
 def test_known_metrics_includes_core():
-    """Los 12 collectors core están registrados."""
+    """Los 14 collectors core están registrados."""
     names = csp.known_metrics()
     expected = {
         "mood_score", "mood_self_report",
@@ -226,6 +226,7 @@ def test_known_metrics_includes_core():
         "spotify_minutes", "spotify_distinct_tracks",
         "queries_total", "queries_existential",
         "wa_outbound_avg_chars",
+        "gmail_received", "vault_notes_touched",
     }
     missing = expected - set(names)
     assert not missing, f"missing collectors: {missing}"
@@ -344,6 +345,76 @@ def test_collect_mood_score_reads_daily_table(tmp_telemetry):
     conn.close()
     result = csp._c_mood_score(yesterday, today)
     assert result == {today: 0.5, yesterday: -0.3}
+
+
+def test_collect_gmail_received_parses_frontmatter(tmp_path, monkeypatch):
+    """gmail_received parsea `message_count: N` del frontmatter de las
+    notas YYYY-MM-DD.md bajo `<vault>/03-Resources/Gmail/`."""
+    folder = tmp_path / "03-Resources" / "Gmail"
+    folder.mkdir(parents=True)
+    (folder / "2026-04-28.md").write_text(
+        "---\nsource: gmail\nmessage_count: 6\nwindow_hours: 48\n---\n\n# Body\n",
+        encoding="utf-8",
+    )
+    (folder / "2026-04-29.md").write_text(
+        "---\nmessage_count: 11\n---\nbody",
+        encoding="utf-8",
+    )
+    # Archivo fuera del rango — se ignora.
+    (folder / "2025-01-01.md").write_text(
+        "---\nmessage_count: 999\n---\nbody",
+        encoding="utf-8",
+    )
+    # Archivo basura — se ignora.
+    (folder / "notas-sueltas.md").write_text("hola", encoding="utf-8")
+    monkeypatch.setattr(rag, "VAULT_PATH", tmp_path)
+    assert csp._c_gmail_received("2026-04-28", "2026-04-29") == {
+        "2026-04-28": 6.0,
+        "2026-04-29": 11.0,
+    }
+
+
+def test_collect_gmail_received_returns_empty_when_folder_missing(tmp_path, monkeypatch):
+    """Sin folder Gmail/, devolver {} silenciosamente (degradación graceful)."""
+    monkeypatch.setattr(rag, "VAULT_PATH", tmp_path)
+    assert csp._c_gmail_received("2026-04-01", "2026-04-30") == {}
+
+
+def test_collect_vault_notes_touched_counts_by_mtime(tmp_path, monkeypatch):
+    """vault_notes_touched cuenta notas .md tocadas por día (mtime),
+    skipea folders system, respeta el rango."""
+    import os
+
+    (tmp_path / "01-Projects").mkdir()
+    (tmp_path / "04-Archive" / "99-obsidian-system").mkdir(parents=True)
+    (tmp_path / ".obsidian").mkdir()
+
+    user_note = tmp_path / "01-Projects" / "alpha.md"
+    user_note.write_text("alpha", encoding="utf-8")
+    user_note2 = tmp_path / "01-Projects" / "beta.md"
+    user_note2.write_text("beta", encoding="utf-8")
+    system_note = tmp_path / "04-Archive" / "99-obsidian-system" / "auto.md"
+    system_note.write_text("auto", encoding="utf-8")
+    obsidian_note = tmp_path / ".obsidian" / "workspace.md"
+    obsidian_note.write_text("ws", encoding="utf-8")
+
+    # Force mtime a una fecha conocida.
+    target_date = "2026-04-29"
+    target_dt = datetime.strptime(target_date, "%Y-%m-%d") + timedelta(hours=14)
+    target_ts = target_dt.timestamp()
+    for p in (user_note, user_note2, system_note, obsidian_note):
+        os.utime(p, (target_ts, target_ts))
+
+    monkeypatch.setattr(rag, "VAULT_PATH", tmp_path)
+    result = csp._c_vault_notes_touched("2026-04-28", "2026-04-30")
+    # Solo las 2 user notes cuentan; system + .obsidian se skipean.
+    assert result == {target_date: 2.0}
+
+
+def test_collect_vault_notes_touched_returns_empty_when_vault_missing(tmp_path, monkeypatch):
+    """Sin vault accesible, degrada a {}."""
+    monkeypatch.setattr(rag, "VAULT_PATH", tmp_path / "no-existe")
+    assert csp._c_vault_notes_touched("2026-04-01", "2026-04-30") == {}
 
 
 def test_collect_skips_zero_signal_days(tmp_telemetry):

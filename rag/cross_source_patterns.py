@@ -412,6 +412,117 @@ def _c_queries_existential(start: str, end: str) -> dict[str, float]:
         return {}
 
 
+@register_metric("gmail_received", "gmail · mensajes recibidos")
+def _c_gmail_received(start: str, end: str) -> dict[str, float]:
+    """Count de mensajes gmail recibidos por día.
+
+    Source: notas en `<vault>/03-Resources/Gmail/<YYYY-MM-DD>.md` que
+    el ingester de gmail genera 1×/día con un dump de las últimas 48h.
+    El frontmatter trae `message_count: N` que es el count exacto.
+    Más confiable que parsear el body buscando subjects (formato puede
+    cambiar). Skipea snapshots overlap por window_hours — solo
+    contamos cada YYYY-MM-DD una vez (la del archivo con ese nombre).
+
+    Devuelve dict vacío si:
+      - vault no resoluble
+      - folder Gmail/ no existe (usuario sin gmail integration)
+      - parse del frontmatter falla (silent-fail)
+    """
+    try:
+        from rag import VAULT_PATH  # noqa: PLC0415
+    except Exception:
+        return {}
+    folder = VAULT_PATH / "03-Resources" / "Gmail"
+    if not folder.exists() or not folder.is_dir():
+        return {}
+    out: dict[str, float] = {}
+    # Filename pattern: YYYY-MM-DD.md (matchea el ingester actual)
+    name_re = re.compile(r"^(\d{4}-\d{2}-\d{2})\.md$")
+    fm_re = re.compile(r"^message_count:\s*(\d+)\s*$", re.MULTILINE)
+    try:
+        for path in folder.iterdir():
+            m = name_re.match(path.name)
+            if not m:
+                continue
+            date = m.group(1)
+            if date < start or date > end:
+                continue
+            try:
+                # Solo leer primeras 30 líneas (el frontmatter es chico).
+                with path.open("r", encoding="utf-8", errors="replace") as f:
+                    head = "".join(f.readline() for _ in range(30))
+            except OSError:
+                continue
+            mm = fm_re.search(head)
+            if mm:
+                try:
+                    out[date] = float(mm.group(1))
+                except ValueError:
+                    continue
+    except Exception as exc:
+        _silent_log_safe("xspat_gmail_received_failed", exc)
+        return {}
+    return out
+
+
+@register_metric("vault_notes_touched", "vault · notas tocadas")
+def _c_vault_notes_touched(start: str, end: str) -> dict[str, float]:
+    """Count de notas .md del vault con mtime en cada día del rango.
+
+    rglob completo del vault filtrando:
+      - Solo `.md`
+      - NO system files (`.obsidian/`, files que arrancan con `_`)
+      - NO bajo `04-Archive/99-obsidian-system/` (auto-generated)
+      - mtime dentro del rango pedido
+
+    Cuesta más que las queries SQL (~200ms para vault chico,
+    ~2s para uno grande). Tolerable porque el engine tiene cache
+    LRU + el endpoint solo se llama on-demand desde el panel.
+
+    Métrica útil para correlar productividad / engagement con el vault
+    vs mood / sleep. Patron esperado: días con muchas notas tocadas
+    suelen ser días "productivos" — vale ver si correlaciona con mood.
+    """
+    try:
+        from rag import VAULT_PATH  # noqa: PLC0415
+    except Exception:
+        return {}
+    if not VAULT_PATH.exists():
+        return {}
+
+    # Convert range to epoch for fast comparison.
+    try:
+        start_dt = datetime.strptime(start, "%Y-%m-%d")
+        end_dt = datetime.strptime(end, "%Y-%m-%d") + timedelta(days=1)
+        start_ts = start_dt.timestamp()
+        end_ts = end_dt.timestamp()
+    except ValueError:
+        return {}
+
+    out: dict[str, int] = {}
+    try:
+        for path in VAULT_PATH.rglob("*.md"):
+            # Skip system folders.
+            rel = path.relative_to(VAULT_PATH)
+            parts = rel.parts
+            if any(p.startswith(".") or p.startswith("_") for p in parts):
+                continue
+            if len(parts) >= 2 and parts[0] == "04-Archive" and parts[1] == "99-obsidian-system":
+                continue
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if mtime < start_ts or mtime >= end_ts:
+                continue
+            date = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d")
+            out[date] = out.get(date, 0) + 1
+    except Exception as exc:
+        _silent_log_safe("xspat_vault_notes_failed", exc)
+        return {}
+    return {d: float(c) for d, c in out.items()}
+
+
 @register_metric("wa_outbound_avg_chars", "WhatsApp · avg chars outbound")
 def _c_wa_outbound_chars(start: str, end: str) -> dict[str, float]:
     """Promedio de chars/mensaje outbound por día desde el bridge SQLite."""

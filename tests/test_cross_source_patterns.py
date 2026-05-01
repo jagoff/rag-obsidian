@@ -535,3 +535,44 @@ def test_cli_patterns_explain_pair(monkeypatch):
     assert result.exit_code == 0, result.output
     assert "r=+1.000" in result.output  # perfect correlation
     assert "n=25" in result.output
+
+
+# ── Frontend bundle smoke (panel p-correlations + modal) ────────────────
+
+
+def test_home_v2_html_has_correlations_panel():
+    """El panel correlations está declarado con id `p-correlations` (NO
+    `p-patterns`, que está tomado por otro panel pre-existente)."""
+    html_path = Path(__file__).resolve().parent.parent / "web" / "static" / "home.v2.html"
+    html = html_path.read_text(encoding="utf-8")
+    assert 'id="p-correlations"' in html
+    assert 'class="panel panel-correlations"' in html
+    # aria-live explicit en el panel-body.
+    idx = html.index('id="p-correlations"')
+    panel_block = html[idx:idx + 800]
+    assert 'aria-live="polite"' in panel_block
+
+
+def test_home_v2_html_has_correlations_modal():
+    html_path = Path(__file__).resolve().parent.parent / "web" / "static" / "home.v2.html"
+    html = html_path.read_text(encoding="utf-8")
+    assert '<dialog id="patterns-modal"' in html
+    assert 'aria-labelledby="patterns-modal-title"' in html
+    assert 'data-patterns-modal-close' in html
+
+
+def test_home_v2_bundle_includes_render_correlations():
+    """El JS bundle tiene `renderCorrelations` (no `renderPatterns`)
+    para evitar shadowing con el render existente del panel
+    `p-patterns` (entidades cross-source)."""
+    js_path = Path(__file__).resolve().parent.parent / "web" / "static" / "home.v2.js"
+    js = js_path.read_text(encoding="utf-8")
+    # Las funciones nuevas:
+    assert "async function renderCorrelations" in js
+    assert "fetchPatterns" in js
+    assert "openPatternsModal" in js
+    assert "renderPatternsModal" in js
+    # Llama a /api/patterns con days=30.
+    assert '"/api/patterns?days=30&top=20"' in js
+    # El render loop principal llama a renderCorrelations(payload).
+    assert "renderCorrelations(payload)" in js

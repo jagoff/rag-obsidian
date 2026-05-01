@@ -13,7 +13,7 @@
   <link rel="icon" type="image/png" sizes="32x32" href="/static/pwa/favicon-32.png">
   <link rel="icon" type="image/png" sizes="16x16" href="/static/pwa/favicon-16.png">
   <link rel="apple-touch-icon" href="/static/pwa/apple-touch-icon.png">
-  <link rel="stylesheet" href="/static/home.v2.css?v=27">
+  <link rel="stylesheet" href="/static/home.v2.css?v=31">
   <!-- marked@18 vendored — same SRI as the v1 home. Used to parse the
        today/tomorrow narrative which has 4 H2 sub-sections that need
        real markdown rendering (lists, headers) — not the regex hack. -->
@@ -236,6 +236,30 @@
           </div>
           <footer class="panel-foot" data-foot></footer>
         </article>
+        <!-- Cross-source correlations · top Pearson + lag analysis.
+             OJO: nombre `p-correlations` (no `p-patterns`) para evitar
+             colisión con el panel pre-existente "Patrones · cross-source"
+             que muestra entidades (personas/topics) en múltiples fuentes
+             el mismo día. Esto es distinto: correlaciones estadísticas
+             entre métricas diarias (mood, sleep, queries, WA, etc)
+             usando Pearson + lag analysis.
+             Source: GET /api/patterns que corre el engine
+             rag/cross_source_patterns.py sobre 12 métricas con lags
+             0/1/7d. Lazy-load: el panel hace su propio fetch al primer
+             render (no viene en /api/home). Empty state si <findings —
+             el user tiene que acumular >=21 días de data en >=2
+             métricas para ver findings. Click "ver todos" abre modal. -->
+        <article class="panel panel-correlations" id="p-correlations" hidden>
+          <header class="panel-head">
+            <span class="title">Correlaciones · 30d</span>
+            <span class="count" data-count></span>
+          </header>
+          <div class="panel-body" data-body
+               aria-live="polite" aria-atomic="false">
+            <div class="empty">cargando…</div>
+          </div>
+          <footer class="panel-foot" data-foot></footer>
+        </article>
         <article class="panel" id="p-cards">
           <header class="panel-head">
             <span class="title">Últimos gastos</span>
@@ -369,7 +393,23 @@
     </div>
   </dialog>
 
-  <script src="/static/home.v2.js?v=27"></script>
+  <!-- Modal "Ver todos los patrones" del panel patterns. <dialog>
+       nativo. Lazy-load + cache. Click backdrop o × cierra. -->
+  <dialog id="patterns-modal" class="patterns-modal mood-modal"
+          aria-labelledby="patterns-modal-title">
+    <div class="mood-modal-head">
+      <h2 id="patterns-modal-title" class="mood-modal-title">Patrones · cross-source detallado</h2>
+      <button type="button" class="mood-modal-close"
+              aria-label="cerrar" data-patterns-modal-close>
+        <span aria-hidden="true">×</span>
+      </button>
+    </div>
+    <div class="mood-modal-body" data-patterns-modal-body>
+      <div class="empty">cargando…</div>
+    </div>
+  </dialog>
+
+  <script src="/static/home.v2.js?v=31"></script>
   <!-- Registra el SW + auto-reload on update. Sin esto, los fixes que
        deployamos al frontend no se propagan: el SW viejo sirve assets
        cacheados y el JS viejo sigue corriendo aunque haya versión

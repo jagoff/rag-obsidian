@@ -428,9 +428,15 @@
 
     const counts = payload.today?.counts || {};
     const evidence = payload.today?.evidence || {};
+    const signals = payload.signals || {};
     const inboxItems = evidence.inbox_today || [];
-    const lowConfItems = payload.signals?.low_conf || [];
-    const tomorrowEvents = payload.tomorrow_calendar?.events || [];
+    const lowConfItems = signals.low_conf || [];
+    // tomorrow_calendar viene como array directo en el payload (NO como
+    // objeto con .events). Bug histórico: el código previo asumía la
+    // shape equivocada y nunca caía al fallback aunque hubiera events.
+    const tomorrowEvents = Array.isArray(payload.tomorrow_calendar)
+      ? payload.tomorrow_calendar
+      : [];
 
     // Counts chip al lado de la fecha
     const totalThings = (counts.total) ||
@@ -442,10 +448,6 @@
     const md = payload.today?.narrative || "";
     const split = splitNarrative(md);
 
-    // Si no hay narrative (LLM aún no corrió), generamos contenido a
-    // partir de evidence directamente — el user no ve "cargando" eterno.
-    const hasNarrative = !!md.trim();
-
     const sectionHTML = (cls, emoji, label, count, contentHTML, emptyText) => `
       <div class="hero-section ${cls}">
         <h3><span>${emoji} ${escapeHTML(label)}</span>${count != null ? `<span class="count">${count}</span>` : ""}</h3>
@@ -453,57 +455,157 @@
       </div>
     `;
 
-    // Sub-section: narrative del LLM ("Lo que pasó hoy")
-    const narrativeHTML = split.narrative
-      ? mdToHTML(split.narrative)
-      : (hasNarrative ? "" : (() => {
-          // Fallback derivado de evidence: notas tocadas hoy
-          const recent = (evidence.recent_notes || []).slice(0, 5);
-          if (!recent.length) return "";
-          return "<p>Notas tocadas hoy:</p><ul>" + recent.map((n) =>
-            `<li><strong>${escapeHTML(n.title || n.path)}</strong></li>`,
-          ).join("") + "</ul>";
-        })());
+    // ── Helpers para los fallbacks ricos ────────────────────────────
+    // Cuando el LLM omite una sub-sección (cosa que hace seguido si
+    // la regla dice "OMITÍ si vacío"), llenamos con data real de
+    // signals. Evita las cajas vacías que el user reportaba.
 
-    // Sub-section: Sin procesar (inbox del día)
+    const fromName = (s) => (s || "").split("<")[0].trim() || s || "";
+    const truncate = (s, n) => (s || "").length > n ? (s || "").slice(0, n) + "…" : (s || "");
+
+    // Sub-section: 🪞 "Lo que pasó hoy" — si el LLM no escribió, armamos
+    // un summary derivado de signals (notas + gmail + WA + youtube).
+    let narrativeHTML = "";
+    if (split.narrative) {
+      narrativeHTML = mdToHTML(split.narrative);
+    } else {
+      const lines = [];
+      const recent = (evidence.recent_notes || []).slice(0, 3);
+      if (recent.length) {
+        lines.push("<p>Notas tocadas hoy:</p><ul>" + recent.map((n) =>
+          `<li><strong>${escapeHTML(n.title || n.path)}</strong></li>`).join("") + "</ul>");
+      }
+      const ytWatched = (signals.youtube_watched || []).slice(0, 3);
+      if (ytWatched.length) {
+        lines.push("<p>Videos que viste:</p><ul>" + ytWatched.map((v) =>
+          `<li>${escapeHTML(v.title || v.video_id || "")}</li>`).join("") + "</ul>");
+      }
+      const gmailRecent = (signals.gmail?.recent || []).slice(0, 3);
+      if (gmailRecent.length) {
+        lines.push("<p>Mails recibidos:</p><ul>" + gmailRecent.map((m) =>
+          `<li><strong>${escapeHTML(fromName(m.from))}</strong>: ${escapeHTML(truncate(m.subject || "", 70))}</li>`).join("") + "</ul>");
+      }
+      narrativeHTML = lines.join("");
+    }
+
+    // Sub-section: 📥 "Sin procesar" — inbox vault + mails VIP +
+    // WhatsApp esperando + mails Apple sin leer. El user los necesita
+    // ver siempre que existan, no importa si el LLM los listó.
     let inboxHTML = "";
     if (split.inbox) {
       inboxHTML = mdToHTML(split.inbox);
-    } else if (inboxItems.length) {
-      inboxHTML = "<ul>" + inboxItems.slice(0, 8).map((it) => {
-        const tags = (it.tags || []).slice(0, 3).map((t) => `<code>#${escapeHTML(t)}</code>`).join(" ");
-        return `<li><strong>${escapeHTML(it.title || it.path)}</strong>${tags ? ` ${tags}` : ""}</li>`;
-      }).join("") + "</ul>";
+    } else {
+      const items = [];
+      // Inbox del vault
+      for (const it of inboxItems.slice(0, 3)) {
+        const tags = (it.tags || []).slice(0, 3)
+          .map((t) => `<code>#${escapeHTML(t)}</code>`).join(" ");
+        items.push(`<li>📝 <strong>${escapeHTML(it.title || it.path)}</strong>${tags ? " " + tags : ""}</li>`);
+      }
+      // Mails VIP / recientes (gmail.recent suele incluir VIP)
+      for (const m of (signals.gmail?.recent || []).slice(0, 3)) {
+        items.push(`<li>📧 <strong>${escapeHTML(fromName(m.from))}</strong>: ${escapeHTML(truncate(m.subject || "", 80))}</li>`);
+      }
+      // WhatsApp esperando respuesta (los más viejos primero)
+      const wa = [...(signals.whatsapp_unreplied || [])]
+        .sort((a, b) => (b.hours_waiting || 0) - (a.hours_waiting || 0))
+        .slice(0, 3);
+      for (const w of wa) {
+        const hrs = w.hours_waiting != null ? ` <em>(${Math.round(w.hours_waiting)}h)</em>` : "";
+        items.push(`<li>💬 <strong>${escapeHTML(w.name || "")}</strong>${hrs}: ${escapeHTML(truncate(w.last_snippet || "", 70))}</li>`);
+      }
+      // Apple Mail unread (si hay y no se duplicó con gmail)
+      const mailUnread = (signals.mail_unread || []).slice(0, 2);
+      if (!signals.gmail?.recent?.length && mailUnread.length) {
+        for (const m of mailUnread) {
+          items.push(`<li>📬 <strong>${escapeHTML(fromName(m.from || m.sender))}</strong>: ${escapeHTML(truncate(m.subject || "", 80))}</li>`);
+        }
+      }
+      inboxHTML = items.length ? `<ul>${items.join("")}</ul>` : "";
     }
 
-    // Sub-section: Preguntas abiertas (low-conf queries)
+    // Sub-section: 🔍 "Preguntas abiertas" — low-conf queries +
+    // followup-aging stale + contradicciones detectadas. Si nada de
+    // eso, queda con el placeholder.
     let questionsHTML = "";
     if (split.questions) {
       questionsHTML = mdToHTML(split.questions);
-    } else if (lowConfItems.length) {
-      questionsHTML = "<ul>" + lowConfItems.slice(0, 5).map((q) => {
+    } else {
+      const items = [];
+      // Low-conf queries (queries que el RAG no contestó bien)
+      for (const q of lowConfItems.slice(0, 3)) {
         const text = q.q || q.question || q.text || "";
-        const score = q.score != null ? ` <em>(score ${q.score.toFixed?.(2) || q.score})</em>` : "";
-        return `<li>${escapeHTML(text)}${score}</li>`;
-      }).join("") + "</ul>";
+        const score = q.score != null
+          ? ` <em>(${(typeof q.score === "number" ? q.score : Number(q.score)).toFixed(2)})</em>`
+          : "";
+        items.push(`<li>❓ ${escapeHTML(text)}${score}</li>`);
+      }
+      // Cabos sueltos viejos (followup-aging stale ≥30d)
+      const aging = signals.followup_aging || {};
+      const stalePlus = aging.stale_30plus || aging.stale_count || 0;
+      if (!items.length && stalePlus > 0) {
+        items.push(`<li>⚠️ <strong>${stalePlus}</strong> loops STALE (≥30d sin avance)</li>`);
+      }
+      // Contradicciones recientes (señales que el sistema detectó pero
+      // el user no resolvió todavía).
+      const contrad = signals.contradictions || [];
+      const newContrad = (evidence.new_contradictions || []).slice(0, 2);
+      const allContrad = newContrad.length ? newContrad : (Array.isArray(contrad) ? contrad.slice(0, 2) : []);
+      for (const c of allContrad) {
+        const text = c.text || c.summary || c.title || c.note_a || "";
+        if (text) items.push(`<li>⚠ ${escapeHTML(truncate(text, 100))}</li>`);
+      }
+      // Loops activos (cosas en curso pendientes de cerrar)
+      if (!items.length) {
+        const activo = (signals.loops_activo || []).slice(0, 3);
+        for (const l of activo) {
+          const txt = l.loop_text || l.text || l.title || "";
+          if (txt) items.push(`<li>🔄 ${escapeHTML(truncate(txt, 100))}</li>`);
+        }
+      }
+      questionsHTML = items.length ? `<ul>${items.join("")}</ul>` : "";
     }
 
-    // Sub-section: Para mañana
+    // Sub-section: 🌅 "Para mañana" — events del calendar + reminders
+    // que vencen mañana. Bug fix: tomorrow_calendar es array directo.
     let tomorrowHTML = "";
     if (split.tomorrow) {
       tomorrowHTML = mdToHTML(split.tomorrow);
-    } else if (tomorrowEvents.length) {
-      tomorrowHTML = "<ul>" + tomorrowEvents.slice(0, 6).map((e) => {
-        const when = e.start || e.time || "";
-        return `<li><strong>${escapeHTML(when)}</strong> ${escapeHTML(e.title || e.summary || "")}</li>`;
-      }).join("") + "</ul>";
+    } else {
+      const items = [];
+      // Events del calendar de mañana
+      for (const e of tomorrowEvents.slice(0, 6)) {
+        const tr = (e.time_range || "").trim();
+        const prefix = tr || "todo el día";
+        const title = e.title || e.summary || "(sin título)";
+        items.push(`<li><strong>${escapeHTML(prefix)}</strong> — ${escapeHTML(title)}</li>`);
+      }
+      // Reminders de mañana (si hay y no duplican calendar)
+      const reminders = (signals.reminders || []).filter((r) => {
+        const due = (r.due || r.due_at || "").toLowerCase();
+        return due.includes("tomorrow") || due.includes("mañana");
+      }).slice(0, 3);
+      for (const r of reminders) {
+        items.push(`<li>📌 ${escapeHTML(truncate(r.title || r.text || "", 80))}</li>`);
+      }
+      tomorrowHTML = items.length ? `<ul>${items.join("")}</ul>` : "";
     }
+
+    // Counts visibles en el chip de cada sección — usar lo que hay
+    // realmente, no solo el bucket "oficial".
+    const inboxCount = inboxItems.length
+      + (signals.gmail?.recent?.length || 0)
+      + (signals.whatsapp_unreplied?.length || 0);
+    const questionsCount = lowConfItems.length
+      + ((signals.followup_aging?.stale_30plus || 0) > 0 ? 1 : 0)
+      + (evidence.new_contradictions?.length || 0);
+    const tomorrowCount = tomorrowEvents.length;
 
     bodyEl.innerHTML = [
       sectionHTML("s-narrative", "🪞", "Lo que pasó hoy", null, narrativeHTML, "Aún sin brief — pulsá ↻ arriba para generar"),
-      sectionHTML("s-inbox", "📥", "Sin procesar", inboxItems.length || null, inboxHTML, "todo procesado ✓"),
-      sectionHTML("s-questions", "🔍", "Preguntas abiertas", lowConfItems.length || null, questionsHTML, "sin preguntas pendientes"),
-      sectionHTML("s-tomorrow", "🌅", "Para mañana", null, tomorrowHTML, "agenda libre · día abierto"),
+      sectionHTML("s-inbox", "📥", "Sin procesar", inboxCount || null, inboxHTML, "todo procesado ✓"),
+      sectionHTML("s-questions", "🔍", "Preguntas abiertas", questionsCount || null, questionsHTML, "sin preguntas pendientes"),
+      sectionHTML("s-tomorrow", "🌅", "Para mañana", tomorrowCount || null, tomorrowHTML, "agenda libre · día abierto"),
     ].join("");
 
     // Botones inline "crear reminder" en cada <li> de "Para mañana"

@@ -406,7 +406,8 @@ def _add_batched(col, ids, embeddings, bodies, metas, source: str) -> None:
     Retry: up to 12 attempts per batch, sleep = 0.25 × 2^attempt seconds
     (0.25, 0.5, 1, 2, 4, 8, 16, 32, 60, 60, 60, 60s → ~5min cumulative
     max, capped at 60s per sleep). If the last attempt still fails,
-    re-raise — something beyond contention is wrong.
+    re-raise — callers that need silent-fail behaviour (e.g. upsert_bookmarks
+    inside run()) wrap the call in their own try/except OperationalError.
 
     Between batches sqlite-vec's writer lock releases briefly, letting
     the concurrent web server slot its own writes in.
@@ -699,15 +700,26 @@ def run(
             _delete_hash(state_conn, "rag_safari_history_state",
                          "history_item_id", hid)
 
-        summary["bookmarks_indexed"] = upsert_bookmarks(col, bm_to_write)
-        for b in bm_to_write:
-            _upsert_hash(state_conn, "rag_safari_bookmark_state",
-                         "bookmark_uuid", b.uuid,
-                         _bookmark_hash(b), now_iso)
-        summary["bookmarks_deleted"] = delete_bookmarks(col, stale_bm_keys)
-        for u in stale_bm_uuids:
-            _delete_hash(state_conn, "rag_safari_bookmark_state",
-                         "bookmark_uuid", u)
+        # bookmarks_indexed: silent-fail on SQLITE_BUSY — the state table is
+        # only updated on success, so the next run re-processes the same items.
+        # This prevents exit=1 when ragvec.db is held by the web server for
+        # longer than the _add_batched retry budget (~5 min).
+        try:
+            summary["bookmarks_indexed"] = upsert_bookmarks(col, bm_to_write)
+            for b in bm_to_write:
+                _upsert_hash(state_conn, "rag_safari_bookmark_state",
+                             "bookmark_uuid", b.uuid,
+                             _bookmark_hash(b), now_iso)
+            summary["bookmarks_deleted"] = delete_bookmarks(col, stale_bm_keys)
+            for u in stale_bm_uuids:
+                _delete_hash(state_conn, "rag_safari_bookmark_state",
+                             "bookmark_uuid", u)
+        except sqlite3.OperationalError as _bm_exc:
+            if "locked" not in str(_bm_exc).lower():
+                raise
+            rag._silent_log("safari_bookmarks_locked", _bm_exc)
+            summary["bookmarks_indexed"] = 0
+            summary["bookmarks_lock_skipped"] = len(bm_to_write)
         state_conn.commit()
     else:
         summary["history_indexed"] = len(hist_to_write)

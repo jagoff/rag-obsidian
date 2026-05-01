@@ -581,6 +581,45 @@ def test_add_batched_entity_extraction_failure_does_not_raise(tmp_vault_col, mon
     assert "locked" in silent_calls[0]["exc"]
 
 
+def test_run_bookmarks_locked_does_not_raise(tmp_vault_col, monkeypatch):
+    """If upsert_bookmarks fails with 'database is locked', run() must NOT
+    propagate the exception (exit=0). History already indexed must be intact,
+    and the lock error must be logged via rag._silent_log."""
+    silent_calls: list = []
+
+    _real_add_batched = s._add_batched
+    call_count = [0]
+
+    def _locked_add_batched(col, ids, embeddings, bodies, metas, source):
+        call_count[0] += 1
+        # First call (history) succeeds; second call (bookmarks) raises locked.
+        if call_count[0] >= 2:
+            raise sqlite3.OperationalError("database is locked")
+        _real_add_batched(col, ids, embeddings, bodies, metas, source)
+
+    def _fake_silent_log(tag, exc):
+        silent_calls.append({"tag": tag, "exc": str(exc)})
+
+    monkeypatch.setattr(s, "_add_batched", _locked_add_batched)
+    monkeypatch.setattr(rag, "_silent_log", _fake_silent_log)
+
+    # Must not raise even though bookmark write fails.
+    summary = s.run(
+        history_fetch_fn=lambda: [_mk_hist(1), _mk_hist(2)],
+        bookmarks_fetch_fn=lambda: [_mk_bm("u1"), _mk_bm("u2")],
+    )
+
+    # History indexed OK.
+    assert summary["history_indexed"] == 2
+    # Bookmarks silently skipped.
+    assert summary["bookmarks_indexed"] == 0
+    assert summary.get("bookmarks_lock_skipped", 0) == 2
+    # Silent-fail called with the right tag.
+    assert any(c["tag"] == "safari_bookmarks_locked" for c in silent_calls)
+    locked_call = next(c for c in silent_calls if c["tag"] == "safari_bookmarks_locked")
+    assert "locked" in locked_call["exc"]
+
+
 # ── Integration ─────────────────────────────────────────────────────────
 
 def test_valid_sources_includes_safari():

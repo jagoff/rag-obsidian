@@ -251,9 +251,13 @@
     /* ── fine_tunning panel ── */
     :root {
       --badge-retrieval: #4c8eff;
+      --badge-retrieval_answer: #2563eb;
       --badge-brief: #a855f7;
       --badge-anticipate: #fb923c;
       --badge-draft: #10b981;
+      --badge-draft_wa: #059669;
+      --badge-proactive_push: #f59e0b;
+      --badge-whatsapp_msg: #25d366;
       --badge-style: #ec4899;
       --badge-tool_routing: #eab308;
       --badge-read_summary: #06b6d4;
@@ -468,13 +472,32 @@
       const subtitleEl = document.getElementById('ft-count');
 
       const STREAM_COLORS = {
-        retrieval:    'var(--badge-retrieval, #4c8eff)',
-        brief:        'var(--badge-brief, #a855f7)',
-        anticipate:   'var(--badge-anticipate, #fb923c)',
-        draft:        'var(--badge-draft, #10b981)',
-        style:        'var(--badge-style, #ec4899)',
-        tool_routing: 'var(--badge-tool_routing, #eab308)',
-        read_summary: 'var(--badge-read_summary, #06b6d4)',
+        retrieval:        'var(--badge-retrieval, #4c8eff)',
+        retrieval_answer: 'var(--badge-retrieval_answer, #2563eb)',
+        brief:            'var(--badge-brief, #a855f7)',
+        anticipate:       'var(--badge-anticipate, #fb923c)',
+        draft:            'var(--badge-draft, #10b981)',
+        draft_wa:         'var(--badge-draft_wa, #059669)',
+        proactive_push:   'var(--badge-proactive_push, #f59e0b)',
+        whatsapp_msg:     'var(--badge-whatsapp_msg, #25d366)',
+        style:            'var(--badge-style, #ec4899)',
+        tool_routing:     'var(--badge-tool_routing, #eab308)',
+        read_summary:     'var(--badge-read_summary, #06b6d4)',
+      };
+
+      /* Labels human-readable por stream (mostrados en el badge UI) */
+      const STREAM_LABELS = {
+        retrieval:        '🔍 query',
+        retrieval_answer: '💬 respuesta',
+        brief:            '📓 brief',
+        anticipate:       '🔮 push',
+        draft:            '✉️ draft',
+        draft_wa:         '💚 wa-draft',
+        proactive_push:   '📣 proactive',
+        whatsapp_msg:     '📱 wa-msg',
+        style:            '🎨 estilo',
+        tool_routing:     '🛠 tool',
+        read_summary:     '📄 read',
       };
 
       /* IDs actualmente en el DOM (para merge en auto-refresh) */
@@ -506,8 +529,9 @@
 
       function buildMeta(item) {
         const parts = [];
-        if (item.stream === 'retrieval') {
+        if (item.stream === 'retrieval' || item.stream === 'retrieval_answer') {
           if (item.top_score != null) parts.push(`score=${item.top_score.toFixed(3)}`);
+          if (item.paths && item.paths.length) parts.push(`${item.paths.length} paths`);
         } else if (item.stream === 'brief') {
           if (item.meta && item.meta.negatives != null) {
             parts.push(`${item.meta.negatives} neg, ${item.meta.mutes || 0} mute`);
@@ -515,8 +539,13 @@
         } else if (item.stream === 'anticipate') {
           if (item.meta && item.meta.kind)  parts.push(`kind=${item.meta.kind}`);
           if (item.meta && item.meta.score != null) parts.push(`score=${item.meta.score.toFixed(2)}`);
-        } else if (item.stream === 'draft') {
-          if (item.meta && item.meta.contact) parts.push(`contacto=${escapeHtml(item.meta.contact)}`);
+        } else if (item.stream === 'draft' || item.stream === 'draft_wa') {
+          if (item.meta && item.meta.contact) parts.push(`a ${item.meta.contact}`);
+          if (item.meta && item.meta.decision) parts.push(`decisión: ${item.meta.decision}`);
+        } else if (item.stream === 'proactive_push') {
+          if (item.meta && item.meta.kind) parts.push(`kind=${item.meta.kind}`);
+        } else if (item.stream === 'whatsapp_msg') {
+          if (item.meta && item.meta.sender) parts.push(`de ${item.meta.sender}`);
         }
         if (item.ts) parts.push(formatRelTime(item.ts));
         return parts.join(' · ');
@@ -533,12 +562,13 @@
         card.dataset.uid = uid;
 
         const color = STREAM_COLORS[item.stream] || '#888';
+        const badgeText = STREAM_LABELS[item.stream] || item.stream;
         const meta  = buildMeta(item);
         const label = item.label || item.item_id;
 
         card.innerHTML = `
           <div class="ft-card-header">
-            <span class="ft-badge" style="background:${color}">${escapeHtml(item.stream)}</span>
+            <span class="ft-badge" style="background:${color}">${escapeHtml(badgeText)}</span>
             <span class="ft-ts">${formatRelTime(item.ts)}</span>
           </div>
           <div class="ft-label">${escapeHtml(label)}</div>

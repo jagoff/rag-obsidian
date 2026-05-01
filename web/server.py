@@ -22867,7 +22867,16 @@ def vault_health_api() -> dict:
 
 # ── Fine-tunning panel ──────────────────────────────────────────────────
 # Endpoints del panel de labeling humano para acelerar los learning loops.
-# Los streams soportados en /api/fine_tunning/rate son:
+# Los streams soportados en /api/fine_tunning/rate son (wave-2: 11 streams):
+#   retrieval         — query con paths, label si encontró bien
+#   retrieval_answer  — query CON respuesta del modelo, label si la respuesta fue útil
+#   brief             — morning/today/digest, label si fue relevante
+#   draft / draft_wa  — drafts del bot WA a contactos
+#   anticipate        — pushes anticipatorios sin reaction
+#   proactive_push    — morning briefs / archive / etc del proactive_log
+#   whatsapp_msg      — chunks WA del corpus, label relevancia para retrieval
+#   style / tool_routing / read_summary — extensible (no populated todavía)
+# Variantes legacy del comentario original:
 #   retrieval | brief | draft | anticipate | style | tool_routing | read_summary
 # Las tablas rag_ft_panel_ratings y rag_ft_active_queue_state se crean en
 # _TELEMETRY_DDL de rag/__init__.py (ya existentes).
@@ -22901,7 +22910,8 @@ class FineTunningRateRequest(BaseModel):
     @classmethod
     def _stream_valid(cls, v: str) -> str:
         _valid = {
-            "retrieval", "brief", "draft", "anticipate",
+            "retrieval", "retrieval_answer", "brief", "draft", "draft_wa",
+            "anticipate", "proactive_push", "whatsapp_msg",
             "style", "tool_routing", "read_summary",
         }
         if v not in _valid:
@@ -23014,6 +23024,230 @@ def fine_tunning_queue(limit: int = 20) -> dict:
                     })
             except Exception as exc_a:
                 _silent_log("fine_tunning_queue_anticipate_error", str(exc_a))
+
+            # ── Retrieval ANSWER: queries con respuesta exitosa, label si fue útil ──
+            # Puntás si la RESPUESTA del modelo era buena (no solo si encontró paths).
+            # Filtra: top_score >= 0.5 (alta confianza) AND answer_len > 0 (LLM respondió)
+            # AND NOT en rag_feedback (sin thumbs explícito todavía).
+            try:
+                cur = conn.execute("""
+                    SELECT q.id, q.q, q.top_score, q.ts, q.paths_json, q.session
+                    FROM rag_queries q
+                    LEFT JOIN rag_ft_panel_ratings ftr
+                      ON ftr.stream = 'retrieval_answer'
+                      AND ftr.item_id = CAST(q.id AS TEXT)
+                    LEFT JOIN rag_ft_active_queue_state fts
+                      ON fts.stream = 'retrieval_answer'
+                      AND fts.item_id = CAST(q.id AS TEXT)
+                    WHERE q.ts >= datetime('now', '-7 days')
+                      AND q.top_score >= 0.5
+                      AND q.answer_len > 0
+                      AND length(q.q) > 4
+                      AND ftr.id IS NULL
+                      AND (fts.snoozed_until_ts IS NULL
+                           OR fts.snoozed_until_ts < datetime('now'))
+                      AND NOT EXISTS (
+                          SELECT 1 FROM rag_feedback f
+                          WHERE f.q = q.q
+                            AND ABS(julianday(f.ts) - julianday(q.ts)) < 0.5
+                      )
+                    ORDER BY q.ts DESC
+                    LIMIT 10
+                """)
+                import json as _json_ra
+                for row in cur.fetchall():
+                    qid, qtext, ts_score, ts_q, paths_json, sess = row
+                    try:
+                        paths = _json_ra.loads(paths_json) if paths_json else []
+                    except Exception:
+                        paths = []
+                    items.append({
+                        "item_id": str(qid),
+                        "stream": "retrieval_answer",
+                        "label": qtext,
+                        "top_score": ts_score,
+                        "ts": ts_q,
+                        "paths": paths if isinstance(paths, list) else [],
+                        "session_id": sess,
+                    })
+            except Exception as exc_ra:
+                _silent_log("fine_tunning_queue_retrieval_answer_error", str(exc_ra))
+
+            # ── Draft WA: drafts del bot a contactos, sin rating del panel ──
+            # Mostrar bot_draft + sent_text (cuando approved_editar) → el user
+            # puntúa si la respuesta era apropiada vs lo que terminó mandando.
+            try:
+                cur = conn.execute("""
+                    SELECT d.draft_id, d.contact_name, d.bot_draft, d.sent_text,
+                           d.decision, d.ts
+                    FROM rag_draft_decisions d
+                    LEFT JOIN rag_ft_panel_ratings ftr
+                      ON ftr.stream = 'draft_wa' AND ftr.item_id = d.draft_id
+                    LEFT JOIN rag_ft_active_queue_state fts
+                      ON fts.stream = 'draft_wa' AND fts.item_id = d.draft_id
+                    WHERE d.ts >= datetime('now', '-7 days')
+                      AND d.bot_draft IS NOT NULL
+                      AND length(d.bot_draft) > 0
+                      AND ftr.id IS NULL
+                      AND (fts.snoozed_until_ts IS NULL
+                           OR fts.snoozed_until_ts < datetime('now'))
+                    ORDER BY
+                      CASE d.decision
+                        WHEN 'approved_editar' THEN 0
+                        WHEN 'rejected' THEN 1
+                        WHEN 'expired' THEN 2
+                        WHEN 'approved_si' THEN 3
+                      END,
+                      d.ts DESC
+                    LIMIT 15
+                """)
+                for row in cur.fetchall():
+                    draft_id, contact, bot_draft, sent_text, decision, ts_d = row
+                    short = (bot_draft or "")[:80]
+                    if len(bot_draft or "") > 80:
+                        short += "…"
+                    items.append({
+                        "item_id": draft_id,
+                        "stream": "draft_wa",
+                        "label": f"→ {contact or 'desconocido'}: {short}",
+                        "ts": ts_d,
+                        "meta": {
+                            "contact": contact,
+                            "bot_draft": bot_draft,
+                            "sent_text": sent_text,
+                            "decision": decision,
+                        },
+                    })
+            except Exception as exc_dw:
+                _silent_log("fine_tunning_queue_draft_wa_error", str(exc_dw))
+
+            # ── Proactive push: morning briefs / archive / etc sin rating panel ──
+            # Schema rag_proactive_log: id, ts, kind, sent, reason, extra_json
+            try:
+                cur = conn.execute("""
+                    SELECT p.id, p.kind, p.reason, p.extra_json, p.ts
+                    FROM rag_proactive_log p
+                    LEFT JOIN rag_ft_panel_ratings ftr
+                      ON ftr.stream = 'proactive_push'
+                      AND ftr.item_id = CAST(p.id AS TEXT)
+                    LEFT JOIN rag_ft_active_queue_state fts
+                      ON fts.stream = 'proactive_push'
+                      AND fts.item_id = CAST(p.id AS TEXT)
+                    WHERE p.ts >= datetime('now', '-7 days')
+                      AND p.sent = 1
+                      AND ftr.id IS NULL
+                      AND (fts.snoozed_until_ts IS NULL
+                           OR fts.snoozed_until_ts < datetime('now'))
+                    ORDER BY p.ts DESC
+                    LIMIT 10
+                """)
+                import json as _json_pp
+                for row in cur.fetchall():
+                    pid, kind, reason, extra_json, ts_p = row
+                    label_short = (reason or kind or "(sin reason)")[:80]
+                    extra = {}
+                    if extra_json:
+                        try:
+                            extra = _json_pp.loads(extra_json) or {}
+                        except Exception:
+                            extra = {}
+                    items.append({
+                        "item_id": str(pid),
+                        "stream": "proactive_push",
+                        "label": f"[{kind}] {label_short}",
+                        "ts": ts_p,
+                        "meta": {"kind": kind, "reason": reason, **extra},
+                    })
+            except Exception as exc_pp:
+                _silent_log("fine_tunning_queue_proactive_push_error", str(exc_pp))
+
+            # ── WhatsApp messages: chunks recientes del corpus, label si son
+            #    relevantes para retrieval (signal directo al ranker WA-aware) ──
+            # Lee de ragvec.db (corpus), NO telemetry.db. Open separado read-only.
+            try:
+                from rag import DB_PATH as _DB_PATH  # noqa: PLC0415
+                import sqlite3 as _sqlite_wa  # noqa: PLC0415
+                _ragvec_db = _DB_PATH / "ragvec.db"
+                if _ragvec_db.exists():
+                    _wa_conn = _sqlite_wa.connect(
+                        f"file:{_ragvec_db}?mode=ro&immutable=1", uri=True
+                    )
+                    try:
+                        # Buscar la tabla meta del v11 collection por convención
+                        cur_w = _wa_conn.execute("""
+                            SELECT name FROM sqlite_master
+                            WHERE type='table' AND name LIKE 'meta_obsidian_notes_v11_%'
+                            LIMIT 1
+                        """)
+                        meta_row = cur_w.fetchone()
+                        if meta_row:
+                            meta_table = meta_row[0]
+                            # Sample WA chunks recientes, capped a 8 (no inflar la cola)
+                            cur_w = _wa_conn.execute(f"""
+                                SELECT id, document, meta_json, created_ts
+                                FROM {meta_table}
+                                WHERE json_extract(meta_json, '$.source') = 'whatsapp'
+                                  AND created_ts >= unixepoch('now', '-3 days')
+                                ORDER BY created_ts DESC
+                                LIMIT 8
+                            """)
+                            import json as _json_wa
+                            wa_rows = cur_w.fetchall()
+                        else:
+                            wa_rows = []
+                    finally:
+                        _wa_conn.close()
+
+                    if wa_rows:
+                        # Cross-check ratings panel en telemetry conn (la ya abierta)
+                        wa_ids = [str(r[0]) for r in wa_rows]
+                        placeholders = ",".join(["?"] * len(wa_ids))
+                        cur_excl = conn.execute(
+                            f"SELECT item_id FROM rag_ft_panel_ratings "
+                            f"WHERE stream='whatsapp_msg' AND item_id IN ({placeholders})",
+                            wa_ids,
+                        )
+                        excluded_rated = {r[0] for r in cur_excl.fetchall()}
+                        cur_excl2 = conn.execute(
+                            f"SELECT item_id FROM rag_ft_active_queue_state "
+                            f"WHERE stream='whatsapp_msg' AND item_id IN ({placeholders}) "
+                            f"AND snoozed_until_ts > datetime('now')",
+                            wa_ids,
+                        )
+                        excluded_snoozed = {r[0] for r in cur_excl2.fetchall()}
+                        excluded = excluded_rated | excluded_snoozed
+
+                        for chunk_id, doc_text, meta_json, created_ts in wa_rows:
+                            sid = str(chunk_id)
+                            if sid in excluded:
+                                continue
+                            try:
+                                meta = _json_wa.loads(meta_json) if meta_json else {}
+                            except Exception:
+                                meta = {}
+                            chat_jid = meta.get("chat_jid") or meta.get("chat") or "?"
+                            sender = meta.get("from") or meta.get("sender") or "?"
+                            short_doc = (doc_text or "")[:100].replace("\n", " ")
+                            if len(doc_text or "") > 100:
+                                short_doc += "…"
+                            # ts ISO desde epoch
+                            try:
+                                import datetime as _dt_wa  # noqa: PLC0415
+                                ts_iso = _dt_wa.datetime.fromtimestamp(
+                                    int(created_ts)
+                                ).isoformat()
+                            except Exception:
+                                ts_iso = ""
+                            items.append({
+                                "item_id": sid,
+                                "stream": "whatsapp_msg",
+                                "label": f"[{sender}] {short_doc}",
+                                "ts": ts_iso,
+                                "meta": {"chat_jid": chat_jid, "sender": sender,
+                                         "snippet": short_doc},
+                            })
+            except Exception as exc_wa:
+                _silent_log("fine_tunning_queue_whatsapp_msg_error", str(exc_wa))
 
     except Exception as exc:
         try:

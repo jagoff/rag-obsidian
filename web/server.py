@@ -23331,6 +23331,57 @@ async def fine_tunning_rate(req: FineTunningRateRequest) -> dict:
     except Exception as exc:
         _silent_log("fine_tunning_queue_state_upsert_failed", str(exc))
 
+    # ── Bridge: retrieval_answer thumbs → rag_feedback ──
+    # El ranker-vivo nightly (`rag tune --online --apply`) lee SOLO rag_feedback.
+    # Sin este bridge, los thumbs sobre respuestas del modelo en el panel quedan
+    # huérfanos del loop de aprendizaje. Idempotente (skip si ya hay row reciente
+    # para la misma query) + try/except total (NUNCA tumba el endpoint).
+    if req.stream == "retrieval_answer":
+        try:
+            import json as _json_bridge  # noqa: PLC0415
+            from rag import record_feedback  # noqa: PLC0415
+
+            with _ragvec_state_conn() as conn:
+                cur = conn.execute(
+                    "SELECT q, paths_json, ts, session FROM rag_queries "
+                    "WHERE id = ? LIMIT 1",
+                    (int(req.item_id),),
+                )
+                row = cur.fetchone()
+                if row is not None:
+                    qtext, paths_json, ts_q, session_id = row
+                    # Idempotencia: skip si ya existe row en rag_feedback con la
+                    # misma query y timestamp dentro de un día (el panel puede
+                    # mostrar la misma query múltiples veces si el user no la
+                    # rateó pero tampoco snoozeó).
+                    cur_dup = conn.execute(
+                        "SELECT 1 FROM rag_feedback "
+                        "WHERE q = ? AND ABS(julianday(ts) - julianday(?)) < 1.0 "
+                        "LIMIT 1",
+                        (qtext, ts_q),
+                    )
+                    if cur_dup.fetchone() is None:
+                        try:
+                            paths_list = _json_bridge.loads(paths_json or "[]")
+                            if not isinstance(paths_list, list):
+                                paths_list = []
+                        except Exception:
+                            paths_list = []
+                        record_feedback(
+                            turn_id=f"fine_tunning:{req.item_id}",
+                            rating=req.rating,
+                            q=qtext,
+                            paths=paths_list,
+                            reason=req.comment,
+                            scope="turn",
+                            session_id=session_id,
+                        )
+        except Exception as exc_bridge:
+            _silent_log(
+                "fine_tunning_rate_bridge_to_feedback_failed",
+                str(exc_bridge),
+            )
+
     return {"ok": True}
 
 

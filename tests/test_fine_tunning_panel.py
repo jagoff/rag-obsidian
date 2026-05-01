@@ -254,3 +254,118 @@ def test_manifest_has_fine_tunning_shortcut():
     manifest = json.loads(Path("web/static/manifest.webmanifest").read_text())
     urls = [s["url"] for s in manifest.get("shortcuts", [])]
     assert "/fine_tunning" in urls
+
+
+# ── Test 12: bridge retrieval_answer → rag_feedback (positive) ─────────────
+
+def test_rate_retrieval_answer_pos_writes_both_tables(client, seeded_conn):
+    """Cuando el user puntúa retrieval_answer +1, además de la row en
+    rag_ft_panel_ratings se debe persistir un row equivalente en rag_feedback
+    para que el ranker-vivo nightly lo levante."""
+    seeded_conn.execute(
+        "INSERT INTO rag_queries(ts, cmd, q, top_score, paths_json, session) "
+        "VALUES (datetime('now', '-2 days'), 'web.chat', "
+        "'pregunta con respuesta excelente', 0.85, "
+        "'[\"01-Projects/X.md\"]', 'web:abc')"
+    )
+    seeded_conn.commit()
+    cur = seeded_conn.execute("SELECT id FROM rag_queries ORDER BY id DESC LIMIT 1")
+    qid = cur.fetchone()[0]
+
+    body = {
+        "stream": "retrieval_answer",
+        "item_id": str(qid),
+        "rating": 1,
+        "label": "pregunta con respuesta excelente",
+        "comment": None,
+    }
+    r = client.post("/api/fine_tunning/rate", json=body)
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+
+    panel_rows = seeded_conn.execute(
+        "SELECT stream, rating FROM rag_ft_panel_ratings WHERE item_id = ?",
+        (str(qid),),
+    ).fetchall()
+    assert len(panel_rows) == 1
+    assert panel_rows[0] == ("retrieval_answer", 1)
+
+    feedback_rows = seeded_conn.execute(
+        "SELECT q, rating FROM rag_feedback WHERE q LIKE 'pregunta con respuesta%'"
+    ).fetchall()
+    assert len(feedback_rows) == 1
+    assert feedback_rows[0][1] == 1
+
+
+# ── Test 13: bridge retrieval_answer negative + comment carries reason ─────
+
+def test_rate_retrieval_answer_neg_with_comment_persists_reason(client, seeded_conn):
+    """Cuando el user puntúa retrieval_answer -1 con un comment, el comment
+    debe llegar a rag_feedback como reason para que el ranker-vivo lo lea."""
+    seeded_conn.execute(
+        "INSERT INTO rag_queries(ts, cmd, q, top_score, paths_json, session) "
+        "VALUES (datetime('now', '-1 days'), 'web.chat', "
+        "'la respuesta del modelo fue incorrecta', 0.7, '[]', 'web:xyz')"
+    )
+    seeded_conn.commit()
+    cur = seeded_conn.execute("SELECT id FROM rag_queries ORDER BY id DESC LIMIT 1")
+    qid = cur.fetchone()[0]
+
+    body = {
+        "stream": "retrieval_answer",
+        "item_id": str(qid),
+        "rating": -1,
+        "label": "la respuesta del modelo fue incorrecta",
+        "comment": "inventó datos que no están en el vault",
+    }
+    r = client.post("/api/fine_tunning/rate", json=body)
+    assert r.status_code == 200
+
+    feedback_rows = seeded_conn.execute(
+        "SELECT rating, json_extract(extra_json, '$.reason') "
+        "FROM rag_feedback WHERE q LIKE 'la respuesta del modelo%'"
+    ).fetchall()
+    assert len(feedback_rows) == 1
+    rating, reason = feedback_rows[0]
+    assert rating == -1
+    assert "inventó datos" in (reason or "")
+
+
+# ── Test 14: otros streams NO tocan rag_feedback ───────────────────────────
+
+def test_rate_other_streams_does_not_touch_rag_feedback(client, seeded_conn):
+    """Solo retrieval_answer hace bridge. Otros streams (brief / draft_wa /
+    anticipate / proactive_push) deben escribir SOLO a rag_ft_panel_ratings,
+    nunca a rag_feedback."""
+    initial_count = seeded_conn.execute(
+        "SELECT COUNT(*) FROM rag_feedback"
+    ).fetchone()[0]
+
+    for stream, item_id in [
+        ("brief", "04-Archive/.../2026-04-29-morning.md"),
+        ("draft_wa", "draft-abc123"),
+        ("anticipate", "cal:event-uuid-1"),
+        ("proactive_push", "42"),
+    ]:
+        body = {
+            "stream": stream,
+            "item_id": item_id,
+            "rating": -1,
+            "label": f"{stream} item",
+            "comment": "no debería llegar a rag_feedback",
+        }
+        r = client.post("/api/fine_tunning/rate", json=body)
+        assert r.status_code == 200, f"{stream} rate failed: {r.text}"
+
+    final_count = seeded_conn.execute(
+        "SELECT COUNT(*) FROM rag_feedback"
+    ).fetchone()[0]
+    assert final_count == initial_count, (
+        f"rag_feedback count cambió de {initial_count} a {final_count} — "
+        f"streams != retrieval_answer NO deberían tocar rag_feedback"
+    )
+
+    panel_count = seeded_conn.execute(
+        "SELECT COUNT(*) FROM rag_ft_panel_ratings WHERE stream != 'retrieval_answer'"
+    ).fetchone()[0]
+    assert panel_count == 4, "Las 4 rates deberían estar en rag_ft_panel_ratings"

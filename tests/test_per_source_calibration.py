@@ -376,5 +376,10 @@ def test_calibration_plist_valid_xml_and_schedule():
     assert "<integer>4</integer>" in content  # Hour=4
     assert "<integer>30</integer>" in content  # Minute=30
     assert "calibrate" in content
-    # Trainer runs with calibration OFF on its own reads.
-    assert "<key>RAG_SCORE_CALIBRATION</key><string>0</string>" in content
+    # 2026-04-30: rolleado de "0" → "1" — el daemon entrenaba pero
+    # `calibrate_score()` bailea con el flag apagado, así que el
+    # isotonic que producía nunca se aplicaba a queries nuevas. Con
+    # "1" el flag se respeta y las nuevas queries del web/serve plists
+    # usan los scores calibrados. Detalle en `_calibration_plist`
+    # docstring.
+    assert "<key>RAG_SCORE_CALIBRATION</key><string>1</string>" in content

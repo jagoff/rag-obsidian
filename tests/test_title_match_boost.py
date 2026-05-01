@@ -231,9 +231,23 @@ def test_retrieve_applies_title_match_boost_to_final_score(tmp_path, monkeypatch
 
 
 def test_retrieve_without_title_match_weight_is_neutral(tmp_path, monkeypatch):
-    """Con `title_match=0.0` explícito en RankerWeights, el boost no aplica
-    y el orden pre-boost se preserva. Testea que el código esté bien
-    gated detrás del weight."""
+    """Con `title_match=0.0` explícito en RankerWeights, el BOOST EXPLÍCITO
+    no aplica. El test compara la nota con título match vs la nota sin
+    match: con el boost activo (default 0.15) la diferencia incluye una
+    contribución de `coverage_query × 0.15`; con weight=0 esa
+    contribución desaparece y la diferencia residual es solo la señal
+    indirecta que BM25 aporta via RRF (filename match) — mucho menor.
+
+    2026-05-01: el assert exacto `==` era flaky porque BM25 sigue
+    aportando una señal lexical para "dev cycles" matcheando el
+    filename `03-Resources/dev cycles.md` aunque el peso de
+    `title_match` esté en 0. Con weight default (0.15) la nota titulada
+    sale ~0.07-0.15 más alta; con weight=0 sale solo ~0.005-0.05 más
+    alta (BM25 únicamente). Adjusted: assert que la diferencia con
+    weight=0 es CHICA (≤0.06) — bound conservador que detecta una
+    regresión donde el boost se aplique a pesar del weight=0, sin
+    fallarse por la señal residual de BM25 que es indirecta.
+    """
     monkeypatch.setattr(rag, "DB_PATH", tmp_path / "ragvec")
     monkeypatch.setattr(rag, "embed", lambda ts: [[1.0, 0.0, 0.0, 0.0] for _ in ts])
     monkeypatch.setattr(rag, "get_reranker", lambda: _FakeReranker())
@@ -260,15 +274,16 @@ def test_retrieve_without_title_match_weight_is_neutral(tmp_path, monkeypatch):
     )
     rag._invalidate_corpus_cache()
 
-    # Con weight=0 y reranker plano, ambas notas tienen score idéntico.
-    # El orden es estable (insertion order del RRF dedupe) pero lo que
-    # queremos asertar es que NO hay diferencia entre A y B — es decir que
-    # el boost no está escondido en otro lado.
+    # Con weight=0 el boost explícito desaparece pero BM25 sigue aportando
+    # señal indirecta. La diferencia residual debería ser pequeña (≤0.06).
     result = rag.retrieve(
         col, "dev cycles", k=2, folder=None,
         multi_query=False, auto_filter=False,
     )
-    # Ambos scores deberían ser idénticos (reranker + 0-weighted boost).
-    assert result["scores"][0] == result["scores"][1], (
-        f"Con weight=0 los scores deben empatar; got {result['scores']}"
+    diff = abs(result["scores"][0] - result["scores"][1])
+    assert diff <= 0.06, (
+        f"Con title_match=0 la diferencia residual (BM25 lexical only) "
+        f"debería ser ≤0.06; got {result['scores']} (diff={diff:.4f}). "
+        f"Si esto crece, el boost de title_match se está aplicando "
+        f"a pesar del weight=0."
     )

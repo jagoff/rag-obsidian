@@ -49259,11 +49259,16 @@ def _calibration_plist(rag_bin: str) -> str:
     of feedback for training isotonic per source; re-runs are cheap
     (<1s typical) because everything's in-process.
 
-    Runs with RAG_SCORE_CALIBRATION=0 so the trainer itself doesn't use
-    calibrated scores on its own telemetry reads — training is a flat
-    raw-score pipeline. Operators opt-in at query-time by setting
-    RAG_SCORE_CALIBRATION=1 on the web+serve plists once they've
-    validated the gate.
+    `RAG_SCORE_CALIBRATION=1` (rolleado 2026-04-30): el daemon corría
+    con `=0` heredado de la fase de validación, pero `calibrate_score()`
+    bailea con el flag apagado y entonces el entrenamiento generaba un
+    isotonic que nunca se aplicaba (telemetría 30d: 0 calibrated_score
+    rows en `rag_queries.extra_json` aunque el job corría todas las
+    noches). Con `=1` el `calibrate` command lee feedback real (que ya
+    pasa por raw-score retrieval) y entrena el isotonic; la lectura
+    misma del telemetry es en raw porque ya quedó persistida sin
+    calibrar — el flag solo afecta NUEVAS queries del web/serve plists.
+    Detalle del rollout en commit `4f7e41f`.
     """
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -49285,7 +49290,6 @@ def _calibration_plist(rag_bin: str) -> str:
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
     <key>RAG_STATE_SQL</key><string>1</string>
-    # 2026-04-30: enabled — daemon entrenaba pero calibrate_score() bailea con RAG_SCORE_CALIBRATION=0
     <key>RAG_SCORE_CALIBRATION</key><string>1</string>
   </dict>
   <key>StartCalendarInterval</key>
@@ -57876,25 +57880,54 @@ def _behavior_backfill_find_match(
     # ix_rag_queries_session_ts. Antes el WHERE envolvía ts en
     # ABS(strftime(...)) que es función → full scan obligado. Sólo el
     # ORDER BY mantiene función — afecta sort de resultset chico, no scan.
+    #
+    # 2026-05-01: el ts_lo/ts_hi calculados con SQLite `datetime(?, '-Ns')`
+    # rompían la comparación cuando el ts almacenado tenía suffix `+00:00`
+    # (formato de `datetime.now(timezone.utc).isoformat()`). SQLite
+    # `datetime()` strippea el tz y devuelve `'2026-05-01 17:20:00'` —
+    # comparación con el raw `'2026-05-01T17:30:00+00:00'` falla porque
+    # 'T' (0x54) > ' ' (0x20) en TEXT comparison y el upper bound siempre
+    # excluye todo. Fix: computar ts_lo/ts_hi en Python para que tengan
+    # el mismo formato exacto que la columna ts (incluyendo tz suffix).
+    # El índice por ts sigue funcionando porque la comparación es
+    # column-vs-bound-param (sin function-on-column).
     window_seconds = int(window_minutes) * 60
+    ts_lo: str | None = None
+    ts_hi: str | None = None
+    try:
+        # Acepta `Z` (UTC zulu) y `+00:00` indistintamente.
+        _orphan_dt = datetime.fromisoformat(orphan_ts.replace("Z", "+00:00"))
+        ts_lo = (_orphan_dt - timedelta(seconds=window_seconds)).isoformat()
+        ts_hi = (_orphan_dt + timedelta(seconds=window_seconds)).isoformat()
+    except (ValueError, AttributeError):
+        # Si el orphan_ts no es ISO-8601 parseable, dejamos que las queries
+        # sigan adelante con bounds que no filtren nada — el ORDER BY +
+        # LIMIT 1 igual funciona, solo perdemos la optimización del
+        # índice. Caso extremadamente raro en prod (los ts siempre vienen
+        # del mismo writer Python), pero no rompemos por defensiva.
+        ts_lo = None
+        ts_hi = None
+
     try:
         with _ragvec_state_conn() as conn:
-            ts_lo = (
-                f"datetime(?, '-{window_seconds} seconds')"
-            )
-            ts_hi = (
-                f"datetime(?, '+{window_seconds} seconds')"
-            )
+            # Helper: build WHERE fragment + extra bound params para los
+            # range bounds. Si ts_lo/ts_hi son None (parsing failed),
+            # devolvemos sin filtro.
+            if ts_lo is not None and ts_hi is not None:
+                _range_where = " AND ts >= ? AND ts <= ?"
+                _range_params: tuple = (ts_lo, ts_hi)
+            else:
+                _range_where = ""
+                _range_params = ()
+
             # Policy 1: same-session
             if orphan_session:
                 row = conn.execute(
                     f"SELECT id, ts, q, session FROM rag_queries"
-                    f" WHERE session = ?"
-                    f" AND ts >= {ts_lo}"
-                    f" AND ts <= {ts_hi}"
+                    f" WHERE session = ?{_range_where}"
                     f" ORDER BY ABS(strftime('%s', ts) - strftime('%s', ?)) ASC"
                     f" LIMIT 1",
-                    (orphan_session, orphan_ts, orphan_ts, orphan_ts),
+                    (orphan_session, *_range_params, orphan_ts),
                 ).fetchone()
                 if row:
                     return {
@@ -57912,10 +57945,9 @@ def _behavior_backfill_find_match(
             if orphan_path:
                 rows = conn.execute(
                     f"SELECT id, ts, q, session, paths_json FROM rag_queries"
-                    f" WHERE ts >= {ts_lo}"
-                    f" AND ts <= {ts_hi}"
+                    f" WHERE 1=1{_range_where}"
                     f" ORDER BY ABS(strftime('%s', ts) - strftime('%s', ?)) ASC",
-                    (orphan_ts, orphan_ts, orphan_ts),
+                    (*_range_params, orphan_ts),
                 ).fetchall()
                 for r in rows:
                     paths_raw = r[4] or ""
@@ -57932,11 +57964,10 @@ def _behavior_backfill_find_match(
             # Policy 3: any session within window, closest by time.
             row = conn.execute(
                 f"SELECT id, ts, q, session FROM rag_queries"
-                f" WHERE ts >= {ts_lo}"
-                f" AND ts <= {ts_hi}"
+                f" WHERE 1=1{_range_where}"
                 f" ORDER BY ABS(strftime('%s', ts) - strftime('%s', ?)) ASC"
                 f" LIMIT 1",
-                (orphan_ts, orphan_ts, orphan_ts),
+                (*_range_params, orphan_ts),
             ).fetchone()
             if row:
                 return {

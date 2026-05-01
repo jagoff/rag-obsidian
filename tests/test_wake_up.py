@@ -293,11 +293,19 @@ def test_wake_up_plist_runs_at_0400_daily():
 
 
 def test_wake_up_plist_has_ollama_keep_alive_env():
-    """OLLAMA_KEEP_ALIVE=-1 es crítico para que el warmup persista
-    entre el wake-up y el primer chat del user."""
+    """OLLAMA_KEEP_ALIVE=20m mantiene el chat model warm entre el
+    wake-up y el primer chat del user.
+
+    Nota 2026-04-30: rolleamos `-1 → 20m` (commit `4f7e41f`). Con `-1`
+    + `OLLAMA_MAX_LOADED_MODELS=3` los 3 modelos pinned forever
+    saturaban unified memory de 36 GB → MPS swappeaba → tokens/s
+    caían 10×. Con `20m` el secundario se descarga si idle, el
+    principal (qwen2.5:7b chat) se mantiene warm porque siempre se
+    usa. Mejora 4-10× end-to-end.
+    """
     d = _parse(rag_module._wake_up_plist(RAG_BIN))
     env = d["EnvironmentVariables"]
-    assert env.get("OLLAMA_KEEP_ALIVE") == "-1"
+    assert env.get("OLLAMA_KEEP_ALIVE") == "20m"
 
 
 def test_wake_up_plist_logs_to_rag_log_dir():

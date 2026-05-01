@@ -47,10 +47,23 @@ def test_serve_chat_system_redirects_factual_to_search():
 
 def test_serve_chat_system_preserves_meta_chat():
     # Greetings and meta questions ("qué podés hacer") should remain
-    # answerable — otherwise the bot becomes user-hostile for "hola".
+    # answerable — otherwise the bot becomes user-hostile para "hola".
+    #
+    # 2026-04-27: el prompt se reescribió para imitar el TONO de Fer
+    # (rioplatense casual) — se sacó la mención explícita a `/help`
+    # porque esa frase pertenece al registro corporate-chatbot que
+    # explícitamente prohibimos en REGLA 4 ("¿en qué te puedo ayudar?").
+    # En su lugar el prompt enumera saludos como "hola", "gracias", "che",
+    # "dale" — el bot responde con esos atómicos en vez de redirigir
+    # genéricamente a /help. Ver `serve_meta.v1.md` REGLA 1 + ejemplos.
     p = rag._SERVE_CHAT_SYSTEM.lower()
-    assert "hola" in p or "gracias" in p
-    assert "/help" in p
+    # El prompt debe enumerar al menos uno de los saludos comunes para
+    # que el bot reconozca que SÍ contesta "hola" / "gracias" en vez de
+    # redirigir a `/search` (que es el path de queries factuales).
+    assert any(greet in p for greet in ("hola", "gracias", "che", "dale", "qué onda")), (
+        "el prompt debe enumerar al menos un saludo común para que "
+        "meta-chat NO se redirija a /search"
+    )
 
 
 def test_serve_chat_system_lists_factual_question_shapes():

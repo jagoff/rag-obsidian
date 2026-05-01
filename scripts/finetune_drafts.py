@@ -466,19 +466,23 @@ def train_lora(
     print(
         f"  Loading {DRAFTS_BASE_MODEL} (transformers={transformers.__version__}) "
         f"on device={device} …",
-        file=sys.stderr,
+        file=sys.stderr, flush=True,
     )
 
+    t_load = time.time()
     tokenizer = AutoTokenizer.from_pretrained(DRAFTS_BASE_MODEL)
     if tokenizer.pad_token is None:
         # Qwen no setea pad_token por default — usamos eos para el
         # padding del collator. Standard recipe.
         tokenizer.pad_token = tokenizer.eos_token
+    print(f"  [{time.time()-t_load:.1f}s] tokenizer loaded", file=sys.stderr, flush=True)
 
+    t_load = time.time()
     base_model = AutoModelForCausalLM.from_pretrained(
         DRAFTS_BASE_MODEL,
         torch_dtype="auto",
     )
+    print(f"  [{time.time()-t_load:.1f}s] base model loaded", file=sys.stderr, flush=True)
 
     lora_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
@@ -508,6 +512,10 @@ def train_lora(
         )
         return enc
 
+    t_tok = time.time()
+    print(f"  Tokenizing {len(train_examples)} train + "
+          f"{len(val_examples) if val_examples else 0} val examples …",
+          file=sys.stderr, flush=True)
     train_ds = Dataset.from_list([
         {"prompt": ex["prompt"], "target": ex["target"]} for ex in train_examples
     ]).map(_tok_fn, batched=True, remove_columns=["prompt", "target"])
@@ -515,6 +523,8 @@ def train_lora(
         {"prompt": ex["prompt"], "target": ex["target"]} for ex in val_examples
     ]).map(_tok_fn, batched=True, remove_columns=["prompt", "target"])
               if val_examples else None)
+    print(f"  [{time.time()-t_tok:.1f}s] datasets tokenized",
+          file=sys.stderr, flush=True)
 
     collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer, mlm=False,
@@ -528,20 +538,55 @@ def train_lora(
         per_device_eval_batch_size=batch_size,
         save_strategy="no",
         eval_strategy="no",
-        logging_steps=10,
+        logging_steps=1,
         seed=42,
         fp16=False,
         bf16=False,
         report_to=[],
         use_cpu=(device == "cpu"),
+        disable_tqdm=True,
     )
+
+    # transformers 5.x: el kwarg `tokenizer=` fue removido (deprecated en
+    # 4.46 → removed en 5.0). Reemplazado por `processing_class=`. Compat:
+    # detectar versión y usar el kwarg correcto.
+    _tx_major = int(transformers.__version__.split(".")[0])
+    _tokenizer_kw = (
+        {"processing_class": tokenizer}
+        if _tx_major >= 5
+        else {"tokenizer": tokenizer}
+    )
+
+    # Callback de progreso con flush — el logger default de transformers
+    # bufferea hasta el final del train, dejándonos a ciegas durante runs
+    # largos. Esto printea cada step.
+    from transformers import TrainerCallback
+    class FlushCallback(TrainerCallback):
+        def __init__(self):
+            self._t0 = time.time()
+        def on_step_end(self, args, state, control, **kwargs):
+            elapsed = time.time() - self._t0
+            print(
+                f"    step {state.global_step}/{state.max_steps} "
+                f"({elapsed:.0f}s elapsed, {elapsed/max(state.global_step,1):.1f}s/step)",
+                file=sys.stderr, flush=True,
+            )
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if logs and "loss" in logs:
+                print(f"    loss={logs['loss']:.3f} lr={logs.get('learning_rate', 0):.2e} "
+                      f"epoch={logs.get('epoch', 0):.2f}",
+                      file=sys.stderr, flush=True)
 
     trainer = Trainer(
         model=model, args=args,
         train_dataset=train_ds, eval_dataset=val_ds,
-        data_collator=collator, tokenizer=tokenizer,
+        data_collator=collator, **_tokenizer_kw,
+        callbacks=[FlushCallback()],
     )
+    print(f"  Training start (epochs={epochs}, batch={batch_size}, "
+          f"train_n={len(train_examples)})", file=sys.stderr, flush=True)
     trainer.train()
+    print("  Training done. Saving adapter …", file=sys.stderr, flush=True)
     model.save_pretrained(str(out_dir))
     try:
         tokenizer.save_pretrained(str(out_dir))
@@ -650,6 +695,9 @@ def main() -> None:
                          "Default: incluir (signal real igual).")
     ap.add_argument("--dry-run", action="store_true",
                     help="Build pairs + report stats; NO entrena.")
+    ap.add_argument("--max-train-samples", type=int, default=None,
+                    help="Cap del training set después del split (debug/perf). "
+                         "Default: usar todo.")
     args = ap.parse_args()
 
     print("== fine-tune drafts WhatsApp (LoRA) ==", file=sys.stderr)
@@ -685,7 +733,16 @@ def main() -> None:
 
     train_examples, val_examples = split_train_val(examples, val_frac=VAL_FRAC)
     print(f"\n  Split: train={len(train_examples)} val={len(val_examples)}",
-          file=sys.stderr)
+          file=sys.stderr, flush=True)
+    if args.max_train_samples and len(train_examples) > args.max_train_samples:
+        rng_cap = random.Random(42)
+        rng_cap.shuffle(train_examples)
+        train_examples = train_examples[:args.max_train_samples]
+        val_cap = max(20, args.max_train_samples // 10)
+        if len(val_examples) > val_cap:
+            val_examples = val_examples[:val_cap]
+        print(f"  CAPPED via --max-train-samples: train={len(train_examples)} "
+              f"val={len(val_examples)}", file=sys.stderr, flush=True)
 
     DRAFTS_FT_ADAPTER_DIR.mkdir(parents=True, exist_ok=True)
     print(f"  Training → {DRAFTS_FT_ADAPTER_DIR}", file=sys.stderr)

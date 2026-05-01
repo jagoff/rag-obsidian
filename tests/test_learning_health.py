@@ -191,18 +191,35 @@ class TestHealthServices:
             f"PID asignado debe ganar al status anterior; got {s}"
 
     def test_secondary_crashed_is_yellow(self, lq, monkeypatch):
-        """Un secundario sin PID con last-exit != 0 (y != -15) → red, pero
-        nada crítico → la salud overall depende de las otras señales. Acá
-        verificamos que la señal individual mete `crashed` en el value_text."""
+        """Un secundario sin PID con last-exit != 0 (y != -15) → yellow
+        (cuando son 1-2; ≥3 escala a red — ver test_secondary_3_crashed_is_red).
+        Refinado 2026-05-01 para coincidir con el docstring original que
+        siempre dijo "1 secundario caído → yellow", aunque la implementación
+        anterior lo marcaba red."""
         self._stub_launchctl(monkeypatch,
             "12345\t0\tcom.fer.obsidian-rag-web\n"
             "12346\t0\tcom.fer.obsidian-rag-watch\n"
-            "12347\t0\tcom.fer.obsidian-rag-serve\n"
             "-\t1\tcom.fer.obsidian-rag-digest\n"  # secundario crashed
         )
         s = lq._health_services()
-        assert s["level"] == "red"
+        assert s["level"] == "yellow", f"1 secundario caído → yellow; got {s}"
         assert "digest" in s["value_text"]
+
+    def test_secondary_3_crashed_is_red(self, lq, monkeypatch):
+        """≥3 secundarios con last-exit != 0 → red (sistémico).
+        Threshold conservador: si caen 3+ jobs distintos en sus últimas
+        corridas hay algo sistémico (Ollama colgado, disco lleno, etc.)."""
+        self._stub_launchctl(monkeypatch,
+            "12345\t0\tcom.fer.obsidian-rag-web\n"
+            "12346\t0\tcom.fer.obsidian-rag-watch\n"
+            "-\t1\tcom.fer.obsidian-rag-digest\n"
+            "-\t1\tcom.fer.obsidian-rag-emergent\n"
+            "-\t1\tcom.fer.obsidian-rag-ingest-safari\n"
+        )
+        s = lq._health_services()
+        assert s["level"] == "red", \
+            f"3+ secundarios caídos → red (sistémico); got {s}"
+        assert s["value_raw"] == 3
 
     def test_launchctl_unavailable_yellow(self, lq, monkeypatch):
         """No-macOS environment: launchctl falla → yellow, no red.
@@ -233,5 +250,15 @@ class TestHealthThresholds:
 
     def test_critical_services_set(self, lq):
         # No queremos que la lista crítica se accidentalmente vacíe.
+        # Tras la deprecación de `serve` en commit 1326d85 (2026-05-01),
+        # el set crítico bajó a 2: `web` (cubre /api/query post-merge) +
+        # `watch` (file watcher). Si bajara a 1 o 0, algo se rompió.
         assert "com.fer.obsidian-rag-web" in lq._HEALTH_CRITICAL_SERVICES
-        assert len(lq._HEALTH_CRITICAL_SERVICES) >= 3
+        assert "com.fer.obsidian-rag-serve" not in lq._HEALTH_CRITICAL_SERVICES
+        assert len(lq._HEALTH_CRITICAL_SERVICES) >= 2
+
+    def test_secondary_red_threshold_sane(self, lq):
+        # 3 = "varios jobs cayeron a la vez = sistémico". Si fuera 1
+        # estaríamos como antes (red por un cron-job aislado, ruidoso).
+        # Si fuera ≥10 nunca dispararía (=> alarma muerta).
+        assert 2 <= lq._HEALTH_SECONDARY_RED_THRESHOLD <= 5

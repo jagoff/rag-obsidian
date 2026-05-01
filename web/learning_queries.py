@@ -1946,11 +1946,22 @@ _HEALTH_SPEED_MIN_SAMPLES = 20           # n<20 → "sin suficientes datos" (yel
 
 # Servicios "críticos" — si UNO de estos está caído, level=red. Servicios
 # secundarios (digest, archive, etc.) son tolerables → max amarillo.
+#
+# Nota 2026-05-01: `com.fer.obsidian-rag-serve` se sacó de la lista cuando
+# el plist se deprecó en commit 1326d85 (split-brain con FastAPI :8765).
+# El hot-path de query ahora vive en `com.fer.obsidian-rag-web` (FastAPI),
+# así que `web` ya cubre el rol crítico de "puede responder consultas".
 _HEALTH_CRITICAL_SERVICES = {
-    "com.fer.obsidian-rag-web",     # web UI + chat SSE
+    "com.fer.obsidian-rag-web",     # web UI + chat SSE + /api/query (post-deprecación de serve)
     "com.fer.obsidian-rag-watch",   # vault file watcher
-    "com.fer.obsidian-rag-serve",   # query server hot path
 }
+
+# Cuántos secundarios con last_exit != 0 hacen falta para escalar a red.
+# 1-2 = ruido transitorio (Ollama saturado, lock contention en `rag index`),
+# 3+ = sistémico (Ollama colgado, disco lleno, config inválida). Este
+# threshold es la diferencia entre "el cron tuvo un mal día" y "algo
+# realmente roto" — el docstring de _health_services lo explica más.
+_HEALTH_SECONDARY_RED_THRESHOLD = 3
 
 
 def _level_worst(levels: list[str]) -> str:
@@ -2047,10 +2058,19 @@ def _health_services() -> dict:
     tengan PID asignado (≠ "-"). Servicios programados (no-keepalive) que
     están en exit 0 sin PID se consideran OK — son cron-style.
 
-    Tolerancia:
-      - Todos críticos arriba → green.
-      - 1 secundario caído (no en la lista crítica) → yellow.
-      - ≥1 crítico caído O ≥1 con last_exit != 0 → red.
+    Tolerancia (refinada 2026-05-01 para que coincida con el docstring
+    original — la implementación previa era más estricta de lo descripto
+    y disparaba red ante un único cron-job que falló su última tick):
+
+      - Todos críticos arriba + 0 secundarios con last_exit != 0 → green.
+      - ≥1 crítico caído (sin PID o no instalado) → red.
+      - 1-2 secundarios con last_exit != 0 (y != -15 SIGTERM) → yellow.
+        Razón: los secundarios son cron-style; un fallo aislado suele
+        ser ruido transitorio (Ollama momentáneamente saturado, lock
+        contention en `rag index`, etc.) que se cura en la próxima tick.
+      - ≥3 secundarios con last_exit != 0 → red. Threshold conservador:
+        si caen 3+ jobs distintos en sus últimas corridas hay algo
+        sistémico (Ollama colgado, disco lleno, etc.).
     """
     import subprocess
     try:
@@ -2115,7 +2135,8 @@ def _health_services() -> dict:
         if crit not in seen_labels:
             critical_down.append(crit.replace("com.fer.obsidian-rag-", "") + " (no instalado)")
 
-    if critical_down or nonzero_exit:
+    # Críticos caídos = red sin importar nada más.
+    if critical_down:
         items_red = critical_down + [f"{s} (crasheó)" for s in nonzero_exit]
         return _signal(
             key="services",
@@ -2126,6 +2147,46 @@ def _health_services() -> dict:
             tooltip="critical down: " + ",".join(critical_down) +
                     " | nonzero exit: " + ",".join(nonzero_exit),
             explanation="Si la búsqueda no responde, lo más probable es esto.",
+        )
+    # 3+ secundarios con last_exit != 0 = red (sistémico).
+    if len(nonzero_exit) >= _HEALTH_SECONDARY_RED_THRESHOLD:
+        return _signal(
+            key="services",
+            label="Servicios del sistema",
+            level="red",
+            value_text=(
+                f"{len(nonzero_exit)} jobs fallaron su última corrida: "
+                + ", ".join(nonzero_exit[:3])
+            ),
+            value_raw=len(nonzero_exit),
+            tooltip="nonzero exit: " + ",".join(nonzero_exit),
+            explanation=(
+                "Cuando varios jobs caen a la vez suele ser Ollama colgado, "
+                "disco lleno o config inválida."
+            ),
+        )
+    # 1-2 secundarios con last_exit != 0 = yellow (ruido transitorio).
+    if nonzero_exit:
+        if len(nonzero_exit) == 1:
+            value_text = (
+                f"1 job falló su última corrida: {nonzero_exit[0]}"
+            )
+        else:
+            value_text = (
+                f"{len(nonzero_exit)} jobs fallaron su última corrida: "
+                + ", ".join(nonzero_exit)
+            )
+        return _signal(
+            key="services",
+            label="Servicios del sistema",
+            level="yellow",
+            value_text=value_text,
+            value_raw=len(nonzero_exit),
+            tooltip="nonzero exit: " + ",".join(nonzero_exit),
+            explanation=(
+                "Servicios secundarios cron-style. Suele curarse en la próxima "
+                "tick — si el contador no baja en 24h, mirar el .error.log."
+            ),
         )
     return _signal(
         key="services",

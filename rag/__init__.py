@@ -24595,19 +24595,25 @@ def emergent(days: int, min_size: int, threshold: float, dry_run: bool, push: bo
         console.print(f"[yellow]no pusheado: {reason or 'razón desconocida'}[/yellow]")
 
 
-@cli.command()
+@cli.command("feedback-patterns")
 @click.option("--last", default=30, show_default=True,
               help="Últimos N feedback events a analizar")
 @click.option("--min-share", default=0.40, show_default=True,
               help="Share mínimo (0-1) de una razón para reportar")
 @click.option("--dry-run", is_flag=True, help="Solo imprimir")
 @click.option("--push", is_flag=True, help="Forzar push")
-def patterns(last: int, min_share: float, dry_run: bool, push: bool):
+def feedback_patterns(last: int, min_share: float, dry_run: bool, push: bool):
     """Alerta cuando una razón de feedback domina.
 
     Mira los últimos N feedback events negativos con `reason` presente. Si
     una razón específica supera --min-share de ellos, pingea WA con
     sugerencia de acción.
+
+    Nota 2026-05-01: este comando se llamaba `patterns` hasta el commit
+    887ece3, donde se introdujo `cli.group("patterns")` para detección
+    cross-source (Pearson). El grupo shadowea al `cli.command("patterns")`
+    así que renombramos este a `feedback-patterns` para evitar la colisión
+    y que el plist `_patterns_plist` deje de exitear con código 2.
     """
     # Post-T10: rag_feedback SQL is the only source. `reason` lives in
     # extra_json (not a first-class column), so json_extract pulls it.
@@ -49307,7 +49313,14 @@ def _emergent_plist(rag_bin: str) -> str:
 
 
 def _patterns_plist(rag_bin: str) -> str:
-    """Proactive #4 — feedback pattern alert, domingo 20:00."""
+    """Proactive #4 — feedback pattern alert, domingo 20:00.
+
+    Nota 2026-05-01: invoca `rag feedback-patterns` (no `rag patterns`)
+    porque el comando original `patterns` quedó shadowed por el grupo
+    Click `patterns` agregado en commit 887ece3 (cross-source Pearson).
+    Antes del rename, este plist exiteaba con código 2 (Click muestra
+    el help del grupo).
+    """
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -49316,7 +49329,7 @@ def _patterns_plist(rag_bin: str) -> str:
   <key>ProgramArguments</key>
   <array>
     <string>{rag_bin}</string>
-    <string>patterns</string>
+    <string>feedback-patterns</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>

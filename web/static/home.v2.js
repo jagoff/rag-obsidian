@@ -1932,6 +1932,88 @@
     self_report: "self-report manual",
   };
 
+  // Helper: enriched sparkline para mood. Reusa renderSparkline pero
+  // agrega:
+  //   - <title> en cada dot con date + score (tooltip nativo del browser)
+  //   - placeholder visual cuando hay <3 puntos válidos (chart vacío
+  //     se ve roto si hay solo 1 dato)
+  //   - linea horizontal en y=0 (zero baseline) cuando hay >=3 puntos
+  function renderMoodSparkline(values, dates) {
+    const validCount = (values || []).filter(v => v != null).length;
+    if (validCount === 0) {
+      return `<div class="mood-spark-placeholder">acumulando data…</div>`;
+    }
+    if (validCount < 3) {
+      // 1-2 puntos: mostrar valor numérico en lugar de chart casi vacío.
+      const lastIdx = values.length - 1 - [...values].reverse().findIndex(v => v != null);
+      const last = values[lastIdx];
+      const sign = last > 0 ? "+" : "";
+      return `<div class="mood-spark-placeholder">
+        acumulando data… (${validCount} día${validCount > 1 ? "s" : ""},
+        último <span class="${moodScoreClass(last)}">${sign}${last.toFixed(2)}</span>)
+      </div>`;
+    }
+    // ≥ 3 puntos: renderSparkline normal + zero-line + tooltips.
+    const W = 160;
+    const H = 28;
+    const padY = 2;
+    // Inline el SVG para inyectar <title> en cada dot + zero-baseline.
+    const padX = 2;
+    const innerW = W - 2 * padX;
+    const innerH = H - 2 * padY;
+    const ymin = -1, ymax = 1;
+    const N = values.length;
+    const xFor = i => padX + (i / Math.max(1, N - 1)) * innerW;
+    const yFor = v => {
+      const t = Math.max(0, Math.min(1, (v - ymin) / (ymax - ymin)));
+      return padY + (1 - t) * innerH;
+    };
+    // Path skipping nulls.
+    const segs = [];
+    let started = false;
+    values.forEach((v, i) => {
+      if (v == null) { started = false; return; }
+      const cmd = started ? "L" : "M";
+      segs.push(`${cmd}${xFor(i).toFixed(1)},${yFor(v).toFixed(1)}`);
+      started = true;
+    });
+    const pathD = segs.join(" ");
+    // Last non-null index for "current" dot styling.
+    let lastIdx = -1;
+    for (let i = N - 1; i >= 0; i--) {
+      if (values[i] != null) { lastIdx = i; break; }
+    }
+    // Dots con <title> tooltip.
+    const dots = values.map((v, i) => {
+      if (v == null) return "";
+      const cls = i === lastIdx ? "spark-dot last" : "spark-dot";
+      const sign = v > 0 ? "+" : "";
+      const dateStr = (dates && dates[i]) || "";
+      return `<circle class="${cls}" cx="${xFor(i).toFixed(1)}" cy="${yFor(v).toFixed(1)}" r="1.5">
+        <title>${escapeHTML(dateStr)}: ${sign}${v.toFixed(2)}</title>
+      </circle>`;
+    }).join("");
+    // Zero baseline horizontal.
+    const yZero = yFor(0);
+    return `<svg class="spark-svg mood-spark-svg" viewBox="0 0 ${W} ${H}"
+      preserveAspectRatio="none" role="img"
+      aria-label="evolución del score 14 días">
+      <line class="spark-zero" x1="${padX}" y1="${yZero.toFixed(1)}"
+            x2="${(W - padX).toFixed(1)}" y2="${yZero.toFixed(1)}"></line>
+      <path class="spark-line" d="${pathD}"></path>
+      ${dots}
+    </svg>`;
+  }
+
+  // Map del label de self-report al score que va a la DB.
+  // Coherente con MOOD_OPTIONS del sleep widget.
+  const MOOD_SELF_REPORT_OPTIONS = [
+    { key: "good", emoji: "😀", label: "bien" },
+    { key: "meh", emoji: "😐", label: "normal" },
+    { key: "bad", emoji: "😞", label: "mal" },
+    { key: "sad", emoji: "😔", label: "triste" },
+  ];
+
   function renderMood(payload) {
     const m = payload.signals?.mood;
     const panel = document.getElementById("p-mood");
@@ -1948,15 +2030,13 @@
     const scoreText = `${sign}${m.score.toFixed(2)}`;
     const labelText = moodLabel(m.score);
 
-    // Sparkline 14d. Y-axis [-1, +1] para que la línea media sea
-    // visualmente "neutro" y los gaps (días sin signals) queden vacíos.
+    // Sparkline 14d enriquecido (tooltips + zero baseline + placeholder
+    // cuando <3 días con data).
     const sparkVals = m.spark_score_14d || [];
-    const sparkSVG = renderSparkline(sparkVals, {
-      width: 160, height: 28, ymin: -1, ymax: 1,
-    });
+    const sparkDates = m.spark_dates_14d || [];
+    const sparkSVG = renderMoodSparkline(sparkVals, sparkDates);
 
-    // Sources chips — qué sources contribuyeron al score de hoy.
-    // Sin source = sin signal; el frontend muestra "—" en ese caso.
+    // Sources chips.
     const sources = m.sources_used || [];
     const sourcesHTML = sources.length
       ? sources.map((s) => {
@@ -1965,9 +2045,7 @@
         }).join("")
       : `<span class="mood-src empty">sin sources</span>`;
 
-    // Drift warning. Solo aparece cuando recent_drift devuelve
-    // drifting=true (≥3 días consecutivos con score ≤ -0.4). NO es
-    // diagnóstico — es un statement factual sobre el agregado.
+    // Drift warning factual (no diagnóstico).
     const drift = m.drift || {};
     const driftHTML = drift.drifting
       ? `<div class="mood-drift" role="status">
@@ -1976,9 +2054,7 @@
         </div>`
       : "";
 
-    // Top evidence (top 3 signals que más contribuyeron al score).
-    // Mostramos el kind humanizado + el value crudo. Si la lista está
-    // vacía (sin top_evidence), ocultamos el bloque.
+    // Top evidence colapsable.
     const topEvidence = m.top_evidence || [];
     const evidenceHTML = topEvidence.length
       ? `<details class="mood-evidence">
@@ -1994,13 +2070,37 @@
             const kindHuman = MOOD_KIND_LABEL[e.signal_kind] || e.signal_kind;
             const srcEmoji = MOOD_SOURCE_EMOJI[e.source] || "·";
             return `<li>
-              <span class="src">${srcEmoji}</span>
+              <span class="src" aria-hidden="true">${srcEmoji}</span>
               <span class="kind">${escapeHTML(kindHuman)}</span>
               <span class="val ${vCls}">${vSign}${v.toFixed(2)}</span>
             </li>`;
           }).join("")}</ul>
         </details>`
       : "";
+
+    // Quick self-report buttons. Reusa POST /api/mood que ya existe
+    // (originariamente del panel sleep). Cierra el loop: tap → signal
+    // → siguiente refresh muestra el dato en sources/top_evidence.
+    // No marca "selected" persistente porque el panel no sabe cuál
+    // fue el último report del user (no lo guardamos en mood payload
+    // para mantenerlo simple); sí da feedback visual transitorio.
+    const reportBtnsHTML = MOOD_SELF_REPORT_OPTIONS.map((opt) => `
+      <button type="button" class="mood-self-btn"
+              data-mood="${opt.key}"
+              aria-label="reportar mood: ${opt.label}"
+              title="${opt.label}">
+        <span aria-hidden="true">${opt.emoji}</span>
+      </button>
+    `).join("");
+    const selfReportHTML = `
+      <div class="mood-self-report" data-self-report>
+        <span class="mood-self-prompt muted">¿cómo te sentís ahora?</span>
+        <div class="mood-self-buttons" role="group"
+             aria-label="reportar mood actual">
+          ${reportBtnsHTML}
+        </div>
+      </div>
+    `;
 
     const body = panel.querySelector("[data-body]");
     body.innerHTML = `
@@ -2017,8 +2117,46 @@
         ${driftHTML}
         <div class="mood-sources">${sourcesHTML}</div>
         ${evidenceHTML}
+        ${selfReportHTML}
       </div>
     `;
+
+    // Wire buttons → POST /api/mood (mismo endpoint que el sleep widget).
+    const reportWidget = body.querySelector("[data-self-report]");
+    reportWidget?.querySelectorAll(".mood-self-btn").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const mood = btn.dataset.mood;
+        if (!mood) return;
+        // Optimistic UI: marcar como pulsado, deshabilitar el grupo
+        // hasta que la respuesta vuelva.
+        const allBtns = reportWidget.querySelectorAll(".mood-self-btn");
+        allBtns.forEach((b) => {
+          b.classList.remove("selected");
+          b.disabled = true;
+        });
+        btn.classList.add("selected");
+        const prompt = reportWidget.querySelector(".mood-self-prompt");
+        if (prompt) prompt.textContent = "guardando…";
+        try {
+          const r = await fetch("/api/mood", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ mood }),
+          });
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          if (prompt) prompt.textContent = "guardado ✓";
+          // Re-habilitar para que pueda corregir el report.
+          allBtns.forEach((b) => { b.disabled = false; });
+        } catch (err) {
+          console.error("mood self-report failed", err);
+          allBtns.forEach((b) => {
+            b.disabled = false;
+            b.classList.remove("selected");
+          });
+          if (prompt) prompt.textContent = "error — reintentá";
+        }
+      });
+    });
 
     // Count chip = n_signals que dispararon el score (transparencia).
     const countEl = panel.querySelector("[data-count]");
@@ -2028,7 +2166,7 @@
     const foot = panel.querySelector("[data-foot]");
     if (foot) {
       foot.innerHTML = `<span class="muted">
-        ver detalles: <code>rag mood explain</code>
+        detalle: <code>rag mood explain</code>
       </span>`;
     }
   }

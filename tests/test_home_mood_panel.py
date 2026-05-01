@@ -269,3 +269,76 @@ def test_drift_active_passes_through(mood_enabled, monkeypatch, fetch_mood):
     assert result["drift"]["drifting"] is True
     assert result["drift"]["n_consecutive"] == 3
     assert result["drift"]["avg_score"] == pytest.approx(-0.55, abs=0.01)
+
+
+# ── Frontend bundle smoke ────────────────────────────────────────────────
+
+
+def test_home_v2_bundle_includes_mood_render():
+    """El bundle JS servido al browser debe contener los nuevos
+    helpers que renderizan el panel `p-mood` con buttons + tooltips +
+    placeholder. Smoke estático contra el archivo en disco — si alguien
+    rompe el render, este test salta antes de que lo veamos en prod."""
+    js_path = Path(__file__).resolve().parent.parent / "web" / "static" / "home.v2.js"
+    assert js_path.exists(), f"missing {js_path}"
+    js = js_path.read_text(encoding="utf-8")
+    # Funciones nuevas del commit de UI mejorada.
+    for sym in (
+        "renderMoodSparkline",
+        "MOOD_SELF_REPORT_OPTIONS",
+        "mood-self-btn",
+        "data-self-report",
+        "spark-zero",
+        "mood-spark-placeholder",
+    ):
+        assert sym in js, f"missing JS symbol: {sym}"
+    # Renderer principal sigue cableado al render loop.
+    assert "renderMood(payload)" in js
+    # POST /api/mood reusado para el self-report.
+    assert "/api/mood" in js
+
+
+def test_home_v2_html_has_mood_panel_with_aria_live():
+    """El panel `p-mood` debe tener `aria-live="polite"` para que screen
+    readers anuncien updates (cumplir Web Interface Guidelines #async)."""
+    html_path = Path(__file__).resolve().parent.parent / "web" / "static" / "home.v2.html"
+    html = html_path.read_text(encoding="utf-8")
+    assert 'id="p-mood"' in html
+    # aria-live debe estar sobre el data-body del panel mood (no en otro).
+    # Usamos un slice alrededor del id para no falsear el match.
+    idx = html.index('id="p-mood"')
+    panel_block = html[idx:idx + 1000]
+    assert 'aria-live="polite"' in panel_block, (
+        "p-mood data-body falta aria-live=\"polite\""
+    )
+
+
+def test_home_v2_css_honors_reduced_motion():
+    """El CSS debe respetar `prefers-reduced-motion` para los buttons
+    de self-report (cumplir Web Interface Guidelines #animation).
+
+    El home.v2 ya tiene un `@media (prefers-reduced-motion: reduce)`
+    global que aplica `transition-duration: 0.01ms !important` a `*` —
+    eso de por sí cubre los buttons. Pero como buena práctica, el
+    bloque CSS específico de `.mood-self-btn` también declara su
+    propio media query. Buscamos el último para no chocar con el
+    global."""
+    css_path = Path(__file__).resolve().parent.parent / "web" / "static" / "home.v2.css"
+    css = css_path.read_text(encoding="utf-8")
+    assert "@media (prefers-reduced-motion: reduce)" in css
+    # Hay 2+ media queries — buscar el ÚLTIMO que es el específico
+    # del mood (el primero es global, el segundo el del panel).
+    pos = css.rfind("@media (prefers-reduced-motion: reduce)")
+    block = css[pos:pos + 600]
+    assert ".mood-self-btn" in block, (
+        "último @media reduced-motion no incluye .mood-self-btn"
+    )
+    # `transition: all` está prohibido por web guidelines — verificamos
+    # que NO usemos esa shortcut en .mood-self-btn.
+    btn_pos = css.index(".mood-self-btn {")
+    btn_block = css[btn_pos:btn_pos + 800]
+    assert "transition: all" not in btn_block, (
+        ".mood-self-btn usa `transition: all` (prohibido por guidelines)"
+    )
+    # Y `touch-action: manipulation` está (mejora touch-screens).
+    assert "touch-action: manipulation" in btn_block

@@ -1849,3 +1849,122 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
   padding: 1px 4px;
   border-radius: 2px;
 }
+
+/* Headline label — text-wrap balance previene viudas en labels
+   de 2 palabras tipo "muy bajo". Fallback a normal en browsers
+   sin soporte. */
+.mood-label {
+  text-wrap: balance;
+}
+
+/* Score numérico monospace — alinea por columna cuando hay
+   updates rápidos (tabular-nums ya viene del .mood-score base
+   pero lo declaramos explícito acá por claridad). */
+.mood-score {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Sparkline mejorada — zero baseline + tooltips (los tooltips
+   son nativos del browser via <title> en SVG, no necesitan CSS).
+   El baseline horizontal ayuda a distinguir score positivo
+   (arriba de la línea) vs negativo (abajo) de un vistazo. */
+.mood-spark-svg .spark-zero {
+  stroke: var(--text-faint);
+  stroke-width: 0.5;
+  stroke-dasharray: 2 2;
+  opacity: 0.4;
+}
+
+/* Placeholder cuando hay <3 puntos — evita el chart vacío con
+   un solo dot que se ve como bug. Mensaje neutral + último valor
+   coloreado por severidad. */
+.mood-spark-placeholder {
+  flex: 1;
+  font-size: var(--fs-mini);
+  color: var(--text-faint);
+  font-style: italic;
+  padding: 6px 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.mood-spark-placeholder .mood-score-low,
+.mood-spark-placeholder .mood-score-tepid,
+.mood-spark-placeholder .mood-score-neutral,
+.mood-spark-placeholder .mood-score-up,
+.mood-spark-placeholder .mood-score-high {
+  font-style: normal;
+  font-weight: 600;
+  padding: 0 4px;
+  border-radius: 2px;
+}
+
+/* Self-report widget — quick buttons para que el user reporte
+   mood actual sin abrir CLI. Reusa POST /api/mood. Layout
+   compacto: prompt arriba, 4 buttons en row, gap consistente. */
+.mood-self-report {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--bg-elev-2);
+}
+
+.mood-self-prompt {
+  font-size: var(--fs-mini);
+}
+
+.mood-self-buttons {
+  display: flex;
+  gap: var(--space-1);
+  flex-wrap: wrap;
+}
+
+.mood-self-btn {
+  font-size: 18px;
+  line-height: 1;
+  padding: 4px 8px;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: var(--bg-elev-2);
+  cursor: pointer;
+  /* touch-action: manipulation evita 300ms delay en touch screens
+     (web guidelines #touch). */
+  touch-action: manipulation;
+  transition: background var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out),
+              transform var(--dur-fast) var(--ease-out);
+}
+
+.mood-self-btn:hover:not([disabled]) {
+  background: var(--bg-elev-3, var(--bg-elev-2));
+  border-color: var(--text-faint);
+}
+
+.mood-self-btn:focus-visible {
+  outline: none;
+  border-color: var(--accent, var(--text-strong));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent, var(--text-strong)) 25%, transparent);
+}
+
+.mood-self-btn.selected {
+  background: color-mix(in srgb, var(--accent, var(--text-strong)) 15%, transparent);
+  border-color: var(--accent, var(--text-strong));
+  transform: scale(0.96);
+}
+
+.mood-self-btn[disabled] {
+  cursor: wait;
+  opacity: 0.6;
+}
+
+/* Honor prefers-reduced-motion — desactiva animaciones, mantiene
+   el feedback visual via background color (que no necesita
+   transition). Web guidelines #animation. */
+@media (prefers-reduced-motion: reduce) {
+  .mood-self-btn {
+    transition: none;
+  }
+  .mood-self-btn.selected {
+    transform: none;
+  }
+}

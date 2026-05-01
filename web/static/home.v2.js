@@ -993,71 +993,185 @@
     }
   });
 
-  // Refresh manual del brief (regenerate=true → compute síncrono ~6-15s
-  // típicamente; hasta ~30s si dispara LLM brief con today_total > 0).
-  // Durante el wait mostramos un progress bar ASCII que avanza cada 1s
-  // sumando 5%, llegando a 95% en ~19s. NO es real — el endpoint no expone
-  // SSE de progreso; es una indicación visual de "todavía vivo". Si el
-  // compute termina antes, stopProgress lo corta y oculta la barra.
+  // Refresh manual del brief vía SSE (/api/home/stream). El endpoint
+  // emite eventos `stage` por cada uno de los ~14 fetchers + sub-stages
+  // de signals, y un `done` final con el payload. La barra se actualiza
+  // basado en cuántos stages completaron / total esperado, así refleja
+  // progress REAL en lugar de un timer fake. El user reportaba que la
+  // barra se clavaba en 95% mientras el compute seguía corriendo —
+  // causa: setInterval avanzaba a ritmo fijo (5%/seg) que llegaba a 95%
+  // antes que el compute terminara (30-45s).
   document.addEventListener("DOMContentLoaded", () => {
     const refreshBtn = document.getElementById("brief-refresh");
     if (!refreshBtn) return;
     const progressEl = document.getElementById("hero-progress");
     const progressBar = document.getElementById("progress-bar");
     const progressLabel = document.getElementById("progress-label");
-    let progressTimer = null;
+    let activeStream = null;
+    let trickleTimer = null;
 
-    function startProgress() {
-      if (!progressEl || !progressBar) return;
+    // El SSE endpoint emite un evento `hello` al inicio con la lista
+    // exacta de stages que va a ejecutar. Usamos ese count para %
+    // 100% real. Default 26 hasta que llegue el hello (cubre el gap
+    // de los primeros milisegundos).
+    let estimatedTotalStages = 26;
+    // Mapa de etiqueta legible por stage — solo para los principales.
+    // Los demás se muestran tal cual ("forecast", "drive", etc).
+    const STAGE_LABELS = {
+      "today": "leyendo evidencia del día…",
+      "signals": "fan-out de 9 señales…",
+      "signals.gmail": "consultando Gmail…",
+      "signals.whatsapp": "consultando WhatsApp…",
+      "signals.calendar": "consultando Calendar…",
+      "signals.mail_unread": "consultando Apple Mail…",
+      "signals.youtube": "consultando YouTube…",
+      "signals.contradictions": "buscando contradicciones…",
+      "signals.loops_activo": "rastreando loops…",
+      "signals.low_conf": "revisando queries low-conf…",
+      "tomorrow": "agenda de mañana…",
+      "forecast": "pronóstico del clima…",
+      "pagerank": "computando autoridad…",
+      "vaults": "actividad del vault…",
+      "drive": "Google Drive…",
+      "wa_unreplied": "chats WhatsApp pendientes…",
+      "bookmarks": "bookmarks de Chrome…",
+      "chrome": "top sitios web…",
+      "eval": "trend de retrieval…",
+      "followup": "loops aging…",
+      "finance": "snapshot de finanzas…",
+      "cards": "movimientos de tarjeta…",
+      "spotify": "Spotify del día…",
+      "sleep": "sueño de anoche…",
+      "mood": "score de mood…",
+      "youtube": "videos vistos…",
+      "narrative": "qwen2.5:7b escribiendo…",
+      "correlator": "armando patrones cross-source…",
+    };
+
+    const totalBlocks = 20;
+    function setBar(pct, label) {
+      if (!progressBar) return;
+      const filled = Math.round((pct / 100) * totalBlocks);
+      const bar = "█".repeat(filled) + "░".repeat(totalBlocks - filled);
+      progressBar.textContent = `[${bar}] ${Math.round(pct)}%`;
+      if (label && progressLabel) progressLabel.textContent = label;
+    }
+
+    function startProgressSSE(regenerate) {
+      if (!progressEl || !progressBar) return null;
       progressEl.hidden = false;
-      const totalBlocks = 20;
       let pct = 0;
-      const labels = [
-        "leyendo señales del vault…",
-        "consultando gmail / wa / calendar…",
-        "armando entidades cross-source…",
-        "esperando al LLM…",
-        "qwen2.5:7b escribiendo…",
-        "post-procesando voz…",
-      ];
-      let labelIdx = 0;
-      progressBar.textContent =
-        `[${"░".repeat(totalBlocks)}] 0%`;
-      progressLabel.textContent = labels[0];
-      // Tick cada 1s, +5%/tick. Llega a 95% en ~19s. Cambio de label
-      // cada ~3-4s para que se sienta movimiento aunque el compute real
-      // sea más rápido que las 6 etapas listadas.
-      progressTimer = setInterval(() => {
-        pct = Math.min(95, pct + 5);
-        const filled = Math.round((pct / 100) * totalBlocks);
-        const bar = "█".repeat(filled) + "░".repeat(totalBlocks - filled);
-        progressBar.textContent = `[${bar}] ${pct}%`;
-        // Avanzar label cada ~15% (~3 ticks). 0/15/30/45/60/75 → 6 etapas.
-        if (pct >= (labelIdx + 1) * 15 && labelIdx < labels.length - 1) {
-          labelIdx++;
-          progressLabel.textContent = labels[labelIdx];
+      let donesSeen = 0;
+      let lastStageTs = Date.now();
+      let lastStageLabel = "leyendo señales…";
+      setBar(0, "iniciando compute…");
+
+      const url = `/api/home/stream${regenerate ? "?regenerate=true" : ""}`;
+      const es = new EventSource(url);
+
+      // El server emite `hello` con la lista exacta de stages al
+      // arranque. Recalibramos el total para que % refleje progress
+      // real al 100% en lugar de un estimate.
+      es.addEventListener("hello", (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          const main = (data.stages || []).length;
+          const sub = Object.values(data.substages || {})
+            .reduce((sum, arr) => sum + (Array.isArray(arr) ? arr.length : 0), 0);
+          if (main + sub > 0) {
+            estimatedTotalStages = main + sub;
+          }
+        } catch (err) {
+          console.warn("[home.v2] hello event parse failed:", err);
+        }
+      });
+
+      es.addEventListener("stage", (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          const stage = data.stage || "";
+          const status = data.status || "";
+          if (status === "done" || status === "timeout" || status === "error") {
+            donesSeen++;
+            // % real basado en stages que terminaron, capped a 92%
+            // (los últimos 8% para el render del payload + final).
+            const real = Math.min(92, Math.round((donesSeen / estimatedTotalStages) * 92));
+            pct = Math.max(pct, real);
+          } else if (status === "start") {
+            const label = STAGE_LABELS[stage] || stage.replace(/_/g, " ") + "…";
+            lastStageLabel = label;
+            lastStageTs = Date.now();
+          }
+          setBar(pct, lastStageLabel);
+        } catch (err) {
+          console.warn("[home.v2] stage event parse failed:", err);
+        }
+      });
+
+      es.addEventListener("done", (e) => {
+        try {
+          const payload = JSON.parse(e.data);
+          _currentPayload = payload;
+          setBar(100, "listo!");
+          render(payload);
+        } catch (err) {
+          console.error("[home.v2] done event parse failed:", err);
+        } finally {
+          stopProgress();
+        }
+      });
+
+      es.addEventListener("error", (e) => {
+        // EventSource auto-reconnects on transient errors. Solo cortamos
+        // si el server cerró cleanly (readyState=CLOSED).
+        if (es.readyState === EventSource.CLOSED) {
+          console.warn("[home.v2] SSE closed unexpectedly");
+          stopProgress();
+        }
+      });
+
+      // Trickle: si el server tarda en mandar `stage` events (LLM corriendo
+      // sin sub-eventos), avanzamos un poco para que el bar no se sienta
+      // congelado. Max +0.3% por segundo, hasta 90%.
+      trickleTimer = setInterval(() => {
+        const sinceLast = (Date.now() - lastStageTs) / 1000;
+        if (sinceLast > 1 && pct < 90) {
+          pct = Math.min(90, pct + 0.3);
+          setBar(pct, lastStageLabel);
         }
       }, 1000);
+
+      return es;
     }
 
     function stopProgress() {
-      if (progressTimer) {
-        clearInterval(progressTimer);
-        progressTimer = null;
+      if (activeStream) {
+        try { activeStream.close(); } catch {}
+        activeStream = null;
+      }
+      if (trickleTimer) {
+        clearInterval(trickleTimer);
+        trickleTimer = null;
       }
       if (progressEl) progressEl.hidden = true;
+      refreshBtn.disabled = false;
+      refreshBtn.textContent = "↻";
     }
 
-    refreshBtn.addEventListener("click", async () => {
+    refreshBtn.addEventListener("click", () => {
+      if (activeStream) return;   // ya hay uno corriendo
       refreshBtn.disabled = true;
       refreshBtn.textContent = "↻";
-      startProgress();
-      try {
-        await load({ regenerate: true });
-      } finally {
-        refreshBtn.disabled = false;
-        stopProgress();
-      }
+      activeStream = startProgressSSE(true);
+      // Safety timeout: si por algún motivo el SSE no termina en 90s,
+      // forzamos un fallback al endpoint normal y cerramos el stream.
+      setTimeout(() => {
+        if (activeStream) {
+          console.warn("[home.v2] SSE timeout — falling back to /api/home");
+          stopProgress();
+          load({ regenerate: false });   // sirve cached
+        }
+      }, 90_000);
     });
   });
 

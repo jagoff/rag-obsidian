@@ -2887,6 +2887,133 @@ def submit_mood(req: MoodRequest) -> dict:
     return result
 
 
+@app.get("/api/mood/history")
+def mood_history(days: int = 30) -> dict:
+    """Detalle granular del mood para el modal "Ver historial".
+
+    Devuelve para cada día de los últimos `days`:
+      - score diario + n_signals + sources_used
+      - breakdown por source: contribución absoluta y % al score
+      - histogram aggregate: contribución por source sumando todo el
+        período (para el mini bar chart del modal).
+
+    El frontend lazy-loadea esto solo cuando el user abre el modal —
+    NO viene en el payload de `/api/home` para no engordar el critical
+    path (el home se llama cada 5 min, este solo on-demand).
+
+    Read-only sobre `rag_mood_signals` + `rag_mood_score_daily`.
+    Devuelve estructura vacía (no 404) cuando no hay data — el modal
+    muestra empty state en lugar de error.
+
+    Args:
+      days: rango histórico, máximo 90. Default 30 cubre 1 mes.
+    """
+    days = max(1, min(int(days or 30), 90))
+    try:
+        from rag import mood as _mood
+    except Exception:
+        return {"days": [], "histogram": [], "total_days_with_data": 0}
+
+    try:
+        recent = _mood.get_recent_scores(days=days)
+    except Exception:
+        recent = []
+
+    daily: list[dict] = []
+    histogram_acc: dict[str, dict[str, float]] = {}
+    for row in recent:
+        date = row.get("date")
+        if not date:
+            continue
+        try:
+            signals = _mood._read_signals_for_date(date)
+        except Exception:
+            signals = []
+        if not signals:
+            # Día sin data — lo dejamos en el array para que el modal
+            # muestre gap visual sin tener que reconstruir fechas.
+            daily.append({
+                "date": date, "score": row.get("score", 0.0),
+                "n_signals": 0, "sources_used": [], "by_source": [],
+            })
+            continue
+
+        # Sumar |value*weight| por source para obtener "peso bruto" de
+        # cada source en el día. % contribución = peso source / suma total.
+        by_source: dict[str, dict[str, float]] = {}
+        for s in signals:
+            src = s.get("source") or "unknown"
+            v = float(s.get("value", 0.0))
+            w = float(s.get("weight", 1.0))
+            contrib_abs = v * w           # signed (mantiene dirección)
+            contrib_weight = abs(v) * w   # peso para % (no signed)
+            entry = by_source.setdefault(src, {
+                "source": src, "contrib_signed": 0.0,
+                "contrib_weight": 0.0, "n_signals": 0,
+            })
+            entry["contrib_signed"] += contrib_abs
+            entry["contrib_weight"] += contrib_weight
+            entry["n_signals"] += 1
+
+        total_weight = sum(e["contrib_weight"] for e in by_source.values()) or 1.0
+        by_source_list = []
+        for src, e in by_source.items():
+            pct = round(e["contrib_weight"] / total_weight * 100.0, 1)
+            by_source_list.append({
+                "source": src,
+                "n_signals": e["n_signals"],
+                "contrib": round(e["contrib_signed"], 3),
+                "pct": pct,
+            })
+            # Acumular para el histograma aggregate.
+            agg = histogram_acc.setdefault(src, {
+                "source": src, "total_contrib": 0.0,
+                "total_weight": 0.0, "days_active": 0, "n_signals": 0,
+            })
+            agg["total_contrib"] += e["contrib_signed"]
+            agg["total_weight"] += e["contrib_weight"]
+            agg["days_active"] += 1
+            agg["n_signals"] += e["n_signals"]
+
+        # Ordenar por |contrib| descendente para que el frontend
+        # pinte primero los más influyentes.
+        by_source_list.sort(key=lambda x: abs(x["contrib"]), reverse=True)
+
+        daily.append({
+            "date": date,
+            "score": round(float(row.get("score", 0.0)), 3),
+            "n_signals": int(row.get("n_signals", 0)),
+            "sources_used": sorted(by_source.keys()),
+            "by_source": by_source_list,
+        })
+
+    # Aggregate histogram: total contribución de cada source en todo el
+    # período, ordenado por |contrib_total|. El frontend pinta como
+    # mini bar chart horizontal.
+    histogram = []
+    grand_total_w = sum(a["total_weight"] for a in histogram_acc.values()) or 1.0
+    for src, a in histogram_acc.items():
+        histogram.append({
+            "source": src,
+            "total_contrib": round(a["total_contrib"], 3),
+            "pct": round(a["total_weight"] / grand_total_w * 100.0, 1),
+            "days_active": a["days_active"],
+            "n_signals": a["n_signals"],
+        })
+    histogram.sort(key=lambda x: abs(x["total_contrib"]), reverse=True)
+
+    # Sort daily oldest → newest así el frontend lo pinta de izquierda
+    # a derecha (matching el sparkline del panel principal).
+    daily.sort(key=lambda x: x["date"])
+
+    return {
+        "days": daily,
+        "histogram": histogram,
+        "total_days_with_data": sum(1 for d in daily if d["n_signals"] > 0),
+        "range_days": days,
+    }
+
+
 # Validamos `decision` contra el mismo set que el helper Python +
 # CHECK constraint de la tabla. Mantener el set en `rag` (single source
 # of truth); copiarlo acá rompería sync.
@@ -7852,6 +7979,26 @@ def _fetch_mood() -> dict | None:
         else:
             spark.append(round(row["score"], 3))
 
+    # Top evidence con % de contribución relativa al score total del día.
+    # El frontend lo usa para mostrar "spotify -0.4 (62%)" en lugar de
+    # solo "spotify -0.4". Permite ver de un vistazo qué señal MOVIÓ
+    # el score más fuerte. Usamos el peso bruto |value*weight| sobre
+    # el total como proxy de contribución (consistente con el endpoint
+    # /api/mood/history que usa la misma lógica).
+    raw_evidence = (score_row.get("top_evidence") or [])[:3]
+    if raw_evidence:
+        total_w = sum(abs(float(e.get("value", 0.0))) * float(e.get("weight", 1.0))
+                      for e in raw_evidence) or 1.0
+        top_evidence = []
+        for e in raw_evidence:
+            v = float(e.get("value", 0.0))
+            w = float(e.get("weight", 1.0))
+            pct = round(abs(v) * w / total_w * 100.0, 1)
+            # Spread minimal: copiamos la dict + agregamos pct.
+            top_evidence.append({**e, "pct": pct})
+    else:
+        top_evidence = []
+
     return {
         "score": round(score_row["score"], 3),
         "n_signals": score_row["n_signals"],
@@ -7863,7 +8010,7 @@ def _fetch_mood() -> dict | None:
             "n_consecutive": int(drift.get("n_consecutive", 0)),
             "avg_score": round(float(drift.get("avg_score", 0.0)), 3),
         },
-        "top_evidence": (score_row.get("top_evidence") or [])[:3],
+        "top_evidence": top_evidence,
         "spark_score_14d": spark,
         "spark_dates_14d": dates,
     }
@@ -9206,12 +9353,14 @@ async def home_stream(request: Request, regenerate: bool = False) -> StreamingRe
         #
         # Pre-2026-04-24 cap was 90s, which was the SUM of nominal
         # per-fetcher budgets — but those run in parallel, not serial.
-        # The 90s cap meant a wedged stream tied up an asyncio task +
-        # one executor thread + a worker thread for 1.5min, hurting
-        # the next visitor when several stale clients piled up
-        # (browser background tab keeps the EventSource alive).
-        # 30s frees those resources 3× faster on a wedge.
-        HARD_CAP_S = 30.0
+        # 60s frees stuck-stream resources without bailing on legitimate
+        # slow regen=true compute. Subido de 30s a 60s después que el
+        # user reportara "se clava en 95%": el SSE timeoutea-ba en 30s
+        # mientras el compute regen=true regularmente toma 33-45s
+        # (signals fan-out + LLM brief + correlator). Trade-off: un
+        # stream realmente wedged ata recursos 60s en lugar de 30s,
+        # pero los compute lentos genuinos ya no se cortan a la mitad.
+        HARD_CAP_S = 60.0
 
         worker = threading.Thread(target=_runner, name="home-stream", daemon=True)
         worker.start()

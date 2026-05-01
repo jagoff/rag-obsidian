@@ -224,6 +224,174 @@ def test_execute_reconcile_action_bootout_no_exists(monkeypatch):
     assert result["exit_code"] == 3
 
 
+# ── regenerate (drift de XML on-disk vs factory) ──────────────────────────────
+
+
+def test_compute_regenerate_detects_drift(tmp_path, monkeypatch):
+    """Si on-disk XML difiere de factory output → action kind=regenerate."""
+    from unittest.mock import patch as _patch
+    label = "com.fer.obsidian-rag-test-drift"
+    fake_factory_xml = "<?xml version='1.0'?><plist><dict>FACTORY</dict></plist>"
+    fake_ondisk_xml = "<?xml version='1.0'?><plist><dict>STALE</dict></plist>"
+
+    plist_path = tmp_path / "Library" / "LaunchAgents" / f"{label}.plist"
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    plist_path.write_text(fake_ondisk_xml, encoding="utf-8")
+
+    monkeypatch.setattr(rag, "Path", _PathRedirector(tmp_path, plist_path, label))
+
+    with (
+        _patch.object(rag, "_all_daemon_labels", return_value=[(label, "managed")]),
+        _patch.object(
+            rag, "_gather_daemon_status",
+            return_value=_fake_status(label, state="running"),
+        ),
+        _patch.object(rag, "_plist_on_disk", return_value=True),
+        _patch.object(
+            rag, "_services_spec",
+            return_value=[(label, f"{label}.plist", fake_factory_xml)],
+        ),
+    ):
+        actions = rag._compute_reconcile_actions(regenerate=True)
+
+    assert len(actions) == 1
+    assert actions[0]["kind"] == "regenerate"
+    assert actions[0]["factory_xml"] == fake_factory_xml
+    assert "drifted" in actions[0]["reason"].lower()
+
+
+def test_compute_regenerate_no_drift_when_xml_matches(tmp_path, monkeypatch):
+    """Si on-disk XML == factory output → NO action (.strip() ignora trailing ws)."""
+    from unittest.mock import patch as _patch
+    label = "com.fer.obsidian-rag-test-clean"
+    xml = "<?xml version='1.0'?><plist><dict>CLEAN</dict></plist>"
+
+    plist_path = tmp_path / "Library" / "LaunchAgents" / f"{label}.plist"
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    plist_path.write_text(xml + "\n", encoding="utf-8")  # trailing newline
+
+    monkeypatch.setattr(rag, "Path", _PathRedirector(tmp_path, plist_path, label))
+
+    with (
+        _patch.object(rag, "_all_daemon_labels", return_value=[(label, "managed")]),
+        _patch.object(
+            rag, "_gather_daemon_status",
+            return_value=_fake_status(label, state="running"),
+        ),
+        _patch.object(rag, "_plist_on_disk", return_value=True),
+        _patch.object(
+            rag, "_services_spec",
+            return_value=[(label, f"{label}.plist", xml)],
+        ),
+    ):
+        actions = rag._compute_reconcile_actions(regenerate=True)
+
+    assert len(actions) == 0
+
+
+def test_compute_regenerate_skips_manual_keep(tmp_path, monkeypatch):
+    """Daemons category=manual_keep nunca se regeneran (out of spec)."""
+    from unittest.mock import patch as _patch
+    label = "com.fer.obsidian-rag-cloudflare-tunnel"
+    on_disk = "<?xml version='1.0'?><plist><dict>STALE_MANUAL</dict></plist>"
+
+    plist_path = tmp_path / "Library" / "LaunchAgents" / f"{label}.plist"
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    plist_path.write_text(on_disk, encoding="utf-8")
+
+    monkeypatch.setattr(rag, "Path", _PathRedirector(tmp_path, plist_path, label))
+
+    with (
+        _patch.object(rag, "_all_daemon_labels", return_value=[(label, "manual_keep")]),
+        _patch.object(
+            rag, "_gather_daemon_status",
+            return_value=_fake_status(label, state="running"),
+        ),
+        _patch.object(rag, "_plist_on_disk", return_value=True),
+        _patch.object(rag, "_services_spec", return_value=[]),  # manual no está en spec
+    ):
+        actions = rag._compute_reconcile_actions(regenerate=True)
+
+    assert len(actions) == 0
+
+
+def test_execute_regenerate_writes_and_bootstraps(monkeypatch, tmp_path):
+    """kind=regenerate: escribe XML, llama bootout + bootstrap, ok si bootstrap exit∈{0,37}."""
+    plist_path = tmp_path / "test.plist"
+    plist_path.write_text("OLD CONTENT", encoding="utf-8")
+    new_xml = "<?xml version='1.0'?><plist><dict>NEW</dict></plist>"
+
+    calls = []
+    def fake_run(args, **kw):
+        calls.append(args)
+        rc = 0  # bootout success, bootstrap success
+        return MagicMock(returncode=rc, stderr="")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = rag._execute_reconcile_action({
+        "label": "com.fer.obsidian-rag-test",
+        "kind": "regenerate",
+        "plist_path": plist_path,
+        "factory_xml": new_xml,
+    })
+
+    assert result["ok"] is True
+    # File writeado con el factory xml
+    assert plist_path.read_text(encoding="utf-8") == new_xml
+    # 2 calls: bootout + bootstrap
+    assert len(calls) == 2
+    assert calls[0][1] == "bootout"
+    assert calls[1][1] == "bootstrap"
+
+
+def test_execute_regenerate_bootout_3_then_bootstrap_0(monkeypatch, tmp_path):
+    """bootout exit=3 (no existe) + bootstrap exit=0 → ok=True (caso normal post-stale)."""
+    plist_path = tmp_path / "test.plist"
+    plist_path.write_text("OLD", encoding="utf-8")
+
+    seq = iter([3, 0])  # bootout=3, bootstrap=0
+    def fake_run(args, **kw):
+        return MagicMock(returncode=next(seq), stderr="")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = rag._execute_reconcile_action({
+        "label": "com.fer.obsidian-rag-test",
+        "kind": "regenerate",
+        "plist_path": plist_path,
+        "factory_xml": "NEW",
+    })
+
+    assert result["ok"] is True
+
+
+def test_execute_regenerate_missing_factory_xml(tmp_path):
+    """Sin factory_xml en el action → ok=False con mensaje claro."""
+    result = rag._execute_reconcile_action({
+        "label": "com.fer.obsidian-rag-test",
+        "kind": "regenerate",
+        "plist_path": tmp_path / "x.plist",
+        "factory_xml": "",  # vacío
+    })
+    assert result["ok"] is False
+    assert "missing" in (result["stderr"] or "").lower()
+
+
+# Helper for redirecting Path(~/Library/LaunchAgents/...) in tests
+class _PathRedirector:
+    """Wraps Path() so that Path.home() returns tmp_path during tests."""
+    def __init__(self, tmp_root, plist_path, label):
+        self._tmp = tmp_root
+        self._plist = plist_path
+        self._label = label
+        # Capturar el Path original para llamadas no-home.
+        from pathlib import Path as _RealPath
+        self._real = _RealPath
+    def __call__(self, *a, **kw):
+        return self._real(*a, **kw)
+    def home(self):
+        return self._tmp
+
+
 # ── daemons_reconcile CLI ─────────────────────────────────────────────────────
 
 

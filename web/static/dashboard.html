@@ -1340,6 +1340,150 @@
       .wa-btn, .wa-btn-link, .wa-chip-quick, .wa-tab { min-height: 36px; }
     }
 
+    /* ── Panel Daemons launchd ── */
+    #card-daemons { margin-top: 20px; }
+
+    .daemons-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 10px;
+      flex-wrap: wrap;
+    }
+    .daemons-head h2 { margin-bottom: 0; }
+
+    .daemons-actions {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+    .daemons-toggle-label {
+      font-size: 11px;
+      color: var(--text-faint);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      user-select: none;
+    }
+    .daemons-toggle-label input { accent-color: var(--cyan); cursor: pointer; }
+
+    .daemons-kpis {
+      display: flex;
+      gap: 20px;
+      margin-bottom: 14px;
+      flex-wrap: wrap;
+    }
+    .daemons-kpi {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 2px;
+    }
+    .daemons-kpi-val {
+      font-size: 22px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      line-height: 1.1;
+    }
+    .daemons-kpi-lbl {
+      font-size: 10px;
+      color: var(--text-faint);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .daemons-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    .daemons-table thead th {
+      text-align: left;
+      padding: 5px 8px;
+      color: var(--text-faint);
+      font-weight: 600;
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      border-bottom: 1px solid var(--border);
+    }
+    .daemons-table tbody tr {
+      border-bottom: 1px solid var(--sep);
+    }
+    .daemons-table tbody tr:hover { background: var(--hover); }
+    .daemons-table td {
+      padding: 5px 8px;
+      vertical-align: middle;
+    }
+    .daemons-label {
+      font-family: 'SF Mono','Menlo','Monaco',monospace;
+      max-width: 220px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .daemons-cat {
+      color: var(--text-faint);
+      font-size: 10px;
+    }
+
+    /* Row color by health */
+    .daemons-row-missing td { color: var(--red); }
+    .daemons-row-bad-exit td:nth-child(5) { color: var(--red); }
+    .daemons-row-overdue { background: rgba(227, 194, 122, 0.04); }
+    .daemons-row-ok { }
+
+    /* State cell colors */
+    .daemons-state-ok   { color: var(--green); }
+    .daemons-state-warn { color: var(--yellow); }
+    .daemons-state-missing { color: var(--red); font-weight: 600; }
+
+    .daemons-overdue-badge {
+      display: inline-block;
+      padding: 1px 6px;
+      border-radius: 4px;
+      background: rgba(227, 194, 122, 0.2);
+      color: var(--yellow);
+      font-size: 10px;
+      font-weight: 600;
+    }
+
+    @media (max-width: 640px) {
+      .daemons-table thead { display: none; }
+      .daemons-table,
+      .daemons-table tbody,
+      .daemons-table tr,
+      .daemons-table td { display: block; width: 100%; }
+      .daemons-table tr {
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        margin-bottom: 8px;
+        padding: 6px 10px;
+        background: var(--bg-card);
+      }
+      .daemons-table td {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 10px;
+        padding: 5px 0;
+        border-bottom: 1px solid var(--sep);
+      }
+      .daemons-table td:last-child { border-bottom: 0; }
+      .daemons-table td::before {
+        content: attr(data-label);
+        color: var(--text-faint);
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        flex-shrink: 0;
+        font-weight: 600;
+      }
+      .daemons-label { max-width: none; }
+    }
+
   </style>
 </head>
 <body>

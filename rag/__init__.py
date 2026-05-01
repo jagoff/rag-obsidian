@@ -50670,6 +50670,63 @@ def _daemon_watchdog_plist(rag_bin: str) -> str:
 """
 
 
+def _wake_hook_plist(rag_bin: str) -> str:
+    """Wake hook — kickstart-overdue post-Mac-wake.
+
+    launchd `StartCalendarInterval` no dispara retroactivamente cuando el
+    Mac estuvo dormido a la hora del slot. El watchdog cada 5min mitiga,
+    pero hay hasta 5min de lag post-wake. Este script corre como daemon
+    long-running (`KeepAlive=true`) en un loop sleep 60s, detecta wakes
+    user-visible vía `pmset -g log | grep "Display is turned on"` y
+    dispara `rag daemons kickstart-overdue` cuando hay un wake nuevo
+    desde el último check.
+
+    State persistido en `~/.local/share/obsidian-rag/wake-hook-state.json`
+    (`{last_wake, last_check_iso, last_kickstart_ok}`). El primer tick
+    post-install hace bootstrap (anchorea al último wake actual sin
+    disparar) — evita kickstart spurious al instalar.
+
+    KeepAlive=true + el sleep interno de 60s es lo más cerca de un
+    "power event hook" nativo que se puede hacer sin pyobjc / IOKit.
+    Costo: ~1 proceso Python idle (~10 MB RSS) + un fork de pmset cada
+    60s (~50ms).
+
+    `_rag_bin` es el path absoluto al CLI (mismo que ProgramArguments
+    de los otros daemons).
+    """
+    script_path = (
+        Path(__file__).resolve().parent.parent / "scripts" / "wake_hook.py"
+    )
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-wake-hook</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>python3</string>
+    <string>{script_path}</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+    <key>RAG_WAKE_HOOK_RAG_BIN</key><string>{rag_bin}</string>
+    <key>RAG_WAKE_HOOK_POLL_SECONDS</key><string>60</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/wake-hook.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/wake-hook.error.log</string>
+</dict>
+</plist>
+"""
+
+
 def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
     """Return [(label, plist_filename, plist_xml), ...].
 
@@ -50887,6 +50944,14 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
         ("com.fer.obsidian-rag-daemon-watchdog",
          "com.fer.obsidian-rag-daemon-watchdog.plist",
          _daemon_watchdog_plist(rag_bin)),
+        # 2026-05-01: wake hook — sidecar Python loop con KeepAlive=true
+        # que polea pmset cada 60s y dispara `rag daemons kickstart-overdue`
+        # cuando detecta un wake user-visible nuevo. Resuelve el lag post-
+        # Mac-wake del watchdog StartInterval=300 (era hasta 5min). Costo:
+        # ~10 MB RSS idle + un fork de pmset cada 60s (~50ms).
+        ("com.fer.obsidian-rag-wake-hook",
+         "com.fer.obsidian-rag-wake-hook.plist",
+         _wake_hook_plist(rag_bin)),
     ]
 
 
@@ -51157,18 +51222,28 @@ def _plist_on_disk(label: str) -> bool:
     return (Path.home() / "Library" / "LaunchAgents" / f"{label}.plist").exists()
 
 
-def _compute_reconcile_actions(*, gentle: bool = False) -> list[dict]:
+def _compute_reconcile_actions(
+    *, gentle: bool = False, regenerate: bool = False,
+) -> list[dict]:
     """Compara estado real vs spec y devuelve lista de acciones requeridas.
 
     Cada acción es un dict con claves:
         label        — nombre completo del daemon
-        kind         — "bootstrap" | "bootout" | "kickstart"
+        kind         — "bootstrap" | "bootout" | "kickstart" | "regenerate"
         reason       — texto libre explicativo
         current_state — dict con state/runs/last_exit/overdue/etc.
         plist_path   — Path al plist en disco (puede ser None)
+        factory_xml  — solo para kind="regenerate": XML output de la factory
 
-    Nota: la acción "regenerate" (diff XML plist on-disk vs factory) es V2
-    pendiente — no implementada en esta versión.
+    Con `gentle=True` solo se generan acciones `kickstart` (no bootout
+    huérfanos, no bootstrap, no regenerate). El watchdog corre así.
+
+    Con `regenerate=True` se compara el XML on-disk vs la factory output
+    para cada daemon managed. Si difieren → action kind="regenerate"
+    (regenera el archivo + bootout + bootstrap). Útil para detectar drift
+    por edits manuales (ej. el bug del comentario shell `#` en el plist
+    del calibrate). NO aplica a manuales (`category=manual_keep`) — esos
+    están fuera de spec por diseño.
     """
     actions: list[dict] = []
     # Self-skip guard: el watchdog ejecuta este reconcile desde dentro del
@@ -51176,6 +51251,19 @@ def _compute_reconcile_actions(*, gentle: bool = False) -> list[dict]:
     # subprocess timea (10s en kickstart -k), el watchdog reporta exit=1,
     # próximo tick lo ve last_exit=1 runs<3, agrega action self-kickstart.
     _SELF_LABEL = "com.fer.obsidian-rag-daemon-watchdog"
+
+    # Pre-cargar el spec managed una sola vez si regenerate=True para
+    # mapear label → factory_xml sin re-llamar las factories N veces.
+    factory_xml_by_label: dict[str, str] = {}
+    if regenerate:
+        rag_bin = _rag_binary()
+        try:
+            for managed_label, _fname, xml_str in _services_spec(rag_bin):
+                factory_xml_by_label[managed_label] = xml_str
+        except Exception:
+            # Silent-fail: si las factories rebotan, skipear regenerate.
+            factory_xml_by_label = {}
+
     for label, category in _all_daemon_labels():
         if label == _SELF_LABEL:
             continue
@@ -51189,6 +51277,32 @@ def _compute_reconcile_actions(*, gentle: bool = False) -> list[dict]:
         last_exit = row.get("last_exit")
         runs = row.get("runs")
         overdue = row.get("overdue", False)
+
+        # Regenerate: solo daemons managed con plist on disk + factory disponible.
+        # Aplica ANTES del kickstart/bootstrap loop para que el regen sea el
+        # fix preferido cuando hay drift de XML.
+        if (
+            regenerate
+            and category == "managed"
+            and plist_exists
+            and plist_path is not None
+            and label in factory_xml_by_label
+        ):
+            try:
+                on_disk = plist_path.read_text(encoding="utf-8")
+            except OSError:
+                on_disk = ""
+            factory_xml = factory_xml_by_label[label]
+            if on_disk.strip() != factory_xml.strip():
+                actions.append({
+                    "label": label,
+                    "kind": "regenerate",
+                    "reason": "on-disk XML drifted vs factory",
+                    "current_state": row,
+                    "plist_path": plist_path,
+                    "factory_xml": factory_xml,
+                })
+                continue
 
         # Plist en disco pero no bootstrappeado → bootstrap
         if state == "missing" and plist_exists:
@@ -51288,6 +51402,26 @@ def _execute_reconcile_action(action: dict) -> dict:
         ok = r["rc"] == 0
         return {"ok": ok, "exit_code": r["rc"], "stderr": r["stderr"]}
 
+    elif kind == "regenerate":
+        # Regenerate: write factory XML to disk + bootout + bootstrap.
+        # bootout puede pegar exit=3 (no existe) → tratamos como OK; bootstrap
+        # puede pegar exit=37 (ya activo, raro post-bootout) → también OK.
+        plist_path = action.get("plist_path")
+        factory_xml = action.get("factory_xml")
+        if plist_path is None or not factory_xml:
+            return {"ok": False, "exit_code": -1, "stderr": "missing plist_path or factory_xml"}
+        try:
+            Path(plist_path).write_text(factory_xml, encoding="utf-8")
+        except OSError as exc:
+            return {"ok": False, "exit_code": -4, "stderr": f"write failed: {exc}"}
+        r1 = _safe_run(["launchctl", "bootout", f"gui/{uid}/{label}"])
+        # bootout exit 0 / 3 son OK; otros rcs los seguimos para reintentar bootstrap.
+        r2 = _safe_run(["launchctl", "bootstrap", f"gui/{uid}", str(plist_path)])
+        ok = r2["rc"] in (0, 37)
+        # Reportar el rc del bootstrap como "el final" de la operación.
+        stderr = r2["stderr"] or (r1["stderr"] if r1["rc"] not in (0, 3) else None)
+        return {"ok": ok, "exit_code": r2["rc"], "stderr": stderr}
+
     return {"ok": False, "exit_code": -1, "stderr": f"kind desconocido: {kind}"}
 
 
@@ -51362,13 +51496,21 @@ def _doctor_diagnose(row: dict) -> str:
 @click.option("--gentle", is_flag=True,
               help="Solo kickstart de last_exit≠0 con runs<3 + overdue. "
                    "NO bootout huérfanos ni regenera plists.")
-def daemons_reconcile(do_apply: bool, dry_run: bool, gentle: bool):
+@click.option("--regenerate", is_flag=True,
+              help="Detectar drift entre el XML del plist on-disk vs la "
+                   "factory en código y regenerar (write + bootout + "
+                   "bootstrap). Solo aplica a daemons managed.")
+def daemons_reconcile(do_apply: bool, dry_run: bool, gentle: bool, regenerate: bool):
     """Compara estado real vs spec y converge (default: dry-run)."""
     if not do_apply and not dry_run:
         dry_run = True
         console.print("[dim]dry-run implícito — usá --apply para ejecutar acciones.[/dim]")
 
-    actions = _compute_reconcile_actions(gentle=gentle)
+    if gentle and regenerate:
+        console.print("[yellow]warning: --regenerate es ignorado con --gentle[/yellow]")
+        regenerate = False
+
+    actions = _compute_reconcile_actions(gentle=gentle, regenerate=regenerate)
 
     if not actions:
         console.print("✓ sin drift detectado")

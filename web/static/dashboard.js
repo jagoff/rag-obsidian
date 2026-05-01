@@ -274,6 +274,7 @@ async function load(showSkeleton) {
       cpuInit();
       waInit();
       vhInit();
+      daemonsInit();
     }
     refresh(d);
     announceStatus(`Datos del dashboard actualizados (${d.kpis.total_queries} queries en ${state.days} días)`);
@@ -573,6 +574,28 @@ function buildLayout(d) {
         <div class="chart-wrap"><canvas id="ch-screentime-daily" aria-label="Gráfico de barras: tiempo de pantalla diario según Screen Time"></canvas><div class="chart-empty">sin datos (knowledgeC.db)</div></div>
       </section>
     </div>
+
+    <!-- ── Panel Daemons launchd ── -->
+    <section class="chart-card wide" id="card-daemons" aria-labelledby="sec-daemons">
+      <div class="daemons-head">
+        <h2 id="sec-daemons">Daemons launchd</h2>
+        <div class="daemons-actions">
+          <span class="vh-meta" id="daemons-updated"></span>
+          <label class="daemons-toggle-label" title="Mostrar solo daemons con problemas">
+            <input type="checkbox" id="daemons-unhealthy-only"> Solo unhealthy
+          </label>
+        </div>
+      </div>
+      <div class="daemons-kpis" id="daemons-kpis">
+        <div class="daemons-kpi"><span class="daemons-kpi-val" id="dk-total">—</span><span class="daemons-kpi-lbl">Total</span></div>
+        <div class="daemons-kpi"><span class="daemons-kpi-val green" id="dk-running">—</span><span class="daemons-kpi-lbl">Running</span></div>
+        <div class="daemons-kpi"><span class="daemons-kpi-val" id="dk-unhealthy">—</span><span class="daemons-kpi-lbl">Unhealthy</span></div>
+        <div class="daemons-kpi"><span class="daemons-kpi-val" id="dk-overdue">—</span><span class="daemons-kpi-lbl">Overdue</span></div>
+      </div>
+      <div id="daemons-body">
+        <div class="fb-empty">cargando…</div>
+      </div>
+    </section>
   `;
 
   // Build chart instances ONCE — refresh() will mutate their data.
@@ -2589,5 +2612,188 @@ function vhRender(data) {
       ${compsHtml}
     </div>
     ${err ? `<div class="vh-error">${escapeHtml(err)}</div>` : ""}
+  `;
+}
+
+// ── Panel Daemons launchd ─────────────────────────────────────────────────
+//
+// Fetch GET /api/daemons/status cada 60s (mismo POLL_MS del dashboard).
+// El server cachea 30s → el costo real de launchctl es 1 call/30s como máximo.
+//
+// Sort: unhealthy primero (missing > exit≠0 > overdue > not-running), luego
+// alphabético por label slug.
+
+const DAEMONS_POLL_MS = 60_000;
+const DMN = { timer: null, inFlight: false, data: null, showUnhealthyOnly: false };
+
+function _daemonIsUnhealthy(it) {
+  // "not running" es normal para daemons periódicos (no KeepAlive).
+  // last_exit como string ("(never exited)") significa proceso pinned = OK.
+  return (
+    it.state === "missing" ||
+    it.state === "unknown" ||
+    (typeof it.last_exit === "number" && it.last_exit !== 0) ||
+    it.overdue
+  );
+}
+
+function _daemonSortKey(it) {
+  // Menor número = más prioritario en la tabla.
+  if (it.state === "missing")                          return 0;
+  if (it.last_exit !== null && it.last_exit !== 0)    return 1;
+  if (it.overdue)                                      return 2;
+  if (it.state === "unknown")                          return 3;
+  if (it.state !== "running")                          return 4;  // "not running"
+  return 5;  // healthy running
+}
+
+// "2h ago" / "5d ago" relative time
+function _relTime(isoStr) {
+  if (!isoStr) return "—";
+  const diff = (Date.now() - new Date(isoStr).getTime()) / 1000;
+  if (diff < 0)     return "justo ahora";
+  if (diff < 90)    return `${Math.round(diff)}s ago`;
+  if (diff < 5400)  return `${Math.round(diff / 60)}m ago`;
+  if (diff < 172800) return `${Math.round(diff / 3600)}h ago`;
+  return `${Math.round(diff / 86400)}d ago`;
+}
+
+// slug corto del label: quitar el prefijo "com.fer.obsidian-rag-"
+function _labelSlug(label) {
+  return label.replace(/^com\.fer\.obsidian-rag-/, "");
+}
+
+function daemonsInit() {
+  const toggle = document.getElementById("daemons-unhealthy-only");
+  if (toggle && !toggle.dataset.bound) {
+    toggle.addEventListener("change", () => {
+      DMN.showUnhealthyOnly = toggle.checked;
+      if (DMN.data) daemonsRender(DMN.data);
+    });
+    toggle.dataset.bound = "1";
+  }
+  daemonsRefresh();
+  daemonsSchedule();
+}
+
+function daemonsSchedule() {
+  if (DMN.timer) { clearTimeout(DMN.timer); DMN.timer = null; }
+  DMN.timer = setTimeout(() => {
+    if (!state.paused) daemonsRefresh();
+    daemonsSchedule();
+  }, DAEMONS_POLL_MS);
+}
+
+async function daemonsRefresh() {
+  if (DMN.inFlight) return;
+  DMN.inFlight = true;
+  try {
+    const res = await fetch("/api/daemons/status");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    DMN.data = data;
+    daemonsRender(data);
+    const upd = document.getElementById("daemons-updated");
+    if (upd) upd.textContent = `actualizado ${nowHM()}`;
+  } catch (err) {
+    const body = document.getElementById("daemons-body");
+    if (body) body.innerHTML = `<div class="fb-empty" style="color:var(--red)">Error: ${escapeHtml(err.message)}</div>`;
+  } finally {
+    DMN.inFlight = false;
+  }
+}
+
+function daemonsRender(data) {
+  // KPI badges
+  const items = data.items || [];
+  const running = items.filter(it => it.state === "running").length;
+  const overdue = items.filter(it => it.overdue).length;
+
+  const dkTotal    = document.getElementById("dk-total");
+  const dkRunning  = document.getElementById("dk-running");
+  const dkUnhealthy = document.getElementById("dk-unhealthy");
+  const dkOverdue  = document.getElementById("dk-overdue");
+
+  if (dkTotal) dkTotal.textContent = items.length;
+  if (dkRunning) dkRunning.textContent = running;
+  if (dkUnhealthy) {
+    dkUnhealthy.textContent = data.unhealthy_count ?? 0;
+    dkUnhealthy.className = `daemons-kpi-val${(data.unhealthy_count || 0) > 0 ? " red" : " green"}`;
+  }
+  if (dkOverdue) {
+    dkOverdue.textContent = overdue;
+    dkOverdue.className = `daemons-kpi-val${overdue > 0 ? " yellow" : ""}`;
+  }
+
+  // Sort: unhealthy first, then alphabetical
+  const sorted = [...items].sort((a, b) => {
+    const sk = _daemonSortKey(a) - _daemonSortKey(b);
+    if (sk !== 0) return sk;
+    return _labelSlug(a.label).localeCompare(_labelSlug(b.label));
+  });
+
+  const filtered = DMN.showUnhealthyOnly ? sorted.filter(_daemonIsUnhealthy) : sorted;
+
+  const body = document.getElementById("daemons-body");
+  if (!body) return;
+
+  if (filtered.length === 0) {
+    body.innerHTML = `<div class="fb-empty">Todos los daemons están healthy.</div>`;
+    return;
+  }
+
+  const rows = filtered.map(it => {
+    const unhealthy = _daemonIsUnhealthy(it);
+    const slug = escapeHtml(_labelSlug(it.label));
+    const cat = escapeHtml(it.category === "managed" ? "mgd" : "man");
+
+    let stateCls = "";
+    if (it.state === "missing")   stateCls = "daemons-state-missing";
+    else if (it.state === "running") stateCls = "daemons-state-ok";
+    else                          stateCls = "daemons-state-warn";
+
+    const stateText = escapeHtml(it.state ?? "?");
+    const runs = it.runs != null ? it.runs : "—";
+    const exitText = it.last_exit === null ? "—" :
+                     it.last_exit === 0    ? "0 ok" :
+                     `<span style="color:var(--red)">${escapeHtml(String(it.last_exit))}</span>`;
+    const tickText = escapeHtml(_relTime(it.last_tick_iso));
+    const overdueBadge = it.overdue
+      ? `<span class="daemons-overdue-badge" title="Último tick hace más de ${Math.round((it.expected_cadence_s || 0) * 2)}s">overdue</span>`
+      : "";
+
+    const rowCls = it.state === "missing" ? "daemons-row-missing"
+                 : (it.last_exit !== null && it.last_exit !== 0) ? "daemons-row-bad-exit"
+                 : it.overdue ? "daemons-row-overdue"
+                 : "daemons-row-ok";
+
+    return `
+      <tr class="daemons-row ${rowCls}">
+        <td data-label="Label" class="daemons-label" title="${escapeHtml(it.label)}">${slug}</td>
+        <td data-label="Cat"   class="daemons-cat">${cat}</td>
+        <td data-label="State" class="${stateCls}">${stateText}</td>
+        <td data-label="Runs">${runs}</td>
+        <td data-label="LastExit">${exitText}</td>
+        <td data-label="LastTick">${tickText}</td>
+        <td data-label="Overdue">${overdueBadge}</td>
+      </tr>
+    `;
+  }).join("");
+
+  body.innerHTML = `
+    <table class="daemons-table" aria-label="Estado de los daemons launchd">
+      <thead>
+        <tr>
+          <th>Label</th>
+          <th>Cat</th>
+          <th>State</th>
+          <th>Runs</th>
+          <th>LastExit</th>
+          <th>LastTick</th>
+          <th>Overdue</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
   `;
 }

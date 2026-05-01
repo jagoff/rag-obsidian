@@ -251,6 +251,9 @@ def test_services_spec_total_count():
     # serve_watchdog para el rationale).
     # Bump 33 → 34 (T4, 2026-05-01): `daemon-watchdog` — self-healing
     # loop cada 5min via `rag daemons reconcile --apply --gentle`.
+    # Bump 34 → 35 (2026-05-01): `wake-hook` — sidecar Python con
+    # KeepAlive=true que detecta wakes user-visible vía pmset y dispara
+    # `kickstart-overdue` para cubrir el lag post-Mac-wake del watchdog.
     #
     # Base infra (23):
     #   watch, web (agregado 2026-04-22 — pre-fix estaba instalado
@@ -287,8 +290,8 @@ def test_services_spec_total_count():
     #   vocab nightly 03:15 con cmd `whisper vocab refresh` post
     #   2026-05-01).
     #
-    # Total: 23 base + 7 ingesters + 4 helpers = 34.
-    assert len(specs) == 34
+    # Total: 23 base + 7 ingesters + 4 helpers + 1 wake-hook = 35.
+    assert len(specs) == 35
 
 
 def test_services_spec_includes_maintenance():

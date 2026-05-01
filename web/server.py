@@ -23369,6 +23369,103 @@ async def fine_tunning_snooze(req: FineTunningSnoozeRequest) -> dict:
 # ── Fin Fine-tunning panel ──────────────────────────────────────────────
 
 
+# ── Panel Daemons launchd ────────────────────────────────────────────────
+#
+# Cache in-memory de 30s para no re-runear `launchctl print` en cada request
+# (40 daemons × subprocess = 1-3s cada vez). El TTL cubre el auto-refresh del
+# frontend (60s) con margen. Thread-safe: el lock protege tanto la lectura del
+# resultado como la escritura del ts + data.
+
+_DAEMONS_CACHE_LOCK = _threading.Lock()
+_daemons_cache_ts: float = 0.0
+_daemons_cache_data: dict | None = None
+_DAEMONS_CACHE_TTL = 30.0  # segundos
+
+
+def _gather_daemon_status(label: str, category: str) -> dict:
+    """Thin wrapper patcheable en tests (delega a rag._gather_daemon_status)."""
+    from rag import _gather_daemon_status as _rag_gds
+    return _rag_gds(label, category)
+
+
+def _all_daemon_labels() -> list:
+    """Thin wrapper patcheable en tests (delega a rag._all_daemon_labels)."""
+    from rag import _all_daemon_labels as _rag_adl
+    return _rag_adl()
+
+
+def _get_daemon_status_cached() -> dict:
+    """Devuelve el status de todos los daemons, con cache de 30s."""
+    import time as _time_mod
+
+    global _daemons_cache_ts, _daemons_cache_data
+
+    now = _time_mod.time()
+    with _DAEMONS_CACHE_LOCK:
+        if _daemons_cache_data is not None and (now - _daemons_cache_ts) < _DAEMONS_CACHE_TTL:
+            return _daemons_cache_data
+
+    # Fuera del lock durante el call pesado (puede demorar 1-3s)
+    labels = _all_daemon_labels()
+    items = [_gather_daemon_status(label, category) for label, category in labels]
+
+    managed_count = sum(1 for it in items if it["category"] == "managed")
+    manual_count = sum(1 for it in items if it["category"] != "managed")
+    unhealthy_count = sum(
+        1 for it in items
+        if (
+            # state "missing" y "unknown" son siempre unhealthy;
+            # "not running" es normal para daemons periódicos (no KeepAlive)
+            it["state"] in ("missing", "unknown")
+            # last_exit != 0 solo cuando es un int (None = nunca salió;
+            # string "(never exited)" = proceso pinned que nunca terminó = OK)
+            or (isinstance(it["last_exit"], int) and it["last_exit"] != 0)
+            or it["overdue"]
+        )
+    )
+
+    result = {
+        "items": items,
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "managed_count": managed_count,
+        "manual_count": manual_count,
+        "unhealthy_count": unhealthy_count,
+    }
+
+    with _DAEMONS_CACHE_LOCK:
+        _daemons_cache_data = result
+        _daemons_cache_ts = _time_mod.time()
+
+    return result
+
+
+@app.get("/api/daemons/status")
+def daemons_status_endpoint(request: Request = None) -> dict:  # type: ignore[assignment]
+    """Estado de todos los daemons launchd del proyecto.
+
+    Returns:
+        {
+            items: [...],          # lista de dicts con 8 keys por daemon
+            ts: str,               # ISO timestamp del snapshot
+            managed_count: int,    # daemons gestionados por rag setup
+            manual_count: int,     # daemons manuales (cloudflare, etc.)
+            unhealthy_count: int,  # missing | overdue | exit != 0
+        }
+
+    Rate limit: reutiliza _BEHAVIOR_BUCKETS (120 req/60s).
+    Cache: 30s in-memory para no runear 40x launchctl por request.
+    """
+    if request is not None:
+        client_ip = request.client.host if request.client else "unknown"
+        _check_rate_limit(_BEHAVIOR_BUCKETS, client_ip,
+                          _BEHAVIOR_RATE_LIMIT, _BEHAVIOR_RATE_WINDOW)
+
+    return _get_daemon_status_cached()
+
+
+# ── Fin Panel Daemons ────────────────────────────────────────────────────
+
+
 if __name__ == "__main__":
     import uvicorn
     # Bind host: default 127.0.0.1 (localhost-only, el estándar). Para

@@ -611,6 +611,15 @@ def generate_predictions(
     """
     import torch
     model.eval()
+    # Detectar device del modelo. En MPS / CUDA, el tokenizer retorna
+    # tensores en CPU por default → hay que .to(model.device) antes de
+    # generate() para evitar `RuntimeError: Placeholder storage has not
+    # been allocated on MPS device`. Bug observado el 2026-05-01 con
+    # transformers 5.1.0 + MPS en M3 Max.
+    try:
+        model_device = next(model.parameters()).device
+    except StopIteration:
+        model_device = torch.device("cpu")
     preds: list[str] = []
     with torch.no_grad():
         for ex in val_examples:
@@ -618,6 +627,7 @@ def generate_predictions(
                 ex["prompt"], return_tensors="pt", truncation=True,
                 max_length=MAX_TOKENS - 200,
             )
+            inp = {k: v.to(model_device) for k, v in inp.items()}
             out = model.generate(
                 **inp,
                 max_new_tokens=200,

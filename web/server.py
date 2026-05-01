@@ -86,6 +86,7 @@ from rag import (  # noqa: E402
     CHAT_OPTIONS,
     CONFIDENCE_RERANK_MIN,
     CONTRADICTION_LOG_PATH,
+    RERANK_POOL_RETRIEVE_ONLY,
     LOG_PATH,
     SILENT_ERRORS_LOG_PATH,
     _LOG_QUEUE,
@@ -11078,6 +11079,271 @@ def chat_get_redirect():
     """
     from fastapi.responses import RedirectResponse  # noqa: PLC0415
     return RedirectResponse(url="/chat", status_code=307)
+
+
+# ── /api/query — sync JSON endpoint para WhatsApp listener (2026-05-01) ─────
+#
+# Reemplaza el `/query` legacy del `rag serve --port 7832` (BaseHTTPServer)
+# que se deprecó por el split-brain con este FastAPI. El listener apunta a
+# `RAG_SERVE_URL=http://127.0.0.1:8765` y consume este endpoint.
+#
+# Wire-format compatible con el legacy:
+#
+#   Input  (POST JSON):
+#     - question: str (required)
+#     - retrieve_only: bool = False        # listener drafts: skip LLM
+#     - session_id: str | None = None
+#     - k: int = RERANK_TOP (5)
+#     - folder: str | None = None
+#     - tag: str | None = None
+#     - num_predict: int = 256
+#
+#   Output (JSON):
+#     Si retrieve_only=True:
+#       {"sources": [{"path", "score", "excerpt", "source"}, ...]}
+#     Si retrieve_only=False:
+#       {"answer", "sources": [{"path", "score", "note"}, ...],
+#        "paths": [...], "confidence", "t_retrieve", "t_gen", "turn_id"}
+#
+# Diseñado simple — NO replica los short-circuits de weather/tasks/finance/
+# spotify/metachat del legacy `_handle_query`. Ese flow vive en `/api/chat`
+# (SSE) y el chat web del PWA. El listener WA pega acá solo para:
+#   1. `loadVaultContextForDraft` (retrieve_only=True) — drafts WA cuando
+#      otros le escriben al user. 99% del tráfico de este endpoint.
+#   2. `ragQuery` (retrieve_only=False) — query directa cuando el user
+#      le habla al bot por WA. Resuelve via retrieve + LLM call sync.
+#
+# Si en el futuro se necesita feature-parity total con el legacy (weather
+# short-circuit, tasks-mode, etc.), el camino correcto es extraer
+# `_handle_query` del closure en `rag.serve()` a una función módulo-level
+# y reusarla acá. Por ahora el flow simple cubre el use-case real.
+class QueryRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=_CHAT_QUESTION_MAX)
+    retrieve_only: bool = False
+    session_id: str | None = Field(None, max_length=200)
+    k: int = Field(default=5, ge=1, le=15)
+    folder: str | None = Field(None, max_length=200)
+    tag: str | None = Field(None, max_length=80)
+    num_predict: int = Field(default=256, ge=1, le=2000)
+
+
+@app.post("/api/query")
+@app.post("/query")  # legacy alias — mantiene compat con clientes apuntando al wire del rag serve
+def api_query(req: QueryRequest, request: Request) -> dict:
+    """Sync JSON wrapper sobre `multi_retrieve` + (optional) ollama.chat.
+
+    Endpoint dedicado para el WhatsApp listener (reemplazo del `/query`
+    del rag serve deprecated). Ver doc-block extenso encima de
+    `QueryRequest` para el wire-format y el rationale.
+
+    Disponible en dos paths:
+    - `/api/query` (canónico FastAPI).
+    - `/query` (alias legacy — mismo wire-format que el `/query` del
+      rag serve BaseHTTPServer deprecated, así clientes que apuntaban
+      al `:7832/query` solo cambian la URL base a `:8765` sin tocar el
+      path).
+    """
+    # Rate limit: igual que /api/chat — un cliente runaway puede saturar
+    # el chat model + reranker en MPS y hacer thrashing al sistema entero.
+    client_ip = (request.client.host if request.client else "unknown")
+    _check_rate_limit(_CHAT_BUCKETS, client_ip, limit=30, window=60.0)
+
+    question = req.question.strip()
+    if not question:
+        return {"error": "empty question"}
+
+    _t0 = time.perf_counter()
+    vaults = resolve_vault_paths(None)
+    if not vaults:
+        return {"error": "no vault registered"}
+
+    # Retrieve sin tools, sin enrich. `multi_query=False` cuando
+    # `retrieve_only` por la misma razón que el legacy: el listener
+    # descarta el output LLM-side, las paráfrasis (1-3s extra) son
+    # overhead puro.
+    #
+    # `rerank_pool=RERANK_POOL_RETRIEVE_ONLY` (10) cuando retrieve_only —
+    # paridad con el legacy (`rag/__init__.py:52725`). Para queries
+    # full-LLM usamos default (None → RERANK_POOL_MAX=25) para que el
+    # ranker LightGBM tenga señal suficiente.
+    _retrieve_pool = (
+        RERANK_POOL_RETRIEVE_ONLY if req.retrieve_only else None
+    )
+    _t_retrieve_start = time.perf_counter()
+    try:
+        result = multi_retrieve(
+            vaults, question, req.k, req.folder, None, req.tag, False,
+            multi_query=not req.retrieve_only,
+            auto_filter=True,
+            date_range=None,
+            rerank_pool=_retrieve_pool,
+            caller="api_query",
+        )
+    except Exception as exc:
+        # Sanear errores internos antes de devolver al listener — el
+        # listener ya tiene fallback a subprocess; un 500 ruidoso al
+        # log ayuda, pero el JSON al cliente queda limpio.
+        print(
+            f"[api-query-error] phase=retrieve "
+            f"exc_type={type(exc).__name__} exc={str(exc)[:200]!r}",
+            flush=True,
+        )
+        return {"error": _sanitize_error_for_user(exc, phase="retrieve")}
+
+    docs = result.get("docs") or []
+    metas = result.get("metas") or []
+    scores = result.get("scores") or []
+    t_retrieve = time.perf_counter() - _t_retrieve_start
+
+    # Sources con shape compatible con lo que el listener espera.
+    # `loadVaultContextForDraft` lee `path`, `score`, `excerpt`, `source`.
+    # `ragQuery` lee `path` (dedup → paths). Damos las dos shapes en una.
+    sources: list[dict] = []
+    paths: list[str] = []
+    seen_paths: set[str] = set()
+    for doc, meta, score in zip(docs, metas, scores):
+        m = meta or {}
+        p = (m.get("file") or "").strip()
+        if p and p not in seen_paths:
+            seen_paths.add(p)
+            paths.append(p)
+        sources.append({
+            "path": p,
+            "note": m.get("note") or (Path(p).stem if p else ""),
+            "score": round(float(score), 3) if score is not None else 0.0,
+            # Excerpt: primeros 500 chars del doc (mismo cap que el
+            # legacy aplicaba downstream). El listener trunca igual a 500.
+            "excerpt": (doc or "")[:500],
+            # Source: vault | whatsapp | gmail | calendar | reminders.
+            # Si meta no lo trae, asumimos vault (caso default del corpus).
+            "source": m.get("source") or "vault",
+        })
+
+    confidence = float(result.get("confidence") or 0.0)
+    if confidence != confidence or confidence == float("-inf"):  # NaN/-inf
+        confidence = 0.0
+
+    if req.retrieve_only:
+        # Listener para drafts: solo necesita sources, no answer.
+        try:
+            log_query_event({
+                "cmd": "api_query.retrieve_only",
+                "q": question[:200],
+                "session": req.session_id,
+                "t_retrieve": round(t_retrieve, 3),
+                "t_gen": 0.0,
+                "n_sources": len(sources),
+            })
+        except Exception:
+            pass
+        return {
+            "sources": sources,
+            "paths": paths,
+            "confidence": round(confidence, 3),
+            "t_retrieve": round(t_retrieve, 3),
+            "t_gen": 0.0,
+        }
+
+    # Full path: retrieve + LLM call sync. Sin tools, sin enrich, sin
+    # SSE. Construimos un prompt minimal con el contexto del retrieve
+    # y dejamos al LLM responder.
+    if not docs:
+        # No hay retrieval — devolvemos answer canned y dejamos al
+        # listener decidir si formatea o pasa raw.
+        canned = "No encontré información relevante en tus notas."
+        return {
+            "answer": canned,
+            "sources": [],
+            "paths": [],
+            "confidence": 0.0,
+            "t_retrieve": round(t_retrieve, 3),
+            "t_gen": 0.0,
+            "mode": "no_results",
+        }
+
+    # Prompt simple — un context block + la pregunta. El system prompt
+    # canónico de WA está en `_SERVE_CHAT_SYSTEM` (rag/__init__.py); para
+    # mantener este endpoint independiente de internals del rag serve,
+    # reusamos `_WEB_SYSTEM_PROMPT` que ya gobierna el chat web.
+    ctx_blocks: list[str] = []
+    for s in sources[:req.k]:
+        snippet = (s["excerpt"] or "").strip()
+        if snippet:
+            ctx_blocks.append(
+                f"[{s['note']}] {snippet}"
+            )
+    context = "\n\n".join(ctx_blocks) if ctx_blocks else "(sin contexto)"
+    user_msg = (
+        f"Contexto del vault:\n{context}\n\n"
+        f"Pregunta: {question}\n\nResponde concisamente en español rioplatense."
+    )
+
+    _t_gen_start = time.perf_counter()
+    try:
+        web_model = _resolve_web_chat_model()
+        # `CHAT_OPTIONS` + `num_ctx=_WEB_CHAT_NUM_CTX` mantiene la KV cache
+        # alineada con `/api/chat` y el `chat-prewarm` (mismo num_ctx ⇒
+        # ollama reusa la cache pre-cargada del modelo). Drift en num_ctx
+        # forza reinit y agrega 3-5s al prefill — ver doc-block extenso
+        # en `_WEB_CHAT_NUM_CTX` (línea ~3884) para el rationale completo.
+        _opts = {
+            **CHAT_OPTIONS,
+            "num_ctx": _WEB_CHAT_NUM_CTX,
+            "num_predict": req.num_predict,
+        }
+        resp = ollama.chat(
+            model=web_model,
+            messages=[
+                {"role": "system", "content": _WEB_SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+            options=_opts,
+            stream=False,
+            think=False,
+            keep_alive=chat_keep_alive(web_model),
+        )
+        answer = (resp.message.content or "").strip()
+    except Exception as exc:
+        print(
+            f"[api-query-error] phase=llm "
+            f"exc_type={type(exc).__name__} exc={str(exc)[:200]!r}",
+            flush=True,
+        )
+        return {
+            "error": _sanitize_error_for_user(exc, phase="synthesis"),
+            "sources": sources,
+            "paths": paths,
+            "confidence": round(confidence, 3),
+            "t_retrieve": round(t_retrieve, 3),
+            "t_gen": 0.0,
+        }
+    t_gen = time.perf_counter() - _t_gen_start
+
+    turn_id = new_turn_id()
+    try:
+        log_query_event({
+            "cmd": "api_query",
+            "q": question[:200],
+            "session": req.session_id,
+            "turn_id": turn_id,
+            "t_retrieve": round(t_retrieve, 3),
+            "t_gen": round(t_gen, 3),
+            "answer_len": len(answer),
+            "top_score": round(confidence, 3),
+            "paths": paths,
+        })
+    except Exception:
+        pass
+
+    return {
+        "answer": answer or "(respuesta vacía)",
+        "sources": sources,
+        "paths": paths,
+        "confidence": round(confidence, 3),
+        "t_retrieve": round(t_retrieve, 3),
+        "t_gen": round(t_gen, 3),
+        "turn_id": turn_id,
+    }
 
 
 @app.post("/api/chat")

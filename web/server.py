@@ -2512,6 +2512,29 @@ def _warmup() -> None:
                           flush=True)
             except Exception as _exc:
                 print(f"[warmup] conversation-turn retry failed: {_exc}", flush=True)
+            # Pre-warm followup_aging cache (2026-04-30 fix). Antes el
+            # primer hit a /api/home post-restart triggereaba el cold path
+            # de _fetch_followup_aging (~30-60s con LLM-judge per loop) y
+            # el SSE timeouteaba con `default=None`. Con el pre-warmer el
+            # web server arranca, dispara este compute en bg, y para
+            # cuando llega el primer request humano (typically 5-15s
+            # después de boot), el cache ya está hot. Si el compute toma
+            # mucho, se sigue corriendo y el primer hit ve None — no peor
+            # que pre-fix, mejor en el caso típico.
+            try:
+                t0_fw = time.time()
+                _compute_followup_aging_result = _compute_followup_aging()
+                if _compute_followup_aging_result is not None:
+                    _FOLLOWUP_AGING_CACHE["ts"] = time.time()
+                    _FOLLOWUP_AGING_CACHE["payload"] = _compute_followup_aging_result
+                    print(
+                        f"[warmup] followup_aging cache pre-warmed in "
+                        f"{time.time() - t0_fw:.1f}s "
+                        f"(total={_compute_followup_aging_result.get('total', 0)})",
+                        flush=True,
+                    )
+            except Exception as _exc:
+                print(f"[warmup] followup_aging pre-warm failed: {_exc}", flush=True)
         except Exception:
             pass
 
@@ -8163,31 +8186,37 @@ def _fetch_eval_trend(n: int = 10) -> dict | None:
 
 
 # Followup aging runs the full `find_followup_loops` pipeline, which costs one
-# LLM judge call per open loop. Cheap per-loop but the list scales with vault
-# size — 6h cache keeps /api/home under ~2s while still refreshing a few
-# times per working day.
+# LLM judge call per open loop. Cheap per-loop but the list scales con vault
+# size — cold path real medido ~15-25s.
+#
+# Strategy: stale-while-revalidate (SWR).
+#   - SOFT TTL (6h): si el cache tiene <6h, devolverlo y NO recomputar.
+#   - HARD TTL (48h): si el cache tiene 6-48h, devolver cache stale +
+#     disparar refresh background. Próximo call ve la versión nueva.
+#   - Fresh cold (no payload nunca): bloquear hasta que el primer compute
+#     termine. La home nunca llamaba acá sin cache porque el budget SSE
+#     era 5s — el future seguía corriendo en bg pero el panel mostraba
+#     "skipped". Ahora con SWR, después del primer compute (cold) el
+#     panel siempre tiene algo que mostrar.
+#
+# Bug pre-fix (2026-04-30 audit): cada 6h el SSE budget de 5s era menor
+# que el cold path (15-25s) → user veía "followup skipped" cada vez que
+# el cache expiraba. Telemetría: 100% de los cold calls timeout.
 _FOLLOWUP_AGING_CACHE: dict = {"ts": 0.0, "payload": None}
-_FOLLOWUP_AGING_TTL = 6 * 3600
+_FOLLOWUP_AGING_SOFT_TTL = 6 * 3600     # serve cached, no recompute
+_FOLLOWUP_AGING_HARD_TTL = 48 * 3600    # serve stale + bg refresh
+_FOLLOWUP_AGING_REFRESHING: bool = False  # single-flight guard
+_FOLLOWUP_AGING_LOCK = threading.Lock()
 
 
-def _fetch_followup_aging() -> dict | None:
-    """Bucketize open-loops-by-age for the /api/home aging widget.
-
-    Buckets: 0-7d, 8-30d, stale_30plus (age≥31 OR status=='stale'). Uses a
-    90d window on `find_followup_loops` so the 30+ bucket actually sees aged
-    items (the default CLI window is 30d). Resolved loops are dropped —
-    they are, by definition, no longer aging.
-    """
-    now_ts = time.time()
-    cached = _FOLLOWUP_AGING_CACHE
-    if cached["payload"] is not None and now_ts - cached["ts"] < _FOLLOWUP_AGING_TTL:
-        return cached["payload"]
-
+def _compute_followup_aging() -> dict | None:
+    """Compute the aging buckets payload. Pure function — no cache logic.
+    Returns the payload dict on success, None on failure."""
     try:
         col = get_db()
         loops = find_followup_loops(col, VAULT_PATH, days=90)
     except Exception:
-        return cached["payload"]  # serve last-known-good on failure
+        return None
 
     open_loops = [it for it in loops if it.get("status") != "resolved"]
     buckets = {"0_7": 0, "8_30": 0, "stale_30plus": 0}
@@ -8212,14 +8241,71 @@ def _fetch_followup_aging() -> dict | None:
         for it in sample
     ]
 
-    payload = {
+    return {
         "buckets": buckets,
         "total": len(open_loops),
         "sample": sample_out,
     }
-    _FOLLOWUP_AGING_CACHE["ts"] = now_ts
-    _FOLLOWUP_AGING_CACHE["payload"] = payload
-    return payload
+
+
+def _refresh_followup_aging_bg() -> None:
+    """Background refresher for the SWR pattern. Single-flight guarded —
+    si ya hay un refresh corriendo, los siguientes calls al guard hacen
+    no-op. Llamado desde `_fetch_followup_aging` cuando el cache está
+    stale (>SOFT_TTL) pero todavía servible (<HARD_TTL)."""
+    global _FOLLOWUP_AGING_REFRESHING
+    with _FOLLOWUP_AGING_LOCK:
+        if _FOLLOWUP_AGING_REFRESHING:
+            return
+        _FOLLOWUP_AGING_REFRESHING = True
+    try:
+        payload = _compute_followup_aging()
+        if payload is not None:
+            _FOLLOWUP_AGING_CACHE["ts"] = time.time()
+            _FOLLOWUP_AGING_CACHE["payload"] = payload
+    finally:
+        with _FOLLOWUP_AGING_LOCK:
+            _FOLLOWUP_AGING_REFRESHING = False
+
+
+def _fetch_followup_aging() -> dict | None:
+    """Bucketize open-loops-by-age for the /api/home aging widget.
+
+    Buckets: 0-7d, 8-30d, stale_30plus (age≥31 OR status=='stale'). Uses a
+    90d window on `find_followup_loops` so the 30+ bucket actually sees aged
+    items (the default CLI window is 30d). Resolved loops are dropped —
+    they are, by definition, no longer aging.
+
+    Cache strategy: SWR (stale-while-revalidate). Ver doc del módulo
+    `_FOLLOWUP_AGING_CACHE` arriba.
+    """
+    now_ts = time.time()
+    cached = _FOLLOWUP_AGING_CACHE
+    age = now_ts - cached["ts"]
+
+    # Hot path: cache fresh (<6h) → return inmediato.
+    if cached["payload"] is not None and age < _FOLLOWUP_AGING_SOFT_TTL:
+        return cached["payload"]
+
+    # SWR path: cache stale (6-48h) → return cached + bg refresh.
+    if cached["payload"] is not None and age < _FOLLOWUP_AGING_HARD_TTL:
+        threading.Thread(
+            target=_refresh_followup_aging_bg,
+            name="followup-aging-swr",
+            daemon=True,
+        ).start()
+        return cached["payload"]
+
+    # Cold path: nada en cache O stale-stale (>48h). Computar bloquante.
+    # La primera vez post-boot esto puede demorar 15-25s, pero ya no
+    # podemos servir nada útil. Después del compute, el SOFT TTL cubre
+    # las próximas 6h sin pagar el costo otra vez.
+    payload = _compute_followup_aging()
+    if payload is not None:
+        _FOLLOWUP_AGING_CACHE["ts"] = now_ts
+        _FOLLOWUP_AGING_CACHE["payload"] = payload
+        return payload
+    return cached["payload"]  # serve last-known-good si compute falló
 
 
 def _fetch_drive_recent(now: datetime, max_items: int = 5) -> list[dict]:
@@ -9975,15 +10061,16 @@ def _home_compute(
         pagerank_top = _await("pagerank", fut_pagerank, 10, default=[]) or []
         chrome_top_week = _await("chrome", fut_chrome, 5, default=[]) or []
         eval_trend = _await("eval", fut_eval, 5, default=None)
-        # followup_aging has its own 6h cache + LLM-judge per loop on cold.
-        # Timeout 5s (era 2s, demasiado corto — el panel quedaba "sin
-        # datos de loops" siempre cold porque ningún compute terminaba
-        # antes). 5s deja al fetcher devolver buckets si está warm en
-        # cache; cold sigue corriendo en bg para warm-ear el cache, y
-        # el próximo cycle ya muestra los datos. Si sigue null, el
-        # frontend hace fallback con loops_stale + loops_activo del
-        # mismo payload.
-        followup_aging = _await("followup", fut_followup, 5, default=None)
+        # followup_aging usa SWR con SOFT_TTL=6h / HARD_TTL=48h (ver
+        # _fetch_followup_aging). Hot path es 0.1ms (cache fresh), SWR
+        # path 0.1ms (return stale + bg refresh), cold real (>48h o
+        # primer boot) demora 15-25s pero solo pasa 1× por restart o
+        # cuando la home no fue visitada en 48h. 30s budget cubre el
+        # cold path de boot — antes era 5s y siempre timeouteaba en
+        # cold (telemetry: 100% timeout post-restart). Después del
+        # primer cold call, SWR mantiene el panel "fresco-suficiente"
+        # por días sin penalizar latencia.
+        followup_aging = _await("followup", fut_followup, 30, default=None)
         drive_recent = _await("drive", fut_drive, 10, default=[]) or []
         whatsapp_unreplied = _await("wa_unreplied", fut_wa_unreplied, 10, default=[]) or []
         chrome_bookmarks = _await("bookmarks", fut_bookmarks, 5, default=[]) or []
@@ -10046,11 +10133,77 @@ def _home_compute(
     # toda la tarde aunque el archivo `YYYY-MM-DD-evening.md` existiera.
     narrative = _today_cached_narrative(date_label) or ""
     narrative_source = "cached" if narrative else "none"
-    # Default correlations: el path de cache (no-regenerate) NO corre el
-    # correlator por costo. Si la UI quiere pintar el panel "🔗 Patrones
-    # del día", solo aparece después de un regenerate. Es OK — los
-    # patrones ya quedan visibles en el narrative del brief cacheado.
-    today_correlations: dict | None = None
+
+    # Correlations + highlights SIEMPRE — el cache path también los expone
+    # al frontend para que los chips de "Lo que pasó hoy" tengan data sin
+    # esperar regenerate. El correlator es <100ms (regex + dict ops, sin
+    # IO); la armada de extras_lite reusa `signals` que ya están fetcheados.
+    # Antes era condicional a `regenerate=true`, lo que dejaba el hero
+    # con prose pero sin chips/patterns en el path normal del navegador.
+    signals_dict_lite = signals if isinstance(signals, dict) else {}
+    extras_lite = {
+        # Aliases sobre signals existentes — el correlator espera estos
+        # keys. Los buckets TODAY-strict (00:00→now) NO se refetchean acá:
+        # el ahorro de latencia (5-7s) supera la pérdida de precisión vs
+        # ventana 24hs rolling de `signals`.
+        "gmail_today": (signals_dict_lite.get("gmail") or {}).get("recent") or [],
+        "whatsapp_today": signals_dict_lite.get("whatsapp") or [],
+        "calendar_today": signals_dict_lite.get("calendar") or [],
+        "youtube_today": [],
+        "tomorrow_calendar": tomorrow_calendar,
+        # Buckets que el correlator/highlights consume:
+        "gmail_unread": signals_dict_lite.get("gmail") or {},
+        "mail_unread": signals_dict_lite.get("mail_unread") or [],
+        "whatsapp_unreplied": signals_dict_lite.get("whatsapp_unreplied")
+            or signals_dict_lite.get("whatsapp") or [],
+        "drive_recent": signals_dict_lite.get("drive_recent") or [],
+        "youtube_recent": signals_dict_lite.get("youtube_watched") or [],
+        "chrome_bookmarks": signals_dict_lite.get("chrome_bookmarks") or [],
+        "loops_stale": signals_dict_lite.get("loops_stale") or [],
+        "loops_activo": signals_dict_lite.get("loops_activo") or [],
+        "pagerank_top": signals_dict_lite.get("pagerank_top") or [],
+        "vault_activity": signals_dict_lite.get("vault_activity") or {},
+        "followup_aging": signals_dict_lite.get("followup_aging") or {},
+    }
+    today_correlations: dict | None
+    try:
+        from rag.today_correlator import correlate_today_signals as _corr
+        today_correlations = _corr(today_ev, extras_lite)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[today-correlator] failed: {exc}", file=sys.stderr)
+        today_correlations = {"people": [], "topics": [], "time_overlaps": []}
+
+    # Highlights: stats sintéticos que el frontend rendea como fila de
+    # chips arriba del prose narrativo en "Lo que pasó hoy". Todo
+    # derivado — sin IO, sin LLM. Si un bucket está vacío, el frontend
+    # oculta el chip correspondiente.
+    _wa_chats = signals_dict_lite.get("whatsapp") or []
+    _gmail_bucket = signals_dict_lite.get("gmail") or {}
+    _cal_today = signals_dict_lite.get("calendar") or []
+    _yt_today = signals_dict_lite.get("youtube_watched") or []
+    _people = (today_correlations or {}).get("people") or []
+    _topics = (today_correlations or {}).get("topics") or []
+    today_highlights: dict = {
+        "wa_top_chat": _wa_chats[0] if _wa_chats else None,
+        "wa_total_msgs": sum(int(c.get("count") or 0) for c in _wa_chats),
+        "wa_active_chats": len(_wa_chats),
+        "gmail_unread": int(_gmail_bucket.get("unread_count") or 0),
+        "gmail_starred": int(_gmail_bucket.get("starred") or 0)
+            if isinstance(_gmail_bucket.get("starred"), (int, float))
+            else len(_gmail_bucket.get("starred") or []),
+        "gmail_awaiting_reply": int(_gmail_bucket.get("awaiting_reply") or 0)
+            if isinstance(_gmail_bucket.get("awaiting_reply"), (int, float))
+            else len(_gmail_bucket.get("awaiting_reply") or []),
+        "calendar_events": len(_cal_today),
+        "youtube_videos": len(_yt_today),
+        "vault_notes_today": len(today_ev.get("recent_notes") or []),
+        "top_person": _people[0] if _people else None,
+        "top_topic": _topics[0] if _topics else None,
+        "people_cross_source": len(_people),
+        "topics_cross_source": len(_topics),
+        "gaps_count": len((today_correlations or {}).get("gaps") or []),
+    }
+
     # Only call the LLM when the caller explicitly asks. Default path stays
     # fast — if no cached brief exists yet, the UI shows "pendiente" y el
     # user clickea ↻ que pega con regenerate=true. Aun cuando today_total==0
@@ -10091,45 +10244,25 @@ def _home_compute(
                 yt_today = fut_yt_today.result(timeout=5) or []
             except Exception:
                 yt_today = []
-        # Cross-source extras — NO los inventamos, ya los recolectamos
-        # en paralelo arriba (`signals` + buckets sueltos + los 4 today
-        # de recién). Pasarlos al LLM permite que el brief escriba
-        # "esperás respuesta de 3 chats WhatsApp + 2 mails VIP + tenés
-        # meet con Pablo mañana 10hs" en vez de un recap solo del vault.
-        # El render del prompt ignora keys vacías así que es safe pasar
-        # todo aunque algunos buckets hayan caído en timeout.
+        # Cross-source extras precisos para el LLM — pisamos los aliases
+        # "lite" con los TODAY-strict que acabamos de fetchear (00:00→now
+        # cut), y dedupeamos YouTube. El correlator ya corrió arriba con
+        # los aliases lite; lo re-corremos acá con los buckets precisos
+        # para que el prompt del LLM use entidades de la ventana exacta
+        # (gain pequeño pero real cuando el día arranca con WA muy temprano).
         signals_dict = signals if isinstance(signals, dict) else {}
-        # Dedup: si un YouTube apareció HOY, sacarlo del bucket "últimos
-        # 7d" para que el LLM no lo cite dos veces. El `youtube_recent`
-        # queda como "lo de los últimos 7 días que NO viste hoy".
         yt_today_ids = {v.get("video_id") for v in yt_today if v.get("video_id")}
         yt_recent_raw = signals_dict.get("youtube_watched") or []
         yt_recent = [v for v in yt_recent_raw if v.get("video_id") not in yt_today_ids]
         extras = {
-            # TODAY (corte exacto al 00:00 local, no ventana rolling)
+            **extras_lite,
+            # Pisar con TODAY-strict (corte exacto al 00:00 local).
             "gmail_today": gmail_today,
             "whatsapp_today": wa_today,
             "calendar_today": cal_today,
             "youtube_today": yt_today,
-            # Buckets ya existentes (rolling windows / "stale" buckets)
-            "gmail_unread": signals_dict.get("gmail") or {},
-            "mail_unread": signals_dict.get("mail_unread") or [],
-            "whatsapp_unreplied": signals_dict.get("whatsapp_unreplied")
-                or signals_dict.get("whatsapp") or [],
-            "tomorrow_calendar": tomorrow_calendar,
-            "drive_recent": signals_dict.get("drive_recent") or [],
             "youtube_recent": yt_recent,
-            "chrome_bookmarks": signals_dict.get("chrome_bookmarks") or [],
-            "loops_stale": signals_dict.get("loops_stale") or [],
-            "loops_activo": signals_dict.get("loops_activo") or [],
-            "pagerank_top": signals_dict.get("pagerank_top") or [],
-            "vault_activity": signals_dict.get("vault_activity") or {},
-            "followup_aging": signals_dict.get("followup_aging") or {},
         }
-        # Pre-correlate ANTES del LLM call. Un 7B aplanado descubre poco
-        # cross-source por su cuenta — pasarle entidades + temas ya
-        # matched evita los "X conecta con Y porque ambos son X" tautológicos
-        # que generaba antes. Costo: <100ms (regex + dict ops, no IO).
         from rag.today_correlator import correlate_today_signals as _corr
         try:
             today_correlations = _corr(today_ev, extras)
@@ -10170,9 +10303,16 @@ def _home_compute(
             },
             "evidence": today_ev,
             # Cross-source matches pre-armados (people + topics + time
-            # overlaps). Solo populated cuando regenerate=true; en el
-            # cache path queda None y el frontend oculta el panel.
+            # overlaps + gaps). Ahora computado SIEMPRE (cache + regenerate),
+            # antes era condicional a regenerate y el frontend nunca lo veía
+            # en el path normal del navegador.
             "correlations": today_correlations,
+            # Stats sintéticos que el frontend rendea como fila de chips
+            # arriba del prose narrativo (Top WA chat · Mails · Meetings ·
+            # YouTube · Top persona · Tema). Todo derivado de signals +
+            # correlations — sin fetch nuevo, sin LLM. Los campos vacíos
+            # los filtra el frontend para no rendear chips placeholder.
+            "highlights": today_highlights,
         },
         "urgent": urgent,
         "signals": signals,

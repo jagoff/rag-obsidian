@@ -23,6 +23,39 @@
   const $ = (sel, root = document) => root.querySelector(sel);
   const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
+  // Detect notif/bot/self emails para no contar como "contactos reales".
+  // Trampas conocidas: github noreply usa display name "Fer F" pero
+  // viene de notifications@github.com → pattern matching en el email.
+  // El propio user (fernandoferrari@gmail.com) también aparece en
+  // recent cuando hace forward o sent — filtrarlo.
+  const isBotOrSelf = (sender) => {
+    if (!sender) return true;
+    const s = String(sender).toLowerCase();
+    if (/notifications?@|noreply@|no-?reply@|donot-?reply@|notificaci[oó]n@|automat|bounce@|mailer-?daemon/.test(s)) return true;
+    if (/no\s*responder|no-?responder|do\s*not\s*reply|noreply/.test(s)) return true;
+    if (/fernandoferrari|fer\.f@/.test(s)) return true;     // self
+    return false;
+  };
+
+  // Extraer nombre legible del sender. Gmail puede venir como:
+  //   "Monica Ferrari <monica.ferrari@gmail.com>"
+  //   "\"Fer F.\" <fernandoferrari@gmail.com>"
+  //   "monica.ferrari@gmail.com"
+  // Devuelve "Monica Ferrari" o "" si no se puede parsear bien.
+  const parseSenderName = (sender) => {
+    if (!sender) return "";
+    const s = String(sender).trim();
+    const m = s.match(/^"?([^"<]+?)"?\s*<.+>$/);
+    if (m) return m[1].trim();
+    if (s.includes("@")) {
+      const local = s.split("@")[0];
+      return local.split(/[._]/)
+        .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+        .join(" ");
+    }
+    return s;
+  };
+
   const escapeHTML = (s) =>
     String(s || "")
       .replace(/&/g, "&amp;")
@@ -427,22 +460,42 @@
   }
 
   function renderContradictions(payload) {
+    // Bug fix UX: el render previo mostraba los slugs raw de los archivos
+    // (ej. "obsidian_rag_today_brief_4_instrucciones_contradictorias_..."
+    // y "vs obsidian_rag_home_brief_vacio_cuando_today_total_0_...") sin
+    // explicar la idea de "contradicción" ni mostrar la razón. El user no
+    // entendía el panel. Ahora:
+    //   - "Notas que se contradicen" como hint del panel (en el HTML).
+    //   - Título: nombre legible derivado del slug (under_score → words).
+    //   - Meta línea 1: "⟷ Otra nota" (legible también).
+    //   - Meta línea 2: "razón: <why del LLM>" (lo más importante — POR QUÉ).
     const items = payload.signals?.contradictions || [];
+    const slugToTitle = (s) => {
+      if (!s) return "";
+      const stem = s.split("/").pop().replace(/\.md$/, "");
+      return stem.replace(/_/g, " ")
+        .replace(/^obsidian rag /i, "")     // prefijo común en mem-vault
+        .replace(/\b\w/g, (c) => c.toUpperCase())
+        .slice(0, 80);
+    };
     const rows = items.slice(0, 6).map((it) => {
-      const subj = (it.subject_path || "").split("/").pop().replace(/\.md$/, "");
+      const subj = slugToTitle(it.subject_path);
       const tgt = (it.targets && it.targets[0]) || {};
+      const tgtTitle = slugToTitle(tgt.note || tgt.path || "");
+      const why = (tgt.why || "").trim();
       return {
-        title: subj,
+        title: `📝 ${subj}`,
         meta: [
-          tgt.note ? `vs ${tgt.note}` : null,
-          tgt.why ? tgt.why.slice(0, 60) : null,
+          tgtTitle ? `⟷ ${tgtTitle}` : null,
+          why ? `motivo: ${why.slice(0, 90)}` : null,
           it.ts ? fmtTimeAgo(it.ts) : null,
         ].filter(Boolean),
       };
     });
     renderPanelList("p-contradictions", rows, {
-      emptyText: "sin contradicciones detectadas",
+      emptyText: "sin contradicciones detectadas entre tus notas",
       capChip: rows.length > 0 ? "warning" : "info",
+      footText: rows.length ? "notas que se contradicen entre sí" : "",
     });
   }
 
@@ -960,6 +1013,11 @@
   }
 
   function renderCards(payload) {
+    // Renombrado de "Tarjetas · ciclo" → "Últimos gastos" a pedido del
+    // user. La data de cards.all_purchases_ars / all_purchases_usd ya
+    // viene en signals.cards[0]; solo cambiamos qué de eso mostramos.
+    // Listamos las top compras por monto descendente del último ciclo
+    // (las más relevantes), agrupadas por tarjeta cuando hay >1.
     const cards = payload.signals?.cards || [];
     const panel = document.getElementById("p-cards");
     if (!panel) return;
@@ -970,15 +1028,60 @@
       count.textContent = "—";
       return;
     }
-    const rows = cards.slice(0, 4).map((c) => ({
-      title: `${c.brand || ""} ····${c.last4 || "????"}`,
+
+    // Recolectar todas las purchases de todas las cards, ordenar por fecha desc
+    const allPurchases = [];
+    for (const c of cards) {
+      const cardLabel = `${c.brand || ""} ····${c.last4 || "????"}`;
+      for (const p of c.all_purchases_ars || c.top_purchases_ars || []) {
+        allPurchases.push({ ...p, _card: cardLabel, _curr: "ARS" });
+      }
+      for (const p of c.all_purchases_usd || c.top_purchases_usd || []) {
+        allPurchases.push({ ...p, _card: cardLabel, _curr: "USD" });
+      }
+    }
+    if (!allPurchases.length) {
+      body.innerHTML = `<div class="empty">sin movimientos en el último ciclo</div>`;
+      count.textContent = "—";
+      return;
+    }
+
+    // Sort: prioritize by date desc; el server ya los ordena pero por las dudas
+    allPurchases.sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+
+    // Limpiar descripciones tipo "Merpago*idilicadeco" → "Idilicadeco"
+    const cleanDesc = (s) => {
+      if (!s) return "";
+      return s
+        .replace(/^(Merpago|Mercpago|Payu|Dlo|Pago tic)\*+/i, "")
+        .replace(/\s+\d{6,}$/, "")
+        .replace(/\b\w/g, (c, i, str) => i === 0 || str[i-1] === " " ? c.toUpperCase() : c)
+        .slice(0, 50);
+    };
+    const fmtAmount = (n, curr) => curr === "USD"
+      ? `US$ ${Number(n).toFixed(2)}`
+      : `$${Math.round(Number(n)).toLocaleString("es-AR")}`;
+    const fmtDate = (d) => {
+      if (!d) return "";
+      try {
+        const dt = new Date(d + "T12:00");
+        return dt.toLocaleDateString("es-AR", { day: "2-digit", month: "short" });
+      } catch { return d; }
+    };
+
+    const showCardLabel = cards.length > 1;
+    const rows = allPurchases.slice(0, 6).map((p) => ({
+      title: cleanDesc(p.description),
       meta: [
-        c.due_date ? `due ${c.due_date}` : null,
-        c.next_closing_date ? `next close ${c.next_closing_date}` : null,
+        fmtDate(p.date),
+        showCardLabel ? p._card : null,
       ].filter(Boolean),
-      aside: c.balance_ars ? fmtCurrencyARS(c.balance_ars) : null,
+      aside: fmtAmount(p.amount, p._curr),
     }));
-    renderPanelList("p-cards", rows, {});
+    renderPanelList("p-cards", rows, {
+      footText: cards.length === 1 ? `${cards[0].brand} ····${cards[0].last4}` : `${cards.length} tarjetas`,
+    });
+    count.textContent = String(allPurchases.length);
   }
 
   function renderRetrievalHealth(payload) {
@@ -1102,14 +1205,61 @@
   }
 
   function renderAuthority(payload) {
-    const items = payload.signals?.pagerank_top || [];
-    const rows = items.slice(0, 5).map((it, i) => ({
-      title: `#${i + 1}  ${it.title || ""}`,
-      meta: [it.path ? it.path.split("/").slice(0, -1).join("/") : null].filter(Boolean),
-      aside: it.pr ? `pr ${it.pr.toFixed?.(2) || it.pr}` : null,
+    // Renombrado: "Autoridad · top 5" → "Top contactos · 7d" a pedido
+    // del user que no entendía qué significaba "autoridad" (era pagerank
+    // de notas — métrica técnica). El panel ahora muestra las personas
+    // con más interacción cross-source en la última semana, derivado de
+    // gmail.recent + whatsapp_unreplied (los chats activos pesan).
+    // Mucho más accionable: "estos son los que esperan respuesta".
+    //
+    // Usa los helpers `isBotOrSelf` y `parseSenderName` definidos al
+    // tope del IIFE — filtran github notifs, country club bots, y el
+    // propio user (forwards/sent que aparecen como "Fer F.").
+    const signals = payload.signals || {};
+    const counts = new Map();   // key=name → {sources:Set, count:int, lastTs}
+    for (const m of signals.gmail?.recent || []) {
+      if (isBotOrSelf(m.from)) continue;
+      const n = parseSenderName(m.from);
+      if (!n) continue;
+      const e = counts.get(n) || { sources: new Set(), count: 0, lastTs: 0 };
+      e.sources.add("📧"); e.count++;
+      e.lastTs = Math.max(e.lastTs, m.internal_date_ms || 0);
+      counts.set(n, e);
+    }
+    for (const w of signals.whatsapp_unreplied || []) {
+      const n = (w.name || "").trim();
+      if (!n || isBotOrSelf(n)) continue;
+      const e = counts.get(n) || { sources: new Set(), count: 0, lastTs: 0 };
+      e.sources.add("💬"); e.count++;
+      counts.set(n, e);
+    }
+    for (const m of signals.mail_unread || []) {
+      const sender = m.from || m.sender || "";
+      if (isBotOrSelf(sender)) continue;
+      const n = parseSenderName(sender);
+      if (!n) continue;
+      const e = counts.get(n) || { sources: new Set(), count: 0, lastTs: 0 };
+      e.sources.add("📬"); e.count++;
+      counts.set(n, e);
+    }
+
+    const tops = Array.from(counts.entries())
+      .sort((a, b) =>
+        (b[1].sources.size - a[1].sources.size) ||
+        (b[1].count - a[1].count) ||
+        (b[1].lastTs - a[1].lastTs)
+      )
+      .slice(0, 5);
+
+    const rows = tops.map(([name, e], i) => ({
+      title: `#${i + 1}  ${name}`,
+      meta: [
+        [...e.sources].join(" "),
+        `${e.count} ${e.count === 1 ? "mensaje" : "mensajes"}`,
+      ],
     }));
     renderPanelList("p-authority", rows, {
-      emptyText: "sin datos",
+      emptyText: "sin actividad de contactos esta semana",
     });
   }
 
@@ -1263,19 +1413,91 @@
   }
 
   function renderCaptured(payload) {
-    const items = payload.today?.evidence?.inbox_today || [];
-    // captured = inbox items modificados hoy
-    const today = new Date().toISOString().slice(0, 10);
-    const todayItems = items.filter((it) => (it.modified || "").startsWith(today));
-    const rows = todayItems.slice(0, 6).map((it) => ({
+    // Bug fix: si no hubo capturas hoy, el panel quedaba vacío con
+    // "nada capturado hoy" sin info útil. Fallback: si hoy=0, mostrar
+    // las últimas capturas de los últimos 7 días desde vault_activity
+    // filtradas por path 00-Inbox/. Cambiamos también el footer para
+    // indicar el rango cuando estamos en fallback mode.
+    const evidence = payload.today?.evidence || {};
+    const inboxToday = evidence.inbox_today || [];
+    // Fecha local (no UTC) para que el filtro "hoy" sea consistente con
+    // la realidad del usuario en ART.
+    const localToday = (() => {
+      const d = new Date();
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    })();
+    const todayItems = inboxToday.filter((it) =>
+      (it.modified || "").startsWith(localToday)
+    );
+
+    // Hoy hay capturas → mostrarlas (caso ideal)
+    if (todayItems.length > 0) {
+      const rows = todayItems.slice(0, 6).map((it) => ({
+        title: it.title || it.path,
+        meta: [
+          it.vault ? `[${it.vault}]` : null,
+          ...(it.tags || []).slice(0, 3).map((t) => `#${t}`),
+          fmtTimeAgo(it.modified),
+        ].filter(Boolean),
+      }));
+      renderPanelList("p-captured", rows, {
+        emptyText: "nada capturado hoy",
+        footText: "items en 00-Inbox · hoy",
+      });
+      return;
+    }
+
+    // Fallback: usar vault_activity (últimas 48h). Primero intentar
+    // filtrar por path de Inbox; si no hay matches (ej. el user no
+    // captó nada nuevo en 00-Inbox), mostrar las últimas notas del
+    // vault — es lo más cercano a "lo último que tocaste". Mejor que
+    // mentir "nada capturado".
+    const vaultAct = payload.signals?.vault_activity || {};
+    const allItems = [];
+    for (const [vaultName, items] of Object.entries(vaultAct)) {
+      if (!Array.isArray(items)) continue;
+      for (const it of items) {
+        allItems.push({ ...it, _vault: vaultName });
+      }
+    }
+    allItems.sort((a, b) => (b.modified || "").localeCompare(a.modified || ""));
+
+    // Primer pase: solo notas en Inbox-like folders
+    const inboxOnly = allItems.filter((it) => {
+      const p = it.path || "";
+      return /(?:^|\/)(00-Inbox|0-Inbox|Inbox|Clippings)\//.test(p)
+        || /^(00-Inbox|0-Inbox|Inbox|Clippings)\//.test(p);
+    });
+
+    let rows;
+    let footHint;
+    if (inboxOnly.length > 0) {
+      rows = inboxOnly.slice(0, 6);
+      footHint = "items en Inbox/Clippings · últimas 48h";
+    } else if (allItems.length > 0) {
+      // Sin items en Inbox pero hay actividad — mostrar últimas notas
+      rows = allItems.slice(0, 6);
+      footHint = "últimas notas tocadas · 48h";
+    } else {
+      renderPanelList("p-captured", [], {
+        emptyText: "sin actividad en los últimos 2 días",
+      });
+      return;
+    }
+
+    const hasMultipleVaults = Object.keys(vaultAct).length > 1;
+    const formattedRows = rows.map((it) => ({
       title: it.title || it.path,
       meta: [
-        ...(it.tags || []).slice(0, 3).map((t) => `#${t}`),
+        hasMultipleVaults ? `[${it._vault}]` : null,
+        it.path ? it.path.split("/").slice(0, -1).join("/") : null,
+        ...(it.tags || []).slice(0, 2).map((t) => `#${t}`),
         fmtTimeAgo(it.modified),
-      ],
+      ].filter(Boolean),
     }));
-    renderPanelList("p-captured", rows, {
-      emptyText: "nada capturado hoy",
+    renderPanelList("p-captured", formattedRows, {
+      emptyText: "sin actividad reciente",
+      footText: footHint,
     });
   }
 
@@ -1712,18 +1934,56 @@
     if (!panel) return;
     const correlations = payload.today?.correlations
       || payload.signals?.correlations
-      || null;
-    if (!correlations) {
-      panel.hidden = true;
-      return;
-    }
+      || {};
     const people = correlations.people || [];
     const topics = correlations.topics || [];
     const overlaps = correlations.time_overlaps || [];
     const gaps = correlations.gaps || [];
     const total = people.length + topics.length + overlaps.length + gaps.length;
+
+    // Fallback: si el correlator no encontró matches cross-source
+    // explícitos hoy, derivar "top contactos del día" cruzando los
+    // remitentes de gmail.recent + nombres de whatsapp_unreplied. Es
+    // útil aunque no sea una correlation formal — al menos el panel
+    // muestra a quiénes tenés que prestar atención hoy.
     if (total === 0) {
-      panel.hidden = true;
+      const signals = payload.signals || {};
+      const counts = new Map();   // name → {sources: Set, mentions: int}
+      for (const m of signals.gmail?.recent || []) {
+        if (isBotOrSelf(m.from)) continue;   // skip notifications/noreply/self
+        const n = parseSenderName(m.from);
+        if (!n) continue;
+        const e = counts.get(n) || { sources: new Set(), mentions: 0 };
+        e.sources.add("📧"); e.mentions++;
+        counts.set(n, e);
+      }
+      for (const w of signals.whatsapp_unreplied || []) {
+        const n = (w.name || "").trim();
+        if (!n || isBotOrSelf(n)) continue;
+        const e = counts.get(n) || { sources: new Set(), mentions: 0 };
+        e.sources.add("💬"); e.mentions++;
+        counts.set(n, e);
+      }
+      // Mostrar los top 5 — sin exigir cross-source, ya el correlator
+      // del LLM lo intentó arriba. Acá es "con quién tuviste contacto".
+      const tops = Array.from(counts.entries())
+        .sort((a, b) => (b[1].sources.size - a[1].sources.size) || (b[1].mentions - a[1].mentions))
+        .slice(0, 5);
+      if (tops.length === 0) {
+        panel.hidden = true;
+        return;
+      }
+      panel.hidden = false;
+      const body = panel.querySelector("[data-body]");
+      const count = panel.querySelector("[data-count]");
+      count.textContent = String(tops.length);
+      body.innerHTML = tops.map(([name, e]) => `
+        <div class="pattern-row">
+          <div>
+            <span class="pattern-name">👤 ${escapeHTML(name)}</span>
+            <span class="pattern-sources"> · ${[...e.sources].join(" ")} (${e.mentions} ${e.mentions === 1 ? "mensaje" : "mensajes"})</span>
+          </div>
+        </div>`).join("");
       return;
     }
     panel.hidden = false;

@@ -3914,6 +3914,28 @@ def _ollama_restart_if_stuck() -> bool:
     cuando el user usaba la .app version (sin homebrew daemon). Repro
     Playwright detectó hangs recurrentes que no se auto-curaban porque el
     restart no aplicaba al daemon real.
+
+    SPLIT-BRAIN FIX (2026-05-01): Un re-spawn ciego del daemon homebrew dejaba
+    al .app daemon original corriendo en paralelo. Ambos hacen `bind(SO_
+    REUSEPORT)` a `:11434` → el kernel load-balancea connections entre los
+    dos arbitrariamente. Resultado: requests del web server iban a un daemon
+    o al otro al azar; el "otro" tenía un set distinto de modelos cargados
+    (el .app no respeta `OLLAMA_MAX_LOADED_MODELS`/`KEEP_ALIVE` del
+    `launchctl setenv`). Cold-load del modelo no presente + KV cache reinit
+    → 90s timeout → "synthesis falló: timed out". Sucedía 1 de cada 2-3
+    chats post-recovery.
+
+    Forensics 2026-05-01 (user report DNI trámite):
+        $ pgrep -lf "ollama serve"
+        1887 /Applications/Ollama.app/Contents/Resources/ollama serve
+        53600 /opt/homebrew/opt/ollama/bin/ollama serve
+        $ lsof -nP -iTCP:11434 -sTCP:LISTEN
+        ollama 1887 ... TCP *:11434
+        ollama 53600 ... TCP 127.0.0.1:11434
+
+    Fix: KILL .app primero (siempre, aunque vayamos a usar homebrew). Si
+    homebrew estaba loaded, solo nos quedamos con homebrew. Si no, abrimos
+    .app desde cero. NUNCA dejamos los dos corriendo.
     """
     # Step 1: kill all runners forcefully (the .app's serve will respawn them
     # on next request). This handles the case where the runner is wedged but
@@ -3929,27 +3951,47 @@ def _ollama_restart_if_stuck() -> bool:
     # Step 2: detect deployment and restart serve.
     restarted = False
     # 2a) Homebrew daemon path.
+    homebrew_loaded = False
     try:
         result = subprocess.run(
             ["launchctl", "list"],
             capture_output=True, text=True, timeout=5, check=False,
         )
-        if result.returncode == 0 and "homebrew.mxcl.ollama" in result.stdout:
-            try:
-                subprocess.run(
-                    ["/opt/homebrew/bin/brew", "services", "restart", "ollama"],
-                    check=True, capture_output=True, timeout=30,
-                )
-                restarted = True
-            except Exception:
-                pass
+        homebrew_loaded = (
+            result.returncode == 0 and "homebrew.mxcl.ollama" in result.stdout
+        )
     except Exception:
         pass
+
+    if homebrew_loaded:
+        # SPLIT-BRAIN GUARD: si Ollama.app también está corriendo (LaunchServices
+        # no lo apagó cuando arrancamos homebrew), ambos se pelean por :11434.
+        # Mátalo antes de restartear homebrew. `pkill -f Ollama.app` cubre el
+        # GUI parent + el serve hijo + los runners.
+        try:
+            subprocess.run(
+                ["pkill", "-9", "-f", "/Applications/Ollama.app"],
+                capture_output=True, timeout=5, check=False,
+            )
+            # Pequeña espera para que el kernel libere los FDs del :11434.
+            time.sleep(1)
+        except Exception:
+            pass
+        try:
+            subprocess.run(
+                ["/opt/homebrew/bin/brew", "services", "restart", "ollama"],
+                check=True, capture_output=True, timeout=30,
+            )
+            restarted = True
+        except Exception:
+            pass
 
     # 2b) Ollama.app path — quit + reopen.
     if not restarted:
         try:
-            # Kill all ollama processes (.app + serve + runner).
+            # Kill all ollama processes (.app + serve + runner). Si había
+            # un homebrew daemon huérfano (residuo de un restart fallido),
+            # también lo matamos para evitar split-brain en el reopen.
             subprocess.run(
                 ["pkill", "-9", "-f", "ollama"],
                 capture_output=True, timeout=5, check=False,
@@ -3972,6 +4014,27 @@ def _ollama_restart_if_stuck() -> bool:
     # cold start takes 5-8s on Apple Silicon).
     for _ in range(24):
         if _ollama_alive(timeout=1.0):
+            # Sanity check: post-restart, should be exactly 1 daemon listening
+            # en :11434. Si el listener detecta 2+ procesos `ollama serve`,
+            # algo del split-brain guard arriba falló — log greppable y sigue
+            # (no abortamos, prefer "degraded mode" a "no chat", pero el log
+            # es la señal para que el operador investigue).
+            try:
+                ps_result = subprocess.run(
+                    ["pgrep", "-f", "ollama serve"],
+                    capture_output=True, text=True, timeout=3, check=False,
+                )
+                pids = [p for p in (ps_result.stdout or "").split() if p.strip()]
+                if len(pids) > 1:
+                    print(
+                        f"[ollama-restart-warn] split-brain detected post-restart: "
+                        f"{len(pids)} `ollama serve` PIDs running ({','.join(pids)}). "
+                        f"Expected 1. May cause request load-balancing across "
+                        f"daemons → intermittent timeouts.",
+                        flush=True,
+                    )
+            except Exception:
+                pass
             return True
         time.sleep(0.5)
     return False

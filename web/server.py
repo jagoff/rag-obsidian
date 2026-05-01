@@ -158,15 +158,33 @@ from rag import (  # noqa: E402
 )
 
 # Cosine band for the borderline reform-LLM gate. The lower bound matches
-# `TOPIC_SHIFT_COSINE` (0.40) — anything below already gets `history = []`
+# `TOPIC_SHIFT_COSINE` (0.32) — anything below already gets `history = []`
 # from `detect_topic_shift`, so the borderline case is "history kept but
-# cosine ≤ this upper bound". 0.7 chosen as the empirical threshold above
-# which user follow-ups are paraphrases / self-contained restatements
-# rather than elliptical references — measured 2026-04-26 on the chains
-# golden set: 0.585 ("listame los gastos en pesos" after "Cuanto devo a
-# la visa?") needed reform; 0.887 ("listame los gastos en pesos de la
-# visa") was already self-contained. 0.7 splits the two.
-REFORM_COSINE_HIGH = 0.70
+# cosine ≤ this upper bound". 0.5 was 0.7 hasta 2026-05-01 cuando un caso
+# concreto rompió el supuesto: cosine 0.55 entre "dame el nro de tramite
+# de mi DNI" y "que info tenes sobre crear una cuenta?" disparó el LLM
+# reformulator (porque caía en [0.32, 0.70]). El reformulator mezcló los
+# 2 topics → query reescrita arrastró "DNI" → retrieve trajo 00-Inbox/
+# Crear cuenta en china.md como top con conf=0.128 + LLM aluzinó
+# respuesta sobre DNI. Ver session web:f4a205c8dbda turno T2.
+#
+# Calibración previa (2026-04-26 chains golden set):
+#   0.585 ("listame los gastos en pesos" tras "Cuanto devo a la visa?")
+#         → cosine medio, paráfrasis real, necesitaba reform.
+#   0.887 ("listame los gastos en pesos de la visa") → autocontenido.
+#
+# Trade-off del cambio 0.70 → 0.50:
+#   - Antes: cualquier cosine [0.32, 0.70] reformulaba. Capturaba
+#     paráfrasis tipo 0.585 PERO también queries no-relacionadas con
+#     overlap léxico ruidoso (caso del DNI).
+#   - Ahora: cosine [0.32, 0.50] reformula. Cosine [0.50, 1.00] usa
+#     query raw. Paráfrasis reales suelen estar arriba de 0.55-0.60 →
+#     query raw funciona igual de bien (el contexto de history sigue
+#     en el prompt del LLM final). Queries weak-related en banda alta
+#     ya no se contaminan.
+#   - Si volvemos a ver "queries cortas perdiendo contexto": subir a
+#     0.55. Si vemos contaminación: bajar a 0.45.
+REFORM_COSINE_HIGH = 0.50
 
 from web.conversation_writer import write_turn, TurnData  # noqa: E402
 from web.tools import (  # noqa: E402
@@ -12302,6 +12320,16 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     # Nueva ubicación canónica desde 2026-04-25 — sistema vive
                     # bajo 99-AI/, fuera del PARA del user.
                     "04-Archive/99-obsidian-system/99-AI/conversations/",
+                    # mem-vault: memorias del agente sobre bugs/decisiones del
+                    # sistema. Son metadata interna, no contenido del user.
+                    # Sin este filtro, una memoria recién guardada puede volver
+                    # como source de la próxima query (observado 2026-05-01:
+                    # query "crear cuenta" trajo `obsidian_rag_preflight_
+                    # ollama_probe_post_restart...md` como source #4).
+                    "04-Archive/99-obsidian-system/99-AI/memory/",
+                    # Planning docs / specs / post-mortems internos del agente.
+                    # Mismo razonamiento que memory/: no son del user.
+                    "04-Archive/99-obsidian-system/99-AI/system/",
                 ),
                 intent=_intent_for_log,
                 caller="web",

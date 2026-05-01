@@ -7756,6 +7756,97 @@ def _fetch_sleep() -> dict | None:
     }
 
 
+def _fetch_mood() -> dict | None:
+    """Score diario de mood + sparkline 14d + drift status.
+
+    Source: tablas `rag_mood_signals` (granular) + `rag_mood_score_daily`
+    (agregado), pobladas por el daemon `com.fer.obsidian-rag-mood-poll`
+    (cada 30 min, opt-in via `~/.local/share/obsidian-rag/mood_enabled`).
+
+    Devuelve None cuando:
+      - `RAG_MOOD_ENABLED` env var no está prendido (feature off).
+      - El daemon nunca corrió y no hay rows en `rag_mood_score_daily`.
+      - El score de hoy tiene `n_signals=0` (daemon corrió pero no
+        encontró nada — no contaminamos el panel con un "neutro").
+
+    Cuando devuelve None, el frontend hidea el panel `p-mood` completo
+    (mismo patrón que Spotify/Sleep cuando no hay data).
+
+    Read-only — no escribe nada. El daemon hace todo el laburo pesado.
+    Cheap (~5ms): 2 SELECTs sobre la DB telemetry + cálculo de tendencia
+    en memoria.
+
+    Returns:
+      `{score: float, n_signals: int, sources_used: [str], trend: str,
+        week_avg: float, drift: dict, top_evidence: [...],
+        spark_score_14d: list, spark_dates_14d: list}` o `None`.
+    """
+    try:
+        from rag import mood as _mood
+    except Exception:
+        return None
+    if not _mood._is_mood_enabled():
+        return None
+    try:
+        today = _mood._today_local()
+        score_row = _mood.get_score_for_date(today)
+        if score_row is None or score_row.get("n_signals", 0) == 0:
+            return None
+        recent = _mood.get_recent_scores(days=14)
+        drift = _mood.recent_drift(days=7)
+    except Exception:
+        return None
+
+    # Trend = comparación con week_avg (similar a today_correlator pero
+    # acá lo dejamos accesible al frontend).
+    valid = [r for r in recent if r.get("n_signals", 0) > 0]
+    if valid:
+        week_avg = sum(r["score"] for r in valid) / len(valid)
+    else:
+        week_avg = score_row["score"]
+    delta = score_row["score"] - week_avg
+    if delta > 0.2:
+        trend = "improving"
+    elif delta < -0.2:
+        trend = "declining"
+    else:
+        trend = "stable"
+
+    # Sparkline 14d ordenado cronológicamente (oldest → newest) para
+    # que el frontend pueda graficar de izquierda a derecha. Filas con
+    # n_signals=0 → null (gap visual). El helper renderSparkline en el
+    # frontend ya skipea nulls correctamente.
+    by_date = {r["date"]: r for r in recent}
+    from datetime import datetime, timedelta
+    today_dt = datetime.strptime(today, "%Y-%m-%d")
+    dates: list[str] = []
+    spark: list[float | None] = []
+    for offset in range(13, -1, -1):
+        d = (today_dt - timedelta(days=offset)).strftime("%Y-%m-%d")
+        dates.append(d)
+        row = by_date.get(d)
+        if row is None or row.get("n_signals", 0) == 0:
+            spark.append(None)
+        else:
+            spark.append(round(row["score"], 3))
+
+    return {
+        "score": round(score_row["score"], 3),
+        "n_signals": score_row["n_signals"],
+        "sources_used": score_row.get("sources_used") or [],
+        "trend": trend,
+        "week_avg": round(week_avg, 3),
+        "drift": {
+            "drifting": bool(drift.get("drifting", False)),
+            "n_consecutive": int(drift.get("n_consecutive", 0)),
+            "avg_score": round(float(drift.get("avg_score", 0.0)), 3),
+        },
+        "top_evidence": (score_row.get("top_evidence") or [])[:3],
+        "spark_score_14d": spark,
+        "spark_dates_14d": dates,
+    }
+
+
 def _fetch_youtube_watched(n: int = 5, hours: int = 168) -> list[dict]:
     """Most-recent YouTube video pages opened in Chrome, last `hours` window.
 
@@ -9641,6 +9732,12 @@ def _home_compute(
         # el daemon `com.fer.obsidian-rag-ingest-pillow`). Hot path
         # ~10ms — single SELECT + cálculo en memoria. 3s budget defensivo.
         fut_sleep       = pool.submit(_timed, "sleep", _fetch_sleep)
+        # Mood: read-only desde rag_mood_score_daily (poblada cada 30min
+        # por el daemon `com.fer.obsidian-rag-mood-poll`, opt-in via
+        # state file). Devuelve None si feature off / daemon no opt-in /
+        # sin score hoy → frontend hidea el panel `p-mood`. Hot path
+        # ~5ms (2 SELECTs + agg en memoria).
+        fut_mood        = pool.submit(_timed, "mood", _fetch_mood)
 
         # Helper: wait on a future with budget, return default on timeout
         # or worker exception. Emits "timeout" progress event so the UI
@@ -9711,6 +9808,7 @@ def _home_compute(
         # esconde detrás de eso).
         spotify = _await("spotify", fut_spotify, 8, default=None)
         sleep = _await("sleep", fut_sleep, 3, default=None)
+        mood = _await("mood", fut_mood, 3, default=None)
 
         signals["pagerank_top"] = pagerank_top
         signals["chrome_top_week"] = chrome_top_week
@@ -9725,6 +9823,7 @@ def _home_compute(
         signals["youtube_watched"] = youtube_watched
         signals["spotify"] = spotify
         signals["sleep"] = sleep
+        signals["mood"] = mood
     finally:
         # Detach stragglers; they continue warming caches for the next call.
         # On SSE-client disconnect (cancel_event set), drop pending
@@ -9889,6 +9988,14 @@ def _home_compute(
         "signals": signals,
         "tomorrow_calendar": tomorrow_calendar,
         "weather_forecast": weather_forecast,
+        # Map alias → dir basename para que el frontend construya
+        # obsidian://open?vault=<dir>&file=<path> URLs correctos. Sin
+        # esto, el JS no sabe si "home" se traduce a "Notes" o a otro
+        # nombre. Obsidian usa el basename del directorio como vault
+        # name canónico.
+        "vault_dir_names": {
+            name: Path(p).name for name, p in (resolve_vault_paths(["all"]) or [])
+        },
     }
 
 

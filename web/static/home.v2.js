@@ -146,6 +146,59 @@
   // Panel helpers
   // ──────────────────────────────────────────────────────────────
 
+  // ──────────────────────────────────────────────────────────────
+  // URL builders — construye URLs accionables por tipo de item
+  // (nota → obsidian://, mail → gmail thread, WA → wa.me, etc).
+  // Cada renderer pasa `r.href` con el resultado para que la row
+  // entera sea clickeable.
+  // ──────────────────────────────────────────────────────────────
+
+  // Cache del map alias→dir-name del vault. El payload lo trae como
+  // `vault_dir_names`. Usamos `_currentPayload` que se setea en cada
+  // load() para que urlFor() pueda accederlo desde cualquier renderer.
+  let _currentPayload = null;
+
+  function obsidianUrl(path, vaultAlias) {
+    if (!path) return null;
+    const dirNames = _currentPayload?.vault_dir_names || {};
+    // Si el item tiene `vault: "home"` el dir name es "Notes" (basename
+    // del path absoluto del vault). El alias es para la UI; Obsidian
+    // necesita el dir name. Default: si no tenemos mapeo, usar el alias
+    // directamente — Obsidian fallback al primer vault que matche.
+    const dirName = dirNames[vaultAlias || ""]
+      || dirNames.home
+      || vaultAlias
+      || "Notes";
+    return `obsidian://open?vault=${encodeURIComponent(dirName)}`
+      + `&file=${encodeURIComponent(path)}`;
+  }
+
+  function gmailThreadUrl(threadId) {
+    if (!threadId) return null;
+    return `https://mail.google.com/mail/u/0/#inbox/${encodeURIComponent(threadId)}`;
+  }
+
+  function whatsappUrl(jid) {
+    // WhatsApp jid formats:
+    //   "5491155894168@s.whatsapp.net"   → individual con phone (linkable)
+    //   "5491155894168@c.us"             → individual legacy (linkable)
+    //   "5491155894168-1358009189@g.us"  → group (sin URL pública)
+    //   "143065847189596@lid"            → LID anónimo (no es phone)
+    //   "1234567890@broadcast"           → broadcast list (no linkable)
+    // Solo aceptamos los individuales con phone real.
+    if (!jid) return null;
+    const s = String(jid);
+    if (!/@(s\.whatsapp\.net|c\.us)$/.test(s)) return null;
+    const phone = s.split("@")[0].replace(/\D/g, "");
+    if (!phone || phone.length < 7) return null;   // sanity check
+    return `https://wa.me/${phone}`;
+  }
+
+  function youtubeUrl(videoId) {
+    if (!videoId) return null;
+    return `https://youtube.com/watch?v=${encodeURIComponent(videoId)}`;
+  }
+
   // Set a panel's body to a list of rows. Each row: {title, meta, aside, href}
   function renderPanelList(panelId, rows, opts = {}) {
     const panel = document.getElementById(panelId);
@@ -173,9 +226,6 @@
       );
     }
     body.innerHTML = rows.map((r) => {
-      const title = r.href
-        ? `<a href="${escapeHTML(r.href)}">${escapeHTML(r.title)}</a>`
-        : escapeHTML(r.title);
       const aside = r.aside ? `<span class="row-aside">${escapeHTML(r.aside)}</span>` : "";
       const meta = r.meta && r.meta.length
         ? `<div class="row-meta">${r.meta.map((m) =>
@@ -184,13 +234,24 @@
               : `<span class="${m.cls || ""}">${escapeHTML(m.text)}</span>`,
           ).join(" · ")}</div>`
         : "";
-      return `<div class="row">
-        <div class="row-main">
-          <div class="row-title">${title}</div>
+      // Cuando hay href, la ROW ENTERA es clickeable (no solo el title).
+      // Usamos <a class="row row--linked"> para que cualquier click en
+      // cualquier parte de la row navegue. target="_blank" para mails,
+      // urls, youtube; sin target para obsidian:// (la app maneja).
+      // Cursor pointer + hover via CSS class .row--linked.
+      const titleHTML = escapeHTML(r.title);
+      const inner = `<div class="row-main">
+          <div class="row-title">${titleHTML}</div>
           ${meta}
         </div>
-        ${aside}
-      </div>`;
+        ${aside}`;
+      if (r.href) {
+        const href = String(r.href);
+        const isExternal = /^https?:/.test(href);
+        const target = isExternal ? ' target="_blank" rel="noopener"' : "";
+        return `<a class="row row--linked" href="${escapeHTML(href)}"${target}>${inner}</a>`;
+      }
+      return `<div class="row">${inner}</div>`;
     }).join("");
     if (foot) foot.innerHTML = footText || "";
     return rows.length;
@@ -290,12 +351,14 @@
           ...(it.tags || []).map((t) => `#${t}`),
           fmtTimeAgo(it.modified),
         ].filter(Boolean),
+        href: obsidianUrl(it.path, it.vault),
       });
     }
     for (const m of gmailRecent.slice(0, 3)) {
       rows.push({
         title: `📧 ${fromName(m.from)}: ${truncate(m.subject || "", 70)}`,
         meta: [m.internal_date_ms ? fmtTimeAgo(new Date(m.internal_date_ms).toISOString()) : null].filter(Boolean),
+        href: gmailThreadUrl(m.thread_id),
       });
     }
     for (const w of waUnreplied.slice(0, 3)) {
@@ -305,6 +368,7 @@
           w.hours_waiting != null ? `${Math.round(w.hours_waiting)}h esperando` : null,
           truncate(w.last_snippet || "", 60),
         ].filter(Boolean),
+        href: whatsappUrl(w.jid),
       });
     }
     if (!rows.length && mailUnread.length) {
@@ -312,6 +376,9 @@
         rows.push({
           title: `📬 ${fromName(m.from || m.sender)}: ${truncate(m.subject || "", 70)}`,
           meta: [],
+          // Apple Mail usa scheme `message://` con message-id, pero no
+          // siempre lo tenemos. Fallback a Mail.app via mailto: del sender.
+          href: m.message_id ? `message:${encodeURIComponent(m.message_id)}` : null,
         });
       }
     }
@@ -347,6 +414,9 @@
           it.score != null ? `score ${(typeof it.score === "number" ? it.score : Number(it.score)).toFixed(2)}` : null,
           it.ts ? fmtTimeAgo(it.ts) : null,
         ].filter(Boolean),
+        // low-conf queries: linkear a /chat con la query pre-filled para
+        // que el user pueda re-preguntar.
+        href: text ? `/chat?q=${encodeURIComponent(text)}` : null,
       });
     }
     const contradList = newContrad.length ? newContrad : (Array.isArray(contradictions) ? contradictions : []);
@@ -356,6 +426,7 @@
       rows.push({
         title: `⚠ ${truncate(text, 90)}`,
         meta: [c.ts ? fmtTimeAgo(c.ts) : null].filter(Boolean),
+        href: obsidianUrl(c.subject_path || c.path, c.vault),
       });
     }
     if (!rows.length) {
@@ -368,6 +439,7 @@
             l.age_days != null ? `${l.age_days}d` : null,
             l.source_note ? l.source_note.split("/").pop().replace(/\.md$/, "") : null,
           ].filter(Boolean),
+          href: obsidianUrl(l.source_note, l.vault),
         });
       }
     }
@@ -437,6 +509,7 @@
              : `${Math.round(it.hours_since / 24)}d`)
           : null,
       ].filter(Boolean),
+      href: whatsappUrl(it.jid),
     }));
     renderPanelList("p-wa-unreplied", rows, {
       emptyText: "todo respondido",
@@ -452,6 +525,7 @@
         it.source_note ? it.source_note.split("/").pop().replace(/\.md$/, "") : null,
         it.extracted_at ? fmtTimeAgo(it.extracted_at) : null,
       ].filter(Boolean),
+      href: obsidianUrl(it.source_note, it.vault),
     }));
     renderPanelList("p-loops-urgent", rows, {
       emptyText: "ningún loop STALE",
@@ -490,6 +564,7 @@
           why ? `motivo: ${why.slice(0, 90)}` : null,
           it.ts ? fmtTimeAgo(it.ts) : null,
         ].filter(Boolean),
+        href: obsidianUrl(it.subject_path, it.vault),
       };
     });
     renderPanelList("p-contradictions", rows, {
@@ -1406,6 +1481,7 @@
         it.path ? it.path.split("/").slice(0, -1).join("/") : null,
         it.modified ? fmtTimeAgo(it.modified) : null,
       ].filter(Boolean),
+      href: obsidianUrl(it.path, it._vault),
     }));
     renderPanelList("p-vault-activity", rows, {
       emptyText: "sin actividad",
@@ -1439,6 +1515,7 @@
           ...(it.tags || []).slice(0, 3).map((t) => `#${t}`),
           fmtTimeAgo(it.modified),
         ].filter(Boolean),
+        href: obsidianUrl(it.path, it._vault || it.vault),
       }));
       renderPanelList("p-captured", rows, {
         emptyText: "nada capturado hoy",
@@ -1494,6 +1571,7 @@
         ...(it.tags || []).slice(0, 2).map((t) => `#${t}`),
         fmtTimeAgo(it.modified),
       ].filter(Boolean),
+      href: obsidianUrl(it.path, it._vault || it.vault),
     }));
     renderPanelList("p-captured", formattedRows, {
       emptyText: "sin actividad reciente",
@@ -1536,7 +1614,7 @@
       meta: [
         it.last_visit_iso ? fmtTimeAgo(it.last_visit_iso) : null,
       ].filter(Boolean),
-      href: it.url,
+      href: youtubeUrl(it.video_id) || it.url,
     }));
     renderPanelList("p-youtube", rows, { emptyText: "sin videos" });
   }
@@ -1549,7 +1627,7 @@
         it.modified ? fmtTimeAgo(it.modified) : null,
         it.owner_email ? it.owner_email.split("@")[0] : null,
       ].filter(Boolean),
-      href: it.link,
+      href: it.webViewLink || it.web_view_link || it.url || it.link || null,
     }));
     renderPanelList("p-drive", rows, { emptyText: "sin actividad reciente" });
   }
@@ -1917,6 +1995,9 @@
       const r = await fetch(url, { headers: { Accept: "application/json" } });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const payload = await r.json();
+      // Cache para que urlFor() y los renderers puedan acceder al
+      // map vault_dir_names sin tener que pasar payload explícito.
+      _currentPayload = payload;
       render(payload);
     } catch (err) {
       console.error("[home.v2] load failed:", err);

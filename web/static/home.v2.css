@@ -1583,6 +1583,45 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 
 
 /* ────────────────────────────────────────────────────────────
+   Row clickeable — cuando un row tiene URL accionable (nota,
+   mail, WA, video, bookmark, etc.) la row entera se vuelve <a>
+   y necesita estilos para no parecer texto plano + cursor pointer.
+   ──────────────────────────────────────────────────────────── */
+.row--linked {
+  display: flex;
+  text-decoration: none;
+  color: inherit;
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease-out);
+  /* Heredar el padding/border del .row default */
+}
+.row--linked:hover {
+  background: var(--bg-elev-2);
+}
+.row--linked:hover .row-title {
+  color: var(--cyan);
+}
+.row--linked:focus-visible {
+  outline: none;
+  background: var(--bg-elev-2);
+  box-shadow: inset 0 0 0 1px var(--border-focus);
+}
+/* Indicador chiquito a la derecha de que es clickeable */
+.row--linked .row-title::after {
+  content: "↗";
+  display: inline-block;
+  margin-left: 6px;
+  opacity: 0;
+  font-size: 11px;
+  color: var(--text-faint);
+  transition: opacity var(--dur-fast) var(--ease-out);
+  vertical-align: 1px;
+}
+.row--linked:hover .row-title::after {
+  opacity: 0.6;
+}
+
+/* ────────────────────────────────────────────────────────────
    Vault tag — chip pequeño "[home]" / "[work]" que aparece al
    lado de cada item del hero brief y del panel "Notas tocadas"
    cuando el user tiene >1 vault registrado. Discreto pero visible.

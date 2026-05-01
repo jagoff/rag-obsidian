@@ -372,15 +372,13 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
   transition: border-color var(--dur-base) var(--ease-out);
 }
 .panel:hover { border-color: var(--border-strong); }
-/* Paneles vacíos: dim + compacto. El user puede expandir manualmente
-   pero no roba atención visual cuando no hay items pendientes. */
+/* Paneles vacíos: ocultos completamente. Si no hay items, no mostrar
+   la caja — sino el grid se llena de placeholders "sin items" que
+   roban atención y agrandan el scroll. Si después llegan datos, el
+   renderer remueve `.is-empty` y el panel reaparece. */
 .panel.is-empty {
-  opacity: 0.45;
-  align-self: start;
+  display: none;
 }
-.panel.is-empty .panel-body { padding: var(--space-2) var(--space-3); min-height: 0; }
-.panel.is-empty .panel-foot { display: none; }
-.panel.is-empty:hover { opacity: 0.85; }
 
 .panel-head {
   display: flex;

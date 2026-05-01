@@ -1405,15 +1405,31 @@
 
   // Hero collapse toggle (Item A): click on the ▼/▶ button toggles
   // `data-collapsed` on the .today-hero and updates aria-expanded.
+  // Estado persistido en localStorage para que sobreviva al reload.
+  const LS_HERO_COLLAPSED = "home.v2.hero.collapsed.v1";
   document.addEventListener("DOMContentLoaded", () => {
     const heroToggle = document.getElementById("hero-toggle");
     if (!heroToggle) return;
     const hero = heroToggle.closest(".today-hero");
     if (!hero) return;
+    // Restaurar estado previo
+    try {
+      if (localStorage.getItem(LS_HERO_COLLAPSED) === "1") {
+        hero.setAttribute("data-collapsed", "true");
+        heroToggle.setAttribute("aria-expanded", "false");
+      }
+    } catch {}
     heroToggle.addEventListener("click", () => {
       const collapsed = hero.getAttribute("data-collapsed") === "true";
-      hero.setAttribute("data-collapsed", collapsed ? "false" : "true");
-      heroToggle.setAttribute("aria-expanded", collapsed ? "true" : "false");
+      const next = !collapsed;
+      hero.setAttribute("data-collapsed", next ? "true" : "false");
+      heroToggle.setAttribute("aria-expanded", next ? "false" : "true");
+      try {
+        if (next) localStorage.setItem(LS_HERO_COLLAPSED, "1");
+        else localStorage.removeItem(LS_HERO_COLLAPSED);
+      } catch {}
+      // Botón "↺ layout" aparece si hay layout custom
+      try { updateResetButtonVisibility(); } catch {}
     });
   });
 
@@ -1421,17 +1437,56 @@
   // toggles its parent .section's `data-collapsed`. On mobile we
   // start with Monitoring + Ambiente collapsed by default to reduce
   // initial scroll; user expands them with tap. Hero + Accionable
-  // stay expanded.
+  // stay expanded. Si el user toca el toggle, el estado persiste y le
+  // gana al default mobile (si ya guardó "false" en mobile, lo dejamos
+  // expandido aunque sea Monitoring/Ambient).
+  const LS_SECTIONS_COLLAPSED = "home.v2.sections.collapsed.v1";
+  function readSectionsCollapsed() {
+    try {
+      const raw = localStorage.getItem(LS_SECTIONS_COLLAPSED);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      return (parsed && typeof parsed === "object") ? parsed : {};
+    } catch { return {}; }
+  }
+  function writeSectionsCollapsed(map) {
+    try {
+      // Limpiar entries falsy para JSON chico
+      const trimmed = {};
+      for (const [k, v] of Object.entries(map)) if (v) trimmed[k] = true;
+      if (Object.keys(trimmed).length === 0) {
+        localStorage.removeItem(LS_SECTIONS_COLLAPSED);
+      } else {
+        localStorage.setItem(LS_SECTIONS_COLLAPSED, JSON.stringify(trimmed));
+      }
+    } catch {}
+  }
   function initCollapsibleSections() {
     const isMobile = window.matchMedia("(max-width: 720px)").matches;
+    const saved = readSectionsCollapsed();
     document.querySelectorAll(".section-toggle").forEach((btn) => {
       const section = btn.closest(".section");
       if (!section) return;
-      // Default-collapse Monitoring + Ambiente on mobile boot
-      if (isMobile && (
-        section.classList.contains("section-monitoring") ||
-        section.classList.contains("section-ambient")
-      )) {
+      // Identificar la sección por la clase específica (section-monitoring,
+      // section-ambient, section-accionable, etc) — la usamos como key
+      // estable en el localStorage.
+      const key = Array.from(section.classList).find(
+        (c) => c.startsWith("section-") && c !== "section",
+      );
+      if (!key) return;
+      // Decidir estado inicial: saved > default mobile > expandido.
+      // Hay key guardada: respetar lo que guardó el user (true o false).
+      // No hay key + mobile + monitoring/ambient: collapse default.
+      // Resto: expandido.
+      let shouldCollapse;
+      if (Object.prototype.hasOwnProperty.call(saved, key)) {
+        shouldCollapse = !!saved[key];
+      } else {
+        shouldCollapse = isMobile && (
+          key === "section-monitoring" || key === "section-ambient"
+        );
+      }
+      if (shouldCollapse) {
         section.setAttribute("data-collapsed", "true");
         btn.setAttribute("aria-expanded", "false");
       }
@@ -1439,8 +1494,16 @@
         // Permitir click en el toggle button sin scroll
         e.preventDefault();
         const collapsed = section.getAttribute("data-collapsed") === "true";
-        section.setAttribute("data-collapsed", collapsed ? "false" : "true");
-        btn.setAttribute("aria-expanded", collapsed ? "true" : "false");
+        const next = !collapsed;
+        section.setAttribute("data-collapsed", next ? "true" : "false");
+        btn.setAttribute("aria-expanded", next ? "false" : "true");
+        // Persistir el estado nuevo (true/false explícito, no solo
+        // collapsed: false sobrevive al default mobile).
+        const map = readSectionsCollapsed();
+        map[key] = next;
+        writeSectionsCollapsed(map);
+        // Botón "↺ layout" aparece si hay layout custom
+        try { updateResetButtonVisibility(); } catch {}
       });
     });
   }
@@ -3420,8 +3483,11 @@
   function clearSavedOrder() {
     try { localStorage.removeItem(LS_PANELS_ORDER); } catch {}
     // El bot\u00f3n "\u21ba orden" tambi\u00e9n limpia el estado de collapse \u2014 si el user
-    // dijo "resetear", quiere TODO el layout custom borrado, no s\u00f3lo el orden.
+    // dijo "resetear", quiere TODO el layout custom borrado: orden + paneles
+    // colapsados + hero colapsado + sections colapsadas.
     try { localStorage.removeItem(LS_PANELS_COLLAPSED); } catch {}
+    try { localStorage.removeItem(LS_HERO_COLLAPSED); } catch {}
+    try { localStorage.removeItem(LS_SECTIONS_COLLAPSED); } catch {}
     // Restore default DOM order — más simple recargar que reconstruir
     // el orden hard-coded del HTML.
     window.location.reload();
@@ -3626,7 +3692,14 @@
   function hasCustomLayout() {
     if (readSavedOrder()) return true;
     const map = readCollapsedMap();
-    return map && Object.keys(map).length > 0;
+    if (map && Object.keys(map).length > 0) return true;
+    // Hero collapsed o sections con estado guardado también cuentan
+    // como "layout custom" — el botón "↺ layout" debe aparecer.
+    try {
+      if (localStorage.getItem(LS_HERO_COLLAPSED) === "1") return true;
+      if (localStorage.getItem(LS_SECTIONS_COLLAPSED)) return true;
+    } catch {}
+    return false;
   }
 
   function updateResetButtonVisibility() {

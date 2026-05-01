@@ -7764,15 +7764,19 @@ def _fetch_mood() -> dict | None:
     (cada 30 min, opt-in via `~/.local/share/obsidian-rag/mood_enabled`).
 
     Devuelve None cuando:
-      - `RAG_MOOD_ENABLED` env var no está prendido (feature off).
       - El daemon nunca corrió y no hay rows en `rag_mood_score_daily`.
       - El score de hoy tiene `n_signals=0` (daemon corrió pero no
         encontró nada — no contaminamos el panel con un "neutro").
+      - La tabla no existe / DB inaccesible (silent-fail).
+
+    Read-only — no escribe nada. El feature gate (`RAG_MOOD_ENABLED` env
+    var + state file) vive en el daemon que es el único writer. El web
+    server es solo lector: si hay data en la DB, la mostramos. Si no
+    hay, hidea el panel.
 
     Cuando devuelve None, el frontend hidea el panel `p-mood` completo
     (mismo patrón que Spotify/Sleep cuando no hay data).
 
-    Read-only — no escribe nada. El daemon hace todo el laburo pesado.
     Cheap (~5ms): 2 SELECTs sobre la DB telemetry + cálculo de tendencia
     en memoria.
 
@@ -7784,8 +7788,6 @@ def _fetch_mood() -> dict | None:
     try:
         from rag import mood as _mood
     except Exception:
-        return None
-    if not _mood._is_mood_enabled():
         return None
     try:
         today = _mood._today_local()

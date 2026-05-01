@@ -1583,6 +1583,32 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 
 
 /* ────────────────────────────────────────────────────────────
+   Wikilinks en el narrative del LLM y prose en general — el
+   LLM escribe [[Nota]] y lo convertimos a <a class="wikilink"
+   href="obsidian://...">. Estilo distintivo (cyan suave, sin
+   underline) y cursor pointer, igual que un link normal.
+   ──────────────────────────────────────────────────────────── */
+.prose a,
+.hero-section .prose a {
+  color: var(--cyan);
+  text-decoration: none;
+  border-bottom: 1px dotted var(--cyan-dim, var(--border-strong));
+  transition: color var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out);
+}
+.prose a:hover,
+.hero-section .prose a:hover {
+  color: var(--phosphor);
+  border-bottom-color: var(--phosphor);
+}
+.prose a.wikilink::before,
+.hero-section .prose a.wikilink::before {
+  content: "📝 ";
+  font-size: 0.85em;
+  opacity: 0.7;
+}
+
+/* ────────────────────────────────────────────────────────────
    Row clickeable — cuando un row tiene URL accionable (nota,
    mail, WA, video, bookmark, etc.) la row entera se vuelve <a>
    y necesita estilos para no parecer texto plano + cursor pointer.
@@ -1638,4 +1664,188 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
   margin-left: 4px;
   vertical-align: 1px;
   user-select: none;
+}
+
+/* ────────────────────────────────────────────────────────────
+   Mood panel — score diario, sparkline 14d, sources, drift, top
+   evidence. Layout inspirado en .sleep-summary pero con foco en
+   el SCORE (un número) en lugar de stages. NO usa emojis grandes
+   ni botones interactivos: la idea es que sea un widget pasivo y
+   discreto. La transparencia viene de mostrar el número crudo
+   junto al label corto.
+   ──────────────────────────────────────────────────────────── */
+.mood-summary {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.mood-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+.mood-headline-row {
+  font-size: var(--fs-base);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Score badge: tono según severidad del valor. La gama matchea
+   la del sparkline (rojo=bajo, ámbar=tibio, neutro=gris,
+   verde=arriba) para que ambos signifiquen lo mismo visualmente. */
+.mood-score {
+  font-weight: 700;
+  font-family: var(--font-mono);
+  font-size: var(--fs-base);
+  padding: 2px 8px;
+  border-radius: 3px;
+}
+
+.mood-score-low { color: var(--red); background: color-mix(in srgb, var(--red) 12%, transparent); }
+.mood-score-tepid { color: var(--amber); background: color-mix(in srgb, var(--amber) 10%, transparent); }
+.mood-score-neutral { color: var(--text-dim); background: var(--bg-elev-2); }
+.mood-score-up { color: var(--green); background: color-mix(in srgb, var(--green) 10%, transparent); }
+.mood-score-high { color: var(--green); background: color-mix(in srgb, var(--green) 18%, transparent); }
+.mood-score-na { color: var(--text-faint); background: var(--bg-elev-2); }
+
+.mood-label {
+  color: var(--text-strong);
+  font-weight: 500;
+}
+
+.mood-trend {
+  font-size: var(--fs-mini);
+  font-weight: 500;
+  padding: 1px 6px;
+  border-radius: 2px;
+}
+
+.mood-trend.up    { color: var(--green); background: color-mix(in srgb, var(--green) 10%, transparent); }
+.mood-trend.down  { color: var(--red);   background: color-mix(in srgb, var(--red) 10%, transparent); }
+.mood-trend.stable { color: var(--text-dim); background: var(--bg-elev-2); }
+
+/* Sparkline mini-chart. Y-axis [-1, +1] — la línea media es
+   "neutro". Width grande para que la tendencia 14d sea legible. */
+.mood-sparkline {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  font-size: var(--fs-mini);
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.mood-sparkline .spark-svg {
+  flex-shrink: 0;
+  height: 28px;
+}
+
+.mood-sparkline .spark-meta {
+  white-space: nowrap;
+}
+
+/* Drift warning — banda ámbar similar a .sleep-insight pero
+   con texto factual sin diagnóstico. */
+.mood-drift {
+  font-size: var(--fs-mini);
+  padding: 4px 8px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--amber) 15%, transparent);
+  color: var(--amber);
+  border-left: 2px solid var(--amber);
+}
+
+.mood-drift .muted {
+  color: var(--text-dim);
+  font-weight: 500;
+}
+
+/* Sources chips — qué fuentes aportaron a hoy. Read-only. */
+.mood-sources {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  font-size: var(--fs-mini);
+}
+
+.mood-src {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 6px;
+  border-radius: 2px;
+  background: var(--bg-elev-2);
+  color: var(--text-dim);
+}
+
+.mood-src.empty {
+  color: var(--text-faint);
+  font-style: italic;
+}
+
+/* Top evidence — collapsable. Por default cerrado para no
+   abrumar el panel con detalle hasta que el user lo pida. */
+.mood-evidence {
+  font-size: var(--fs-mini);
+  color: var(--text-dim);
+}
+
+.mood-evidence summary {
+  cursor: pointer;
+  user-select: none;
+  color: var(--text-faint);
+  padding: 2px 0;
+}
+
+.mood-evidence summary:hover {
+  color: var(--text-dim);
+}
+
+.mood-evidence ul {
+  list-style: none;
+  margin: var(--space-1) 0 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.mood-evidence li {
+  display: grid;
+  grid-template-columns: 18px 1fr auto;
+  gap: var(--space-2);
+  align-items: baseline;
+  padding: 2px 0;
+}
+
+.mood-evidence li .src {
+  color: var(--text-faint);
+}
+
+.mood-evidence li .kind {
+  color: var(--text-dim);
+}
+
+.mood-evidence li .val {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-mini);
+}
+
+.mood-evidence li .val.pos        { color: var(--green); }
+.mood-evidence li .val.pos-strong { color: var(--green); font-weight: 600; }
+.mood-evidence li .val.neg        { color: var(--amber); }
+.mood-evidence li .val.neg-strong { color: var(--red); font-weight: 600; }
+.mood-evidence li .val.flat       { color: var(--text-faint); }
+
+.panel-mood .panel-foot code {
+  font-family: var(--font-mono);
+  font-size: var(--fs-mini);
+  color: var(--text-dim);
+  background: var(--bg-elev-2);
+  padding: 1px 4px;
+  border-radius: 2px;
 }

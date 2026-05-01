@@ -581,8 +581,35 @@
   // y renderemos cada uno en su columna.
   // ──────────────────────────────────────────────────────────────
 
-  // Strip [[wikilinks]] del texto para que marked no los rompa (no son
-  // markdown válido). Replico el helper que tiene v1.
+  // Convertir [[wikilinks]] del LLM a markdown link estándar
+  // [Label](obsidian://...) — antes los strippeábamos a texto plano,
+  // perdiendo la posibilidad de hacer click. Ahora abren la nota en
+  // Obsidian.app directamente. El user pidió: "las notas de obsidian
+  // pueden ser clickeables también".
+  //
+  // Casos:
+  //   [[Foo]]            → [Foo](obsidian://open?vault=Notes&file=Foo)
+  //   [[Foo|Display]]    → [Display](obsidian://open?vault=Notes&file=Foo)
+  //
+  // Vault name: el LLM no incluye el vault en el wikilink. Usamos el
+  // current vault (home), así Obsidian busca en ese vault primero. Si
+  // la nota está en el vault work, Obsidian igual la encuentra porque
+  // el `file=<nombre>` se resuelve por nombre, no por path absoluto.
+  function wikilinksToMarkdown(s) {
+    if (!s) return "";
+    return s
+      .replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, (_, target, label) => {
+        const url = obsidianUrl(target.trim());
+        return url ? `[${label.trim()}](${url})` : label.trim();
+      })
+      .replace(/\[\[([^\]]+)\]\]/g, (_, target) => {
+        const t = target.trim();
+        const url = obsidianUrl(t);
+        return url ? `[${t}](${url})` : t;
+      });
+  }
+  // Backwards-compat alias para callers que solo quieren el plain text
+  // (vault tag derivation, count, etc).
   function stripWikilinks(s) {
     if (!s) return "";
     return s.replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, "$2")
@@ -602,16 +629,32 @@
 
   function mdToHTML(md) {
     if (!md) return "";
-    const stripped = stripWikilinks(md);
+    // Convertir wikilinks A markdown ANTES de pasar a marked, para que
+    // [Label](obsidian://...) se renderee como <a> nativo. Después
+    // post-process para agregar target=_blank en URLs externas y class
+    // "wikilink" en obsidian:// (para CSS distinto si querés).
+    const withLinks = wikilinksToMarkdown(md);
     if (window.marked) {
       try {
-        return sanitizeHTML(window.marked.parse(stripped));
+        let html = window.marked.parse(withLinks);
+        html = sanitizeHTML(html);
+        // Marcar los links a obsidian:// con clase distintiva. Los http
+        // van a tab nueva. Skip los links internos (#anchor).
+        html = html.replace(
+          /<a\s+href="(obsidian:\/\/[^"]+)"/g,
+          '<a class="wikilink" href="$1"',
+        );
+        html = html.replace(
+          /<a\s+href="(https?:\/\/[^"]+)"(?![^>]*target=)/g,
+          '<a href="$1" target="_blank" rel="noopener"',
+        );
+        return html;
       } catch (e) {
         console.warn("[home.v2] marked.parse failed:", e);
       }
     }
-    // Fallback regex-based — peor pero suficiente.
-    return `<pre style="white-space:pre-wrap;font-family:inherit;margin:0;">${escapeHTML(stripped)}</pre>`;
+    // Fallback sin marked: strippear wikilinks a texto plano.
+    return `<pre style="white-space:pre-wrap;font-family:inherit;margin:0;">${escapeHTML(stripWikilinks(md))}</pre>`;
   }
 
   // Splittear el narrative en sus 4 sub-secciones por H2.
@@ -716,18 +759,27 @@
       const lines = [];
       const recent = (evidence.recent_notes || []).slice(0, 3);
       if (recent.length) {
-        lines.push("<p>Notas tocadas hoy:</p><ul>" + recent.map((n) =>
-          `<li><strong>${escapeHTML(n.title || n.path)}</strong>${vaultTag(n)}</li>`).join("") + "</ul>");
+        lines.push("<p>Notas tocadas hoy:</p><ul>" + recent.map((n) => {
+          const url = obsidianUrl(n.path, n.vault);
+          const titleHTML = `<strong>${escapeHTML(n.title || n.path)}</strong>${vaultTag(n)}`;
+          return `<li>${url ? `<a class="wikilink" href="${escapeHTML(url)}">${titleHTML}</a>` : titleHTML}</li>`;
+        }).join("") + "</ul>");
       }
       const ytWatched = (signals.youtube_watched || []).slice(0, 3);
       if (ytWatched.length) {
-        lines.push("<p>Videos que viste:</p><ul>" + ytWatched.map((v) =>
-          `<li>${escapeHTML(v.title || v.video_id || "")}</li>`).join("") + "</ul>");
+        lines.push("<p>Videos que viste:</p><ul>" + ytWatched.map((v) => {
+          const url = youtubeUrl(v.video_id);
+          const txt = escapeHTML(v.title || v.video_id || "");
+          return `<li>${url ? `<a href="${escapeHTML(url)}" target="_blank" rel="noopener">${txt}</a>` : txt}</li>`;
+        }).join("") + "</ul>");
       }
       const gmailRecent = (signals.gmail?.recent || []).slice(0, 3);
       if (gmailRecent.length) {
-        lines.push("<p>Mails recibidos:</p><ul>" + gmailRecent.map((m) =>
-          `<li><strong>${escapeHTML(fromName(m.from))}</strong>: ${escapeHTML(truncate(m.subject || "", 70))}</li>`).join("") + "</ul>");
+        lines.push("<p>Mails recibidos:</p><ul>" + gmailRecent.map((m) => {
+          const url = gmailThreadUrl(m.thread_id);
+          const inner = `<strong>${escapeHTML(fromName(m.from))}</strong>: ${escapeHTML(truncate(m.subject || "", 70))}`;
+          return `<li>${url ? `<a href="${escapeHTML(url)}" target="_blank" rel="noopener">${inner}</a>` : inner}</li>`;
+        }).join("") + "</ul>");
       }
       narrativeHTML = lines.join("");
     }
@@ -740,16 +792,26 @@
       inboxHTML = mdToHTML(split.inbox);
     } else {
       const items = [];
+      // Helper local para wrappear el contenido de un <li> en un link
+      // si tenemos URL accionable. Usa target=_blank para http(s).
+      const wrapLink = (url, innerHTML, isObsidian = false) => {
+        if (!url) return innerHTML;
+        const target = /^https?:/.test(url) ? ' target="_blank" rel="noopener"' : "";
+        const cls = isObsidian ? ' class="wikilink"' : "";
+        return `<a${cls} href="${escapeHTML(url)}"${target}>${innerHTML}</a>`;
+      };
       // Inbox del vault (puede venir de cualquiera de los vaults
       // registrados — el tag [home]/[work] aclara cuál si hay >1).
       for (const it of inboxItems.slice(0, 3)) {
         const tags = (it.tags || []).slice(0, 3)
           .map((t) => `<code>#${escapeHTML(t)}</code>`).join(" ");
-        items.push(`<li>📝 <strong>${escapeHTML(it.title || it.path)}</strong>${vaultTag(it)}${tags ? " " + tags : ""}</li>`);
+        const inner = `📝 <strong>${escapeHTML(it.title || it.path)}</strong>${vaultTag(it)}${tags ? " " + tags : ""}`;
+        items.push(`<li>${wrapLink(obsidianUrl(it.path, it.vault), inner, true)}</li>`);
       }
       // Mails VIP / recientes (gmail.recent suele incluir VIP)
       for (const m of (signals.gmail?.recent || []).slice(0, 3)) {
-        items.push(`<li>📧 <strong>${escapeHTML(fromName(m.from))}</strong>: ${escapeHTML(truncate(m.subject || "", 80))}</li>`);
+        const inner = `📧 <strong>${escapeHTML(fromName(m.from))}</strong>: ${escapeHTML(truncate(m.subject || "", 80))}`;
+        items.push(`<li>${wrapLink(gmailThreadUrl(m.thread_id), inner)}</li>`);
       }
       // WhatsApp esperando respuesta (los más viejos primero)
       const wa = [...(signals.whatsapp_unreplied || [])]
@@ -757,7 +819,8 @@
         .slice(0, 3);
       for (const w of wa) {
         const hrs = w.hours_waiting != null ? ` <em>(${Math.round(w.hours_waiting)}h)</em>` : "";
-        items.push(`<li>💬 <strong>${escapeHTML(w.name || "")}</strong>${hrs}: ${escapeHTML(truncate(w.last_snippet || "", 70))}</li>`);
+        const inner = `💬 <strong>${escapeHTML(w.name || "")}</strong>${hrs}: ${escapeHTML(truncate(w.last_snippet || "", 70))}`;
+        items.push(`<li>${wrapLink(whatsappUrl(w.jid), inner)}</li>`);
       }
       // Apple Mail unread (si hay y no se duplicó con gmail)
       const mailUnread = (signals.mail_unread || []).slice(0, 2);
@@ -777,13 +840,21 @@
       questionsHTML = mdToHTML(split.questions);
     } else {
       const items = [];
-      // Low-conf queries (queries que el RAG no contestó bien)
+      const wrapLink = (url, innerHTML, isObsidian = false) => {
+        if (!url) return innerHTML;
+        const target = /^https?:/.test(url) ? ' target="_blank" rel="noopener"' : "";
+        const cls = isObsidian ? ' class="wikilink"' : "";
+        return `<a${cls} href="${escapeHTML(url)}"${target}>${innerHTML}</a>`;
+      };
+      // Low-conf queries (queries que el RAG no contestó bien) → /chat?q=
       for (const q of lowConfItems.slice(0, 3)) {
         const text = q.q || q.question || q.text || "";
         const score = q.score != null
           ? ` <em>(${(typeof q.score === "number" ? q.score : Number(q.score)).toFixed(2)})</em>`
           : "";
-        items.push(`<li>❓ ${escapeHTML(text)}${score}</li>`);
+        const inner = `❓ ${escapeHTML(text)}${score}`;
+        const url = text ? `/chat?q=${encodeURIComponent(text)}` : null;
+        items.push(`<li>${wrapLink(url, inner)}</li>`);
       }
       // Cabos sueltos viejos (followup-aging stale ≥30d)
       const aging = signals.followup_aging || {};
@@ -791,21 +862,26 @@
       if (!items.length && stalePlus > 0) {
         items.push(`<li>⚠️ <strong>${stalePlus}</strong> loops STALE (≥30d sin avance)</li>`);
       }
-      // Contradicciones recientes (señales que el sistema detectó pero
-      // el user no resolvió todavía).
+      // Contradicciones recientes — clickeables a la nota subject
       const contrad = signals.contradictions || [];
       const newContrad = (evidence.new_contradictions || []).slice(0, 2);
       const allContrad = newContrad.length ? newContrad : (Array.isArray(contrad) ? contrad.slice(0, 2) : []);
       for (const c of allContrad) {
         const text = c.text || c.summary || c.title || c.note_a || "";
-        if (text) items.push(`<li>⚠ ${escapeHTML(truncate(text, 100))}</li>`);
+        if (!text) continue;
+        const inner = `⚠ ${escapeHTML(truncate(text, 100))}`;
+        const url = obsidianUrl(c.subject_path || c.path, c.vault);
+        items.push(`<li>${wrapLink(url, inner, true)}</li>`);
       }
-      // Loops activos (cosas en curso pendientes de cerrar)
+      // Loops activos — clickeables a la nota source
       if (!items.length) {
         const activo = (signals.loops_activo || []).slice(0, 3);
         for (const l of activo) {
           const txt = l.loop_text || l.text || l.title || "";
-          if (txt) items.push(`<li>🔄 ${escapeHTML(truncate(txt, 100))}</li>`);
+          if (!txt) continue;
+          const inner = `🔄 ${escapeHTML(truncate(txt, 100))}`;
+          const url = obsidianUrl(l.source_note, l.vault);
+          items.push(`<li>${wrapLink(url, inner, true)}</li>`);
         }
       }
       questionsHTML = items.length ? `<ul>${items.join("")}</ul>` : "";
@@ -1791,6 +1867,172 @@
     3: "bien",
   };
 
+  // Mood score → label corto sin ser paternalista.
+  // Cada label dura una sola palabra para no incentivar al usuario a leer
+  // demasiado en una etiqueta. El número crudo SIEMPRE va al lado para
+  // transparencia — preferimos no escudar el dato.
+  function moodLabel(score) {
+    if (score == null) return "—";
+    if (score <= -0.6) return "muy bajo";
+    if (score <= -0.3) return "bajo";
+    if (score <= -0.1) return "tibio";
+    if (score < 0.1)   return "neutro";
+    if (score < 0.3)   return "estable";
+    if (score < 0.6)   return "arriba";
+    return "alto";
+  }
+
+  // Score → CSS class para colorear el badge headline. Usa la misma
+  // gama que el sparkline (rojo → ámbar → neutro → verde) para que
+  // visualmente sean coherentes.
+  function moodScoreClass(score) {
+    if (score == null) return "mood-score-na";
+    if (score <= -0.4) return "mood-score-low";
+    if (score <= -0.1) return "mood-score-tepid";
+    if (score < 0.2)   return "mood-score-neutral";
+    if (score < 0.5)   return "mood-score-up";
+    return "mood-score-high";
+  }
+
+  // Trend → glyph + texto. NO verbaliza el dato emocional — solo dirección
+  // observada vs el promedio de los últimos 7 días.
+  function moodTrendBadge(trend) {
+    if (trend === "improving") return `<span class="mood-trend up">↑ subiendo</span>`;
+    if (trend === "declining") return `<span class="mood-trend down">↓ bajando</span>`;
+    return `<span class="mood-trend stable">· estable</span>`;
+  }
+
+  // Map source → emoji para chips compactos. Misma paleta que ya usamos
+  // en otros paneles (spotify=verde, journal=cuaderno, etc.).
+  const MOOD_SOURCE_EMOJI = {
+    spotify: "🎧",
+    journal: "📓",
+    wa_outbound: "💬",
+    queries: "🔍",
+    calendar: "📅",
+    pillow: "🌙",
+    manual: "✋",
+  };
+
+  // Map signal_kind → texto humano para evidence chips. NO usamos el
+  // valor del signal acá — solo el kind. Si quisiéramos más detalle,
+  // hay que abrir `rag mood explain` desde la CLI (link al final del panel).
+  const MOOD_KIND_LABEL = {
+    artist_mood_lookup: "artistas escuchados",
+    compulsive_repeat: "repetición de track",
+    late_night_listening: "música tarde",
+    keyword_negative: "palabras en notas",
+    note_sentiment: "tono journal",
+    tone_short: "WhatsApp corto",
+    existential_pattern: "queries del RAG",
+    density_overload: "agenda saturada",
+    back_to_back_meetings: "reuniones seguidas",
+    wakeup_mood: "despertar (Pillow)",
+    fatigue: "fatiga (Pillow)",
+    self_report: "self-report manual",
+  };
+
+  function renderMood(payload) {
+    const m = payload.signals?.mood;
+    const panel = document.getElementById("p-mood");
+    if (!panel) return;
+    if (!m || m.score == null) {
+      panel.hidden = true;
+      return;
+    }
+    panel.hidden = false;
+
+    // Headline: score numérico (transparencia) + label corto + trend.
+    const scoreClass = moodScoreClass(m.score);
+    const sign = m.score > 0 ? "+" : "";
+    const scoreText = `${sign}${m.score.toFixed(2)}`;
+    const labelText = moodLabel(m.score);
+
+    // Sparkline 14d. Y-axis [-1, +1] para que la línea media sea
+    // visualmente "neutro" y los gaps (días sin signals) queden vacíos.
+    const sparkVals = m.spark_score_14d || [];
+    const sparkSVG = renderSparkline(sparkVals, {
+      width: 160, height: 28, ymin: -1, ymax: 1,
+    });
+
+    // Sources chips — qué sources contribuyeron al score de hoy.
+    // Sin source = sin signal; el frontend muestra "—" en ese caso.
+    const sources = m.sources_used || [];
+    const sourcesHTML = sources.length
+      ? sources.map((s) => {
+          const emoji = MOOD_SOURCE_EMOJI[s] || "·";
+          return `<span class="mood-src">${emoji} ${escapeHTML(s)}</span>`;
+        }).join("")
+      : `<span class="mood-src empty">sin sources</span>`;
+
+    // Drift warning. Solo aparece cuando recent_drift devuelve
+    // drifting=true (≥3 días consecutivos con score ≤ -0.4). NO es
+    // diagnóstico — es un statement factual sobre el agregado.
+    const drift = m.drift || {};
+    const driftHTML = drift.drifting
+      ? `<div class="mood-drift" role="status">
+          ⚠ ${drift.n_consecutive} días consecutivos abajo del baseline
+          <span class="muted">(promedio ${drift.avg_score.toFixed(2)})</span>
+        </div>`
+      : "";
+
+    // Top evidence (top 3 signals que más contribuyeron al score).
+    // Mostramos el kind humanizado + el value crudo. Si la lista está
+    // vacía (sin top_evidence), ocultamos el bloque.
+    const topEvidence = m.top_evidence || [];
+    const evidenceHTML = topEvidence.length
+      ? `<details class="mood-evidence">
+          <summary>top ${topEvidence.length} señal(es)</summary>
+          <ul>${topEvidence.map((e) => {
+            const v = e.value;
+            const vSign = v > 0 ? "+" : "";
+            const vCls = v <= -0.5 ? "neg-strong"
+                       : v <= -0.2 ? "neg"
+                       : v >= 0.5 ? "pos-strong"
+                       : v >= 0.2 ? "pos"
+                       : "flat";
+            const kindHuman = MOOD_KIND_LABEL[e.signal_kind] || e.signal_kind;
+            const srcEmoji = MOOD_SOURCE_EMOJI[e.source] || "·";
+            return `<li>
+              <span class="src">${srcEmoji}</span>
+              <span class="kind">${escapeHTML(kindHuman)}</span>
+              <span class="val ${vCls}">${vSign}${v.toFixed(2)}</span>
+            </li>`;
+          }).join("")}</ul>
+        </details>`
+      : "";
+
+    const body = panel.querySelector("[data-body]");
+    body.innerHTML = `
+      <div class="mood-summary">
+        <div class="mood-row mood-headline-row">
+          <span class="mood-score ${scoreClass}">${scoreText}</span>
+          <span class="mood-label">${labelText}</span>
+          ${moodTrendBadge(m.trend)}
+        </div>
+        <div class="mood-sparkline">
+          ${sparkSVG}
+          <span class="muted spark-meta">14d · vs ${m.week_avg.toFixed(2)} (7d avg)</span>
+        </div>
+        ${driftHTML}
+        <div class="mood-sources">${sourcesHTML}</div>
+        ${evidenceHTML}
+      </div>
+    `;
+
+    // Count chip = n_signals que dispararon el score (transparencia).
+    const countEl = panel.querySelector("[data-count]");
+    if (countEl) countEl.textContent = m.n_signals;
+
+    // Footer: link a docs (CLI) para que el user pueda investigar más.
+    const foot = panel.querySelector("[data-foot]");
+    if (foot) {
+      foot.innerHTML = `<span class="muted">
+        ver detalles: <code>rag mood explain</code>
+      </span>`;
+    }
+  }
+
   function renderSleep(payload) {
     const sleep = payload.signals?.sleep;
     const panel = document.getElementById("p-sleep");
@@ -2149,6 +2391,7 @@
     renderDrive(payload);
     renderSpotify(payload);
     renderSleep(payload);
+    renderMood(payload);
   }
 
   // Auto-refresh cada 5 min

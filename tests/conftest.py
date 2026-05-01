@@ -279,6 +279,39 @@ def _isolate_vault_path(tmp_path_factory, request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_index_process_lock(tmp_path_factory, monkeypatch):
+    """2026-05-01: el process-level mutex `INDEX_PROCESS_LOCK` (introducido
+    por el Fix #2 del incidente del chat web) protege contra dos `rag index`
+    corriendo en paralelo y saturando Ollama. Apunta por default a
+    `~/.local/share/obsidian-rag/index.lock`.
+
+    Bug de la suite cuando este lock es real:
+      1. El plist `com.fer.obsidian-rag-ingest-safari` corre cada 6h y, si
+         está activo, toma el flock con su propio PID.
+      2. Tests que invocan `CliRunner().invoke(rag.index, ...)` —
+         `test_ingest_whatsapp.py`, `test_ingest_gmail.py`, `test_ingest_calendar.py`,
+         etc. — llaman al verdadero CLI command, que adquiere el lock real.
+      3. Si el plist está activo (cualquier momento del día), el primer
+         `CliRunner` rebota con `Otro rag index activo` → exit 1 → assertion
+         fail.
+      4. Aún sin plist activo: el PRIMER test que invoca `rag.index` y
+         retorna por una rama temprana (ej. `--source facebook` → `Fuente
+         inválida`) deja el lock file con texto stale (PID del pytest
+         worker). El SEGUNDO test que invoque `rag.index` ve el lock libre
+         (flock se libera al close del fh) pero el holder text dice el PID
+         del primer test — confuso para debug.
+
+    Fix: redirigir `INDEX_PROCESS_LOCK` a un path único por test, así cada
+    test invoca `rag.index` con su propio lock aislado del sistema real
+    Y de los otros tests.
+    """
+    import rag as _rag
+    tmp = tmp_path_factory.mktemp("index_lock") / "index.lock"
+    monkeypatch.setattr(_rag, "INDEX_PROCESS_LOCK", tmp)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_silent_errors_log(tmp_path_factory):
     """Evita que los tests que ejercen paths con `_silent_log` (session
     JSON corrupto, ranker.json corrupto, synthetic_q_cache corrupto,

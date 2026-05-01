@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -72,6 +73,29 @@ _started = False
 _start_lock = threading.Lock()
 _last_restart_ts: float = 0.0
 _last_restart_lock = threading.Lock()
+
+# Contador de checks consecutivos donde el watchdog detectó degradación
+# (ratio >= threshold) pero NO pudo restartear porque los gates bloquearon
+# (in_flight chats, cooldown). Se resetea cuando un check vuelve al estado
+# `ok`. Cuando llega a `ESCALATE_KILL_AFTER_SKIPS` (default 10 → ~5 min),
+# el watchdog escala a un kill heurístico de `rag index` clients que estén
+# ESTABLISHED contra :11434 — la asunción es que un `rag index` colgado en
+# `sock_recv` por >5min mientras el chat está degradado SOSTENIDO es la
+# causa raíz, no un index legítimamente progresando.
+#
+# Por qué este escalado existe: 2026-05-01, una sesión devin paralela
+# dejó un `rag index --no-contradict` en bash retry-loop que se quedó en
+# `__recvfrom` 1.5h. El gate `in_flight_guard` (correctamente diseñado
+# para no cortar streams /api/chat) impidió cualquier restart de ollama,
+# y el chat del user quedó pegado eternamente. Con el Fix #1 (timeout 120s
+# en `embed()`) ese caso ya no debería existir, pero este escalado es
+# defensa de último recurso por si aparece otro consumer de Ollama no
+# protegido.
+_consecutive_degraded_skips = 0
+_consecutive_skips_lock = threading.Lock()
+ESCALATE_KILL_AFTER_SKIPS = int(
+    os.environ.get("RAG_LATENCY_WATCHDOG_ESCALATE_AFTER", "10")
+)
 
 # Persistencia de `_last_restart_ts` en disco (2026-05-01).
 #
@@ -217,6 +241,118 @@ def _read_recent_query_latencies(window_minutes: int) -> tuple[list[float], list
     return recent, baseline
 
 
+def _list_ollama_clients() -> list[tuple[int, str]]:
+    """Best-effort: lista (PID, command) de procesos con conexión TCP
+    abierta a `localhost:11434`, EXCLUYENDO el daemon ollama.
+
+    Implementación: `lsof -i :11434 -P -F pcn` parseado a mano (no hay
+    libs estándar para esto sin dependencias extra). Si lsof falla por
+    cualquier razón (no instalado, sandbox, permisos), devuelve `[]` —
+    el caller trata `[]` como "no hay zombies que matar".
+
+    Returns: lista de tuplas `(pid, full_command)`. PIDs únicos. El
+    comando es el output de `ps -p <pid> -o command=` (sin truncar).
+    """
+    try:
+        result = subprocess.run(
+            ["lsof", "-i", ":11434", "-P", "-F", "pc"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except Exception:
+        return []
+    if result.returncode != 0:
+        return []
+    pids: set[int] = set()
+    cmd_by_pid: dict[int, str] = {}
+    current_pid: int | None = None
+    for line in result.stdout.splitlines():
+        if not line:
+            continue
+        tag, rest = line[0], line[1:]
+        if tag == "p":
+            try:
+                current_pid = int(rest)
+            except ValueError:
+                current_pid = None
+        elif tag == "c" and current_pid is not None:
+            cmd = rest.strip()
+            # Skip the ollama daemon + ollama runners themselves.
+            if "ollama" in cmd.lower():
+                continue
+            pids.add(current_pid)
+            cmd_by_pid[current_pid] = cmd
+    # Get full command for each PID (lsof's `c` field truncates at 9 chars
+    # which is useless for "rag index --foo" detection).
+    out: list[tuple[int, str]] = []
+    for pid in pids:
+        try:
+            ps = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "command="],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+        except Exception:
+            continue
+        if ps.returncode != 0:
+            continue
+        full_cmd = ps.stdout.strip()
+        if full_cmd:
+            out.append((pid, full_cmd))
+    return out
+
+
+def _kill_stuck_rag_index_clients() -> tuple[int, list[int]]:
+    """Best-effort: matar `rag index` clients que estén con conexión
+    abierta a Ollama mientras el watchdog detectó degradación sostenida.
+
+    Heurística: si después de >5min de degradación (`ESCALATE_KILL_AFTER_SKIPS`
+    checks consecutivos en estado degraded sin poder restartear), hay un
+    proceso cuyo full command incluye `rag index` Y tiene conexión a
+    `:11434`, asumimos que es un zombie en `sock_recv` (Fix #1 hace que
+    los `rag index` legítimos terminen en <120s por request, así que un
+    rag index activo >5min hablando con Ollama es altamente sospechoso).
+
+    Procedure:
+      1. SIGTERM a todos los matches.
+      2. Esperar 5s para que terminen graceful.
+      3. SIGKILL a los survivors.
+
+    Returns: `(count_targeted, [pids])` — count incluye cualquier PID al
+    que se le mandó SIGTERM, vivan o no después.
+
+    NEVER kills the web server (`uvicorn`/`python -m web.server` etc.) ni
+    ningún proceso cuyo command no matchee `rag index` exactamente.
+    """
+    clients = _list_ollama_clients()
+    targets: list[int] = []
+    for pid, cmd in clients:
+        # Match conservador: el ÚNICO comando que matamos es `rag index`.
+        # `rag query` interactivo, `rag chat`, `python -m web.server` y
+        # cualquier otro consumer de Ollama queda intacto.
+        if "rag index" in cmd or "rag.py index" in cmd:
+            targets.append(pid)
+    if not targets:
+        return 0, []
+    for pid in targets:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    time.sleep(5)
+    survivors: list[int] = []
+    for pid in targets:
+        try:
+            os.kill(pid, 0)  # signal 0 = "still alive?"
+            survivors.append(pid)
+        except OSError:
+            pass  # already dead
+    for pid in survivors:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    return len(targets), targets
+
+
 def _restart_ollama_daemon() -> tuple[bool, str]:
     """Reinicia el daemon ollama. Retorna (ok, detail).
 
@@ -325,6 +461,10 @@ def _latency_degradation_check(
     ratio = p95_recent / p95_baseline
     out["ratio"] = round(ratio, 2)
     if ratio < threshold:
+        # Ollama está sano — resetear contador de skips sostenidos.
+        global _consecutive_degraded_skips
+        with _consecutive_skips_lock:
+            _consecutive_degraded_skips = 0
         out["action"] = "ok"
         out["reason"] = f"ratio={ratio:.2f} < threshold={threshold}"
         return out
@@ -334,26 +474,53 @@ def _latency_degradation_check(
     # y la query muere. Skipear acá deja al request actual completar;
     # el próximo check (30s) re-evalúa con el counter en cero.
     n_in_flight = in_flight_chats()
-    if n_in_flight > 0:
+    skipped_for_in_flight = n_in_flight > 0
+    if skipped_for_in_flight:
         out["action"] = "restart_skipped_in_flight"
         out["reason"] = f"in_flight={n_in_flight}"
-        return out
-    # Gate (b): cooldown.
-    global _last_restart_ts
-    with _last_restart_lock:
-        now_t = time.time()
-        if now_t - _last_restart_ts < cooldown_seconds:
-            out["action"] = "restart_skipped_cooldown"
-            out["reason"] = f"last_restart_was_{int(now_t - _last_restart_ts)}s_ago"
-            return out
-        _last_restart_ts = now_t
-    # Persistir EN CUANTO seteamos el ts en memoria — antes de bouncear
-    # el daemon — para que aunque el restart cause efectos colaterales
-    # (web server crashea, plist reload, etc.) el cooldown ya esté escrito.
-    _persist_restart_ts(now_t)
-    ok, detail = _restart_ollama_daemon()
-    out["action"] = "restart_attempted"
-    out["reason"] = f"restart_ok={ok} detail={detail}"
+    else:
+        # Gate (b): cooldown.
+        global _last_restart_ts
+        with _last_restart_lock:
+            now_t = time.time()
+            if now_t - _last_restart_ts < cooldown_seconds:
+                out["action"] = "restart_skipped_cooldown"
+                out["reason"] = f"last_restart_was_{int(now_t - _last_restart_ts)}s_ago"
+            else:
+                _last_restart_ts = now_t
+                # Persistir EN CUANTO seteamos el ts en memoria — antes de
+                # bouncear el daemon — para que aunque el restart cause
+                # efectos colaterales (web server crashea, plist reload,
+                # etc.) el cooldown ya esté escrito.
+                _persist_restart_ts(now_t)
+                ok, detail = _restart_ollama_daemon()
+                out["action"] = "restart_attempted"
+                out["reason"] = f"restart_ok={ok} detail={detail}"
+                # Restart actually fired — reset el contador de degraded
+                # skips porque el sistema está post-restart fresh.
+                with _consecutive_skips_lock:
+                    _consecutive_degraded_skips = 0
+                return out
+    # Estamos en un skip (in_flight o cooldown) AND degradados. Incrementar
+    # contador y, si pasamos el threshold, escalar a kill de zombies.
+    with _consecutive_skips_lock:
+        _consecutive_degraded_skips += 1
+        skips = _consecutive_degraded_skips
+        should_escalate = skips >= ESCALATE_KILL_AFTER_SKIPS
+        if should_escalate:
+            _consecutive_degraded_skips = 0  # reset post-escalation
+    if should_escalate:
+        prev_action = out["action"]  # captura antes de reasignar
+        n_killed, pids = _kill_stuck_rag_index_clients()
+        out["action"] = "escalated_killed_rag_index"
+        out["reason"] = (
+            f"degraded_skips={skips} prev_action={prev_action} "
+            f"killed={n_killed} pids={pids}"
+        )
+    else:
+        # Stamp el counter en la reason para visibilidad en logs sin
+        # cambiar el action (queda como `restart_skipped_*`).
+        out["reason"] = f"{out['reason']} degraded_skips={skips}/{ESCALATE_KILL_AFTER_SKIPS}"
     return out
 
 
@@ -377,6 +544,7 @@ def _watchdog_loop(
                 "restart_attempted",
                 "restart_skipped_cooldown",
                 "restart_skipped_in_flight",
+                "escalated_killed_rag_index",
             ):
                 print(
                     f"[ollama-health-watchdog] {result['action']}: "

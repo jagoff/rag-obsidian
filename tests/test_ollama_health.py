@@ -265,3 +265,236 @@ class TestPersistedRestartTs:
         ok = health.start_latency_degradation_watchdog()
         assert ok is True
         assert health._last_restart_ts == 0.0
+
+
+class TestEscalateKillRagIndex:
+    """Watchdog escala a kill de `rag index` zombies cuando la degradación
+    persiste sostenidamente Y los gates (in_flight / cooldown) bloquean
+    el restart de Ollama. Esto es defensa en profundidad contra el bug
+    del 2026-05-01 (sesión devin huérfana en otra TTY mantenía un index
+    en `recvfrom` 1.5h, saturando Ollama; el chat del user quedó pegado
+    porque el `in_flight_guard` impedía el restart correctamente — pero
+    nadie mataba al consumer real)."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_counter(self):
+        """Aislar tests: reset el counter global antes de cada uno."""
+        health._consecutive_degraded_skips = 0
+        yield
+        health._consecutive_degraded_skips = 0
+
+    def _setup_degraded(self, monkeypatch):
+        """Helper: simula degradación sostenida + in_flight chat para que
+        el check siempre devuelva `restart_skipped_in_flight`."""
+        monkeypatch.setattr(
+            health, "_read_recent_query_latencies",
+            lambda window_minutes: ([200_000] * 10, [50_000] * 50),
+        )
+        monkeypatch.setattr(health, "_in_flight_count", 1)
+
+    def test_skips_increment_counter(self, monkeypatch):
+        """Cada check degraded incrementa `_consecutive_degraded_skips`."""
+        self._setup_degraded(monkeypatch)
+        for expected in range(1, 5):
+            result = health._latency_degradation_check(threshold=1.8)
+            assert result["action"] == "restart_skipped_in_flight"
+            assert health._consecutive_degraded_skips == expected
+            assert f"degraded_skips={expected}/" in result["reason"]
+
+    def test_ok_resets_counter(self, monkeypatch):
+        """Cuando el ratio vuelve a < threshold, el counter se resetea
+        para evitar disparar la escalation a partir de skips de hace
+        horas que ya quedaron stale."""
+        self._setup_degraded(monkeypatch)
+        # 5 skips degraded
+        for _ in range(5):
+            health._latency_degradation_check(threshold=1.8)
+        assert health._consecutive_degraded_skips == 5
+        # Ahora simular recovery: ratio < threshold
+        monkeypatch.setattr(
+            health, "_read_recent_query_latencies",
+            lambda window_minutes: ([60_000] * 10, [50_000] * 50),
+        )
+        result = health._latency_degradation_check(threshold=1.8)
+        assert result["action"] == "ok"
+        assert health._consecutive_degraded_skips == 0
+
+    def test_escalates_after_threshold_skips(self, monkeypatch):
+        """Tras `ESCALATE_KILL_AFTER_SKIPS` skips consecutivos, el watchdog
+        escala a `_kill_stuck_rag_index_clients` y resetea el counter."""
+        self._setup_degraded(monkeypatch)
+        kill_calls: dict[str, int] = {"count": 0}
+
+        def fake_kill():
+            kill_calls["count"] += 1
+            return 2, [11111, 22222]
+
+        monkeypatch.setattr(health, "_kill_stuck_rag_index_clients", fake_kill)
+        monkeypatch.setattr(health, "ESCALATE_KILL_AFTER_SKIPS", 5)
+
+        # 4 skips: counter sube, NO escala
+        for _ in range(4):
+            r = health._latency_degradation_check(threshold=1.8)
+            assert r["action"] == "restart_skipped_in_flight"
+        assert kill_calls["count"] == 0
+
+        # 5to skip: hits threshold → escala
+        result = health._latency_degradation_check(threshold=1.8)
+        assert result["action"] == "escalated_killed_rag_index"
+        assert kill_calls["count"] == 1
+        assert "killed=2" in result["reason"]
+        assert "11111" in result["reason"]
+        assert "prev_action=restart_skipped_in_flight" in result["reason"]
+        # Counter reset post-escalation
+        assert health._consecutive_degraded_skips == 0
+
+    def test_restart_attempted_resets_counter(self, monkeypatch):
+        """Si los gates eventualmente liberan y el restart se ejecuta,
+        el counter se resetea — no queremos escalar a kill JUSTO después
+        de un restart que apenas se firmó."""
+        # Primero unos skips degraded
+        self._setup_degraded(monkeypatch)
+        for _ in range(3):
+            health._latency_degradation_check(threshold=1.8)
+        assert health._consecutive_degraded_skips == 3
+        # Ahora liberar el gate (in_flight=0, cooldown=0) y mockear restart
+        monkeypatch.setattr(health, "_in_flight_count", 0)
+        monkeypatch.setattr(health, "_last_restart_ts", 0.0)
+        monkeypatch.setattr(health, "_restart_ollama_daemon", lambda: (True, "mock"))
+        result = health._latency_degradation_check(
+            threshold=1.8, cooldown_seconds=0,
+        )
+        assert result["action"] == "restart_attempted"
+        # Counter reset post-restart real
+        assert health._consecutive_degraded_skips == 0
+
+
+class TestListOllamaClients:
+    """`_list_ollama_clients()` parsea `lsof -i :11434 -P -F pc` y devuelve
+    los PIDs no-ollama hablando con el daemon."""
+
+    def test_returns_empty_when_lsof_missing(self, monkeypatch):
+        def fake_run(cmd, **kw):
+            raise FileNotFoundError("lsof not installed")
+        monkeypatch.setattr(health.subprocess, "run", fake_run)
+        assert health._list_ollama_clients() == []
+
+    def test_returns_empty_when_lsof_fails(self, monkeypatch):
+        class FakeResult:
+            returncode = 1
+            stdout = ""
+            stderr = "lsof: error"
+        monkeypatch.setattr(
+            health.subprocess, "run",
+            lambda *a, **kw: FakeResult(),
+        )
+        assert health._list_ollama_clients() == []
+
+    def test_excludes_ollama_self(self, monkeypatch):
+        """El daemon ollama y los runners NO deben aparecer como clients."""
+        # First call: lsof — return ollama daemon + a python rag index
+        # Second call: ps -p <pid> for python (ollama gets skipped before ps)
+        lsof_output = (
+            "p1234\n"   # ollama daemon
+            "collama\n"
+            "p5678\n"   # ollama runner
+            "collama-runner\n"
+            "p9999\n"   # rag index
+            "cpython3.1\n"  # truncated lsof field
+        )
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kw):
+            calls.append(list(cmd))
+            class R:
+                returncode = 0
+                stdout = lsof_output if "lsof" in cmd else "/path/python3 /bin/rag index --foo\n"
+                stderr = ""
+            return R()
+
+        monkeypatch.setattr(health.subprocess, "run", fake_run)
+        clients = health._list_ollama_clients()
+        # Solo el PID 9999 sobrevive al filtro
+        assert len(clients) == 1
+        assert clients[0][0] == 9999
+        assert "rag index" in clients[0][1]
+
+
+class TestKillStuckRagIndexClients:
+    """`_kill_stuck_rag_index_clients()` SOLO mata procesos cuyo command
+    matchea `rag index` literal. Cualquier otro consumer de Ollama (web
+    server, rag watch, rag chat, etc.) queda intacto — la heurística es
+    conservadora a propósito para minimizar false positives."""
+
+    def test_no_targets_means_no_kills(self, monkeypatch):
+        monkeypatch.setattr(
+            health, "_list_ollama_clients",
+            lambda: [(1234, "ollama serve"),
+                     (5678, "/python /bin/rag watch --all-vaults"),
+                     (9999, "/python /web/server.py")],
+        )
+        kill_log: list[tuple[int, int]] = []
+        monkeypatch.setattr(
+            health.os, "kill",
+            lambda pid, sig: kill_log.append((pid, sig)),
+        )
+        n, pids = health._kill_stuck_rag_index_clients()
+        assert n == 0
+        assert pids == []
+        assert kill_log == []  # nada se mató
+
+    def test_kills_rag_index_only(self, monkeypatch):
+        """De 4 clients (rag watch + web server + rag query + rag index),
+        solo `rag index` se va. Los otros quedan intactos."""
+        monkeypatch.setattr(
+            health, "_list_ollama_clients",
+            lambda: [
+                (1111, "/python /bin/rag watch --all-vaults"),
+                (2222, "/python /web/server.py"),
+                (3333, "/python /bin/rag query 'hola'"),
+                (4444, "/python /bin/rag index --no-contradict"),
+            ],
+        )
+        kill_log: list[tuple[int, int]] = []
+
+        def fake_kill(pid, sig):
+            kill_log.append((pid, sig))
+            # Simulate signal 0 returning OSError (process dead) for our target
+            if sig == 0:
+                raise OSError("dead")
+
+        monkeypatch.setattr(health.os, "kill", fake_kill)
+        # Avoid the 5s sleep in the real function
+        monkeypatch.setattr(health.time, "sleep", lambda s: None)
+        n, pids = health._kill_stuck_rag_index_clients()
+        assert n == 1
+        assert pids == [4444]
+        # Solo SIGTERM al target (signal 0 sí va para health-check)
+        sigterm_targets = [p for p, s in kill_log if s == health.signal.SIGTERM]
+        assert sigterm_targets == [4444]
+        # Ningún SIGTERM al watch/web/query
+        assert 1111 not in sigterm_targets
+        assert 2222 not in sigterm_targets
+        assert 3333 not in sigterm_targets
+
+    def test_sigkill_survivors(self, monkeypatch):
+        """Si el target sigue vivo después del SIGTERM + sleep, escalar a SIGKILL."""
+        monkeypatch.setattr(
+            health, "_list_ollama_clients",
+            lambda: [(8888, "/python /bin/rag index")],
+        )
+        kill_log: list[tuple[int, int]] = []
+
+        def fake_kill(pid, sig):
+            kill_log.append((pid, sig))
+            # Signal 0 NO raises → proceso sigue vivo después del SIGTERM
+
+        monkeypatch.setattr(health.os, "kill", fake_kill)
+        monkeypatch.setattr(health.time, "sleep", lambda s: None)
+        n, pids = health._kill_stuck_rag_index_clients()
+        assert n == 1
+        assert pids == [8888]
+        # Tanto SIGTERM como SIGKILL fueron mandados al survivor
+        signals_sent = [s for p, s in kill_log if p == 8888]
+        assert health.signal.SIGTERM in signals_sent
+        assert health.signal.SIGKILL in signals_sent

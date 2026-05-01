@@ -40,6 +40,8 @@ imports run after `rag.__init__` finishes, so they always succeed.
 from __future__ import annotations
 
 import json
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -257,10 +259,39 @@ def _fetch_gmail_today(now: datetime, max_items: int = 8) -> list[dict]:
     return out
 
 
+# Cache para _fetch_gmail_evidence (2026-05-01 audit fix). El fetcher
+# pega 5-15 veces a la Gmail API por call (~2.7s warm medido en SSE
+# stream, p99 mucho peor en cold con OAuth refresh). El panel home se
+# refrescá cada 5min pero el user puede hacer manual refreshes — cache
+# corto (90s) absorbe esos hits sin que la data quede stale (gmail no
+# cambia mucho en 90s y el morning brief que es el otro consumer se
+# corre 1x/día).
+#
+# Lock para single-flight (2 fetchers concurrentes en cold = 2 OAuth
+# refreshes paralelos = peor). El primer caller hace el HTTP, los demás
+# esperan el lock + leen del cache.
+_GMAIL_EVIDENCE_CACHE: dict = {"ts": 0.0, "payload": None}
+_GMAIL_EVIDENCE_TTL = 90  # seconds
+_GMAIL_EVIDENCE_LOCK = threading.Lock()
+
+
+def _clear_gmail_evidence_cache() -> None:
+    """Test helper — drop the gmail evidence cache."""
+    with _GMAIL_EVIDENCE_LOCK:
+        _GMAIL_EVIDENCE_CACHE["ts"] = 0.0
+        _GMAIL_EVIDENCE_CACHE["payload"] = None
+
+
 def _fetch_gmail_evidence(now: datetime) -> dict:
     """Gmail signals for the morning brief + on-demand "últimos mails"
     queries. Hits Gmail API ~5-15 times (<3s total with cached discovery).
     Silent-fail on any error.
+
+    Cached 90s in-memory. The cache is keyed only by the function
+    (not by `now`) — `now` is used only for date-relative queries that
+    don't drift meaningfully in 90s. If the user is at midnight rollover
+    there's a 90s window where stale "today" buckets can show, but the
+    next refresh covers it.
 
     Returns:
         {
@@ -283,6 +314,35 @@ def _fetch_gmail_evidence(now: datetime) -> dict:
         (web tools → `gmail_recent`) don't have to re-query Gmail to enrich
         each item. `internal_date_ms` is int milliseconds since epoch;
         callers convert to ISO timestamp at render time.
+    """
+    # Cache check + single-flight: si el payload está fresh, return inmediato.
+    # Si no, tomamos el lock y dejamos que solo un caller pegue a la API.
+    # Los demás esperan el lock; cuando entran, re-checkean el cache (que ya
+    # fue populado por el primer caller) y retornan sin pegar a Gmail.
+    now_ts = time.time()
+    cached = _GMAIL_EVIDENCE_CACHE
+    if cached["payload"] is not None and now_ts - cached["ts"] < _GMAIL_EVIDENCE_TTL:
+        return cached["payload"]
+
+    with _GMAIL_EVIDENCE_LOCK:
+        # Re-check dentro del lock para soportar single-flight real.
+        cached = _GMAIL_EVIDENCE_CACHE
+        if cached["payload"] is not None and time.time() - cached["ts"] < _GMAIL_EVIDENCE_TTL:
+            return cached["payload"]
+        # Compute uncached + persist. El uncached call es pesado (~2.7s warm,
+        # mucho más en cold con OAuth refresh) → sostenemos el lock durante
+        # todo el HTTP así otros callers no disparan requests redundantes.
+        result = _fetch_gmail_evidence_uncached(now)
+        if result:
+            _GMAIL_EVIDENCE_CACHE["ts"] = time.time()
+            _GMAIL_EVIDENCE_CACHE["payload"] = result
+        return result
+
+
+def _fetch_gmail_evidence_uncached(now: datetime) -> dict:
+    """Internal helper — does the actual HTTP/API work for `_fetch_gmail_evidence`.
+    Extracted so the cache wrapper can compose it without the cache logic
+    leaking into the API call paths.
     """
     from rag import _silent_log
     svc = _gmail_service()

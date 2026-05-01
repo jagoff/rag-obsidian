@@ -406,9 +406,16 @@ def test_stream_done_persists_into_home_state_cache(stub_fetchers):
 # recursos del server quedan tied up por minutos en wedges.
 
 
-def test_hard_cap_s_is_30_seconds_or_less():
-    """SSE stream cap stays ≤ 30s. Si necesitás más, abrir issue + medir
+def test_hard_cap_s_is_60_seconds_or_less():
+    """SSE stream cap stays ≤ 60s. Si necesitás más, abrir issue + medir
     P95 real de `_home_compute` antes de subir.
+
+    Bumpeado de 30s a 60s en commit del peer (2026-04-30): el user
+    reportó 'se clava en 95%' porque el SSE timeouteaba en 30s pero el
+    compute con regen=true toma 33-45s regularmente (signals fan-out +
+    LLM brief + correlator). Trade-off: stream wedged ata recursos 60s
+    en lugar de 30s, pero compute lentos legítimos ya no se cortan a la
+    mitad.
 
     Implementación: el cap es local al `_gen()` async generator, no una
     constante module-level. Lo extraemos via source-grep de la asignación
@@ -423,11 +430,11 @@ def test_hard_cap_s_is_30_seconds_or_less():
     matches = re.findall(r"HARD_CAP_S\s*=\s*([\d.]+)", body)
     assert matches, "HARD_CAP_S assignment not found in web/server.py"
     # Take the FIRST match (the in-function definition; any other refs
-    # are reads). All assignments must be ≤ 30.
+    # are reads). All assignments must be ≤ 60.
     for raw in matches:
         val = float(raw)
-        assert val <= 30.0, (
-            f"HARD_CAP_S = {val}s exceeds the 30s ceiling. If you really "
+        assert val <= 60.0, (
+            f"HARD_CAP_S = {val}s exceeds the 60s ceiling. If you really "
             f"need more, document the regression in the test + commit."
         )
 

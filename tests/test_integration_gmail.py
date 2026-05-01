@@ -38,6 +38,16 @@ import pytest
 from rag.integrations import gmail as gmail_mod
 
 
+@pytest.fixture(autouse=True)
+def _clear_gmail_evidence_cache_between_tests():
+    """Drop the gmail evidence cache before/after each test so the 90s
+    in-memory cache (added 2026-05-01 perf fix) doesn't leak between tests.
+    Without this, mocks from one test pollute the cache for the next."""
+    gmail_mod._clear_gmail_evidence_cache()
+    yield
+    gmail_mod._clear_gmail_evidence_cache()
+
+
 # ── _gmail_service: missing deps + missing creds ────────────────────────────
 
 
@@ -644,3 +654,40 @@ def test_gmail_creds_dir_is_under_home():
     NPM package; debe estar bajo `~/.gmail-mcp` para que el setup
     documentado funcione."""
     assert str(gmail_mod.GMAIL_CREDS_DIR).endswith(".gmail-mcp")
+
+
+# ── Cache de _fetch_gmail_evidence (perf fix 2026-05-01) ────────────────────
+
+
+def test_gmail_evidence_cache_returns_payload_within_ttl():
+    """Cache hit: si hay un payload <90s en _GMAIL_EVIDENCE_CACHE, return
+    sin tocar la API. Verifica que el cache ahorra el HTTP."""
+    import time as _t
+    fake = {"unread_count": 5, "starred": [], "awaiting_reply": [], "recent": []}
+    gmail_mod._GMAIL_EVIDENCE_CACHE["ts"] = _t.time()
+    gmail_mod._GMAIL_EVIDENCE_CACHE["payload"] = fake
+
+    # Sin mock — si el cache no funcionara, _gmail_service() devolvería None
+    # (no hay creds en el test env) y el resultado sería {}. Comportamiento
+    # correcto: cache hit → fake payload literal.
+    out = gmail_mod._fetch_gmail_evidence(datetime(2026, 5, 1))
+    assert out == fake
+
+
+def test_gmail_evidence_cache_invalidates_after_ttl(monkeypatch):
+    """Si el ts del cache es viejo (>TTL), forzamos re-fetch. Como el
+    test env no tiene creds, _fetch_gmail_evidence_uncached devuelve {}
+    que NO popula el cache (el `if result:` skip). Verificamos que la
+    función NO devolvió el payload viejo."""
+    import time as _t
+    stale = {"unread_count": 999, "starred": [], "awaiting_reply": [], "recent": []}
+    # ts MUY viejo — más allá del TTL.
+    gmail_mod._GMAIL_EVIDENCE_CACHE["ts"] = _t.time() - gmail_mod._GMAIL_EVIDENCE_TTL - 100
+    gmail_mod._GMAIL_EVIDENCE_CACHE["payload"] = stale
+
+    # Sin svc → fetch_uncached devuelve {} → cache NO se actualiza, pero
+    # la función devuelve el resultado del uncached call (que es {}),
+    # NO el payload stale. Eso es lo correcto: stale TTL invalida.
+    monkeypatch.setattr(gmail_mod, "_gmail_service", lambda: None)
+    out = gmail_mod._fetch_gmail_evidence(datetime(2026, 5, 1))
+    assert out == {}  # uncached fallback, no el stale

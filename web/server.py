@@ -2512,27 +2512,48 @@ def _warmup() -> None:
                           flush=True)
             except Exception as _exc:
                 print(f"[warmup] conversation-turn retry failed: {_exc}", flush=True)
-            # Pre-warm followup_aging cache (2026-04-30 fix). Antes el
-            # primer hit a /api/home post-restart triggereaba el cold path
-            # de _fetch_followup_aging (~30-60s con LLM-judge per loop) y
-            # el SSE timeouteaba con `default=None`. Con el pre-warmer el
-            # web server arranca, dispara este compute en bg, y para
-            # cuando llega el primer request humano (typically 5-15s
-            # después de boot), el cache ya está hot. Si el compute toma
-            # mucho, se sigue corriendo y el primer hit ve None — no peor
-            # que pre-fix, mejor en el caso típico.
+            # Pre-warm followup_aging cache (2026-04-30 + 2026-05-01).
+            # Cold path real medido: ~9 min (find_followup_loops + LLM-judge
+            # por cada uno de ~95 open loops). Pagar ESO en cada restart del
+            # web server era inaceptable.
+            #
+            # Strategy en 2 fases:
+            #   1. Si hay un payload fresh (<24h) en disk, hidratá in-memory
+            #      desde ahí — instant. Cubre el caso "kickstart después de
+            #      sesión normal" donde el cache anterior sigue siendo válido.
+            #   2. Si no hay payload fresh en disk, dispará el cold compute
+            #      en bg (esto sigue tomando ~9min para vault grande). Hasta
+            #      que termine, el primer request al panel ve `None` — no
+            #      peor que pre-fix, pero ahora el resultado SE PERSISTE
+            #      al disk al terminar, así que el próximo restart ya
+            #      hidrata sin pagar el costo.
             try:
-                t0_fw = time.time()
-                _compute_followup_aging_result = _compute_followup_aging()
-                if _compute_followup_aging_result is not None:
-                    _FOLLOWUP_AGING_CACHE["ts"] = time.time()
-                    _FOLLOWUP_AGING_CACHE["payload"] = _compute_followup_aging_result
+                hydrated = _followup_aging_hydrate_from_disk_if_needed()
+                if hydrated:
                     print(
-                        f"[warmup] followup_aging cache pre-warmed in "
-                        f"{time.time() - t0_fw:.1f}s "
-                        f"(total={_compute_followup_aging_result.get('total', 0)})",
+                        f"[warmup] followup_aging hydrated from disk "
+                        f"(total={(_FOLLOWUP_AGING_CACHE['payload'] or {}).get('total', 0)}, "
+                        f"age={int(time.time() - _FOLLOWUP_AGING_CACHE['ts'])}s)",
                         flush=True,
                     )
+                else:
+                    t0_fw = time.time()
+                    _compute_followup_aging_result = _compute_followup_aging()
+                    if _compute_followup_aging_result is not None:
+                        now = time.time()
+                        _FOLLOWUP_AGING_CACHE["ts"] = now
+                        _FOLLOWUP_AGING_CACHE["payload"] = _compute_followup_aging_result
+                        _followup_aging_persist(
+                            now, _compute_followup_aging_result,
+                            elapsed_s=now - t0_fw,
+                        )
+                        print(
+                            f"[warmup] followup_aging cache pre-warmed in "
+                            f"{now - t0_fw:.1f}s "
+                            f"(total={_compute_followup_aging_result.get('total', 0)}) "
+                            f"+ persisted to disk",
+                            flush=True,
+                        )
             except Exception as _exc:
                 print(f"[warmup] followup_aging pre-warm failed: {_exc}", flush=True)
         except Exception:
@@ -8243,18 +8264,22 @@ def _fetch_eval_trend(n: int = 10) -> dict | None:
 
 
 # Followup aging runs the full `find_followup_loops` pipeline, which costs one
-# LLM judge call per open loop. Cheap per-loop but the list scales con vault
-# size — cold path real medido ~15-25s.
+# LLM judge call per open loop. Cold path real medido ~9 minutos en un vault
+# de 95+ open loops (mucho peor que la estimación inicial de 15-25s).
 #
-# Strategy: stale-while-revalidate (SWR).
+# Strategy: stale-while-revalidate (SWR) + persistencia a disk.
 #   - SOFT TTL (6h): si el cache tiene <6h, devolverlo y NO recomputar.
 #   - HARD TTL (48h): si el cache tiene 6-48h, devolver cache stale +
 #     disparar refresh background. Próximo call ve la versión nueva.
-#   - Fresh cold (no payload nunca): bloquear hasta que el primer compute
+#   - Cold real (no payload nunca): bloquear hasta que el primer compute
 #     termine. La home nunca llamaba acá sin cache porque el budget SSE
 #     era 5s — el future seguía corriendo en bg pero el panel mostraba
 #     "skipped". Ahora con SWR, después del primer compute (cold) el
 #     panel siempre tiene algo que mostrar.
+#   - PERSISTENCIA (2026-05-01): tabla `rag_followup_aging_cache` en
+#     telemetry.db con (ts, payload_json). Sobrevive restarts del web
+#     server — antes cada kickstart re-pagaba los 9min del cold path.
+#     Con persistence, el `_do_warmup` lee del disk en vez de re-computar.
 #
 # Bug pre-fix (2026-04-30 audit): cada 6h el SSE budget de 5s era menor
 # que el cold path (15-25s) → user veía "followup skipped" cada vez que
@@ -8262,8 +8287,98 @@ def _fetch_eval_trend(n: int = 10) -> dict | None:
 _FOLLOWUP_AGING_CACHE: dict = {"ts": 0.0, "payload": None}
 _FOLLOWUP_AGING_SOFT_TTL = 6 * 3600     # serve cached, no recompute
 _FOLLOWUP_AGING_HARD_TTL = 48 * 3600    # serve stale + bg refresh
+_FOLLOWUP_AGING_DISK_TTL = 24 * 3600    # max age al hidratar desde disk en boot
 _FOLLOWUP_AGING_REFRESHING: bool = False  # single-flight guard
 _FOLLOWUP_AGING_LOCK = threading.Lock()
+_FOLLOWUP_AGING_DDL_ENSURED = False
+
+
+def _ensure_followup_aging_table() -> None:
+    """One-time DDL: crea `rag_followup_aging_cache` si no existe.
+    Tabla single-row (PK=1) — el último cómputo overwrites la fila previa
+    via UPSERT. JSON blob del payload + ts unix + elapsed_s para telemetría
+    futura ("¿cuánto tardó el último cold path?")."""
+    global _FOLLOWUP_AGING_DDL_ENSURED
+    if _FOLLOWUP_AGING_DDL_ENSURED:
+        return
+    try:
+        from rag import _ragvec_state_conn
+        with _ragvec_state_conn() as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS rag_followup_aging_cache ("
+                " id INTEGER PRIMARY KEY,"
+                " ts REAL NOT NULL,"
+                " payload_json TEXT NOT NULL,"
+                " elapsed_s REAL"
+                ")"
+            )
+        _FOLLOWUP_AGING_DDL_ENSURED = True
+    except Exception:
+        # Si el DDL falla (DB locked, permissions, etc.), seguimos sin
+        # persistencia — el SWR in-memory sigue funcionando. NO blockear.
+        pass
+
+
+def _followup_aging_load_from_disk() -> tuple[float, dict] | None:
+    """Lee el último payload persistido. Devuelve (ts_unix, payload) o None
+    si no hay row, o el row está más viejo que `_FOLLOWUP_AGING_DISK_TTL`,
+    o el JSON está corrupto."""
+    _ensure_followup_aging_table()
+    try:
+        from rag import _ragvec_state_conn
+        with _ragvec_state_conn() as conn:
+            row = conn.execute(
+                "SELECT ts, payload_json FROM rag_followup_aging_cache WHERE id = 1"
+            ).fetchone()
+    except Exception:
+        return None
+    if row is None:
+        return None
+    ts, payload_json = row
+    if not ts or not payload_json:
+        return None
+    if time.time() - ts > _FOLLOWUP_AGING_DISK_TTL:
+        return None  # demasiado viejo para hidratar en boot
+    try:
+        import json as _json
+        return float(ts), _json.loads(payload_json)
+    except Exception:
+        return None
+
+
+def _followup_aging_persist(ts: float, payload: dict, elapsed_s: float | None = None) -> None:
+    """UPSERT del payload al disk. Best-effort — si falla, el cache
+    in-memory sigue funcionando. Se llama desde `_compute_followup_aging`
+    + el pre-warmer."""
+    _ensure_followup_aging_table()
+    try:
+        import json as _json
+        from rag import _ragvec_state_conn
+        with _ragvec_state_conn() as conn:
+            conn.execute(
+                "INSERT INTO rag_followup_aging_cache (id, ts, payload_json, elapsed_s) "
+                "VALUES (1, ?, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET ts=excluded.ts, "
+                "payload_json=excluded.payload_json, elapsed_s=excluded.elapsed_s",
+                (ts, _json.dumps(payload, ensure_ascii=False), elapsed_s),
+            )
+    except Exception:
+        pass
+
+
+def _followup_aging_hydrate_from_disk_if_needed() -> bool:
+    """Si el cache in-memory está vacío y hay un payload en disk fresh
+    (<24h), hidrata el in-memory desde disk. Returns True si hidrató,
+    False si no hizo nada (cache ya populado o disk vacío)."""
+    if _FOLLOWUP_AGING_CACHE["payload"] is not None:
+        return False  # in-memory ya tiene algo, no overwrite
+    loaded = _followup_aging_load_from_disk()
+    if loaded is None:
+        return False
+    ts, payload = loaded
+    _FOLLOWUP_AGING_CACHE["ts"] = ts
+    _FOLLOWUP_AGING_CACHE["payload"] = payload
+    return True
 
 
 def _compute_followup_aging() -> dict | None:
@@ -8316,10 +8431,13 @@ def _refresh_followup_aging_bg() -> None:
             return
         _FOLLOWUP_AGING_REFRESHING = True
     try:
+        t0 = time.time()
         payload = _compute_followup_aging()
         if payload is not None:
-            _FOLLOWUP_AGING_CACHE["ts"] = time.time()
+            now = time.time()
+            _FOLLOWUP_AGING_CACHE["ts"] = now
             _FOLLOWUP_AGING_CACHE["payload"] = payload
+            _followup_aging_persist(now, payload, elapsed_s=now - t0)
     finally:
         with _FOLLOWUP_AGING_LOCK:
             _FOLLOWUP_AGING_REFRESHING = False
@@ -8333,9 +8451,14 @@ def _fetch_followup_aging() -> dict | None:
     items (the default CLI window is 30d). Resolved loops are dropped —
     they are, by definition, no longer aging.
 
-    Cache strategy: SWR (stale-while-revalidate). Ver doc del módulo
-    `_FOLLOWUP_AGING_CACHE` arriba.
+    Cache strategy: SWR (stale-while-revalidate) + persistencia disk.
+    Ver doc del módulo `_FOLLOWUP_AGING_CACHE` arriba.
     """
+    # Boot-time hydration: si el cache in-memory está vacío pero hay un
+    # payload fresh (<24h) en `rag_followup_aging_cache`, hidratá en vez
+    # de re-computar. Esto evita pagar 9min cada restart del web server.
+    _followup_aging_hydrate_from_disk_if_needed()
+
     now_ts = time.time()
     cached = _FOLLOWUP_AGING_CACHE
     age = now_ts - cached["ts"]
@@ -8354,13 +8477,15 @@ def _fetch_followup_aging() -> dict | None:
         return cached["payload"]
 
     # Cold path: nada en cache O stale-stale (>48h). Computar bloquante.
-    # La primera vez post-boot esto puede demorar 15-25s, pero ya no
+    # La primera vez post-boot esto puede demorar 9min, pero ya no
     # podemos servir nada útil. Después del compute, el SOFT TTL cubre
     # las próximas 6h sin pagar el costo otra vez.
+    t0 = time.time()
     payload = _compute_followup_aging()
     if payload is not None:
         _FOLLOWUP_AGING_CACHE["ts"] = now_ts
         _FOLLOWUP_AGING_CACHE["payload"] = payload
+        _followup_aging_persist(now_ts, payload, elapsed_s=time.time() - t0)
         return payload
     return cached["payload"]  # serve last-known-good si compute falló
 

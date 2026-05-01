@@ -484,6 +484,24 @@ def analyze_brief_feedback(brief_kind: str, lookback_days: int = 30) -> dict:
             )
         else:
             suggested, rec_reason = suggestion
+            # Enrich rec_reason with panel feedback comments if available
+            ft_comments = []
+            try:
+                from rag import _ragvec_state_conn  # lazy
+                with _ragvec_state_conn() as conn:
+                    cur = conn.execute("""
+                        SELECT comment FROM rag_ft_panel_ratings
+                        WHERE stream='brief' AND rating=-1
+                          AND ts >= datetime('now', ?)
+                          AND comment IS NOT NULL AND length(comment) > 0
+                          AND item_id LIKE ?
+                        ORDER BY ts DESC LIMIT 5
+                    """, (f'-{lookback_days} days', f'%-{brief_kind}%'))
+                    ft_comments = [row[0] for row in cur.fetchall()]
+            except Exception:
+                pass  # silent-fail
+            if ft_comments:
+                rec_reason = f"{rec_reason} | feedback panel: {' / '.join(ft_comments[:3])}"
 
     should_shift = suggested is not None
     return {

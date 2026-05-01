@@ -32,7 +32,7 @@
 
 // Bump cuando cambie el shell / la estrategia. El activate handler borra
 // todo cache que no matchee esta versión, así no se acumulan huérfanos.
-const CACHE_VERSION = "rag-pwa-v32-2026-04-30-highlights-patterns";
+const CACHE_VERSION = "rag-pwa-v33-2026-05-01-fine-tunning-panel";
 const SHELL_CACHE = `${CACHE_VERSION}-shell`;
 const STATIC_CACHE = `${CACHE_VERSION}-static`;
 
@@ -43,6 +43,7 @@ const SHELL_URLS = [
   "/",
   "/chat",
   "/dashboard",
+  "/fine_tunning",
   "/manifest.webmanifest",
   "/static/pwa/icon-192.png",
   "/static/pwa/icon-512.png",

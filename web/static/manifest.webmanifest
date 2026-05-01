@@ -67,6 +67,13 @@
       "description": "Cómo evoluciona el aprendizaje del sistema",
       "url": "/learning",
       "icons": [{ "src": "/static/pwa/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Fine-tunning",
+      "short_name": "fine_tunning",
+      "description": "Cola de labeling humano para acelerar learning loops",
+      "url": "/fine_tunning",
+      "icons": [{ "src": "/static/pwa/icon-192.png", "sizes": "192x192" }]
     }
   ]
 }

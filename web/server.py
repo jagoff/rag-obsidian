@@ -17477,6 +17477,16 @@ _LOG_RE_CLOUDFLARED_NOISE = re.compile(
 # Capturamos el timestamp en formato ISO normalizado (sin Z ni offset).
 _LOG_RE_TS_JSONL = re.compile(r'"ts"\s*:\s*"(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})')
 _LOG_RE_TS_ISO_T = re.compile(r"\b(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})")
+# El bracketed prefix `[2026-05-01 18:46:06-03:00]` es lo que el listener
+# TS usa para todas sus líneas — sin esta variante, las lines del listener
+# que sí tienen timestamp inline quedaban sin matchear porque
+# `_LOG_RE_TS_ISO_SPACE` requería inicio-de-línea sin `[`. Bug observado
+# 2026-05-01: el ranking de latency outliers devolvía 0 items aunque
+# `[whisper] duration_ms=28760` estaba precedido por una línea con ts
+# `[2026-05-01 18:46:06-03:00]` que el forward-fill nunca pudo heredar.
+_LOG_RE_TS_ISO_BRACKETED = re.compile(
+    r"^\s*\[\s*(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})"
+)
 _LOG_RE_TS_ISO_SPACE = re.compile(r"^\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
 
 
@@ -17499,6 +17509,9 @@ def _extract_log_ts(line: str) -> str | None:
     m = _LOG_RE_TS_ISO_T.search(line)
     if m:
         return m.group(1)
+    m = _LOG_RE_TS_ISO_BRACKETED.match(line)
+    if m:
+        return m.group(1).replace(" ", "T")
     m = _LOG_RE_TS_ISO_SPACE.match(line)
     if m:
         return m.group(1).replace(" ", "T")
@@ -18292,18 +18305,228 @@ def _normalize_log_line_signature(line: str) -> str:
     return s.lower()
 
 
+# ── Latency extractor ────────────────────────────────────────────────
+# Heurística regex para sacar duraciones del log y rankear por p99 por
+# service. Los 4 patrones cubren el ~95% de líneas con timing en este
+# stack (medido grep-ando los .log reales del 2026-05-01):
+#
+#   1. `ttft_ms=12345`              — chat-stream-error
+#   2. `total=12345ms`              — chat-timing
+#   3. `duration_ms=12345`          — whisper server/cli
+#   4. `warm-up OK (12345ms, ...)`  — whisper warm-up
+#
+# Devolvemos siempre milisegundos. Una sola línea puede tener múltiples
+# matches (ej. `ttft_ms=200 ... total=300ms`); en ese caso tomamos el
+# primero que matchea — `total=` es lo que más nos importa para depurar
+# perf, así que va PRIMERO en la disjunción.
+_LOG_RE_LATENCY = re.compile(
+    r"(?:"
+    r"\btotal=(\d+)ms"
+    r"|\bttft_ms=(\d+)"
+    r"|\bduration_ms=(\d+)"
+    r"|warm-up OK \((\d+)ms"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _extract_latency_ms(line: str) -> int | None:
+    """Sacar milisegundos de una línea de log si matchea uno de los 4
+    patrones reconocidos. Devolver None si no hay match.
+
+    Idempotente y rápido — un solo regex con disjunción. `re.search` agarra
+    el match más a la izquierda de la línea (leftmost-longest), no el
+    primero de la alternativa, así que si una línea tiene `ttft_ms=200
+    ... total=300ms`, devuelve `200`. Aceptable para el use case: cualquier
+    duración es útil para rankear outliers, y los logs reales raramente
+    mezclan ambas formas en la misma línea.
+    """
+    m = _LOG_RE_LATENCY.search(line)
+    if not m:
+        return None
+    for g in m.groups():
+        if g is not None:
+            try:
+                return int(g)
+            except (ValueError, TypeError):
+                return None
+    return None
+
+
+def _percentile_int(values: list[int], p: int) -> int:
+    """Calcular el p-ésimo percentil (p=99 → p99) usando nearest-rank.
+    Devuelve 0 si la lista está vacía. Para listas chicas (n < 100), el
+    p99 colapsa al máximo, lo cual es el comportamiento correcto: con
+    poca data, el outlier ES el p99.
+    """
+    if not values:
+        return 0
+    sorted_vals = sorted(int(v) for v in values)
+    if len(sorted_vals) == 1:
+        return sorted_vals[0]
+    # Nearest-rank: ceil(p/100 * n) - 1, clamp a [0, n-1].
+    idx = max(0, min(len(sorted_vals) - 1, int(round(p / 100.0 * len(sorted_vals))) - 1))
+    return sorted_vals[idx]
+
+
+# ── Silent service detector ──────────────────────────────────────────
+# Mapeo target launchd → nombre base del log file. Reglas heurísticas
+# basadas en cómo nombramos los plists históricamente:
+#
+#   - `com.fer.obsidian-rag-<X>` → log basename `<X>` (ej. `watch`, `web`,
+#     `serve-watchdog`, `ingest-gmail`, etc.)
+#   - `com.fer.whatsapp-<X>` → log basename `<X>` (ej. `bridge`, `listener`)
+#   - `com.fer.<X>` (sin obsidian-rag/whatsapp) → `<X>` literal
+#
+# Si el log no existe en _LOG_DIRS, asumimos que el daemon no escribe
+# logs ahí (puede ser silent legítimo, o usar otro destino). Devolvemos
+# None y el caller decide si es silent o "no observable".
+
+def _candidate_log_paths_for_label(label: str) -> list[Path]:
+    """Devolver todos los archivos de log esperados para un label de
+    launchd. Probamos varias variantes de basename porque la convención
+    no es 100% consistente — ej. `com.fer.obsidian-rag-web` escribe a
+    `web.log` y a `web.error.log` (NO `obsidian-rag-web.log`)."""
+    candidates: list[str] = []
+    if label.startswith("com.fer.obsidian-rag-"):
+        candidates.append(label[len("com.fer.obsidian-rag-"):])
+    elif label.startswith("com.fer.whatsapp-"):
+        candidates.append(label[len("com.fer.whatsapp-"):])
+    elif label.startswith("com.fer."):
+        candidates.append(label[len("com.fer."):])
+    # Fallback: usar el label entero (raro pero por las dudas).
+    candidates.append(label)
+    paths: list[Path] = []
+    for log_dir in _LOG_DIRS:
+        if not log_dir.is_dir():
+            continue
+        for cand in candidates:
+            for ext in (".log", ".error.log", ".stdout.log", ".stderr.log"):
+                p = log_dir / f"{cand}{ext}"
+                if p.is_file() and p not in paths:
+                    paths.append(p)
+    return paths
+
+
+def _scheduled_runs_count(label: str) -> int | None:
+    """Contar `runs` en `launchctl print` para un job scheduled. Devuelve
+    None si no se puede obtener. Útil para distinguir "scheduled que
+    nunca corrió" de "scheduled silenciado" (ambos tienen mtime viejo
+    pero el primero es esperado)."""
+    info = _launchctl_print_fields(label)
+    if info is None:
+        return None
+    raw = info.get("runs")
+    if not raw:
+        return None
+    try:
+        return int(raw.split()[0])
+    except (ValueError, IndexError):
+        return None
+
+
+# Threshold por kind para considerar "silent". Daemons KeepAlive deberían
+# escribir logs continuamente; si no lo hacen en 1h, ya es alarma.
+# Scheduled corren periódicamente (algunos cada 24h) — si no escribieron
+# en 30h, ya es señal de problema.
+_SILENT_THRESHOLD_DAEMON_S = 60 * 60        # 1h
+_SILENT_THRESHOLD_SCHEDULED_S = 30 * 3600   # 30h
+
+
+def _build_silent_services(top_n: int, *, _now: float | None = None) -> list[dict]:
+    """Devolver top-N services del catálogo que están loaded en launchd
+    pero llevan tiempo sin escribir logs.
+
+    El threshold por kind es:
+      - daemon (KeepAlive): 1h sin actividad → silent.
+      - scheduled (cron-like): 30h sin actividad → silent.
+
+    Skipea items con `kind not in (daemon, scheduled)` (los chequeos de
+    DB / vault / ollama del catálogo no aplican).
+
+    Para scheduled jobs que nunca corrieron (`runs == 0`), el log file
+    puede no existir aún. Eso NO es silent — es legítimamente "todavía
+    no le tocó". Esos los marcamos `kind=never_ran` en el output para
+    que el frontend pueda agruparlos visualmente distinto.
+    """
+    now = _now if _now is not None else time.time()
+    out: list[dict] = []
+    for entry in _STATUS_CATALOG:
+        kind = entry.get("kind", "")
+        if kind not in ("daemon", "scheduled"):
+            continue
+        label = entry.get("target", "")
+        if not label:
+            continue
+        # ¿Está loaded en launchd? Si no, NO es "silent" — es "disabled".
+        info = _launchctl_print_fields(label)
+        if info is None:
+            continue
+        # Threshold según el kind.
+        threshold = (_SILENT_THRESHOLD_DAEMON_S if kind == "daemon"
+                     else _SILENT_THRESHOLD_SCHEDULED_S)
+        # Buscar el log más reciente y su mtime.
+        candidate_paths = _candidate_log_paths_for_label(label)
+        if not candidate_paths:
+            # No hay log file → si es scheduled con runs=0, "never ran".
+            runs = _scheduled_runs_count(label) if kind == "scheduled" else None
+            if kind == "scheduled" and runs == 0:
+                out.append({
+                    "service": entry.get("name") or label,
+                    "label": label,
+                    "kind": "never_ran",
+                    "silence_seconds": None,
+                    "last_activity": None,
+                    "category": entry.get("category"),
+                })
+            continue
+        try:
+            mtimes = [p.stat().st_mtime for p in candidate_paths]
+        except Exception:
+            continue
+        most_recent = max(mtimes)
+        silence = now - most_recent
+        if silence >= threshold:
+            out.append({
+                "service": entry.get("name") or label,
+                "label": label,
+                "kind": kind,
+                "silence_seconds": int(silence),
+                "last_activity": datetime.fromtimestamp(most_recent).isoformat(timespec="seconds"),
+                "category": entry.get("category"),
+            })
+    # Ordenar por silence_seconds desc (los más silenciosos primero).
+    # Items "never_ran" (silence_seconds=None) van al final.
+    out.sort(key=lambda x: x["silence_seconds"] if x["silence_seconds"] is not None else -1, reverse=True)
+    return out[:top_n]
+
+
 def _build_rankings_payload(window_s: int, top_n: int) -> dict:
     """Construir el payload de /api/logs/rankings.
 
     Reaprovecha el scan único de _LOG_DIRS de _build_global_errors_payload
     pero sin levantar la list completa de lines (no la necesitamos para
-    rankings, solo agregamos counters).
+    rankings, solo agregamos counters + métricas para los 9 rankings).
+
+    Cuando `window_s >= 7200` (al menos 2h), también computamos
+    `new_error_patterns`: patrones de error que aparecen en la última
+    hora pero NO aparecían en la porción "previa" de la ventana. Si
+    `window_s < 7200`, ese ranking devuelve [] (no hay base de comparación).
     """
-    cutoff_ts = time.time() - window_s
+    now_ts = time.time()
+    cutoff_ts = now_ts - window_s
+    # Sub-ventana "última hora" para el detector de regresiones nuevas.
+    # Solo significa algo si `window_s` es bastante más grande que 1h.
+    one_hour_ago_ts = now_ts - 3600
+    has_regression_window = window_s >= 7200  # ≥ 2h da al menos 1h de "previo"
     services_errors: dict[str, int] = {}
     services_warns: dict[str, int] = {}
     services_lines_total: dict[str, int] = {}  # cualquier level → noisy_logs
-    pattern_buckets: dict[str, dict] = {}
+    services_bytes_total: dict[str, int] = {}  # bytes/min → growth_rate
+    services_latencies: dict[str, list[int]] = {}  # ms list → latency_outliers
+    pattern_buckets: dict[str, dict] = {}        # all error patterns en window
+    pattern_recent: dict[str, dict] = {}         # patterns que aparecen en última 1h
+    pattern_pre_recent: set[str] = set()         # signatures que ya aparecían antes de la última 1h
     recent_errors: list[dict] = []
     files_scanned = 0
     files_skipped_old = 0
@@ -18341,6 +18564,7 @@ def _build_rankings_payload(window_s: int, top_n: int) -> dict:
 
             raw = _read_tail_lines(path, _LOG_GLOBAL_TAIL_PER_FILE)
             last_ts: str | None = None
+            file_bytes_in_window = 0
             for ln in raw:
                 level = _classify_log_line(ln)
                 ts = _extract_log_ts(ln)
@@ -18356,12 +18580,22 @@ def _build_rankings_payload(window_s: int, top_n: int) -> dict:
                     continue
                 # Filter por window.
                 try:
-                    if datetime.fromisoformat(ts).timestamp() < cutoff_ts:
-                        continue
+                    line_ts_epoch = datetime.fromisoformat(ts).timestamp()
                 except Exception:
+                    continue
+                if line_ts_epoch < cutoff_ts:
                     continue
                 # Contadores agregados.
                 services_lines_total[base] = services_lines_total.get(base, 0) + 1
+                # Bytes per service: usamos len(line)+1 (newline) como proxy
+                # del byte cost. No es exacto a nivel filesystem pero es lo
+                # mejor que tenemos sin re-stat el archivo por linea.
+                file_bytes_in_window += len(ln.encode("utf-8", errors="replace")) + 1
+                # Latency extraction — funciona en cualquier nivel (no solo
+                # errors), capturamos info/ok/warn lines que reportan timing.
+                lat_ms = _extract_latency_ms(ln)
+                if lat_ms is not None:
+                    services_latencies.setdefault(base, []).append(lat_ms)
                 if level == "error":
                     services_errors[base] = services_errors.get(base, 0) + 1
                     sig = _normalize_log_line_signature(ln)
@@ -18384,6 +18618,27 @@ def _build_rankings_payload(window_s: int, top_n: int) -> dict:
                                 bucket["first_ts"] = ts
                             if ts > bucket["last_ts"]:
                                 bucket["last_ts"] = ts
+                        # Sub-buckets para regression detector.
+                        if has_regression_window:
+                            if line_ts_epoch >= one_hour_ago_ts:
+                                rb = pattern_recent.get(sig)
+                                if rb is None:
+                                    pattern_recent[sig] = {
+                                        "signature": sig,
+                                        "count": 1,
+                                        "example": ln,
+                                        "services": {base},
+                                        "first_ts": ts,
+                                        "last_ts": ts,
+                                        "ref": f"{dir_slug}/{name}",
+                                    }
+                                else:
+                                    rb["count"] += 1
+                                    rb["services"].add(base)
+                                    if ts > rb["last_ts"]:
+                                        rb["last_ts"] = ts
+                            else:
+                                pattern_pre_recent.add(sig)
                     recent_errors.append({
                         "ts": ts,
                         "level": level,
@@ -18394,6 +18649,10 @@ def _build_rankings_payload(window_s: int, top_n: int) -> dict:
                     })
                 elif level == "warn":
                     services_warns[base] = services_warns.get(base, 0) + 1
+            # Aggregate bytes per service (suma sobre potenciales múltiples
+            # archivos del mismo service: stdout + error log).
+            if file_bytes_in_window > 0:
+                services_bytes_total[base] = services_bytes_total.get(base, 0) + file_bytes_in_window
 
     # Sort + cap.
     def _topn(d: dict, key: str = "count") -> list[dict]:
@@ -18425,6 +18684,69 @@ def _build_rankings_payload(window_s: int, top_n: int) -> dict:
     recent_errors.sort(key=lambda x: x["ts"], reverse=True)
     recent_errors = recent_errors[:top_n]
 
+    # Latency outliers: rankear por p99 por service. Mínimo 3 muestras
+    # para no reportar p99 sobre n=1 que es ruido. Devolvemos p50/p99 +
+    # n para que el frontend pueda mostrar contexto.
+    latency_outliers = []
+    for service, lats in services_latencies.items():
+        if len(lats) < 3:
+            continue
+        latency_outliers.append({
+            "service": service,
+            "p50_ms": _percentile_int(lats, 50),
+            "p99_ms": _percentile_int(lats, 99),
+            "max_ms": max(lats),
+            "n": len(lats),
+        })
+    latency_outliers.sort(key=lambda x: -x["p99_ms"])
+    latency_outliers = latency_outliers[:top_n]
+
+    # Growth rate: rankear por bytes/min. Usamos bytes en vez de lines
+    # para evitar que el cap del tail subestime el rate (services que
+    # spamean mucho terminan capeados a las últimas 300 líneas, pero los
+    # bytes de esas 300 líneas son suficientes para distinguir el ruidoso
+    # del tranquilo).
+    window_min = max(1.0, window_s / 60.0)
+    growth_rate = []
+    for service, total_bytes in services_bytes_total.items():
+        bpm = total_bytes / window_min
+        growth_rate.append({
+            "service": service,
+            "bytes_per_min": int(round(bpm)),
+            "lines_per_min": round(services_lines_total.get(service, 0) / window_min, 2),
+            "total_bytes_in_window": total_bytes,
+        })
+    growth_rate.sort(key=lambda x: -x["bytes_per_min"])
+    growth_rate = growth_rate[:top_n]
+
+    # New error patterns (regression detector): patterns que aparecen en
+    # la última hora pero NO aparecían en la porción anterior de la
+    # ventana. Si window_s < 2h, no hay porción "previa" así que skip.
+    new_error_patterns = []
+    if has_regression_window:
+        for sig, rb in pattern_recent.items():
+            if sig in pattern_pre_recent:
+                continue  # ya existía antes — no es regresión
+            new_error_patterns.append({
+                "signature": rb["signature"],
+                "count": rb["count"],
+                "example": rb["example"],
+                "services": sorted(rb["services"]),
+                "first_ts": rb["first_ts"],
+                "last_ts": rb["last_ts"],
+                "ref": rb["ref"],
+            })
+        new_error_patterns.sort(key=lambda x: -x["count"])
+        new_error_patterns = new_error_patterns[:top_n]
+
+    # Silent services — el único ranking que no depende del scan de logs;
+    # cruza launchctl + mtimes. Lo pedimos siempre con el top_n del request
+    # pero la función tiene su propio threshold por kind (1h daemon, 30h
+    # scheduled) que NO se reescala con `window_s` — la idea es detectar
+    # silencios anómalos según la cadencia natural del service, no según
+    # la ventana del usuario.
+    silent_services = _build_silent_services(top_n, _now=now_ts)
+
     # Totals para que el frontend tenga contexto sin re-requestear.
     totals = {
         "errors": sum(services_errors.values()),
@@ -18433,6 +18755,7 @@ def _build_rankings_payload(window_s: int, top_n: int) -> dict:
         "services_with_warns": len(services_warns),
         "files_scanned": files_scanned,
         "files_skipped_old": files_skipped_old,
+        "has_regression_window": has_regression_window,
     }
 
     return {
@@ -18446,6 +18769,10 @@ def _build_rankings_payload(window_s: int, top_n: int) -> dict:
             "error_patterns": error_patterns,
             "recent_errors": recent_errors,
             "noisy_logs": noisy_logs,
+            "latency_outliers": latency_outliers,
+            "silent_services": silent_services,
+            "growth_rate": growth_rate,
+            "new_error_patterns": new_error_patterns,
         },
     }
 
@@ -22536,6 +22863,502 @@ def vault_health_api() -> dict:
 
 
 # ── Fin Vault health card ───────────────────────────────────────────────
+
+
+# ── Fine-tunning panel ──────────────────────────────────────────────────
+# Endpoints del panel de labeling humano para acelerar los learning loops.
+# Los streams soportados en /api/fine_tunning/rate son (wave-2: 11 streams):
+#   retrieval         — query con paths, label si encontró bien
+#   retrieval_answer  — query CON respuesta del modelo, label si la respuesta fue útil
+#   brief             — morning/today/digest, label si fue relevante
+#   draft / draft_wa  — drafts del bot WA a contactos
+#   anticipate        — pushes anticipatorios sin reaction
+#   proactive_push    — morning briefs / archive / etc del proactive_log
+#   whatsapp_msg      — chunks WA del corpus, label relevancia para retrieval
+#   style / tool_routing / read_summary — extensible (no populated todavía)
+# Variantes legacy del comentario original:
+#   retrieval | brief | draft | anticipate | style | tool_routing | read_summary
+# Las tablas rag_ft_panel_ratings y rag_ft_active_queue_state se crean en
+# _TELEMETRY_DDL de rag/__init__.py (ya existentes).
+# ───────────────────────────────────────────────────────────────────────
+
+
+@app.get("/fine_tunning")
+def fine_tunning_page() -> FileResponse:
+    """HTML shell del panel de labeling. El contenido se hidrata vía
+    ``/api/fine_tunning/queue`` (lista de items) y ``/api/fine_tunning/rate``
+    (persistir ratings)."""
+    return FileResponse(STATIC_DIR / "fine_tunning.html")
+
+
+class FineTunningRateRequest(BaseModel):
+    stream: str  # retrieval|brief|draft|anticipate|style|tool_routing|read_summary
+    item_id: str
+    rating: int  # +1 | -1
+    label: str | None = None
+    comment: str | None = None
+    session_id: str | None = None
+
+    @field_validator("rating")
+    @classmethod
+    def _rating_in_range(cls, v: int) -> int:
+        if v not in (-1, 1):
+            raise ValueError("rating must be +1 or -1")
+        return v
+
+    @field_validator("stream")
+    @classmethod
+    def _stream_valid(cls, v: str) -> str:
+        _valid = {
+            "retrieval", "retrieval_answer", "brief", "draft", "draft_wa",
+            "anticipate", "proactive_push", "whatsapp_msg",
+            "style", "tool_routing", "read_summary",
+        }
+        if v not in _valid:
+            raise ValueError(f"stream must be one of {_valid}")
+        return v
+
+
+class FineTunningSnoozeRequest(BaseModel):
+    item_id: str
+    stream: str
+    hours: int = 24
+
+
+@app.get("/api/fine_tunning/queue")
+def fine_tunning_queue(limit: int = 20) -> dict:
+    """Cola unificada de items pendientes de labeling, compuesta por tres streams:
+    retrieval (queries low-confidence sin feedback), brief (briefs con reactions
+    negativas) y anticipate (candidates pusheados sin reaction posterior).
+
+    Silent-fail: si la DB está inaccesible devuelve lista vacía sin romper.
+    """
+    items: list[dict] = []
+    try:
+        from rag import (  # noqa: PLC0415
+            _get_fine_tunning_retrieval_queue,
+            _ragvec_state_conn,
+            _silent_log,
+        )
+        clamped = max(1, min(int(limit), 50))
+        with _ragvec_state_conn() as conn:
+            # ── Retrieval: queries low-confidence sin feedback explícito ──
+            try:
+                items.extend(
+                    _get_fine_tunning_retrieval_queue(conn, limit=clamped)
+                )
+            except Exception as exc_r:
+                _silent_log("fine_tunning_queue_retrieval_error", str(exc_r))
+
+            # ── Brief: últimos 10 con reactions negativas/mute sin rating panel ──
+            try:
+                cur = conn.execute("""
+                    SELECT bf.dedup_key,
+                           MAX(bf.ts)                                             AS last_ts,
+                           SUM(CASE WHEN bf.rating='positive' THEN 1 ELSE 0 END) AS pos,
+                           SUM(CASE WHEN bf.rating='negative' THEN 1 ELSE 0 END) AS neg,
+                           SUM(CASE WHEN bf.rating='mute'     THEN 1 ELSE 0 END) AS mute
+                    FROM rag_brief_feedback bf
+                    LEFT JOIN rag_ft_panel_ratings ftr
+                      ON ftr.stream = 'brief' AND ftr.item_id = bf.dedup_key
+                    LEFT JOIN rag_ft_active_queue_state fts
+                      ON fts.stream = 'brief' AND fts.item_id = bf.dedup_key
+                    WHERE bf.ts >= datetime('now', '-30 days')
+                      AND ftr.id IS NULL
+                      AND (fts.snoozed_until_ts IS NULL
+                           OR fts.snoozed_until_ts < datetime('now'))
+                    GROUP BY bf.dedup_key
+                    HAVING (neg + mute) >= 1 AND pos < 1
+                    ORDER BY last_ts DESC
+                    LIMIT 10
+                """)
+                for row in cur.fetchall():
+                    items.append({
+                        "item_id": row[0],
+                        "stream": "brief",
+                        "label": row[0],   # vault_relpath sirve de label
+                        "ts": row[1],
+                        "meta": {
+                            "positive": row[2],
+                            "negative": row[3],
+                            "mute": row[4],
+                        },
+                    })
+            except Exception as exc_b:
+                _silent_log("fine_tunning_queue_brief_error", str(exc_b))
+
+            # ── Anticipate: candidates pusheados sin reaction ni rating panel ──
+            # Schema real: id, ts, kind, score, dedup_key, selected, sent,
+            #              reason, message_preview  (NO tiene columna "label")
+            try:
+                cur = conn.execute("""
+                    SELECT ac.dedup_key,
+                           ac.kind,
+                           ac.message_preview,
+                           ac.score,
+                           ac.ts
+                    FROM rag_anticipate_candidates ac
+                    LEFT JOIN rag_anticipate_feedback af
+                      ON af.dedup_key = ac.dedup_key
+                    LEFT JOIN rag_ft_panel_ratings ftr
+                      ON ftr.stream = 'anticipate' AND ftr.item_id = ac.dedup_key
+                    LEFT JOIN rag_ft_active_queue_state fts
+                      ON fts.stream = 'anticipate' AND fts.item_id = ac.dedup_key
+                    WHERE ac.sent = 1
+                      AND ac.ts >= datetime('now', '-7 days')
+                      AND af.id IS NULL
+                      AND ftr.id IS NULL
+                      AND (fts.snoozed_until_ts IS NULL
+                           OR fts.snoozed_until_ts < datetime('now'))
+                    ORDER BY ac.ts DESC
+                    LIMIT 10
+                """)
+                for row in cur.fetchall():
+                    dedup_key, kind, preview, score, ts = row
+                    items.append({
+                        "item_id": dedup_key,
+                        "stream": "anticipate",
+                        "label": preview or kind,   # message_preview si existe, else kind
+                        "ts": ts,
+                        "meta": {"kind": kind, "score": score},
+                    })
+            except Exception as exc_a:
+                _silent_log("fine_tunning_queue_anticipate_error", str(exc_a))
+
+            # ── Retrieval ANSWER: queries con respuesta exitosa, label si fue útil ──
+            # Puntás si la RESPUESTA del modelo era buena (no solo si encontró paths).
+            # Filtra: top_score >= 0.5 (alta confianza) AND answer_len > 0 (LLM respondió)
+            # AND NOT en rag_feedback (sin thumbs explícito todavía).
+            try:
+                cur = conn.execute("""
+                    SELECT q.id, q.q, q.top_score, q.ts, q.paths_json, q.session
+                    FROM rag_queries q
+                    LEFT JOIN rag_ft_panel_ratings ftr
+                      ON ftr.stream = 'retrieval_answer'
+                      AND ftr.item_id = CAST(q.id AS TEXT)
+                    LEFT JOIN rag_ft_active_queue_state fts
+                      ON fts.stream = 'retrieval_answer'
+                      AND fts.item_id = CAST(q.id AS TEXT)
+                    WHERE q.ts >= datetime('now', '-7 days')
+                      AND q.top_score >= 0.5
+                      AND q.answer_len > 0
+                      AND length(q.q) > 4
+                      AND ftr.id IS NULL
+                      AND (fts.snoozed_until_ts IS NULL
+                           OR fts.snoozed_until_ts < datetime('now'))
+                      AND NOT EXISTS (
+                          SELECT 1 FROM rag_feedback f
+                          WHERE f.q = q.q
+                            AND ABS(julianday(f.ts) - julianday(q.ts)) < 0.5
+                      )
+                    ORDER BY q.ts DESC
+                    LIMIT 10
+                """)
+                import json as _json_ra
+                for row in cur.fetchall():
+                    qid, qtext, ts_score, ts_q, paths_json, sess = row
+                    try:
+                        paths = _json_ra.loads(paths_json) if paths_json else []
+                    except Exception:
+                        paths = []
+                    items.append({
+                        "item_id": str(qid),
+                        "stream": "retrieval_answer",
+                        "label": qtext,
+                        "top_score": ts_score,
+                        "ts": ts_q,
+                        "paths": paths if isinstance(paths, list) else [],
+                        "session_id": sess,
+                    })
+            except Exception as exc_ra:
+                _silent_log("fine_tunning_queue_retrieval_answer_error", str(exc_ra))
+
+            # ── Draft WA: drafts del bot a contactos, sin rating del panel ──
+            # Mostrar bot_draft + sent_text (cuando approved_editar) → el user
+            # puntúa si la respuesta era apropiada vs lo que terminó mandando.
+            try:
+                cur = conn.execute("""
+                    SELECT d.draft_id, d.contact_name, d.bot_draft, d.sent_text,
+                           d.decision, d.ts
+                    FROM rag_draft_decisions d
+                    LEFT JOIN rag_ft_panel_ratings ftr
+                      ON ftr.stream = 'draft_wa' AND ftr.item_id = d.draft_id
+                    LEFT JOIN rag_ft_active_queue_state fts
+                      ON fts.stream = 'draft_wa' AND fts.item_id = d.draft_id
+                    WHERE d.ts >= datetime('now', '-7 days')
+                      AND d.bot_draft IS NOT NULL
+                      AND length(d.bot_draft) > 0
+                      AND ftr.id IS NULL
+                      AND (fts.snoozed_until_ts IS NULL
+                           OR fts.snoozed_until_ts < datetime('now'))
+                    ORDER BY
+                      CASE d.decision
+                        WHEN 'approved_editar' THEN 0
+                        WHEN 'rejected' THEN 1
+                        WHEN 'expired' THEN 2
+                        WHEN 'approved_si' THEN 3
+                      END,
+                      d.ts DESC
+                    LIMIT 15
+                """)
+                for row in cur.fetchall():
+                    draft_id, contact, bot_draft, sent_text, decision, ts_d = row
+                    short = (bot_draft or "")[:80]
+                    if len(bot_draft or "") > 80:
+                        short += "…"
+                    items.append({
+                        "item_id": draft_id,
+                        "stream": "draft_wa",
+                        "label": f"→ {contact or 'desconocido'}: {short}",
+                        "ts": ts_d,
+                        "meta": {
+                            "contact": contact,
+                            "bot_draft": bot_draft,
+                            "sent_text": sent_text,
+                            "decision": decision,
+                        },
+                    })
+            except Exception as exc_dw:
+                _silent_log("fine_tunning_queue_draft_wa_error", str(exc_dw))
+
+            # ── Proactive push: morning briefs / archive / etc sin rating panel ──
+            # Schema rag_proactive_log: id, ts, kind, sent, reason, extra_json
+            try:
+                cur = conn.execute("""
+                    SELECT p.id, p.kind, p.reason, p.extra_json, p.ts
+                    FROM rag_proactive_log p
+                    LEFT JOIN rag_ft_panel_ratings ftr
+                      ON ftr.stream = 'proactive_push'
+                      AND ftr.item_id = CAST(p.id AS TEXT)
+                    LEFT JOIN rag_ft_active_queue_state fts
+                      ON fts.stream = 'proactive_push'
+                      AND fts.item_id = CAST(p.id AS TEXT)
+                    WHERE p.ts >= datetime('now', '-7 days')
+                      AND p.sent = 1
+                      AND ftr.id IS NULL
+                      AND (fts.snoozed_until_ts IS NULL
+                           OR fts.snoozed_until_ts < datetime('now'))
+                    ORDER BY p.ts DESC
+                    LIMIT 10
+                """)
+                import json as _json_pp
+                for row in cur.fetchall():
+                    pid, kind, reason, extra_json, ts_p = row
+                    label_short = (reason or kind or "(sin reason)")[:80]
+                    extra = {}
+                    if extra_json:
+                        try:
+                            extra = _json_pp.loads(extra_json) or {}
+                        except Exception:
+                            extra = {}
+                    items.append({
+                        "item_id": str(pid),
+                        "stream": "proactive_push",
+                        "label": f"[{kind}] {label_short}",
+                        "ts": ts_p,
+                        "meta": {"kind": kind, "reason": reason, **extra},
+                    })
+            except Exception as exc_pp:
+                _silent_log("fine_tunning_queue_proactive_push_error", str(exc_pp))
+
+            # ── WhatsApp messages: chunks recientes del corpus, label si son
+            #    relevantes para retrieval (signal directo al ranker WA-aware) ──
+            # Lee de ragvec.db (corpus), NO telemetry.db. Open separado read-only.
+            try:
+                from rag import DB_PATH as _DB_PATH  # noqa: PLC0415
+                import sqlite3 as _sqlite_wa  # noqa: PLC0415
+                _ragvec_db = _DB_PATH / "ragvec.db"
+                if _ragvec_db.exists():
+                    _wa_conn = _sqlite_wa.connect(
+                        f"file:{_ragvec_db}?mode=ro&immutable=1", uri=True
+                    )
+                    try:
+                        # Buscar la tabla meta del v11 collection por convención
+                        cur_w = _wa_conn.execute("""
+                            SELECT name FROM sqlite_master
+                            WHERE type='table' AND name LIKE 'meta_obsidian_notes_v11_%'
+                            LIMIT 1
+                        """)
+                        meta_row = cur_w.fetchone()
+                        if meta_row:
+                            meta_table = meta_row[0]
+                            # Sample WA chunks recientes, capped a 8 (no inflar la cola)
+                            cur_w = _wa_conn.execute(f"""
+                                SELECT id, document, meta_json, created_ts
+                                FROM {meta_table}
+                                WHERE json_extract(meta_json, '$.source') = 'whatsapp'
+                                  AND created_ts >= unixepoch('now', '-3 days')
+                                ORDER BY created_ts DESC
+                                LIMIT 8
+                            """)
+                            import json as _json_wa
+                            wa_rows = cur_w.fetchall()
+                        else:
+                            wa_rows = []
+                    finally:
+                        _wa_conn.close()
+
+                    if wa_rows:
+                        # Cross-check ratings panel en telemetry conn (la ya abierta)
+                        wa_ids = [str(r[0]) for r in wa_rows]
+                        placeholders = ",".join(["?"] * len(wa_ids))
+                        cur_excl = conn.execute(
+                            f"SELECT item_id FROM rag_ft_panel_ratings "
+                            f"WHERE stream='whatsapp_msg' AND item_id IN ({placeholders})",
+                            wa_ids,
+                        )
+                        excluded_rated = {r[0] for r in cur_excl.fetchall()}
+                        cur_excl2 = conn.execute(
+                            f"SELECT item_id FROM rag_ft_active_queue_state "
+                            f"WHERE stream='whatsapp_msg' AND item_id IN ({placeholders}) "
+                            f"AND snoozed_until_ts > datetime('now')",
+                            wa_ids,
+                        )
+                        excluded_snoozed = {r[0] for r in cur_excl2.fetchall()}
+                        excluded = excluded_rated | excluded_snoozed
+
+                        for chunk_id, doc_text, meta_json, created_ts in wa_rows:
+                            sid = str(chunk_id)
+                            if sid in excluded:
+                                continue
+                            try:
+                                meta = _json_wa.loads(meta_json) if meta_json else {}
+                            except Exception:
+                                meta = {}
+                            chat_jid = meta.get("chat_jid") or meta.get("chat") or "?"
+                            sender = meta.get("from") or meta.get("sender") or "?"
+                            short_doc = (doc_text or "")[:100].replace("\n", " ")
+                            if len(doc_text or "") > 100:
+                                short_doc += "…"
+                            # ts ISO desde epoch
+                            try:
+                                import datetime as _dt_wa  # noqa: PLC0415
+                                ts_iso = _dt_wa.datetime.fromtimestamp(
+                                    int(created_ts)
+                                ).isoformat()
+                            except Exception:
+                                ts_iso = ""
+                            items.append({
+                                "item_id": sid,
+                                "stream": "whatsapp_msg",
+                                "label": f"[{sender}] {short_doc}",
+                                "ts": ts_iso,
+                                "meta": {"chat_jid": chat_jid, "sender": sender,
+                                         "snippet": short_doc},
+                            })
+            except Exception as exc_wa:
+                _silent_log("fine_tunning_queue_whatsapp_msg_error", str(exc_wa))
+
+    except Exception as exc:
+        try:
+            from rag import _silent_log as _sl  # noqa: PLC0415
+            _sl("fine_tunning_queue_error", str(exc))
+        except Exception:
+            pass
+        items = []
+
+    return {"items": items, "count": len(items)}
+
+
+@app.post("/api/fine_tunning/rate")
+async def fine_tunning_rate(req: FineTunningRateRequest) -> dict:
+    """Persiste rating en rag_ft_panel_ratings + upsertea rag_ft_active_queue_state
+    para que el item no vuelva a aparecer en el próximo /queue refresh.
+
+    El write a rag_ft_panel_ratings es async por default (RAG_LOG_FT_RATING_ASYNC=1).
+    El upsert de queue_state es siempre sync para que /queue lo refleje de inmediato.
+    """
+    import datetime as _dt  # noqa: PLC0415
+
+    from rag import (  # noqa: PLC0415
+        _enqueue_background_sql,
+        _log_ft_rating_event_background_default,
+        _ragvec_state_conn,
+        _silent_log,
+    )
+
+    now = _dt.datetime.now().isoformat()
+    row = {
+        "ts": now,
+        "stream": req.stream,
+        "item_id": req.item_id,
+        "rating": req.rating,
+        "label": req.label,
+        "comment": req.comment,
+        "session_id": req.session_id,
+    }
+
+    def _do_insert() -> None:
+        with _ragvec_state_conn() as conn:
+            conn.execute(
+                "INSERT INTO rag_ft_panel_ratings"
+                "(ts, stream, item_id, rating, label, comment, session_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (now, req.stream, req.item_id, req.rating,
+                 req.label, req.comment, req.session_id),
+            )
+            conn.commit()
+
+    use_async = _log_ft_rating_event_background_default()
+    if use_async:
+        _enqueue_background_sql(_do_insert, "fine_tunning_rate_insert_failed")
+    else:
+        try:
+            _do_insert()
+        except Exception as exc:
+            _silent_log("fine_tunning_rate_insert_failed", str(exc))
+
+    # Upsert queue_state sync → /queue inmediatamente excluye el item
+    try:
+        with _ragvec_state_conn() as conn:
+            conn.execute("""
+                INSERT INTO rag_ft_active_queue_state
+                  (item_id, stream, first_seen_ts, last_shown_ts, shown_count)
+                VALUES (?, ?, ?, ?, 1)
+                ON CONFLICT(item_id, stream) DO UPDATE SET
+                  last_shown_ts = excluded.last_shown_ts,
+                  shown_count   = shown_count + 1
+            """, (req.item_id, req.stream, now, now))
+            conn.commit()
+    except Exception as exc:
+        _silent_log("fine_tunning_queue_state_upsert_failed", str(exc))
+
+    return {"ok": True}
+
+
+@app.post("/api/fine_tunning/snooze")
+async def fine_tunning_snooze(req: FineTunningSnoozeRequest) -> dict:
+    """Pospone un item para que no aparezca en /queue hasta después de
+    ``hours`` horas (default 24, máx 168 = 1 semana)."""
+    import datetime as _dt  # noqa: PLC0415
+
+    from rag import _ragvec_state_conn, _silent_log  # noqa: PLC0415
+
+    now = _dt.datetime.now()
+    hours_clamped = max(1, min(req.hours, 168))
+    snoozed_until = (now + _dt.timedelta(hours=hours_clamped)).isoformat()
+    now_iso = now.isoformat()
+
+    try:
+        with _ragvec_state_conn() as conn:
+            conn.execute("""
+                INSERT INTO rag_ft_active_queue_state
+                  (item_id, stream, first_seen_ts, last_shown_ts,
+                   snoozed_until_ts, shown_count)
+                VALUES (?, ?, ?, ?, ?, 0)
+                ON CONFLICT(item_id, stream) DO UPDATE SET
+                  snoozed_until_ts = excluded.snoozed_until_ts,
+                  last_shown_ts    = excluded.last_shown_ts
+            """, (req.item_id, req.stream, now_iso, now_iso, snoozed_until))
+            conn.commit()
+    except Exception as exc:
+        _silent_log("fine_tunning_snooze_failed", str(exc))
+        raise HTTPException(status_code=500, detail="snooze failed") from exc
+
+    return {"ok": True, "snoozed_until": snoozed_until}
+
+
+# ── Fin Fine-tunning panel ──────────────────────────────────────────────
 
 
 if __name__ == "__main__":

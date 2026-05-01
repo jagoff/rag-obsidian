@@ -14218,15 +14218,34 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         and skips cycles while > 0 so chat gets exclusive ollama time.
         Decrement runs in `finally`, which executes on normal completion
         AND when the client disconnects (generator .close()).
+
+        2026-05-01: además del counter local `_CHAT_INFLIGHT` (que usa
+        el home-prewarmer), llamamos `begin_chat()/end_chat()` del
+        módulo `_ollama_health`. El watchdog de latencia consulta ese
+        counter via `in_flight_chats()` y skipea el `pkill -9 -f ollama`
+        mientras hay >=1 request streaming. Pre-fix: el watchdog mataba
+        ollama mid-synthesis y el cliente veía "Server disconnected
+        without sending a response" — exactamente el síntoma que el
+        watchdog dice arreglar. Lazy import para no acoplar el módulo.
         """
         global _CHAT_INFLIGHT
         with _CHAT_INFLIGHT_LOCK:
             _CHAT_INFLIGHT += 1
         try:
+            from rag._ollama_health import begin_chat as _hc_begin
+            _hc_begin()
+        except Exception:
+            pass
+        try:
             yield from gen()
         finally:
             with _CHAT_INFLIGHT_LOCK:
                 _CHAT_INFLIGHT = max(0, _CHAT_INFLIGHT - 1)
+            try:
+                from rag._ollama_health import end_chat as _hc_end
+                _hc_end()
+            except Exception:
+                pass
 
     # Bug fix 2026-04-27: add anti-buffering headers so reverse proxies
     # (Caddy, nginx) don't buffer the SSE stream, causing the user to

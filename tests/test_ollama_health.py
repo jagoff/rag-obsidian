@@ -91,6 +91,62 @@ class TestLatencyDegradationCheck:
         assert called["count"] == 0
 
 
+class TestInFlightGuard:
+    """Watchdog NO debe restartear ollama mientras hay /api/chat streaming."""
+
+    def test_skips_restart_when_chat_in_flight(self, monkeypatch):
+        # Recent p95 mucho mayor que baseline → ratio dispara restart.
+        recent = [200_000] * 10
+        baseline = [50_000] * 50
+        monkeypatch.setattr(
+            health, "_read_recent_query_latencies",
+            lambda window_minutes: (recent, baseline),
+        )
+        # Simular un chat en vuelo via el counter.
+        monkeypatch.setattr(health, "_in_flight_count", 1)
+        monkeypatch.setattr(health, "_last_restart_ts", 0.0)
+        called = {"count": 0}
+        monkeypatch.setattr(
+            health, "_restart_ollama_daemon",
+            lambda: (called.update({"count": called["count"] + 1}) or (True, "test")),
+        )
+        result = health._latency_degradation_check(threshold=1.8, cooldown_seconds=0)
+        assert result["action"] == "restart_skipped_in_flight"
+        assert "in_flight=1" in result["reason"]
+        assert called["count"] == 0  # NO se llamó el restart
+
+    def test_proceeds_when_no_chat_in_flight(self, monkeypatch):
+        recent = [200_000] * 10
+        baseline = [50_000] * 50
+        monkeypatch.setattr(
+            health, "_read_recent_query_latencies",
+            lambda window_minutes: (recent, baseline),
+        )
+        monkeypatch.setattr(health, "_in_flight_count", 0)
+        monkeypatch.setattr(health, "_last_restart_ts", 0.0)
+        called = {"count": 0}
+        monkeypatch.setattr(
+            health, "_restart_ollama_daemon",
+            lambda: (called.update({"count": called["count"] + 1}) or (True, "test")),
+        )
+        result = health._latency_degradation_check(threshold=1.8, cooldown_seconds=0)
+        assert result["action"] == "restart_attempted"
+        assert called["count"] == 1
+
+    def test_begin_end_chat_counter(self):
+        # Reset to 0 (other tests may have modified it).
+        health._in_flight_count = 0
+        assert health.in_flight_chats() == 0
+        health.begin_chat()
+        health.begin_chat()
+        assert health.in_flight_chats() == 2
+        health.end_chat()
+        assert health.in_flight_chats() == 1
+        health.end_chat()
+        health.end_chat()  # should clamp at 0, not go negative
+        assert health.in_flight_chats() == 0
+
+
 class TestStartWatchdog:
     def test_disabled_via_env(self, monkeypatch):
         monkeypatch.setenv("RAG_LATENCY_WATCHDOG_DISABLE", "1")

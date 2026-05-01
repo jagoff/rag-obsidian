@@ -403,18 +403,31 @@ def _add_batched(col, ids, embeddings, bodies, metas, source: str) -> None:
     `busy_timeout` on sqlite-vec is 0 (no wait), so any concurrent
     writer causes an immediate failure.
 
-    Retry: up to 8 attempts per batch, sleep = 0.25 × 2^attempt seconds
-    (0.25, 0.5, 1, 2, 4, 8, 16, 32s → ~64s cumulative max). If the last
-    attempt still fails, re-raise — something beyond contention is wrong.
+    Retry: up to 12 attempts per batch, sleep = 0.25 × 2^attempt seconds
+    (0.25, 0.5, 1, 2, 4, 8, 16, 32, 60, 60, 60, 60s → ~5min cumulative
+    max, capped at 60s per sleep). If the last attempt still fails,
+    re-raise — something beyond contention is wrong.
 
     Between batches sqlite-vec's writer lock releases briefly, letting
     the concurrent web server slot its own writes in.
+
+    Entity extraction runs ONCE after all batches have been committed to
+    the corpus — it must NOT be called inside the retry loop. Calling it
+    per-batch caused `database is locked` errors on the entity tables
+    (rag_entities / rag_entity_mentions) because those writes don't have
+    their own retry logic. Entity extraction is silent-fail: if it fails
+    the corpus is already persisted and the graph rebuilds on the next run.
     """
     import time as _time
+    # Accumulate completed chunks across batches; entity extraction runs once
+    # at the end after all col.add() calls succeed.
+    all_bodies: list = []
+    all_ids: list = []
+    all_metas: list = []
     for i in range(0, len(ids), _ADD_BATCH_SIZE):
         j = i + _ADD_BATCH_SIZE
         last_exc: Exception | None = None
-        for attempt in range(8):
+        for attempt in range(12):
             try:
                 col.add(
                     ids=ids[i:j], embeddings=embeddings[i:j],
@@ -426,12 +439,23 @@ def _add_batched(col, ids, embeddings, bodies, metas, source: str) -> None:
                 if "locked" not in str(exc).lower():
                     raise
                 last_exc = exc
-                _time.sleep(0.25 * (2 ** attempt))
+                _time.sleep(min(60.0, 0.25 * (2 ** attempt)))
         if last_exc is not None:
             raise last_exc
-        rag._extract_and_index_entities_for_chunks(
-            bodies[i:j], ids[i:j], metas[i:j], source,
-        )
+        all_bodies.extend(bodies[i:j])
+        all_ids.extend(ids[i:j])
+        all_metas.extend(metas[i:j])
+
+    # Single entity-extraction call for the entire batch set.
+    # Silent-fail: if the entity tables are locked the corpus is already
+    # committed and the graph will be rebuilt on the next ingester run.
+    if all_ids:
+        try:
+            rag._extract_and_index_entities_for_chunks(
+                all_bodies, all_ids, all_metas, source,
+            )
+        except Exception as exc:
+            rag._silent_log("safari_entity_extraction", exc)
 
 
 def upsert_history(col, entries: list[HistoryEntry]) -> int:

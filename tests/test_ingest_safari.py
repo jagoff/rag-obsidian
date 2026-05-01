@@ -513,6 +513,74 @@ def test_run_missing_sources_error(tmp_vault_col):
     assert "error" in summary
 
 
+# ── Entity extraction isolation (lock-fix regression tests) ─────────────
+
+def test_add_batched_entity_extraction_called_once(tmp_vault_col, monkeypatch):
+    """Entity extraction must run ONCE per _add_batched call, not once per
+    batch. Pre-fix: it was called inside the batch loop → N calls per run."""
+    col = tmp_vault_col
+    call_log: list = []
+
+    def _fake_extract(bodies, ids, metas, source):
+        call_log.append({"ids": list(ids), "source": source})
+
+    monkeypatch.setattr(rag, "_extract_and_index_entities_for_chunks", _fake_extract)
+
+    # Build 3 batches worth of entries (batch size is 50; use 3 items so
+    # there is a single batch in practice, but the key invariant is that
+    # the mock is called exactly ONCE regardless of how many batches exist).
+    n = s._ADD_BATCH_SIZE * 3 + 7  # force 4 batches
+    ids = [f"safari://history/{i}::0" for i in range(n)]
+    bodies = [f"body {i}" for i in range(n)]
+    metas = [{"file": f"safari://history/{i}", "source": "safari"} for i in range(n)]
+    dim = 8
+    embeddings = [[0.1] * dim for _ in range(n)]
+
+    s._add_batched(col, ids, embeddings, bodies, metas, "safari")
+
+    assert len(call_log) == 1, (
+        f"_extract_and_index_entities_for_chunks called {len(call_log)} times; expected 1"
+    )
+    # All IDs must be present in the single call.
+    assert set(call_log[0]["ids"]) == set(ids)
+    assert call_log[0]["source"] == "safari"
+
+
+def test_add_batched_entity_extraction_failure_does_not_raise(tmp_vault_col, monkeypatch, tmp_path):
+    """If entity extraction raises OperationalError (database is locked),
+    _add_batched must NOT re-raise — the corpus chunks are already persisted.
+    The error must be logged via rag._silent_log."""
+    col = tmp_vault_col
+    silent_calls: list = []
+
+    def _exploding_extract(bodies, ids, metas, source):
+        raise sqlite3.OperationalError("database is locked")
+
+    def _fake_silent_log(tag, exc):
+        silent_calls.append({"tag": tag, "exc": str(exc)})
+
+    monkeypatch.setattr(rag, "_extract_and_index_entities_for_chunks", _exploding_extract)
+    monkeypatch.setattr(rag, "_silent_log", _fake_silent_log)
+
+    ids = ["safari://history/99::0"]
+    bodies = ["body 99"]
+    metas = [{"file": "safari://history/99", "source": "safari"}]
+    embeddings = [[0.5] * 8]
+
+    # Must not raise even though entity extraction explodes.
+    s._add_batched(col, ids, embeddings, bodies, metas, "safari")
+
+    # The chunk must be in the corpus (corpus write succeeded before the
+    # entity extraction attempt).
+    got = col.get(where={"file": "safari://history/99"}, include=[])
+    assert got["ids"] == ["safari://history/99::0"], "Chunk missing from corpus post-failure"
+
+    # Silent-fail must have been called with the safari-specific tag.
+    assert len(silent_calls) == 1
+    assert silent_calls[0]["tag"] == "safari_entity_extraction"
+    assert "locked" in silent_calls[0]["exc"]
+
+
 # ── Integration ─────────────────────────────────────────────────────────
 
 def test_valid_sources_includes_safari():

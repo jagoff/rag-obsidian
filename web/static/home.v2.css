@@ -727,7 +727,9 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
    left color-coded por sub-sección para reforzar la jerarquía. */
 .today-hero-body {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  /* 5 cols desktop: Lo que pasó · Sin procesar · Preguntas · Para hoy ·
+     Para mañana. Antes eran 4 (sin "Para hoy" como sub-sección). */
+  grid-template-columns: repeat(5, 1fr);
   gap: 0;
 }
 .today-hero-body > .hero-section {
@@ -752,6 +754,7 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 .hero-section.s-narrative h3 { color: var(--cyan); }
 .hero-section.s-inbox h3      { color: var(--amber); }
 .hero-section.s-questions h3  { color: var(--magenta); }
+.hero-section.s-today h3      { color: var(--phosphor); }
 .hero-section.s-tomorrow h3   { color: var(--phosphor); }
 .hero-section h3 .count {
   margin-left: auto;

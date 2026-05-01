@@ -657,7 +657,7 @@
     return `<pre style="white-space:pre-wrap;font-family:inherit;margin:0;">${escapeHTML(stripWikilinks(md))}</pre>`;
   }
 
-  // Splittear el narrative en sus 4 sub-secciones por H2.
+  // Splittear el narrative en sus 5 sub-secciones por H2.
   // El formato esperado del LLM (system prompt en rag.py):
   //   ## 🪞 Lo que pasó hoy
   //   ...prose
@@ -665,14 +665,18 @@
   //   - item
   //   ## 🔍 Preguntas abiertas
   //   ...
+  //   ## 🌅 Para hoy
+  //   - item     (agenda del día actual: events + reminders due hoy)
   //   ## 🌅 Para mañana
-  //   - item
+  //   - item     (eventos de mañana + reminders due mañana)
   //
-  // Devolvemos `{narrative, inbox, questions, tomorrow}` con el contenido
-  // (sin el header) de cada sub-sección. Si el LLM se zarpó con el orden
-  // o agregó/sacó secciones, matcheamos por keyword en el header.
+  // Devolvemos `{narrative, inbox, questions, today, tomorrow}` con el
+  // contenido (sin el header) de cada sub-sección. Si el LLM se zarpó con
+  // el orden o agregó/sacó secciones, matcheamos por keyword en el header.
+  // Cuidado con el header "🌅 Para hoy" — debe matchear ANTES que el
+  // matcher genérico "lo que pasó hoy" porque ambos tienen "hoy".
   function splitNarrative(md) {
-    const out = { narrative: "", inbox: "", questions: "", tomorrow: "" };
+    const out = { narrative: "", inbox: "", questions: "", today: "", tomorrow: "" };
     if (!md) return out;
     // Split por líneas que empiezan con `## ` (H2). El primer chunk
     // es lo que va antes del primer H2 (puede ser vacío).
@@ -682,14 +686,18 @@
       if (!headerMatch) continue;
       const header = headerMatch[1].toLowerCase();
       const body = headerMatch[2].trim();
-      if (/lo que pas[oó]|hoy/.test(header) && /pas/.test(header)) {
+      // "Para mañana" PRIMERO — sino "para hoy" matchea con el matcher
+      // genérico "/hoy/" y se pisan entre sí.
+      if (/ma[ñn]ana|tomorrow/.test(header)) {
+        out.tomorrow = body;
+      } else if (/para\s*hoy|agenda\s*hoy|🌅.*hoy|hoy\b.*agenda/.test(header)) {
+        out.today = body;
+      } else if (/lo que pas[oó]|qu[eé] pas[oó]/.test(header)) {
         out.narrative = body;
       } else if (/sin procesar|inbox|por procesar/.test(header)) {
         out.inbox = body;
       } else if (/pregunta|abierta|open|low.?conf/.test(header)) {
         out.questions = body;
-      } else if (/ma[ñn]ana|tomorrow|para hoy m/.test(header)) {
-        out.tomorrow = body;
       }
     }
     return out;
@@ -929,8 +937,13 @@
     // tomorrow_calendar viene como array directo en el payload (NO como
     // objeto con .events). Bug histórico: el código previo asumía la
     // shape equivocada y nunca caía al fallback aunque hubiera events.
+    // today_calendar es paralelo: eventos de HOY (con date_label="today"
+    // de icalBuddy). Antes ambos venían mezclados en tomorrow_calendar.
     const tomorrowEvents = Array.isArray(payload.tomorrow_calendar)
       ? payload.tomorrow_calendar
+      : [];
+    const todayEvents = Array.isArray(payload.today_calendar)
+      ? payload.today_calendar
       : [];
 
     // Counts chip al lado de la fecha
@@ -1115,29 +1128,68 @@
       questionsHTML = items.length ? `<ul>${items.join("")}</ul>` : "";
     }
 
-    // Sub-section: 🌅 "Para mañana" — events del calendar + reminders
-    // que vencen mañana. Bug fix: tomorrow_calendar es array directo.
-    let tomorrowHTML = "";
-    if (split.tomorrow) {
-      tomorrowHTML = mdToHTML(split.tomorrow);
-    } else {
+    // Helper: due date matchers para reminders. "today"/"hoy" matchea
+    // due strings tipo "today 9:00 am", "hoy 9:00", "today" exacto.
+    // "tomorrow"/"mañana" idem para mañana.
+    const dueMatchesToday = (r) => {
+      const due = (r.due || r.due_at || "").toLowerCase();
+      return /\btoday\b|\bhoy\b/.test(due);
+    };
+    const dueMatchesTomorrow = (r) => {
+      const due = (r.due || r.due_at || "").toLowerCase();
+      return /\btomorrow\b|ma[ñn]ana/.test(due);
+    };
+
+    // Helper: render una agenda (events + reminders due) como <ul>.
+    const renderAgendaItems = (events, reminders, fallbackPrefix) => {
       const items = [];
-      // Events del calendar de mañana
-      for (const e of tomorrowEvents.slice(0, 6)) {
+      for (const e of events.slice(0, 6)) {
         const tr = (e.time_range || "").trim();
-        const prefix = tr || "todo el día";
+        const prefix = tr || fallbackPrefix;
         const title = e.title || e.summary || "(sin título)";
         items.push(`<li><strong>${escapeHTML(prefix)}</strong> — ${escapeHTML(title)}</li>`);
       }
-      // Reminders de mañana (si hay y no duplican calendar)
-      const reminders = (signals.reminders || []).filter((r) => {
-        const due = (r.due || r.due_at || "").toLowerCase();
-        return due.includes("tomorrow") || due.includes("mañana");
-      }).slice(0, 3);
-      for (const r of reminders) {
+      for (const r of reminders.slice(0, 3)) {
         items.push(`<li>📌 ${escapeHTML(truncate(r.title || r.text || "", 80))}</li>`);
       }
-      tomorrowHTML = items.length ? `<ul>${items.join("")}</ul>` : "";
+      return items.length ? `<ul>${items.join("")}</ul>` : "";
+    };
+
+    // Sub-section: 🌅 "Para hoy" — agenda del día actual (events del
+    // calendar de hoy + reminders due hoy). Antes esta sección no
+    // existía y los eventos de hoy se mezclaban en "Para mañana" por
+    // un bug del filtro de _fetch_calendar_ahead. Si el LLM no la
+    // generó, fallback con todayEvents (filtrados por date_label en
+    // el server).
+    let todayHTML = "";
+    if (split.today) {
+      todayHTML = mdToHTML(split.today);
+    } else {
+      const reminders = (signals.reminders || []).filter(dueMatchesToday);
+      todayHTML = renderAgendaItems(todayEvents, reminders, "todo el día");
+    }
+
+    // Sub-section: 🌅 "Para mañana" — events del calendar de mañana +
+    // reminders que vencen mañana. tomorrow_calendar ahora viene
+    // filtrado en el server (date_label != "today").
+    //
+    // Heurística defensiva: si el LLM brief CACHED tiene una sección
+    // "Para mañana" pero el server dice que tomorrow_calendar está
+    // vacío Y today_calendar tiene events, asumimos que el brief es
+    // de antes del fix (cuando tomorrow_calendar incluía eventos de
+    // hoy con date_label="today"). En ese caso, ignoramos el cached
+    // narrative para mañana y usamos el fallback (que va a decir
+    // "agenda libre mañana"). El próximo regenerate del LLM va a
+    // generar AMBAS secciones bien separadas.
+    const tomorrowBriefIsStale = split.tomorrow
+      && tomorrowEvents.length === 0
+      && todayEvents.length > 0;
+    let tomorrowHTML = "";
+    if (split.tomorrow && !tomorrowBriefIsStale) {
+      tomorrowHTML = mdToHTML(split.tomorrow);
+    } else {
+      const reminders = (signals.reminders || []).filter(dueMatchesTomorrow);
+      tomorrowHTML = renderAgendaItems(tomorrowEvents, reminders, "todo el día");
     }
 
     // Counts visibles en el chip de cada sección — usar lo que hay
@@ -1148,13 +1200,17 @@
     const questionsCount = lowConfItems.length
       + ((signals.followup_aging?.stale_30plus || 0) > 0 ? 1 : 0)
       + (evidence.new_contradictions?.length || 0);
-    const tomorrowCount = tomorrowEvents.length;
+    const todayCount = todayEvents.length
+      + (signals.reminders || []).filter(dueMatchesToday).length;
+    const tomorrowCount = tomorrowEvents.length
+      + (signals.reminders || []).filter(dueMatchesTomorrow).length;
 
     bodyEl.innerHTML = [
       sectionHTML("s-narrative", "🪞", "Lo que pasó hoy", null, narrativeHTML, "Aún sin brief — pulsá ↻ arriba para generar"),
       sectionHTML("s-inbox", "📥", "Sin procesar", inboxCount || null, inboxHTML, "todo procesado ✓"),
       sectionHTML("s-questions", "🔍", "Preguntas abiertas", questionsCount || null, questionsHTML, "sin preguntas pendientes"),
-      sectionHTML("s-tomorrow", "🌅", "Para mañana", tomorrowCount || null, tomorrowHTML, "agenda libre · día abierto"),
+      sectionHTML("s-today", "🌅", "Para hoy", todayCount || null, todayHTML, "agenda libre hoy · día abierto"),
+      sectionHTML("s-tomorrow", "🌅", "Para mañana", tomorrowCount || null, tomorrowHTML, "agenda libre mañana · día abierto"),
     ].join("");
 
     // Botones inline "crear reminder" en cada <li> de "Para mañana"

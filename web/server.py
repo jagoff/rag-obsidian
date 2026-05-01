@@ -10373,7 +10373,19 @@ def _home_compute(
         # eats the cold compute. If it still times out, the next cycle
         # repopulates and SWR keeps stale signals visible meanwhile.
         signals = _await("signals", fut_signals, 45, default={}) or {}
-        tomorrow_calendar = _await("tomorrow", fut_tomorrow, 10, default=[]) or []
+        # `_fetch_calendar_ahead(1)` devuelve TODOS los eventos del rango
+        # [hoy, hoy+1] mezclados — incluye los de hoy con date_label="today"
+        # y los de mañana con date_label="tomorrow" (o fecha YYYY-MM-DD).
+        # Bug histórico: el frontend renderaba `tomorrow_calendar` como
+        # "Para mañana" sin filtrar, así que un FERIADO de hoy aparecía
+        # listado bajo "🌅 Para mañana". Lo separamos explícitamente acá:
+        # `today_calendar` para la sección "Para hoy" del hero, y
+        # `tomorrow_calendar` para "Para mañana" (solo eventos no-today).
+        _calendar_ahead = _await("tomorrow", fut_tomorrow, 10, default=[]) or []
+        def _label(ev: dict) -> str:
+            return (ev.get("date_label") or "").strip().lower()
+        today_calendar = [e for e in _calendar_ahead if _label(e) == "today"]
+        tomorrow_calendar = [e for e in _calendar_ahead if _label(e) and _label(e) != "today"]
         weather_forecast = _await("forecast", fut_forecast, 10, default=None)
         pagerank_top = _await("pagerank", fut_pagerank, 10, default=[]) or []
         chrome_top_week = _await("chrome", fut_chrome, 5, default=[]) or []
@@ -10661,6 +10673,11 @@ def _home_compute(
         },
         "urgent": urgent,
         "signals": signals,
+        # `today_calendar` / `tomorrow_calendar` separados explícitamente
+        # — derivados del mismo `_fetch_calendar_ahead(1)` filtrando por
+        # `date_label`. El frontend renderea dos sub-secciones del hero
+        # ("🌅 Para hoy" / "🌅 Para mañana") independientes.
+        "today_calendar": today_calendar,
         "tomorrow_calendar": tomorrow_calendar,
         "weather_forecast": weather_forecast,
         # Map alias → dir basename para que el frontend construya

@@ -9689,10 +9689,14 @@ def _home_compute(
         chrome_top_week = _await("chrome", fut_chrome, 5, default=[]) or []
         eval_trend = _await("eval", fut_eval, 5, default=None)
         # followup_aging has its own 6h cache + LLM-judge per loop on cold.
-        # If not ready within 2s, skip it this cycle — the bg thread keeps
-        # computing and the next prewarmer pass (25s later) picks up the
-        # warm cache. This shaves ~15s off the cold critical path.
-        followup_aging = _await("followup", fut_followup, 2, default=None)
+        # Timeout 5s (era 2s, demasiado corto — el panel quedaba "sin
+        # datos de loops" siempre cold porque ningún compute terminaba
+        # antes). 5s deja al fetcher devolver buckets si está warm en
+        # cache; cold sigue corriendo en bg para warm-ear el cache, y
+        # el próximo cycle ya muestra los datos. Si sigue null, el
+        # frontend hace fallback con loops_stale + loops_activo del
+        # mismo payload.
+        followup_aging = _await("followup", fut_followup, 5, default=None)
         drive_recent = _await("drive", fut_drive, 10, default=[]) or []
         whatsapp_unreplied = _await("wa_unreplied", fut_wa_unreplied, 10, default=[]) or []
         chrome_bookmarks = _await("bookmarks", fut_bookmarks, 5, default=[]) or []

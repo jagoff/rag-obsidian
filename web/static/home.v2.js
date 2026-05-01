@@ -232,45 +232,151 @@
   }
 
   function renderInbox(payload) {
-    const items = payload.today?.evidence?.inbox_today || [];
-    const rows = items.slice(0, 8).map((it) => ({
-      title: it.title || it.path,
-      meta: [
-        ...(it.tags || []).map((t) => `#${t}`),
-        fmtTimeAgo(it.modified),
-      ],
-    }));
+    // Bug fix: el panel sólo miraba `evidence.inbox_today` (capturas
+    // del vault). Si el inbox del vault estaba vacío pero había
+    // mails VIP / WhatsApp pendientes / mail Apple sin leer, el panel
+    // mostraba "todo procesado ✓" mintiéndole al user. Cascada igual
+    // a la del hero: vault inbox → gmail.recent → whatsapp_unreplied
+    // → mail_unread.
+    const evidence = payload.today?.evidence || {};
+    const signals = payload.signals || {};
+    const inboxToday = evidence.inbox_today || [];
+    const gmailRecent = signals.gmail?.recent || [];
+    const waUnreplied = [...(signals.whatsapp_unreplied || [])]
+      .sort((a, b) => (b.hours_waiting || 0) - (a.hours_waiting || 0));
+    const mailUnread = signals.mail_unread || [];
+    const fromName = (s) => (s || "").split("<")[0].trim() || s || "";
+    const truncate = (s, n) => (s || "").length > n ? (s || "").slice(0, n) + "…" : (s || "");
+
+    const rows = [];
+    for (const it of inboxToday.slice(0, 3)) {
+      rows.push({
+        title: it.title || it.path,
+        meta: [
+          it.vault ? `[${it.vault}]` : null,
+          ...(it.tags || []).map((t) => `#${t}`),
+          fmtTimeAgo(it.modified),
+        ].filter(Boolean),
+      });
+    }
+    for (const m of gmailRecent.slice(0, 3)) {
+      rows.push({
+        title: `📧 ${fromName(m.from)}: ${truncate(m.subject || "", 70)}`,
+        meta: [m.internal_date_ms ? fmtTimeAgo(new Date(m.internal_date_ms).toISOString()) : null].filter(Boolean),
+      });
+    }
+    for (const w of waUnreplied.slice(0, 3)) {
+      rows.push({
+        title: `💬 ${w.name || ""}`,
+        meta: [
+          w.hours_waiting != null ? `${Math.round(w.hours_waiting)}h esperando` : null,
+          truncate(w.last_snippet || "", 60),
+        ].filter(Boolean),
+      });
+    }
+    if (!rows.length && mailUnread.length) {
+      for (const m of mailUnread.slice(0, 3)) {
+        rows.push({
+          title: `📬 ${fromName(m.from || m.sender)}: ${truncate(m.subject || "", 70)}`,
+          meta: [],
+        });
+      }
+    }
+
+    const total = inboxToday.length + gmailRecent.length + waUnreplied.length + mailUnread.length;
     renderPanelList("p-inbox", rows, {
       emptyText: "todo el inbox procesado ✓",
       capChip: rows.length > 5 ? "warning" : "info",
-      footText: rows.length ? `top 8 de ${items.length}` : "",
+      footText: rows.length ? `${rows.length} de ${total}` : "",
     });
   }
 
   function renderQuestions(payload) {
-    const items = payload.signals?.low_conf || [];
-    const rows = items.slice(0, 6).map((it) => ({
-      title: it.q || it.question || it.text || "",
-      meta: [
-        it.score != null ? `score ${it.score.toFixed?.(2) || it.score}` : null,
-        it.ts ? fmtTimeAgo(it.ts) : null,
-      ].filter(Boolean),
-    }));
+    // Bug fix: el panel sólo miraba `signals.low_conf`. Si el día no
+    // tuvo queries low-confidence (común), ignoraba contradicciones
+    // detectadas y loops activos / stale que sí pueden tener items
+    // accionables. Cascada como en el hero: low_conf → contradictions
+    // → loops_activo → loops_stale.
+    const signals = payload.signals || {};
+    const evidence = payload.today?.evidence || {};
+    const lowConf = signals.low_conf || [];
+    const newContrad = evidence.new_contradictions || [];
+    const contradictions = signals.contradictions || [];
+    const loopsActivo = signals.loops_activo || [];
+    const truncate = (s, n) => (s || "").length > n ? (s || "").slice(0, n) + "…" : (s || "");
+
+    const rows = [];
+    for (const it of lowConf.slice(0, 4)) {
+      const text = it.q || it.question || it.text || "";
+      rows.push({
+        title: `❓ ${text}`,
+        meta: [
+          it.score != null ? `score ${(typeof it.score === "number" ? it.score : Number(it.score)).toFixed(2)}` : null,
+          it.ts ? fmtTimeAgo(it.ts) : null,
+        ].filter(Boolean),
+      });
+    }
+    const contradList = newContrad.length ? newContrad : (Array.isArray(contradictions) ? contradictions : []);
+    for (const c of contradList.slice(0, 3)) {
+      const text = c.text || c.summary || c.title || c.note_a || c.subject_path || "";
+      if (!text) continue;
+      rows.push({
+        title: `⚠ ${truncate(text, 90)}`,
+        meta: [c.ts ? fmtTimeAgo(c.ts) : null].filter(Boolean),
+      });
+    }
+    if (!rows.length) {
+      for (const l of loopsActivo.slice(0, 4)) {
+        const text = l.loop_text || l.text || l.title || "";
+        if (!text) continue;
+        rows.push({
+          title: `🔄 ${truncate(text, 90)}`,
+          meta: [
+            l.age_days != null ? `${l.age_days}d` : null,
+            l.source_note ? l.source_note.split("/").pop().replace(/\.md$/, "") : null,
+          ].filter(Boolean),
+        });
+      }
+    }
     renderPanelList("p-questions", rows, {
       emptyText: "no hay preguntas sin respuesta",
-      capChip: "warning",
+      capChip: rows.length > 4 ? "warning" : "info",
     });
   }
 
   function renderTomorrow(payload) {
-    const cal = payload.tomorrow_calendar || {};
-    const items = cal.events || [];
-    const rows = items.slice(0, 8).map((e) => ({
-      title: e.title || e.summary || "(sin título)",
-      meta: [e.start || e.time, e.location].filter(Boolean),
-    }));
+    // Bug fix: `tomorrow_calendar` viene como ARRAY directo en el
+    // payload, no como objeto con `.events`. El panel usaba `cal.events`
+    // y siempre quedaba vacío aunque hubiera 2 events de mañana.
+    // Misma raíz que el bug del hero "Para mañana".
+    const events = Array.isArray(payload.tomorrow_calendar)
+      ? payload.tomorrow_calendar
+      : [];
+    const signals = payload.signals || {};
+    const reminders = (signals.reminders || []).filter((r) => {
+      const due = (r.due || r.due_at || "").toLowerCase();
+      return due.includes("tomorrow") || due.includes("mañana");
+    });
+
+    const rows = [];
+    for (const e of events.slice(0, 8)) {
+      const tr = (e.time_range || "").trim();
+      rows.push({
+        title: e.title || e.summary || "(sin título)",
+        meta: [
+          tr || "todo el día",
+          e.location || null,
+        ].filter(Boolean),
+      });
+    }
+    for (const r of reminders.slice(0, 3)) {
+      rows.push({
+        title: `📌 ${r.title || r.text || ""}`,
+        meta: [r.list || null].filter(Boolean),
+      });
+    }
     renderPanelList("p-tomorrow", rows, {
-      emptyText: cal.message || "agenda libre mañana",
+      emptyText: "agenda libre mañana",
     });
   }
 
@@ -928,30 +1034,71 @@
     if (!panel) return;
     const body = panel.querySelector("[data-body]");
     const count = panel.querySelector("[data-count]");
-    if (!f || !f.buckets) {
-      body.innerHTML = `<div class="empty">sin datos de loops</div>`;
-      count.textContent = "—";
+
+    // Bug fix nombres de keys: el server emite `buckets["0_7"]`,
+    // `buckets["8_30"]`, `buckets["stale_30plus"]` (con guión bajo),
+    // pero el render previo buscaba `buckets["0-7d"]` etc. (con guión y
+    // sufijo "d"). Mismatch silencioso → todos quedaban en 0 aunque la
+    // data llegara. Fallback compat con keys viejas.
+    let fresh = 0, aging = 0, stale = 0;
+    let total = 0;
+    let sample = [];
+    if (f && f.buckets) {
+      const b = f.buckets;
+      fresh = Number(b["0_7"] ?? b["0-7d"] ?? b.fresh ?? 0);
+      aging = Number(b["8_30"] ?? b["8-30d"] ?? b.aging ?? 0);
+      stale = Number(b["stale_30plus"] ?? b["stale"] ?? b.STALE ?? 0);
+      total = Number(f.total ?? (fresh + aging + stale));
+      sample = f.sample || [];
+    }
+
+    // Si el cache de followup_aging está cold y el fetcher devolvió
+    // null (timeout 5s), fallback derivamos los buckets de
+    // signals.loops_stale + loops_activo (que sí vienen sync). Es una
+    // aproximación — los buckets de aging real necesitan un LLM-judge
+    // per loop — pero al menos el panel deja de mentir "sin datos".
+    if (total === 0) {
+      const loopsStale = (payload.signals?.loops_stale || []).length;
+      const loopsActivo = (payload.signals?.loops_activo || []).length;
+      if (loopsStale > 0 || loopsActivo > 0) {
+        stale = loopsStale;
+        // No tenemos breakdown 0_7 vs 8_30 sin LLM-judge, pero podemos
+        // distribuir loops_activo por age_days si existe.
+        for (const l of payload.signals?.loops_activo || []) {
+          const age = Number(l.age_days || 0);
+          if (age >= 8) aging++;
+          else fresh++;
+        }
+        total = fresh + aging + stale;
+        // Sample: los más viejos (stale primero, después loops_activo)
+        sample = [
+          ...(payload.signals?.loops_stale || []).slice(0, 2),
+          ...(payload.signals?.loops_activo || []).slice(0, 2),
+        ];
+      }
+    }
+
+    if (total === 0) {
+      body.innerHTML = `<div class="empty">sin loops abiertos · todo cerrado</div>`;
+      count.textContent = "0";
       return;
     }
-    const buckets = f.buckets || {};
-    const fresh = buckets["0-7d"] || buckets.fresh || 0;
-    const aging = buckets["8-30d"] || buckets.aging || 0;
-    const stale = buckets["stale"] || buckets.STALE || 0;
+
     body.innerHTML = `
       <div class="panel-kpi">
-        <span class="value">${f.total || (fresh + aging + stale)}</span>
+        <span class="value">${total}</span>
         ${stale > 0 ? `<span class="delta up">${stale} STALE</span>` : `<span class="delta down">tranquilo</span>`}
       </div>
       ${stackedBar({ fresh, aging, stale })}
-      ${(f.sample || []).slice(0, 3).length ? `
+      ${sample.slice(0, 3).length ? `
         <div class="row-meta" style="margin-top: 8px; flex-direction: column; align-items: stretch;">
-          ${(f.sample || []).slice(0, 3).map((s) =>
-            `<div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">· ${escapeHTML((s.text || s.loop_text || "").slice(0, 60))}</div>`
+          ${sample.slice(0, 3).map((s) =>
+            `<div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">· ${escapeHTML((s.loop || s.loop_text || s.text || "").slice(0, 60))}</div>`
           ).join("")}
         </div>
       ` : ""}
     `;
-    count.textContent = f.total || (fresh + aging + stale);
+    count.textContent = String(total);
   }
 
   function renderAuthority(payload) {
@@ -996,36 +1143,94 @@
   }
 
   function renderWeather(payload) {
+    // Shape real (verificado en /api/home, weather_forecast):
+    //   { location, current: {description, temp_C}, days: [
+    //     {date, minC, maxC, avgC, description, chanceofrain,
+    //      chanceofthunder}, ...] }
+    // Bug previo: el render usaba `d.summary` / `d.temp_min` / `d.temp_max`
+    // que NO existen en este shape. El panel quedaba mostrando solo la
+    // fecha sin temperatura ni descripción — por eso el user dijo "no
+    // tiene sentido, solo muestra la fecha".
     const wf = payload.weather_forecast;
-    const today = payload.signals?.weather;
     const panel = document.getElementById("p-weather");
     if (!panel) return;
     const body = panel.querySelector("[data-body]");
     const count = panel.querySelector("[data-count]");
 
-    let items = [];
-    if (Array.isArray(wf)) items = wf;
-    else if (wf && typeof wf === "object") {
-      items = wf.forecast || wf.days || Object.values(wf).filter((v) => v && typeof v === "object");
-    }
-    if (today && (!items.length || !items.some((d) => d.date === today.date))) {
-      items = [today, ...items];
-    }
-    if (!items.length) {
-      body.innerHTML = `<div class="empty">sin datos</div>`;
+    if (!wf || (!wf.days && !wf.current && !Array.isArray(wf))) {
+      body.innerHTML = `<div class="empty">sin datos del clima</div>`;
       count.textContent = "—";
       return;
     }
-    const rows = items.slice(0, 4).map((d) => ({
-      title: d.date || d.day || "",
-      meta: [
-        d.summary || d.condition || "",
-        d.temp_min != null && d.temp_max != null
-          ? `${d.temp_min}°–${d.temp_max}°`
-          : (d.temp != null ? `${d.temp}°` : null),
-      ].filter(Boolean),
-    }));
-    renderPanelList("p-weather", rows, {});
+
+    // Header: localización + condición actual + temperatura
+    const loc = wf.location || "";
+    const cur = wf.current || {};
+    const headerParts = [];
+    if (loc) headerParts.push(escapeHTML(loc.split(",")[0]));
+    if (cur.description) headerParts.push(escapeHTML(cur.description));
+    if (cur.temp_C != null) headerParts.push(`${cur.temp_C}°C`);
+    const headerHTML = headerParts.length
+      ? `<div class="row-meta" style="margin-bottom: var(--space-3); font-size: 13px; color: var(--text);">
+          ${headerParts.join(" · ")}
+         </div>`
+      : "";
+
+    // Pronóstico de los próximos días
+    const days = Array.isArray(wf) ? wf : (wf.days || wf.forecast || []);
+    const dayIcon = (desc) => {
+      const d = (desc || "").toLowerCase();
+      if (/lluvi|chuva|rain/.test(d)) return "🌧";
+      if (/tormen|trueno|thunder/.test(d)) return "⛈";
+      if (/nub|nublad|cloud/.test(d)) return "☁";
+      if (/parcial|partly/.test(d)) return "⛅";
+      if (/despej|sole|clear|sun/.test(d)) return "☀";
+      if (/niebl|fog|mist/.test(d)) return "🌫";
+      return "·";
+    };
+    const dayLabel = (dateStr) => {
+      if (!dateStr) return "";
+      // Usar fecha LOCAL (no UTC) para que "hoy"/"mañana" no shifteen
+      // por timezone. Bug previo: `new Date().toISOString()` da UTC,
+      // así que después de 21:00 ART (UTC-3) "hoy" se calculaba como
+      // el día siguiente y el panel mostraba "jue 30 → hoy → mañana"
+      // off-by-one.
+      const localDate = (offsetDays = 0) => {
+        const d = new Date();
+        d.setDate(d.getDate() + offsetDays);
+        return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+      };
+      if (dateStr === localDate(0)) return "hoy";
+      if (dateStr === localDate(1)) return "mañana";
+      try {
+        const d = new Date(dateStr + "T12:00");  // mediodía evita DST/timezone edge
+        return d.toLocaleDateString("es-AR", { weekday: "short", day: "2-digit" });
+      } catch { return dateStr.slice(5); }
+    };
+
+    const rows = days.slice(0, 4).map((d) => {
+      const icon = dayIcon(d.description);
+      const tempRange = (d.minC != null && d.maxC != null)
+        ? `${d.minC}°–${d.maxC}°`
+        : (d.avgC != null ? `${d.avgC}°` : "");
+      const rain = Number(d.chanceofrain) || 0;
+      const metaBits = [
+        d.description ? escapeHTML(d.description) : "",
+        rain >= 30 ? `💧 ${rain}%` : "",
+      ].filter(Boolean);
+      return `<div class="row" style="padding: 4px 0;">
+        <div class="row-main">
+          <div class="row-title" style="display: flex; gap: 8px; align-items: center;">
+            <span style="font-size: 16px; min-width: 20px;">${icon}</span>
+            <span><strong>${escapeHTML(dayLabel(d.date))}</strong> · ${tempRange}</span>
+          </div>
+          ${metaBits.length ? `<div class="row-meta" style="margin-left: 28px;">${metaBits.join(" · ")}</div>` : ""}
+        </div>
+      </div>`;
+    });
+
+    body.innerHTML = headerHTML + rows.join("");
+    count.textContent = cur.temp_C != null ? `${cur.temp_C}°C` : (days.length ? `${days.length}d` : "—");
   }
 
   function renderVaultActivity(payload) {

@@ -49884,8 +49884,18 @@ def _mood_poll_plist(rag_bin: str) -> str:
 
 
 def _routing_rules_plist(rag_bin: str) -> str:
-    """Detector de patrones de ruteo — cada 5 minutos, analiza comportamiento
-    y sugiere nuevas rutas de queries."""
+    """Detector de patrones de ruteo — cada 5 minutos, analiza
+    comportamiento y promueve nuevas rutas de queries automáticamente.
+
+    Fix 2026-05-01: agregamos `--auto-promote` para que el cron cierre
+    el loop end-to-end. Antes el daemon SOLO listaba candidatos
+    (`extract-rules` sin flag = listing puro) → `rag_routing_rules`
+    quedaba con 0 rows aunque hubiera patrones consistentes. Ahora,
+    cuando un patrón cumple `min_count=5` y `min_ratio=0.90`, se
+    upsertea directo a `rag_routing_rules(active=1)` y el listener
+    WhatsApp lo aplica en el próximo dispatch. Sin esto, el loop
+    quedaba half-closed (collector OK, trainer OK, apply ✗).
+    """
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -49896,6 +49906,7 @@ def _routing_rules_plist(rag_bin: str) -> str:
     <string>{rag_bin}</string>
     <string>routing</string>
     <string>extract-rules</string>
+    <string>--auto-promote</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
@@ -49915,7 +49926,17 @@ def _routing_rules_plist(rag_bin: str) -> str:
 
 def _whisper_vocab_plist(rag_bin: str) -> str:
     """Extractor nightly de vocabulario de transcripción WhatsApp — 03:15,
-    popula rag_whisper_vocab para mejorar el reconocimiento de Whisper."""
+    popula rag_whisper_vocab para mejorar el reconocimiento de Whisper.
+
+    Fix 2026-05-01: el comando real es `rag whisper vocab refresh` (3
+    niveles: grupo `whisper` → subgrupo `vocab` → comando `refresh`).
+    Antes el plist decía `whisper-vocab refresh` (con guión) que no
+    existía como comando — el daemon fallaba silenciosamente cada noche
+    desde el 2026-04-25, dejando `rag_whisper_vocab` con vocab estático
+    (400 rows congeladas). Resultado: la transcripción de WhatsApp no
+    aprendía términos nuevos del corpus reciente. Ver memoria
+    `whisper-vocab-plist-fix-2026-05-01` en mem-vault para el detalle.
+    """
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -49924,7 +49945,8 @@ def _whisper_vocab_plist(rag_bin: str) -> str:
   <key>ProgramArguments</key>
   <array>
     <string>{rag_bin}</string>
-    <string>whisper-vocab</string>
+    <string>whisper</string>
+    <string>vocab</string>
     <string>refresh</string>
   </array>
   <key>EnvironmentVariables</key>

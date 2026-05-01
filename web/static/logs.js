@@ -34,6 +34,9 @@
     live: true,
     sidebarTimer: null,
     viewerTimer: null,
+    rankings: null,        // payload completo del último /api/logs/rankings
+    rankingsWindow: null,  // segundos seleccionados (1h/24h/7d)
+    rankingsTimer: null,
   };
 
   const GLOBAL_WINDOWS = {
@@ -45,6 +48,12 @@
   const SIDEBAR_REFRESH_MS = 8000;
   const VIEWER_REFRESH_MS = 4000;
   const VIEWER_TAIL_DEFAULT = 500;
+  const RANKINGS_REFRESH_MS = 12000;
+  const RANKINGS_TOP_N = 5;
+  // Default window: 24h. El select del header lo override-a y persistimos
+  // la elección en localStorage para que sobreviva refresh/restart.
+  const RANKINGS_WINDOW_DEFAULT = 86400;
+  const RANKINGS_WINDOW_KEY = "rag-logs-rankings-window";
 
   // ── Helpers ──────────────────────────────────────────────────────────
   function $(id) { return document.getElementById(id); }
@@ -143,6 +152,237 @@
     $("total-error").textContent = totals.error ?? 0;
     $("total-warn").textContent = totals.warn ?? 0;
     $("total-ok").textContent = totals.ok ?? 0;
+  }
+
+  // ── Rankings ────────────────────────────────────────────────────────
+  // Panel "Rankings" arriba del layout: 5 cards top-N con dimensiones
+  // rankeables (services con más errores, más warns, errores que más se
+  // repiten, errores más recientes, logs más ruidosos). Click en cualquier
+  // item navega al log correspondiente.
+  //
+  // Polling: 12s (más lento que sidebar 8s porque el endpoint scanea todos
+  // los archivos y es ~30-50ms vs 5-10ms del index).
+
+  function loadRankingsWindow() {
+    let stored = null;
+    try { stored = parseInt(localStorage.getItem(RANKINGS_WINDOW_KEY) || "", 10); } catch {}
+    if (stored && [3600, 86400, 604800].includes(stored)) return stored;
+    return RANKINGS_WINDOW_DEFAULT;
+  }
+  function saveRankingsWindow(secs) {
+    try { localStorage.setItem(RANKINGS_WINDOW_KEY, String(secs)); } catch {}
+  }
+
+  function fmtRelativeTs(ts) {
+    if (!ts) return "—";
+    let dt;
+    try { dt = new Date(ts); } catch { return ts; }
+    if (isNaN(dt.getTime())) return ts;
+    const diffMs = Date.now() - dt.getTime();
+    const sec = Math.max(0, Math.round(diffMs / 1000));
+    if (sec < 60) return `hace ${sec}s`;
+    if (sec < 3600) return `hace ${Math.round(sec / 60)}m`;
+    if (sec < 86400) return `hace ${Math.round(sec / 3600)}h`;
+    return `hace ${Math.round(sec / 86400)}d`;
+  }
+
+  // Fade-collapse del whitespace múltiple para que el preview en el
+  // ranking de errores recientes / patterns no muestre 5 espacios seguidos.
+  function collapseWs(s) { return String(s || "").replace(/\s+/g, " ").trim(); }
+
+  // Navegación a un service desde un click en cualquier ranking. Si el
+  // service NO está en `state.services` (caso raro: la ventana de
+  // rankings es 7d pero el sidebar/index sólo lista servicios con logs
+  // recientes), refrescamos el sidebar primero antes de intentar de
+  // nuevo.
+  async function navigateToService(serviceName, dirHint) {
+    const matchByDir = (s) => s.service === serviceName &&
+      (!dirHint || s.dir === dirHint);
+    let svc = state.services.find(matchByDir);
+    if (!svc) {
+      // Probable: state.services tiene match por nombre pero otro dir.
+      // Soltamos el dirHint y aceptamos el primer match por nombre.
+      svc = state.services.find((s) => s.service === serviceName);
+    }
+    if (!svc) {
+      // Refrescar y volver a buscar.
+      await fetchServices();
+      svc = state.services.find(matchByDir) ||
+            state.services.find((s) => s.service === serviceName);
+    }
+    if (svc) selectService(svc);
+  }
+
+  function rankingItem({ rank, label, sub, count, onClick, ariaLabel, title }) {
+    const inner = el("div", { class: "ranking-text" });
+    inner.appendChild(el("span", { class: "ranking-text-main" }, label));
+    if (sub) {
+      inner.appendChild(el("span", { class: "ranking-text-meta" }, sub));
+    }
+    const item = el("li", {
+      class: "ranking-item",
+      role: "button",
+      tabindex: "0",
+      onclick: onClick,
+      onkeydown: (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onClick(e);
+        }
+      },
+      "aria-label": ariaLabel || label,
+      title: title || label,
+    },
+      inner,
+      el("span", { class: "ranking-count" }, String(count)),
+    );
+    return item;
+  }
+
+  function emptyRankingItem(text) {
+    return el("li", { class: "ranking-empty" }, text || "sin datos en esta ventana");
+  }
+
+  async function fetchRankings() {
+    if (!state.rankingsWindow) state.rankingsWindow = loadRankingsWindow();
+    const totalsHost = $("rankings-totals");
+    if (totalsHost) totalsHost.classList.add("is-loading");
+    const params = new URLSearchParams({
+      since_seconds: String(state.rankingsWindow),
+      top_n: String(RANKINGS_TOP_N),
+    });
+    try {
+      const resp = await fetch(`/api/logs/rankings?${params.toString()}`, { cache: "no-store" });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      state.rankings = data;
+      renderRankings();
+    } catch (e) {
+      // Silencioso: si el endpoint falla, el panel queda con el último
+      // render. El error general del page (sidebar fail) ya se muestra
+      // en el banner.
+      console.warn("[rankings] fetch failed:", e);
+    } finally {
+      if (totalsHost) totalsHost.classList.remove("is-loading");
+    }
+  }
+
+  function renderRankings() {
+    const data = state.rankings;
+    if (!data) return;
+    const r = data.rankings || {};
+    const totalsHost = $("rankings-totals");
+    if (totalsHost) {
+      const t = data.totals || {};
+      const errs = t.errors ?? 0;
+      const warns = t.warns ?? 0;
+      const services = t.services_with_errors ?? 0;
+      totalsHost.textContent =
+        `${errs} error${errs === 1 ? "" : "es"} · ${warns} warning${warns === 1 ? "" : "s"} · `
+        + `${services} service${services === 1 ? "" : "s"} afectado${services === 1 ? "" : "s"}`;
+    }
+
+    // Card 1: services con más errores.
+    const c1 = $("rk-services-errors");
+    c1.replaceChildren();
+    const list1 = r.services_by_errors || [];
+    if (list1.length === 0) {
+      c1.appendChild(emptyRankingItem("sin errores en esta ventana 🎉"));
+    } else {
+      for (const it of list1) {
+        c1.appendChild(rankingItem({
+          label: it.service,
+          count: it.count,
+          onClick: () => navigateToService(it.service),
+          ariaLabel: `${it.service}, ${it.count} errores. Abrir log.`,
+          title: `${it.count} errores · click para abrir el log`,
+        }));
+      }
+    }
+
+    // Card 2: services con más warnings.
+    const c2 = $("rk-services-warns");
+    c2.replaceChildren();
+    const list2 = r.services_by_warns || [];
+    if (list2.length === 0) {
+      c2.appendChild(emptyRankingItem("sin warnings en esta ventana"));
+    } else {
+      for (const it of list2) {
+        c2.appendChild(rankingItem({
+          label: it.service,
+          count: it.count,
+          onClick: () => navigateToService(it.service),
+          ariaLabel: `${it.service}, ${it.count} warnings. Abrir log.`,
+          title: `${it.count} warnings · click para abrir el log`,
+        }));
+      }
+    }
+
+    // Card 3: errores que más se repiten (patrones clusterizados).
+    const c3 = $("rk-error-patterns");
+    c3.replaceChildren();
+    const list3 = r.error_patterns || [];
+    if (list3.length === 0) {
+      c3.appendChild(emptyRankingItem("sin patrones de error agrupados"));
+    } else {
+      for (const it of list3) {
+        const services = (it.services || []).slice(0, 3).join(", ");
+        const more = (it.services || []).length > 3 ? ` +${it.services.length - 3}` : "";
+        const sub = `${services}${more} · último ${fmtRelativeTs(it.last_ts)}`;
+        const example = collapseWs(it.example || it.signature);
+        c3.appendChild(rankingItem({
+          label: example,
+          sub,
+          count: it.count,
+          onClick: () => {
+            // Abrir el primer service afectado del pattern.
+            const target = (it.services && it.services[0]) || null;
+            if (target) navigateToService(target);
+          },
+          ariaLabel: `${example}, ${it.count} ocurrencias en ${(it.services || []).length} service${(it.services || []).length === 1 ? "" : "s"}.`,
+          title: example,
+        }));
+      }
+    }
+
+    // Card 4: errores más recientes.
+    const c4 = $("rk-recent-errors");
+    c4.replaceChildren();
+    const list4 = r.recent_errors || [];
+    if (list4.length === 0) {
+      c4.appendChild(emptyRankingItem("sin errores recientes 🎉"));
+    } else {
+      for (const it of list4) {
+        const text = collapseWs(it.text);
+        const sub = `${it.service} · ${fmtRelativeTs(it.ts)}`;
+        c4.appendChild(rankingItem({
+          label: text,
+          sub,
+          count: fmtRelativeTs(it.ts).replace("hace ", ""),
+          onClick: () => navigateToService(it.service, it.dir),
+          ariaLabel: `${it.service}: ${text}`,
+          title: text,
+        }));
+      }
+    }
+
+    // Card 5: logs más ruidosos.
+    const c5 = $("rk-noisy-logs");
+    c5.replaceChildren();
+    const list5 = r.noisy_logs || [];
+    if (list5.length === 0) {
+      c5.appendChild(emptyRankingItem("sin actividad en esta ventana"));
+    } else {
+      for (const it of list5) {
+        c5.appendChild(rankingItem({
+          label: it.service,
+          count: it.count,
+          onClick: () => navigateToService(it.service),
+          ariaLabel: `${it.service}, ${it.count} líneas. Abrir log.`,
+          title: `${it.count} líneas · click para abrir el log`,
+        }));
+      }
+    }
   }
 
   function passesSidebarFilter(svc) {
@@ -870,12 +1110,15 @@
     state.viewerTimer = setInterval(() => {
       if (state.selectedKey) fetchAndRenderViewer(false);
     }, VIEWER_REFRESH_MS);
+    state.rankingsTimer = setInterval(fetchRankings, RANKINGS_REFRESH_MS);
   }
   function stopTimers() {
     if (state.sidebarTimer) clearInterval(state.sidebarTimer);
     if (state.viewerTimer) clearInterval(state.viewerTimer);
+    if (state.rankingsTimer) clearInterval(state.rankingsTimer);
     state.sidebarTimer = null;
     state.viewerTimer = null;
+    state.rankingsTimer = null;
   }
 
   // ── Wire-up ──────────────────────────────────────────────────────────
@@ -891,7 +1134,24 @@
     $("refresh-now").addEventListener("click", async () => {
       await fetchServices();
       if (state.selectedKey) await fetchAndRenderViewer(false);
+      await fetchRankings();
     });
+
+    // Selector de ventana del panel de rankings. Persiste la elección
+    // en localStorage. Cambiarla refetcha inmediatamente.
+    const rankingsSelect = $("rankings-window");
+    if (rankingsSelect) {
+      // Sync el valor del select con el localStorage al boot.
+      const initialWindow = loadRankingsWindow();
+      state.rankingsWindow = initialWindow;
+      rankingsSelect.value = String(initialWindow);
+      rankingsSelect.addEventListener("change", () => {
+        const v = parseInt(rankingsSelect.value, 10) || RANKINGS_WINDOW_DEFAULT;
+        state.rankingsWindow = v;
+        saveRankingsWindow(v);
+        fetchRankings();
+      });
+    }
 
     $("search-services").addEventListener("input", (e) => {
       state.sidebarQuery = e.target.value.trim();
@@ -944,6 +1204,8 @@
         document.querySelector(".layout").hidden = isQueue;
         $("queue-panel").hidden = !isQueue;
         document.getElementById("totals").hidden = isQueue;
+        const rk = document.getElementById("rankings");
+        if (rk) rk.hidden = isQueue;
         if (isQueue) {
           fetchQueueNow();
           startQueueTimer();
@@ -1135,7 +1397,11 @@
 
   // ── Init ─────────────────────────────────────────────────────────────
   wireUp();
+  // Sidebar primero (el resto de la página depende de tener `state.services`),
+  // rankings en paralelo. Si rankings termina antes que el primer sidebar
+  // fetch, el render queda visible mientras la sidebar termina de cargar.
   fetchServices().then(() => startTimers());
+  fetchRankings();
   // Poll queue in background para el badge incluso si estás en vista logs.
   setInterval(() => {
     if (!document.hidden) {

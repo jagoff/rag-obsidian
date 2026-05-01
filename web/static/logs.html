@@ -215,6 +215,176 @@
     .totals .chip.ok    { color: var(--green); border-color: color-mix(in srgb, var(--green) 35%, var(--border)); }
     .totals .chip.dim   { color: var(--text-dim); }
 
+    /* Rankings panel — top-N agregados de los logs. Cada card muestra
+       una dimensión rankeable (errores por service, patrones, recientes,
+       ruidosos). Click en cualquier item navega al log correspondiente. */
+    .rankings {
+      margin-bottom: 14px;
+      padding: 14px 16px 16px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+    }
+    .rankings-header {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 8px 16px;
+      margin-bottom: 10px;
+    }
+    .rankings-header h2 {
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      margin: 0;
+      color: var(--text-dim);
+    }
+    .rankings-controls {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      color: var(--text-faint);
+    }
+    .rankings-controls label {
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      font-size: 10px;
+    }
+    .rankings-controls select {
+      background: var(--bg-elev);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      padding: 3px 7px;
+      font-size: 12px;
+      font-family: inherit;
+      cursor: pointer;
+    }
+    .rankings-controls select:focus-visible {
+      outline: 2px solid color-mix(in srgb, var(--text-dim) 60%, transparent);
+      outline-offset: 1px;
+    }
+    .rankings-totals {
+      font-variant-numeric: tabular-nums;
+      color: var(--text-dim);
+    }
+    .rankings-totals.is-loading { opacity: 0.6; }
+    .rankings-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 12px;
+    }
+    .ranking-card {
+      background: var(--bg-elev);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px 12px;
+      min-width: 0;  /* permite que el ranking-text trunque sin desbordar */
+    }
+    .ranking-card h3 {
+      margin: 0 0 8px;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text);
+      letter-spacing: 0.02em;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .ranking-list {
+      list-style: none;
+      counter-reset: rk;
+      margin: 0;
+      padding: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .ranking-item {
+      counter-increment: rk;
+      display: grid;
+      grid-template-columns: 18px 1fr auto;
+      gap: 8px;
+      align-items: center;
+      padding: 4px 6px;
+      border-radius: 5px;
+      font-size: 12px;
+      cursor: pointer;
+      background: transparent;
+      border: 1px solid transparent;
+      transition: background 80ms ease, border-color 80ms ease;
+      min-width: 0;
+    }
+    .ranking-item:hover,
+    .ranking-item:focus-visible {
+      background: color-mix(in srgb, var(--bg-card) 80%, transparent);
+      border-color: var(--border-strong);
+      outline: none;
+    }
+    .ranking-item::before {
+      content: counter(rk);
+      color: var(--text-faint);
+      font-variant-numeric: tabular-nums;
+      font-size: 11px;
+      text-align: right;
+    }
+    .ranking-text {
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      min-width: 0;
+    }
+    .ranking-text-meta {
+      display: block;
+      color: var(--text-faint);
+      font-size: 10.5px;
+      letter-spacing: 0;
+      margin-top: 1px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .ranking-count {
+      font-variant-numeric: tabular-nums;
+      font-weight: 600;
+      font-size: 12px;
+      padding: 1px 6px;
+      border-radius: 4px;
+      background: color-mix(in srgb, var(--bg-card) 60%, transparent);
+      color: var(--text);
+    }
+    .ranking-card[data-card="services_by_errors"] .ranking-count,
+    .ranking-card[data-card="error_patterns"] .ranking-count,
+    .ranking-card[data-card="recent_errors"] .ranking-count {
+      color: var(--red);
+      background: color-mix(in srgb, var(--red) 18%, transparent);
+    }
+    .ranking-card[data-card="services_by_warns"] .ranking-count {
+      color: var(--yellow);
+      background: color-mix(in srgb, var(--yellow) 18%, transparent);
+    }
+    .ranking-card[data-card="noisy_logs"] .ranking-count {
+      color: var(--text-dim);
+    }
+    .ranking-empty {
+      color: var(--text-faint);
+      font-size: 12px;
+      font-style: italic;
+      padding: 8px 6px;
+    }
+    /* En mobile las cards se apilan; mantenemos legibilidad ajustando el
+       padding y permitiendo que el text wrap-ee en 2 líneas si hace falta
+       (el ellipsis del .ranking-text es para nombres súper largos). */
+    @media (max-width: 700px) {
+      .rankings { padding: 12px 12px 14px; }
+      .rankings-grid { grid-template-columns: 1fr; gap: 10px; }
+      .ranking-item { font-size: 11.5px; }
+    }
+
     /* Layout: sidebar (lista de services) + viewer (tail). En desktop
        las 2 columnas; en mobile la sidebar arriba colapsable. */
     .layout {
@@ -1181,6 +1351,53 @@
         <span class="chip ok"><strong id="total-ok">0</strong> ok</span>
       </div>
 
+      <section class="rankings" id="rankings" aria-label="Rankings de logs">
+        <header class="rankings-header">
+          <h2>rankings</h2>
+          <div class="rankings-controls">
+            <label for="rankings-window">ventana</label>
+            <select id="rankings-window" aria-label="Ventana temporal de los rankings">
+              <option value="3600">última hora</option>
+              <option value="86400" selected>último día</option>
+              <option value="604800">última semana</option>
+            </select>
+            <span class="rankings-totals" id="rankings-totals">cargando…</span>
+          </div>
+        </header>
+        <div class="rankings-grid" id="rankings-grid">
+          <div class="ranking-card" data-card="services_by_errors">
+            <h3>🔴 services con más errores</h3>
+            <ol class="ranking-list" id="rk-services-errors">
+              <li class="ranking-empty">cargando…</li>
+            </ol>
+          </div>
+          <div class="ranking-card" data-card="services_by_warns">
+            <h3>🟡 services con más warnings</h3>
+            <ol class="ranking-list" id="rk-services-warns">
+              <li class="ranking-empty">cargando…</li>
+            </ol>
+          </div>
+          <div class="ranking-card" data-card="error_patterns">
+            <h3>📋 errores que más se repiten</h3>
+            <ol class="ranking-list" id="rk-error-patterns">
+              <li class="ranking-empty">cargando…</li>
+            </ol>
+          </div>
+          <div class="ranking-card" data-card="recent_errors">
+            <h3>⏱ errores más recientes</h3>
+            <ol class="ranking-list" id="rk-recent-errors">
+              <li class="ranking-empty">cargando…</li>
+            </ol>
+          </div>
+          <div class="ranking-card" data-card="noisy_logs">
+            <h3>📣 logs más ruidosos</h3>
+            <ol class="ranking-list" id="rk-noisy-logs">
+              <li class="ranking-empty">cargando…</li>
+            </ol>
+          </div>
+        </div>
+      </section>
+
       <div id="error-banner-host"></div>
 
       <div class="layout">
@@ -1303,6 +1520,6 @@
 
   <link rel="stylesheet" href="/static/diagnose-modal.css?v=2026-04-29-recovery">
   <script src="/static/diagnose-modal.js?v=2026-04-29-recovery" defer></script>
-  <script src="/static/logs.js?v=2026-04-26-queue" defer></script>
+  <script src="/static/logs.js?v=2026-05-01-rankings" defer></script>
 </body>
 </html>

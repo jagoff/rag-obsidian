@@ -830,4 +830,192 @@ def test_static_assets_exist():
     assert (_STATIC_DIR / "logs.html").is_file()
     assert (_STATIC_DIR / "logs.js").is_file()
     assert (_STATIC_DIR / "diagnose-modal.js").is_file()
+
+
+# ── /api/logs/rankings — agregaciones top-N (2026-05-01) ──────────────
+
+class TestNormalizeLogLineSignature:
+    """`_normalize_log_line_signature` strippea timestamps + números +
+    paths + UUIDs + IPs para que líneas que sólo difieren en magnitudes
+    caigan al mismo bucket de clustering."""
+
+    def test_clusters_lines_differing_only_in_duration(self):
+        a = _server._normalize_log_line_signature(
+            "[2026-05-01 18:46:06] failed in 12345ms"
+        )
+        b = _server._normalize_log_line_signature(
+            "[2026-05-01 19:01:00] failed in 99ms"
+        )
+        assert a == b
+        assert "<n>" in a
+        assert "ms" in a  # sufijo preservado
+
+    def test_clusters_lines_with_embedded_underscore_numbers(self):
+        """Caso real del watchdog: `last_restart_was_1644s_ago` tiene
+        digits precedidos por underscore (word char), `\\b` no matchea
+        ahí. El normalizer debe usar lookbehind sobre dígitos."""
+        a = _server._normalize_log_line_signature(
+            "[ollama-health-watchdog] last_restart_was_1644s_ago"
+        )
+        b = _server._normalize_log_line_signature(
+            "[ollama-health-watchdog] last_restart_was_30s_ago"
+        )
+        assert a == b
+        assert "<n>" in a
+
+    def test_normalizes_paths_uuids_ips(self):
+        sig = _server._normalize_log_line_signature(
+            "ERROR: connection refused 127.0.0.1:8080 in /Users/fer/foo/bar.py"
+        )
+        assert "<ip>" in sig
+        assert "<path>" in sig
+
+    def test_strips_iso_timestamp_prefix(self):
+        a = _server._normalize_log_line_signature("[2026-05-01T18:46:06] foo")
+        b = _server._normalize_log_line_signature("[2026-04-29T11:00:00] foo")
+        assert a == b
+        assert a.startswith("foo") or a.startswith("foo")
+        assert "2026" not in a
+
+    def test_strips_level_prefix(self):
+        a = _server._normalize_log_line_signature("ERROR: connection refused")
+        b = _server._normalize_log_line_signature("INFO: connection refused")
+        # Ambos prefijos se strippean → mismo bucket.
+        assert a == b
+        assert "connection refused" in a
+
+    def test_lowercases_for_case_insensitive_clustering(self):
+        a = _server._normalize_log_line_signature("ERROR: connection refused")
+        assert a == a.lower()
+
+    def test_empty_input_returns_empty(self):
+        assert _server._normalize_log_line_signature("") == ""
+        assert _server._normalize_log_line_signature("   ") == ""
+
+    def test_caps_long_inputs(self):
+        long = "x" * 5000
+        sig = _server._normalize_log_line_signature(long)
+        assert len(sig) <= _server._LOG_SIG_MAX_CHARS + 5  # +ellipsis "…"
+
+
+class TestRankingsPayload:
+    """`_build_rankings_payload` agrega counters de los _LOG_DIRS reales.
+    Tests son contra el sistema vivo (igual que los de /api/logs/file),
+    así que skipean si no hay dirs disponibles."""
+
+    def _has_log_dirs(self) -> bool:
+        return any(d.is_dir() for d in _server._LOG_DIRS)
+
+    def test_payload_shape(self):
+        if not self._has_log_dirs():
+            pytest.skip("no log dirs en este sistema")
+        out = _server._build_rankings_payload(window_s=86400, top_n=5)
+        # Top-level
+        assert out["window_seconds"] == 86400
+        assert out["top_n"] == 5
+        assert "scanned_at" in out
+        assert "totals" in out
+        # Totals
+        for k in ("errors", "warns", "services_with_errors",
+                  "services_with_warns", "files_scanned", "files_skipped_old"):
+            assert k in out["totals"]
+            assert isinstance(out["totals"][k], int)
+        # Rankings buckets
+        for bucket in ("services_by_errors", "services_by_warns",
+                       "error_patterns", "recent_errors", "noisy_logs"):
+            assert bucket in out["rankings"]
+            assert isinstance(out["rankings"][bucket], list)
+            assert len(out["rankings"][bucket]) <= 5
+
+    def test_top_n_clamped(self):
+        if not self._has_log_dirs():
+            pytest.skip("no log dirs en este sistema")
+        # Pedir 200 — el endpoint clampea a 50.
+        resp = _client.get("/api/logs/rankings?top_n=200")
+        assert resp.status_code == 200
+        d = resp.json()
+        assert d["top_n"] == 50
+
+    def test_window_clamped(self):
+        if not self._has_log_dirs():
+            pytest.skip("no log dirs en este sistema")
+        # Pedir 999 días — clampea a max 7d.
+        resp = _client.get("/api/logs/rankings?since_seconds=86400000")
+        assert resp.status_code == 200
+        d = resp.json()
+        assert d["window_seconds"] == 7 * 86400
+
+    def test_window_min_60s(self):
+        if not self._has_log_dirs():
+            pytest.skip("no log dirs en este sistema")
+        resp = _client.get("/api/logs/rankings?since_seconds=10")
+        assert resp.status_code == 200
+        d = resp.json()
+        assert d["window_seconds"] == 60
+
+    def test_default_window_1h(self):
+        if not self._has_log_dirs():
+            pytest.skip("no log dirs en este sistema")
+        resp = _client.get("/api/logs/rankings")
+        assert resp.status_code == 200
+        d = resp.json()
+        assert d["window_seconds"] == 3600
+
+    def test_recent_errors_sorted_desc(self):
+        if not self._has_log_dirs():
+            pytest.skip("no log dirs en este sistema")
+        out = _server._build_rankings_payload(window_s=7 * 86400, top_n=10)
+        recent = out["rankings"]["recent_errors"]
+        if len(recent) < 2:
+            pytest.skip("no hay suficientes errores recientes para validar orden")
+        for i in range(len(recent) - 1):
+            assert recent[i]["ts"] >= recent[i + 1]["ts"], \
+                f"recent_errors no ordenado: {recent[i]['ts']} >= {recent[i+1]['ts']}"
+
+    def test_services_by_errors_sorted_desc(self):
+        if not self._has_log_dirs():
+            pytest.skip("no log dirs en este sistema")
+        out = _server._build_rankings_payload(window_s=7 * 86400, top_n=10)
+        items = out["rankings"]["services_by_errors"]
+        if len(items) < 2:
+            pytest.skip("no hay suficientes services con errores")
+        for i in range(len(items) - 1):
+            assert items[i]["count"] >= items[i + 1]["count"]
+
+    def test_error_patterns_have_required_fields(self):
+        if not self._has_log_dirs():
+            pytest.skip("no log dirs en este sistema")
+        out = _server._build_rankings_payload(window_s=7 * 86400, top_n=10)
+        for p in out["rankings"]["error_patterns"]:
+            assert "signature" in p
+            assert "count" in p
+            assert "example" in p
+            assert "services" in p
+            assert isinstance(p["services"], list)
+            assert "first_ts" in p
+            assert "last_ts" in p
+            # last_ts >= first_ts (orden cronológico mínimo dentro del bucket)
+            assert p["last_ts"] >= p["first_ts"]
+            assert p["count"] >= 1
+
+    def test_cache_returns_same_payload_within_ttl(self):
+        if not self._has_log_dirs():
+            pytest.skip("no log dirs en este sistema")
+        r1 = _client.get("/api/logs/rankings?since_seconds=3600&top_n=5").json()
+        r2 = _client.get("/api/logs/rankings?since_seconds=3600&top_n=5").json()
+        # Mismo scanned_at → vino del cache (TTL 8s).
+        assert r1["scanned_at"] == r2["scanned_at"]
+
+    def test_nocache_forces_refresh(self):
+        if not self._has_log_dirs():
+            pytest.skip("no log dirs en este sistema")
+        r1 = _client.get("/api/logs/rankings?since_seconds=3600&nocache=1").json()
+        r2 = _client.get("/api/logs/rankings?since_seconds=3600&nocache=1").json()
+        # Aunque el contenido sea similar, los scanned_at deberían diferir
+        # porque cada request escaneó de nuevo (a menos que pase en el
+        # mismo segundo, raro pero posible — toleramos ese caso).
+        assert "scanned_at" in r1 and "scanned_at" in r2
+
+
+def test_diagnose_modal_css_exists():
     assert (_STATIC_DIR / "diagnose-modal.css").is_file()

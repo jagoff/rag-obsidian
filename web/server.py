@@ -18179,6 +18179,307 @@ def logs_global_errors(
     return entry["payload"]
 
 
+# ── /api/logs/rankings — agregaciones rankeables del stack ────────────
+# Endpoint dedicado para alimentar el panel "Rankings" de /logs. La
+# motivación: el `/api/logs/errors` ya devuelve `top_services` por
+# error count, pero el frontend no lo mostraba; y al user le gusta ver
+# todo lo rankeable junto en un solo lugar para depurar de un vistazo.
+#
+# Devuelve 5 listas top-N (default N=5):
+#
+#   1. services_by_errors — services con más líneas error en la ventana
+#   2. services_by_warns — services con más warnings en la ventana
+#   3. error_patterns — error lines clusterizadas por signature
+#       (timestamp/números/paths normalizados → mismo bucket), con
+#       count + último ts visto + services afectados
+#   4. recent_errors — últimas N líneas con level=error, cronológico desc
+#   5. noisy_logs — services con más líneas TOTAL en la ventana
+#       (proxy de "qué está spameando logs ahora")
+#
+# Cacheado mismo TTL que /api/logs/errors (8s) para no rescanear ~80
+# files por cada poll del frontend. Clave de cache: (window_s, top_n).
+#
+# Notas de diseño:
+#
+# - El cap de tail por archivo es el mismo `_LOG_GLOBAL_TAIL_PER_FILE`
+#   que /api/logs/errors usa (300 líneas). Eso es 300×80 = 24k líneas
+#   máximo por scan. En SSD M4 toma ~30-50ms.
+#
+# - Para `error_patterns`, la signature se calcula con
+#   `_normalize_log_line_signature` (define abajo). La heurística es
+#   conservadora: si dos líneas SÓLO difieren en timestamp / números /
+#   paths absolutos / UUIDs / IPs, caen al mismo bucket. Si difieren en
+#   palabras (ej. "loadVaultContext" vs "loadDraftContext"), no.
+#
+# - Las "recent_errors" tienen el mismo shape que las lines de
+#   /api/logs/errors para que el frontend pueda reutilizar el rendering
+#   (incluye `ref` para click-through al viewer del service).
+#
+# - "noisy_logs" se computa en LÍNEAS por service, no en bytes — es
+#   lo que ya tenemos del tail. Si un service spamea 500 líneas/min de
+#   INFO benigno, sale arriba del ranking — es exactamente lo que queremos
+#   ver para depurar (cualquier service ruidoso es candidato a o ajustar
+#   el log level o investigar por qué loggea tanto).
+
+_RANKINGS_CACHE: dict = {}
+_RANKINGS_CACHE_TTL = 8.0
+_RANKINGS_CACHE_LOCK = threading.Lock()
+
+
+# Signature normalizer para clustering de error lines. Estrategia: strip
+# todas las partes "variables" (timestamps, números, paths, hashes) y
+# preservar el "esqueleto" del mensaje. Lines que sólo difieren en valores
+# concretos caen al mismo bucket.
+#
+# Ejemplos:
+#   "[2026-05-01 18:46:06] failed in 12345ms" → "failed in <n>ms"
+#   "[2026-05-01 19:01:00] failed in 99ms"    → "failed in <n>ms"
+#   → mismo bucket.
+#
+#   "loadVaultContextForDraft falló: timeout"     → "loadVaultContextForDraft falló: timeout"
+#   "loadVaultContextForDraft falló: 500 Server"  → "loadVaultContextForDraft falló: <n> Server"
+#   → mismo bucket (los 2 errores del path loadVaultContextForDraft
+#     se clusterizan, lo cual es lo que querés ver).
+
+_LOG_RE_TS_PREFIX_NORM = re.compile(
+    r"^\s*\[?\s*\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:?\d{2}|Z)?\]?\s*",
+)
+_LOG_RE_LEVEL_PREFIX_NORM = re.compile(
+    r"^\s*(INFO|DEBUG|WARNING|WARN|ERROR|TRACE|NOTICE|CRITICAL|FATAL)\s*[:\-]\s*",
+    re.IGNORECASE,
+)
+# Lookbehind negativo: un número es cualquier run de dígitos NO precedido
+# por otro dígito. Esto evita matchear partial-runs y maneja todos los
+# casos importantes: `12345ms` (digit→letter, sin word-boundary trailing),
+# `last_restart_was_1644s_ago` (`_` es word char así que `\b` no matchea
+# `_1644`), `qwen2.5:7b` (en identifiers compuestos también clustea, lo
+# cual es deseable: `qwen2.5:7b` y `qwen2.5:14b` mergean en el mismo
+# bucket de error y eso es lo que querés ver en los rankings).
+_LOG_RE_NUM_NORM = re.compile(r"(?<!\d)\d+(?:\.\d+)?")
+_LOG_RE_UUID_NORM = re.compile(
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+    re.IGNORECASE,
+)
+_LOG_RE_LONG_HEX_NORM = re.compile(r"\b[0-9a-f]{16,}\b", re.IGNORECASE)
+_LOG_RE_IPV4_PORT_NORM = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b")
+_LOG_RE_PATH_NORM = re.compile(
+    r"(?:/Users/[^\s'\"]+|/var/[^\s'\"]+|/tmp/[^\s'\"]+|/opt/[^\s'\"]+|/private/[^\s'\"]+)",
+)
+_LOG_RE_WS_NORM = re.compile(r"\s+")
+_LOG_SIG_MAX_CHARS = 240
+
+
+def _normalize_log_line_signature(line: str) -> str:
+    """Normalizar una línea de log a una signature reutilizable para
+    clustering. Devuelve string lowercased no-empty, capped a
+    `_LOG_SIG_MAX_CHARS`. Pensado para errors pero funciona para cualquier
+    line. Idempotente: aplicarlo dos veces da el mismo resultado.
+
+    Si la entrada está vacía o contiene sólo whitespace después de
+    normalizar, devuelve "" — el caller debería skipear esas signatures.
+    """
+    s = line or ""
+    s = _LOG_RE_TS_PREFIX_NORM.sub("", s, count=1)
+    s = _LOG_RE_LEVEL_PREFIX_NORM.sub("", s, count=1)
+    s = _LOG_RE_UUID_NORM.sub("<uuid>", s)
+    s = _LOG_RE_LONG_HEX_NORM.sub("<hex>", s)
+    s = _LOG_RE_IPV4_PORT_NORM.sub("<ip>", s)
+    s = _LOG_RE_PATH_NORM.sub("<path>", s)
+    s = _LOG_RE_NUM_NORM.sub("<n>", s)
+    s = _LOG_RE_WS_NORM.sub(" ", s).strip()
+    if len(s) > _LOG_SIG_MAX_CHARS:
+        s = s[:_LOG_SIG_MAX_CHARS] + "…"
+    return s.lower()
+
+
+def _build_rankings_payload(window_s: int, top_n: int) -> dict:
+    """Construir el payload de /api/logs/rankings.
+
+    Reaprovecha el scan único de _LOG_DIRS de _build_global_errors_payload
+    pero sin levantar la list completa de lines (no la necesitamos para
+    rankings, solo agregamos counters).
+    """
+    cutoff_ts = time.time() - window_s
+    services_errors: dict[str, int] = {}
+    services_warns: dict[str, int] = {}
+    services_lines_total: dict[str, int] = {}  # cualquier level → noisy_logs
+    pattern_buckets: dict[str, dict] = {}
+    recent_errors: list[dict] = []
+    files_scanned = 0
+    files_skipped_old = 0
+
+    for log_dir in _LOG_DIRS:
+        if not log_dir.is_dir():
+            continue
+        dir_slug = log_dir.name
+        for path in sorted(log_dir.iterdir()):
+            if not path.is_file():
+                continue
+            name = path.name
+            if not (name.endswith(".log") or name.endswith(".stdout.log") or
+                    name.endswith(".stderr.log")):
+                continue
+            try:
+                stat = path.stat()
+            except Exception:
+                continue
+            if stat.st_size == 0:
+                continue
+            if stat.st_mtime < cutoff_ts:
+                files_skipped_old += 1
+                continue
+            files_scanned += 1
+            base = name
+            if base.endswith(".error.log"):
+                base = base[: -len(".error.log")]
+            elif base.endswith(".stderr.log"):
+                base = base[: -len(".stderr.log")]
+            elif base.endswith(".stdout.log"):
+                base = base[: -len(".stdout.log")]
+            elif base.endswith(".log"):
+                base = base[: -len(".log")]
+
+            raw = _read_tail_lines(path, _LOG_GLOBAL_TAIL_PER_FILE)
+            last_ts: str | None = None
+            for ln in raw:
+                level = _classify_log_line(ln)
+                ts = _extract_log_ts(ln)
+                if ts:
+                    last_ts = ts
+                elif last_ts is not None:
+                    ts = last_ts
+                else:
+                    # Sin ts → no podemos confirmar que está en window.
+                    # Skipeamos para no contaminar rankings con líneas
+                    # potencialmente viejas (mismo guard que el feed
+                    # global de errors).
+                    continue
+                # Filter por window.
+                try:
+                    if datetime.fromisoformat(ts).timestamp() < cutoff_ts:
+                        continue
+                except Exception:
+                    continue
+                # Contadores agregados.
+                services_lines_total[base] = services_lines_total.get(base, 0) + 1
+                if level == "error":
+                    services_errors[base] = services_errors.get(base, 0) + 1
+                    sig = _normalize_log_line_signature(ln)
+                    if sig:
+                        bucket = pattern_buckets.get(sig)
+                        if bucket is None:
+                            pattern_buckets[sig] = {
+                                "signature": sig,
+                                "count": 1,
+                                "example": ln,
+                                "services": {base},
+                                "first_ts": ts,
+                                "last_ts": ts,
+                                "ref": f"{dir_slug}/{name}",
+                            }
+                        else:
+                            bucket["count"] += 1
+                            bucket["services"].add(base)
+                            if ts < bucket["first_ts"]:
+                                bucket["first_ts"] = ts
+                            if ts > bucket["last_ts"]:
+                                bucket["last_ts"] = ts
+                    recent_errors.append({
+                        "ts": ts,
+                        "level": level,
+                        "service": base,
+                        "dir": dir_slug,
+                        "ref": f"{dir_slug}/{name}",
+                        "text": ln,
+                    })
+                elif level == "warn":
+                    services_warns[base] = services_warns.get(base, 0) + 1
+
+    # Sort + cap.
+    def _topn(d: dict, key: str = "count") -> list[dict]:
+        items = sorted(d.items(), key=lambda x: -x[1])[:top_n]
+        return [{"service": k, "count": v} for k, v in items]
+
+    services_by_errors = _topn(services_errors)
+    services_by_warns = _topn(services_warns)
+    noisy_logs = _topn(services_lines_total)
+
+    # Patterns: ordenar por count desc, limitar al top_n. Convertir
+    # `services` set a list ordenada para JSON.
+    sorted_patterns = sorted(
+        pattern_buckets.values(), key=lambda b: -b["count"],
+    )[:top_n]
+    error_patterns = []
+    for b in sorted_patterns:
+        error_patterns.append({
+            "signature": b["signature"],
+            "count": b["count"],
+            "example": b["example"],
+            "services": sorted(b["services"]),
+            "first_ts": b["first_ts"],
+            "last_ts": b["last_ts"],
+            "ref": b["ref"],
+        })
+
+    # Recent errors: ordenar por ts desc, cap a top_n.
+    recent_errors.sort(key=lambda x: x["ts"], reverse=True)
+    recent_errors = recent_errors[:top_n]
+
+    # Totals para que el frontend tenga contexto sin re-requestear.
+    totals = {
+        "errors": sum(services_errors.values()),
+        "warns": sum(services_warns.values()),
+        "services_with_errors": len(services_errors),
+        "services_with_warns": len(services_warns),
+        "files_scanned": files_scanned,
+        "files_skipped_old": files_skipped_old,
+    }
+
+    return {
+        "window_seconds": window_s,
+        "top_n": top_n,
+        "scanned_at": datetime.now().isoformat(timespec="seconds"),
+        "totals": totals,
+        "rankings": {
+            "services_by_errors": services_by_errors,
+            "services_by_warns": services_by_warns,
+            "error_patterns": error_patterns,
+            "recent_errors": recent_errors,
+            "noisy_logs": noisy_logs,
+        },
+    }
+
+
+@app.get("/api/logs/rankings")
+def logs_rankings(
+    since_seconds: int = _LOG_GLOBAL_DEFAULT_WINDOW_S,
+    top_n: int = 5,
+    nocache: int = 0,
+) -> dict:
+    """Devolver 5 rankings top-N agregados de los logs del stack.
+
+    Args:
+        since_seconds: ventana (default 1h, max 7d).
+        top_n: cuántos items por ranking (default 5, clamped a [1, 50]).
+        nocache: 1 fuerza refresh.
+
+    Response: ver `_build_rankings_payload`.
+    """
+    window_s = max(60, min(int(since_seconds), _LOG_GLOBAL_MAX_WINDOW_S))
+    n = max(1, min(int(top_n), 50))
+    cache_key = (window_s, n)
+    now_mono = time.monotonic()
+    with _RANKINGS_CACHE_LOCK:
+        entry = _RANKINGS_CACHE.get(cache_key)
+        fresh = entry is not None and (now_mono - entry["ts"]) < _RANKINGS_CACHE_TTL
+    if nocache or not fresh:
+        payload = _build_rankings_payload(window_s, n)
+        with _RANKINGS_CACHE_LOCK:
+            _RANKINGS_CACHE[cache_key] = {"payload": payload, "ts": now_mono}
+        return payload
+    return entry["payload"]
+
+
 # ── /api/diagnose-error — LLM-powered error diagnosis ─────────────────
 # El user clickea el botón "🩺 fix con IA" al lado de una línea con
 # level=error en el viewer, y recibe streaming del LLM con un análisis

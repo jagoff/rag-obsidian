@@ -164,3 +164,104 @@ class TestStartWatchdog:
         second = health.start_latency_degradation_watchdog()
         assert first is True
         assert second is True  # Already started but doesn't error
+
+
+class TestPersistedRestartTs:
+    """`_last_restart_ts` debe sobrevivir restarts del web server.
+
+    Sin esto, cada vez que el web server reinicia (manual, plist reload,
+    crash) el watchdog ve `now - 0 = enorme >> cooldown` y restartea
+    ollama el primer check post-arranque. Si las queries lentas que
+    dispararon p95 alto siguen en la window de 10min, el ciclo
+    autodestructivo continúa: ollama restart → cold-load → próxima
+    query lenta → watchdog ve p95 alto otra vez → restart.
+
+    El fix persiste el ts en `~/.local/share/obsidian-rag/ollama_health_state.json`.
+    """
+
+    def test_persist_round_trip(self, tmp_path, monkeypatch):
+        """Un `_persist_restart_ts(ts)` seguido de `_load_persisted_restart_ts()`
+        recupera el mismo timestamp."""
+        state_file = tmp_path / "ollama_health_state.json"
+        monkeypatch.setattr(health, "_STATE_FILE", state_file)
+
+        ts = time.time() - 100.0  # 100s atrás
+        health._persist_restart_ts(ts)
+        loaded = health._load_persisted_restart_ts()
+        assert abs(loaded - ts) < 0.001
+
+    def test_load_returns_zero_when_no_file(self, tmp_path, monkeypatch):
+        """Sin archivo previo, retorna 0.0 (mismo comportamiento que pre-fix)."""
+        state_file = tmp_path / "nonexistent.json"
+        monkeypatch.setattr(health, "_STATE_FILE", state_file)
+        assert health._load_persisted_restart_ts() == 0.0
+
+    def test_load_returns_zero_on_corrupt_json(self, tmp_path, monkeypatch):
+        """JSON corrupto → 0.0 silent-fail (no rompe el watchdog)."""
+        state_file = tmp_path / "corrupt.json"
+        state_file.write_text("not-json {{")
+        monkeypatch.setattr(health, "_STATE_FILE", state_file)
+        assert health._load_persisted_restart_ts() == 0.0
+
+    def test_persist_after_restart_attempt(self, tmp_path, monkeypatch):
+        """Cuando el check dispara `restart_attempted`, `_last_restart_ts`
+        queda persistido en disco antes de que el daemon bouncing termine."""
+        state_file = tmp_path / "ollama_health_state.json"
+        monkeypatch.setattr(health, "_STATE_FILE", state_file)
+        recent = [200_000] * 10
+        baseline = [50_000] * 50
+        monkeypatch.setattr(
+            health, "_read_recent_query_latencies",
+            lambda window_minutes: (recent, baseline),
+        )
+        monkeypatch.setattr(health, "_in_flight_count", 0)
+        monkeypatch.setattr(health, "_last_restart_ts", 0.0)
+        monkeypatch.setattr(
+            health, "_restart_ollama_daemon",
+            lambda: (True, "test-mock"),
+        )
+
+        before = time.time()
+        result = health._latency_degradation_check(threshold=1.8, cooldown_seconds=0)
+        after = time.time()
+        assert result["action"] == "restart_attempted"
+
+        # File debe existir y tener el ts dentro del rango.
+        assert state_file.exists()
+        loaded = health._load_persisted_restart_ts()
+        assert before <= loaded <= after
+
+    def test_start_watchdog_hydrates_from_disk(self, tmp_path, monkeypatch):
+        """Al arrancar el watchdog, `_last_restart_ts` se hidrata del archivo
+        en lugar de quedar en 0.0. Eso evita el restart autodestructivo
+        post-boot del web server."""
+        state_file = tmp_path / "ollama_health_state.json"
+        monkeypatch.setattr(health, "_STATE_FILE", state_file)
+        # Simulamos un restart hace 60s persistido en disco.
+        ts_60s_ago = time.time() - 60.0
+        health._persist_restart_ts(ts_60s_ago)
+
+        # Reset module state como si el proceso hubiera reiniciado.
+        monkeypatch.setattr(health, "_started", False)
+        monkeypatch.setattr(health, "_last_restart_ts", 0.0)
+        monkeypatch.setattr(health, "_watchdog_loop", lambda *a, **kw: None)
+        monkeypatch.delenv("RAG_LATENCY_WATCHDOG_DISABLE", raising=False)
+
+        ok = health.start_latency_degradation_watchdog()
+        assert ok is True
+        # El ts hidratado debe estar dentro de ~5s del valor original.
+        assert abs(health._last_restart_ts - ts_60s_ago) < 5.0
+
+    def test_start_watchdog_no_hydrate_when_file_absent(self, tmp_path, monkeypatch):
+        """Sin archivo previo (primera ejecución del binario), `_last_restart_ts`
+        queda en 0.0 — comportamiento legacy preservado."""
+        state_file = tmp_path / "nonexistent.json"
+        monkeypatch.setattr(health, "_STATE_FILE", state_file)
+        monkeypatch.setattr(health, "_started", False)
+        monkeypatch.setattr(health, "_last_restart_ts", 0.0)
+        monkeypatch.setattr(health, "_watchdog_loop", lambda *a, **kw: None)
+        monkeypatch.delenv("RAG_LATENCY_WATCHDOG_DISABLE", raising=False)
+
+        ok = health.start_latency_degradation_watchdog()
+        assert ok is True
+        assert health._last_restart_ts == 0.0

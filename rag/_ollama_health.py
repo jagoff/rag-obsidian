@@ -58,11 +58,13 @@ Trade-off threshold + cooldown (2026-05-01):
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 
@@ -70,6 +72,61 @@ _started = False
 _start_lock = threading.Lock()
 _last_restart_ts: float = 0.0
 _last_restart_lock = threading.Lock()
+
+# Persistencia de `_last_restart_ts` en disco (2026-05-01).
+#
+# Bug observado: cuando el web server reinicia (manual, plist reload, crash),
+# el módulo se reimporta y `_last_restart_ts = 0.0`. El primer check del
+# watchdog post-boot ve `now - 0 = enorme >> cooldown` → restart inmediato
+# de ollama. Si las queries lentas que dispararon p95 alto siguen en la
+# ventana de 10min (típico hasta 10min después del último outlier), el
+# watchdog restartea ollama JUSTO mientras el user está mandando una query
+# nueva post-boot → "synthesis falló: Server disconnected".
+#
+# Loop reproducido en el log del 2026-05-01 ~15:14 (user: "podes recomendarme
+# series respecto a las que yo tengo rankeadas en mis notas?"):
+#   1. Web server arranca a las T0.
+#   2. p95_recent (10min window) seguía con la query de 287s de hace 5min.
+#   3. Watchdog ve ratio=5.51 ≥ 3.0, cooldown_ts=0 → 1er restart a T0+30s.
+#   4. User manda chat a T0+45s → ollama está cold-loading post-restart.
+#   5. Server cierra conexión a los ~7-8s mientras prefilea → user ve error.
+#
+# Fix: persistir `_last_restart_ts` en JSON simple. Cargar al `start_*()`
+# para que el primer check post-boot conozca el timestamp real del último
+# restart. Escribir cada vez que se restartea ollama. Silent-fail en I/O —
+# no es crítico, solo perf de cold-start.
+_STATE_FILE = Path.home() / ".local/share/obsidian-rag" / "ollama_health_state.json"
+
+
+def _load_persisted_restart_ts() -> float:
+    """Lee `_last_restart_ts` del archivo de estado. Retorna 0.0 si no
+    existe o falla — es seguro defaultear porque eso replica el
+    comportamiento pre-fix."""
+    try:
+        with _STATE_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        ts = data.get("last_restart_ts")
+        if isinstance(ts, (int, float)) and ts > 0:
+            return float(ts)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _persist_restart_ts(ts: float) -> None:
+    """Escribe `_last_restart_ts` al archivo de estado. Silent-fail —
+    no es crítico para la operación, solo para que el state sobreviva
+    restarts del proceso."""
+    try:
+        _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # Write atomically via temp + rename — evita JSON corrupto si
+        # el proceso muere mid-write.
+        tmp = _STATE_FILE.with_suffix(".json.tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump({"last_restart_ts": float(ts)}, f)
+        tmp.replace(_STATE_FILE)
+    except Exception:
+        pass
 
 # In-flight chat counter — el web server llama begin_chat()/end_chat()
 # alrededor de cada /api/chat handler. El watchdog NO restartea ollama
@@ -290,6 +347,10 @@ def _latency_degradation_check(
             out["reason"] = f"last_restart_was_{int(now_t - _last_restart_ts)}s_ago"
             return out
         _last_restart_ts = now_t
+    # Persistir EN CUANTO seteamos el ts en memoria — antes de bouncear
+    # el daemon — para que aunque el restart cause efectos colaterales
+    # (web server crashea, plist reload, etc.) el cooldown ya esté escrito.
+    _persist_restart_ts(now_t)
     ok, detail = _restart_ollama_daemon()
     out["action"] = "restart_attempted"
     out["reason"] = f"restart_ok={ok} detail={detail}"
@@ -330,7 +391,7 @@ def _watchdog_loop(
 
 def start_latency_degradation_watchdog() -> bool:
     """Idempotent. Returns True if started, False if skipped/disabled."""
-    global _started
+    global _started, _last_restart_ts
     with _start_lock:
         if _started:
             return True
@@ -344,6 +405,15 @@ def start_latency_degradation_watchdog() -> bool:
             cooldown = int(os.environ.get("RAG_LATENCY_WATCHDOG_COOLDOWN", "1800"))
         except ValueError:
             interval, window, threshold, min_recent, cooldown = 30, 10, 3.0, 5, 1800
+        # Hidratar `_last_restart_ts` desde disco para que el cooldown
+        # sobreviva restarts del web server. Pre-fix esto era 0.0 en
+        # cada boot → el primer check post-arranque siempre pasaba el
+        # cooldown gate y restarteaba ollama si p95 estaba alto.
+        # Ver doc del módulo y comentario adyacente a `_STATE_FILE`.
+        with _last_restart_lock:
+            persisted = _load_persisted_restart_ts()
+            if persisted > 0:
+                _last_restart_ts = persisted
         t = threading.Thread(
             target=_watchdog_loop,
             args=(interval, window, threshold, min_recent, cooldown),
@@ -352,10 +422,16 @@ def start_latency_degradation_watchdog() -> bool:
         )
         t.start()
         _started = True
+        with _last_restart_lock:
+            persisted_age = (time.time() - _last_restart_ts) if _last_restart_ts > 0 else None
+        persisted_msg = (
+            f" persisted_last_restart={int(persisted_age)}s_ago"
+            if persisted_age is not None else " persisted_last_restart=none"
+        )
         print(
             f"[ollama-health-watchdog] started "
             f"interval={interval}s window={window}min threshold={threshold}x "
-            f"min_recent={min_recent} cooldown={cooldown}s",
+            f"min_recent={min_recent} cooldown={cooldown}s{persisted_msg}",
             flush=True,
         )
         return True

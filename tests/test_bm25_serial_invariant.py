@@ -243,37 +243,49 @@ def test_bm25_search_serial_when_guarded(monkeypatch):
 
     NUM_THREADS = 8
     errors: list = []
+    successes: list = [None] * NUM_THREADS
     start_barrier = threading.Barrier(NUM_THREADS)
 
-    def worker() -> None:
+    def worker(i: int) -> None:
         try:
             start_barrier.wait(timeout=5.0)
-            rag.bm25_search(
+            successes[i] = rag.bm25_search(
                 col=None, query="x", k=3,
                 folder=None, tag=None, date_range=None,
             )
         except BaseException as exc:  # noqa: BLE001
             errors.append(exc)
 
-    threads = [threading.Thread(target=worker) for _ in range(NUM_THREADS)]
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(NUM_THREADS)]
     for t in threads:
         t.start()
     for t in threads:
         t.join(timeout=10.0)
 
-    # With `_bm25_inflight_lock` (non-blocking acquire + RuntimeError on
-    # re-entry) the 7 threads that don't acquire first should have raised
-    # RuntimeError — that's actually the GUARD behavior we want. We don't
-    # assert `not errors` because raises are expected. We DO assert that
-    # max_active never exceeded 1.
+    # 2026-05-01: el lock cambió de `blocking=False + raise` a
+    # `acquire(timeout=30.0)`. El nuevo comportamiento serializa los
+    # callers en lugar de fallar — TODOS los threads deben completar OK.
+    # max_active sigue siendo ≤1 porque el lock garantiza exclusión mutua.
     guard_name = guard_info[0]
+    assert not errors, (
+        f"bm25_search debería esperar (acquire timeout=30s) en lugar de "
+        f"fallar bajo contención, pero {len(errors)} threads tiraron "
+        f"excepción: {errors!r}"
+    )
+    assert all(r is not None for r in successes), (
+        f"Algún thread no completó: successes={successes!r}"
+    )
     assert max_active <= 1, (
         f"rag.{guard_name} is present but did NOT serialise callers: "
         f"observed max_active={max_active} concurrent get_scores calls "
         f"under {NUM_THREADS} threads. The guard should wrap the whole "
         f"bm25_search body (not just the cache read)."
     )
-    # At least one thread should have succeeded (the first to acquire).
-    assert max_active >= 1 or errors, (
-        "No thread ever entered bm25_search body — guard or monkeypatch broken."
-    )
+    # Sanity: el lock corrió cada thread serialmente (max_active==1) y
+    # todos los threads vieron al mismo top-k (consistency bajo serialización).
+    reference = successes[0]
+    for i, r in enumerate(successes[1:], start=1):
+        assert r == reference, (
+            f"Thread {i} returned different results than thread 0 — "
+            f"serialised but not consistent. Expected {reference!r}, got {r!r}."
+        )

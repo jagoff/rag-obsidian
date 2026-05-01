@@ -12446,12 +12446,29 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             # diseño (CLAUDE.md línea 126, medido 3× slower paralelo en M3 Max)`
             # se filtraba directo al chat. Reemplazamos por mensaje user-friendly
             # y loggeamos el original en web.log para debug.
+            #
+            # 2026-05-01 (observabilidad): además del original en una línea,
+            # loggeamos el traceback COMPLETO al log (NO al user) cuando el
+            # exc_type sugiere un bug interno (no un input malo). Pre-fix
+            # cuando el bm25 lock decía "Revisá el stack si vino de un
+            # ThreadPoolExecutor", el stack NO se imprimía — debug imposible.
+            # Ahora el traceback queda en web.log para diagnosticar el caller.
             _sanitized_msg = _sanitize_error_for_user(exc, phase="retrieve")
             print(
                 f"[chat-error-sanitized] phase=retrieve "
                 f"exc_type={type(exc).__name__} "
                 f"original={str(exc)[:200]!r} "
                 f"sent_to_user={_sanitized_msg!r}",
+                flush=True,
+            )
+            # Imprimir el traceback en una línea separada — solo al log,
+            # NUNCA al user (ya emitimos `_sanitized_msg` arriba). Útil
+            # cuando el sanitized message no alcanza para identificar el
+            # caller (ej. RuntimeError genérico desde un módulo lejano).
+            import traceback as _tb
+            _tb_str = "".join(_tb.format_exception(type(exc), exc, exc.__traceback__))
+            print(
+                f"[chat-error-sanitized-tb] phase=retrieve\n{_tb_str}",
                 flush=True,
             )
             yield _sse("error", {"message": _sanitized_msg})

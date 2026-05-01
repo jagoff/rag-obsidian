@@ -42,6 +42,7 @@ import argparse
 import base64
 import html
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -63,6 +64,15 @@ MAX_MESSAGES_PER_RUN = 5000         # hard cap per ingest run
 # Labels we always skip. CHAT is Hangouts log noise; SPAM/TRASH would
 # re-surface junk into the corpus.
 HARDCODED_EXCLUDE_LABELS = frozenset({"CHAT", "SPAM", "TRASH"})
+
+# Bot email guard (2026-04-30): skip emails from/to this address if the
+# body contains [RAG_GENERATED] marker — prevents feedback loops. Env var
+# OBSIDIAN_RAG_BOT_EMAIL defaults to empty (feature inactive if not set).
+# Reason: when the system sends an email to a contact and that contact
+# replies, the reply lands in Gmail, gets indexed, and the LLM might cite
+# its own previous response back to the user (false self-referentiality).
+BOT_EMAIL = os.environ.get("OBSIDIAN_RAG_BOT_EMAIL", "").strip()
+BOT_EMAIL_MARKER = "[RAG_GENERATED]"
 
 CHUNK_MAX_CHARS = 800
 PARENT_MAX_CHARS = 1200
@@ -395,11 +405,20 @@ def fetch_message(svc, message_id: str) -> GmailMessage | None:
 def fetch_messages_bulk(svc, ids: list[str]) -> list[GmailMessage]:
     """Sequential .get() per ID. Gmail API doesn't have a real batch path
     in googleapiclient's default discovery; at 500-1000 msgs this is
-    still well under the 250 queries/user/second quota."""
+    still well under the 250 queries/user/second quota.
+
+    Bot-email guard (2026-04-30): skip messages from/to BOT_EMAIL (if
+    configured) when the body contains BOT_EMAIL_MARKER — prevents
+    feedback loops where the bot's own generated responses get indexed
+    and re-cited back to the user."""
     out: list[GmailMessage] = []
     for mid in ids:
         m = fetch_message(svc, mid)
         if m is not None:
+            # Skip bot-generated messages if guard is active.
+            if BOT_EMAIL and (m.sender == BOT_EMAIL or BOT_EMAIL in m.to):
+                if BOT_EMAIL_MARKER in m.body:
+                    continue  # Skip this message; it's bot-generated output.
             out.append(m)
     return out
 

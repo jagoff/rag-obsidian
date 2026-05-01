@@ -466,7 +466,7 @@ def run(
     state_conn_local = state_conn
     opened_state = False
     if state_conn_local is None:
-        state_conn_local = sqlite3.connect(str(rag.DB_PATH / STATE_DB_FILE))
+        state_conn_local = sqlite3.connect(str(rag.DB_PATH / STATE_DB_FILE), timeout=15.0)
         opened_state = True
     try:
         _ensure_state_table(state_conn_local)

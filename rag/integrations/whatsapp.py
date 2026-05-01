@@ -1696,6 +1696,7 @@ def _fetch_whatsapp_unread(hours: int = 24, max_chats: int = 8) -> list[dict]:
               AND datetime(m.timestamp) > datetime('now', ?)
               AND m.chat_jid != ?
               AND m.chat_jid NOT LIKE '%status@broadcast'
+              AND substr(content, 1, 1) != char(8203)
             GROUP BY m.chat_jid
             ORDER BY cnt DESC
             LIMIT ?
@@ -1799,6 +1800,7 @@ def _fetch_whatsapp_window(
             WHERE datetime(m.timestamp) >= datetime(?)
               AND m.chat_jid != ?
               AND m.chat_jid NOT LIKE '%status@broadcast'
+              AND substr(content, 1, 1) != char(8203)
             ORDER BY m.timestamp ASC
             """,
             (since_iso, bot_jid),

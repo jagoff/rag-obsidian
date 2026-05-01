@@ -626,15 +626,27 @@ def test_cli_anticipate_log_with_rows(state_db):
 
 def test_threshold_env_override(monkeypatch):
     """RAG_ANTICIPATE_MIN_SCORE override es leído al import. Reload garantiza
-    que el cambio en runtime tome efecto."""
-    # Probamos directo el módulo: el constante se setea al import. Test que
-    # un score por debajo del MIN actual no pasa filter.
-    cand = rag.AnticipatoryCandidate(
-        kind="anticipate-echo", score=rag._ANTICIPATE_MIN_SCORE - 0.01,
-        message="m", dedup_key="k:thresh", snooze_hours=72, reason="r",
+    que el cambio en runtime tome efecto.
+
+    2026-04-30 Update: anticipate-echo ahora usa su propio threshold mínimo
+    (_ANTICIPATE_ECHO_MIN_SCORE, default 0.30) en lugar del global (0.35).
+    Ajustamos el test para testear ambos casos."""
+    # Test 1: anticipate-echo debajo de su propio threshold
+    cand_below_echo = rag.AnticipatoryCandidate(
+        kind="anticipate-echo", score=rag._ANTICIPATE_ECHO_MIN_SCORE - 0.01,
+        message="m", dedup_key="k:thresh_echo", snooze_hours=72, reason="r",
     )
-    # El orchestrator debe filtrarlo por score
     monkeypatch.setattr(rag, "_ANTICIPATE_SIGNALS",
-                        (("a", lambda now: [cand]),))
+                        (("a", lambda now: [cand_below_echo]),))
     res = rag.anticipate_run_impl(dry_run=True)
-    assert res["selected"] is None
+    assert res["selected"] is None, "anticipate-echo debajo de su threshold debe rechazarse"
+
+    # Test 2: anticipate-commitment con el threshold global
+    cand_below_global = rag.AnticipatoryCandidate(
+        kind="anticipate-commitment", score=rag._ANTICIPATE_MIN_SCORE - 0.01,
+        message="m", dedup_key="k:thresh_commit", snooze_hours=168, reason="r",
+    )
+    monkeypatch.setattr(rag, "_ANTICIPATE_SIGNALS",
+                        (("a", lambda now: [cand_below_global]),))
+    res = rag.anticipate_run_impl(dry_run=True)
+    assert res["selected"] is None, "anticipate-commitment debajo del threshold global debe rechazarse"

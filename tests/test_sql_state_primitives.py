@@ -84,9 +84,6 @@ def test_ensure_telemetry_tables_idempotent(tmp_path):
     # 1 routing decisions + 1 routing rules (voice-classifier Bloque B
     # 2026-04-25, system/voice-classifier/spec.md — LLM routing aprendido
     # de audios reenviados a RagNet) +
-    # 5 negotiation tables (rag_negotiations, rag_negotiation_turns,
-    # rag_negotiation_pending_sends, rag_style_fingerprints,
-    # rag_behavior_priors_wa — WA Negotiation Auto-Pilot Fase 0) +
     # 1 draft decisions (rag_draft_decisions, 2026-04-29 — cierra
     # el loop de auto-aprendizaje del bot WA: incoming → draft →
     # /si /no /editar en RagNet → reply + feedback al modelo) +
@@ -97,18 +94,43 @@ def test_ensure_telemetry_tables_idempotent(tmp_path):
     # 1 brief schedule prefs (rag_brief_schedule_prefs, 2026-04-29 — el
     # auto-tune de horarios de briefs upsertea acá el override hour/minute
     # cuando el feedback indica que el horario actual concentra mutes;
-    # `_services_spec()` lee este pref antes de generar el plist) =
-    # 47 tables total.
+    # `_services_spec()` lee este pref antes de generar el plist) +
+    # 1 anticipate feedback (rag_anticipate_feedback, 2026-04-30 — movida
+    # de DDL standalone en rag_anticipate/feedback.py al DDL central para
+    # que aparezca en schema checks y rollback loop) =
+    # 47 tables total. Nota: 6 tablas ghost removidas 2026-04-30
+    # (rag_promises, rag_negotiations, rag_negotiation_turns,
+    # rag_negotiation_pending_sends, rag_style_fingerprints,
+    # rag_behavior_priors_wa — sin daemon activo en _services_spec).
+    # Los módulos rag_negotiations/crud.py siguen vivos; si se activa el
+    # daemon, los módulos recrean las tablas vía CREATE TABLE IF NOT EXISTS.
     expected = {name for name, _ in rag._TELEMETRY_DDL}
     assert expected.issubset(after)
     # Sanity floor: si esto baja accidentalmente, alguien borró tablas en
     # _TELEMETRY_DDL sin migration. El upper bound no se trackea acá — la
-    # lista crece naturalmente con cada feature nueva (49 al 2026-04-30,
-    # historic baseline 47 pre-2026-04-30 cuando se agregaron 2 nuevas).
+    # lista crece naturalmente con cada feature nueva.
     assert len(expected) >= 47, (
         f"_TELEMETRY_DDL bajó de 47 tablas (ahora {len(expected)}) — "
         "verificar que ninguna feature perdió su tabla"
     )
+    # Fix #2 — rag_anticipate_feedback debe estar en el DDL central
+    assert "rag_anticipate_feedback" in expected, (
+        "rag_anticipate_feedback debe estar en _TELEMETRY_DDL"
+    )
+    # Tablas ghost eliminadas 2026-04-30 — si vuelven a aparecer, el audit
+    # las detectará como surplus en lugar de como ghost.
+    for _ghost in (
+        "rag_promises",
+        "rag_negotiations",
+        "rag_negotiation_turns",
+        "rag_negotiation_pending_sends",
+        "rag_style_fingerprints",
+        "rag_behavior_priors_wa",
+    ):
+        assert _ghost not in expected, (
+            f"{_ghost} es una tabla ghost — fue removida de _TELEMETRY_DDL; "
+            "no re-agregarla sin un daemon activo en _services_spec()"
+        )
     c.close()
 
 

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import sys
 import time
@@ -89,19 +90,20 @@ DOC_ID_PREFIX = "whatsapp"
 # width space) is bot output (the listener anti-loop marker). Defense
 # in depth for any future bot-to-non-RagNet-chat path; today the JID
 # guard alone catches all production cases.
+_LISTENER_NOTES_CHAT_JID = os.environ.get(
+    "WA_LISTENER_NOTES_CHAT_JID",
+    "5493425153999-1539438783@g.us",
+)
 HARDCODED_EXCLUDE_JIDS = frozenset({
     "status@broadcast",
     rag.WHATSAPP_BOT_JID,
-    # 2026-04-30: chat "Notes" (5493425153999-1539438783@g.us) — el user
-    # lo usa como inbox de capture (notes-to-self); cada msg ahí es
-    # materializado como `.md` en `00-Inbox/` por `whatsapp-listener` y
-    # ya entra al RAG via la indexación normal del vault. Si lo
-    # indexáramos también acá, tendríamos cada nota duplicada como
-    # chunk WhatsApp + chunk vault — ruido en search results y disk.
-    # Override este JID via env `WA_LISTENER_NOTES_CHAT_JID`; tener que
-    # mantener ambos en sync (acá + listener) es aceptable porque cambia
-    # ~nunca y el JID del grupo es estable.
-    "5493425153999-1539438783@g.us",
+    # 2026-04-30: chat "Notes" — el user lo usa como inbox de capture
+    # (notes-to-self); cada msg ahí es materializado como `.md` en
+    # `00-Inbox/` por `whatsapp-listener` y ya entra al RAG via la
+    # indexación normal del vault. Si lo indexáramos también acá,
+    # tendríamos cada nota duplicada como chunk WhatsApp + chunk vault —
+    # ruido en search results y disk. Override via env `WA_LISTENER_NOTES_CHAT_JID`.
+    _LISTENER_NOTES_CHAT_JID,
 })
 
 # U+200B (zero-width space) anti-loop marker. The listener bot prefixes

@@ -2918,7 +2918,7 @@ class DraftDecisionPayload(BaseModel):
 
 
 @app.post("/api/draft/decision")
-def submit_draft_decision(req: DraftDecisionPayload) -> dict:
+def submit_draft_decision(req: DraftDecisionPayload, request: Request) -> dict:
     """Persiste la decisión del user sobre un draft del bot WhatsApp.
 
     Llamado por el listener TS al detectar `/si`, `/no`, `/editar <texto>`
@@ -2930,6 +2930,11 @@ def submit_draft_decision(req: DraftDecisionPayload) -> dict:
     `approved_si | approved_editar | rejected | expired`; cualquier otro
     valor → 400 (Pydantic validation rebota antes de entrar al handler).
     """
+    # Rate limit: 120 events/60s per client IP (mismo bucket que /api/behavior)
+    client_ip = (request.client.host if request.client else "unknown")
+    _check_rate_limit(_BEHAVIOR_BUCKETS, client_ip,
+                      _BEHAVIOR_RATE_LIMIT, _BEHAVIOR_RATE_WINDOW)
+
     # Importamos el helper acá para que monkeypatches en tests
     # (`patch.object(_web_server, "_record_draft_decision", ...)`) NO sean
     # necesarios — el handler resuelve via `rag._record_draft_decision`
@@ -2982,7 +2987,7 @@ class DraftPreviewPayload(BaseModel):
 
 
 @app.post("/api/draft/preview")
-def submit_draft_preview(req: DraftPreviewPayload) -> dict:
+def submit_draft_preview(req: DraftPreviewPayload, request: Request) -> dict:
     """Genera el output del modelo fine-tuned para A/B manual.
 
     Body shape: ver `DraftPreviewPayload`. Devuelve:
@@ -2992,6 +2997,11 @@ def submit_draft_preview(req: DraftPreviewPayload) -> dict:
     echo del baseline (false) — útil para que el caller sepa si
     está viendo un A/B real o el mismo baseline.
     """
+    # Rate limit: 120 events/60s per client IP (mismo bucket que /api/behavior)
+    client_ip = (request.client.host if request.client else "unknown")
+    _check_rate_limit(_BEHAVIOR_BUCKETS, client_ip,
+                      _BEHAVIOR_RATE_LIMIT, _BEHAVIOR_RATE_WINDOW)
+
     from rag import (
         _drafts_ft_adapter_available,
         _drafts_ft_enabled,
@@ -3037,7 +3047,7 @@ class AnticipateFeedbackPayload(BaseModel):
 
 
 @app.post("/api/anticipate/feedback")
-def submit_anticipate_feedback(req: AnticipateFeedbackPayload) -> dict:
+def submit_anticipate_feedback(req: AnticipateFeedbackPayload, request: Request) -> dict:
     """Persiste un feedback del user sobre un push del Anticipatory Agent.
 
     Llamado por el listener TS cuando el user responde al push proactivo
@@ -3046,6 +3056,11 @@ def submit_anticipate_feedback(req: AnticipateFeedbackPayload) -> dict:
     record_feedback` es silent-fail — devolvemos `{ok: False, reason: ...}`
     si el write falla, pero NUNCA un 5xx para no romper el listener.
     """
+    # Rate limit: 120 events/60s per client IP (mismo bucket que /api/behavior)
+    client_ip = (request.client.host if request.client else "unknown")
+    _check_rate_limit(_BEHAVIOR_BUCKETS, client_ip,
+                      _BEHAVIOR_RATE_LIMIT, _BEHAVIOR_RATE_WINDOW)
+
     # Import deferred igual que en `submit_draft_decision`: tests pueden
     # monkeypatchear `rag_anticipate.feedback.record_feedback` directamente.
     from rag_anticipate.feedback import record_feedback as _rec_feedback
@@ -3093,7 +3108,7 @@ class BriefFeedbackPayload(BaseModel):
 
 
 @app.post("/api/brief/feedback")
-def submit_brief_feedback(req: BriefFeedbackPayload) -> dict:
+def submit_brief_feedback(req: BriefFeedbackPayload, request: Request) -> dict:
     """Persiste un feedback del user sobre un brief (morning/evening/digest).
 
     Llamado por el listener TS cuando el user reacciona en RagNet a un
@@ -3103,6 +3118,11 @@ def submit_brief_feedback(req: BriefFeedbackPayload) -> dict:
     feedback` es silent-fail — devolvemos `{ok: False, reason: ...}` si
     el write falla, pero NUNCA un 5xx para no romper el listener.
     """
+    # Rate limit: 120 events/60s per client IP (mismo bucket que /api/behavior)
+    client_ip = (request.client.host if request.client else "unknown")
+    _check_rate_limit(_BEHAVIOR_BUCKETS, client_ip,
+                      _BEHAVIOR_RATE_LIMIT, _BEHAVIOR_RATE_WINDOW)
+
     # Import deferred igual que en `submit_draft_decision` y
     # `submit_anticipate_feedback`: tests pueden monkeypatchear
     # `rag._record_brief_feedback` directamente.
@@ -13783,7 +13803,6 @@ def _query_pulse_recencies(paths_filter: set[str] | None = None) -> dict[str, fl
     no aparecen en el dict (= tier 0 en el frontend).
     """
     import json as _json
-    import sqlite3
     from datetime import datetime as _dt, timedelta, timezone
     try:
         import rag as _rag_mod
@@ -13796,14 +13815,14 @@ def _query_pulse_recencies(paths_filter: set[str] | None = None) -> dict[str, fl
     cutoff = (_dt.now(timezone.utc) - timedelta(days=90)).isoformat(timespec="seconds")
     out: dict[str, float] = {}
     try:
-        conn = sqlite3.connect(f"file:{telemetry_db}?mode=ro", uri=True, timeout=10.0)
-        rows = conn.execute(
-            "SELECT ts, paths_json FROM rag_queries "
-            "WHERE ts >= ? AND paths_json IS NOT NULL AND paths_json != ''",
-            (cutoff,),
-        ).fetchall()
-        conn.close()
-    except sqlite3.OperationalError:
+        from rag import _ragvec_state_conn as _rvsc
+        with _rvsc() as conn:
+            rows = conn.execute(
+                "SELECT ts, paths_json FROM rag_queries "
+                "WHERE ts >= ? AND paths_json IS NOT NULL AND paths_json != ''",
+                (cutoff,),
+            ).fetchall()
+    except Exception:
         return {}
 
     for ts_str, pjson in rows:
@@ -13868,7 +13887,6 @@ def atlas_pulse_recent_api(since_id: int = 0, limit: int = 30) -> dict:
         }
     """
     import json as _json
-    import sqlite3
     from datetime import datetime as _dt, timezone
     try:
         import rag as _rag_mod
@@ -13880,15 +13898,15 @@ def atlas_pulse_recent_api(since_id: int = 0, limit: int = 30) -> dict:
 
     limit = max(1, min(limit, 100))
     try:
-        conn = sqlite3.connect(f"file:{telemetry_db}?mode=ro", uri=True, timeout=10.0)
-        rows = conn.execute(
-            "SELECT id, ts, paths_json FROM rag_queries "
-            "WHERE id > ? AND paths_json IS NOT NULL AND paths_json != '' "
-            "ORDER BY id ASC LIMIT ?",
-            (since_id, limit),
-        ).fetchall()
-        conn.close()
-    except sqlite3.OperationalError:
+        from rag import _ragvec_state_conn as _rvsc2
+        with _rvsc2() as conn:
+            rows = conn.execute(
+                "SELECT id, ts, paths_json FROM rag_queries "
+                "WHERE id > ? AND paths_json IS NOT NULL AND paths_json != '' "
+                "ORDER BY id ASC LIMIT ?",
+                (since_id, limit),
+            ).fetchall()
+    except Exception:
         return {"events": [], "last_id": since_id}
 
     events = []
@@ -19128,9 +19146,29 @@ def _dashboard_compute_sql(days: int = 30) -> dict:
 
     with _ragvec_state_conn() as conn:
         q_rows_window = _sql_query_window(conn, "rag_queries", cutoff_iso)
-        # all_queries: full history — same semantics as JSONL (unbounded scan).
-        q_rows_all = _sql_query_window(conn, "rag_queries", ancient_iso)
-        fb_rows_all = _sql_query_window(conn, "rag_feedback", ancient_iso)
+        # total_queries_all_time: COUNT(*) directo — no necesitamos traer las
+        # rows completas, solo el número. Pre-fix traía TODO el historial (O(n)
+        # RAM) para después hacer `len(all_queries)`.
+        try:
+            _q_all_total: int = conn.execute(
+                "SELECT COUNT(*) FROM rag_queries"
+            ).fetchone()[0] or 0
+        except Exception:
+            _q_all_total = 0
+        # fb_rows_all: feedback all-time; necesitamos las rows para path-counts,
+        # corrective-misses y neg-reasons. Cap defensivo 10 000 para evitar RAM
+        # proporcional al historial bajo polling 60s. En prod el feedback es <500
+        # rows; el cap es solo red de seguridad. Usamos query directa con LIMIT
+        # porque _sql_query_window no tiene parámetro limit.
+        import sqlite3 as _sqlite3_fb
+        _prev_rf = conn.row_factory
+        try:
+            conn.row_factory = _sqlite3_fb.Row
+            fb_rows_all = list(conn.execute(
+                "SELECT * FROM rag_feedback ORDER BY ts LIMIT 10000"
+            ).fetchall())
+        finally:
+            conn.row_factory = _prev_rf
         amb_rows = _sql_query_window(conn, "rag_ambient", cutoff_iso)
         contra_rows = _sql_query_window(conn, "rag_contradictions", cutoff_iso)
         filing_rows = _sql_query_window(conn, "rag_filing_log", cutoff_iso)
@@ -19177,7 +19215,9 @@ def _dashboard_compute_sql(days: int = 30) -> dict:
     _FIL_JSON = ("neighbors",)
     _T_JSON = ("baseline", "best")
 
-    all_queries = [_dashboard_sql_row_to_event(r, _Q_JSON) for r in q_rows_all]
+    # all_queries ya no se trae completo — usamos el COUNT(*) en _q_all_total.
+    # Pasamos lista vacía al aggregator y sobreescribimos el KPI después.
+    all_queries: list[dict] = []
     queries = [_dashboard_sql_row_to_event(r, _Q_JSON) for r in q_rows_window]
     fb_entries = [_dashboard_sql_row_to_event(r, _F_JSON) for r in fb_rows_all]
     # rag_ambient stores extra fields in `payload_json`, not `extra_json`.
@@ -19225,6 +19265,12 @@ def _dashboard_compute_sql(days: int = 30) -> dict:
         surface_entries=surface_entries,
         days=days,
     )
+    # Parchar el KPI all-time con el COUNT(*) calculado arriba — el aggregator
+    # ve all_queries=[] y produce 0, reemplazamos aquí con el valor real.
+    try:
+        payload["kpis"]["total_queries_all_time"] = _q_all_total
+    except Exception:
+        pass
     # Signals panel — additive, non-breaking. Dashboard.js reads
     # payload.signals optionally; old clients just ignore it.
     payload["signals"] = {

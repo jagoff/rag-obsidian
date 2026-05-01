@@ -108,6 +108,7 @@ if TYPE_CHECKING:
 
 # ── Env-tunable thresholds ──────────────────────────────────────────────────
 _ANTICIPATE_MIN_SCORE = float(os.environ.get("RAG_ANTICIPATE_MIN_SCORE", "0.35"))
+_ANTICIPATE_ECHO_MIN_SCORE = float(os.environ.get("RAG_ANTICIPATE_ECHO_MIN_SCORE", "0.30"))
 _ANTICIPATE_DEDUP_WINDOW_HOURS = int(
     os.environ.get("RAG_ANTICIPATE_DEDUP_WINDOW_HOURS", "24")
 )
@@ -528,7 +529,12 @@ def _phase2_apply_kind_weight(kind: str, score: float) -> float:
 
 def _phase2_kind_threshold(kind: str) -> float:
     """Phase 2.A wire-up: threshold base + delta per-kind del feedback
-    tuning. Silent-fail al threshold base si el módulo no carga."""
+    tuning. Silent-fail al threshold base si el módulo no carga.
+
+    Special case (2026-04-30): anticipate-echo usa su propio threshold
+    minimum (_ANTICIPATE_ECHO_MIN_SCORE, default 0.30) en lugar del global
+    (_ANTICIPATE_MIN_SCORE, default 0.35) para permitir más echoes de bajo
+    score que pertenecen al realmente temporal echo signal."""
     try:
         from rag_anticipate.feedback_tuning import (
             compute_kind_threshold_adjustment,
@@ -536,6 +542,10 @@ def _phase2_kind_threshold(kind: str) -> float:
         delta = compute_kind_threshold_adjustment(kind)
     except Exception:
         delta = 0.0
+
+    # Kind-specific minimums (all others use the global default).
+    if kind == "anticipate-echo":
+        return float(_ANTICIPATE_ECHO_MIN_SCORE) + float(delta)
     return float(_ANTICIPATE_MIN_SCORE) + float(delta)
 
 

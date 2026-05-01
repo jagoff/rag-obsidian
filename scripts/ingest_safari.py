@@ -609,7 +609,7 @@ def run(
         return summary
 
     col = vault_col if vault_col is not None else rag.get_db()
-    state_conn = sqlite3.connect(str(rag.DB_PATH / "ragvec.db"))
+    state_conn = sqlite3.connect(str(rag.DB_PATH / "ragvec.db"), timeout=15.0)
     _ensure_state_tables(state_conn)
     if reset:
         _reset_state(state_conn)

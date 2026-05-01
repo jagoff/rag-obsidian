@@ -5261,6 +5261,10 @@ def _corpus_hash_cached(col) -> str:
     Una sola llamada a col.count(): si el cache está caliente devolvemos
     directo; si miss, computamos hash desde el cnt ya leído (sin re-llamar
     col.count() dentro de _compute_corpus_hash).
+
+    # 2026-04-30: LOW — retrieve() ya llamó col.count() para hint_count; si
+    # en el futuro se pasa hint_count como arg podría evitar el col.count()
+    # acá (tercer count por retrieve()). Opcional, no crítico.
     """
     try:
         cnt = int(col.count())
@@ -5970,42 +5974,6 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             "CREATE INDEX IF NOT EXISTS ix_rag_wa_tasks_ts ON rag_wa_tasks(ts)",
         ),
     ),
-    # Promesas WhatsApp pendientes (feat 2026-04-25). Detectamos frases
-    # como "después te aviso", "te llamo mañana", "en un rato lo reviso"
-    # tanto outbound (yo prometo a un contacto) como inbound (un contacto
-    # me promete) y agendamos un recordatorio en RagNet self-chat.
-    # Un signal pluggable (`rag_anticipate/signals/promises.py`) lee la
-    # tabla y dispara `proactive_push` cuando `due_ts <= now + 30min` y
-    # `status='pending'`. Auto-cierre: cuando hay nuevo msg outbound
-    # sustantivo (>20 chars, no-promesa) al `contact_jid`, marcamos
-    # `closed (reason='activity')`. Manual override via `rag promises`
-    # CLI subcomandos.
-    (
-        "rag_promises",
-        (
-            "CREATE TABLE IF NOT EXISTS rag_promises ("
-            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
-            " ts TEXT NOT NULL,"
-            " contact_jid TEXT NOT NULL,"
-            " contact_name TEXT,"
-            " promise_text TEXT NOT NULL,"
-            " direction TEXT NOT NULL,"
-            " due_ts TEXT,"
-            " due_confidence REAL,"
-            " source_msg_id TEXT,"
-            " source_chat_jid TEXT,"
-            " status TEXT NOT NULL DEFAULT 'pending',"
-            " reminder_sent_ts TEXT,"
-            " closed_ts TEXT,"
-            " closed_reason TEXT,"
-            " extra_json TEXT"
-            ")",
-            "CREATE INDEX IF NOT EXISTS ix_rag_promises_ts ON rag_promises(ts)",
-            "CREATE INDEX IF NOT EXISTS ix_rag_promises_due_ts ON rag_promises(due_ts)",
-            "CREATE INDEX IF NOT EXISTS ix_rag_promises_status ON rag_promises(status)",
-            "CREATE INDEX IF NOT EXISTS ix_rag_promises_contact ON rag_promises(contact_jid)",
-        ),
-    ),
     (
         "rag_archive_log",
         (
@@ -6130,6 +6098,31 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             # Audit R2-7 #2.
             "CREATE INDEX IF NOT EXISTS ix_rag_anticipate_candidates_kind_ts"
             " ON rag_anticipate_candidates(kind, ts)",
+        ),
+    ),
+    (
+        # Anticipatory agent feedback — reactions del user sobre los pushes
+        # proactivos (👍/👎/🔇). El listener TS parsea el footer
+        # `_anticipate:<dedup_key>_` del msg quoted y postea al endpoint
+        # /api/anticipate/feedback. DDL espejo de `rag_anticipate/feedback.py:
+        # _FEEDBACK_DDL` — ese módulo mantiene su propio `_ensure_feedback_table`
+        # como defense in depth (standalone use sin web/server.py); el DDL acá
+        # garantiza que la tabla aparece en el schema check, en el rollback DROP
+        # loop, y en `test_schema_version_registered`.
+        "rag_anticipate_feedback",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_anticipate_feedback ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " dedup_key TEXT NOT NULL,"
+            " rating TEXT NOT NULL CHECK(rating IN ('positive', 'negative', 'mute')),"
+            " source TEXT DEFAULT 'wa',"
+            " reason TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_anticipate_feedback_ts "
+            "ON rag_anticipate_feedback(ts)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_anticipate_feedback_dedup_key "
+            "ON rag_anticipate_feedback(dedup_key)",
         ),
     ),
     (
@@ -6778,150 +6771,6 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             ")",
             "CREATE INDEX IF NOT EXISTS ix_routing_rules_active "
             "ON rag_routing_rules(active, bucket)",
-        ),
-    ),
-    (
-        # WA Negotiation Auto-Pilot — Fase 0 (Foundation). Spec en
-        # 04-Archive/99-obsidian-system/99-AI/system/wa-negotiation-
-        # autopilot/design.md. Una fila por negociación que el user
-        # lance vía PWA / self-DM / voz. El `status` está validado al
-        # transition por `rag_negotiations.state_machine.transition()`
-        # — esta tabla NO impone CHECK constraints sobre los strings
-        # legales para que sea fácil agregar estados nuevos sin
-        # migration. Estados actuales: draft, launched, in_flight,
-        # escalated, closed_ok, closed_fail, cancelled, out_of_perimeter.
-        # `perimeter_json` lleva el scope acordado al lanzar (topic +
-        # items + caps de transacción) — el classifier lo lee en F2
-        # para detectar `perimeter_violation`.
-        "rag_negotiations",
-        (
-            "CREATE TABLE IF NOT EXISTS rag_negotiations ("
-            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
-            " trace_id TEXT,"
-            " user_intent TEXT NOT NULL,"
-            " target_jid TEXT NOT NULL,"
-            " target_name TEXT,"
-            " status TEXT NOT NULL,"
-            " created_at TEXT NOT NULL,"
-            " updated_at TEXT NOT NULL,"
-            " closed_at TEXT,"
-            " perimeter_json TEXT NOT NULL,"
-            " confidence_threshold REAL,"
-            " max_messages INTEGER,"
-            " messages_sent INTEGER DEFAULT 0,"
-            " messages_received INTEGER DEFAULT 0,"
-            " last_message_id TEXT,"
-            " closure_type TEXT,"
-            " closure_summary TEXT,"
-            " side_effect_json TEXT,"
-            " style_seed_jid TEXT,"
-            " style_examples_count INTEGER,"
-            " cost_estimate_cents INTEGER,"
-            " user_overrode_count INTEGER DEFAULT 0"
-            ")",
-            "CREATE INDEX IF NOT EXISTS ix_negotiations_status_updated "
-            "ON rag_negotiations(status, updated_at DESC)",
-            "CREATE INDEX IF NOT EXISTS ix_negotiations_target_jid "
-            "ON rag_negotiations(target_jid, created_at DESC)",
-            "CREATE INDEX IF NOT EXISTS ix_negotiations_trace_id "
-            "ON rag_negotiations(trace_id) WHERE trace_id IS NOT NULL",
-        ),
-    ),
-    (
-        # Una fila por mensaje (in/out) de una negociación.
-        # `direction='in'` = mensaje recibido del target_jid;
-        # `direction='out'` = mensaje mandado por el bot (o por el
-        # user si fue user_resumes / user_takes_over). El classifier
-        # confidence + reasoning quedan para audit ("¿por qué el bot
-        # contestó así?"). FK con `ON DELETE CASCADE` para que borrar
-        # una negociación obsoleta limpie todo el historial sin
-        # orphan rows.
-        "rag_negotiation_turns",
-        (
-            "CREATE TABLE IF NOT EXISTS rag_negotiation_turns ("
-            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
-            " negotiation_id INTEGER NOT NULL"
-            "   REFERENCES rag_negotiations(id) ON DELETE CASCADE,"
-            " ts TEXT NOT NULL,"
-            " direction TEXT NOT NULL,"
-            " content TEXT NOT NULL,"
-            " classifier_confidence REAL,"
-            " classifier_reasoning TEXT,"
-            " pause_simulated_ms INTEGER,"
-            " bridge_message_id TEXT,"
-            " escalated_at TEXT,"
-            " user_response_text TEXT,"
-            " user_response_at TEXT,"
-            " user_overrode INTEGER"
-            ")",
-            "CREATE INDEX IF NOT EXISTS ix_negotiation_turns_neg_ts "
-            "ON rag_negotiation_turns(negotiation_id, ts)",
-        ),
-    ),
-    (
-        # Cola de envíos pendientes — el orchestrator (F3) lee con
-        # `dequeue_due(now)` cada N segundos. `send_after_ts` es
-        # epoch-seconds; el pause simulator setea el delay
-        # apropiado. `attempts` permite reintentos exponenciales
-        # cuando el bridge devuelve fail. `status` ∈
-        # {pending, sent, failed, cancelled}.
-        "rag_negotiation_pending_sends",
-        (
-            "CREATE TABLE IF NOT EXISTS rag_negotiation_pending_sends ("
-            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
-            " negotiation_id INTEGER NOT NULL"
-            "   REFERENCES rag_negotiations(id) ON DELETE CASCADE,"
-            " content TEXT NOT NULL,"
-            " typing_simulation_ms INTEGER,"
-            " send_after_ts REAL NOT NULL,"
-            " queued_at TEXT NOT NULL,"
-            " attempts INTEGER DEFAULT 0,"
-            " last_attempt_ts TEXT,"
-            " status TEXT NOT NULL"
-            ")",
-            "CREATE INDEX IF NOT EXISTS ix_pending_sends_due "
-            "ON rag_negotiation_pending_sends(status, send_after_ts)",
-            "CREATE INDEX IF NOT EXISTS ix_pending_sends_neg "
-            "ON rag_negotiation_pending_sends(negotiation_id, queued_at DESC)",
-        ),
-    ),
-    (
-        # Style fingerprint per contacto — refrescado por el watcher
-        # de F1 cuando detecta cambios en el bridge. El JSON tiene
-        # tone / vocabulary / structural / temporal features. F0 lo
-        # trata como blob opaco; el classifier de F2 lo lee.
-        # `target_jid` como PK natural — un JID, un fingerprint.
-        "rag_style_fingerprints",
-        (
-            "CREATE TABLE IF NOT EXISTS rag_style_fingerprints ("
-            " target_jid TEXT PRIMARY KEY,"
-            " fingerprint_json TEXT NOT NULL,"
-            " messages_analyzed INTEGER NOT NULL,"
-            " computed_at TEXT NOT NULL"
-            ")",
-            "CREATE INDEX IF NOT EXISTS ix_style_fingerprints_computed "
-            "ON rag_style_fingerprints(computed_at DESC)",
-        ),
-    ),
-    (
-        # Behavior priors per contacto — alimentan el pause simulator
-        # de F3 (lognormal del response lag). NULL en cualquier
-        # campo → fallback a defaults globales en el simulator.
-        # `samples_n` permite UI tipo "basado en N mensajes".
-        "rag_behavior_priors_wa",
-        (
-            "CREATE TABLE IF NOT EXISTS rag_behavior_priors_wa ("
-            " target_jid TEXT PRIMARY KEY,"
-            " response_lag_mu REAL,"
-            " response_lag_sigma REAL,"
-            " avg_msg_length_words REAL,"
-            " msg_per_response REAL,"
-            " emoji_freq REAL,"
-            " samples_n INTEGER,"
-            " computed_at TEXT NOT NULL"
-            ")",
-            "CREATE INDEX IF NOT EXISTS ix_behavior_priors_wa_computed "
-            "ON rag_behavior_priors_wa(computed_at DESC)",
         ),
     ),
     (
@@ -13648,7 +13497,7 @@ def _tokenize(text: str) -> list[str]:
     return re.findall(r"\w+", stripped)
 
 
-def _load_corpus(col: SqliteVecCollection) -> dict:
+def _load_corpus(col: SqliteVecCollection, *, hint_count: int | None = None) -> dict:
     """Load and cache the full corpus + BM25 index + vocabulary.
 
     Invalidation keys: (collection UUID, chunk count). A concurrent
@@ -13657,9 +13506,17 @@ def _load_corpus(col: SqliteVecCollection) -> dict:
     on count alone left long-lived chat processes serving stale BM25
     indexes whose ids had been wiped. `col.id` is the authoritative churn
     signal — sqlite-vec rotates it on every delete+create.
+
+    `hint_count` (2026-04-30, M1 perf fix): when the caller already
+    holds an authoritative `col.count()` reading from the same retrieve
+    cycle, pass it here to skip the redundant SQL round-trip used for
+    cache invalidation. Default `None` preserves legacy behavior — the
+    function performs `col.count()` itself. Saves ~2-4ms per retrieve
+    when the cache is warm (the count itself is cheap, but ~3 calls per
+    retrieve compound).
     """
     global _corpus_cache
-    n = col.count()
+    n = int(hint_count) if hint_count is not None else col.count()
     cid = str(getattr(col, "id", "") or "")
     # Single-flight pattern: el lock cubre TODO el rebuild para que dos
     # threads en miss simultáneo no ejecuten BM25Okapi en paralelo.
@@ -17466,6 +17323,29 @@ def expand_to_parent(chunk_text: str, meta: dict) -> str:
     return parent if parent else chunk_text
 
 
+def _build_rerank_input(parent: str, meta: dict) -> str:
+    """Prepend ``{title}\\n({folder})\\n\\n`` al parent text que va al
+    cross-encoder. Memoria ``project_rerank_title_prefix`` (2026-04-17):
+    +8pp chains hit@5, +4pp MRR vs body-only — el reranker matchea la
+    identidad de la nota incluso cuando el body tiene structural noise
+    (``[Verso 1]``, secciones repetidas, etc.).
+
+    Centralizado 2026-04-30 (M2) para que ``retrieve()`` y
+    ``collect_ranker_features`` produzcan rerank scores comparables —
+    antes ``collect_ranker_features`` rerank-eaba sólo el parent (sin
+    title prefix), así que ``rag tune`` optimizaba weights sobre features
+    con scores DIFERENTES a los que ``retrieve()`` produce en runtime.
+    Tras este fix la primera corrida de ``rag tune`` post-fix puede mover
+    los weights — deseado: tune ahora optimiza la métrica correcta.
+    """
+    title = (meta.get("note") or "").strip()
+    folder = (meta.get("folder") or "").strip()
+    header = f"{title}\n({folder})\n\n" if title and folder else (
+        f"{title}\n\n" if title else ""
+    )
+    return header + parent
+
+
 def get_vocabulary(col: SqliteVecCollection) -> tuple[set[str], set[str]]:
     """Collect unique tags and folders from the index for intent-based filtering."""
     c = _load_corpus(col)
@@ -17841,7 +17721,7 @@ def _prompt_name_for_intent(intent: str | None, loose: bool) -> str:
     """
     if loose:
         return "system_rules"
-    if intent in ("count", "list", "recent", "agenda"):
+    if intent in ("count", "list", "recent", "agenda", "entity_lookup"):
         return "lookup"
     if intent == "synthesis":
         return "synthesis"
@@ -21708,13 +21588,11 @@ def retrieve(
     #    prose that happen to rank higher). Bracketed section markers like
     #    `[Verso 1]` also drag scores down; the title prefix compensates.
     reranker = get_reranker()
-    def _rerank_doc(parent: str, meta: dict) -> str:
-        title = (meta.get("note") or "").strip()
-        folder = (meta.get("folder") or "").strip()
-        header = f"{title}\n({folder})\n\n" if title and folder else (
-            f"{title}\n\n" if title else ""
-        )
-        return header + parent
+    # 2026-04-30 (M2): el helper `_build_rerank_input` (module-level) reemplaza
+    # la closure local. Antes había un `_rerank_doc` definido inline acá; ahora
+    # `collect_ranker_features` reusa la MISMA función para que tune ↔ retrieve
+    # produzcan rerank scores comparables.
+    _rerank_doc = _build_rerank_input
 
     # Fast-path del reranker (audit 2026-04-25 finding R2-1 #2). Ver
     # docstring de `_should_skip_rerank` para detalles.
@@ -21781,7 +21659,7 @@ def retrieve(
     # user types `#tag`) — here it's a soft ranking signal that survives
     # when the user omits the `#`.
     try:
-        tag_vocab = _load_corpus(col)["tags"]
+        tag_vocab = _load_corpus(col, hint_count=_col_count)["tags"]
     except Exception:
         tag_vocab = set()
     query_tag_hits = match_literal_tags(question, tag_vocab) if tag_vocab else set()
@@ -21818,7 +21696,7 @@ def retrieve(
         _seed_paths = [p for p in _seed_paths if p]
         if _seed_paths:
             try:
-                _corpus = _load_corpus(col)
+                _corpus = _load_corpus(col, hint_count=_col_count)
                 _adj = _build_graph_adj(_corpus)
                 ppr_score = _personalized_pagerank(_adj, _seed_paths)
             except Exception:
@@ -22034,10 +21912,17 @@ def retrieve(
     #
     # No-op on empty pools. Weighted by lambda (RAG_MMR_LAMBDA, default 0.7):
     # higher → more relevance-driven; lower → more diversity.
-    if scored_all and _MMR_DIVERSITY_ENABLED:
+    # RAG_MMR=1 (semantic) y RAG_MMR_DIVERSITY=1 (Jaccard) son mutuamente
+    # excluyentes: si el semantico esta ON ya cubre la diversificacion en el
+    # bloque siguiente; aplicar Jaccard primero seria redundante y menos
+    # preciso. Semantico tiene prioridad (embedding cosine > bigram Jaccard).
+    _mmr_full_enabled = (
+        os.environ.get("RAG_MMR", "").strip().lower() in ("1", "true", "yes")
+    )
+    if scored_all and _MMR_DIVERSITY_ENABLED and not _mmr_full_enabled:
         _mmr_lambda = float(os.environ.get("RAG_MMR_LAMBDA", "0.7"))
         # Only reorder inside the top (k * mmr_pool_multiplier) to keep
-        # cost bounded. Default 3× k, e.g. reorder the top-15 of a k=5.
+        # cost bounded. Default 3x k, e.g. reorder the top-15 of a k=5.
         _mmr_pool_mult = float(os.environ.get("RAG_MMR_POOL_MULTIPLIER", "3.0"))
         scored_all = _apply_mmr_reorder(
             scored_all, lambda_=_mmr_lambda,
@@ -22237,7 +22122,7 @@ def retrieve(
     _t0 = time.perf_counter()
     if metas and top_score <= GRAPH_EXPANSION_GATE:
         try:
-            corpus = _load_corpus(col)
+            corpus = _load_corpus(col, hint_count=_col_count)
             adj = _build_graph_adj(corpus)
             pr = get_pagerank(col)
             hit_paths = {m.get("file", "") for m in metas}
@@ -22260,17 +22145,38 @@ def retrieve(
             # Fetch best chunk per neighbor (first chunk = most representative)
             # Cap 2: cada neighbor suma ~300-400 tokens al prefill del LLM;
             # más de 2 rara vez cambian la respuesta y encarecen generate.
-            for nb_path, _ in sorted_neighbors[:2]:
+            #
+            # 2026-04-30 (M3): batch en una sola llamada `col.get(where={"file":
+            # {"$in": [...]}})` en vez de un get por neighbor. Ahorra ~10ms por
+            # retrieve (2 round-trips a sqlite-vec → 1). Dedup por path mantiene
+            # el primer chunk por archivo (mismo criterio que el loop pre-fix:
+            # "first chunk = most representative") y preservamos el orden de
+            # `sorted_neighbors` (closer hops + higher PageRank primero) iterando
+            # sobre `top_neighbors` post-fetch.
+            top_neighbors = [nb for nb, _ in sorted_neighbors[:2]]
+            if top_neighbors:
                 try:
                     nb_chunks = col.get(
-                        where={"file": nb_path},
+                        where={"file": {"$in": top_neighbors}},
                         include=["documents", "metadatas"],
                     )
-                    if nb_chunks["ids"]:
-                        best_meta = nb_chunks["metadatas"][0]
-                        best_doc = expand_to_parent(
-                            nb_chunks["documents"][0], best_meta
-                        )
+                    per_path: dict[str, tuple[str, dict]] = {}
+                    for doc, meta in zip(
+                        nb_chunks.get("documents", []) or [],
+                        nb_chunks.get("metadatas", []) or [],
+                    ):
+                        if not isinstance(meta, dict):
+                            continue
+                        f = meta.get("file", "")
+                        if not f or f in per_path:
+                            continue
+                        per_path[f] = (doc, meta)
+                    for nb_path in top_neighbors:
+                        item = per_path.get(nb_path)
+                        if item is None:
+                            continue
+                        best_doc_raw, best_meta = item
+                        best_doc = expand_to_parent(best_doc_raw, best_meta)
                         graph_docs.append(best_doc)
                         graph_metas.append(best_meta)
                 except Exception as exc:
@@ -22291,7 +22197,7 @@ def retrieve(
     #
     # Randomness: secrets.randbelow — NOT reproducible by design. We want real
     # diversity across sessions, not reproducible exploration slots.
-    if os.environ.get("RAG_EXPLORE") == "1" and len(docs) >= 3 and len(scored_all) > k:
+    if os.environ.get("RAG_EXPLORE", "").strip().lower() in ("1", "true", "yes") and len(docs) >= 3 and len(scored_all) > k:
         import secrets
         # Fire with probability ε=0.1 (10 out of 100 calls)
         if secrets.randbelow(100) < 10:
@@ -22439,7 +22345,12 @@ def retrieve(
                 )
             except ValueError:
                 _wa_thresh = 0.05
-            _top1_score = float(final_scores[0])
+            # H8 2026-04-30: usar raw_scores[0] (pre-calibration) para que el
+            # threshold 0.05 siga siendo válido cuando RAG_SCORE_CALIBRATION=1
+            # mapea scores calibrados a [0,1] — un calibrado >0.05 trivialmente
+            # haría que branch 2 dispare para TODA query WA. raw_scores ya existe
+            # en este scope (línea ~22199) y nunca es modificado post-rerank.
+            _top1_score = float(raw_scores[0]) if raw_scores else float(final_scores[0])
             if _top1_score > _wa_thresh:
                 _top3_sources = [
                     normalize_source((m or {}).get("source"))
@@ -22872,8 +22783,15 @@ def collect_ranker_features(
     # forzaba 30 inferencias secuenciales MPS (~500ms-1s); batch default lo
     # procesa en una pasada (~100-200ms). Mismo razonamiento que en la rerank
     # principal (ver comentario en rag.py alrededor de 17869-17874).
+    #
+    # 2026-04-30 (M2): title prefix para paridad scoring tune ↔ retrieve();
+    # memoria `project_rerank_title_prefix` mide +8pp chains hit@5. El
+    # primer `rag tune` post-fix puede mover los weights — deseado: tune
+    # ahora optimiza la métrica correcta (los rerank scores que retrieve()
+    # genera en runtime).
     rerank_scores = reranker.predict(
-        [(question, e) for e in expanded], show_progress_bar=False,
+        [(question, _build_rerank_input(e, c[1])) for e, c in zip(expanded, candidates)],
+        show_progress_bar=False,
     )
 
     try:
@@ -48656,7 +48574,8 @@ def _calibration_plist(rag_bin: str) -> str:
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
     <key>RAG_STATE_SQL</key><string>1</string>
-    <key>RAG_SCORE_CALIBRATION</key><string>0</string>
+    # 2026-04-30: enabled — daemon entrenaba pero calibrate_score() bailea con RAG_SCORE_CALIBRATION=0
+    <key>RAG_SCORE_CALIBRATION</key><string>1</string>
   </dict>
   <key>StartCalendarInterval</key>
   <dict>
@@ -53935,13 +53854,12 @@ _SQL_ROTATION_POLICY: tuple[tuple, ...] = (
     ("system_memory_metrics", 30),
     # Audit 2026-04-26 BUG #2 telemetry: estas tablas son creadas por
     # writers fuera de _TELEMETRY_DDL (rag_ranker_lgbm/synthetic_queries.py
-    # + hard_negatives.py + wa_scheduled.py + obsidian-rag-promises fork).
-    # Pre-fix crecían sin rotation — `rag_synthetic_negatives` ya tiene
-    # ~3K rows. Estas son señales temporales del fine-tune y la auto-
-    # tuning pipeline; rotation 90d es generosa.
+    # + hard_negatives.py + wa_scheduled.py). Pre-fix crecían sin rotation —
+    # `rag_synthetic_negatives` ya tiene ~3K rows. Estas son señales
+    # temporales del fine-tune y la auto-tuning pipeline; rotation 90d es
+    # generosa.
     ("rag_synthetic_queries", 90),
     ("rag_synthetic_negatives", 90),
-    ("rag_promises", 90),
     # rag_whatsapp_scheduled usa `created_at` como columna timestamp — el DDL
     # original (wa_scheduled.py) eligió ese nombre; aquí se declara explícito
     # para que el loop no aborte con "no such column: ts".
@@ -54933,6 +54851,56 @@ def run_maintenance(
         except Exception as e:
             results["chat_uploads_cleaned_error"] = str(e)
 
+    # 10c. Reranker fine-tune cache cleanup (2026-04-30).
+    # ~/.cache/obsidian-rag/reranker-ft-YYYYMMDD-HHMMSS dirs acumulan 2.1 GB
+    # cada uno indefinidamente. Preserva el target del symlink reranker-ft-current
+    # (el modelo activo) y borra dirs >7 días que NO sean el activo.
+    try:
+        _cache_base = Path.home() / ".cache" / "obsidian-rag"
+        _ft_symlink = _cache_base / "reranker-ft-current"
+        _ft_active_target: str | None = None
+        if _ft_symlink.is_symlink():
+            try:
+                _ft_active_target = str(_ft_symlink.resolve())
+            except OSError:
+                _ft_active_target = None
+        import glob as _glob  # noqa: PLC0415
+        _ft_cutoff = _t.time() - 7 * 86400
+        _ft_deleted = 0
+        _ft_bytes = 0
+        _ft_pattern = str(_cache_base / "reranker-ft-[0-9]*")
+        for _ft_dir_str in _glob.glob(_ft_pattern):
+            _ft_dir = Path(_ft_dir_str)
+            if not _ft_dir.is_dir():
+                continue
+            if _ft_active_target and str(_ft_dir.resolve()) == _ft_active_target:
+                continue
+            try:
+                if _ft_dir.stat().st_mtime >= _ft_cutoff:
+                    continue
+                if not dry_run:
+                    _ft_size = sum(
+                        f.stat().st_size
+                        for f in _ft_dir.rglob("*")
+                        if f.is_file()
+                    )
+                    import shutil as _shutil  # noqa: PLC0415
+                    _shutil.rmtree(_ft_dir, ignore_errors=True)
+                    _ft_bytes += _ft_size
+                else:
+                    _ft_size = sum(
+                        f.stat().st_size
+                        for f in _ft_dir.rglob("*")
+                        if f.is_file()
+                    )
+                    _ft_bytes += _ft_size
+                _ft_deleted += 1
+            except OSError:
+                continue
+        results["reranker_ft_cleaned"] = {"deleted": _ft_deleted, "bytes_freed": _ft_bytes}
+    except Exception as e:
+        results["reranker_ft_cleaned_error"] = str(e)
+
     # 11. URL orphans (files deleted but URL rows remain)
     if dry_run:
         try:
@@ -54988,6 +54956,13 @@ def run_maintenance(
         results["dead_notes"] = len(dead)
     except Exception:
         results["dead_notes"] = 0
+
+    # 15. Background SQL queue health — drops son signal de overload.
+    # El counter es module-level; leerlo desde maintenance lo expone en
+    # el JSON de salida para alerting externo (cron, healthcheck).
+    results["bg_sql_queue_drops"] = _BACKGROUND_SQL_QUEUE_DROPS
+    if _BACKGROUND_SQL_QUEUE_DROPS > 0 and not dry_run:
+        print(f"[maintenance] bg_sql_queue_drops={_BACKGROUND_SQL_QUEUE_DROPS}")
 
     results["took_ms"] = int((_t.perf_counter() - t0) * 1000)
     return results
@@ -60371,10 +60346,27 @@ def tune_lambdarank(
     El modelo NO se usa todavía en producción — falta la integración con
     `apply_weighted_scores`. Para evaluar A/B: `rag eval-lambdarank`.
 
+    Gateado por `RAG_LGBM_TRAIN_ENABLED=1` (default OFF) para evitar
+    gastar ~5-10 min de CPU/RAM cada domingo sin efecto en producción.
+    Prender el flag en el plist cuando el modelo esté integrado y validado.
+
     Costo: el feature replay (que reusa `collect_ranker_features`) tarda
     ~1-2s por query del feedback set. Con 100-200 queries históricos,
     esperá 2-7 minutos.
     """
+    if os.environ.get("RAG_LGBM_TRAIN_ENABLED", "0").strip().lower() not in (
+        "1", "true", "yes",
+    ):
+        msg = (
+            "LGBM training deshabilitado — ranker.lgbm no se usa en retrieve(). "
+            "Setear RAG_LGBM_TRAIN_ENABLED=1 cuando se integre en el pipeline."
+        )
+        if as_json:
+            import json as _json
+            click.echo(_json.dumps({"skipped": True, "reason": msg}))
+        else:
+            console.print(f"[dim]{msg}[/dim]")
+        return
     import json as _json
     from rag_ranker_lgbm import (
         DEFAULT_MODEL_PATH,
@@ -60645,6 +60637,19 @@ def synth_queries_generate(
       rag synth-queries generate --source gmail --apply
       rag synth-queries generate --source whatsapp --apply
     """
+    if os.environ.get("RAG_LGBM_TRAIN_ENABLED", "0").strip().lower() not in (
+        "1", "true", "yes",
+    ):
+        msg = (
+            "synth-queries deshabilitado — feeder del LGBM que no se usa en retrieve(). "
+            "Setear RAG_LGBM_TRAIN_ENABLED=1 para correr."
+        )
+        if as_json:
+            import json as _json
+            click.echo(_json.dumps({"skipped": True, "reason": msg}))
+        else:
+            console.print(f"[dim]{msg}[/dim]")
+        return
     import json as _json
     from rag_ranker_lgbm import (
         CROSS_SOURCE_SOURCES,
@@ -60735,6 +60740,19 @@ def synth_queries_mine_negatives(
     as_json: bool,
 ) -> None:
     """Mining hard negatives sobre las synthetic queries existentes."""
+    if os.environ.get("RAG_LGBM_TRAIN_ENABLED", "0").strip().lower() not in (
+        "1", "true", "yes",
+    ):
+        msg = (
+            "mine-negatives deshabilitado — feeder del LGBM que no se usa en retrieve(). "
+            "Setear RAG_LGBM_TRAIN_ENABLED=1 para correr."
+        )
+        if as_json:
+            import json as _json
+            click.echo(_json.dumps({"skipped": True, "reason": msg}))
+        else:
+            console.print(f"[dim]{msg}[/dim]")
+        return
     import json as _json
     from rag_ranker_lgbm import mine_hard_negatives_for_synthetic
 
@@ -62057,6 +62075,7 @@ from rag.anticipatory import (  # noqa: E402, F401
     _ANTICIPATE_DEDUP_WINDOW_HOURS,
     _ANTICIPATE_ECHO_MIN_AGE_DAYS,
     _ANTICIPATE_ECHO_MIN_COSINE,
+    _ANTICIPATE_ECHO_MIN_SCORE,
     _ANTICIPATE_EXTRA_SIGNALS,
     _ANTICIPATE_MIN_SCORE,
     _ANTICIPATE_SIGNALS,

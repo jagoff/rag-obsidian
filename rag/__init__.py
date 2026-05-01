@@ -1029,7 +1029,7 @@ def _bump_silent_log_counter() -> None:
             pass
 
 
-def _silent_log(where: str, exc: BaseException) -> None:
+def _silent_log(where: str, exc: BaseException, *, with_traceback: bool = False) -> None:
     """Record a swallowed exception without raising or blocking.
 
     Used at sites where the contract is `silently fall back` (corrupt
@@ -1044,6 +1044,11 @@ def _silent_log(where: str, exc: BaseException) -> None:
     adds observability only. The helper itself must never raise; if the
     queue is full or JSON serialisation throws, we drop the record.
 
+    `with_traceback=True` agrega `traceback` (last 8 frames, ~2KB cap) al
+    JSON line. Útil para sitios donde `exc_type` + `exc` no alcanzan para
+    diagnosticar (ej. `graph_expand.outer` con TypeError genérico). Default
+    False para mantener el costo bajo en hot paths que loggean miles/h.
+
     Sites that are genuinely best-effort (optional enrichment, shutdown
     cleanup, HTTP posts to bridges that may be down, chmod on NFS/SMB)
     intentionally keep bare `pass` — see code-review-followup.md.
@@ -1054,12 +1059,20 @@ def _silent_log(where: str, exc: BaseException) -> None:
     RAG_SILENT_LOG_ALERT_THRESHOLD env var.
     """
     try:
-        line = json.dumps({
+        record = {
             "ts": datetime.now().isoformat(timespec="seconds"),
             "where": where,
             "exc_type": type(exc).__name__,
             "exc": str(exc)[:500],
-        }, ensure_ascii=False) + "\n"
+        }
+        if with_traceback:
+            try:
+                tb_frames = traceback.format_tb(exc.__traceback__)[-8:]
+                tb_text = "".join(tb_frames)[-2000:]
+                record["traceback"] = tb_text
+            except Exception:
+                pass
+        line = json.dumps(record, ensure_ascii=False) + "\n"
         _LOG_QUEUE.put_nowait((SILENT_ERRORS_LOG_PATH, line))
     except Exception:
         pass
@@ -22316,10 +22329,29 @@ def retrieve(
             corpus = _load_corpus(col, hint_count=_col_count)
             adj = _build_graph_adj(corpus)
             pr = get_pagerank(col)
-            hit_paths = {m.get("file", "") for m in metas}
+            # Defensive guards (silent_errors.jsonl 2026-04-30: 2 hits de
+            # `graph_expand.outer` con TypeError 'NoneType' is not
+            # subscriptable). Si algún helper devuelve None bajo race con
+            # `index --reset` que recrea la collection mid-query, los usos
+            # subsequent con `corpus["..."]` o `adj.get(...)` rompen. Skip
+            # graph expand entero (mejor sin grafo que romper la query).
+            if not isinstance(corpus, dict) or not isinstance(adj, dict):
+                raise RuntimeError(
+                    f"graph_expand: corpus or adj not a dict "
+                    f"(corpus={type(corpus).__name__}, adj={type(adj).__name__}) "
+                    f"— probable race con index --reset"
+                )
+            if not isinstance(pr, dict):
+                pr = {}
+            # Defensive: filtrar metas que sean None o no-dict (caso edge
+            # de un row con metadata corrupta que se escabulló).
+            valid_metas = [m for m in metas if isinstance(m, dict)]
+            if not valid_metas:
+                raise RuntimeError("graph_expand: ningún meta valid en top-k")
+            hit_paths = {m.get("file", "") for m in valid_metas}
             # Collect neighbors with (hop_distance, -pagerank) for sorting
             neighbor_scores: dict[str, tuple[int, float]] = {}
-            for m in metas[:3]:  # expand from top-3 only
+            for m in valid_metas[:3]:  # expand from top-3 only
                 path = m.get("file", "")
                 for nb in adj.get(path, set()):
                     if nb not in hit_paths and nb not in neighbor_scores:
@@ -22373,7 +22405,11 @@ def retrieve(
                 except Exception as exc:
                     _silent_log("graph_expand.neighbor_fetch", exc)
         except Exception as exc:
-            _silent_log("graph_expand.outer", exc)
+            # with_traceback=True acá porque ya vimos 2 hits en
+            # silent_errors.jsonl 2026-04-30 con TypeError genérico —
+            # no podíamos diagnosticar sin stack trace. El opt-in cubre
+            # el caso edge sin cargar al hot path normal.
+            _silent_log("graph_expand.outer", exc, with_traceback=True)
     _timing["graph_expand_ms"] = (time.perf_counter() - _t0) * 1000
 
     # ── ε-exploration toggle ─────────────────────────────────────────────────

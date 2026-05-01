@@ -48,6 +48,49 @@ def test_silent_log_writes_record(silent_log_path, flush_log):
     lines = silent_log_path.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1
     rec = json.loads(lines[0])
+    # Default sin with_traceback no agrega `traceback` al record
+    assert "traceback" not in rec
+
+
+def test_silent_log_with_traceback_includes_stack_frames(silent_log_path, flush_log):
+    """`with_traceback=True` agrega el campo `traceback` con frames del stack.
+
+    Útil para sitios como `graph_expand.outer` donde `exc_type` + `exc` no
+    alcanzan para diagnosticar (TypeError genérico, sin contexto del
+    callsite). El default sigue siendo False para no inflar los logs en
+    hot paths.
+    """
+    def inner():
+        raise TypeError("'NoneType' object is not subscriptable")
+
+    try:
+        inner()
+    except TypeError as exc:
+        rag._silent_log("graph_expand.outer", exc, with_traceback=True)
+
+    rag._LOG_QUEUE.join()
+    lines = silent_log_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    rec = json.loads(lines[0])
+    assert rec["where"] == "graph_expand.outer"
+    assert rec["exc_type"] == "TypeError"
+    # Traceback debería mencionar la función inner() del stack
+    assert "traceback" in rec
+    assert "inner" in rec["traceback"]
+    # Cap a 2KB
+    assert len(rec["traceback"]) <= 2000
+
+
+def test_silent_log_record_has_default_fields(silent_log_path, flush_log):
+    """Backward compat: el shape default sigue siendo where + exc_type + exc + ts."""
+    try:
+        raise ValueError("boom")
+    except ValueError as exc:
+        rag._silent_log("test_where", exc)
+
+    rag._LOG_QUEUE.join()
+    lines = silent_log_path.read_text(encoding="utf-8").splitlines()
+    rec = json.loads(lines[0])
     assert rec["where"] == "test_where"
     assert rec["exc_type"] == "ValueError"
     assert rec["exc"] == "boom"

@@ -214,40 +214,66 @@ def test_serve_plist_port_7832_and_keepalive():
 def test_serve_plist_warm_model_env():
     """Serve exists to keep models warm — without these env vars the
     whole point of the service evaporates (reranker unloads after 15min
-    idle, bge-m3 pays HTTP round-trip, ollama drops the chat model)."""
+    idle, bge-m3 pays HTTP round-trip, ollama drops the chat model).
+
+    Nota 2026-04-30: rolleamos `OLLAMA_KEEP_ALIVE -1 → 20m` (commit
+    `4f7e41f`). Razón: con `-1` + `OLLAMA_MAX_LOADED_MODELS=3` los 3
+    modelos pinned forever saturaban unified memory de 36 GB, MPS
+    swappeaba y tokens/s caían 10×. Con `20m` el secundario se descarga
+    si idle, el principal se mantiene warm porque siempre se usa.
+    Mejora 4-10× end-to-end (RagNet 41-90s → 14-23s).
+    """
     d = _parse_plist(rag_module._serve_plist(RAG_BIN))
     env = d.get("EnvironmentVariables", {})
-    assert env.get("OLLAMA_KEEP_ALIVE") == "-1"
+    assert env.get("OLLAMA_KEEP_ALIVE") == "20m"
+    assert env.get("OLLAMA_MAX_LOADED_MODELS") == "2"
     assert env.get("RAG_RERANKER_NEVER_UNLOAD") == "1"
     assert env.get("RAG_LOCAL_EMBED") == "1"
 
 
 def test_services_spec_total_count():
     specs = rag_module._services_spec(RAG_BIN)
-    # 22 base servicios + 4 ingesters cross-source
-    # (WhatsApp/Gmail/Reminders/Calendar). Calendar se skipea al install
-    # si ~/.calendar-mcp/credentials.json no existe (gate en `setup()`),
-    # pero el plist siempre está en el spec.
-    # Base roster: watch, serve, web (agregado 2026-04-22 — pre-fix estaba
-    # instalado manualmente fuera de setup), digest, morning, today,
-    # wake-up (agregado 2026-04-24 — orquestador nocturno 04:00),
-    # emergent, patterns, archive, wa-tasks, reminder-wa-push (cron 5min
-    # para disparar Apple Reminders via WhatsApp bridge antes de la due
-    # — ver docstring en _services_spec), wa-scheduled-send (2026-04-25 —
-    # worker de mensajes WA programados, idempotente vía status enum),
-    # auto-harvest (2026-04-23 — LLM-as-judge nocturno que labelea
-    # queries low-conf sin feedback), implicit-feedback (2026-04-26 —
-    # Sprint 1 del cierre del loop de auto-aprendizaje), online-tune,
-    # calibrate (2026-04-23 — per-source isotonic regression re-entrenada
-    # con feedback), maintenance (2026-04-21 hardening), consolidate,
-    # vault-cleanup (2026-04-27 — purge diario de carpetas transitorias
-    # bajo 99-AI/, mueve a .trash/ del vault), anticipate (2026-04-24 —
-    # game-changer push proactivo cada 10 min), serve-watchdog
-    # (2026-04-27 — HTTP healthcheck del web server cada 60s),
-    # active-learning-nudge (2026-04-29), brief-auto-tune (2026-04-29
-    # — Sunday 03:00 shift de morning/today/digest si el user mutea
-    # consistentemente). Total: 24 base + 4 ingesters cross-source = 28.
-    assert len(specs) == 28
+    # Roster actualizado al 2026-05-01. Drift desde el last assert
+    # (28 → 35): se sumaron 7 plists post-2026-04-29 que la nota previa
+    # no contemplaba.
+    #
+    # Base infra (24):
+    #   watch, serve, web (agregado 2026-04-22 — pre-fix estaba instalado
+    #   manualmente fuera de setup), digest, morning, today, wake-up
+    #   (2026-04-24 — orquestador nocturno 04:00), emergent, patterns,
+    #   archive, wa-tasks, reminder-wa-push (cron 5min para disparar
+    #   Apple Reminders via WhatsApp bridge antes de la due —
+    #   ver docstring en _services_spec), wa-scheduled-send (2026-04-25
+    #   — worker de mensajes WA programados, idempotente vía status enum),
+    #   auto-harvest (2026-04-23 — LLM-as-judge nocturno que labelea
+    #   queries low-conf sin feedback), active-learning-nudge (2026-04-29),
+    #   implicit-feedback (2026-04-26 — Sprint 1 del cierre del loop de
+    #   auto-aprendizaje), online-tune, calibrate (2026-04-23 —
+    #   per-source isotonic regression re-entrenada con feedback),
+    #   maintenance (2026-04-21 hardening), consolidate, vault-cleanup
+    #   (2026-04-27), anticipate (2026-04-24), serve-watchdog
+    #   (2026-04-27 — HTTP healthcheck del web server cada 60s),
+    #   brief-auto-tune (2026-04-29 — Sunday 03:00 shift de morning/
+    #   today/digest si el user mutea consistentemente).
+    #
+    # Cross-source ingesters (7):
+    #   ingest-whatsapp, ingest-gmail, ingest-reminders, ingest-calendar
+    #   (4 originales — calendar se skipea al install si ~/.calendar-mcp/
+    #   credentials.json no existe), ingest-calls (2026-04-30 — Apple
+    #   CallHistory), ingest-safari (2026-04-30 — bookmarks + history),
+    #   ingest-drive (2026-04-30 — Google Drive via OAuth).
+    #
+    # Helpers nuevos (4):
+    #   ingest-pillow (2026-04-30 — sleep tracker daily 09:30),
+    #   mood-poll (2026-04-30 — opt-in score diario cada 30min,
+    #   exit-early si state file mood_enabled missing), routing-rules
+    #   (2026-04-30 — detector de patrones cada 5min con --auto-promote
+    #   post 2026-05-01), whisper-vocab (2026-04-30 — extractor de
+    #   vocab nightly 03:15 con cmd `whisper vocab refresh` post
+    #   2026-05-01).
+    #
+    # Total: 24 base + 7 ingesters + 4 helpers = 35.
+    assert len(specs) == 35
 
 
 def test_services_spec_includes_maintenance():
@@ -367,10 +393,14 @@ def test_ingester_plist_valid_plist(fn_name, expected_source, expected_interval)
     #    "qué tengo esta semana" con data stale.
     assert d["RunAtLoad"] is True
 
-    # 6. OLLAMA_KEEP_ALIVE=-1 en env — el ingester emite un batch de embeds
-    #    con bge-m3; sin esto, cada corrida paga cold-load.
+    # 6. OLLAMA_KEEP_ALIVE=20m en env — el ingester emite un batch de embeds
+    #    con bge-m3; sin un keep-alive, cada corrida paga cold-load.
+    #    Pre-2026-04-30 era `-1` (pin forever) pero saturaba unified
+    #    memory junto con qwen2.5:7b + qwen2.5:3b. Rolleamos a 20m + cap
+    #    `MAX_LOADED_MODELS=2`. Detalle en commit `4f7e41f` y en el
+    #    docstring del módulo de configuración keep-alive.
     env = d.get("EnvironmentVariables", {})
-    assert env.get("OLLAMA_KEEP_ALIVE") == "-1"
+    assert env.get("OLLAMA_KEEP_ALIVE") == "20m"
 
 
 def test_ingester_plists_log_paths_distinct():

@@ -144,8 +144,16 @@ def test_web_plist_has_rag_reranker_never_unload():
 
 
 def test_web_plist_has_ollama_keep_alive():
+    """Web plist pinns `OLLAMA_KEEP_ALIVE=20m` (post-rollback 2026-04-30,
+    commit `4f7e41f`). Pre-rollback era `-1` (pin forever) pero con 3
+    modelos pinned + 36 GB unified memory MPS swappeaba y tokens/s se
+    caían 10×. `20m` deja warm el principal (qwen2.5:7b se usa todo el
+    rato así que nunca expira) y descarga los secundarios cuando idle.
+    """
     d = _parse(rag_module._web_plist(RAG_BIN))
-    assert d["EnvironmentVariables"].get("OLLAMA_KEEP_ALIVE") == "-1"
+    assert d["EnvironmentVariables"].get("OLLAMA_KEEP_ALIVE") == "20m"
+    # Cap simultáneo de modelos cargados en VRAM (rolleamos de 3 a 2).
+    assert d["EnvironmentVariables"].get("OLLAMA_MAX_LOADED_MODELS") == "2"
 
 
 def test_web_plist_keepalive_runatload():

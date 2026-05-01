@@ -20484,16 +20484,25 @@ def reformulate_query(
     # HTTP 503 "server busy"). Causas:
     #   - Timeout: cold-load de qwen2.5:3b bajo contención (chat+reranker
     #     pineados en MPS, el helper necesita >30s para cargar). Fix:
-    #     1 retry con 3s de backoff para dar tiempo al cold-load.
+    #     retry con backoff exponencial.
     #   - 503: OLLAMA_MAX_LOADED_MODELS=2 saturado, Ollama rechaza. Fix:
     #     mismo retry (los 503 se resuelven en <1s al liberar slot).
-    # El retry es conservador: solo 1 intento, no loop — si el segundo
-    # falla también, se degrada a la pregunta original como antes.
+    #
+    # 2026-05-01: con solo 1 retry + backoff fijo 3s, un burst de 32×503
+    # ocurrió cuando online-tune corrió catchup (Mac dormida, despertó
+    # 07:00 y disparó nightly + eval) — el eval llama reformulate por
+    # cada query (60 queries) y 503-rebotó masivamente. Fix: subimos a
+    # 3 retries con backoff exponencial (3s → 6s → 12s) — total
+    # worst-case wait 21s, suficiente para que el cold-load termine y
+    # se libere un slot en la queue. El cap acumulado de 21s es seguro
+    # porque el caller (retrieve()) ya tiene timeout total de 60s y
+    # degrada a la pregunta original si todo falla.
     _last_exc: Exception | None = None
-    for _attempt in range(2):  # intento 0 (normal) + intento 1 (retry)
-        if _attempt > 0:
+    _backoffs = (0.0, 3.0, 6.0, 12.0)  # 3 retries + intento inicial
+    for _attempt, _wait in enumerate(_backoffs):
+        if _wait > 0:
             import time as _time
-            _time.sleep(3.0)  # backoff fijo: tiempo suficiente para cold-load
+            _time.sleep(_wait)
         try:
             resp = _helper_client().chat(
                 model=HELPER_MODEL,
@@ -20505,7 +20514,7 @@ def reformulate_query(
             return _postprocess_reformulation(question, raw, history)
         except Exception as exc:
             _last_exc = exc
-    # Ambos intentos fallaron — loguear y degradar
+    # Todos los intentos fallaron — loguear y degradar.
     try:
         _silent_log("reformulate_query_failed", _last_exc)
     except Exception:

@@ -123,28 +123,48 @@ def test_retrieval_health_healthy_when_metrics_normal(tmp_path):
     """top_score 0.7, retrieve 800ms, cache hit 65% → healthy.
 
     Metricas todas dentro de baseline → no debe disparar ninguna regla.
-    Sembramos cache mix (13 hits / 7 miss = ~65%) sobre cmd='web' para
-    pasar el threshold de muestra mínima (≥20 web queries con
-    cache_probe).
+    Sembramos cache mix (13 hits + 7 miss = 65% hit rate sobre 20
+    queries elegibles) + 5 skipped (history) que NO entran al rate
+    pero que el script reporta separado.
+
+    2026-05-01: schema del cache_probe cambió de `extra_json.cache_hit`
+    (bool) a `extra_json.cache_probe.result` (str: 'hit'/'miss'/'skipped')
+    para soportar el contador de queries skipped. El audit ahora
+    excluye las skipped del denominador (por design — esas queries
+    nunca fueron candidatas al cache).
     """
     conn, _ = _seed_telemetry_db(tmp_path)
-    # 20 web queries con cache_probe (13 hits + 7 miss = 65% hit rate)
+    # 20 web queries elegibles (13 hits + 7 miss = 65% hit rate)
     for i in range(20):
-        cache_hit = "true" if i < 13 else "false"
+        result_str = "hit" if i < 13 else "miss"
         _insert_query(
             conn,
             cmd="web",
             top_score=0.7,
             t_retrieve=0.8,
-            extra_json='{"cache_hit": ' + cache_hit + '}',
+            extra_json=(
+                '{"cache_probe": {"result": "' + result_str + '"}}'
+            ),
+        )
+    # 5 web queries `skipped` (NO suman al hit rate — el caller traía
+    # history o multi-vault, fuera del cache layer por design).
+    for _ in range(5):
+        _insert_query(
+            conn,
+            cmd="web",
+            top_score=0.7,
+            t_retrieve=0.8,
+            extra_json='{"cache_probe": {"result": "skipped"}}',
         )
     # Y 5 queries más (cmd='query') para darle señal al p95 / median
     for _ in range(5):
         _insert_query(conn, cmd="query", top_score=0.7, t_retrieve=0.8)
     result = check_retrieval_health(conn, days=7)
     assert result["status"] == "healthy", f"issues: {result['issues']}"
-    assert result["details"]["queries_count"] == 25
+    assert result["details"]["queries_count"] == 30
     assert result["details"]["cache_hit_rate_pct"] == 65.0
+    assert result["details"]["cache_eligible_count"] == 20
+    assert result["details"]["cache_skipped_count"] == 5
 
 
 def test_retrieval_health_degraded_when_p95_high(tmp_path):

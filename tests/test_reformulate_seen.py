@@ -159,8 +159,14 @@ def test_reformulate_retries_once_on_503(monkeypatch):
     assert calls["n"] == 2
 
 
-def test_reformulate_degrades_after_two_failures(monkeypatch):
-    """Ambos intentos fallan → devuelve la pregunta original sin crashear."""
+def test_reformulate_degrades_after_all_failures(monkeypatch):
+    """Todos los intentos fallan → devuelve la pregunta original sin crashear.
+
+    2026-05-01: subimos de 2 a 4 intentos (1 + 3 retries con backoff
+    exponencial 3s/6s/12s) tras un burst de 32×503 cuando online-tune
+    catchup disparó el eval saturando Ollama. Total worst-case wait
+    21s, dentro del cap de 60s del retrieve() caller.
+    """
     import rag
 
     calls = {"n": 0}
@@ -181,8 +187,38 @@ def test_reformulate_degrades_after_two_failures(monkeypatch):
         result = rag.reformulate_query("pregunta original", history)
 
     assert result == "pregunta original"
-    assert calls["n"] == 2, "exactamente 2 intentos (no loop infinito)"
-    assert logged["exc"] is not None, "debe loguear la excepción del segundo intento"
+    # 1 intento inicial + 3 retries con backoff exponencial = 4 calls
+    assert calls["n"] == 4, "exactamente 4 intentos (no loop infinito)"
+    assert logged["exc"] is not None, "debe loguear la excepción del último intento"
+
+
+def test_reformulate_succeeds_on_third_retry(monkeypatch):
+    """Si el 3er retry pega → la query reformulada se devuelve.
+
+    Cubre el caso donde Ollama tarda más en liberar slot — los primeros
+    3 intentos pegan 503 pero el 4º ya tiene slot libre. El backoff
+    exponencial (3+6+12=21s acumulado) suele alcanzar.
+    """
+    import rag
+
+    calls = {"n": 0}
+
+    def _fake_chat(model, messages, **kwargs):
+        calls["n"] += 1
+        if calls["n"] < 4:
+            raise Exception("server busy, please try again. maximum pending requests exceeded (status code: 503)")
+        return _make_fake_resp("reformulada ok tras 3 retries")
+
+    monkeypatch.setattr(rag.ollama, "chat", _fake_chat)
+    monkeypatch.setattr(rag, "_postprocess_reformulation",
+                        lambda q, raw, hist: raw)
+    import unittest.mock as mock
+    with mock.patch("time.sleep"):
+        history = [{"role": "user", "content": "algo"}]
+        result = rag.reformulate_query("y?", history)
+
+    assert result == "reformulada ok tras 3 retries"
+    assert calls["n"] == 4
 
 
 def test_reformulate_no_retry_without_history(monkeypatch):

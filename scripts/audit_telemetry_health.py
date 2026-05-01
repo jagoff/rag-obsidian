@@ -460,19 +460,32 @@ def check_retrieval_health(conn: sqlite3.Connection, days: int = 7) -> dict:
     # Solo evaluamos la regla si tenemos una muestra mínima — sino los
     # primeros días post-deploy mostrarían "cache hit rate 0% degraded"
     # cuando en realidad recién empezó a poblarse.
+    #
+    # 2026-05-01: excluimos del denominador las queries `skipped`
+    # (con history, multi-vault, forced/propose intent — todas
+    # legítimamente NO elegibles para cache). Pre-fix el rate quedaba
+    # en 0% en todo deploy donde el chat es multi-turn (caso WhatsApp
+    # listener: ~90% de queries tienen history). El nuevo numerator
+    # son los hits sobre queries que SÍ pasaron por el cache layer
+    # (result IN ('hit', 'miss')).
     cache_rows = conn.execute(
-        "SELECT json_extract(extra_json, '$.cache_hit') "
+        "SELECT json_extract(extra_json, '$.cache_probe.result') "
         "FROM rag_queries "
         "WHERE ts >= ? AND cmd = 'web' "
-        "  AND json_extract(extra_json, '$.cache_hit') IS NOT NULL",
+        "  AND json_extract(extra_json, '$.cache_probe.result') IS NOT NULL",
         (cutoff_iso,),
     ).fetchall()
-    cache_total = len(cache_rows)
-    cache_hits = sum(1 for r in cache_rows if r[0])
+    cache_total_eligible = sum(1 for r in cache_rows if r[0] in ("hit", "miss"))
+    cache_total_skipped = sum(1 for r in cache_rows if r[0] == "skipped")
+    cache_hits = sum(1 for r in cache_rows if r[0] == "hit")
     cache_hit_rate_pct: float | None = None
-    if cache_total > 0:
-        cache_hit_rate_pct = round(100.0 * cache_hits / cache_total, 1)
+    if cache_total_eligible > 0:
+        cache_hit_rate_pct = round(100.0 * cache_hits / cache_total_eligible, 1)
         out["details"]["cache_hit_rate_pct"] = cache_hit_rate_pct
+        out["details"]["cache_eligible_count"] = cache_total_eligible
+        out["details"]["cache_skipped_count"] = cache_total_skipped
+    # cache_total se mantiene para back-compat de la regla de issues.
+    cache_total = cache_total_eligible
 
     # 4) p95 t_retrieve (en ms). Nearest-rank percentile — para muestras
     # chicas no usamos interpolación (sería sobreingeniería). Convertimos
@@ -530,14 +543,21 @@ def check_retrieval_health(conn: sqlite3.Connection, days: int = 7) -> dict:
     P95_BASELINE_MS = 1500.0
     P95_THRESHOLD_MS = P95_BASELINE_MS * 1.3  # 1950ms
 
+    # Cache hit rate threshold: bajo a 10% (sobre queries elegibles).
+    # 50% era irrealista — la mayoría de queries semánticas son únicas
+    # (paráfrasis del user nunca pegan exactamente). 10% sobre queries
+    # elegibles indica al menos algo de re-uso. Si el cache quedó
+    # inservible (queries todas únicas), 0% por mucho tiempo dispara
+    # alerta — pero el threshold real lo debería ajustar el operador
+    # mirando varios días.
     if (
         cache_hit_rate_pct is not None
-        and cache_total >= 20
-        and cache_hit_rate_pct < 50.0
+        and cache_total >= 50
+        and cache_hit_rate_pct < 10.0
     ):
         issues.append(
-            f"cache hit rate {cache_hit_rate_pct:.1f}% < 50% threshold "
-            f"(n={cache_total})"
+            f"cache hit rate {cache_hit_rate_pct:.1f}% < 10% threshold "
+            f"(n_eligible={cache_total}, n_skipped={cache_total_skipped})"
         )
     if median_top_score is not None and median_top_score < 0.4:
         issues.append(

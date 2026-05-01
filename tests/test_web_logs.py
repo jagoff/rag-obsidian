@@ -1019,3 +1019,299 @@ class TestRankingsPayload:
 
 def test_diagnose_modal_css_exists():
     assert (_STATIC_DIR / "diagnose-modal.css").is_file()
+
+
+# ── Latency extractor + percentile (2026-05-01 v2) ────────────────────
+
+class TestExtractLatencyMs:
+    """`_extract_latency_ms` cubre los 4 patrones más frecuentes en los
+    logs reales del stack: total=Xms, ttft_ms=X, duration_ms=X, warm-up
+    OK (Xms,...). Cualquier match devuelve int de ms; sin match → None."""
+
+    def test_total_ms_pattern(self):
+        assert _server._extract_latency_ms(
+            "[chat-timing] model=qwen2.5:7b retrieve=150ms total=51755ms"
+        ) == 51755
+
+    def test_ttft_ms_pattern(self):
+        assert _server._extract_latency_ms(
+            "[chat-stream-error] phase=synthesis ttft_ms=90004 query=hola"
+        ) == 90004
+
+    def test_duration_ms_pattern(self):
+        assert _server._extract_latency_ms(
+            "[whisper] mode=server duration_ms=48644 bytes=8190"
+        ) == 48644
+
+    def test_warmup_ms_pattern(self):
+        assert _server._extract_latency_ms(
+            "[whisper] warm-up OK (621ms, source=real:audio)"
+        ) == 621
+
+    def test_no_match_returns_none(self):
+        assert _server._extract_latency_ms("just some random log line") is None
+        assert _server._extract_latency_ms("") is None
+
+    def test_total_without_ms_suffix_does_not_match(self):
+        """`total=168` en `[warmup] cache total=168` es count, NO duración.
+        El regex requiere el sufijo `ms` literal para evitar este FP."""
+        assert _server._extract_latency_ms(
+            "[warmup] followup_aging cache pre-warmed in 898.8s (total=168)"
+        ) is None
+
+    def test_first_match_in_line_wins(self):
+        """`re.search` con disjunción agarra el match más a la izquierda
+        de la LÍNEA, no el primero de la alternativa. En la práctica
+        eso da `ttft_ms` cuando aparece antes que `total=`. Aceptable —
+        cualquiera de las dos métricas es útil para rankear."""
+        result = _server._extract_latency_ms(
+            "[chat-timing] ttft_ms=200 total=300ms"
+        )
+        # ttft_ms aparece antes en la línea → ese match gana.
+        assert result == 200
+        # Cuando total= viene primero, gana total=:
+        result2 = _server._extract_latency_ms(
+            "[chat-timing] total=300ms ttft_ms=200"
+        )
+        assert result2 == 300
+
+
+class TestPercentileInt:
+    def test_p50_simple(self):
+        # mediana de [1,2,3,4,5] = 3, pero nearest-rank con n=5 da idx=2 → val=3
+        assert _server._percentile_int([1, 2, 3, 4, 5], 50) in (2, 3)
+
+    def test_p99_with_outlier(self):
+        vals = [1, 2, 3, 4, 100]
+        assert _server._percentile_int(vals, 99) == 100  # el outlier
+
+    def test_p99_with_n_100_random(self):
+        assert _server._percentile_int(list(range(1, 101)), 99) in (98, 99)
+
+    def test_empty_returns_zero(self):
+        assert _server._percentile_int([], 50) == 0
+        assert _server._percentile_int([], 99) == 0
+
+    def test_single_value(self):
+        assert _server._percentile_int([42], 99) == 42
+        assert _server._percentile_int([42], 50) == 42
+
+
+# ── Silent services + candidate paths (2026-05-01 v2) ─────────────────
+
+class TestCandidateLogPathsForLabel:
+    """`_candidate_log_paths_for_label` mapea label launchd → archivos de
+    log esperados. La convención del repo es:
+      - `com.fer.obsidian-rag-X` → `X.log` y `X.error.log`.
+      - `com.fer.whatsapp-Y` → `Y.log` y `Y.error.log`.
+    """
+
+    def test_obsidian_rag_prefix_strip(self):
+        log_dir = Path.home() / ".local/share/obsidian-rag"
+        if not log_dir.is_dir():
+            pytest.skip("no obsidian-rag log dir on this machine")
+        # web.log existe en el sistema vivo del user.
+        if not (log_dir / "web.log").is_file():
+            pytest.skip("no web.log on this machine")
+        paths = _server._candidate_log_paths_for_label("com.fer.obsidian-rag-web")
+        names = {p.name for p in paths}
+        assert "web.log" in names
+
+    def test_whatsapp_prefix_strip(self):
+        log_dir = Path.home() / ".local/share/whatsapp-listener"
+        if not log_dir.is_dir():
+            pytest.skip("no whatsapp-listener log dir on this machine")
+        if not (log_dir / "listener.log").is_file():
+            pytest.skip("no listener.log on this machine")
+        paths = _server._candidate_log_paths_for_label("com.fer.whatsapp-listener")
+        names = {p.name for p in paths}
+        assert "listener.log" in names
+
+    def test_unknown_label_returns_empty_or_fallback(self):
+        # Label que no existe → no debería tirar excepción, devolver lista
+        # (vacía o con fallbacks que no existen).
+        paths = _server._candidate_log_paths_for_label(
+            "com.fer.nonexistent-label-xyz123"
+        )
+        assert isinstance(paths, list)
+
+
+class TestBuildSilentServices:
+    """`_build_silent_services` cruza `_STATUS_CATALOG` + `_launchctl_print_fields`
+    + mtime de logs. Tests con monkey-patching de las dependencias I/O para
+    no depender del estado real del sistema."""
+
+    def test_skips_non_daemon_kinds(self, monkeypatch):
+        """Solo daemons + scheduled. Los kind=ollama / rag_db / vault del
+        catálogo son chequeos de estado, no servicios silenciables."""
+        fake_catalog = [
+            {"kind": "ollama", "id": "ollama"},
+            {"kind": "rag_db", "id": "rag-db"},
+        ]
+        monkeypatch.setattr(_server, "_STATUS_CATALOG", fake_catalog)
+        out = _server._build_silent_services(top_n=5)
+        assert out == []
+
+    def test_returns_silent_daemon(self, monkeypatch):
+        """Daemon loaded sin actividad reciente → silent."""
+        old_mtime = 9999999.0  # placeholder; el _now lo usa para diff
+        fake_catalog = [
+            {"kind": "daemon", "target": "com.fer.test-daemon", "name": "Test daemon"},
+        ]
+        monkeypatch.setattr(_server, "_STATUS_CATALOG", fake_catalog)
+        # launchctl_print devuelve algo (loaded=True)
+        monkeypatch.setattr(_server, "_launchctl_print_fields",
+                            lambda label, timeout=3.0: {"state": "running"})
+        # Simular log con mtime de hace 2h (>1h threshold de daemon)
+        class FakePath:
+            def __init__(self, m): self._m = m
+            def is_file(self): return True
+            def stat(self):
+                class S: pass
+                s = S()
+                s.st_mtime = self._m
+                return s
+        fake_path = FakePath(1000.0)  # epoch arbitrario
+        monkeypatch.setattr(_server, "_candidate_log_paths_for_label",
+                            lambda label: [fake_path])
+        # _now = 1000 + 2h → silence = 7200s > threshold 3600
+        out = _server._build_silent_services(top_n=5, _now=1000.0 + 7200)
+        assert len(out) == 1
+        assert out[0]["service"] == "Test daemon"
+        assert out[0]["kind"] == "daemon"
+        assert out[0]["silence_seconds"] == 7200
+
+    def test_skips_recent_daemon(self, monkeypatch):
+        """Daemon con log fresco → NO silent."""
+        fake_catalog = [
+            {"kind": "daemon", "target": "com.fer.fresh-daemon", "name": "Fresh"},
+        ]
+        monkeypatch.setattr(_server, "_STATUS_CATALOG", fake_catalog)
+        monkeypatch.setattr(_server, "_launchctl_print_fields",
+                            lambda label, timeout=3.0: {"state": "running"})
+        class FakePath:
+            def __init__(self, m): self._m = m
+            def is_file(self): return True
+            def stat(self):
+                class S: pass
+                s = S()
+                s.st_mtime = self._m
+                return s
+        fake_path = FakePath(1000.0)
+        monkeypatch.setattr(_server, "_candidate_log_paths_for_label",
+                            lambda label: [fake_path])
+        # silence = 30s, < threshold 3600 → no silent
+        out = _server._build_silent_services(top_n=5, _now=1000.0 + 30)
+        assert out == []
+
+    def test_skips_unloaded_daemon(self, monkeypatch):
+        """Daemon NO loaded en launchd → no aparece (es disabled, no silent)."""
+        fake_catalog = [
+            {"kind": "daemon", "target": "com.fer.disabled", "name": "Disabled"},
+        ]
+        monkeypatch.setattr(_server, "_STATUS_CATALOG", fake_catalog)
+        monkeypatch.setattr(_server, "_launchctl_print_fields",
+                            lambda label, timeout=3.0: None)  # no loaded
+        out = _server._build_silent_services(top_n=5)
+        assert out == []
+
+    def test_scheduled_threshold_30h(self, monkeypatch):
+        """Scheduled jobs tienen threshold de 30h (no 1h)."""
+        fake_catalog = [
+            {"kind": "scheduled", "target": "com.fer.daily", "name": "Daily"},
+        ]
+        monkeypatch.setattr(_server, "_STATUS_CATALOG", fake_catalog)
+        monkeypatch.setattr(_server, "_launchctl_print_fields",
+                            lambda label, timeout=3.0: {"runs": "5"})
+        class FakePath:
+            def __init__(self, m): self._m = m
+            def is_file(self): return True
+            def stat(self):
+                class S: pass
+                s = S()
+                s.st_mtime = self._m
+                return s
+        fake_path = FakePath(1000.0)
+        monkeypatch.setattr(_server, "_candidate_log_paths_for_label",
+                            lambda label: [fake_path])
+        # silence = 5h, < 30h → NO silent (scheduled tiene threshold más laxo)
+        out_5h = _server._build_silent_services(top_n=5, _now=1000.0 + 5 * 3600)
+        assert out_5h == []
+        # silence = 35h, > 30h → silent
+        out_35h = _server._build_silent_services(top_n=5, _now=1000.0 + 35 * 3600)
+        assert len(out_35h) == 1
+        assert out_35h[0]["kind"] == "scheduled"
+
+
+# ── Rankings v2: latency_outliers, silent_services, growth_rate, new_error_patterns
+
+class TestRankingsV2Endpoint:
+    """Smoke contra el endpoint en vivo. Solo valida la PRESENCIA de los 4
+    rankings nuevos en el response — el contenido depende del estado del
+    sistema y no es estable test-a-test."""
+
+    def _has_log_dirs(self) -> bool:
+        return any(d.is_dir() for d in _server._LOG_DIRS)
+
+    def test_v2_rankings_present(self):
+        if not self._has_log_dirs():
+            pytest.skip("no log dirs en este sistema")
+        resp = _client.get("/api/logs/rankings?since_seconds=86400&top_n=5&nocache=1")
+        assert resp.status_code == 200
+        d = resp.json()
+        rankings = d["rankings"]
+        # Presencia de los 5 originales:
+        for k in ("services_by_errors", "services_by_warns", "error_patterns",
+                  "recent_errors", "noisy_logs"):
+            assert k in rankings
+        # Presencia de los 4 nuevos:
+        for k in ("latency_outliers", "silent_services", "growth_rate", "new_error_patterns"):
+            assert k in rankings
+            assert isinstance(rankings[k], list)
+
+    def test_has_regression_window_flag(self):
+        if not self._has_log_dirs():
+            pytest.skip("no log dirs en este sistema")
+        # window=1h NO tiene base de comparación → flag false
+        d1 = _client.get("/api/logs/rankings?since_seconds=3600&nocache=1").json()
+        assert d1["totals"]["has_regression_window"] is False
+        assert d1["rankings"]["new_error_patterns"] == []
+        # window=24h sí
+        d24 = _client.get("/api/logs/rankings?since_seconds=86400&nocache=1").json()
+        assert d24["totals"]["has_regression_window"] is True
+
+    def test_latency_outliers_shape(self):
+        if not self._has_log_dirs():
+            pytest.skip("no log dirs en este sistema")
+        out = _server._build_rankings_payload(window_s=7 * 86400, top_n=10)
+        for it in out["rankings"]["latency_outliers"]:
+            assert "service" in it
+            assert "p50_ms" in it
+            assert "p99_ms" in it
+            assert "max_ms" in it
+            assert "n" in it
+            assert it["n"] >= 3  # mínimo 3 samples
+            assert it["max_ms"] >= it["p99_ms"] >= it["p50_ms"] >= 0
+
+    def test_growth_rate_shape(self):
+        if not self._has_log_dirs():
+            pytest.skip("no log dirs en este sistema")
+        out = _server._build_rankings_payload(window_s=86400, top_n=5)
+        for it in out["rankings"]["growth_rate"]:
+            assert "service" in it
+            assert "bytes_per_min" in it
+            assert "lines_per_min" in it
+            assert "total_bytes_in_window" in it
+            assert it["bytes_per_min"] >= 0
+
+    def test_silent_services_shape(self):
+        if not self._has_log_dirs():
+            pytest.skip("no log dirs en este sistema")
+        out = _server._build_rankings_payload(window_s=86400, top_n=5)
+        for it in out["rankings"]["silent_services"]:
+            assert "service" in it
+            assert "label" in it
+            assert "kind" in it
+            assert it["kind"] in ("daemon", "scheduled", "never_ran")
+            # silence_seconds puede ser None si kind=never_ran.
+            assert "silence_seconds" in it

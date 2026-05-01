@@ -367,8 +367,21 @@
       color: var(--yellow);
       background: color-mix(in srgb, var(--yellow) 18%, transparent);
     }
-    .ranking-card[data-card="noisy_logs"] .ranking-count {
+    .ranking-card[data-card="noisy_logs"] .ranking-count,
+    .ranking-card[data-card="growth_rate"] .ranking-count {
       color: var(--text-dim);
+    }
+    .ranking-card[data-card="latency_outliers"] .ranking-count {
+      color: var(--yellow);
+      background: color-mix(in srgb, var(--yellow) 18%, transparent);
+    }
+    .ranking-card[data-card="silent_services"] .ranking-count {
+      color: var(--text-faint);
+      background: color-mix(in srgb, var(--text-faint) 14%, transparent);
+    }
+    .ranking-card[data-card="new_error_patterns"] .ranking-count {
+      color: var(--red);
+      background: color-mix(in srgb, var(--red) 22%, transparent);
     }
     .ranking-empty {
       color: var(--text-faint);
@@ -1395,6 +1408,30 @@
               <li class="ranking-empty">cargando…</li>
             </ol>
           </div>
+          <div class="ranking-card" data-card="latency_outliers">
+            <h3>🐌 services más lentos (p99)</h3>
+            <ol class="ranking-list" id="rk-latency-outliers">
+              <li class="ranking-empty">cargando…</li>
+            </ol>
+          </div>
+          <div class="ranking-card" data-card="silent_services">
+            <h3>🔕 services silenciosos</h3>
+            <ol class="ranking-list" id="rk-silent-services">
+              <li class="ranking-empty">cargando…</li>
+            </ol>
+          </div>
+          <div class="ranking-card" data-card="growth_rate">
+            <h3>📈 logs que más crecen (bytes/min)</h3>
+            <ol class="ranking-list" id="rk-growth-rate">
+              <li class="ranking-empty">cargando…</li>
+            </ol>
+          </div>
+          <div class="ranking-card" data-card="new_error_patterns">
+            <h3>🆕 errores nuevos (regression)</h3>
+            <ol class="ranking-list" id="rk-new-error-patterns">
+              <li class="ranking-empty">cargando…</li>
+            </ol>
+          </div>
         </div>
       </section>
 
@@ -1520,6 +1557,6 @@
 
   <link rel="stylesheet" href="/static/diagnose-modal.css?v=2026-04-29-recovery">
   <script src="/static/diagnose-modal.js?v=2026-04-29-recovery" defer></script>
-  <script src="/static/logs.js?v=2026-05-01-rankings" defer></script>
+  <script src="/static/logs.js?v=2026-05-01-rankings-v2" defer></script>
 </body>
 </html>

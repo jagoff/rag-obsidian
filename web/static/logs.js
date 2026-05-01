@@ -383,6 +383,139 @@
         }));
       }
     }
+
+    // Card 6: latency outliers (p99 por service). El backend reporta
+    // p50 + p99 + max + n; mostramos `p99ms` como count visible y `p50 / n` en sub.
+    const c6 = $("rk-latency-outliers");
+    c6.replaceChildren();
+    const list6 = r.latency_outliers || [];
+    if (list6.length === 0) {
+      c6.appendChild(emptyRankingItem("no hay datos de latency en esta ventana"));
+    } else {
+      for (const it of list6) {
+        const sub = `p50 ${formatMs(it.p50_ms)} · max ${formatMs(it.max_ms)} · n=${it.n}`;
+        c6.appendChild(rankingItem({
+          label: it.service,
+          sub,
+          count: formatMs(it.p99_ms),
+          onClick: () => navigateToService(it.service),
+          ariaLabel: `${it.service}: p99 ${formatMs(it.p99_ms)}, ${it.n} muestras.`,
+          title: `${it.service} · p99=${formatMs(it.p99_ms)} · click para abrir el log`,
+        }));
+      }
+    }
+
+    // Card 7: silent services. Items son services con kind=daemon|scheduled
+    // que están loaded en launchd pero llevan tiempo sin escribir logs.
+    // El "count" visible es el tiempo de silencio formateado.
+    const c7 = $("rk-silent-services");
+    c7.replaceChildren();
+    const list7 = r.silent_services || [];
+    if (list7.length === 0) {
+      c7.appendChild(emptyRankingItem("ningún service silencioso 🎉"));
+    } else {
+      for (const it of list7) {
+        const isNeverRan = it.kind === "never_ran";
+        const silenceLabel = isNeverRan
+          ? "nunca corrió"
+          : fmtDuration(it.silence_seconds || 0);
+        const sub = `${it.kind}${it.category ? " · " + it.category : ""}${
+          it.last_activity ? " · última " + fmtRelativeTs(it.last_activity) : ""
+        }`;
+        c7.appendChild(rankingItem({
+          label: it.service,
+          sub,
+          count: silenceLabel,
+          onClick: () => {
+            // Intentar mapear el label launchd al service log basename.
+            // El backend devuelve `label` con prefijo (com.fer...). El
+            // service log tiene basename sin prefijo. Heurística: strip
+            // `com.fer.obsidian-rag-` o `com.fer.whatsapp-` y probar.
+            const guess = (it.label || "")
+              .replace(/^com\.fer\.obsidian-rag-/, "")
+              .replace(/^com\.fer\.whatsapp-/, "")
+              .replace(/^com\.fer\./, "");
+            if (guess) navigateToService(guess);
+          },
+          ariaLabel: `${it.service}: ${isNeverRan ? "nunca corrió" : `silencio hace ${silenceLabel}`}. Abrir log.`,
+          title: `${it.service} · ${silenceLabel} · click para abrir el log`,
+        }));
+      }
+    }
+
+    // Card 8: growth rate (bytes/min). Mostramos bytes/min como count;
+    // sub muestra lines/min para contexto.
+    const c8 = $("rk-growth-rate");
+    c8.replaceChildren();
+    const list8 = r.growth_rate || [];
+    if (list8.length === 0) {
+      c8.appendChild(emptyRankingItem("sin actividad en esta ventana"));
+    } else {
+      for (const it of list8) {
+        const sub = `${it.lines_per_min.toFixed(1)} líneas/min · total ${formatBytes(it.total_bytes_in_window)}`;
+        c8.appendChild(rankingItem({
+          label: it.service,
+          sub,
+          count: formatBytes(it.bytes_per_min) + "/m",
+          onClick: () => navigateToService(it.service),
+          ariaLabel: `${it.service}: ${formatBytes(it.bytes_per_min)}/min. Abrir log.`,
+          title: `${it.service} · ${formatBytes(it.bytes_per_min)}/min · click para abrir el log`,
+        }));
+      }
+    }
+
+    // Card 9: nuevos error patterns (regression detector). Solo se popula
+    // si la ventana es ≥ 2h. Si no, mostramos hint para cambiar la ventana.
+    const c9 = $("rk-new-error-patterns");
+    c9.replaceChildren();
+    const list9 = r.new_error_patterns || [];
+    const hasRegressionWindow = (data.totals && data.totals.has_regression_window) === true;
+    if (!hasRegressionWindow) {
+      c9.appendChild(emptyRankingItem("elegí ventana ≥ 24h para detectar errores nuevos"));
+    } else if (list9.length === 0) {
+      c9.appendChild(emptyRankingItem("ningún error nuevo en la última hora 🎉"));
+    } else {
+      for (const it of list9) {
+        const services = (it.services || []).slice(0, 3).join(", ");
+        const more = (it.services || []).length > 3 ? ` +${it.services.length - 3}` : "";
+        const sub = `${services}${more} · primero ${fmtRelativeTs(it.first_ts)}`;
+        const example = collapseWs(it.example || it.signature);
+        c9.appendChild(rankingItem({
+          label: example,
+          sub,
+          count: it.count,
+          onClick: () => {
+            const target = (it.services && it.services[0]) || null;
+            if (target) navigateToService(target);
+          },
+          ariaLabel: `${example}, ${it.count} ocurrencias nuevas en la última hora.`,
+          title: example,
+        }));
+      }
+    }
+  }
+
+  // Helpers de formato extra para los rankings v2.
+  function formatMs(ms) {
+    if (ms == null || isNaN(ms)) return "—";
+    if (ms < 1000) return `${Math.round(ms)}ms`;
+    if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
+    return `${Math.round(ms / 60000)}m`;
+  }
+  function formatBytes(b) {
+    if (b == null || isNaN(b)) return "0";
+    const n = Number(b);
+    if (n < 1024) return `${Math.round(n)} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+    if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+    return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
+  }
+  function fmtDuration(secs) {
+    if (secs == null) return "—";
+    if (secs < 60) return `${Math.round(secs)}s`;
+    if (secs < 3600) return `${Math.round(secs / 60)}m`;
+    if (secs < 86400) return `${Math.round(secs / 3600)}h`;
+    return `${Math.round(secs / 86400)}d`;
   }
 
   function passesSidebarFilter(svc) {

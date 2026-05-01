@@ -462,6 +462,16 @@
 
     const fromName = (s) => (s || "").split("<")[0].trim() || s || "";
     const truncate = (s, n) => (s || "").length > n ? (s || "").slice(0, n) + "…" : (s || "");
+    // Detectar si hay >1 vault para mostrar el tag [vault: name] en cada
+    // item. Sino, sería ruido visual cuando solo hay un vault.
+    const vaultsInPlay = new Set();
+    for (const item of [...(evidence.recent_notes || []), ...inboxItems, ...(evidence.todos || [])]) {
+      if (item && item.vault) vaultsInPlay.add(item.vault);
+    }
+    const showVaultTag = vaultsInPlay.size > 1;
+    const vaultTag = (item) => (showVaultTag && item?.vault)
+      ? ` <span class="vault-tag">[${escapeHTML(item.vault)}]</span>`
+      : "";
 
     // Sub-section: 🪞 "Lo que pasó hoy" — si el LLM no escribió, armamos
     // un summary derivado de signals (notas + gmail + WA + youtube).
@@ -473,7 +483,7 @@
       const recent = (evidence.recent_notes || []).slice(0, 3);
       if (recent.length) {
         lines.push("<p>Notas tocadas hoy:</p><ul>" + recent.map((n) =>
-          `<li><strong>${escapeHTML(n.title || n.path)}</strong></li>`).join("") + "</ul>");
+          `<li><strong>${escapeHTML(n.title || n.path)}</strong>${vaultTag(n)}</li>`).join("") + "</ul>");
       }
       const ytWatched = (signals.youtube_watched || []).slice(0, 3);
       if (ytWatched.length) {
@@ -496,11 +506,12 @@
       inboxHTML = mdToHTML(split.inbox);
     } else {
       const items = [];
-      // Inbox del vault
+      // Inbox del vault (puede venir de cualquiera de los vaults
+      // registrados — el tag [home]/[work] aclara cuál si hay >1).
       for (const it of inboxItems.slice(0, 3)) {
         const tags = (it.tags || []).slice(0, 3)
           .map((t) => `<code>#${escapeHTML(t)}</code>`).join(" ");
-        items.push(`<li>📝 <strong>${escapeHTML(it.title || it.path)}</strong>${tags ? " " + tags : ""}</li>`);
+        items.push(`<li>📝 <strong>${escapeHTML(it.title || it.path)}</strong>${vaultTag(it)}${tags ? " " + tags : ""}</li>`);
       }
       // Mails VIP / recientes (gmail.recent suele incluir VIP)
       for (const m of (signals.gmail?.recent || []).slice(0, 3)) {
@@ -1018,11 +1029,25 @@
   }
 
   function renderVaultActivity(payload) {
+    // Bug fix multi-vault: el código previo solo leía `act.home` y
+    // ignoraba todos los demás vaults registrados (work, etc). Ahora
+    // itera todos los vaults del payload, etiqueta cada item con su
+    // vault de origen, y los ordena por mtime desc cross-vault.
     const act = payload.signals?.vault_activity || {};
-    const home = act.home || [];
-    const rows = home.slice(0, 6).map((it) => ({
+    const merged = [];
+    for (const [vaultName, items] of Object.entries(act)) {
+      if (!Array.isArray(items)) continue;
+      for (const it of items) {
+        merged.push({ ...it, _vault: vaultName });
+      }
+    }
+    merged.sort((a, b) => (b.modified || "").localeCompare(a.modified || ""));
+    const hasMultipleVaults = Object.keys(act).length > 1;
+    const rows = merged.slice(0, 6).map((it) => ({
       title: it.title || it.path,
       meta: [
+        // Mostrar el vault solo si hay más de uno (sino es ruido)
+        hasMultipleVaults ? `[${it._vault}]` : null,
         it.path ? it.path.split("/").slice(0, -1).join("/") : null,
         it.modified ? fmtTimeAgo(it.modified) : null,
       ].filter(Boolean),

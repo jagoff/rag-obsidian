@@ -1580,3 +1580,23 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 @media (prefers-reduced-motion: reduce) {
   .panel-collapse-btn .toggle-icon { transition: none; }
 }
+
+
+/* ────────────────────────────────────────────────────────────
+   Vault tag — chip pequeño "[home]" / "[work]" que aparece al
+   lado de cada item del hero brief y del panel "Notas tocadas"
+   cuando el user tiene >1 vault registrado. Discreto pero visible.
+   ──────────────────────────────────────────────────────────── */
+.vault-tag {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+  background: var(--bg-elev-2);
+  padding: 1px 5px;
+  border-radius: 2px;
+  margin-left: 4px;
+  vertical-align: 1px;
+  user-select: none;
+}

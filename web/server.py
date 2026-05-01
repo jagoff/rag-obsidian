@@ -9465,6 +9465,66 @@ def _chat_cache_put(key: str, payload: dict) -> None:
             _CHAT_CACHE.popitem(last=False)
 
 
+def _collect_today_evidence_multi(
+    now: datetime,
+    log_path: Path,
+    contradiction_log_path: Path,
+) -> dict:
+    """Multi-vault wrapper sobre `_collect_today_evidence`.
+
+    Cuando el usuario tiene >1 vault registrado en `~/.config/obsidian-rag/
+    vaults.json` (típico: home + work), el brief debería ver señales de
+    TODOS los vaults, no solo del activo. Esta función llama a
+    `_collect_today_evidence` por cada vault registrado y mergea los
+    bucket vault-scoped (`recent_notes`, `inbox_today`, `todos`). Cada
+    item agrega un campo `vault` con el nombre del vault de origen para
+    que la UI/LLM puedan distinguirlos.
+
+    Los buckets globales (`new_contradictions`, `low_conf_queries`) se
+    leen UNA sola vez del log path principal — no per-vault, porque los
+    logs son globales del daemon.
+    """
+    vaults = resolve_vault_paths(["all"])
+    # Single-vault o registry vacío → comportamiento idéntico al original
+    if not vaults or len(vaults) <= 1:
+        return _collect_today_evidence(now, VAULT_PATH, log_path, contradiction_log_path)
+
+    # Multi-vault: 1) llamar al current con logs (para low_conf + new_contrad),
+    # 2) llamar a los demás con logs dummy (no-existing) para que solo
+    #    devuelvan los buckets vault-scoped (no duplicar logs globales).
+    base = _collect_today_evidence(now, VAULT_PATH, log_path, contradiction_log_path)
+    current_resolved = VAULT_PATH.resolve()
+    current_name = next(
+        (n for n, p in vaults if p.resolve() == current_resolved),
+        "current",
+    )
+    # Anotar items del current con su vault de origen para que la UI
+    # los distinga visualmente.
+    for k in ("recent_notes", "inbox_today", "todos"):
+        for item in base.get(k) or []:
+            if isinstance(item, dict) and "vault" not in item:
+                item["vault"] = current_name
+
+    # Para vaults extras: log paths bogus → is_file() == False → no leen logs.
+    bogus_log = Path("/dev/null/__obsidian_rag_multi_vault_skip__")
+    for vault_name, vault_path in vaults:
+        if vault_path.resolve() == current_resolved:
+            continue
+        try:
+            extra = _collect_today_evidence(now, vault_path, bogus_log, bogus_log)
+        except Exception as exc:
+            print(f"[home-compute] vault '{vault_name}' skipped: {exc}",
+                  file=sys.stderr)
+            continue
+        for k in ("recent_notes", "inbox_today", "todos"):
+            extra_items = extra.get(k) or []
+            for item in extra_items:
+                if isinstance(item, dict) and "vault" not in item:
+                    item["vault"] = vault_name
+            base.setdefault(k, []).extend(extra_items)
+    return base
+
+
 def _home_compute(
     regenerate: bool = False,
     progress: "Callable[[str, str, float, str | None], None] | None" = None,
@@ -9537,9 +9597,12 @@ def _home_compute(
             raise
 
     try:
+        # Multi-vault aware: si hay >1 vault registrado, agrega
+        # recent_notes / inbox_today / todos de todos los vaults; cada
+        # item lleva el campo `vault` con su origen.
         fut_today       = pool.submit(
-            _timed, "today", _collect_today_evidence,
-            now, VAULT_PATH, LOG_PATH, CONTRADICTION_LOG_PATH,
+            _timed, "today", _collect_today_evidence_multi,
+            now, LOG_PATH, CONTRADICTION_LOG_PATH,
         )
         # Signals fans out 9 sub-fetchers internally — surface them as
         # `signals.<name>` sub-stages so the UI can pinpoint which inner

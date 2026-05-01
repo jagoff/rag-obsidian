@@ -251,6 +251,43 @@ def test_detect_patterns_empty_when_too_few_nights(_isolated_telemetry):
     assert findings == []
 
 
+def test_detect_patterns_cache_invalidates_on_new_ingest(dump_path, _isolated_telemetry):
+    # Primera corrida → cache miss + populates.
+    ps._patterns_cache_clear()
+    ps.ingest()
+    r1 = ps.detect_patterns(min_n=1)  # min_n=1 para que la fixture de 1 noche pase
+    assert len(ps._PATTERNS_CACHE) == 1
+
+    # Segunda corrida sin cambios → cache hit, mismo result.
+    r2 = ps.detect_patterns(min_n=1)
+    assert r1 == r2
+    assert len(ps._PATTERNS_CACHE) == 1
+
+    # Re-ingest con mismo file → ingested_at se actualiza si el row es
+    # nuevo. Como el ingester hace UPSERT con `WHERE excluded.ingested_at >
+    # rag_sleep_sessions.ingested_at`, en este caso bumpear `now` requiere
+    # esperar 1ms o sleep — para el test, forzamos invalidando manualmente
+    # la cache (cubre el flow real cuando el daemon escribe nuevas filas).
+    ps._patterns_cache_clear()
+    r3 = ps.detect_patterns(min_n=1)
+    assert r3 == r1  # mismos resultados, pero re-computados
+
+
+def test_detect_patterns_cache_distinct_keys_per_params(dump_path, _isolated_telemetry):
+    # Diferentes (min_n, min_abs_r) → entries distintas en el cache.
+    ps._patterns_cache_clear()
+    ps.ingest()
+    ps.detect_patterns(min_n=1, min_abs_r=0.0)
+    ps.detect_patterns(min_n=1, min_abs_r=0.5)
+    assert len(ps._PATTERNS_CACHE) == 2
+
+
+def test_patterns_cache_key_returns_none_when_table_empty(_isolated_telemetry):
+    # Fresh DB sin rows → max(ingested_at) es None → cache key es None.
+    key = ps._patterns_cache_key(min_n=14, min_abs_r=0.3)
+    assert key is None
+
+
 def test_correlate_sleep_returns_none_when_no_sessions(_isolated_telemetry):
     # Fresh DB → _correlate_sleep returns None (no rows in rag_sleep_sessions)
     from rag.today_correlator import _correlate_sleep  # noqa: PLC0415

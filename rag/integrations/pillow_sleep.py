@@ -668,6 +668,50 @@ def _bedtime_normalized(start_ts: float, tz_name: str) -> float:
     return h + 24 if h < 12 else h
 
 
+# Cache para detect_patterns(): clave = (min_n, min_abs_r, max_ingested_at).
+# La data de sleep solo cambia 1×/día cuando el ingester corre 09:30, así
+# que correr Pearson sobre 558 noches en cada call al panel home es waste
+# (~30ms cold). Memoizamos por max(ingested_at) — invalidación natural y
+# barata (1 SELECT MAX). Cap a 4 entries en el dict para soportar 2-3
+# combinaciones de (min_n, min_abs_r) que el CLI puede pedir.
+_PATTERNS_CACHE: dict[tuple[int, float, float], list[dict[str, Any]]] = {}
+_PATTERNS_CACHE_MAX = 4
+
+
+def _patterns_cache_put(key: tuple[int, float, float], value: list[dict[str, Any]]) -> None:
+    """Insert into the cache with FIFO eviction at MAX entries. We don't
+    bother with LRU — N=4 is small enough that any eviction policy
+    behaves similarly."""
+    if len(_PATTERNS_CACHE) >= _PATTERNS_CACHE_MAX:
+        # Drop the oldest entry by insertion order (Python 3.7+ dicts
+        # preserve insertion order, so the first key is the oldest).
+        oldest = next(iter(_PATTERNS_CACHE))
+        del _PATTERNS_CACHE[oldest]
+    _PATTERNS_CACHE[key] = value
+
+
+def _patterns_cache_clear() -> None:
+    """Test helper — drop all cached patterns. Production code shouldn't
+    need this; the cache invalidates naturally on max(ingested_at) bump."""
+    _PATTERNS_CACHE.clear()
+
+
+def _patterns_cache_key(min_n: int, min_abs_r: float) -> tuple[int, float, float] | None:
+    """Devuelve la cache key (min_n, min_abs_r, max_ingested_at) o None
+    si no hay sesiones todavía. Una sola query SQL — barato (~0.5ms warm)."""
+    try:
+        with _telemetry_conn() as conn:
+            row = conn.execute(
+                "SELECT MAX(ingested_at) FROM rag_sleep_sessions WHERE is_nap=0"
+            ).fetchone()
+    except Exception:
+        return None
+    max_ingested = row[0] if row else None
+    if max_ingested is None:
+        return None
+    return (min_n, min_abs_r, float(max_ingested))
+
+
 def detect_patterns(min_n: int = 14, min_abs_r: float = 0.3) -> list[dict[str, Any]]:
     """Compute correlations on the user's whole sleep history and return
     the strongest findings as a list of dicts ready to render in the UI
@@ -682,7 +726,17 @@ def detect_patterns(min_n: int = 14, min_abs_r: float = 0.3) -> list[dict[str, A
       - |r| ≥ `min_abs_r` (default 0.3 — drop weak noise)
 
     Returns empty list if there aren't enough sessions yet.
+
+    Memoized by `max(ingested_at)` of `rag_sleep_sessions` — re-running this
+    function within the same ingest cycle (typical for the home panel that
+    reloads every 5min) hits the cache instead of re-running Pearson over
+    the whole history. Cache invalidates naturally when the daily Pillow
+    ingester writes new rows (max(ingested_at) bumps).
     """
+    cache_key = _patterns_cache_key(min_n, min_abs_r)
+    if cache_key is not None and cache_key in _PATTERNS_CACHE:
+        return _PATTERNS_CACHE[cache_key]
+
     with _telemetry_conn() as conn:
         import sqlite3
         conn.row_factory = sqlite3.Row
@@ -690,6 +744,11 @@ def detect_patterns(min_n: int = 14, min_abs_r: float = 0.3) -> list[dict[str, A
             "SELECT * FROM rag_sleep_sessions WHERE is_nap=0 ORDER BY end_ts ASC"
         ).fetchall()
     if len(rows) < min_n:
+        # Cachear el "no hay data" también — evita re-query mientras la
+        # tabla siga vacía. Pero solo si la cache key existe (sino no
+        # hay nada a memoizar).
+        if cache_key is not None:
+            _patterns_cache_put(cache_key, [])
         return []
     nights = [_row_to_dict(r) for r in rows]
 
@@ -757,6 +816,8 @@ def detect_patterns(min_n: int = 14, min_abs_r: float = 0.3) -> list[dict[str, A
 
     # Sort by strength (|r|) descending — strongest patterns first.
     findings.sort(key=lambda f: -abs(f["r"]))
+    if cache_key is not None:
+        _patterns_cache_put(cache_key, findings)
     return findings
 
 

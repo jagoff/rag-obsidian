@@ -121,6 +121,7 @@ atexit.register(_shutdown_joblib_loky_pool)
 import click
 import difflib
 import sqlite_vec
+import httpx
 import ollama
 import yaml
 from rank_bm25 import BM25Okapi
@@ -29193,25 +29194,25 @@ def query(
 
     t_gen_start = time.perf_counter()
     parts: list[str] = []
-    if plain:
-        # Buffer the stream; do NOT emit here. Citation-repair and critique may
-        # mutate `full` after generation. The single `click.echo` for plain mode
-        # fires after both passes complete (see below, after critique block).
-        for chunk in ollama.chat(
-            model=_gen_model,
-            messages=messages,
-            options=_gen_options,
-            stream=True,
-            keep_alive=chat_keep_alive(),
-        ):
-            parts.append(chunk.message.content)
-    else:
-        console.print()
-        # Stream tokens: perceived latency drops from ~30s to ~3s as the user sees
-        # the answer forming. We render unstyled during the stream, then redraw
-        # with link/ext styling at the end.
-        from rich.live import Live
-        with Live("", console=console, refresh_per_second=12, transient=True) as live:
+    # Network-error guard envuelve ambos paths del stream (plain + interactive).
+    # Histórico 2026-05-01: bajo memory pressure crónico (4K pages free de
+    # 2.3M = 0.18% RAM libre, swap activo), ollama crashea mid-stream con
+    # `httpx.RemoteProtocolError: Server disconnected without sending a
+    # response.` Sin handler, click captura la excepción y emite un stack
+    # trace de 80 líneas a stderr + exit 1. El listener WhatsApp llama acá
+    # via subprocess → ve `code 1` y postea
+    # "rag query falló — code 1: sin detalle" al grupo RagNet (el `tail`
+    # del stderr a veces llega vacío si SIGKILL del timeout corta el flush
+    # del traceback). UX rota — el user no entiende qué pasó. Fix: catch
+    # los errores de red de ollama y emitir un mensaje breve + exit 0
+    # para que el listener postee algo útil. No reintentamos acá: si
+    # ollama está caído, retry inmediato no ayuda — dejamos que el user
+    # reintente cuando la presión de memoria baje.
+    try:
+        if plain:
+            # Buffer the stream; do NOT emit here. Citation-repair and critique may
+            # mutate `full` after generation. The single `click.echo` for plain mode
+            # fires after both passes complete (see below, after critique block).
             for chunk in ollama.chat(
                 model=_gen_model,
                 messages=messages,
@@ -29220,7 +29221,34 @@ def query(
                 keep_alive=chat_keep_alive(),
             ):
                 parts.append(chunk.message.content)
-                live.update(Text("".join(parts)))
+        else:
+            console.print()
+            # Stream tokens: perceived latency drops from ~30s to ~3s as the user sees
+            # the answer forming. We render unstyled during the stream, then redraw
+            # with link/ext styling at the end.
+            from rich.live import Live
+            with Live("", console=console, refresh_per_second=12, transient=True) as live:
+                for chunk in ollama.chat(
+                    model=_gen_model,
+                    messages=messages,
+                    options=_gen_options,
+                    stream=True,
+                    keep_alive=chat_keep_alive(),
+                ):
+                    parts.append(chunk.message.content)
+                    live.update(Text("".join(parts)))
+    except (httpx.RemoteProtocolError, httpx.ConnectError,
+            httpx.ReadTimeout, httpx.ConnectTimeout,
+            ConnectionError) as _exc:
+        _msg = (
+            f"⚠️ Ollama desconectó mid-stream ({type(_exc).__name__}). "
+            "Probable memory pressure — reintentá en unos segundos."
+        )
+        if plain:
+            click.echo(_msg)
+        else:
+            console.print(f"[yellow]{_msg}[/yellow]")
+        sys.exit(0)
     t_gen = time.perf_counter() - t_gen_start
     full = "".join(parts)
     if not plain:
@@ -50947,6 +50975,427 @@ def daemons_status(as_json: bool, unhealthy_only: bool):
         label="<status_run>",
         action="status_check",
         reason=f"unhealthy={unhealthy_count}",
+    )
+
+
+# ── Daemons control plane: reconcile / doctor / retry / kickstart-overdue ────
+
+def _all_daemon_labels() -> list[tuple[str, str]]:
+    """Devuelve lista de (label, category) de todos los daemons conocidos."""
+    rag_bin = _rag_binary()
+    managed = [(label, "managed") for (label, _fname, _xml) in _services_spec(rag_bin)]
+    manual = [(spec["label"], spec["category"]) for spec in _services_spec_manual()]
+    return managed + manual
+
+
+def _plist_on_disk(label: str) -> bool:
+    """True si ~/Library/LaunchAgents/<label>.plist existe en disco."""
+    return (Path.home() / "Library" / "LaunchAgents" / f"{label}.plist").exists()
+
+
+def _compute_reconcile_actions(*, gentle: bool = False) -> list[dict]:
+    """Compara estado real vs spec y devuelve lista de acciones requeridas.
+
+    Cada acción es un dict con claves:
+        label        — nombre completo del daemon
+        kind         — "bootstrap" | "bootout" | "kickstart"
+        reason       — texto libre explicativo
+        current_state — dict con state/runs/last_exit/overdue/etc.
+        plist_path   — Path al plist en disco (puede ser None)
+
+    Nota: la acción "regenerate" (diff XML plist on-disk vs factory) es V2
+    pendiente — no implementada en esta versión.
+    """
+    actions: list[dict] = []
+    for label, category in _all_daemon_labels():
+        row = _gather_daemon_status(label, category)
+        state = row.get("state")
+        plist_exists = _plist_on_disk(label)
+        plist_path = (
+            Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+            if plist_exists else None
+        )
+        last_exit = row.get("last_exit")
+        runs = row.get("runs")
+        overdue = row.get("overdue", False)
+
+        # Plist en disco pero no bootstrappeado → bootstrap
+        if state == "missing" and plist_exists:
+            actions.append({
+                "label": label,
+                "kind": "bootstrap",
+                "reason": "plist on disk, not loaded",
+                "current_state": row,
+                "plist_path": plist_path,
+            })
+            continue
+
+        # Bootstrappeado pero sin plist en disco → bootout (solo si !gentle)
+        if state != "missing" and not plist_exists and not gentle:
+            actions.append({
+                "label": label,
+                "kind": "bootout",
+                "reason": "loaded but no plist on disk",
+                "current_state": row,
+                "plist_path": None,
+            })
+            continue
+
+        # last_exit != 0 AND runs < 3 → kickstart
+        if (
+            isinstance(last_exit, int)
+            and last_exit != 0
+            and runs is not None
+            and runs < 3
+        ):
+            actions.append({
+                "label": label,
+                "kind": "kickstart",
+                "reason": f"last_exit={last_exit} runs={runs}",
+                "current_state": row,
+                "plist_path": plist_path,
+            })
+            continue
+
+        # overdue → kickstart
+        if overdue:
+            actions.append({
+                "label": label,
+                "kind": "kickstart",
+                "reason": "overdue Nx cadence",
+                "current_state": row,
+                "plist_path": plist_path,
+            })
+
+    return actions
+
+
+def _execute_reconcile_action(action: dict) -> dict:
+    """Ejecuta una acción de reconciliación via launchctl.
+
+    Devuelve {"ok": bool, "exit_code": int, "stderr": str | None}.
+
+    Códigos de salida tratados como éxito:
+        bootstrap exit=37 → EALREADY (ya cargado)
+        bootout   exit=3  → no existe (ya bootouted)
+    """
+    import subprocess
+    label = action["label"]
+    kind = action["kind"]
+    uid = os.getuid()
+
+    if kind == "bootstrap":
+        plist_path = action.get("plist_path")
+        if plist_path is None:
+            return {"ok": False, "exit_code": -1, "stderr": "plist_path missing"}
+        proc = subprocess.run(
+            ["launchctl", "bootstrap", f"gui/{uid}", str(plist_path)],
+            capture_output=True, text=True, timeout=10,
+        )
+        ok = proc.returncode in (0, 37)
+        return {"ok": ok, "exit_code": proc.returncode, "stderr": proc.stderr or None}
+
+    elif kind == "bootout":
+        proc = subprocess.run(
+            ["launchctl", "bootout", f"gui/{uid}/{label}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        ok = proc.returncode in (0, 3)
+        return {"ok": ok, "exit_code": proc.returncode, "stderr": proc.stderr or None}
+
+    elif kind == "kickstart":
+        proc = subprocess.run(
+            ["launchctl", "kickstart", "-k", f"gui/{uid}/{label}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        ok = proc.returncode == 0
+        return {"ok": ok, "exit_code": proc.returncode, "stderr": proc.stderr or None}
+
+    return {"ok": False, "exit_code": -1, "stderr": f"kind desconocido: {kind}"}
+
+
+def _doctor_diagnose(row: dict) -> str:
+    """Devuelve párrafo de diagnóstico + remediación para un daemon unhealthy."""
+    label = row["label"]
+    slug = label.replace("com.fer.obsidian-rag-", "")
+    state = row.get("state", "unknown")
+    last_exit = row.get("last_exit")
+    overdue = row.get("overdue", False)
+    runs = row.get("runs")
+    last_tick = row.get("last_tick_iso")
+
+    lines: list[str] = [f"── {slug} ──"]
+
+    if state == "missing":
+        lines.append(
+            f"  Síntoma: plist no bootstrappeado (state=missing).\n"
+            f"  Remediación: `rag daemons reconcile --apply` (si plist en disco) "
+            f"o `rag setup` (si plist faltante)."
+        )
+        return "\n".join(lines)
+
+    if label.endswith("ingest-safari") and isinstance(last_exit, int) and last_exit == 1:
+        lines.append(
+            f"  Síntoma: exit=1 (database lock conocido de Safari History.db).\n"
+            f"  Remediación: `rag daemons retry ingest-safari` para reintentar; "
+            f"si persiste, ver `~/.local/share/obsidian-rag/ingest-safari.error.log`."
+        )
+        return "\n".join(lines)
+
+    if label.endswith("web") and isinstance(runs, int) and runs > 5:
+        if last_tick:
+            try:
+                from datetime import datetime as _dt
+                age_min = (_dt.now() - _dt.fromisoformat(last_tick)).total_seconds() / 60
+                if age_min < 5:
+                    lines.append(
+                        f"  Síntoma: posible crash loop (runs={runs}, last_tick hace "
+                        f"{age_min:.0f}min).\n"
+                        f"  Remediación: ver `~/.local/share/obsidian-rag/web.error.log` "
+                        f"para la causa raíz."
+                    )
+                    return "\n".join(lines)
+            except Exception:
+                pass
+
+    if overdue:
+        lines.append(
+            f"  Síntoma: daemon overdue (Mac posiblemente dormida durante el tick).\n"
+            f"  Remediación: `rag daemons retry {slug}` para forzar tick."
+        )
+        return "\n".join(lines)
+
+    if isinstance(last_exit, int) and last_exit != 0:
+        lines.append(
+            f"  Síntoma: último exit_code={last_exit}.\n"
+            f"  Remediación: ver log: `tail ~/.local/share/obsidian-rag/{slug}.error.log`."
+        )
+        return "\n".join(lines)
+
+    # Fallback genérico
+    lines.append(f"  Síntoma: state={state}, last_exit={last_exit}, overdue={overdue}.")
+    return "\n".join(lines)
+
+
+@daemons_group.command("reconcile")
+@click.option("--apply", "do_apply", is_flag=True,
+              help="Ejecutar las acciones (default: dry-run).")
+@click.option("--dry-run", "dry_run", is_flag=True,
+              help="Solo mostrar qué se haría.")
+@click.option("--gentle", is_flag=True,
+              help="Solo kickstart de last_exit≠0 con runs<3 + overdue. "
+                   "NO bootout huérfanos ni regenera plists.")
+def daemons_reconcile(do_apply: bool, dry_run: bool, gentle: bool):
+    """Compara estado real vs spec y converge (default: dry-run)."""
+    if not do_apply and not dry_run:
+        dry_run = True
+        console.print("[dim]dry-run implícito — usá --apply para ejecutar acciones.[/dim]")
+
+    actions = _compute_reconcile_actions(gentle=gentle)
+
+    if not actions:
+        console.print("✓ sin drift detectado")
+        return
+
+    table = Table(title="Acciones reconcile", show_lines=False, header_style="bold")
+    table.add_column("Label", style="dim", no_wrap=True)
+    table.add_column("Acción", no_wrap=True)
+    table.add_column("Motivo")
+
+    for a in actions:
+        slug = a["label"].replace("com.fer.obsidian-rag-", "")
+        table.add_row(slug, a["kind"], a["reason"])
+
+    console.print(table)
+
+    if dry_run:
+        console.print("[dim]dry-run — ejecutá con --apply para aplicar[/dim]")
+        return
+
+    # apply path
+    import time
+    ok_count = 0
+    fail_count = 0
+    for a in actions:
+        prev_state = a["current_state"].get("state")
+        result = _execute_reconcile_action(a)
+
+        # Re-fetch estado post-acción para el log
+        time.sleep(1)
+        post_row = _gather_daemon_status(a["label"], a["current_state"].get("category", "managed"))
+        new_state = post_row.get("state") if result["ok"] else None
+
+        _log_daemon_run_event(
+            label=a["label"],
+            action=f"reconcile_{a['kind']}",
+            prev_state=prev_state,
+            new_state=new_state,
+            exit_code=result["exit_code"],
+            reason=a["reason"],
+        )
+
+        slug = a["label"].replace("com.fer.obsidian-rag-", "")
+        if result["ok"]:
+            console.print(f"[green]✓[/green] {slug} → {a['kind']} ok")
+            ok_count += 1
+        else:
+            console.print(
+                f"[red]✗[/red] {slug} → {a['kind']} exit={result['exit_code']}"
+                + (f" ({result['stderr'][:80]})" if result.get("stderr") else "")
+            )
+            fail_count += 1
+
+    console.print(
+        f"\n[green]{ok_count} ok[/green]"
+        + (f"  [red]{fail_count} fallidos[/red]" if fail_count else "")
+    )
+
+
+@daemons_group.command("doctor")
+def daemons_doctor():
+    """Diagnostica daemons unhealthy y sugiere remediación (solo lectura)."""
+    all_labels = _all_daemon_labels()
+    rows = [_gather_daemon_status(label, category) for label, category in all_labels]
+
+    def _is_unhealthy_row(row: dict) -> bool:
+        state = row["state"]
+        last_exit = row["last_exit"]
+        # Cron jobs que terminaron limpiamente: state="not running", last_exit=0/None.
+        # "never exited" aparece en daemons que nunca corrieron (KeepAlive recién
+        # instalados sin un tick todavía) — no es unhealthy per se.
+        if state == "missing":
+            return True
+        if isinstance(last_exit, int) and last_exit != 0:
+            return True
+        if row["overdue"]:
+            return True
+        return False
+
+    unhealthy = [r for r in rows if _is_unhealthy_row(r)]
+
+    if not unhealthy:
+        console.print("✓ todos los daemons sanos")
+        return
+
+    for row in unhealthy:
+        console.print(_doctor_diagnose(row))
+        console.print()
+
+
+@daemons_group.command("retry")
+@click.argument("label")
+def daemons_retry(label: str):
+    """Forzar un kickstart -k del daemon LABEL (slug corto o nombre completo)."""
+    import subprocess, time
+    full_label = (
+        label if label.startswith("com.fer.obsidian-rag-")
+        else f"com.fer.obsidian-rag-{label}"
+    )
+
+    # Validar que el label existe en spec o manual
+    known_labels = {lbl for lbl, _cat in _all_daemon_labels()}
+    if full_label not in known_labels:
+        raise click.BadParameter(
+            f"'{full_label}' no está en la spec conocida de daemons. "
+            f"Usá `rag daemons status` para ver los labels válidos.",
+            param_hint="label",
+        )
+
+    uid = os.getuid()
+
+    # Estado previo
+    category = next(
+        (cat for lbl, cat in _all_daemon_labels() if lbl == full_label), "managed"
+    )
+    prev_row = _gather_daemon_status(full_label, category)
+    prev_state = prev_row.get("state")
+
+    # Ejecutar kickstart -k
+    proc = subprocess.run(
+        ["launchctl", "kickstart", "-k", f"gui/{uid}/{full_label}"],
+        capture_output=True, text=True, timeout=10,
+    )
+    ok = proc.returncode == 0
+
+    # Estado post
+    time.sleep(2)
+    post_row = _gather_daemon_status(full_label, category)
+    new_state = post_row.get("state") if ok else None
+
+    # Log
+    _log_daemon_run_event(
+        label=full_label,
+        action="retry",
+        prev_state=prev_state,
+        new_state=new_state,
+        exit_code=proc.returncode,
+        reason="manual retry via CLI",
+    )
+
+    slug = full_label.replace("com.fer.obsidian-rag-", "")
+    if ok:
+        console.print(f"[green]✓[/green] {slug} → kickstart ok (state: {prev_state} → {new_state})")
+    else:
+        stderr_hint = proc.stderr.strip()[:120] if proc.stderr else ""
+        console.print(
+            f"[red]✗[/red] {slug} → kickstart exit={proc.returncode}"
+            + (f"\n  {stderr_hint}" if stderr_hint else "")
+        )
+
+
+@daemons_group.command("kickstart-overdue")
+def daemons_kickstart_overdue():
+    """Kickstart de TODOS los daemons en estado overdue.
+
+    Recupera daemons saltados mientras el Mac estaba dormida.
+    """
+    import subprocess, time
+    all_labels = _all_daemon_labels()
+    rows = [_gather_daemon_status(label, category) for label, category in all_labels]
+    overdue = [r for r in rows if r.get("overdue")]
+
+    if not overdue:
+        console.print("✓ ningún daemon overdue")
+        return
+
+    uid = os.getuid()
+    ok_count = 0
+    fail_count = 0
+
+    for row in overdue:
+        label = row["label"]
+        slug = label.replace("com.fer.obsidian-rag-", "")
+        prev_state = row.get("state")
+
+        proc = subprocess.run(
+            ["launchctl", "kickstart", "-k", f"gui/{uid}/{label}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        ok = proc.returncode == 0
+
+        time.sleep(1)
+        post_row = _gather_daemon_status(label, row.get("category", "managed"))
+        new_state = post_row.get("state") if ok else None
+
+        _log_daemon_run_event(
+            label=label,
+            action="kickstart",
+            prev_state=prev_state,
+            new_state=new_state,
+            exit_code=proc.returncode,
+            reason="kickstart-overdue batch",
+        )
+
+        if ok:
+            console.print(f"[green]✓[/green] {slug} → kickstart ok")
+            ok_count += 1
+        else:
+            console.print(f"[red]✗[/red] {slug} → exit={proc.returncode}")
+            fail_count += 1
+
+    console.print(
+        f"\n✓ kickstarteados {ok_count} daemons overdue"
+        + (f"  [red]{fail_count} fallidos[/red]" if fail_count else "")
     )
 
 

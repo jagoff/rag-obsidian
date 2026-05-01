@@ -473,6 +473,17 @@ def _force_behavior_and_metrics_sync(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _force_ft_rating_sync(monkeypatch):
+    """``_log_ft_rating_event_background_default`` pasó a async por default
+    (mismo patrón que log_behavior_event). Forzamos sync en todos los tests
+    para que reads de ``rag_ft_panel_ratings`` sean inmediatos post-write.
+    Override per-test con ``monkeypatch.setenv("RAG_LOG_FT_RATING_ASYNC", "1")``.
+    """
+    monkeypatch.setenv("RAG_LOG_FT_RATING_ASYNC", "0")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _snapshot_rag_local_embed_env():
     """`_maybe_auto_enable_local_embed` (rag.py:6970) mutates `os.environ`
     directly when the CLI group runs for query-like subcommands. Any test that

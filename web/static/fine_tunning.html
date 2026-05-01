@@ -1,0 +1,688 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#1a1a1f">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="rag">
+  <title>rag · fine_tunning</title>
+
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" type="image/png" sizes="32x32" href="/static/pwa/favicon-32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/static/pwa/favicon-16.png">
+  <link rel="apple-touch-icon" href="/static/pwa/apple-touch-icon.png">
+  <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-x.png"
+        media="(device-width: 375px) and (device-height: 812px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-xr.png"
+        media="(device-width: 414px) and (device-height: 896px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-xs-max.png"
+        media="(device-width: 414px) and (device-height: 896px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-12-mini.png"
+        media="(device-width: 360px) and (device-height: 780px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-12.png"
+        media="(device-width: 390px) and (device-height: 844px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-12-pro-max.png"
+        media="(device-width: 428px) and (device-height: 926px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-14-pro.png"
+        media="(device-width: 393px) and (device-height: 852px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-14-pro-max.png"
+        media="(device-width: 430px) and (device-height: 932px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-16-pro.png"
+        media="(device-width: 402px) and (device-height: 874px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-16-pro-max.png"
+        media="(device-width: 440px) and (device-height: 956px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+
+  <script>
+    (function () {
+      try {
+        var t = localStorage.getItem("rag-theme");
+        if (t === "light" || t === "dark") {
+          document.documentElement.setAttribute("data-theme", t);
+        }
+      } catch (e) {}
+    })();
+  </script>
+  <script src="/static/pwa/register-sw.js" defer></script>
+
+  <style>
+    :root {
+      --bg: #1a1a1f;
+      --bg-elev: #222228;
+      --bg-card: #26262c;
+      --border: #33333a;
+      --border-strong: #3e3e46;
+      --text: #ececed;
+      --text-dim: #a0a0a6;
+      --text-faint: #7a7a82;
+      --green: #7ee787;
+      --cyan: #79c0ff;
+      --cyan-dim: #5a9bd5;
+      --yellow: #e3c27a;
+      --red: #ff7b72;
+      --purple: #d2a8ff;
+      --orange: #ffa657;
+      --pink: #f778ba;
+      --grid: rgba(255,255,255,0.04);
+      --hover: rgba(255,255,255,0.06);
+      --sep: rgba(255,255,255,0.03);
+      color-scheme: dark;
+    }
+
+    :root[data-theme="light"] {
+      --bg: #fafafa;
+      --bg-elev: #ffffff;
+      --bg-card: #ffffff;
+      --border: #e2e2e5;
+      --border-strong: #cfcfd4;
+      --text: #1a1a20;
+      --text-dim: #52525b;
+      --text-faint: #70707a;
+      --green: #2f8f3d;
+      --cyan: #0969da;
+      --cyan-dim: #0969da;
+      --yellow: #a0761a;
+      --red: #c8311f;
+      --purple: #7c3aed;
+      --orange: #c25a11;
+      --pink: #d02a8a;
+      --grid: rgba(0,0,0,0.05);
+      --hover: rgba(0,0,0,0.04);
+      --sep: rgba(0,0,0,0.04);
+      color-scheme: light;
+    }
+
+    @media (prefers-color-scheme: light) {
+      :root:not([data-theme="dark"]) {
+        --bg: #fafafa;
+        --bg-elev: #ffffff;
+        --bg-card: #ffffff;
+        --border: #e2e2e5;
+        --border-strong: #cfcfd4;
+        --text: #1a1a20;
+        --text-dim: #52525b;
+        --text-faint: #70707a;
+        --green: #2f8f3d;
+        --cyan: #0969da;
+        --cyan-dim: #0969da;
+        --yellow: #a0761a;
+        --red: #c8311f;
+        --purple: #7c3aed;
+        --orange: #c25a11;
+        --pink: #d02a8a;
+        --grid: rgba(0,0,0,0.05);
+        --hover: rgba(0,0,0,0.04);
+        --sep: rgba(0,0,0,0.04);
+        color-scheme: light;
+      }
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      overflow-x: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "SF Mono", "Menlo", "Monaco", "JetBrains Mono", ui-monospace, monospace;
+      font-size: 13px;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    :focus { outline: none; }
+    :focus-visible {
+      outline: 2px solid var(--cyan);
+      outline-offset: 2px;
+      border-radius: 4px;
+    }
+
+    header.hdr {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 8px 12px;
+      padding: 14px 24px 16px;
+      border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      background: color-mix(in srgb, var(--bg) 92%, transparent);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+    }
+    .hdr-l {
+      display: inline-flex;
+      align-items: baseline;
+      gap: 6px;
+      font-size: 18px;
+      font-weight: 700;
+    }
+    .hdr-l .brand { color: var(--cyan); text-decoration: none; }
+    .hdr-l .brand:hover { color: var(--cyan); filter: brightness(1.15); }
+    .hdr-l .sep { color: var(--text-faint); font-weight: 400; }
+    .hdr-l .title { color: var(--text-faint); font-weight: 400; }
+
+    .hdr-r {
+      display: inline-flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 12px;
+      color: var(--text-dim);
+      flex-wrap: wrap;
+    }
+
+    .hdr-nav { display: inline-flex; gap: 4px; flex-wrap: wrap; }
+    .hdr-nav a {
+      font-size: 12px;
+      color: var(--text-dim);
+      text-decoration: none;
+      padding: 4px 8px;
+      border-radius: 4px;
+    }
+    .hdr-nav a:hover { color: var(--cyan); background: var(--hover); }
+
+    .btn-icon {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      color: var(--text-faint);
+      cursor: pointer;
+      user-select: none;
+      padding: 3px 8px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg-elev);
+      font-family: inherit;
+    }
+    .btn-icon:hover { border-color: var(--border-strong); color: var(--text); }
+
+    .skip-link {
+      position: absolute;
+      top: 0;
+      left: 0;
+      background: var(--cyan);
+      color: var(--bg);
+      padding: 8px 14px;
+      border-radius: 0 0 8px 0;
+      font-weight: 700;
+      font-size: 13px;
+      text-decoration: none;
+      z-index: 9999;
+      transform: translateY(-110%);
+      transition: transform 120ms ease-out;
+    }
+    .skip-link:focus, .skip-link:focus-visible {
+      transform: translateY(0);
+      outline: 2px solid var(--text);
+      outline-offset: 2px;
+    }
+
+    main { padding: 24px; }
+
+    #ft-queue {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    #ft-empty {
+      padding: 48px 24px;
+      text-align: center;
+      color: var(--text-faint);
+      font-size: 14px;
+      border: 1px dashed var(--border);
+      border-radius: 10px;
+      background: var(--bg-card);
+    }
+
+    @media (max-width: 640px) {
+      header.hdr { padding: 12px 16px; }
+      .hdr-l { font-size: 16px; }
+      main { padding: 16px; }
+    }
+    @media (pointer: coarse), (max-width: 640px) {
+      .btn-icon, .hdr-nav a { min-height: 36px; }
+    }
+
+    /* ── fine_tunning panel ── */
+    :root {
+      --badge-retrieval: #4c8eff;
+      --badge-brief: #a855f7;
+      --badge-anticipate: #fb923c;
+      --badge-draft: #10b981;
+      --badge-style: #ec4899;
+      --badge-tool_routing: #eab308;
+      --badge-read_summary: #06b6d4;
+      --card-bg: var(--bg-card);
+      --fg: var(--text);
+      --muted: var(--text-faint);
+      --accent: var(--cyan);
+    }
+
+    .ft-subtitle {
+      font-size: 12px;
+      color: var(--text-faint);
+      margin-left: 4px;
+    }
+
+    main {
+      max-width: 720px;
+      margin: 0 auto;
+    }
+
+    .ft-loading {
+      padding: 32px 0;
+      text-align: center;
+      color: var(--text-faint);
+      font-size: 13px;
+    }
+
+    .ft-card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px 16px;
+      margin-bottom: 12px;
+      transition: opacity 300ms ease, max-height 300ms ease, padding 300ms ease, margin 300ms ease, border 300ms ease;
+      overflow: hidden;
+      max-height: 600px;
+    }
+    .ft-card.fading { opacity: 0; max-height: 0; padding: 0; margin: 0; border: 0; }
+
+    .ft-card-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 6px;
+    }
+
+    .ft-badge {
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-size: 11px;
+      font-weight: 600;
+      color: white;
+      text-transform: uppercase;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+
+    .ft-ts {
+      font-size: 11px;
+      color: var(--text-faint);
+      margin-left: auto;
+      white-space: nowrap;
+    }
+
+    .ft-label {
+      font-size: 15px;
+      font-weight: 500;
+      color: var(--fg);
+      margin: 4px 0;
+      word-wrap: break-word;
+      overflow-wrap: break-word;
+    }
+
+    .ft-meta {
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 10px;
+    }
+
+    .ft-actions {
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+      align-items: center;
+    }
+
+    .ft-actions button {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 14px;
+      cursor: pointer;
+      font-size: 16px;
+      color: var(--fg);
+      font-family: inherit;
+      transition: background 150ms, border-color 150ms;
+    }
+    .ft-actions button:hover { background: var(--hover); border-color: var(--border-strong); }
+    .ft-actions button.btn-pos:hover { background: rgba(126, 231, 135, 0.15); border-color: var(--green); }
+    .ft-actions button.btn-neg:hover { background: rgba(255, 123, 114, 0.15); border-color: var(--red); }
+    .ft-actions button.btn-snooze:hover { background: rgba(227, 194, 122, 0.15); border-color: var(--yellow); }
+    .ft-actions button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .ft-comment {
+      margin-top: 10px;
+      display: none;
+    }
+    .ft-comment.expanded { display: block; }
+
+    .ft-comment textarea {
+      width: 100%;
+      min-height: 60px;
+      padding: 8px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: inherit;
+      font-size: 13px;
+      resize: vertical;
+      margin-bottom: 8px;
+    }
+    .ft-comment textarea:focus {
+      border-color: var(--border-strong);
+      outline: none;
+    }
+
+    .ft-comment-actions {
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+    }
+    .ft-comment-actions button {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 12px;
+      cursor: pointer;
+      font-size: 13px;
+      color: var(--fg);
+      font-family: inherit;
+    }
+    .ft-comment-actions .btn-submit-neg {
+      background: rgba(255, 123, 114, 0.15);
+      border-color: var(--red);
+      color: var(--red);
+    }
+    .ft-comment-actions .btn-submit-neg:hover { background: rgba(255, 123, 114, 0.25); }
+    .ft-comment-actions .btn-cancel-neg { color: var(--text-faint); }
+    .ft-comment-actions .btn-cancel-neg:hover { color: var(--fg); background: var(--hover); }
+
+    @media (max-width: 600px) {
+      .ft-card { padding: 12px; margin-bottom: 10px; }
+      .ft-actions button { padding: 10px 16px; font-size: 18px; }
+    }
+  </style>
+</head>
+<body>
+  <a href="#content" class="skip-link">Saltar al contenido</a>
+
+  <header class="hdr">
+    <div class="hdr-l">
+      <a href="/" class="brand">rag</a>
+      <span class="sep">·</span>
+      <span class="title">fine_tunning</span>
+      <span id="ft-count" class="ft-subtitle"></span>
+    </div>
+    <div class="hdr-r">
+      <button id="theme-toggle" class="btn-icon" type="button"
+              aria-label="Alternar tema claro/oscuro">
+        <span id="theme-icon" aria-hidden="true"></span>
+      </button>
+      <nav class="hdr-nav" aria-label="Navegación principal">
+        <a href="/dashboard">dashboard</a>
+        <a href="/learning">learning</a>
+        <a href="/status">status</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="content" tabindex="-1">
+    <div id="ft-queue"></div>
+    <div id="ft-empty" hidden>🎉 Sin pendientes — volvé mañana</div>
+  </main>
+
+  <script>
+    /* ── theme toggle ── */
+    (function () {
+      var btn = document.getElementById('theme-toggle');
+      var icon = document.getElementById('theme-icon');
+      function applyTheme(t) {
+        document.documentElement.setAttribute('data-theme', t);
+        try { localStorage.setItem('rag-theme', t); } catch (e) {}
+        icon.textContent = t === 'light' ? '🌙' : '☀️';
+      }
+      var stored = null;
+      try { stored = localStorage.getItem('rag-theme'); } catch (e) {}
+      var initial = stored || (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+      applyTheme(initial);
+      btn.addEventListener('click', function () {
+        var cur = document.documentElement.getAttribute('data-theme') || 'dark';
+        applyTheme(cur === 'dark' ? 'light' : 'dark');
+      });
+    })();
+  </script>
+
+  <script>
+    /* ── fine_tunning panel ── */
+    (() => {
+      const queueEl   = document.getElementById('ft-queue');
+      const emptyEl   = document.getElementById('ft-empty');
+      const subtitleEl = document.getElementById('ft-count');
+
+      const STREAM_COLORS = {
+        retrieval:    'var(--badge-retrieval, #4c8eff)',
+        brief:        'var(--badge-brief, #a855f7)',
+        anticipate:   'var(--badge-anticipate, #fb923c)',
+        draft:        'var(--badge-draft, #10b981)',
+        style:        'var(--badge-style, #ec4899)',
+        tool_routing: 'var(--badge-tool_routing, #eab308)',
+        read_summary: 'var(--badge-read_summary, #06b6d4)',
+      };
+
+      /* IDs actualmente en el DOM (para merge en auto-refresh) */
+      const activeIds = new Set();
+
+      /* ── helpers ── */
+      function escapeHtml(s) {
+        return String(s)
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;');
+      }
+
+      function formatRelTime(iso) {
+        if (!iso) return '';
+        const ms = Date.now() - new Date(iso).getTime();
+        const s = Math.round(ms / 1000);
+        if (s < 60)          return 'hace un momento';
+        const m = Math.round(s / 60);
+        if (m < 60)          return `hace ${m}m`;
+        const h = Math.round(m / 60);
+        if (h < 24)          return `hace ${h}h`;
+        const d = Math.round(h / 24);
+        if (d < 30)          return `hace ${d}d`;
+        const mo = Math.round(d / 30);
+        return `hace ${mo} mes${mo > 1 ? 'es' : ''}`;
+      }
+
+      function buildMeta(item) {
+        const parts = [];
+        if (item.stream === 'retrieval') {
+          if (item.top_score != null) parts.push(`score=${item.top_score.toFixed(3)}`);
+        } else if (item.stream === 'brief') {
+          if (item.meta && item.meta.negatives != null) {
+            parts.push(`${item.meta.negatives} neg, ${item.meta.mutes || 0} mute`);
+          }
+        } else if (item.stream === 'anticipate') {
+          if (item.meta && item.meta.kind)  parts.push(`kind=${item.meta.kind}`);
+          if (item.meta && item.meta.score != null) parts.push(`score=${item.meta.score.toFixed(2)}`);
+        } else if (item.stream === 'draft') {
+          if (item.meta && item.meta.contact) parts.push(`contacto=${escapeHtml(item.meta.contact)}`);
+        }
+        if (item.ts) parts.push(formatRelTime(item.ts));
+        return parts.join(' · ');
+      }
+
+      /* ── renderCard ── */
+      function renderCard(item) {
+        const uid = `${item.stream}::${item.item_id}`;
+        if (activeIds.has(uid)) return null;
+        activeIds.add(uid);
+
+        const card = document.createElement('div');
+        card.className = 'ft-card';
+        card.dataset.uid = uid;
+
+        const color = STREAM_COLORS[item.stream] || '#888';
+        const meta  = buildMeta(item);
+        const label = item.label || item.item_id;
+
+        card.innerHTML = `
+          <div class="ft-card-header">
+            <span class="ft-badge" style="background:${color}">${escapeHtml(item.stream)}</span>
+            <span class="ft-ts">${formatRelTime(item.ts)}</span>
+          </div>
+          <div class="ft-label">${escapeHtml(label)}</div>
+          ${meta ? `<div class="ft-meta">${escapeHtml(meta)}</div>` : ''}
+          <div class="ft-actions">
+            <button class="btn-pos" title="Positivo" aria-label="Votar positivo">👍</button>
+            <button class="btn-neg" title="Negativo" aria-label="Votar negativo">👎</button>
+            <button class="btn-snooze" title="Snooze 24h" aria-label="Posponer 24 horas">💤</button>
+          </div>
+          <div class="ft-comment" aria-live="polite">
+            <textarea placeholder="¿qué falló? (opcional)"></textarea>
+            <div class="ft-comment-actions">
+              <button class="btn-cancel-neg" type="button">Cancelar</button>
+              <button class="btn-submit-neg" type="button">Enviar 👎</button>
+            </div>
+          </div>
+        `;
+
+        const btnPos    = card.querySelector('.btn-pos');
+        const btnNeg    = card.querySelector('.btn-neg');
+        const btnSnooze = card.querySelector('.btn-snooze');
+        const commentEl = card.querySelector('.ft-comment');
+        const textarea  = card.querySelector('textarea');
+        const btnSubmit = card.querySelector('.btn-submit-neg');
+        const btnCancel = card.querySelector('.btn-cancel-neg');
+
+        btnPos.addEventListener('click', () => {
+          handleRate(item.stream, item.item_id, 1, label, null, item.session_id, card);
+        });
+
+        btnNeg.addEventListener('click', () => {
+          if (commentEl.classList.contains('expanded')) {
+            /* segundo click → enviar sin comentario */
+            handleRate(item.stream, item.item_id, -1, label, null, item.session_id, card);
+          } else {
+            commentEl.classList.add('expanded');
+            textarea.focus();
+          }
+        });
+
+        btnSubmit.addEventListener('click', () => {
+          handleRate(item.stream, item.item_id, -1, label, textarea.value.trim() || null, item.session_id, card);
+        });
+
+        btnCancel.addEventListener('click', () => {
+          commentEl.classList.remove('expanded');
+          textarea.value = '';
+        });
+
+        btnSnooze.addEventListener('click', () => {
+          handleSnooze(item.stream, item.item_id, card);
+        });
+
+        return card;
+      }
+
+      /* ── animación de salida ── */
+      function fadeRemove(card) {
+        const uid = card.dataset.uid;
+        card.classList.add('fading');
+        card.addEventListener('transitionend', () => {
+          card.remove();
+          activeIds.delete(uid);
+          updateSubtitle();
+          updateEmpty();
+        }, { once: true });
+      }
+
+      /* ── acciones remotas ── */
+      async function handleRate(stream, itemId, rating, label, comment, sessionId, card) {
+        const btns = card.querySelectorAll('button');
+        btns.forEach(b => { b.disabled = true; });
+        try {
+          const resp = await fetch('/api/fine_tunning/rate', { /* POST /api/fine_tunning/rate */
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ stream, item_id: itemId, rating, label, comment: comment || null, session_id: sessionId || null }),
+          });
+          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+          fadeRemove(card);
+        } catch (err) {
+          btns.forEach(b => { b.disabled = false; });
+          alert('Error al guardar — reintentá');
+        }
+      }
+
+      async function handleSnooze(stream, itemId, card) {
+        const btns = card.querySelectorAll('button');
+        btns.forEach(b => { b.disabled = true; });
+        try {
+          const resp = await fetch('/api/fine_tunning/snooze', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ item_id: itemId, stream, hours: 24 }),
+          });
+          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+          fadeRemove(card);
+        } catch (err) {
+          btns.forEach(b => { b.disabled = false; });
+          alert('Error al guardar — reintentá');
+        }
+      }
+
+      /* ── UI helpers ── */
+      function updateSubtitle() {
+        const n = queueEl.querySelectorAll('.ft-card:not(.fading)').length;
+        subtitleEl.textContent = n > 0 ? `· ${n} pendiente${n !== 1 ? 's' : ''}` : '';
+      }
+
+      function updateEmpty() {
+        const n = queueEl.querySelectorAll('.ft-card:not(.fading)').length;
+        emptyEl.hidden = n > 0;
+      }
+
+      /* ── fetch + render ── */
+      async function fetchQueue() {
+        try {
+          const resp = await fetch('/api/fine_tunning/queue?limit=20');
+          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+          const data = await resp.json();
+          const items = data.items || [];
+
+          /* quitar loader si está */
+          const loader = queueEl.querySelector('.ft-loading');
+          if (loader) loader.remove();
+
+          items.forEach(item => {
+            const card = renderCard(item);
+            if (card) queueEl.appendChild(card);
+          });
+
+          updateSubtitle();
+          updateEmpty();
+        } catch (err) {
+          const loader = queueEl.querySelector('.ft-loading');
+          if (loader) loader.textContent = 'Error al cargar — reintentando…';
+        }
+      }
+
+      /* ── init ── */
+      queueEl.innerHTML = '<div class="ft-loading">cargando…</div>';
+      fetchQueue();
+      setInterval(fetchQueue, 60000);
+    })();
+  </script>
+</body>
+</html>

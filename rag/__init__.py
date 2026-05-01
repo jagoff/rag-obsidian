@@ -1312,6 +1312,17 @@ def _log_behavior_event_background_default() -> bool:
     return val not in ("0", "false", "no")
 
 
+def _log_ft_rating_event_background_default() -> bool:
+    """True cuando las writes de ``rag_ft_panel_ratings`` deben ir al queue async.
+
+    Default ON. Override con ``RAG_LOG_FT_RATING_ASYNC=0`` para forzar sync
+    (útil en tests que leen ``rag_ft_panel_ratings`` inmediatamente post-write).
+    El conftest setea ``0`` para preservar el contract sincrónico del suite.
+    """
+    val = os.environ.get("RAG_LOG_FT_RATING_ASYNC", "1").strip().lower()
+    return val not in ("0", "false", "no", "off")
+
+
 def log_query_event(event: dict) -> None:
     """Insert a query event into rag_queries.
 
@@ -7158,6 +7169,53 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             "ON rag_sleep_sessions(start_ts DESC)",
             "CREATE INDEX IF NOT EXISTS ix_rag_sleep_sessions_nap_date "
             "ON rag_sleep_sessions(is_nap, date DESC)",
+        ),
+    ),
+    (
+        # Fine-tuning panel ratings — captura ratings de la UI /fine_tunning
+        # para cada item de cada stream (retrieval, brief, draft, anticipate,
+        # style, tool_routing, read_summary). Append-only; un mismo item_id
+        # puede recibir múltiples ratings si el user cambia de opinión.
+        # No se usa CHECK en `stream` para que nuevos streams sean extensibles
+        # sin migration. Retention: sin TTL — señal de entrenamiento gold.
+        "rag_ft_panel_ratings",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_ft_panel_ratings ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " stream TEXT NOT NULL,"
+            " item_id TEXT NOT NULL,"
+            " rating INTEGER NOT NULL CHECK(rating IN (-1, 1)),"
+            " label TEXT,"
+            " comment TEXT,"
+            " session_id TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_ft_panel_ratings_stream_ts"
+            " ON rag_ft_panel_ratings(stream, ts)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_ft_panel_ratings_item_id"
+            " ON rag_ft_panel_ratings(item_id)",
+        ),
+    ),
+    (
+        # Fine-tuning panel active queue state — rastrea qué items ya fueron
+        # mostrados en cada stream y cuándo se snoozearon. PK compuesto
+        # (item_id, stream) porque el mismo id numérico puede existir en
+        # rag_queries (stream=retrieval) y en rag_anticipate_candidates
+        # (stream=anticipate) sin colisión.
+        "rag_ft_active_queue_state",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_ft_active_queue_state ("
+            " item_id TEXT NOT NULL,"
+            " stream TEXT NOT NULL,"
+            " first_seen_ts TEXT NOT NULL,"
+            " last_shown_ts TEXT NOT NULL,"
+            " shown_count INTEGER NOT NULL DEFAULT 0,"
+            " snoozed_until_ts TEXT,"
+            " PRIMARY KEY (item_id, stream)"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_ft_active_queue_state_snoozed"
+            " ON rag_ft_active_queue_state(snoozed_until_ts)"
+            " WHERE snoozed_until_ts IS NOT NULL",
         ),
     ),
 )
@@ -61718,6 +61776,96 @@ def _count_active_learning_candidates(
     except Exception:
         return 0
     return int(row[0] or 0) if row else 0
+
+
+def _get_fine_tunning_retrieval_queue(
+    conn: "sqlite3.Connection",
+    *,
+    limit: int = 20,
+) -> list[dict]:
+    """Cola de queries de retrieval candidatas a labeling humano para `/fine_tunning`.
+
+    Selecciona queries de `rag_queries` con baja confianza (top_score < 0.15) en
+    los últimos 14 días, excluye queries triviales (length <= 4) y excluye las
+    que ya tienen feedback explícito en `rag_feedback` (match por q.q + ts
+    proximity, paridad con `_count_active_learning_candidates`). También excluye
+    items con un rating reciente en `rag_ft_panel_ratings` (stream='retrieval')
+    o snoozeados en `rag_ft_active_queue_state` (snoozed_until_ts > now).
+
+    Returns list[dict] con keys: item_id (str(q.id)), stream ('retrieval'),
+    label (q.q), top_score (float), ts (ISO str), paths (list[str] desde
+    paths_json), session_id (str | None — desde rag_queries.session). Cap
+    limit a 50. Silent-fail (devuelve []) si SQL falla.
+    """
+    safe_limit = max(1, min(int(limit), 50))
+    placeholders = ",".join(["?"] * len(_ACTIVE_LEARNING_TRIVIAL_QUERIES))
+    sql = f"""
+        SELECT q.id, q.q, q.top_score, q.ts, q.paths_json, q.session
+        FROM rag_queries q
+        LEFT JOIN rag_ft_panel_ratings ftr
+               ON ftr.stream = 'retrieval'
+              AND ftr.item_id = CAST(q.id AS TEXT)
+        LEFT JOIN rag_ft_active_queue_state fts
+               ON fts.stream = 'retrieval'
+              AND fts.item_id = CAST(q.id AS TEXT)
+        WHERE q.ts > datetime('now', '-14 days')
+          AND q.top_score IS NOT NULL
+          AND q.top_score < 0.15
+          AND length(q.q) > 4
+          AND q.q NOT IN ({placeholders})
+          AND NOT EXISTS (
+              SELECT 1 FROM rag_feedback f
+              WHERE f.q = q.q
+                AND ABS(julianday(f.ts) - julianday(q.ts)) < 1
+          )
+          AND ftr.id IS NULL
+          AND (fts.snoozed_until_ts IS NULL
+               OR fts.snoozed_until_ts < datetime('now'))
+        ORDER BY q.ts DESC
+        LIMIT ?
+    """
+    try:
+        rows = conn.execute(
+            sql,
+            (*_ACTIVE_LEARNING_TRIVIAL_QUERIES, safe_limit),
+        ).fetchall()
+    except Exception as exc:
+        try:
+            _silent_log("fine_tunning.retrieval_queue", exc)
+        except Exception:
+            pass
+        return []
+
+    out: list[dict] = []
+    for row in rows or ():
+        try:
+            qid, q_text, top_score, ts, paths_json, session = (
+                row[0], row[1], row[2], row[3], row[4], row[5]
+            )
+        except Exception:
+            continue
+        paths: list[str] = []
+        if paths_json:
+            try:
+                parsed = json.loads(paths_json)
+                if isinstance(parsed, list):
+                    paths = [str(p) for p in parsed if p is not None]
+            except Exception:
+                paths = []
+        try:
+            score_f = float(top_score) if top_score is not None else 0.0
+        except Exception:
+            score_f = 0.0
+        out.append({
+            "item_id": str(qid),
+            "stream": "retrieval",
+            "label": q_text or "",
+            "top_score": score_f,
+            "ts": ts or "",
+            "paths": paths,
+            "session_id": session if session else None,
+        })
+    return out
 
 
 def _send_active_learning_nudge_wa(n: int, since_days: int) -> bool:

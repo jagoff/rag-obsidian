@@ -97,20 +97,24 @@ def test_ensure_telemetry_tables_idempotent(tmp_path):
     # `_services_spec()` lee este pref antes de generar el plist) +
     # 1 anticipate feedback (rag_anticipate_feedback, 2026-04-30 — movida
     # de DDL standalone en rag_anticipate/feedback.py al DDL central para
-    # que aparezca en schema checks y rollback loop) =
-    # 53 tables total tras restaurar las 5 dormant (rag_promises,
+    # que aparezca en schema checks y rollback loop) +
+    # 2 fine-tuning panel (rag_ft_panel_ratings, rag_ft_active_queue_state,
+    # 2026-05-01 — ratings de la UI /fine_tunning + estado de cola activa
+    # por stream; PK compuesto en queue_state para evitar colisión entre
+    # item_id numéricos de distintos streams) =
+    # 55 tables total tras restaurar las 5 dormant (rag_promises,
     # rag_negotiations*, rag_style_fingerprints, rag_behavior_priors_wa)
-    # + agregar rag_anticipate_feedback al DDL central. Las dormant
-    # mantienen la infra de tabla para que tests del CRUD pasen y la
-    # feature pueda activarse en el futuro sin migration manual; el
+    # + agregar rag_anticipate_feedback al DDL central + 2 ft-panel tables.
+    # Las dormant mantienen la infra de tabla para que tests del CRUD pasen
+    # y la feature pueda activarse en el futuro sin migration manual; el
     # daemon-activation gate vive en `_services_spec()`.
     expected = {name for name, _ in rag._TELEMETRY_DDL}
     assert expected.issubset(after)
     # Sanity floor: si esto baja accidentalmente, alguien borró tablas en
     # _TELEMETRY_DDL sin migration. El upper bound no se trackea acá — la
     # lista crece naturalmente con cada feature nueva.
-    assert len(expected) >= 53, (
-        f"_TELEMETRY_DDL bajó de 53 tablas (ahora {len(expected)}) — "
+    assert len(expected) >= 55, (
+        f"_TELEMETRY_DDL bajó de 55 tablas (ahora {len(expected)}) — "
         "verificar que ninguna feature perdió su tabla"
     )
     # Fix #2 — rag_anticipate_feedback debe estar en el DDL central

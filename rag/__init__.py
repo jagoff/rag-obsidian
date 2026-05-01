@@ -49811,6 +49811,7 @@ def _implicit_feedback_plist(rag_bin: str) -> str:
         f'{rag_bin} feedback detect-requery --json && '
         f'{rag_bin} feedback classify-sessions --json'
     )
+    cmd_xml = cmd.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -49820,7 +49821,7 @@ def _implicit_feedback_plist(rag_bin: str) -> str:
   <array>
     <string>/bin/bash</string>
     <string>-c</string>
-    <string>{cmd}</string>
+    <string>{cmd_xml}</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
@@ -50515,6 +50516,60 @@ def _brief_auto_tune_plist(rag_bin: str) -> str:
 """
 
 
+def _daemon_watchdog_plist(rag_bin: str) -> str:
+    """Self-healing loop para el control plane de daemons launchd.
+
+    Corre `rag daemons reconcile --apply --gentle` cada 5 minutos para
+    retry-ear daemons con exit ≠ 0 + kickstart-ear overdues (turnos que
+    no dispararon en su StartInterval esperado por Mac asleep / launchd
+    backoff / external restarts).
+
+    `--gentle` NO regenera plists ni bootea huérfanos — solo re-intenta
+    los ya registrados. Para cambios de infraestructura profundos, el user
+    corre `rag setup` de forma interactiva.
+
+    `RunAtLoad=true` + `StartInterval=300` produce un primer tick inmediato
+    cuando el plist se bootstrappa (útil post-reboot del Mac para hacer
+    catchup de lo que se perdió durante shutdown), después cada 5 min.
+
+    `Throttle=60` evita ráfagas si el comando termina muy rápido —
+    mínimo 60s entre runs.
+
+    Reemplaza el catchup post-sleep que tenía el difunto `serve-watchdog`
+    (deprecado 2026-05-01), pero ahora para TODO el stack de daemons
+    en lugar de solo `serve`.
+    """
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-daemon-watchdog</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{rag_bin}</string>
+    <string>daemons</string>
+    <string>reconcile</string>
+    <string>--apply</string>
+    <string>--gentle</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+    <key>RAG_STATE_SQL</key><string>1</string>
+  </dict>
+  <key>StartInterval</key><integer>300</integer>
+  <key>RunAtLoad</key><true/>
+  <key>Throttle</key><integer>60</integer>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/daemon-watchdog.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/daemon-watchdog.error.log</string>
+</dict>
+</plist>
+"""
+
+
 def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
     """Return [(label, plist_filename, plist_xml), ...].
 
@@ -50723,6 +50778,15 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
         ("com.fer.obsidian-rag-brief-auto-tune",
          "com.fer.obsidian-rag-brief-auto-tune.plist",
          _brief_auto_tune_plist(rag_bin)),
+        # Daemon watchdog — T4 del control plane (2026-05-01). Self-healing
+        # loop que corre `rag daemons reconcile --apply --gentle` cada 5min
+        # para retry-ear daemons fallidos + kickstart-ear overdues sin tocar
+        # el registro de plists. RunAtLoad=true + StartInterval=300 → primer
+        # tick inmediato post-bootstrap, después cada 5min. Reemplaza el
+        # catchup del difunto serve-watchdog, ahora para TODO el stack.
+        ("com.fer.obsidian-rag-daemon-watchdog",
+         "com.fer.obsidian-rag-daemon-watchdog.plist",
+         _daemon_watchdog_plist(rag_bin)),
     ]
 
 
@@ -51007,7 +51071,14 @@ def _compute_reconcile_actions(*, gentle: bool = False) -> list[dict]:
     pendiente — no implementada en esta versión.
     """
     actions: list[dict] = []
+    # Self-skip guard: el watchdog ejecuta este reconcile desde dentro del
+    # daemon-watchdog mismo. Auto-kickstart-earse es loop garantizado:
+    # subprocess timea (10s en kickstart -k), el watchdog reporta exit=1,
+    # próximo tick lo ve last_exit=1 runs<3, agrega action self-kickstart.
+    _SELF_LABEL = "com.fer.obsidian-rag-daemon-watchdog"
     for label, category in _all_daemon_labels():
+        if label == _SELF_LABEL:
+            continue
         row = _gather_daemon_status(label, category)
         state = row.get("state")
         plist_exists = _plist_on_disk(label)
@@ -51084,32 +51155,38 @@ def _execute_reconcile_action(action: dict) -> dict:
     kind = action["kind"]
     uid = os.getuid()
 
+    def _safe_run(args: list[str], timeout: int = 10) -> dict:
+        """Wrap subprocess.run con catch de TimeoutExpired y OSError.
+
+        Si launchctl cuelga (ej. mood-poll cron en flight) propagar
+        TimeoutExpired uncaught tumba el reconcile entero — los kickstarts
+        siguientes no se ejecutan. Mejor: trato timeout como exit=-2 y sigo.
+        """
+        try:
+            p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+            return {"rc": p.returncode, "stderr": p.stderr or None}
+        except subprocess.TimeoutExpired:
+            return {"rc": -2, "stderr": f"timeout {timeout}s"}
+        except OSError as exc:
+            return {"rc": -3, "stderr": f"OSError: {exc}"}
+
     if kind == "bootstrap":
         plist_path = action.get("plist_path")
         if plist_path is None:
             return {"ok": False, "exit_code": -1, "stderr": "plist_path missing"}
-        proc = subprocess.run(
-            ["launchctl", "bootstrap", f"gui/{uid}", str(plist_path)],
-            capture_output=True, text=True, timeout=10,
-        )
-        ok = proc.returncode in (0, 37)
-        return {"ok": ok, "exit_code": proc.returncode, "stderr": proc.stderr or None}
+        r = _safe_run(["launchctl", "bootstrap", f"gui/{uid}", str(plist_path)])
+        ok = r["rc"] in (0, 37)
+        return {"ok": ok, "exit_code": r["rc"], "stderr": r["stderr"]}
 
     elif kind == "bootout":
-        proc = subprocess.run(
-            ["launchctl", "bootout", f"gui/{uid}/{label}"],
-            capture_output=True, text=True, timeout=10,
-        )
-        ok = proc.returncode in (0, 3)
-        return {"ok": ok, "exit_code": proc.returncode, "stderr": proc.stderr or None}
+        r = _safe_run(["launchctl", "bootout", f"gui/{uid}/{label}"])
+        ok = r["rc"] in (0, 3)
+        return {"ok": ok, "exit_code": r["rc"], "stderr": r["stderr"]}
 
     elif kind == "kickstart":
-        proc = subprocess.run(
-            ["launchctl", "kickstart", "-k", f"gui/{uid}/{label}"],
-            capture_output=True, text=True, timeout=10,
-        )
-        ok = proc.returncode == 0
-        return {"ok": ok, "exit_code": proc.returncode, "stderr": proc.stderr or None}
+        r = _safe_run(["launchctl", "kickstart", "-k", f"gui/{uid}/{label}"])
+        ok = r["rc"] == 0
+        return {"ok": ok, "exit_code": r["rc"], "stderr": r["stderr"]}
 
     return {"ok": False, "exit_code": -1, "stderr": f"kind desconocido: {kind}"}
 

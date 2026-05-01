@@ -249,8 +249,10 @@ def test_services_spec_total_count():
     # `com.fer.obsidian-rag-serve-watchdog` por el split-brain con el
     # FastAPI web server (ver test_services_spec_excludes_serve_and_
     # serve_watchdog para el rationale).
+    # Bump 33 → 34 (T4, 2026-05-01): `daemon-watchdog` — self-healing
+    # loop cada 5min via `rag daemons reconcile --apply --gentle`.
     #
-    # Base infra (22):
+    # Base infra (23):
     #   watch, web (agregado 2026-04-22 — pre-fix estaba instalado
     #   manualmente fuera de setup), digest, morning, today, wake-up
     #   (2026-04-24 — orquestador nocturno 04:00), emergent, patterns,
@@ -266,7 +268,8 @@ def test_services_spec_total_count():
     #   maintenance (2026-04-21 hardening), consolidate, vault-cleanup
     #   (2026-04-27), anticipate (2026-04-24), brief-auto-tune
     #   (2026-04-29 — Sunday 03:00 shift de morning/today/digest si el
-    #   user mutea consistentemente).
+    #   user mutea consistentemente), daemon-watchdog (2026-05-01 T4
+    #   — self-healing).
     #
     # Cross-source ingesters (7):
     #   ingest-whatsapp, ingest-gmail, ingest-reminders, ingest-calendar
@@ -284,8 +287,8 @@ def test_services_spec_total_count():
     #   vocab nightly 03:15 con cmd `whisper vocab refresh` post
     #   2026-05-01).
     #
-    # Total: 22 base + 7 ingesters + 4 helpers = 33.
-    assert len(specs) == 33
+    # Total: 23 base + 7 ingesters + 4 helpers = 34.
+    assert len(specs) == 34
 
 
 def test_services_spec_includes_maintenance():

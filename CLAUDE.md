@@ -1552,14 +1552,33 @@ Lista de plists registrados (cualquier `obsidian-rag-*` que `launchctl list` mue
 | `com.fer.obsidian-rag-ingest-safari` | cada 6h 15min | `rag index --source safari` | Safari History + Bookmarks + Reading List ingester |
 | `com.fer.obsidian-rag-ingest-pillow` | 1×/día 09:30 | `rag index --source pillow` | Pillow ingester — sleep tracker iOS, lee `~/Library/Mobile Documents/com~apple~CloudDocs/Sueño/PillowData.txt` (Core Data dump sync iCloud) → `rag_sleep_sessions`. Silent-fail si Pillow no está instalado / sync roto. CLI: `rag sleep show/patterns/ingest` |
 | `com.fer.obsidian-rag-mood-poll` | cada 30min | `rag mood-poll` | Mood poll daemon — **UI no cableada** (mood signals NO se renderizan en home.v2 actualmente) |
+| `com.fer.obsidian-rag-daemon-watchdog` | 5min | `rag daemons reconcile --apply --gentle` | **(nuevo 2026-05-01)** Control plane watchdog — retry de daemons en exit≠0 + kickstart-overdue. Reemplaza el catchup post-sleep que tenía el difunto `serve-watchdog`. |
 
-**Nota 2026-04-30**: los daemons `cloudflare-tunnel`, `cloudflare-tunnel-watcher`, `lgbm-train`, `paraphrases-train`, `synth-refresh` están instalados manualmente — no son regenerados por `rag setup` (no figuran en `_services_spec()`). Si necesitás reinstalarlos, copialos de tu backup o regenerá manualmente desde el código que los originó.
+**Nota 2026-05-01**: los daemons listados con `(manual)` en la tabla arriba están instalados a mano y NO son regenerados por `rag setup` (no figuran en `_services_spec()`). Quedan trackeados por el control plane vía `_services_spec_manual()` — `rag daemons status` los muestra con `category=manual_keep`. Lista actual: `cloudflare-tunnel`, `cloudflare-tunnel-watcher`, `lgbm-train`, `paraphrases-train`, `synth-refresh`, `spotify-poll`, `log-rotate`.
 
 Si el listado anterior queda desactualizado, el source de verdad es la lista de tuplas en [`rag/__init__.py`](rag/__init__.py) función `_services_spec()` — `grep -n "_services_spec\|com.fer.obsidian-rag-" rag/__init__.py | head -80`.
 
 ### Bypass: `rag setup` también funciona
 
 Si la feature shippea junto con cambios al `rag setup` (o si el user prefiere reinstalar todo en bloque), `rag setup` instala/recarga TODOS los plists de la tabla anterior. Es más invasivo (puede recargar daemons que ya estaban corriendo bien) pero menos manual. Como compromiso: para plists nuevos individuales → recipe del checklist. Para refactors masivos → `rag setup`.
+
+### Control plane: `rag daemons`
+
+Control plane unificado para visibilidad + reconciliación + self-healing del stack launchd. Reemplaza el ritual manual de `launchctl list | grep obsidian-rag` + `launchctl print` + `tail` de logs cuando algo no está corriendo bien.
+
+Subcomandos:
+
+- `rag daemons status [--json --unhealthy-only]` — tabla de estado actual (loaded? running? last_exit? overdue? category).
+- `rag daemons reconcile [--apply --dry-run --gentle]` — converge drift entre `_services_spec()` y lo que realmente está cargado (default dry-run; `--apply` hace los cambios; `--gentle` evita acciones destructivas).
+- `rag daemons doctor` — diagnóstico humano + remediation sugerida por daemon problemático (lee logs, parsea exit codes, propone fix).
+- `rag daemons retry <label>` — kickstart -k de un daemon puntual (acepta slug corto tipo `web` o label completo `com.fer.obsidian-rag-web`).
+- `rag daemons kickstart-overdue` — kickstart de los daemons marcados `overdue=true` (catchup post-sleep manual cuando el Mac estuvo dormido y se saltearon `StartCalendarInterval` schedules).
+
+El daemon `com.fer.obsidian-rag-daemon-watchdog` corre `reconcile --apply --gentle` cada 5min automáticamente. `--gentle` solo retry-ea daemons en exit≠0 + kickstart-ea overdues, NO bootea huérfanos ni regenera plists — el watchdog corre desatendido y no debe tomar decisiones destructivas. Para reconciliación agresiva (incluye bootout de huérfanos + regeneración de plists drifteados) hay que correr `rag daemons reconcile --apply` a mano.
+
+Las acciones del control plane (retry, kickstart, bootout, bootstrap) se loggean a `rag_daemon_runs` en `telemetry.db` con retention 90d. Útil para audit post-mortem cuando algo se cae a las 4am.
+
+Workflow típico: `rag daemons status` para ver qué hay; `rag daemons doctor` para diagnosticar; `rag daemons reconcile --apply` para corregir drift agresivamente; el watchdog corre solo cada 5min sin que tengas que llamarlo.
 
 ### Cuándo NO instalar el plist en el commit
 

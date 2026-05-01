@@ -88,6 +88,73 @@ else
   log "UNHEALTHY  — http=${http_code} fails=${fails}/${FAIL_THRESHOLD} url=${URL}"
 fi
 
+# ── Ollama zombie-runner detection (2026-04-30) ─────────────────────────
+#
+# Caso real: 2026-04-30 a la noche el rag-serve quedó respondiendo HTTP 000
+# durante horas y el watchdog no lograba recuperarlo. Root cause: el
+# runner de Ollama de `bge-m3` (PID 96534) estaba zombie — `/api/embed`
+# de bge-m3 timeouteaba a 30s+ aunque Ollama serve mismo respondía OK
+# en `/api/tags`. El kickstart al rag-serve no servía para nada: el
+# nuevo proceso pegaba al mismo Ollama colgado y volvía a quedar
+# inutilizable.
+#
+# Fix: cuando el rag-serve está UNHEALTHY por OLLAMA_PROBE_THRESHOLD
+# ticks consecutivos, probamos si Ollama embed está colgado. Si sí,
+# matamos todos los `ollama runner` zombies — Ollama serve los respawna
+# en segundos cuando llega el próximo embed/chat call. Esto desbloquea
+# al rag-serve sin necesidad de kickstart.
+#
+# Knob para deshabilitar: RAG_OLLAMA_PROBE_DISABLED=1 (env var).
+# Threshold: RAG_OLLAMA_PROBE_THRESHOLD (default 3 = 3min de fails
+# antes de sospechar de Ollama). Cooldown propio para evitar killing
+# runners en loop si el problema NO es runner zombie sino otro.
+
+OLLAMA_PROBE_THRESHOLD="${RAG_OLLAMA_PROBE_THRESHOLD:-3}"
+OLLAMA_KILL_COOLDOWN_SEC="${RAG_OLLAMA_KILL_COOLDOWN_SEC:-300}"  # 5min
+last_ollama_kill="${last_ollama_kill:-0}"
+
+if [ -z "${RAG_OLLAMA_PROBE_DISABLED:-}" ] \
+   && [ "${fails}" -ge "${OLLAMA_PROBE_THRESHOLD}" ] \
+   && ! [[ "${http_code}" =~ ^2 ]]; then
+  ollama_now=$(date +%s)
+  ollama_since=$(( ollama_now - last_ollama_kill ))
+  if [ "${ollama_since}" -gt "${OLLAMA_KILL_COOLDOWN_SEC}" ]; then
+    # Probe directo: ¿el embed de bge-m3 responde? Es el upstream
+    # típico del rag-serve para retrieve_only y la causa del
+    # case real 2026-04-30. Timeout corto (5s) — un embed warm
+    # corre en <500ms; si tarda >5s es zombie.
+    embed_code=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' \
+      -X POST http://127.0.0.1:11434/api/embed \
+      -H "Content-Type: application/json" \
+      -d '{"model":"bge-m3","input":"watchdog ping"}' 2>/dev/null || echo "000")
+
+    if ! [[ "${embed_code}" =~ ^2 ]]; then
+      log "OLLAMA_HUNG — bge-m3 embed http=${embed_code} → killing zombie runners"
+      # `pgrep -f 'ollama runner'` lista PIDs de TODOS los runners
+      # (bge-m3, qwen2.5:7b, lo que esté loaded). Killealos a todos.
+      # Ollama serve los respawn cuando llega el próximo call. Trade-
+      # off aceptado: ~10s de "todos los modelos cold" mientras
+      # Ollama recarga, vs horas de rag-serve down.
+      killed=$(pgrep -f 'ollama runner' | tr '\n' ' ' | sed 's/ $//')
+      if [ -n "${killed}" ]; then
+        # shellcheck disable=SC2086
+        kill -9 ${killed} 2>>"${LOG}" || true
+        log "OLLAMA_KILLED — runner pids=${killed} (Ollama serve respawn auto)"
+        last_ollama_kill=${ollama_now}
+        # Reset fails — al próximo tick el rag-serve debería responder OK
+        # cuando Ollama recargó los modelos.
+        fails=0
+      else
+        log "OLLAMA_NO_RUNNERS — pgrep no encontró ollama runner procs (raro)"
+      fi
+    else
+      log "OLLAMA_OK — embed http=${embed_code} (rag-serve hung pero Ollama no es la causa)"
+    fi
+  else
+    log "OLLAMA_PROBE_COOLDOWN — since_last_kill=${ollama_since}s < ${OLLAMA_KILL_COOLDOWN_SEC}s"
+  fi
+fi
+
 # Decide restart.
 now=$(date +%s)
 since_last=$(( now - last_restart ))
@@ -245,5 +312,6 @@ tmp="${STATE}.tmp.$$"
 {
   printf 'fails=%s\n' "${fails}"
   printf 'last_restart=%s\n' "${last_restart}"
+  printf 'last_ollama_kill=%s\n' "${last_ollama_kill:-0}"
 } > "${tmp}"
 mv -f "${tmp}" "${STATE}"

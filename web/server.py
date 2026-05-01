@@ -23182,11 +23182,15 @@ def fine_tunning_queue(limit: int = 20) -> dict:
                         meta_row = cur_w.fetchone()
                         if meta_row:
                             meta_table = meta_row[0]
-                            # Sample WA chunks recientes, capped a 8 (no inflar la cola)
+                            # Sample WA chunks recientes, capped a 8 (no inflar la cola).
+                            # Schema real: source/file/note/extra_json son columnas
+                            # directas (no hay meta_json). chat_jid/sender viven en
+                            # extra_json o se infieren del file/folder path.
                             cur_w = _wa_conn.execute(f"""
-                                SELECT id, document, meta_json, created_ts
+                                SELECT chunk_id, document, file, folder, note,
+                                       extra_json, created_ts
                                 FROM {meta_table}
-                                WHERE json_extract(meta_json, '$.source') = 'whatsapp'
+                                WHERE source = 'whatsapp'
                                   AND created_ts >= unixepoch('now', '-3 days')
                                 ORDER BY created_ts DESC
                                 LIMIT 8
@@ -23217,16 +23221,20 @@ def fine_tunning_queue(limit: int = 20) -> dict:
                         excluded_snoozed = {r[0] for r in cur_excl2.fetchall()}
                         excluded = excluded_rated | excluded_snoozed
 
-                        for chunk_id, doc_text, meta_json, created_ts in wa_rows:
+                        for chunk_id, doc_text, file_, folder, note, extra_json, created_ts in wa_rows:
                             sid = str(chunk_id)
                             if sid in excluded:
                                 continue
                             try:
-                                meta = _json_wa.loads(meta_json) if meta_json else {}
+                                extra = _json_wa.loads(extra_json) if extra_json else {}
                             except Exception:
-                                meta = {}
-                            chat_jid = meta.get("chat_jid") or meta.get("chat") or "?"
-                            sender = meta.get("from") or meta.get("sender") or "?"
+                                extra = {}
+                            # chat_jid: del extra_json o inferido del file path
+                            # (ej. 'whatsapp://5491155555555@s.whatsapp.net/msg-id')
+                            chat_jid = (extra.get("chat_jid") or extra.get("chat")
+                                        or (note or file_ or "?"))
+                            sender = (extra.get("from") or extra.get("sender")
+                                      or extra.get("sender_name") or "?")
                             short_doc = (doc_text or "")[:100].replace("\n", " ")
                             if len(doc_text or "") > 100:
                                 short_doc += "…"

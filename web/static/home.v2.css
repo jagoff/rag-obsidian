@@ -1735,6 +1735,11 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 }
 .panel[data-collapsed="true"] {
   min-height: 0;
+  /* Sin esto, el grid (align-items: stretch por default) estira la caja
+     colapsada a la altura del panel más alto del row → "solo se minimiza
+     el texto, la caja sigue grande". align-self: start hace que la celda
+     se ajuste al alto real del header colapsado. */
+  align-self: start;
 }
 .panel[data-collapsed="true"] .panel-head {
   border-bottom: 0;

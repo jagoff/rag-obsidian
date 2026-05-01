@@ -16118,12 +16118,29 @@ def warmup_async() -> None:
         # ollama daemon son PIDs distintos). Estos dos sí se serializan
         # entre sí dentro del mismo thread para respetar el VRAM
         # presupuesto de ollama.
+        #
+        # CRITICAL — num_ctx debe coincidir con el valor de RUNTIME
+        # (CHAT_OPTIONS / HELPER_OPTIONS / _WEB_CHAT_NUM_CTX). Histórico
+        # 2026-05-01: este warmup pre-cargaba con num_ctx=64 (intento de
+        # acelerar el ping con un context mínimo). Resultado: ollama
+        # dejaba el modelo en VRAM con context_length=64 (visible en
+        # `/api/ps`), y el primer call real de runtime con num_ctx=4096
+        # (chat web, drafts del listener WhatsApp) forzaba un KV cache
+        # reinit en MPS → 60-120s bajo memory pressure → TODOS los
+        # drafts del bot WhatsApp timeouteaban con
+        # "❌ no pude generar draft" en RagNet. Ver el doc-block extenso
+        # en `CHAT_OPTIONS.num_ctx` (línea ~2675) y la fix gemela del
+        # 2026-04-30 en el listener TS (commit 93a6180 — "num_ctx
+        # mismatch con web/server.py 8192 vs 4096"). El fix correcto es
+        # alinear el warmup al num_ctx de runtime, no al ping mínimo.
         try:
             _chat_model = resolve_chat_model()
             ollama.chat(
                 model=_chat_model,
                 messages=[{"role": "user", "content": "ok"}],
-                options={"num_predict": 1, "num_ctx": 64, "temperature": 0},
+                options={"num_predict": 1,
+                         "num_ctx": CHAT_OPTIONS["num_ctx"],
+                         "temperature": 0},
                 keep_alive=chat_keep_alive(_chat_model),
             )
         except Exception:
@@ -16132,7 +16149,9 @@ def warmup_async() -> None:
             ollama.chat(
                 model=HELPER_MODEL,
                 messages=[{"role": "user", "content": "ok"}],
-                options={"num_predict": 1, "num_ctx": 64, "temperature": 0},
+                options={"num_predict": 1,
+                         "num_ctx": HELPER_OPTIONS["num_ctx"],
+                         "temperature": 0},
                 keep_alive=OLLAMA_KEEP_ALIVE,
             )
         except Exception:

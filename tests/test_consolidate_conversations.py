@@ -288,6 +288,100 @@ def test_unique_path_returns_candidate_if_free(tmp_vault: Path):
     assert cc._unique_path(p) == p
 
 
+# ── Filename safety (regression: 2026-05-01 malformed paths) ─────────────
+
+def test_safe_stem_strips_backticks_parens_and_caps_length():
+    # Caso real del incidente del 2026-05-01: el LLM devolvió la primera
+    # oración del body como "título" y traía backticks + paréntesis sin
+    # balancear. La versión vieja sólo quitaba `/\:\n` → archivo fue creado
+    # como `... (\`01-Projects Coaching Autoridad.md\`.md`.
+    raw = "Según tus notas, en la nota sobre autoridad (`01-Projects/Coaching/Autoridad.md`"
+    stem = cc._safe_stem(raw)
+    assert "`" not in stem
+    assert "(" not in stem and ")" not in stem
+    assert "/" not in stem and "\\" not in stem
+    assert len(stem) <= 80
+    # No trailing punctuation noise.
+    assert not stem.endswith((" ", ".", ",", ";", ":", "-"))
+
+
+def test_safe_stem_preserves_letters_and_collapses_spaces():
+    raw = "  Tema  con   espacios   raros / barra  "
+    stem = cc._safe_stem(raw)
+    assert "  " not in stem  # no double spaces
+    assert "/" not in stem
+    assert stem.startswith("Tema con espacios raros")
+
+
+def test_safe_stem_falls_back_to_timestamp_when_empty():
+    # Title compuesto sólo de noise → todo se tira → fallback timestamp.
+    stem = cc._safe_stem("```()[]")
+    assert stem.startswith("consolidated-")
+
+
+def test_synthesize_cluster_uses_h1_when_present(tmp_vault: Path, monkeypatch):
+    """Regression: el LLM ahora devuelve `# H1` en la primera línea y
+    queremos agarrar EL H1, no la oración descriptiva que viene después."""
+    p1 = _seed_conversation(tmp_vault, session_id="x", question="q", answer="a")
+    items = cc.scan_conversations(
+        tmp_vault / "04-Archive" / "99-obsidian-system" / "99-AI" / "conversations",
+        window_days=14,
+    )
+
+    class _FakeChatResp(dict):
+        pass
+
+    fake_body = (
+        "# Autoridad y coaching\n"
+        "\n"
+        "Según tus notas, en la nota sobre autoridad (`01-Projects/Coaching/Autoridad.md`) "
+        "se discute el tema central.\n"
+        "\n## Puntos clave\n- Foo\n"
+    )
+
+    class _FakeOllama:
+        def chat(self, **kwargs):
+            return {"message": {"content": fake_body}}
+
+    monkeypatch.setitem(__import__("sys").modules, "ollama", _FakeOllama())
+    monkeypatch.setattr(cc.rag, "resolve_chat_model", lambda: "qwen2.5:7b")
+    title, body = cc.synthesize_cluster(items)
+    assert title == "Autoridad y coaching"
+    assert body == fake_body.strip()
+
+
+def test_synthesize_cluster_rejects_long_prose_first_line(tmp_vault: Path, monkeypatch):
+    """Si el LLM ignoró el directive de H1 y devolvió una oración larga
+    como primera línea, NO usarla como título — fallback a la primera
+    pregunta del cluster, que tiene más signal y es más corta."""
+    p1 = _seed_conversation(
+        tmp_vault, session_id="x",
+        question="qué dice sobre autoridad", answer="...",
+    )
+    items = cc.scan_conversations(
+        tmp_vault / "04-Archive" / "99-obsidian-system" / "99-AI" / "conversations",
+        window_days=14,
+    )
+    fake_body = (
+        "Según tus notas, en la nota sobre autoridad (`01-Projects/Coaching/Autoridad.md`), "
+        "se discute mucho sobre la voz interna.\n"
+        "\n## Puntos clave\n- Foo\n"
+    )
+
+    class _FakeOllama:
+        def chat(self, **kwargs):
+            return {"message": {"content": fake_body}}
+
+    monkeypatch.setitem(__import__("sys").modules, "ollama", _FakeOllama())
+    monkeypatch.setattr(cc.rag, "resolve_chat_model", lambda: "qwen2.5:7b")
+    title, _ = cc.synthesize_cluster(items)
+    # Title must NOT contain backticks or parens (the prose had them).
+    assert "`" not in title and "(" not in title
+    assert len(title) <= 80
+    # Title should derive from the first question, not the long prose.
+    assert "autoridad" in title.lower()
+
+
 # ── Index exclusion ───────────────────────────────────────────────────────
 
 def test_is_excluded_covers_archived_conversations():

@@ -293,8 +293,11 @@ _SYNTH_SYSTEM = (
     "\n"
     "Requisitos:\n"
     "- Escribí en español rioplatense, natural y directo.\n"
-    "- Devolvé SOLO el body de la nota (sin frontmatter, sin backticks).\n"
-    "- Empezá con una oración que describa el tema central.\n"
+    "- Devolvé SOLO el body de la nota (sin frontmatter).\n"
+    "- PRIMERA LÍNEA: un título H1 corto (`# Título`), máximo 60 caracteres, "
+    "sin comillas, sin backticks, sin paréntesis, sin punto final. "
+    "Tema central destilado en pocas palabras (3-8 palabras).\n"
+    "- Después una línea en blanco, y una oración que describa el tema central.\n"
     "- Después agrupá en secciones con `##`: puntos clave, decisiones tomadas, "
     "preguntas abiertas. Omití secciones vacías.\n"
     "- Preservá los [[wikilinks]] que aparecen en el input.\n"
@@ -338,25 +341,67 @@ def synthesize_cluster(
     body = (resp.get("message", {}).get("content") or "").strip()
     if not body:
         raise RuntimeError("empty synthesis response")
-    # Title heuristic: first non-empty line that isn't a heading marker.
+    # Title extraction: prefer the H1 the prompt asks for; fall back to the
+    # first short non-empty line; otherwise synthesise from cluster date.
+    # Both branches go through `_safe_stem` for filesystem safety, so this
+    # only has to produce a *human-friendly* string — not a final filename.
     title = ""
     for ln in body.splitlines():
         ln = ln.strip()
         if not ln:
             continue
-        # strip leading #, **, ", bullets
-        title = re.sub(r"^[#*\-\"\s]+", "", ln).rstrip(" .:;")
-        if title:
-            break
+        # Strip leading markdown markers (#, **, *, -, quotes, whitespace)
+        candidate = re.sub(r"^[#*\-\"\s]+", "", ln).rstrip(" .:;")
+        if not candidate:
+            continue
+        # Reject lines that look like full sentences (long, mid-sentence
+        # punctuation) — the LLM ignored the H1 directive and started with
+        # prose. Generate a synthetic title from the first question instead.
+        if len(candidate) <= 60 and not re.search(r"[`(\[].*[)\]`]|, ", candidate):
+            title = candidate
+        break
     if not title:
-        title = f"Conversaciones consolidadas {cluster[0].created.date().isoformat()}"
+        # Fallback: derive from the most recent conversation's first question.
+        # Better than `Conversaciones consolidadas <date>` because it carries
+        # topical signal forward.
+        first_q = (cluster[0].first_question or "").strip()
+        if first_q:
+            title = re.sub(r"\s+", " ", first_q)[:60].rstrip(" .,;:?¿!¡")
+        if not title:
+            title = f"Conversaciones consolidadas {cluster[0].created.date().isoformat()}"
     return title[:80], body
 
 
 # ── Writers ────────────────────────────────────────────────────────────────
 
 def _safe_stem(title: str) -> str:
-    safe = re.sub(r"[/\\:\n]", " ", title).strip()
+    """Filesystem-safe filename stem for a consolidated note.
+
+    Defense in depth: even if the title-extractor upstream slips through
+    a long sentence with markdown noise (backticks, parens, brackets,
+    code-fence remnants), this function guarantees the resulting filename
+    is short, balanced, and free of characters that break:
+      - Obsidian wikilinks (backticks, brackets, pipes)
+      - Markdown rendering (asterisks, underscores at word edges)
+      - Filesystems / git (`/`, `\\`, `:`, `<`, `>`, `|`, `?`, `*`, control)
+      - Visual cleanliness (trailing punctuation, double spaces)
+
+    Aprendido el 2026-05-01: el daemon creó dos archivos con paths como
+    `03-Resources/Según tus notas, en la nota sobre autoridad
+    (`01-Projects Coaching Autoridad.md`.md` porque la versión vieja sólo
+    quitaba `/\\:\\n`. Ahora se sanitiza agresivo y se capa a 80 chars.
+    """
+    # 1) Remove markdown / Obsidian noise (kept lossy by design).
+    safe = re.sub(r"[`'\"*\[\]()<>{}|?]", "", title)
+    # 2) Path separators + control whitespace → single space.
+    safe = re.sub(r"[/\\:\n\r\t]", " ", safe)
+    # 3) Collapse runs of whitespace.
+    safe = re.sub(r"\s+", " ", safe).strip()
+    # 4) Trim trailing punctuation that filenames hate visually.
+    safe = safe.rstrip(" .,;:-")
+    # 5) Cap to 80 chars (HFS+/APFS allow much more, but Obsidian sidebars
+    #    truncate visually around there and git status output gets ugly).
+    safe = safe[:80].rstrip(" .,;:-")
     return safe or datetime.now().strftime("consolidated-%Y%m%d-%H%M%S")
 
 

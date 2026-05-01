@@ -11992,7 +11992,18 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # need a manual panic-button press.
         if not _ollama_alive(timeout=2.0) or not _ollama_chat_probe(timeout_s=6.0):
             print("[ollama-preflight] stuck-load detected — auto-restarting", flush=True)
-            if not _ollama_restart_if_stuck() or not _ollama_chat_probe(timeout_s=8.0):
+            # Post-restart probe needs to cover a real cold-load:
+            # brew/launchd bounce (~3s) + qwen2.5:7b cold-load (5-10s on
+            # M-series) + 1300-token system prefill (~2.5s on first hit)
+            # + 1 token decode (~100ms). 8s no alcanzaba — el restart sí
+            # funcionaba (logs ~2026-05-01 mostraron `recovered via
+            # restart` poco después), pero el probe timeouteaba y emitíamos
+            # "Auto-restart falló" cuando en realidad el daemon estaba
+            # sano. La request siguiente sí completaba (ttft~60-105s)
+            # pero el user veía el banner rojo igual. 25s da margen real
+            # sin ahogar el spinner del frontend más allá de lo razonable
+            # para un cold-load.
+            if not _ollama_restart_if_stuck() or not _ollama_chat_probe(timeout_s=25.0):
                 yield _sse("error", {
                     "message": "Ollama no responde (stuck-load). Auto-restart falló. "
                     "Probá: brew services restart ollama",

@@ -824,29 +824,50 @@ def predict_mood_tomorrow(
     target: str = _PREDICT_TARGET,
     features: list[str] | None = None,
 ) -> dict[str, Any] | None:
-    """Predice `mood_score` de mañana usando LinearRegression sobre las
-    features (con lag-1) de los últimos `days` días + features de hoy
-    como input.
+    """Predice `mood_score` de mañana usando RidgeCV sobre las features
+    (lag-1) de los últimos `days` días + features de hoy como input.
 
     Algoritmo:
       1. Colectar métricas de los últimos `days` días.
       2. Build training data: cada row es (features[t-1] → mood[t]).
-      3. Si tenemos < `_PREDICT_MIN_DAYS` rows entrenables, devolver None.
-      4. Fit `LinearRegression`.
-      5. Tomar features de HOY (que predicen MAÑANA).
-      6. Predecir + calcular R² como confidence.
-      7. Devolver top features por |coef * value| (qué features
-         contribuyen más a la predicción específica de mañana).
+      3. Si tenemos < `_PREDICT_MIN_DAYS` rows entrenables → None.
+      4. Fit `RidgeCV` (alpha auto-seleccionada por LOO interno) con
+         fallback a `LinearRegression` si Ridge falla.
+      5. Cross-validation R² out-of-sample con `TimeSeriesSplit`
+         (2-5 folds según n) → eso es `confidence`. NO usamos R²
+         in-sample como antes — eso era overconfident con n cercano
+         al mínimo.
+      6. Tomar features de HOY (que predicen MAÑANA).
+      7. Predecir + clamp a [-1, +1].
+      8. Calcular SHAP-style importance (`coef * (value_today - mean_train)`)
+         que mide cuánto la feature de HOY desvía la predicción
+         respecto a un día promedio. Más interpretable que el
+         producto crudo `coef * value_today`.
 
     Returns:
-      `{prediction: float (-1..+1), confidence: float (0..1, R²),
-        n_training_days: int, target_date: str (mañana),
-        based_on_date: str (hoy), top_features: [(name, coef, value, contrib), ...]}`
-      o `None` si no hay enough data.
+      `{
+        prediction: float (-1..+1) | None,
+        confidence: float (CV R², puede ser <0 si modelo peor que media),
+        confidence_in_sample: float (R² del fit, retrocompat / debug),
+        model: "ridge_cv" | "linear",
+        alpha: float | None (alpha de Ridge, None si fallback a Linear),
+        cv_n_splits: int (0 si CV no se pudo correr),
+        n_training_days: int,
+        target_date: str (mañana, YYYY-MM-DD),
+        based_on_date: str (hoy, YYYY-MM-DD),
+        top_features: [{
+          feature, coef, value_today, value_baseline,
+          contribution,                # legacy: coef*value_today
+          deviation_contribution,      # SHAP-style: coef*(today-mean)
+        }, ...] (ordenadas por |deviation_contribution|, top 5)
+      }`
+      o `None` si no hay enough data o sklearn no está disponible.
 
     Importante: NO interpretar como verdad — la regresión asume
     estabilidad de patrones que pueden cambiar. UI debe marcar como
-    "estimación basada en patrones recientes".
+    "estimación basada en patrones recientes" y mostrar `confidence`
+    (CV R²) prominentemente — si está cerca de 0 o negativo, el
+    modelo no aprendió nada útil.
     """
     if metrics is None:
         metrics = collect_daily_metrics(days=days)
@@ -858,27 +879,74 @@ def predict_mood_tomorrow(
         return None
 
     try:
-        from sklearn.linear_model import LinearRegression  # noqa: PLC0415
         import numpy as np  # noqa: PLC0415
+        from sklearn.linear_model import (  # noqa: PLC0415
+            LinearRegression,
+            RidgeCV,
+        )
+        from sklearn.model_selection import (  # noqa: PLC0415
+            TimeSeriesSplit,
+            cross_val_score,
+        )
     except Exception as exc:
         _silent_log_safe("xspat_predict_sklearn_failed", exc)
         return None
 
+    # 1. Modelo: RidgeCV con grid de alphas razonables — auto-selecciona
+    #    el mejor por leave-one-out CV interno. Para 21-30 days y ~10
+    #    features, regularizar evita overfit cuando alguna feature es
+    #    casi-constante o colineal con otra. Si por algún motivo Ridge
+    #    falla (raro: matriz singular extrema), caemos a LinearRegression.
     try:
         X_np = np.array(X, dtype=float)
         y_np = np.array(y, dtype=float)
-        model = LinearRegression()
-        model.fit(X_np, y_np)
-        # R² del fit. NO es validación cross-fold (eso seria mas
-        # honest pero overkill para un MVP). Para >=21 days es OK.
-        confidence = float(model.score(X_np, y_np))
+        try:
+            model = RidgeCV(alphas=[0.01, 0.1, 1.0, 10.0])
+            model.fit(X_np, y_np)
+            model_name = "ridge_cv"
+            alpha = float(getattr(model, "alpha_", 0.0))
+        except Exception:
+            model = LinearRegression()
+            model.fit(X_np, y_np)
+            model_name = "linear"
+            alpha = None
+        # R² in-sample (lo que devolvíamos antes como confidence). Lo
+        # mantenemos para retrocompat / debug — pero NO es la métrica
+        # principal de honestidad.
+        confidence_in_sample = float(model.score(X_np, y_np))
     except Exception as exc:
         _silent_log_safe("xspat_predict_fit_failed", exc)
         return None
 
-    # Features de HOY (las del último día disponible). Esas predicen
-    # MAÑANA bajo la asumción de que los patrones de los últimos días
-    # se mantienen.
+    # 2. Cross-validation R² (out-of-sample, time-aware). TimeSeriesSplit
+    #    respeta orden temporal: cada fold entrena en pasado y testea en
+    #    futuro. Para n=21 → 2 folds; para n=42 → ~5 folds. Nunca menos
+    #    de 2 (si n<10 saltamos CV y devolvemos in-sample como confidence,
+    #    pero esto es muy raro porque _PREDICT_MIN_DAYS=21).
+    n_splits = max(2, min(5, len(X) // 7))
+    cv_r2: float | None = None
+    try:
+        if len(X) >= 2 * n_splits + 1:
+            tscv = TimeSeriesSplit(n_splits=n_splits)
+            cv_scores = cross_val_score(
+                model, X_np, y_np, cv=tscv, scoring="r2",
+            )
+            # cross_val_score puede devolver R² negativos cuando el
+            # modelo es peor que predecir la media. Es signal valid:
+            # confidence baja → UI debe mostrar warning.
+            cv_r2 = float(cv_scores.mean())
+    except Exception as exc:
+        _silent_log_safe("xspat_predict_cv_failed", exc)
+        cv_r2 = None
+
+    # `confidence` ahora es CV R² (out-of-sample, honest). Si CV no se
+    # pudo correr por algún motivo, fallback a in-sample para no romper
+    # el contrato (callers asumen `confidence: float`).
+    confidence = cv_r2 if cv_r2 is not None else confidence_in_sample
+
+    # 3. Features de HOY (las del último día disponible). Esas predicen
+    #    MAÑANA bajo la asumción de que los patrones de los últimos
+    #    días se mantienen.
     today_str = _today_str()
     target_date = (datetime.strptime(today_str, "%Y-%m-%d")
                    + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -890,6 +958,10 @@ def predict_mood_tomorrow(
             return {
                 "prediction": None,
                 "confidence": round(confidence, 3),
+                "confidence_in_sample": round(confidence_in_sample, 3),
+                "model": model_name,
+                "alpha": alpha,
+                "cv_n_splits": n_splits if cv_r2 is not None else 0,
                 "n_training_days": len(X),
                 "target_date": target_date,
                 "based_on_date": today_str,
@@ -906,22 +978,43 @@ def predict_mood_tomorrow(
         _silent_log_safe("xspat_predict_inference_failed", exc)
         return None
 
-    # Top features por |coef * value| (qué movió más la predicción).
+    # 4. Importance estilo SHAP (lineal exacto):
+    #    contribution        = coef * value_today                (legacy)
+    #    deviation_contribution = coef * (value_today - mean(value_train))
+    #
+    # La deviation es más interpretable porque mide "cuánto la feature
+    # de HOY desvía la predicción respecto a un día promedio". Si
+    # value_today == mean → contribución 0 (no es noticia). Si
+    # value_today >> mean y coef > 0 → push positivo fuerte. Esto es
+    # el SHAP value exacto para modelos lineales (cuando el baseline
+    # es la expectativa marginal de la feature).
     coefs = model.coef_.tolist()
+    feature_means = X_np.mean(axis=0).tolist()
     contributions = []
-    for fname, coef, value in zip(feature_names, coefs, today_features):
+    for fname, coef, value, mean_v in zip(
+        feature_names, coefs, today_features, feature_means,
+    ):
         contrib = coef * value
+        deviation_contrib = coef * (value - mean_v)
         contributions.append({
             "feature": fname,
             "coef": round(float(coef), 4),
             "value_today": round(value, 3),
-            "contribution": round(contrib, 3),
+            "value_baseline": round(float(mean_v), 3),
+            "contribution": round(float(contrib), 3),
+            "deviation_contribution": round(float(deviation_contrib), 3),
         })
-    contributions.sort(key=lambda x: -abs(x["contribution"]))
+    # Ordenamos por |deviation_contribution| — qué tan inusual es hoy
+    # respecto al baseline + cuánto pesa esa feature en el modelo.
+    contributions.sort(key=lambda x: -abs(x["deviation_contribution"]))
 
     return {
         "prediction": round(prediction, 3),
         "confidence": round(confidence, 3),
+        "confidence_in_sample": round(confidence_in_sample, 3),
+        "model": model_name,
+        "alpha": alpha,
+        "cv_n_splits": n_splits if cv_r2 is not None else 0,
         "n_training_days": len(X),
         "target_date": target_date,
         "based_on_date": today_str,

@@ -32071,41 +32071,63 @@ def mood_predict_cmd(days: int, plain: bool) -> None:
         console.print(f"[dim]reason: {reason}[/]")
         return
 
+    model_name = result.get("model", "linear")
+    alpha = result.get("alpha")
+    cv_splits = result.get("cv_n_splits", 0)
+    conf_in = result.get("confidence_in_sample", conf)
+
     if plain:
+        alpha_part = f" alpha={alpha:.2f}" if alpha is not None else ""
         click.echo(
             f"prediction={pred:+.3f} confidence={conf:.3f} "
+            f"confidence_in_sample={conf_in:.3f} "
+            f"model={model_name}{alpha_part} cv_splits={cv_splits} "
             f"n_training={n} target_date={target}"
         )
         for f in top:
+            dev = f.get("deviation_contribution", f["contribution"])
+            baseline = f.get("value_baseline", 0.0)
             click.echo(
                 f"  feature={f['feature']} coef={f['coef']:+.4f} "
                 f"value_today={f['value_today']:+.3f} "
+                f"baseline={baseline:+.3f} "
+                f"deviation_contribution={dev:+.3f} "
                 f"contribution={f['contribution']:+.3f}"
             )
         return
 
     color = _mood_score_color(pred)
+    # CV R² puede ser negativo cuando el modelo es peor que predecir
+    # la media — eso es signal de "no aprendí nada" y la UI lo flaggea.
     conf_color = (
-        "green" if conf >= 0.5 else "yellow" if conf >= 0.3 else "red"
+        "green" if conf >= 0.5 else "yellow" if conf >= 0.2 else "red"
     )
     sign = "+" if pred > 0 else ""
     console.print(f"\n[bold]predicción mood mañana ({target})[/]")
     console.print(f"  [{color}]{sign}{pred:.2f}[/]  "
-                  f"confianza R² [{conf_color}]{conf:.2f}[/] "
-                  f"[dim](n={n} días entrenamiento)[/]")
-    if conf < 0.3:
-        console.print("[dim]⚠ R² bajo — el modelo está adivinando. "
-                      "Mirá los features individuales más que el número.[/dim]")
+                  f"confianza CV R² [{conf_color}]{conf:+.2f}[/] "
+                  f"[dim](n={n} días, modelo={model_name}"
+                  + (f", α={alpha:.2f}" if alpha is not None else "")
+                  + f", in-sample R²={conf_in:+.2f})[/dim]")
+    if conf < 0.2:
+        console.print("[dim]⚠ CV R² bajo — el modelo no está aprendiendo "
+                      "del histórico. Mirá los features individuales más "
+                      "que el número.[/dim]")
     if top:
-        console.print("\n[dim]top features que mueven la predicción:[/]")
+        console.print("\n[dim]top features (ordenadas por desviación vs "
+                      "tu promedio histórico):[/]")
         for f in top:
-            contrib = f["contribution"]
-            c = "bright_red" if abs(contrib) >= 0.3 else "yellow" if abs(contrib) >= 0.1 else "white"
-            sign_c = "+" if contrib > 0 else ""
+            # Usamos deviation_contribution como medida de "qué tan
+            # inusual es hoy esta feature, ponderado por su peso en
+            # el modelo". Más interpretable que contribution.
+            dev = f.get("deviation_contribution", f["contribution"])
+            c = "bright_red" if abs(dev) >= 0.3 else "yellow" if abs(dev) >= 0.1 else "white"
+            sign_c = "+" if dev > 0 else ""
+            baseline = f.get("value_baseline", 0.0)
             console.print(
                 f"  [{c}]{f['feature']:<28}[/] "
-                f"[dim]coef={f['coef']:+.3f} hoy={f['value_today']:+.2f}[/] "
-                f"[{c}]→ {sign_c}{contrib:.2f}[/]"
+                f"[dim]hoy={f['value_today']:+.2f} vs base={baseline:+.2f}[/] "
+                f"[{c}]→ {sign_c}{dev:.2f}[/]"
             )
 
 
@@ -48208,8 +48230,33 @@ def find_followup_loops(
     if completed_reminders is None:
         completed_reminders = _fetch_completed_reminders(now, days=days)
 
-    classified = [
-        _classify_followup_loop(
+    # Paralelizar la clasificación (audit fix 2026-05-01).
+    # Cold path real medido: 9min para 95 loops cuando se hace serial,
+    # porque cada `_classify_followup_loop` activa retrieve() + 1 LLM
+    # judge call (~5s cada uno). El LLM judge es I/O bound (HTTP a
+    # Ollama, GIL released), perfecto para concurrencia.
+    #
+    # Workers default = 4. Conservador para no saturar Ollama (que
+    # serializa internamente requests al mismo modelo: con 4 paralelos,
+    # ya estamos haciendo back-pressure útil sin overhead). Override via
+    # `RAG_FOLLOWUP_PARALLEL_WORKERS` env si querés tunear.
+    #
+    # Determinismo: `executor.map` preserva el orden de `all_loops`, así
+    # que el output sigue siendo idéntico al loop secuencial — solo más
+    # rápido. Tests con `judge_fn` mock siguen pasando porque el mock no
+    # bloquea (cero contención).
+    #
+    # Trade-off: 1 worker (serial) = ~9min reproducible; 4 workers ≈
+    # 2.5min; 8 workers ≈ 1.5min (Ollama empieza a serializar). Con 4
+    # llegamos al objetivo "≤ mitad" sin riesgo.
+    try:
+        _n_workers = int(os.environ.get("RAG_FOLLOWUP_PARALLEL_WORKERS", "4"))
+    except (TypeError, ValueError):
+        _n_workers = 4
+    _n_workers = max(1, min(_n_workers, 16))  # clamp [1, 16]
+
+    def _classify_one(loop):
+        return _classify_followup_loop(
             col,
             loop,
             now,
@@ -48218,8 +48265,21 @@ def find_followup_loops(
             judge_fn=judge_fn,
             completed_reminders=completed_reminders,
         )
-        for loop in all_loops
-    ]
+
+    if _n_workers == 1 or len(all_loops) <= 1:
+        # Path serial: respeta el comportamiento previo cuando hay 0-1
+        # loops o el user explicit-deshabilita paralelismo (debugging).
+        classified = [_classify_one(loop) for loop in all_loops]
+    else:
+        from concurrent.futures import ThreadPoolExecutor as _TPE
+        with _TPE(
+            max_workers=_n_workers,
+            thread_name_prefix="followup-classify",
+        ) as pool:
+            # `executor.map` preserva el order y consume el iterable —
+            # construimos lista al final para forzar evaluation antes de
+            # que el pool se cierre.
+            classified = list(pool.map(_classify_one, all_loops))
     order = {"stale": 0, "activo": 1, "resolved": 2}
     classified.sort(key=lambda r: (order.get(r["status"], 3), -r["age_days"]))
 

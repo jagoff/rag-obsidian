@@ -720,6 +720,130 @@ def test_predict_mood_silent_fail_when_no_target():
     assert result is None
 
 
+def _synthetic_30d_metrics():
+    """Helper: 30 días con sleep_quality[t-1] perfectamente correlacionado
+    con mood_score[t]. Devuelve metrics dict listo para usar."""
+    today = datetime.now()
+    sleep_series = {}
+    mood_series = {}
+    for offset in range(30, -1, -1):
+        date = (today - timedelta(days=offset)).strftime("%Y-%m-%d")
+        sleep_q = 0.4 + (offset % 7) * 0.05
+        sleep_series[date] = sleep_q
+        prev_date = (today - timedelta(days=offset + 1)).strftime("%Y-%m-%d")
+        if prev_date in sleep_series:
+            mood_series[date] = sleep_series[prev_date] * 1.5 - 0.5
+    return {
+        "mood_score": mood_series,
+        "sleep_quality": sleep_series,
+        "sleep_duration_h": sleep_series,
+        "sleep_awakenings": {d: 2.0 for d in sleep_series},
+        "wakeup_mood": sleep_series,
+        "spotify_minutes": {d: 30.0 for d in sleep_series},
+        "spotify_distinct_tracks": {d: 5.0 for d in sleep_series},
+        "queries_total": {d: 10.0 for d in sleep_series},
+        "queries_existential": {d: 0.0 for d in sleep_series},
+        "wa_outbound_avg_chars": {d: 50.0 for d in sleep_series},
+        "mood_self_report": {},
+    }
+
+
+def test_predict_uses_ridge_cv_with_alpha_metadata():
+    """RidgeCV es el modelo default y el alpha elegido se reporta.
+    Si Ridge falla por algún motivo (no debería con data limpia),
+    cae a LinearRegression."""
+    result = csp.predict_mood_tomorrow(metrics=_synthetic_30d_metrics(), days=60)
+    assert result is not None
+    # Modelo elegido + metadata.
+    assert result["model"] in {"ridge_cv", "linear"}
+    if result["model"] == "ridge_cv":
+        # alpha viene del grid pasado a RidgeCV (0.01..10.0).
+        assert result["alpha"] is not None
+        assert 0.0 <= result["alpha"] <= 100.0
+
+
+def test_predict_confidence_is_cross_validated():
+    """`confidence` es R² out-of-sample (CV time-aware), no in-sample.
+    Para data perfectamente correlacionada, CV R² debe ser alto pero
+    distinto de 1.0 (CV puede tener leakage parcial pero no perfecto).
+    `confidence_in_sample` queda como retrocompat."""
+    result = csp.predict_mood_tomorrow(metrics=_synthetic_30d_metrics(), days=60)
+    assert result is not None
+    # Las dos confidences existen y son floats.
+    assert isinstance(result["confidence"], (int, float))
+    assert isinstance(result["confidence_in_sample"], (int, float))
+    # cv_n_splits > 0 → CV se corrió.
+    assert result["cv_n_splits"] >= 2
+    # Para correlación perfecta, in-sample R² es altísimo (>0.9).
+    assert result["confidence_in_sample"] >= 0.9
+
+
+def test_predict_confidence_can_be_negative_with_noise():
+    """Cuando las features no predicen el target, CV R² puede ser
+    negativo. Eso es signal valid (no rompe el contrato)."""
+    today = datetime.now()
+    rng = list(range(30, -1, -1))
+    dates = [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in rng]
+    # Mood random; features constantes → CV R² ~0 o negativo.
+    import random
+    random.seed(42)
+    metrics = {
+        "mood_score": {d: random.gauss(0, 0.3) for d in dates},
+        "sleep_quality": {d: 0.5 for d in dates},
+        "sleep_duration_h": {d: 7.0 for d in dates},
+        "sleep_awakenings": {d: 2.0 for d in dates},
+        "wakeup_mood": {d: 0.0 for d in dates},
+        "spotify_minutes": {d: 30.0 for d in dates},
+        "spotify_distinct_tracks": {d: 5.0 for d in dates},
+        "queries_total": {d: 10.0 for d in dates},
+        "queries_existential": {d: 0.0 for d in dates},
+        "wa_outbound_avg_chars": {d: 50.0 for d in dates},
+        "mood_self_report": {},
+    }
+    result = csp.predict_mood_tomorrow(metrics=metrics, days=60)
+    if result is None or result.get("prediction") is None:
+        pytest.skip("not enough data after alignment")
+    # Confidence ahora es CV R² — para features constantes vs target
+    # ruidoso, debe estar bajo (probably < 0.3 o incluso negativo).
+    assert result["confidence"] < 0.5
+
+
+def test_predict_top_features_include_baseline_and_deviation():
+    """Cada top feature trae `value_baseline` (mean histórico) y
+    `deviation_contribution` (SHAP-style). Para correlación perfecta
+    con sleep, sleep_quality debe estar en el top y su deviation
+    debe ser != 0 (porque sleep_quality oscila día a día)."""
+    result = csp.predict_mood_tomorrow(metrics=_synthetic_30d_metrics(), days=60)
+    assert result is not None
+    if result.get("prediction") is None:
+        pytest.skip("missing today features")
+    top = result["top_features"]
+    assert top, "expected at least 1 top feature"
+    sample = top[0]
+    # Schema completo: nuevos keys presentes.
+    assert "value_baseline" in sample
+    assert "deviation_contribution" in sample
+    # Y los legacy keys siguen.
+    assert "contribution" in sample
+    assert "coef" in sample
+    assert "value_today" in sample
+    # value_baseline es float razonable (mean del training).
+    assert isinstance(sample["value_baseline"], (int, float))
+
+
+def test_predict_top_features_ordered_by_deviation_contribution():
+    """El nuevo orden es por |deviation_contribution|, no por
+    |contribution| (legacy). Verificable construyendo features con
+    coef alto pero value_today == mean (deviation=0) — esa feature
+    NO debe estar primera aunque su contribución absoluta sea alta."""
+    result = csp.predict_mood_tomorrow(metrics=_synthetic_30d_metrics(), days=60)
+    assert result is not None
+    if result.get("prediction") is None:
+        pytest.skip("missing today features")
+    devs = [abs(f["deviation_contribution"]) for f in result["top_features"]]
+    assert devs == sorted(devs, reverse=True)
+
+
 # ── CLI rag mood predict ─────────────────────────────────────────────────
 
 

@@ -7177,23 +7177,47 @@ def _ensure_telemetry_tables(conn) -> None:
         try:
             if skip_ddl:
                 # Las tablas existen — solo aplicamos los inserts a
-                # rag_schema_version (idempotent INSERT OR IGNORE), sin BEGIN
-                # explícito para reducir la window de write-lock.
+                # rag_schema_version (idempotent INSERT OR IGNORE).
+                # Fix 2026-04-30: wrappear en BEGIN IMMEDIATE para que los N
+                # INSERT OR IGNORE sean una sola transacción y no N
+                # autocommit-transactions independientes. En modo autocommit
+                # cada INSERT pelea por el write-lock por separado, produciendo
+                # `database is locked` bajo contención con el web server.
+                # BEGIN IMMEDIATE toma el write-lock UNA vez para todo el batch.
                 if has_schema_version:
-                    conn.executemany(
-                        "INSERT OR IGNORE INTO rag_schema_version(table_name, version) VALUES(?, 1)",
-                        [(name,) for name, _ in _TELEMETRY_DDL],
-                    )
+                    last_exc: Exception | None = None
+                    for attempt in range(5):
+                        try:
+                            conn.execute("BEGIN IMMEDIATE")
+                            conn.executemany(
+                                "INSERT OR IGNORE INTO rag_schema_version(table_name, version) VALUES(?, 1)",
+                                [(name,) for name, _ in _TELEMETRY_DDL],
+                            )
+                            conn.execute("COMMIT")
+                            last_exc = None
+                            break
+                        except _sqlite3.OperationalError as exc:
+                            try:
+                                conn.execute("ROLLBACK")
+                            except _sqlite3.Error:
+                                pass
+                            if not _is_transient_sql_error(exc):
+                                raise
+                            last_exc = exc
+                            time.sleep(0.5 * (2 ** attempt))  # 0.5, 1, 2, 4, 8s
+                    if last_exc is not None:
+                        raise last_exc
             else:
                 # Slow path: hacer el bootstrap completo con retry transient.
-                # Si chocamos contra un writer concurrente y el busy_timeout
-                # se agota, volvemos a probar después de backoff. Las DDL son
-                # CREATE TABLE IF NOT EXISTS (idempotent) — el rollback no
-                # deja state corrupto.
+                # Fix 2026-04-30: BEGIN → BEGIN IMMEDIATE para tomar el
+                # write-lock inmediatamente, no diferido hasta el primer write.
+                # Con BEGIN DEFERRED la contención se detecta tarde (al primer
+                # CREATE TABLE / INSERT) en vez de al BEGIN, generando un burst
+                # de OperationalError difícil de diagnosticar.
                 last_exc: Exception | None = None
                 for attempt in range(5):
                     try:
-                        conn.execute("BEGIN")
+                        conn.execute("BEGIN IMMEDIATE")
                         for _table_name, stmts in _TELEMETRY_DDL:
                             for stmt in stmts:
                                 conn.execute(stmt)

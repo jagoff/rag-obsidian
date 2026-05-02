@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/fer</string>
+		<key>OLLAMA_EMBED_FAIL_THRESHOLD</key>
+		<string>2</string>
+		<key>OLLAMA_EMBED_TIMEOUT</key>
+		<string>8</string>
+		<key>OLLAMA_GENERATE_FAIL_THRESHOLD</key>
+		<string>2</string>
+		<key>OLLAMA_GENERATE_TIMEOUT</key>
+		<string>10</string>
+		<key>OLLAMA_KILL_COOLDOWN_SEC</key>
+		<string>120</string>
+		<key>OLLAMA_TAGS_TIMEOUT</key>
+		<string>10</string>
+		<key>OLLAMA_WATCHDOG_GENERATE_MODEL</key>
+		<string>qwen2.5:7b</string>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>Label</key>
+	<string>com.fer.obsidian-rag-ollama-watchdog</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/Users/fer/repositories/obsidian-rag/scripts/ollama-watchdog.sh</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/fer/.local/share/obsidian-rag/ollama-watchdog.stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/fer/.local/share/obsidian-rag/ollama-watchdog.stdout.log</string>
+	<key>StartInterval</key>
+	<integer>30</integer>
+</dict>
+</plist>

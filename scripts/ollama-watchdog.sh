@@ -137,6 +137,68 @@ log() {
   printf '[%s] %s\n' "$(date +%Y-%m-%dT%H:%M:%S%z)" "$1" >> "${LOG}"
 }
 
+# capture_postmortem — dispara el script de captura completa de
+# evidencia ante un evento crítico (zombie state, draft fail, etc).
+# Dedupe: solo dispara si pasaron al menos POSTMORTEM_COOLDOWN_SEC
+# desde el último postmortem capturado. Sin esto, en un loop de
+# zombie state, capturaríamos un postmortem cada 30s saturando disk.
+POSTMORTEM_COOLDOWN_SEC="${POSTMORTEM_COOLDOWN_SEC:-180}"
+LAST_POSTMORTEM_FILE="${STATE_DIR}/last-postmortem.epoch"
+capture_postmortem() {
+  local reason="${1:-unknown}"
+  local last=0
+  if [ -f "${LAST_POSTMORTEM_FILE}" ]; then
+    last=$(cat "${LAST_POSTMORTEM_FILE}" 2>/dev/null || echo 0)
+  fi
+  if [ $(( now - last )) -lt "${POSTMORTEM_COOLDOWN_SEC}" ]; then
+    return 0
+  fi
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [ -x "${script_dir}/draft-fail-postmortem.sh" ]; then
+    local out
+    out=$("${script_dir}/draft-fail-postmortem.sh" "${reason}" 2>&1 | tail -1)
+    log "POSTMORTEM_CAPTURED — reason=${reason} dir=${out}"
+    echo "${now}" > "${LAST_POSTMORTEM_FILE}"
+  fi
+}
+
+# scan_listener_for_drafts_failed — dispara postmortem si vemos drafts
+# fallando en el listener.error.log durante los últimos 90s. Usa
+# `find -newer` para detectar si el log fue tocado, después grep para
+# contar fallos recientes. Más robusto que tail -F (que requeriría
+# proceso persistente).
+LISTENER_ERR_LOG="${HOME}/.local/share/whatsapp-listener/listener.error.log"
+scan_listener_for_drafts_failed() {
+  if [ ! -f "${LISTENER_ERR_LOG}" ]; then
+    return 0
+  fi
+  # Si el log fue modificado en los últimos 90s, hay actividad reciente
+  local mtime
+  mtime=$(stat -f "%m" "${LISTENER_ERR_LOG}" 2>/dev/null || echo 0)
+  if [ $(( now - mtime )) -gt 90 ]; then
+    return 0
+  fi
+  # Contar "LLM no generó nada" en las últimas 50 líneas (los últimos
+  # ~5 minutos en operación normal). Si hay >= 1 fail reciente,
+  # capturar postmortem.
+  local recent_fails
+  recent_fails=$(tail -n 50 "${LISTENER_ERR_LOG}" 2>/dev/null | grep -c "LLM no generó nada" || true)
+  if [ "${recent_fails:-0}" -gt 0 ]; then
+    capture_postmortem "draft_fail_count_${recent_fails}"
+  fi
+}
+
+# ── PRE-probe: scan listener para drafts failed → postmortem auto ───
+# Cada tick, mirar si el listener WhatsApp logueó "LLM no generó nada"
+# en los últimos 90s. Si sí, capturar evidencia del momento del fail
+# (vmmap, ollama state, mem stats, etc) en
+# ~/.local/share/obsidian-rag/draft-postmortems/<ts>/. Permite
+# investigar post-incident sin estar online en el momento del fail.
+# Dedupe via POSTMORTEM_COOLDOWN_SEC (default 180s) para no saturar
+# disk en loops de zombie state.
+scan_listener_for_drafts_failed
+
 # ── Probe 0: Duplicate-instance detection ──────────────────────────────
 # Si hay >1 listener en :11434 (típicamente IPv4 + IPv6 separados),
 # significa que están corriendo brew `ollama serve` Y `Ollama.app` al
@@ -315,6 +377,10 @@ since_serve_restart=$(( now - last_serve_restart ))
 if [ "${tags_fails}" -ge "${TAGS_FAIL_THRESHOLD}" ] \
    && [ "${since_serve_restart}" -gt "${RESTART_COOLDOWN_SEC}" ]; then
   log "RESTARTING_SERVE — tags_fails=${tags_fails} since_last=${since_serve_restart}s"
+  # Capturar evidencia ANTES del restart — útil para diagnosticar
+  # por qué tags fallaba (proceso vivo? deadlock? OOM?). El postmortem
+  # tiene su propio cooldown así no spammea si esto se repite.
+  capture_postmortem "tags_fail_threshold_${tags_fails}"
   if /opt/homebrew/bin/brew services restart ollama 2>>"${LOG}" >>"${LOG}"; then
     log "RESTART_SERVE_OK — brew services restart ollama"
     last_serve_restart=${now}
@@ -403,6 +469,11 @@ else
     if [ "${kills_without_recovery}" -ge "${ESCALATE_KILLS_THRESHOLD}" ] \
        && [ "${since_serve_restart}" -gt "${RESTART_COOLDOWN_SEC}" ]; then
       log "ESCALATE_RESTART_SERVE — kills_without_recovery=${kills_without_recovery} (kill no resuelve, restart serve completo)"
+      # Capturar evidencia del momento de la escalación — esta es la
+      # situación donde más necesitamos saber qué tiene el sistema (web
+      # mem, ollama log, kernel events). Con el cooldown del postmortem
+      # también, evita spam en zombie loops.
+      capture_postmortem "escalate_restart_kwr_${kills_without_recovery}"
       if /opt/homebrew/bin/brew services restart ollama 2>>"${LOG}" >>"${LOG}"; then
         log "RESTART_SERVE_OK — brew services restart ollama (escalado)"
         last_serve_restart=${now}

@@ -17032,6 +17032,14 @@ def status_logs(
         payload = _status_logs_build_payload(window_s, lim, level)
         with _LOGS_CACHE_LOCK:
             _LOGS_CACHE[cache_key] = {"payload": payload, "ts": now_mono}
+            # Evict stale entries — sin esto el dict crece sin bound porque
+            # cada combinación de (window, limit, level) crea una key nueva
+            # y el TTL check de arriba sólo decide si DEVOLVER la cache,
+            # no la limpia. Crecimiento observado en sesiones largas.
+            cutoff = now_mono - (_LOGS_CACHE_TTL + 5.0)
+            stale = [k for k, v in _LOGS_CACHE.items() if v["ts"] < cutoff]
+            for k in stale:
+                _LOGS_CACHE.pop(k, None)
         return payload
     return entry["payload"]
 
@@ -18212,6 +18220,11 @@ def logs_global_errors(
         payload = _build_global_errors_payload(window_s, level)
         with _LOG_GLOBAL_CACHE_LOCK:
             _LOG_GLOBAL_CACHE[cache_key] = {"payload": payload, "ts": now_mono}
+            # Evict stale — ver _LOGS_CACHE para el rationale.
+            cutoff = now_mono - (_LOG_GLOBAL_CACHE_TTL + 5.0)
+            stale = [k for k, v in _LOG_GLOBAL_CACHE.items() if v["ts"] < cutoff]
+            for k in stale:
+                _LOG_GLOBAL_CACHE.pop(k, None)
         return payload
     return entry["payload"]
 
@@ -18827,6 +18840,11 @@ def logs_rankings(
         payload = _build_rankings_payload(window_s, n)
         with _RANKINGS_CACHE_LOCK:
             _RANKINGS_CACHE[cache_key] = {"payload": payload, "ts": now_mono}
+            # Evict stale — ver _LOGS_CACHE para el rationale.
+            cutoff = now_mono - (_RANKINGS_CACHE_TTL + 5.0)
+            stale = [k for k, v in _RANKINGS_CACHE.items() if v["ts"] < cutoff]
+            for k in stale:
+                _RANKINGS_CACHE.pop(k, None)
         return payload
     return entry["payload"]
 
@@ -20700,6 +20718,12 @@ def dashboard_api(days: int = 30) -> dict:
         return hit[1]
     payload = _dashboard_compute(days)
     _DASHBOARD_CACHE[days] = (now_ts, payload)
+    # Evict stale — ver _LOGS_CACHE para el rationale (acumulación sin
+    # bound aunque las entries no se devuelvan via TTL check).
+    cutoff = now_ts - (_DASHBOARD_TTL + 5.0)
+    stale = [k for k, v in _DASHBOARD_CACHE.items() if v[0] < cutoff]
+    for k in stale:
+        _DASHBOARD_CACHE.pop(k, None)
     return payload
 
 
@@ -21961,6 +21985,11 @@ def learning_api(days: int = 30) -> dict:
     }
     with _LEARNING_CACHE_LOCK:
         _LEARNING_CACHE[days] = (now_ts, payload)
+        # Evict stale — ver _LOGS_CACHE para el rationale.
+        cutoff = now_ts - (_LEARNING_TTL + 5.0)
+        stale = [k for k, v in _LEARNING_CACHE.items() if v[0] < cutoff]
+        for k in stale:
+            _LEARNING_CACHE.pop(k, None)
     return payload
 
 

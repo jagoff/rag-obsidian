@@ -26,6 +26,12 @@
 #
 # ── Estrategia ──────────────────────────────────────────────────────────
 # Cada tick (StartInterval 60s):
+#  -1. RSS del web/server.py. Si supera WEB_BLOAT_THRESHOLD_MB (8 GB
+#      default), restartear `com.fer.obsidian-rag-web` para limpiar el
+#      memory leak crónico (caches sin evict + buffers de streaming).
+#      Cooldown 1h. Sin esto, en sesiones de 3-4 hs el server llega a
+#      12-16 GB RSS, satura unified memory, ollama no consigue VRAM,
+#      drafts del listener fallan en cascada.
 #   0. lsof :11434. Si hay >1 listener (típico: brew bindea IPv4 +
 #      Ollama.app bindea IPv6 al mismo puerto), kill los PIDs de
 #      Ollama.app + remover de login items. Sin cooldown — `pgrep` da
@@ -77,6 +83,9 @@
 #   OLLAMA_ESCALATE_KILLS_THRESHOLD=2         kills sin recovery → restart
 #   OLLAMA_GENERATE_PROBE_DISABLED=1          desactiva probe de chat
 #   OLLAMA_DUP_DETECTION_DISABLED=1           desactiva probe 0 (kill Ollama.app)
+#   OLLAMA_WEB_BLOAT_DETECTION_DISABLED=1     desactiva probe -1 (restart web bloated)
+#   OLLAMA_WEB_BLOAT_THRESHOLD_MB=8000        RSS umbral del web (MB)
+#   OLLAMA_WEB_BLOAT_COOLDOWN_SEC=3600        cooldown entre restarts del web
 #   OLLAMA_WATCHDOG_CATCHUP_DISABLED=1        desactiva el catchup nightly
 #
 # ── Estado ──────────────────────────────────────────────────────────────
@@ -118,6 +127,12 @@ ESCALATE_KILLS_THRESHOLD="${OLLAMA_ESCALATE_KILLS_THRESHOLD:-2}"
 EMBED_MODEL="${OLLAMA_WATCHDOG_EMBED_MODEL:-bge-m3}"
 GENERATE_MODEL="${OLLAMA_WATCHDOG_GENERATE_MODEL:-qwen2.5:7b}"
 
+# Timestamp del tick — usado por TODOS los probes (web bloat, dup
+# instance, tags, embed, generate). Tiene que estar definido ANTES
+# del Probe -1 / Probe 0; el Probe 1 originalmente lo definía
+# después del read-state pero los probes nuevos lo necesitan.
+now=$(date +%s)
+
 log() {
   printf '[%s] %s\n' "$(date +%Y-%m-%dT%H:%M:%S%z)" "$1" >> "${LOG}"
 }
@@ -143,6 +158,106 @@ log() {
 #
 # Override: `OLLAMA_DUP_DETECTION_DISABLED=1` apaga el probe (útil si
 # alguien temporalmente quiere ambos para debug).
+
+# ── Probe -1: Web server RSS bloat detection ──────────────────────────
+# El proceso `web/server.py` (FastAPI dashboard + RagNet) sufre un memory
+# leak crónico (caches sin eviction + buffers de streaming + retención
+# MPS). En sesiones largas (3-4 hs) llega a 12-16 GB RSS, satura unified
+# memory del Mac, swap activo 8-14 GB → cuando ollama necesita VRAM
+# para cargar modelos, el SO no se la puede dar → cold loads timeoutean
+# → drafts del WhatsApp listener fallan con "❌ no pude generar".
+#
+# Repro real 2026-05-02: el user recibió 4 notificaciones de fallos de
+# drafts en pocas horas (Fer F, Maria, Seba × 2). Diagnóstico revelo
+# web/server.py PID con 16 GB RSS, swap saturado a 14 GB.
+#
+# Estrategia: si la memoria del proceso `web/server.py` supera el
+# threshold (default 12 GB), restartear el daemon `com.fer.obsidian-rag-web`.
+# El restart limpia la mayoría del leak y libera la presión de memoria.
+# Cooldown 1h para evitar restart loops si el leak es muy rápido.
+#
+# Grace period: el web/server.py tiene un footprint legítimo de 9-11 GB
+# al BOOT (carga del corpus + bge-m3 local + reranker MPS + Qdrant
+# embedded). Si matamos al proceso durante los primeros 5 minutos,
+# entramos en restart loop. WEB_BLOAT_BOOT_GRACE_SEC (default 300s)
+# protege la fase de startup.
+#
+# Métrica usada: `top -o mem` "MEM" (incluye RSS + swap + compressed),
+# en lugar de `ps rss` solo. macOS comprime/swappea pages agresivamente
+# bajo presión, RSS solo no captura el leak total. Repro 2026-05-02:
+# RSS=1.5GB pero MEM=14GB en top después de 10 min → web/server.py ya
+# había forzado 12.5 GB a swap/compressor sin que RSS lo reflejara.
+#
+# Override: `OLLAMA_WEB_BLOAT_DETECTION_DISABLED=1` apaga el probe.
+WEB_BLOAT_THRESHOLD_MB="${OLLAMA_WEB_BLOAT_THRESHOLD_MB:-12000}"
+WEB_BLOAT_COOLDOWN_SEC="${OLLAMA_WEB_BLOAT_COOLDOWN_SEC:-3600}"
+WEB_BLOAT_BOOT_GRACE_SEC="${OLLAMA_WEB_BLOAT_BOOT_GRACE_SEC:-300}"
+
+# Read previous last_web_restart from state (compatible con state file viejo
+# que no lo tenga — defaults a 0, fuerza el primer restart al alcanzar
+# threshold).
+last_web_restart=0
+if [ -f "${STATE}" ]; then
+  last_web_restart=$(grep '^last_web_restart=' "${STATE}" 2>/dev/null \
+                     | tail -1 | cut -d'=' -f2)
+  last_web_restart="${last_web_restart:-0}"
+fi
+
+if [ -z "${OLLAMA_WEB_BLOAT_DETECTION_DISABLED:-}" ]; then
+  web_pid=$(pgrep -f "web/server\.py" 2>/dev/null | head -1)
+  if [ -n "${web_pid}" ]; then
+    # Edad del proceso en segundos (etime en formato hh:mm:ss o mm:ss).
+    # Si está dentro del boot grace, skippeamos el check para no entrar
+    # en restart loop por el footprint legítimo de startup.
+    web_etime=$(ps -p "${web_pid}" -o etime= 2>/dev/null | tr -d ' ')
+    web_age_sec=$(awk -v t="${web_etime}" 'BEGIN{
+      n=split(t, a, ":")
+      if (n == 2) { printf "%d", a[1]*60 + a[2] }
+      else if (n == 3) { printf "%d", a[1]*3600 + a[2]*60 + a[3] }
+      else { printf "0" }
+    }')
+    # `top -l 1 -o mem -pid X -stats mem` devuelve la memoria total
+    # demandada (RSS + swap + compressed) en formato "1234M" o "12G".
+    # Parseamos a MB.
+    web_mem_raw=$(top -l 1 -o mem -pid "${web_pid}" -stats mem 2>/dev/null \
+                  | tail -1 | tr -d ' ')
+    web_mem_mb=$(awk -v s="${web_mem_raw}" 'BEGIN{
+      n=s; sub(/[A-Z]+$/, "", n)
+      if (s ~ /G\+?$/) { printf "%d", n*1024 }
+      else if (s ~ /M\+?$/) { printf "%d", n }
+      else if (s ~ /K\+?$/) { printf "%d", n/1024 }
+      else if (s ~ /^[0-9]+$/) { printf "%d", n/1024/1024 }
+      else { printf "0" }
+    }')
+    if [ "${web_age_sec:-0}" -lt "${WEB_BLOAT_BOOT_GRACE_SEC}" ]; then
+      # Boot grace — no restartear durante el startup. Si vemos uso
+      # alto, lo logueamos para audit pero no actuamos.
+      if [ "${web_mem_mb:-0}" -gt "${WEB_BLOAT_THRESHOLD_MB}" ]; then
+        log "WEB_BLOAT_BOOT_GRACE — pid=${web_pid} mem=${web_mem_raw} > ${WEB_BLOAT_THRESHOLD_MB}MB pero age=${web_age_sec}s < ${WEB_BLOAT_BOOT_GRACE_SEC}s (skip)"
+      fi
+    elif [ "${web_mem_mb:-0}" -gt "${WEB_BLOAT_THRESHOLD_MB}" ]; then
+      since_restart=$(( now - last_web_restart ))
+      if [ "${since_restart}" -gt "${WEB_BLOAT_COOLDOWN_SEC}" ]; then
+        log "WEB_BLOAT — pid=${web_pid} mem=${web_mem_raw} (~${web_mem_mb}MB) > ${WEB_BLOAT_THRESHOLD_MB}MB → restart obsidian-rag-web"
+        if launchctl bootout "gui/$(id -u)/com.fer.obsidian-rag-web" 2>>"${LOG}"; then
+          sleep 2
+          # bootout no manda SIGKILL — rematamos manual si quedó vivo
+          kill -9 "${web_pid}" 2>>"${LOG}" 2>&1 || true
+          sleep 2
+          launchctl bootstrap "gui/$(id -u)" \
+            "${HOME}/Library/LaunchAgents/com.fer.obsidian-rag-web.plist" 2>>"${LOG}" || true
+          log "WEB_BLOAT_OK — bootout + bootstrap obsidian-rag-web"
+          last_web_restart=${now}
+        else
+          log "WEB_BLOAT_FAIL — bootout obsidian-rag-web non-zero"
+        fi
+      else
+        log "WEB_BLOAT_COOLDOWN — pid=${web_pid} mem=${web_mem_raw} > ${WEB_BLOAT_THRESHOLD_MB}MB pero since_restart=${since_restart}s < ${WEB_BLOAT_COOLDOWN_SEC}s"
+      fi
+    fi
+  fi
+fi
+
 if [ -z "${OLLAMA_DUP_DETECTION_DISABLED:-}" ]; then
   listeners=$(lsof -nP -iTCP:11434 -sTCP:LISTEN 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')
   if [ "${listeners:-0}" -gt 1 ]; then
@@ -180,8 +295,6 @@ if [ -f "${STATE}" ]; then
   last_runners_kill="${last_runners_kill:-0}"
   kills_without_recovery="${kills_without_recovery:-0}"
 fi
-
-now=$(date +%s)
 
 # ── Probe 1: Ollama serve responde a /api/tags ─────────────────────────
 tags_code=$(curl -sS -m "${TAGS_TIMEOUT}" -o /dev/null -w '%{http_code}' \
@@ -436,5 +549,6 @@ tmp="${STATE}.tmp.$$"
   printf 'last_serve_restart=%s\n' "${last_serve_restart}"
   printf 'last_runners_kill=%s\n' "${last_runners_kill}"
   printf 'kills_without_recovery=%s\n' "${kills_without_recovery}"
+  printf 'last_web_restart=%s\n' "${last_web_restart}"
 } > "${tmp}"
 mv -f "${tmp}" "${STATE}"

@@ -51705,11 +51705,29 @@ def daemons_kickstart_overdue():
         slug = label.replace("com.fer.obsidian-rag-", "")
         prev_state = row.get("state")
 
-        proc = subprocess.run(
-            ["launchctl", "kickstart", "-k", f"gui/{uid}/{label}"],
-            capture_output=True, text=True, timeout=10,
-        )
-        ok = proc.returncode == 0
+        # `launchctl kickstart -k` puede bloquear varios segundos: kickea la
+        # instancia previa (con el `exit timeout` del plist, hasta 5s), y no
+        # devuelve hasta que la nueva instancia esté spawneada. En la práctica
+        # observamos kickstarts de ~50s para servicios con AppleScript /
+        # Spotify locks. Subimos el timeout a 30s y atrapamos TimeoutExpired
+        # / OSError para que UN daemon lento no aborte el batch entero — el
+        # bug histórico era que `spotify-poll` o `mood-poll` timeouteaban a
+        # los 10s y la TimeoutExpired propagaba hasta click, cancelando los
+        # daemons restantes (wake-hook.error.log 2026-05-02 11:07).
+        exit_code = -1
+        ok = False
+        try:
+            proc = subprocess.run(
+                ["launchctl", "kickstart", "-k", f"gui/{uid}/{label}"],
+                capture_output=True, text=True, timeout=30,
+            )
+            exit_code = proc.returncode
+            ok = exit_code == 0
+        except subprocess.TimeoutExpired:
+            exit_code = 124  # convención: timeout
+        except OSError as exc:
+            exit_code = -2
+            console.print(f"[red]✗[/red] {slug} → OSError: {exc}")
 
         time.sleep(1)
         post_row = _gather_daemon_status(label, row.get("category", "managed"))
@@ -51720,15 +51738,18 @@ def daemons_kickstart_overdue():
             action="kickstart",
             prev_state=prev_state,
             new_state=new_state,
-            exit_code=proc.returncode,
+            exit_code=exit_code,
             reason="kickstart-overdue batch",
         )
 
         if ok:
             console.print(f"[green]✓[/green] {slug} → kickstart ok")
             ok_count += 1
+        elif exit_code == 124:
+            console.print(f"[yellow]⏱[/yellow] {slug} → kickstart timeout (30s) — sigo")
+            fail_count += 1
         else:
-            console.print(f"[red]✗[/red] {slug} → exit={proc.returncode}")
+            console.print(f"[red]✗[/red] {slug} → exit={exit_code}")
             fail_count += 1
 
     console.print(

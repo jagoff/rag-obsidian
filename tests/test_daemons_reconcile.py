@@ -604,3 +604,96 @@ def test_daemons_kickstart_overdue_two(sql_env):
     assert len(log_calls) == 2
     for lc in log_calls:
         assert lc["action"] == "kickstart"
+
+
+def test_daemons_kickstart_overdue_timeout_continues(sql_env):
+    """Si UN `launchctl kickstart` timeoutea, los demás siguen procesándose.
+
+    Regression test: antes (timeout=10, sin try/except), un solo kickstart
+    lento (e.g. spotify-poll, mood-poll que llaman AppleScript) cancelaba el
+    batch entero porque subprocess.TimeoutExpired propagaba hasta click.
+    Ahora atrapamos TimeoutExpired y seguimos con el siguiente daemon.
+    Aprendido del wake-hook.error.log 2026-05-02 11:07.
+    """
+    from unittest.mock import patch as _patch
+    runner = CliRunner()
+
+    labels = [
+        "com.fer.obsidian-rag-mood-poll",
+        "com.fer.obsidian-rag-anticipate",
+    ]
+    row_map = {
+        labels[0]: _fake_status(labels[0], overdue=True),
+        labels[1]: _fake_status(labels[1], overdue=True),
+    }
+
+    mock_ok = MagicMock()
+    mock_ok.returncode = 0
+    mock_ok.stderr = ""
+
+    def _flaky_run(cmd, *args, **kwargs):
+        if "mood-poll" in cmd[-1]:
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=30)
+        return mock_ok
+
+    log_calls: list[dict] = []
+
+    def _capturing_log(label, action, **kwargs):
+        log_calls.append({"label": label, "action": action, **kwargs})
+
+    def _fake_gather(label, category):
+        return row_map[label]
+
+    with (
+        _patch.object(rag, "_all_daemon_labels", return_value=[(l, "managed") for l in labels]),
+        _patch.object(rag, "_gather_daemon_status", side_effect=_fake_gather),
+        _patch.object(subprocess, "run", side_effect=_flaky_run),
+        _patch.object(rag, "_log_daemon_run_event", side_effect=_capturing_log),
+    ):
+        result = runner.invoke(rag.daemons_kickstart_overdue, [])
+
+    # Exit 0: la CLI no rebota aunque UN daemon haya timeouteado.
+    assert result.exit_code == 0, result.output
+    # Ambos daemons quedaron en log: uno con timeout (124), otro ok (0).
+    assert len(log_calls) == 2
+    by_label = {lc["label"]: lc for lc in log_calls}
+    assert by_label["com.fer.obsidian-rag-mood-poll"]["exit_code"] == 124
+    assert by_label["com.fer.obsidian-rag-anticipate"]["exit_code"] == 0
+    # Output muestra el timeout marker + el ok marker.
+    assert "timeout" in result.output
+    assert "anticipate" in result.output
+
+
+def test_daemons_kickstart_overdue_oserror_continues(sql_env):
+    """Si subprocess.run lanza OSError, también seguimos con el siguiente."""
+    from unittest.mock import patch as _patch
+    runner = CliRunner()
+
+    labels = ["com.fer.obsidian-rag-foo", "com.fer.obsidian-rag-bar"]
+    row_map = {l: _fake_status(l, overdue=True) for l in labels}
+
+    mock_ok = MagicMock()
+    mock_ok.returncode = 0
+    mock_ok.stderr = ""
+
+    def _flaky_run(cmd, *args, **kwargs):
+        if "foo" in cmd[-1]:
+            raise OSError("ENOMEM")
+        return mock_ok
+
+    log_calls: list[dict] = []
+
+    with (
+        _patch.object(rag, "_all_daemon_labels", return_value=[(l, "managed") for l in labels]),
+        _patch.object(rag, "_gather_daemon_status", side_effect=lambda l, c: row_map[l]),
+        _patch.object(subprocess, "run", side_effect=_flaky_run),
+        _patch.object(rag, "_log_daemon_run_event",
+                      side_effect=lambda label, action, **kw: log_calls.append({"label": label, **kw})),
+    ):
+        result = runner.invoke(rag.daemons_kickstart_overdue, [])
+
+    assert result.exit_code == 0, result.output
+    assert len(log_calls) == 2
+    by_label = {lc["label"]: lc for lc in log_calls}
+    assert by_label["com.fer.obsidian-rag-foo"]["exit_code"] == -2
+    assert by_label["com.fer.obsidian-rag-bar"]["exit_code"] == 0

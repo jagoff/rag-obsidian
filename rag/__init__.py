@@ -13924,10 +13924,17 @@ def _load_corpus(col: SqliteVecCollection, *, hint_count: int | None = None) -> 
     retrieve compound).
     """
     global _corpus_cache
-    n = int(hint_count) if hint_count is not None else col.count()
-    cid = str(getattr(col, "id", "") or "")
-    # Single-flight pattern: el lock cubre TODO el rebuild para que dos
-    # threads en miss simultáneo no ejecuten BM25Okapi en paralelo.
+    # Single-flight pattern: el lock cubre TODO el rebuild + las queries
+    # de invalidation (col.count() / col.id) que comparten el connection
+    # SQLite con todo el resto del web server. Pre-fix (2026-04-30): los
+    # `n = col.count()` y `cid = col.id` corrían FUERA del lock,
+    # exponiendo la connection compartida (`check_same_thread=False`) a
+    # una race condition en el statement-prepare. Resultado observado en
+    # producción 2026-05-01: 26 fallos `InterfaceError: bad parameter
+    # or other API misuse` al día desde graph_expand.outer + IndexError
+    # en `col.count()` cuando dos threads concurrentes corrupted el
+    # statement-state en simultaneo. Mover ambas dentro del lock cuesta
+    # ~2-4ms en cache hit (el lock acquire es rápido) y elimina el race.
     # Pre-fix: el lock se soltaba tras el check de hit y el rebuild
     # ocurría fuera — el segundo thread overwriteaba al primero, y si
     # un tercer thread llamaba `_invalidate_corpus_cache()` entre el
@@ -13937,6 +13944,8 @@ def _load_corpus(col: SqliteVecCollection, *, hint_count: int | None = None) -> 
     # Costo: queries paralelas serializan en cache miss (~50-300ms una
     # vez); el cache hit subsequent es libre (check al inicio del lock).
     with _corpus_cache_lock:
+        n = int(hint_count) if hint_count is not None else col.count()
+        cid = str(getattr(col, "id", "") or "")
         cached = _corpus_cache
         if (
             cached is not None

@@ -467,53 +467,11 @@
     .ft-actions button.btn-snooze:hover { background: rgba(227, 194, 122, 0.15); border-color: var(--yellow); }
     .ft-actions button:disabled { opacity: 0.4; cursor: not-allowed; }
 
-    .ft-comment {
-      margin-top: 10px;
-      display: none;
-    }
-    .ft-comment.expanded { display: block; }
+    /* CSS de .ft-comment / .ft-comment-actions removido post 2026-05-01
+     * evening — el textarea de comment se eliminó (audit del día 1 mostró
+     * 0 comments en 20 negatives → fricción inútil). Ambos botones ahora
+     * fire-and-remove al primer click. */
 
-    .ft-comment textarea {
-      width: 100%;
-      min-height: 60px;
-      padding: 8px;
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      background: var(--bg);
-      color: var(--fg);
-      font-family: inherit;
-      font-size: 13px;
-      resize: vertical;
-      margin-bottom: 8px;
-    }
-    .ft-comment textarea:focus {
-      border-color: var(--border-strong);
-      outline: none;
-    }
-
-    .ft-comment-actions {
-      display: flex;
-      gap: 8px;
-      justify-content: flex-end;
-    }
-    .ft-comment-actions button {
-      background: var(--card-bg);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 6px 12px;
-      cursor: pointer;
-      font-size: 13px;
-      color: var(--fg);
-      font-family: inherit;
-    }
-    .ft-comment-actions .btn-submit-neg {
-      background: rgba(255, 123, 114, 0.15);
-      border-color: var(--red);
-      color: var(--red);
-    }
-    .ft-comment-actions .btn-submit-neg:hover { background: rgba(255, 123, 114, 0.25); }
-    .ft-comment-actions .btn-cancel-neg { color: var(--text-faint); }
-    .ft-comment-actions .btn-cancel-neg:hover { color: var(--fg); background: var(--hover); }
 
     @media (max-width: 600px) {
       .ft-card { padding: 12px; margin-bottom: 10px; }
@@ -730,46 +688,21 @@
             <button class="btn-neg" title="Negativo" aria-label="Votar negativo">👎</button>
             <button class="btn-snooze" title="Snooze 24h" aria-label="Posponer 24 horas">💤</button>
           </div>
-          <div class="ft-comment" aria-live="polite">
-            <textarea placeholder="¿qué falló en la respuesta del modelo?"></textarea>
-            <div class="ft-comment-actions">
-              <button class="btn-cancel-neg" type="button">Cancelar</button>
-              <button class="btn-submit-neg" type="button">Enviar 👎</button>
-            </div>
-          </div>
         `;
 
         const btnPos    = card.querySelector('.btn-pos');
         const btnNeg    = card.querySelector('.btn-neg');
         const btnSnooze = card.querySelector('.btn-snooze');
-        const commentEl = card.querySelector('.ft-comment');
-        const textarea  = card.querySelector('textarea');
-        const btnSubmit = card.querySelector('.btn-submit-neg');
-        const btnCancel = card.querySelector('.btn-cancel-neg');
 
+        // Ambos botones fire-and-remove al primer click — el textarea de
+        // comment se removió post 2026-05-01 evening (audit del día 1
+        // mostró 0 comments en 20 negatives → fricción inútil).
         btnPos.addEventListener('click', () => {
           handleRate(item.stream, item.item_id, 1, label, null, item.session_id, card);
         });
-
         btnNeg.addEventListener('click', () => {
-          if (commentEl.classList.contains('expanded')) {
-            /* segundo click → enviar sin comentario */
-            handleRate(item.stream, item.item_id, -1, label, null, item.session_id, card);
-          } else {
-            commentEl.classList.add('expanded');
-            textarea.focus();
-          }
+          handleRate(item.stream, item.item_id, -1, label, null, item.session_id, card);
         });
-
-        btnSubmit.addEventListener('click', () => {
-          handleRate(item.stream, item.item_id, -1, label, textarea.value.trim() || null, item.session_id, card);
-        });
-
-        btnCancel.addEventListener('click', () => {
-          commentEl.classList.remove('expanded');
-          textarea.value = '';
-        });
-
         btnSnooze.addEventListener('click', () => {
           handleSnooze(item.stream, item.item_id, card);
         });

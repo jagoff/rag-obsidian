@@ -15527,6 +15527,7 @@ def transcripts_dashboard(nofresh: int = 0) -> HTMLResponse:
     <a href="/dashboard">dashboard</a>
     <a href="/status">status</a>
     <a href="/transcripts" class="active">transcripts</a>
+    <a href="/fine_tunning">fine_tunning</a>
     <a href="https://ra.ai/agents/">agents</a>
   </nav>
   <h1>whisper transcripts <a href="/transcripts" class="refresh-btn" title="recargar ahora">↻</a></h1>

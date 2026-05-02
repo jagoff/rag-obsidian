@@ -22867,19 +22867,20 @@ def vault_health_api() -> dict:
 
 # ── Fine-tunning panel ──────────────────────────────────────────────────
 # Endpoints del panel de labeling humano para acelerar los learning loops.
-# Los streams soportados en /api/fine_tunning/rate son (wave-2: 11 streams):
-#   retrieval         — query con paths, label si encontró bien
-#   retrieval_answer  — query CON respuesta del modelo, label si la respuesta fue útil
-#   brief             — morning/today/digest, label si fue relevante
-#   draft / draft_wa  — drafts del bot WA a contactos
-#   anticipate        — pushes anticipatorios sin reaction
+# Diseño (post 2026-05-01 evening): el panel SÓLO expone outputs del MODELO
+# en contexto de conversación. NO se puntúa input humano (queries crudas,
+# mensajes WhatsApp del corpus) — eso no acelera el aprendizaje.
+#
+# Streams válidos en /api/fine_tunning/rate:
+#   retrieval_answer  — respuesta del LLM a una query (con contexto del turn)
+#   brief             — morning/today/digest generado por el modelo
+#   draft / draft_wa  — drafts que el bot redactó para responder a contactos
+#   anticipate        — pushes anticipatorios generados por el modelo
 #   proactive_push    — morning briefs / archive / etc del proactive_log
-#   whatsapp_msg      — chunks WA del corpus, label relevancia para retrieval
 #   style / tool_routing / read_summary — extensible (no populated todavía)
-# Variantes legacy del comentario original:
-#   retrieval | brief | draft | anticipate | style | tool_routing | read_summary
+#
 # Las tablas rag_ft_panel_ratings y rag_ft_active_queue_state se crean en
-# _TELEMETRY_DDL de rag/__init__.py (ya existentes).
+# _TELEMETRY_DDL de rag/__init__.py.
 # ───────────────────────────────────────────────────────────────────────
 
 
@@ -22910,8 +22911,8 @@ class FineTunningRateRequest(BaseModel):
     @classmethod
     def _stream_valid(cls, v: str) -> str:
         _valid = {
-            "retrieval", "retrieval_answer", "brief", "draft", "draft_wa",
-            "anticipate", "proactive_push", "whatsapp_msg",
+            "retrieval_answer", "brief", "draft", "draft_wa",
+            "anticipate", "proactive_push",
             "style", "tool_routing", "read_summary",
         }
         if v not in _valid:
@@ -22927,29 +22928,28 @@ class FineTunningSnoozeRequest(BaseModel):
 
 @app.get("/api/fine_tunning/queue")
 def fine_tunning_queue(limit: int = 20) -> dict:
-    """Cola unificada de items pendientes de labeling, compuesta por tres streams:
-    retrieval (queries low-confidence sin feedback), brief (briefs con reactions
-    negativas) y anticipate (candidates pusheados sin reaction posterior).
+    """Cola unificada de OUTPUTS DEL MODELO en contexto de conversación.
+
+    Diseño (post 2026-05-01 evening): el panel sólo muestra cosas que generó
+    EL MODELO (respuestas RAG, drafts del bot, briefs, pushes anticipatorios).
+    NO muestra lo que escribió el user (queries crudas) ni lo que dijo la
+    gente (mensajes WhatsApp del corpus) — puntuar input humano no acelera
+    el aprendizaje del modelo.
+
+    Streams activos: retrieval_answer, brief, anticipate, draft_wa,
+    proactive_push. Cada item lleva contexto suficiente para juzgar la
+    salida sin abrir otra herramienta.
 
     Silent-fail: si la DB está inaccesible devuelve lista vacía sin romper.
     """
     items: list[dict] = []
     try:
         from rag import (  # noqa: PLC0415
-            _get_fine_tunning_retrieval_queue,
             _ragvec_state_conn,
             _silent_log,
         )
         clamped = max(1, min(int(limit), 50))
         with _ragvec_state_conn() as conn:
-            # ── Retrieval: queries low-confidence sin feedback explícito ──
-            try:
-                items.extend(
-                    _get_fine_tunning_retrieval_queue(conn, limit=clamped)
-                )
-            except Exception as exc_r:
-                _silent_log("fine_tunning_queue_retrieval_error", str(exc_r))
-
             # ── Brief: últimos 10 con reactions negativas/mute sin rating panel ──
             try:
                 cur = conn.execute("""
@@ -23025,14 +23025,24 @@ def fine_tunning_queue(limit: int = 20) -> dict:
             except Exception as exc_a:
                 _silent_log("fine_tunning_queue_anticipate_error", str(exc_a))
 
-            # ── Retrieval ANSWER: queries con respuesta exitosa, label si fue útil ──
-            # Puntás si la RESPUESTA del modelo era buena (no solo si encontró paths).
-            # Filtra: top_score >= 0.5 (alta confianza) AND answer_len > 0 (LLM respondió)
-            # AND NOT en rag_feedback (sin thumbs explícito todavía).
+            # ── Retrieval ANSWER: respuestas del modelo en contexto de conversación ──
+            # El user puntúa si la RESPUESTA del modelo fue útil (qué dijo, no qué
+            # preguntó). Filtra: top_score >= 0.5 (alta confianza) AND answer_len > 0
+            # (LLM respondió) AND NOT en rag_feedback (sin thumbs explícito todavía).
+            # LEFT JOIN a rag_response_cache para traer el TEXTO de la respuesta cuando
+            # esté cacheado, y a rag_conversations_index para linkear a la nota episódica
+            # del vault que tiene el turno completo (system + user + assistant).
             try:
                 cur = conn.execute("""
-                    SELECT q.id, q.q, q.top_score, q.ts, q.paths_json, q.session
+                    SELECT q.id, q.q, q.top_score, q.ts, q.paths_json, q.session,
+                           rc.response,
+                           ci.relative_path
                     FROM rag_queries q
+                    LEFT JOIN rag_response_cache rc
+                      ON rc.question = q.q
+                      AND ABS(julianday(rc.ts) - julianday(q.ts)) < 1.0
+                    LEFT JOIN rag_conversations_index ci
+                      ON ci.session_id = q.session
                     LEFT JOIN rag_ft_panel_ratings ftr
                       ON ftr.stream = 'retrieval_answer'
                       AND ftr.item_id = CAST(q.id AS TEXT)
@@ -23056,11 +23066,16 @@ def fine_tunning_queue(limit: int = 20) -> dict:
                 """)
                 import json as _json_ra
                 for row in cur.fetchall():
-                    qid, qtext, ts_score, ts_q, paths_json, sess = row
+                    (qid, qtext, ts_score, ts_q, paths_json, sess,
+                     response_text, conv_relpath) = row
                     try:
                         paths = _json_ra.loads(paths_json) if paths_json else []
                     except Exception:
                         paths = []
+                    response_short = None
+                    if response_text:
+                        rt = response_text.replace("\n", " ").strip()
+                        response_short = rt[:240] + ("…" if len(rt) > 240 else "")
                     items.append({
                         "item_id": str(qid),
                         "stream": "retrieval_answer",
@@ -23069,6 +23084,12 @@ def fine_tunning_queue(limit: int = 20) -> dict:
                         "ts": ts_q,
                         "paths": paths if isinstance(paths, list) else [],
                         "session_id": sess,
+                        "meta": {
+                            "user_query": qtext,
+                            "model_response": response_short,
+                            "conversation_path": conv_relpath,
+                            "n_paths": len(paths) if isinstance(paths, list) else 0,
+                        },
                     })
             except Exception as exc_ra:
                 _silent_log("fine_tunning_queue_retrieval_answer_error", str(exc_ra))
@@ -23174,101 +23195,12 @@ def fine_tunning_queue(limit: int = 20) -> dict:
             except Exception as exc_pp:
                 _silent_log("fine_tunning_queue_proactive_push_error", str(exc_pp))
 
-            # ── WhatsApp messages: chunks recientes del corpus, label si son
-            #    relevantes para retrieval (signal directo al ranker WA-aware) ──
-            # Lee de ragvec.db (corpus), NO telemetry.db. Open separado read-only.
-            try:
-                from rag import DB_PATH as _DB_PATH  # noqa: PLC0415
-                import sqlite3 as _sqlite_wa  # noqa: PLC0415
-                _ragvec_db = _DB_PATH / "ragvec.db"
-                if _ragvec_db.exists():
-                    _wa_conn = _sqlite_wa.connect(
-                        f"file:{_ragvec_db}?mode=ro&immutable=1", uri=True
-                    )
-                    try:
-                        # Buscar la tabla meta del v11 collection por convención
-                        cur_w = _wa_conn.execute("""
-                            SELECT name FROM sqlite_master
-                            WHERE type='table' AND name LIKE 'meta_obsidian_notes_v11_%'
-                            LIMIT 1
-                        """)
-                        meta_row = cur_w.fetchone()
-                        if meta_row:
-                            meta_table = meta_row[0]
-                            # Sample WA chunks recientes, capped a 8 (no inflar la cola).
-                            # Schema real: source/file/note/extra_json son columnas
-                            # directas (no hay meta_json). chat_jid/sender viven en
-                            # extra_json o se infieren del file/folder path.
-                            cur_w = _wa_conn.execute(f"""
-                                SELECT chunk_id, document, file, folder, note,
-                                       extra_json, created_ts
-                                FROM {meta_table}
-                                WHERE source = 'whatsapp'
-                                  AND created_ts >= unixepoch('now', '-3 days')
-                                ORDER BY created_ts DESC
-                                LIMIT 8
-                            """)
-                            import json as _json_wa
-                            wa_rows = cur_w.fetchall()
-                        else:
-                            wa_rows = []
-                    finally:
-                        _wa_conn.close()
-
-                    if wa_rows:
-                        # Cross-check ratings panel en telemetry conn (la ya abierta)
-                        wa_ids = [str(r[0]) for r in wa_rows]
-                        placeholders = ",".join(["?"] * len(wa_ids))
-                        cur_excl = conn.execute(
-                            f"SELECT item_id FROM rag_ft_panel_ratings "
-                            f"WHERE stream='whatsapp_msg' AND item_id IN ({placeholders})",
-                            wa_ids,
-                        )
-                        excluded_rated = {r[0] for r in cur_excl.fetchall()}
-                        cur_excl2 = conn.execute(
-                            f"SELECT item_id FROM rag_ft_active_queue_state "
-                            f"WHERE stream='whatsapp_msg' AND item_id IN ({placeholders}) "
-                            f"AND snoozed_until_ts > datetime('now')",
-                            wa_ids,
-                        )
-                        excluded_snoozed = {r[0] for r in cur_excl2.fetchall()}
-                        excluded = excluded_rated | excluded_snoozed
-
-                        for chunk_id, doc_text, file_, folder, note, extra_json, created_ts in wa_rows:
-                            sid = str(chunk_id)
-                            if sid in excluded:
-                                continue
-                            try:
-                                extra = _json_wa.loads(extra_json) if extra_json else {}
-                            except Exception:
-                                extra = {}
-                            # chat_jid: del extra_json o inferido del file path
-                            # (ej. 'whatsapp://5491155555555@s.whatsapp.net/msg-id')
-                            chat_jid = (extra.get("chat_jid") or extra.get("chat")
-                                        or (note or file_ or "?"))
-                            sender = (extra.get("from") or extra.get("sender")
-                                      or extra.get("sender_name") or "?")
-                            short_doc = (doc_text or "")[:100].replace("\n", " ")
-                            if len(doc_text or "") > 100:
-                                short_doc += "…"
-                            # ts ISO desde epoch
-                            try:
-                                import datetime as _dt_wa  # noqa: PLC0415
-                                ts_iso = _dt_wa.datetime.fromtimestamp(
-                                    int(created_ts)
-                                ).isoformat()
-                            except Exception:
-                                ts_iso = ""
-                            items.append({
-                                "item_id": sid,
-                                "stream": "whatsapp_msg",
-                                "label": f"[{sender}] {short_doc}",
-                                "ts": ts_iso,
-                                "meta": {"chat_jid": chat_jid, "sender": sender,
-                                         "snippet": short_doc},
-                            })
-            except Exception as exc_wa:
-                _silent_log("fine_tunning_queue_whatsapp_msg_error", str(exc_wa))
+            # NOTE: stream `whatsapp_msg` (chunks WA del corpus) eliminado el
+            # 2026-05-01 evening. Razón: lo que escribió la GENTE en sus chats
+            # no es output del modelo — puntuar input humano no acelera el
+            # aprendizaje. El panel sólo expone outputs del modelo en contexto
+            # de conversación (retrieval_answer, brief, anticipate, draft_wa,
+            # proactive_push).
 
     except Exception as exc:
         try:

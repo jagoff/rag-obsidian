@@ -88,14 +88,18 @@ def test_queue_empty_returns_empty_list(client, seeded_conn):
 
 # ── Test 3 ─────────────────────────────────────────────────────────────────
 
-def test_queue_includes_retrieval_low_score(client, seeded_conn):
+def test_queue_includes_retrieval_answer_high_score(client, seeded_conn):
+    """Post 2026-05-01 evening: el panel sólo muestra outputs del modelo.
+    El stream `retrieval_answer` aparece cuando hay query con respuesta del LLM
+    (top_score >= 0.5 AND answer_len > 0)."""
     seeded_conn.execute(
         """
         INSERT INTO rag_queries
-            (ts, q, top_score, paths_json, cmd)
+            (ts, q, top_score, answer_len, paths_json, cmd)
         VALUES
-            (datetime('now', '-1 hour'), 'qué pasa con esto', 0.05,
-             '["a.md"]', 'query')
+            (datetime('now', '-1 hour'),
+             'pregunta con respuesta del modelo', 0.85, 1024,
+             '["a.md"]', 'web.chat')
         """
     )
     seeded_conn.commit()
@@ -103,21 +107,24 @@ def test_queue_includes_retrieval_low_score(client, seeded_conn):
     r = client.get("/api/fine_tunning/queue")
     assert r.status_code == 200
     items = r.json()["items"]
-    retrieval_items = [i for i in items if i["stream"] == "retrieval"]
-    assert len(retrieval_items) >= 1
-    labels = [i["label"] for i in retrieval_items]
-    assert "qué pasa con esto" in labels
+    answer_items = [i for i in items if i["stream"] == "retrieval_answer"]
+    assert len(answer_items) >= 1
+    labels = [i["label"] for i in answer_items]
+    assert "pregunta con respuesta del modelo" in labels
 
 
 # ── Test 4 ─────────────────────────────────────────────────────────────────
 
-def test_queue_excludes_high_score_query(client, seeded_conn):
+def test_queue_excludes_query_without_answer(client, seeded_conn):
+    """Post 2026-05-01: queries sin respuesta del modelo (answer_len = 0)
+    NO aparecen en el panel — sólo se puntúa output del modelo."""
     seeded_conn.execute(
         """
         INSERT INTO rag_queries
-            (ts, q, top_score, paths_json, cmd)
+            (ts, q, top_score, answer_len, paths_json, cmd)
         VALUES
-            (datetime('now', '-1 hour'), 'query muy confiable', 0.5,
+            (datetime('now', '-1 hour'),
+             'query sin respuesta del modelo', 0.85, 0,
              '["b.md"]', 'query')
         """
     )
@@ -127,18 +134,18 @@ def test_queue_excludes_high_score_query(client, seeded_conn):
     assert r.status_code == 200
     items = r.json()["items"]
     labels = [i.get("label", "") for i in items]
-    assert "query muy confiable" not in labels
+    assert "query sin respuesta del modelo" not in labels
 
 
 # ── Test 5 ─────────────────────────────────────────────────────────────────
 
 def test_post_rate_persists_row(client, seeded_conn):
     body = {
-        "stream": "retrieval",
-        "item_id": "42",
+        "stream": "brief",
+        "item_id": "04-Archive/.../2026-04-29-morning.md",
         "rating": -1,
-        "label": "test query",
-        "comment": "no encontró nada útil",
+        "label": "morning brief 2026-04-29",
+        "comment": "muy genérico",
     }
     r = client.post("/api/fine_tunning/rate", json=body)
     assert r.status_code == 200
@@ -148,17 +155,17 @@ def test_post_rate_persists_row(client, seeded_conn):
         "SELECT stream, item_id, rating, comment FROM rag_ft_panel_ratings"
     ).fetchone()
     assert row is not None
-    assert row[0] == "retrieval"
-    assert row[1] == "42"
+    assert row[0] == "brief"
+    assert row[1] == "04-Archive/.../2026-04-29-morning.md"
     assert row[2] == -1
-    assert row[3] == "no encontró nada útil"
+    assert row[3] == "muy genérico"
 
 
 # ── Test 6 ─────────────────────────────────────────────────────────────────
 
 def test_post_rate_invalid_rating_returns_422(client, seeded_conn):
     body = {
-        "stream": "retrieval",
+        "stream": "brief",
         "item_id": "42",
         "rating": 0,
         "label": "x",
@@ -183,7 +190,7 @@ def test_post_rate_invalid_stream_returns_422(client, seeded_conn):
 # ── Test 8 ─────────────────────────────────────────────────────────────────
 
 def test_post_snooze_persists_state(client, seeded_conn):
-    body = {"stream": "retrieval", "item_id": "42", "hours": 24}
+    body = {"stream": "brief", "item_id": "42", "hours": 24}
     r = client.post("/api/fine_tunning/snooze", json=body)
     assert r.status_code == 200
 
@@ -191,7 +198,7 @@ def test_post_snooze_persists_state(client, seeded_conn):
         """
         SELECT snoozed_until_ts
         FROM rag_ft_active_queue_state
-        WHERE item_id = '42' AND stream = 'retrieval'
+        WHERE item_id = '42' AND stream = 'brief'
         """
     ).fetchone()
     assert row is not None
@@ -207,37 +214,35 @@ def test_post_snooze_persists_state(client, seeded_conn):
 # ── Test 9 ─────────────────────────────────────────────────────────────────
 
 def test_queue_excludes_snoozed_items(client, seeded_conn):
-    # Seedear una query low-score
+    """Snooze sobre retrieval_answer debe excluir el item del próximo /queue."""
     seeded_conn.execute(
         """
         INSERT INTO rag_queries
-            (ts, q, top_score, paths_json, cmd)
+            (ts, q, top_score, answer_len, paths_json, cmd)
         VALUES
-            (datetime('now', '-1 hour'), 'pregunta para snooze', 0.04,
-             '["c.md"]', 'query')
+            (datetime('now', '-1 hour'),
+             'respuesta del modelo para snooze', 0.85, 512,
+             '["c.md"]', 'web.chat')
         """
     )
     seeded_conn.commit()
 
-    # Obtener el id insertado
     row = seeded_conn.execute(
-        "SELECT id FROM rag_queries WHERE q = 'pregunta para snooze'"
+        "SELECT id FROM rag_queries WHERE q = 'respuesta del modelo para snooze'"
     ).fetchone()
     assert row is not None
     query_id = str(row[0])
 
-    # Snooze via endpoint
     r = client.post(
         "/api/fine_tunning/snooze",
-        json={"stream": "retrieval", "item_id": query_id, "hours": 48},
+        json={"stream": "retrieval_answer", "item_id": query_id, "hours": 48},
     )
     assert r.status_code == 200
 
-    # Verificar que no aparece en la cola
     r2 = client.get("/api/fine_tunning/queue")
     assert r2.status_code == 200
     items = r2.json()["items"]
-    ids = [i["item_id"] for i in items if i["stream"] == "retrieval"]
+    ids = [i["item_id"] for i in items if i["stream"] == "retrieval_answer"]
     assert query_id not in ids
 
 

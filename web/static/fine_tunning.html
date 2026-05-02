@@ -337,6 +337,58 @@
       margin-bottom: 10px;
     }
 
+    .ft-conversation {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin: 8px 0 10px 0;
+      padding: 10px 12px;
+      background: var(--bg);
+      border-left: 3px solid var(--border);
+      border-radius: 0 6px 6px 0;
+    }
+    .ft-conv {
+      display: flex;
+      gap: 8px;
+      font-size: 13px;
+      line-height: 1.4;
+      align-items: flex-start;
+    }
+    .ft-conv-role {
+      flex: 0 0 auto;
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--muted);
+      padding: 2px 6px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      min-width: 56px;
+      text-align: center;
+      white-space: nowrap;
+    }
+    .ft-conv-user .ft-conv-role { color: var(--accent); border-color: var(--accent); }
+    .ft-conv-model .ft-conv-role {
+      color: var(--badge-retrieval_answer, #2563eb);
+      border-color: var(--badge-retrieval_answer, #2563eb);
+    }
+    .ft-conv-text {
+      flex: 1;
+      color: var(--fg);
+      word-wrap: break-word;
+      overflow-wrap: break-word;
+    }
+    .ft-conv-faded .ft-conv-text { color: var(--muted); font-style: italic; }
+    .ft-conv-link {
+      font-size: 12px;
+      margin-top: 2px;
+    }
+    .ft-conv-link a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+    .ft-conv-link a:hover { text-decoration: underline; }
+
     .ft-actions {
       display: flex;
       gap: 8px;
@@ -471,30 +523,28 @@
       const emptyEl   = document.getElementById('ft-empty');
       const subtitleEl = document.getElementById('ft-count');
 
+      /* Sólo OUTPUTS DEL MODELO. retrieval (queries del user) y whatsapp_msg
+       * (chunks del corpus) se removieron post 2026-05-01 evening. */
       const STREAM_COLORS = {
-        retrieval:        'var(--badge-retrieval, #4c8eff)',
         retrieval_answer: 'var(--badge-retrieval_answer, #2563eb)',
         brief:            'var(--badge-brief, #a855f7)',
         anticipate:       'var(--badge-anticipate, #fb923c)',
         draft:            'var(--badge-draft, #10b981)',
         draft_wa:         'var(--badge-draft_wa, #059669)',
         proactive_push:   'var(--badge-proactive_push, #f59e0b)',
-        whatsapp_msg:     'var(--badge-whatsapp_msg, #25d366)',
         style:            'var(--badge-style, #ec4899)',
         tool_routing:     'var(--badge-tool_routing, #eab308)',
         read_summary:     'var(--badge-read_summary, #06b6d4)',
       };
 
-      /* Labels human-readable por stream (mostrados en el badge UI) */
+      /* Labels human-readable por stream — sólo OUTPUTS DEL MODELO */
       const STREAM_LABELS = {
-        retrieval:        '🔍 query',
         retrieval_answer: '💬 respuesta',
         brief:            '📓 brief',
         anticipate:       '🔮 push',
         draft:            '✉️ draft',
         draft_wa:         '💚 wa-draft',
         proactive_push:   '📣 proactive',
-        whatsapp_msg:     '📱 wa-msg',
         style:            '🎨 estilo',
         tool_routing:     '🛠 tool',
         read_summary:     '📄 read',
@@ -529,7 +579,7 @@
 
       function buildMeta(item) {
         const parts = [];
-        if (item.stream === 'retrieval' || item.stream === 'retrieval_answer') {
+        if (item.stream === 'retrieval_answer') {
           if (item.top_score != null) parts.push(`score=${item.top_score.toFixed(3)}`);
           if (item.paths && item.paths.length) parts.push(`${item.paths.length} paths`);
         } else if (item.stream === 'brief') {
@@ -544,11 +594,75 @@
           if (item.meta && item.meta.decision) parts.push(`decisión: ${item.meta.decision}`);
         } else if (item.stream === 'proactive_push') {
           if (item.meta && item.meta.kind) parts.push(`kind=${item.meta.kind}`);
-        } else if (item.stream === 'whatsapp_msg') {
-          if (item.meta && item.meta.sender) parts.push(`de ${item.meta.sender}`);
         }
-        if (item.ts) parts.push(formatRelTime(item.ts));
         return parts.join(' · ');
+      }
+
+      /* ── buildConversationContext ── render contexto de conversación
+       *  según el stream (qué dijo el user vs qué respondió el modelo). */
+      function buildConversationContext(item) {
+        const m = item.meta || {};
+        const blocks = [];
+
+        if (item.stream === 'retrieval_answer') {
+          if (m.user_query || item.label) {
+            blocks.push(`<div class="ft-conv ft-conv-user">
+              <span class="ft-conv-role">user</span>
+              <span class="ft-conv-text">${escapeHtml(m.user_query || item.label)}</span>
+            </div>`);
+          }
+          if (m.model_response) {
+            blocks.push(`<div class="ft-conv ft-conv-model">
+              <span class="ft-conv-role">modelo</span>
+              <span class="ft-conv-text">${escapeHtml(m.model_response)}</span>
+            </div>`);
+          } else {
+            blocks.push(`<div class="ft-conv ft-conv-model ft-conv-faded">
+              <span class="ft-conv-role">modelo</span>
+              <span class="ft-conv-text">(respuesta no cacheada — abrí la conversación para verla)</span>
+            </div>`);
+          }
+          if (m.conversation_path) {
+            const url = `obsidian://open?vault=Notes&file=${encodeURIComponent(m.conversation_path.replace(/\.md$/, ''))}`;
+            blocks.push(`<div class="ft-conv-link"><a href="${url}" target="_blank">→ abrir conversación en Obsidian</a></div>`);
+          }
+        } else if (item.stream === 'draft_wa') {
+          if (m.bot_draft) {
+            blocks.push(`<div class="ft-conv ft-conv-model">
+              <span class="ft-conv-role">bot drafteó</span>
+              <span class="ft-conv-text">${escapeHtml(m.bot_draft)}</span>
+            </div>`);
+          }
+          if (m.sent_text && m.sent_text !== m.bot_draft) {
+            blocks.push(`<div class="ft-conv ft-conv-user">
+              <span class="ft-conv-role">vos editaste</span>
+              <span class="ft-conv-text">${escapeHtml(m.sent_text)}</span>
+            </div>`);
+          }
+        } else if (item.stream === 'anticipate') {
+          if (m.message_preview) {
+            blocks.push(`<div class="ft-conv ft-conv-model">
+              <span class="ft-conv-role">push del modelo</span>
+              <span class="ft-conv-text">${escapeHtml(m.message_preview)}</span>
+            </div>`);
+          }
+        } else if (item.stream === 'proactive_push') {
+          if (m.reason) {
+            blocks.push(`<div class="ft-conv ft-conv-model">
+              <span class="ft-conv-role">push del modelo</span>
+              <span class="ft-conv-text">${escapeHtml(m.reason)}</span>
+            </div>`);
+          }
+        } else if (item.stream === 'brief') {
+          // Para briefs el label ya es el path; no hay snippet del contenido.
+          // Mostrar link al brief en el vault.
+          if (item.item_id) {
+            const url = `obsidian://open?vault=Notes&file=${encodeURIComponent(item.item_id.replace(/\.md$/, ''))}`;
+            blocks.push(`<div class="ft-conv-link"><a href="${url}" target="_blank">→ abrir brief en Obsidian</a></div>`);
+          }
+        }
+
+        return blocks.length ? `<div class="ft-conversation">${blocks.join('')}</div>` : '';
       }
 
       /* ── renderCard ── */
@@ -565,6 +679,7 @@
         const badgeText = STREAM_LABELS[item.stream] || item.stream;
         const meta  = buildMeta(item);
         const label = item.label || item.item_id;
+        const conversation = buildConversationContext(item);
 
         card.innerHTML = `
           <div class="ft-card-header">
@@ -572,6 +687,7 @@
             <span class="ft-ts">${formatRelTime(item.ts)}</span>
           </div>
           <div class="ft-label">${escapeHtml(label)}</div>
+          ${conversation}
           ${meta ? `<div class="ft-meta">${escapeHtml(meta)}</div>` : ''}
           <div class="ft-actions">
             <button class="btn-pos" title="Positivo" aria-label="Votar positivo">👍</button>
@@ -579,7 +695,7 @@
             <button class="btn-snooze" title="Snooze 24h" aria-label="Posponer 24 horas">💤</button>
           </div>
           <div class="ft-comment" aria-live="polite">
-            <textarea placeholder="¿qué falló? (opcional)"></textarea>
+            <textarea placeholder="¿qué falló en la respuesta del modelo?"></textarea>
             <div class="ft-comment-actions">
               <button class="btn-cancel-neg" type="button">Cancelar</button>
               <button class="btn-submit-neg" type="button">Enviar 👎</button>

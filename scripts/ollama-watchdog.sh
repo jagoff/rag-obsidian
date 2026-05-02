@@ -26,6 +26,11 @@
 #
 # ── Estrategia ──────────────────────────────────────────────────────────
 # Cada tick (StartInterval 60s):
+#   0. lsof :11434. Si hay >1 listener (típico: brew bindea IPv4 +
+#      Ollama.app bindea IPv6 al mismo puerto), kill los PIDs de
+#      Ollama.app + remover de login items. Sin cooldown — `pgrep` da
+#      idempotencia. Bug recurrente: ambas instancias duplican modelos
+#      en VRAM → embeds 30-90s, drafts WhatsApp timeoutean.
 #   1. GET /api/tags timeout 5s. Si no responde 2xx → Ollama serve está
 #      caído o pegado a TCP-level. Después de TAGS_FAIL_THRESHOLD ticks
 #      consecutivos (default 3 = 3min), `brew services restart ollama`.
@@ -71,6 +76,7 @@
 #   OLLAMA_POST_KILL_GRACE_SEC=120            grace post-kill (cold-load)
 #   OLLAMA_ESCALATE_KILLS_THRESHOLD=2         kills sin recovery → restart
 #   OLLAMA_GENERATE_PROBE_DISABLED=1          desactiva probe de chat
+#   OLLAMA_DUP_DETECTION_DISABLED=1           desactiva probe 0 (kill Ollama.app)
 #   OLLAMA_WATCHDOG_CATCHUP_DISABLED=1        desactiva el catchup nightly
 #
 # ── Estado ──────────────────────────────────────────────────────────────
@@ -115,6 +121,47 @@ GENERATE_MODEL="${OLLAMA_WATCHDOG_GENERATE_MODEL:-qwen2.5:7b}"
 log() {
   printf '[%s] %s\n' "$(date +%Y-%m-%dT%H:%M:%S%z)" "$1" >> "${LOG}"
 }
+
+# ── Probe 0: Duplicate-instance detection ──────────────────────────────
+# Si hay >1 listener en :11434 (típicamente IPv4 + IPv6 separados),
+# significa que están corriendo brew `ollama serve` Y `Ollama.app` al
+# mismo tiempo. Cada uno carga sus propios modelos en VRAM → unified
+# memory pressure → embeds 30-90s, drafts WhatsApp timeoutean
+# (`LLM call failed (todos los modelos): The operation timed out`).
+#
+# Bug recurrente — primera vez 2026-04-30 (memoria
+# `ollama_saturated_60s_embed_timeout_culprit_2_instancias_paralela`),
+# volvió 2026-05-02 cuando el user reabrió Ollama.app sin querer y
+# rompió 3 drafts seguidos (Fer F, Maria, Seba Serra). El watchdog
+# detectaba "ollama lento" pero no la causa raíz, restartear brew no
+# alcanzaba porque Ollama.app seguía consumiendo VRAM.
+#
+# Estrategia: el de brew es la instancia headless confiable (LaunchAgent
+# que reinicia solo si crashea); la app es solo botón menubar / settings
+# GUI. Si detectamos ambos, matamos la app y dejamos brew. La idempotencia
+# está dada por `pgrep`: si la app ya no existe, no hay nada que matar.
+#
+# Override: `OLLAMA_DUP_DETECTION_DISABLED=1` apaga el probe (útil si
+# alguien temporalmente quiere ambos para debug).
+if [ -z "${OLLAMA_DUP_DETECTION_DISABLED:-}" ]; then
+  listeners=$(lsof -nP -iTCP:11434 -sTCP:LISTEN 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')
+  if [ "${listeners:-0}" -gt 1 ]; then
+    # Identificar PIDs de Ollama.app (Electron menubar + su `ollama serve` hijo + runners)
+    app_pids=$(pgrep -f "Applications/Ollama.app" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
+    if [ -n "${app_pids}" ]; then
+      log "DUP_INSTANCE — listeners=${listeners} en :11434 (esperado=1). Ollama.app pids=[${app_pids}] — kill (queda brew solo)"
+      # shellcheck disable=SC2086
+      kill -9 ${app_pids} 2>>"${LOG}" || true
+      # Bonus: removerla de login items para que no vuelva al próximo boot.
+      # Idempotente — si ya está fuera, no falla.
+      osascript -e 'tell application "System Events" to delete every login item whose name is "Ollama"' \
+        >>"${LOG}" 2>&1 || true
+      log "DUP_INSTANCE_OK — Ollama.app killed + removida de login items"
+    else
+      log "DUP_INSTANCE_UNKNOWN — listeners=${listeners} pero no encontré pids de Applications/Ollama.app (revisar manual)"
+    fi
+  fi
+fi
 
 # ── Read previous state ────────────────────────────────────────────────
 tags_fails=0
@@ -266,7 +313,26 @@ else
         generate_fails=0
         kills_without_recovery=$(( kills_without_recovery + 1 ))
       else
-        log "KILL_RUNNERS_NOOP — pgrep no encontró ollama runner procs (raro: tags=200 pero sin runners?)"
+        # Runners-less zombie state — `ollama serve` responde HTTP pero
+        # los runners están muertos (caso típico: kill -9 manual de
+        # runners, app crash externa, OOM). `ollama ps` puede mentir
+        # diciendo que los modelos siguen cargados, pero embed/generate
+        # timeoutean. Sin escalation, el watchdog quedaría infinitamente
+        # logueando NOOP y nunca salvaría la situación.
+        #
+        # Tratamos esto como un "kill sin recovery" virtual: incrementamos
+        # el contador para que el próximo tick (con embed/generate
+        # todavía rotos) escale a restart_serve completo.
+        #
+        # 2026-05-02 root cause: descubierto durante el cleanup de
+        # duplicate-instance — al matar Ollama.app sus runners murieron,
+        # brew `ollama serve` quedó solo y zombie (HTTP up, runners
+        # gone). El watchdog detectó duplicate-instance pero no logró
+        # auto-recover el zombie state hasta que parcheamos esto.
+        log "KILL_RUNNERS_NOOP — pgrep no encontró ollama runner procs (zombie state — runners muertos pero serve up). reason=${reason}"
+        kills_without_recovery=$(( kills_without_recovery + 1 ))
+        embed_fails=0
+        generate_fails=0
       fi
     fi
   fi

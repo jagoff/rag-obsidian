@@ -509,30 +509,44 @@ Fix en este caso: extraer `buildDraftIncomingQuery({bypassOn, whitelistedJids, s
 
 **Tests**: [`tests/test_draft_decisions_table.py`](tests/test_draft_decisions_table.py) (DDL + helper, 10 casos), [`tests/test_draft_decisions_endpoint.py`](tests/test_draft_decisions_endpoint.py) (4 decision types + validation + persistencia, 9 casos), [`tests/test_anticipate_feedback_endpoint.py`](tests/test_anticipate_feedback_endpoint.py) (3 ratings + validation + silent-fail, 7 casos), [`tests/test_proactive_push_dedup_key_footer.py`](tests/test_proactive_push_dedup_key_footer.py) (footer agrega `_anticipate:<key>_` + back-compat sin dedup_key, 7 casos). Drift guard: table count en [`tests/test_sql_state_primitives.py`](tests/test_sql_state_primitives.py) bumpeado 44→45.
 
-### Fine-tune del modelo de drafts WA — LoRA sobre approved_editar (2026-04-29)
+### Fine-tune del modelo de drafts WA — DPO + LoRA sobre approved_editar (refactor 2026-05-01)
 
-Loop completo del bot WA (sección anterior) acumula gold pairs `(bot_draft, sent_text)` cuando el user hace `/editar`. Esa data hasta ahora se acumulaba sin consumirse. **El fine-tune cierra el loop**: entrena un adapter PEFT/LoRA sobre Qwen2.5-7B-Instruct usando los pares como ground-truth de "qué corrige Fer y por dónde". El adapter NO sustituye el modelo del listener (sigue siendo `qwen2.5:14b`) — es accesible solo vía endpoint preview para A/B manual.
+Loop completo del bot WA (sección anterior) acumula preference pairs `(bot_draft, sent_text)` cuando el user hace `/editar`. **El fine-tune cierra el loop**: entrena un adapter PEFT/LoRA sobre Qwen2.5-7B-Instruct via [DPO (Direct Preference Optimization)](https://arxiv.org/abs/2305.18290) — `bot_draft` es el `rejected`, `sent_text` es el `chosen`. El adapter NO sustituye el modelo del listener (sigue siendo `qwen2.5:7b` con fallback) — es accesible solo vía endpoint preview para A/B manual.
+
+**Por qué DPO y no SFT** (refactor 2026-05-01):
+
+El script viejo usaba SFT con un parche feo: para `decision='rejected'` ponía `target=""` con `weight=0.3` como pseudo-anti-pattern. Resultado: el modelo aprendía mediocre porque CrossEntropy no distingue "preferí esto" vs "rechazá aquello". DPO optimiza directamente `log p(chosen) - log p(rejected)` con KL penalty contra el modelo base — es la herramienta natural para preference pairs y evita catastrophic forgetting.
+
+Caso de éxito comparable: [`RigoChat-7b-v2`](https://huggingface.co/IIC/RigoChat-7b-v2) es Qwen2.5-7B-Instruct fine-tuned con DPO para español por el [IIC](https://www.iic.uam.es/). Mejora 79.55 vs 77.17 en Spanish MMLU vs el base, sin regresión en otros idiomas. Mismo playbook acá.
 
 **Cómo correr**:
 
 ```bash
 rag drafts finetune --dry-run                          # reporta stats sin entrenar
-rag drafts finetune --epochs 3 --lr 1e-4               # entrena con defaults
+rag drafts finetune --epochs 1 --lr 5e-6               # default DPO + LoRA
 rag drafts finetune --exclude-review-only              # filtra rows con extra_json.review_only=true
 
 # Equivalente directo al script:
 uv run python scripts/finetune_drafts.py --dry-run
 ```
 
-**Cuándo correr**: requiere ≥100 pares totales (`approved_editar` + `rejected`). Por debajo de ese umbral el script falla con `exit 1` y mensaje claro ("datos insuficientes, esperá más feedback"). Razón: con <100 ejemplos el LoRA overfit-ea al estilo exacto de las pocas frases vistas y no generaliza. Para ver el conteo actual: `rag drafts stats`.
+**Defaults nuevos vs SFT viejo**: `epochs=1` (DPO converge más rápido), `lr=5e-6` (10x más bajo que SFT — el contrastive loss tiene gradients más fuertes), `beta=0.1` (KL penalty estándar). El r=8/alpha=16 sobre q+v projections se mantiene.
 
-Estimación de tiempo: con ~500 pares y 3 epochs en CPU del M-series tarda ~10-30min (LoRA r=8 alpha=16 sobre Q/V projections, ~5 MB de adapter). El base model (~14 GB) se descarga del HF Hub la primera vez.
+**Cuándo correr**: requiere ≥100 GOLD preference pairs (rows `decision='approved_editar'` con `sent_text != bot_draft`). Las rows `decision='rejected'` YA NO cuentan — DPO requiere ambos chosen Y rejected, y rechazo sin alternativa no aporta. Por debajo de 100 el script falla con `exit 1`. Para ver el conteo actual: `rag drafts stats`.
 
-**Métricas held-out** (split estratificado 80/20 por `draft_id` para no leakear): BLEU-1 unigram + similaridad char-level (1 - normalized edit distance via [`difflib.SequenceMatcher`](https://docs.python.org/3/library/difflib.html#difflib.SequenceMatcher)). Print de 5 samples random con bot_draft / target / prediction. Ambas métricas son sanity-check (no eval competitiva) — la eval real la hace el user comparando outputs vía el endpoint preview.
+Estimación de tiempo: con ~500 pares y 1 epoch DPO en CPU del M-series tarda ~10-15min (LoRA r=8 alpha=16 sobre q+v projections, ~5 MB de adapter). El base model (~14 GB) se descarga del HF Hub la primera vez. `precompute_ref_log_probs=True` ahorra memoria 2x al precomputar log-probs del modelo base congelado antes del loop.
+
+**Métricas held-out** (split estratificado 80/20 por `draft_id` para no leakear):
+
+- **BLEU-1 unigram precision** vs el `chosen` (sent_text)
+- **Similarity (char-level)** vs el `chosen`, via [`difflib.SequenceMatcher`](https://docs.python.org/3/library/difflib.html#difflib.SequenceMatcher)
+- **Preference win rate**: % de val_examples donde `sim(pred, chosen) > sim(pred, rejected)` — la métrica DIRECTA de calidad DPO. Si win rate ≤50% el modelo no está aprendiendo a preferir tu tono.
+
+Print de 5 samples random con rejected / chosen / prediction + flag de win/loss. La eval competitiva la hace el user comparando outputs vía el endpoint preview.
 
 **Activación del adapter — env var `RAG_DRAFTS_FT=1`**:
 
-Default OFF. Cuando ON + el adapter existe en `~/.local/share/obsidian-rag/drafts_ft/`, el endpoint [`POST /api/draft/preview`](web/server.py) usa el modelo fine-tuned. Sin esto (default), el endpoint devuelve `bot_draft_baseline` sin modificar (echo). El listener TS NUNCA usa este modelo — sigue con `qwen2.5:14b` para los drafts en producción.
+Default OFF. Cuando ON + el adapter existe en `~/.local/share/obsidian-rag/drafts_ft/`, el endpoint [`POST /api/draft/preview`](web/server.py) usa el modelo fine-tuned. Sin esto (default), el endpoint devuelve `bot_draft_baseline` sin modificar (echo). El listener TS NUNCA usa este modelo — sigue con `qwen2.5:7b` para los drafts en producción.
 
 **Endpoint `/api/draft/preview`**:
 
@@ -561,15 +575,16 @@ rag drafts finetune           # entrena (requires ≥100 pares)
 - El adapter dir vive bajo XDG data home (`~/.local/share/obsidian-rag/drafts_ft/`), NO bajo cache (`~/.cache/`). La signal del user (sus correcciones) no es regenerable; macOS limpia el cache automáticamente cuando hay low disk, no queremos perder un fine-tune curado.
 - La `stats` extendida lee `extra_json.review_only` con `json_extract(...) IN (1, 'true', true)` — back-compat con tres formas de booleano truthy que pueden llegar del listener.
 
-**Tests**: [`tests/test_finetune_drafts.py`](tests/test_finetune_drafts.py) (11 casos: mining gold+anti, filtro review-only, exit 1 con <100 pares, dry-run happy path, endpoint flag OFF echoes, endpoint flag ON adapter missing → silent fallback, endpoint helper never raises, CLI smoke `rag drafts stats --plain` plural+singular alias, BLEU/sim sanity, split sin leak por draft_id).
+**Tests**: [`tests/test_finetune_drafts.py`](tests/test_finetune_drafts.py) (14 casos: mining gold-only + skip rejected, skip degenerate pairs (chosen==rejected), filtro review-only, exit 1 con <100 pares, dry-run happy path, endpoint flag OFF echoes, endpoint flag ON adapter missing → silent fallback, endpoint helper never raises, CLI smoke `rag drafts stats --plain` plural+singular alias con adapter dir aislado, BLEU/sim sanity, build_dpo_example shape (prompt sin bot_draft, chosen/rejected wired correctos), preference_win classification, split sin leak por draft_id).
 
 **Flujo recomendado** una vez que se acumulen los pares:
 
 1. `rag drafts stats` periódicamente para ver cuándo cruzo los 100 pares.
 2. `rag drafts finetune --dry-run` para confirmar el split y los counts antes de invertir tiempo de training.
-3. `rag drafts finetune --epochs 3` para entrenar.
-4. `export RAG_DRAFTS_FT=1` + reiniciar `rag serve` (`launchctl kickstart -k gui/$(id -u)/com.fer.obsidian-rag-web`) para que el endpoint pickup el adapter.
-5. Levantar el listener TS con la conversación de un contacto real, capturar el `bot_draft` y el `original_conversation`, y `curl POST /api/draft/preview` para ver el A/B. Si el output del fine-tuned está más cerca del estilo de Fer → keep el adapter activo. Si peor → `unset RAG_DRAFTS_FT` y volver a iterar con más data.
+3. `rag drafts finetune --epochs 1` para entrenar (DPO converge en 1 epoch — más overfit-prone).
+4. Revisar el `pref_win_rate` en el reporte. Si ≤50% el modelo no aprendió — más data o ajustar `--lr`/`--epochs`.
+5. `export RAG_DRAFTS_FT=1` + reiniciar `rag serve` (`launchctl kickstart -k gui/$(id -u)/com.fer.obsidian-rag-web`) para que el endpoint pickup el adapter.
+6. Levantar el listener TS con la conversación de un contacto real, capturar el `bot_draft` y el `original_conversation`, y `curl POST /api/draft/preview` para ver el A/B. Si el output del fine-tuned está más cerca del estilo de Fer → keep el adapter activo. Si peor → `unset RAG_DRAFTS_FT` y volver a iterar con más data.
 
 ### Brief feedback loop — los briefs aprenden de las reactions (2026-04-29)
 

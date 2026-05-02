@@ -91,16 +91,35 @@ entities = ["gliner>=0.2.26"]
 # auto-download on first use to ~/.cache/huggingface/hub/.
 # Install: `uv tool install --reinstall --editable '.[stt]'`
 stt = ["faster-whisper>=1.0.0"]
-# LoRA fine-tune del cross-encoder reranker (GC#2.C, 2026-04-23).
-# `scripts/finetune_reranker.py --mode lora` entrena un adapter PEFT
-# (r=8, alpha=16, dropout=0.1) on top de bge-reranker-v2-m3 usando los
-# pares positivos/negativos de `rag_feedback` + `rag_behavior`. El
-# adapter se guarda en `~/.local/share/obsidian-rag/reranker_ft/` y
-# solo se carga en runtime cuando `RAG_RERANKER_FT=1` (default OFF).
-# Soft dependency: el script + el loader fallan a base model con un
-# warning a `silent_errors.jsonl` cuando peft no está instalado.
-# Install: `uv tool install --reinstall --editable '.[finetune]'`
-finetune = ["peft>=0.12", "transformers>=4.40", "datasets>=2.20", "accelerate>=0.30"]
+# LoRA fine-tune del cross-encoder reranker (GC#2.C, 2026-04-23) +
+# DPO+LoRA fine-tune del modelo de drafts WhatsApp (GC#3, 2026-05-01).
+#
+# Reranker: `scripts/finetune_reranker.py --mode lora` entrena un adapter
+# PEFT (r=8, alpha=16, dropout=0.1) on top de bge-reranker-v2-m3 usando
+# los pares positivos/negativos de `rag_feedback` + `rag_behavior`. El
+# adapter se guarda en `~/.local/share/obsidian-rag/reranker_ft/` y solo
+# se carga en runtime cuando `RAG_RERANKER_FT=1` (default OFF).
+#
+# Drafts: `scripts/finetune_drafts.py` entrena un adapter PEFT con DPO
+# (TRL DPOTrainer) sobre Qwen2.5-7B-Instruct usando los preference pairs
+# (bot_draft=rejected, sent_text=chosen) que el listener captura cuando
+# el user edita un borrador con /editar. Adapter en
+# `~/.local/share/obsidian-rag/drafts_ft/`, opt-in via `RAG_DRAFTS_FT=1`.
+#
+# `trl` agrega DPOTrainer + DPOConfig — la lib oficial de HuggingFace
+# para Direct Preference Optimization. v0.11+ tiene la API estable
+# `precompute_ref_log_probs` que reduce memoria 2x en CPU/MPS.
+#
+# Soft dependency: los scripts + los loaders fallan al base model con
+# un warning a `silent_errors.jsonl` cuando peft / trl no están
+# instalados. Install: `uv tool install --reinstall --editable '.[finetune]'`
+finetune = [
+    "peft>=0.12",
+    "transformers>=4.40",
+    "datasets>=2.20",
+    "accelerate>=0.30",
+    "trl>=0.11",
+]
 
 [project.scripts]
 rag = "rag:cli"

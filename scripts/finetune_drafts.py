@@ -1,72 +1,76 @@
-"""Fine-tune del modelo de drafts de WhatsApp via LoRA (2026-04-29).
+"""Fine-tune del modelo de drafts de WhatsApp via DPO + LoRA (2026-05-01).
 
 Contrato:
   Input:  rows de `rag_draft_decisions` con `decision='approved_editar'`
-          (gold pairs (bot_draft, sent_text)) + `decision='rejected'`
-          (anti-patterns).
+          — gold preference pairs `(bot_draft=rejected, sent_text=chosen)`.
   Output: PEFT/LoRA adapter en `~/.local/share/obsidian-rag/drafts_ft/`
           con `adapter_config.json` + `adapter_model.safetensors` +
           `ft_meta.json` (training config + held-out metrics).
-  Goal:   capturar las correcciones que Fer hace al draft generado por
-          el listener TS para que el modelo "aprenda" su estilo.
+  Goal:   alinear el modelo al tono Fer (rioplatense, voseo, sin
+          "¡"/"¿", acks atómicos) usando DPO sobre los pares reales
+          (corporate bot_draft → estilo Fer sent_text) que el listener
+          captura cuando vos editás un borrador.
 
-Decisión deliberada: el modelo en producción para generar drafts es
-`qwen2.5:14b` (en el listener TS). El fine-tune corre sobre `qwen2.5:7b`
-(modelo más chico, más rápido de entrenar, ~20x menos VRAM). El adapter
-NO sustituye el draft generation del listener — es completamente
-opcional y solo accesible vía endpoint preview (`/api/draft/preview`)
-para permitirle a Fer comparar manualmente "qué hubiera salido del
-baseline" vs "qué hubiera salido del fine-tuned".
+Por qué DPO y no SFT:
+  El refactor anterior usaba SFT (Supervised Fine-Tuning) con un truco
+  feo: para `decision='rejected'` ponía `target=""` con `weight=0.3`
+  como "pseudo-anti-pattern". Eso es un parche — el modelo igual ve
+  todos los pares con la misma cross-entropy y aprende mediocre.
+
+  DPO (Direct Preference Optimization, [Rafailov et al. 2023]) es la
+  herramienta natural para este problema: tus pares son LITERALMENTE
+  preference pairs (sent_text > bot_draft). DPO optimiza directamente
+  log p(chosen) - log p(rejected) con una KL penalty contra el modelo
+  base, evitando catastrophic forgetting.
+
+  Caso de éxito comparable: [`RigoChat-7b-v2`](https://huggingface.co/IIC/RigoChat-7b-v2)
+  es Qwen2.5-7B-Instruct fine-tuned con DPO para español por el IIC.
+  Mejora 79.55 vs 77.17 en Spanish benchmark MMLU vs el base, sin
+  perder capabilities en otros idiomas. Mismo playbook acá.
+
+Decisión deliberada — base model 7B vs el 14B en producción:
+  El listener TS usa qwen2.5:7b en producción (con fallback). El
+  fine-tune corre sobre `Qwen/Qwen2.5-7B-Instruct` (HF Hub, no Ollama).
+  El adapter NO sustituye el draft generation del listener — es
+  completamente opcional y solo accesible vía endpoint preview
+  (`/api/draft/preview`) para A/B manual del user.
 
 Pipeline:
-  1. Pull de `rag_draft_decisions` con `decision IN ('approved_editar',
-     'rejected')`. `approved_editar` → label=positive (sent_text es el
-     target real), `rejected` → label=negative (cualquier output ≠
-     bot_draft preferido). Por default incluye rows con
-     `extra_json.review_only=true`; el flag `--exclude-review-only` los
-     filtra (signal del review-only loop sigue siendo signal real, así
-     que default=incluir).
-  2. Construye prompt en formato chat:
-        <conversación previa>
-        ## Borrador del bot:
-        <bot_draft>
-        ## Mensaje final que mandó Fer:
-        <sent_text>     ← el target a aprender
-  3. Stratified 80/20 split por `draft_id` (no leakea same-draft pares
-     entre train/val).
-  4. Entrena LoRA r=8 alpha=16 dropout=0.05 sobre Qwen2.5-7B (HF tag
-     `Qwen/Qwen2.5-7B-Instruct`). Solo Q/V projections — convención
-     que empíricamente funciona para causal LMs.
-  5. Métricas held-out: BLEU-1 (unigram precision-recall) + similarity
-     (1 - normalized edit distance via difflib.SequenceMatcher) entre
-     pred y sent_text. Print 5 samples random.
-  6. Persist `ft_meta.json` con timestamp, config, métricas — el
-     loader runtime lo lee para mostrar en `rag draft stats`.
+  1. Pull de `rag_draft_decisions` con `decision='approved_editar'`. Por
+     default incluye rows con `extra_json.review_only=true`; el flag
+     `--exclude-review-only` los filtra. La data sintética del
+     `augment_drafts_dataset.py` (review_only=true, synthetic=true) se
+     incluye también — ayuda al volumen para que el LoRA generalice.
+  2. Construye DPO triplets:
+        prompt:   "Conversación con <contacto>:\n<últimos 5 msgs>\n\n## Tu respuesta:\n"
+        chosen:   sent_text          ← lo que vos escribiste (target)
+        rejected: bot_draft          ← lo que el bot propuso (corporate)
+  3. Stratified 80/20 split por `draft_id` (no leakea same-draft entre
+     train/val).
+  4. DPO sobre Qwen2.5-7B con LoRA r=8 alpha=16 dropout=0.05, target
+     modules q+v projections, beta=0.1 (KL penalty estándar).
+  5. Métricas held-out: BLEU-1 (unigram precision-recall) +
+     similarity (1 - normalized edit distance) + preference win rate
+     (cuántas veces la generación se parece más al chosen que al
+     rejected) entre pred y sent_text. Print 5 samples random.
+  6. Persist `ft_meta.json` con timestamp, config, métricas.
 
-Activación del loader runtime:
-  - El listener TS NO usa este modelo directamente (decisión: complejo
-    + riesgo). El draft que va al user sigue saliendo de qwen2.5:14b en
-    el listener.
+Activación del loader runtime (sin cambios vs SFT):
+  - El listener TS NO usa este modelo directamente.
   - El endpoint `/api/draft/preview` (web/server.py) acepta
     `{original_conversation, bot_draft_baseline}` y devuelve el output
-    del fine-tuned model SI:
-      * existe el adapter en `~/.local/share/obsidian-rag/drafts_ft/`
-      * `RAG_DRAFTS_FT=1` está seteado
-    Si alguna condición falla → echo del baseline (silent-fail con log
-    a `silent_errors.jsonl`).
+    del fine-tuned model SI `RAG_DRAFTS_FT=1` + adapter existe.
+    Si alguna condición falla → echo del baseline.
 
 Reglas de seguridad:
-  - <100 pares totales → exit 1 con mensaje claro ("datos insuficientes,
-    esperá más feedback"). El fine-tune sobre poca data overfitea brutal.
-  - peft no instalado → mensaje claro + exit 6 (no excepción rara).
+  - <100 pares con preference completo → exit 1 con mensaje claro.
+  - peft / trl no instalados → mensaje claro + exit 6.
   - dry-run: solo build pairs + print stats, no toca el modelo.
-  - NO se promueve automáticamente: una vez que entrena, el operator
-    decide cuándo activar via `RAG_DRAFTS_FT=1`. Este script no setea
-    env vars ni reinicia procesos.
+  - NO se promueve automáticamente.
 
 Uso:
   uv run python scripts/finetune_drafts.py --dry-run
-  uv run python scripts/finetune_drafts.py --epochs 3 --lr 1e-4
+  uv run python scripts/finetune_drafts.py --epochs 1 --lr 5e-6
   uv run python scripts/finetune_drafts.py --exclude-review-only
 """
 from __future__ import annotations
@@ -100,66 +104,68 @@ DRAFTS_FT_ADAPTER_DIR = (
     Path.home() / ".local" / "share" / "obsidian-rag" / "drafts_ft"
 )
 
-# Modelo base. Usamos el chico (7B vs 14B del listener) porque:
-#   - El fine-tune del 14B requiere >40GB VRAM incluso con LoRA
-#   - El A/B "baseline qwen2.5:14b en el listener vs fine-tuned 7B en
-#     preview" se hace manualmente por el user, así que el cambio de
-#     tamaño es aceptable.
-# Tag HF (transformers descarga del Hub). Override via
-# `RAG_DRAFTS_FT_BASE_MODEL` env si el user quiere experimentar.
+# Modelo base. Override via `RAG_DRAFTS_FT_BASE_MODEL` env si el user
+# quiere experimentar con RigoChat-7b-v2 / llama3.1:8b, etc.
 DRAFTS_BASE_MODEL = os.environ.get(
     "RAG_DRAFTS_FT_BASE_MODEL", "Qwen/Qwen2.5-7B-Instruct"
 )
 
-# LoRA hyperparams. Mismo r=8/alpha=16 que el reranker (ratio 2.0).
-# dropout=0.05 más bajo que el reranker (0.1) porque la data de drafts
-# es más diversa por fuente: no overfit-prone como el rerank-binary.
+# LoRA hyperparams. r=8/alpha=16 dropout=0.05 mismo que el reranker
+# (ratio 2.0). Solo q+v projections — minimiza parametros entrenables
+# y es la convención que empíricamente funciona para causal LMs.
 LORA_R = 8
 LORA_ALPHA = 16
 LORA_DROPOUT = 0.05
-# Qwen2.5 attention proj names (verificable con
-# `print(model)` — los q/v projection layers). Mantengo solo q+v para
-# minimizar parametros entrenables (consistente con reranker).
 LORA_TARGET_MODULES = ("q_proj", "v_proj")
 
-# Threshold mínimo de pares para considerar el fine-tune viable.
-# Lo justifico al user en el exit message: <100 → variance del estilo
-# personal no se captura, el LoRA con 50 ejemplos overfit a las 50
-# frases exactas y no generaliza.
+# Threshold mínimo de PREFERENCE PAIRS COMPLETOS para considerar el
+# fine-tune viable. <100 → DPO con LoRA overfit-prone (gradient noise
+# alto + few preference signals).
 MIN_PAIRS = 100
 
 # Held-out validation fraction. 20% es estándar para LoRA con datasets
-# pequeños — el train set queda con 80%, suficiente para 3 epochs sin
-# memorizar.
+# pequeños — train queda con 80%, suficiente para 1-3 epochs sin memo.
 VAL_FRAC = 0.2
 
 # Max tokens por sample. Las conversaciones de WA son cortas (<2KB
 # típico). 1024 cubre prompts grandes sin truncar la respuesta target.
 MAX_TOKENS = 1024
 
+# DPO beta (KL penalty coefficient). 0.1 es el default de TRL y un
+# sweet spot empírico — más alto (0.5+) anchorea demasiado al modelo
+# base y limita el aprendizaje del estilo.
+DPO_BETA = 0.1
+
 
 # ── Mining de pairs ───────────────────────────────────────────────────────
 
 
 def fetch_draft_pairs(*, exclude_review_only: bool = False) -> dict:
-    """Pull `rag_draft_decisions` y arma listas de gold/anti-pattern pairs.
+    """Pull `rag_draft_decisions` y arma listas de gold preference pairs.
 
     Args:
         exclude_review_only: si True, descarta rows cuyo
-            `extra_json.review_only` sea truthy. Default False — el
-            review-only loop sigue siendo signal real (el user igual
-            corrige), así que normalmente lo queremos en train.
+            `extra_json.review_only` sea truthy. Default False — los
+            sintéticos del augmenter Y los reales review-only siguen
+            siendo signal real.
 
     Returns:
         dict con keys:
-            gold: list[dict]    — approved_editar, gold (bot_draft, sent_text)
-            anti: list[dict]    — rejected (anti-pattern: cualquier output != bot_draft)
+            gold: list[dict]    — preference pairs (bot_draft=rejected, sent_text=chosen)
+            anti: list[dict]    — VACÍA siempre (legacy compat: el SFT viejo
+                                  usaba 'rejected' rows como pseudo-anti, DPO
+                                  no las puede usar sin un chosen alternativo)
             stats: dict         — counts + ratio review-only para reporte
     """
     gold: list[dict] = []
+    # `anti` queda vacía — el legacy SFT usaba decision='rejected' rows
+    # como pseudo-anti-patterns con target="". DPO requiere AMBOS chosen
+    # y rejected, y no tenemos un "chosen alternativo" para esas rows.
+    # Las skipeamos limpiamente. Las contamos para el reporte.
     anti: list[dict] = []
     n_review_only_total = 0
     n_review_only_excluded = 0
+    n_rejected_skipped = 0
 
     try:
         with rag._ragvec_state_conn() as conn:
@@ -195,6 +201,22 @@ def fetch_draft_pairs(*, exclude_review_only: bool = False) -> dict:
                 n_review_only_excluded += 1
                 continue
 
+        # decision='rejected' rows: skip silently. Legacy SFT las
+        # contaba como anti, DPO no puede usarlas.
+        if decision == "rejected":
+            n_rejected_skipped += 1
+            continue
+
+        # Only approved_editar reaches here. Validamos sent_text ≠ bot_draft.
+        if not sent_text:
+            # defensivo: no debería pasar (si fueran iguales sería
+            # approved_si). Skip silently.
+            continue
+        if sent_text == bot_draft:
+            # par degenerado: chosen == rejected → DPO log-ratio = 0,
+            # gradient = 0. Skip para no diluir el batch.
+            continue
+
         try:
             original_msgs = json.loads(msgs_json) if msgs_json else []
         except Exception:
@@ -209,26 +231,15 @@ def fetch_draft_pairs(*, exclude_review_only: bool = False) -> dict:
             "sent_text": sent_text,
             "ts": ts,
         }
-
-        if decision == "approved_editar":
-            # Gold pair: bot_draft != sent_text por definición (si fueran
-            # iguales sería approved_si). El sent_text es el target.
-            if not sent_text:
-                # defensivo: no debería pasar (el listener envía sent_text
-                # cuando hay edit). Skip silently.
-                continue
-            gold.append(item)
-        elif decision == "rejected":
-            # Anti-pattern: el bot_draft fue rechazado completamente. NO
-            # tenemos un "good output" alternativo, solo sabemos que el
-            # bot_draft no sirve. Lo usamos como signal débil (ranking-
-            # loss style: preferir CUALQUIER output != bot_draft).
-            anti.append(item)
+        gold.append(item)
 
     stats = {
         "n_total_rows": len(rows),
         "n_gold": len(gold),
-        "n_anti": len(anti),
+        # `n_anti` queda en 0 siempre. Mantenemos la key por
+        # compat con scripts/observers que la leen.
+        "n_anti": 0,
+        "n_rejected_skipped": n_rejected_skipped,
         "n_review_only_total": n_review_only_total,
         "n_review_only_excluded": n_review_only_excluded,
         "review_only_ratio": (
@@ -238,7 +249,7 @@ def fetch_draft_pairs(*, exclude_review_only: bool = False) -> dict:
     return {"gold": gold, "anti": anti, "stats": stats}
 
 
-# ── Pair → training prompt ────────────────────────────────────────────────
+# ── Pair → DPO triplet ────────────────────────────────────────────────────
 
 
 def _format_conversation(original_msgs: list[dict]) -> str:
@@ -261,52 +272,40 @@ def _format_conversation(original_msgs: list[dict]) -> str:
     return full[-600:] if len(full) > 600 else full
 
 
-def build_training_example(item: dict, *, is_anti: bool = False) -> dict:
-    """Convierte una row del DB en un sample de training (prompt → target).
+def build_dpo_example(item: dict) -> dict:
+    """Convierte una row gold en un DPO preference triplet.
 
-    Para gold (approved_editar):
-        prompt: contexto + bot_draft + "## Mensaje final que mandó Fer:\n"
-        target: sent_text
-        weight: 1.0
+    El prompt MATCHEA lo que el modelo va a ver en producción
+    (`/api/draft/preview`): solo el contexto conversacional, sin el
+    bot_draft incluido. El bot_draft es el "rejected" porque
+    representa el output corporate-aburrido que NO querés. El
+    sent_text es el "chosen" porque es lo que VOS realmente
+    mandaste — tono Fer, voseo rioplatense, conciso.
 
-    Para anti (rejected):
-        prompt: contexto + bot_draft + "## Mensaje final que mandó Fer:\n"
-        target: "" (vacío — pseudo-anti, el modelo aprende que el
-                bot_draft completo merecía ser ignorado)
-        weight: 0.3 (signal débil — sabemos que bot_draft no sirve, pero
-                no tenemos un good output)
-
-    Note: el peso anti=0.3 es heurístico. Si en el futuro acumulamos
-    enough volume de rejected (>500), podríamos hacer ranking-loss
-    contrastivo en lugar de peso. Por ahora simple (CrossEntropy
-    weighted).
+    Output schema (TRL DPOTrainer compatible):
+        {
+            "prompt": str,       # contexto + intro
+            "chosen": str,       # sent_text (tu respuesta real)
+            "rejected": str,     # bot_draft (la corporate)
+            "draft_id": str,     # para stratified split
+        }
     """
     contact = item.get("contact_name") or "(sin nombre)"
     convo = _format_conversation(item["original_msgs"])
     bot_draft = item.get("bot_draft") or ""
+    sent_text = item.get("sent_text") or ""
 
     prompt = (
         f"Conversación con {contact}:\n"
         f"{convo}\n\n"
-        f"## Borrador del bot:\n"
-        f"{bot_draft}\n\n"
-        f"## Mensaje final que mandó Fer:\n"
+        f"## Tu respuesta:\n"
     )
-    if is_anti:
-        # Pseudo-target vacío. El loss apunta a "no copiar el bot_draft".
-        target = ""
-        weight = 0.3
-    else:
-        target = item.get("sent_text") or ""
-        weight = 1.0
 
     return {
         "prompt": prompt,
-        "target": target,
-        "weight": weight,
+        "chosen": sent_text,
+        "rejected": bot_draft,
         "draft_id": item.get("draft_id", ""),
-        # Useful para debugging:
-        "_bot_draft": bot_draft,
     }
 
 
@@ -334,7 +333,7 @@ def split_train_val(
     return train, val
 
 
-# ── Métricas (BLEU-1 + similarity) ────────────────────────────────────────
+# ── Métricas (BLEU-1 + similarity + preference win rate) ──────────────────
 
 
 def _tokenize(text: str) -> list[str]:
@@ -382,22 +381,52 @@ def similarity(pred: str, ref: str) -> float:
     return difflib.SequenceMatcher(None, pred, ref).ratio()
 
 
+def preference_win(pred: str, chosen: str, rejected: str) -> bool:
+    """¿La predicción se parece más al chosen que al rejected?
+
+    Métrica única de DPO: queremos que el modelo, cuando genera
+    libremente, produzca algo más cercano al sent_text (chosen) que
+    al bot_draft (rejected). Usamos similarity como proxy de
+    "cercanía". Si chosen y rejected están ambos lejos de pred (caso
+    creativo), el modelo devuelve "neutral" → contamos como TIE
+    (no win, no loss).
+
+    Returns:
+        True si sim(pred, chosen) > sim(pred, rejected).
+        False si sim(pred, chosen) <= sim(pred, rejected).
+    """
+    s_chosen = similarity(pred, chosen)
+    s_rejected = similarity(pred, rejected)
+    return s_chosen > s_rejected
+
+
 def evaluate_predictions(
     val_examples: list[dict], predictions: list[str],
 ) -> dict:
     """Computa métricas held-out + selecciona 5 samples random para print.
+
+    Métricas:
+      - bleu1 / sim contra el chosen (sent_text) — qué tan cerca está
+        la generación del target preferido.
+      - preference win rate — % de val_examples donde sim(pred, chosen)
+        > sim(pred, rejected). Métrica directa de la calidad DPO.
     """
     if not predictions:
         return {
             "n_val": 0, "bleu1_mean": 0.0, "sim_mean": 0.0,
+            "pref_win_rate": 0.0,
             "samples": [],
         }
     bleu_scores = [
-        bleu1(pred, ex["target"])
+        bleu1(pred, ex["chosen"])
         for pred, ex in zip(predictions, val_examples)
     ]
     sim_scores = [
-        similarity(pred, ex["target"])
+        similarity(pred, ex["chosen"])
+        for pred, ex in zip(predictions, val_examples)
+    ]
+    pref_wins = [
+        preference_win(pred, ex["chosen"], ex["rejected"])
         for pred, ex in zip(predictions, val_examples)
     ]
 
@@ -408,11 +437,12 @@ def evaluate_predictions(
     samples = []
     for i in sample_idxs:
         samples.append({
-            "bot_draft": val_examples[i].get("_bot_draft", ""),
-            "target_sent_text": val_examples[i]["target"],
+            "rejected_bot_draft": val_examples[i]["rejected"],
+            "chosen_sent_text": val_examples[i]["chosen"],
             "prediction": predictions[i],
             "bleu1": bleu_scores[i],
             "sim": sim_scores[i],
+            "pref_win": pref_wins[i],
         })
 
     return {
@@ -423,40 +453,37 @@ def evaluate_predictions(
         "sim_mean": sum(sim_scores) / len(sim_scores) if sim_scores else 0.0,
         "sim_min": min(sim_scores) if sim_scores else 0.0,
         "sim_max": max(sim_scores) if sim_scores else 0.0,
+        "pref_win_rate": sum(pref_wins) / len(pref_wins) if pref_wins else 0.0,
         "samples": samples,
     }
 
 
-# ── Training (LoRA via peft) ──────────────────────────────────────────────
+# ── Training (DPO + LoRA via trl + peft) ──────────────────────────────────
 
 
-def train_lora(
+def train_dpo(
     train_examples: list[dict], val_examples: list[dict],
     *, out_dir: Path, epochs: int, lr: float, batch_size: int,
 ) -> dict:
-    """Entrena un LoRA adapter sobre Qwen2.5-7B-Instruct.
+    """Entrena un LoRA adapter sobre el modelo base via DPO.
 
     Imports lazy adentro de la fn para que `--dry-run` no intente
-    cargar transformers/peft (1-2s startup + dep check). Si falta
-    `peft` o `transformers`, exit 6 con mensaje accionable.
+    cargar transformers/peft/trl. Si falta cualquiera, exit 6 con
+    mensaje accionable.
 
-    Returns dict con métricas held-out (bleu1_mean, sim_mean, samples).
+    Returns dict con métricas held-out (bleu1_mean, sim_mean,
+    pref_win_rate, samples).
     """
     try:
         import torch  # noqa: F401
         import transformers  # noqa: F401
         from datasets import Dataset
-        from peft import LoraConfig, TaskType, get_peft_model
-        from transformers import (
-            AutoModelForCausalLM,
-            AutoTokenizer,
-            DataCollatorForLanguageModeling,
-            Trainer,
-            TrainingArguments,
-        )
+        from peft import LoraConfig
+        from trl import DPOConfig, DPOTrainer
+        from transformers import AutoModelForCausalLM, AutoTokenizer
     except ImportError as exc:
         print(
-            f"[error] missing dep para LoRA training: {exc}\n"
+            f"[error] missing dep para DPO+LoRA training: {exc}\n"
             "  Install with: uv tool install --reinstall --editable '.[finetune]'",
             file=sys.stderr,
         )
@@ -475,62 +502,44 @@ def train_lora(
         # Qwen no setea pad_token por default — usamos eos para el
         # padding del collator. Standard recipe.
         tokenizer.pad_token = tokenizer.eos_token
-    print(f"  [{time.time()-t_load:.1f}s] tokenizer loaded", file=sys.stderr, flush=True)
+    print(f"  [{time.time()-t_load:.1f}s] tokenizer loaded",
+          file=sys.stderr, flush=True)
 
     t_load = time.time()
     base_model = AutoModelForCausalLM.from_pretrained(
         DRAFTS_BASE_MODEL,
         torch_dtype="auto",
     )
-    print(f"  [{time.time()-t_load:.1f}s] base model loaded", file=sys.stderr, flush=True)
+    print(f"  [{time.time()-t_load:.1f}s] base model loaded",
+          file=sys.stderr, flush=True)
 
-    lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
+    # LoRA config — DPOTrainer lo inyecta vía peft_config. NO necesita
+    # un ref_model separado: TRL usa el modelo base congelado como
+    # referencia automáticamente cuando hay peft_config.
+    peft_config = LoraConfig(
+        task_type="CAUSAL_LM",
         r=LORA_R,
         lora_alpha=LORA_ALPHA,
         lora_dropout=LORA_DROPOUT,
         target_modules=list(LORA_TARGET_MODULES),
         bias="none",
     )
-    model = get_peft_model(base_model, lora_config)
-    try:
-        model.print_trainable_parameters()
-    except Exception:
-        pass
 
-    def _tok_fn(batch):
-        # Concatenamos prompt + target (causal LM training: el modelo
-        # ve todo el secuencia y el loss se computa sobre los tokens
-        # del target solamente — el collator usa labels=-100 en los
-        # prompt tokens via `mlm=False` + label_pad_token_id).
-        texts = []
-        for prompt, target in zip(batch["prompt"], batch["target"]):
-            texts.append(prompt + target + tokenizer.eos_token)
-        enc = tokenizer(
-            texts, truncation=True, max_length=MAX_TOKENS,
-            padding=False,
-        )
-        return enc
-
-    t_tok = time.time()
-    print(f"  Tokenizing {len(train_examples)} train + "
-          f"{len(val_examples) if val_examples else 0} val examples …",
-          file=sys.stderr, flush=True)
+    # Datasets en formato TRL preference: {prompt, chosen, rejected}.
     train_ds = Dataset.from_list([
-        {"prompt": ex["prompt"], "target": ex["target"]} for ex in train_examples
-    ]).map(_tok_fn, batched=True, remove_columns=["prompt", "target"])
+        {"prompt": ex["prompt"], "chosen": ex["chosen"],
+         "rejected": ex["rejected"]}
+        for ex in train_examples
+    ])
     val_ds = (Dataset.from_list([
-        {"prompt": ex["prompt"], "target": ex["target"]} for ex in val_examples
-    ]).map(_tok_fn, batched=True, remove_columns=["prompt", "target"])
-              if val_examples else None)
-    print(f"  [{time.time()-t_tok:.1f}s] datasets tokenized",
-          file=sys.stderr, flush=True)
+        {"prompt": ex["prompt"], "chosen": ex["chosen"],
+         "rejected": ex["rejected"]}
+        for ex in val_examples
+    ]) if val_examples else None)
 
-    collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer, mlm=False,
-    )
-
-    args = TrainingArguments(
+    # DPOConfig — superset de TrainingArguments con los kwargs DPO-
+    # specific (beta, loss_type, max_length, precompute_ref_log_probs).
+    args = DPOConfig(
         output_dir=str(out_dir / "ckpts"),
         num_train_epochs=epochs,
         learning_rate=lr,
@@ -545,57 +554,90 @@ def train_lora(
         report_to=[],
         use_cpu=(device == "cpu"),
         disable_tqdm=True,
+        # ── DPO-specific ────────────────────────────────────────
+        beta=DPO_BETA,
+        loss_type="sigmoid",  # default DPO loss; "ipo" / "kto_pair" disponibles
+        max_length=MAX_TOKENS,
+        max_prompt_length=MAX_TOKENS // 2,
+        # precompute_ref_log_probs=True ahorra memoria al precomputar
+        # log-probs del modelo de referencia (frozen base) ANTES del
+        # loop. Importante en CPU/MPS donde el ref forward de cada
+        # batch es caro.
+        precompute_ref_log_probs=True,
+        remove_unused_columns=False,
     )
 
-    # transformers 5.x: el kwarg `tokenizer=` fue removido (deprecated en
-    # 4.46 → removed en 5.0). Reemplazado por `processing_class=`. Compat:
-    # detectar versión y usar el kwarg correcto.
-    _tx_major = int(transformers.__version__.split(".")[0])
-    _tokenizer_kw = (
-        {"processing_class": tokenizer}
-        if _tx_major >= 5
-        else {"tokenizer": tokenizer}
-    )
-
-    # Callback de progreso con flush — el logger default de transformers
-    # bufferea hasta el final del train, dejándonos a ciegas durante runs
-    # largos. Esto printea cada step.
+    # Callback de progreso con flush — el logger default de
+    # transformers bufferea hasta el final, dejándonos a ciegas
+    # durante runs largos. Esto printea cada step.
     from transformers import TrainerCallback
+
     class FlushCallback(TrainerCallback):
         def __init__(self):
             self._t0 = time.time()
+
         def on_step_end(self, args, state, control, **kwargs):
             elapsed = time.time() - self._t0
             print(
                 f"    step {state.global_step}/{state.max_steps} "
-                f"({elapsed:.0f}s elapsed, {elapsed/max(state.global_step,1):.1f}s/step)",
+                f"({elapsed:.0f}s elapsed, "
+                f"{elapsed/max(state.global_step,1):.1f}s/step)",
                 file=sys.stderr, flush=True,
             )
-        def on_log(self, args, state, control, logs=None, **kwargs):
-            if logs and "loss" in logs:
-                print(f"    loss={logs['loss']:.3f} lr={logs.get('learning_rate', 0):.2e} "
-                      f"epoch={logs.get('epoch', 0):.2f}",
-                      file=sys.stderr, flush=True)
 
-    trainer = Trainer(
-        model=model, args=args,
-        train_dataset=train_ds, eval_dataset=val_ds,
-        data_collator=collator, **_tokenizer_kw,
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if not logs:
+                return
+            # DPO emite rewards/chosen, rewards/rejected, rewards/margins
+            # — métricas únicas del DPO loss, las exponemos.
+            if "loss" in logs:
+                loss = logs["loss"]
+                lr = logs.get("learning_rate", 0)
+                ep = logs.get("epoch", 0)
+                margin = logs.get("rewards/margins", None)
+                acc = logs.get("rewards/accuracies", None)
+                extra = ""
+                if margin is not None:
+                    extra += f" margin={margin:+.3f}"
+                if acc is not None:
+                    extra += f" acc={acc:.2f}"
+                print(
+                    f"    loss={loss:.3f} lr={lr:.2e} epoch={ep:.2f}"
+                    f"{extra}",
+                    file=sys.stderr, flush=True,
+                )
+
+    trainer = DPOTrainer(
+        model=base_model,
+        args=args,
+        train_dataset=train_ds,
+        eval_dataset=val_ds,
+        peft_config=peft_config,
+        processing_class=tokenizer,
         callbacks=[FlushCallback()],
     )
-    print(f"  Training start (epochs={epochs}, batch={batch_size}, "
-          f"train_n={len(train_examples)})", file=sys.stderr, flush=True)
+
+    print(
+        f"  Training start (DPO, epochs={epochs}, batch={batch_size}, "
+        f"train_n={len(train_examples)}, beta={DPO_BETA}, lr={lr})",
+        file=sys.stderr, flush=True,
+    )
     trainer.train()
     print("  Training done. Saving adapter …", file=sys.stderr, flush=True)
-    model.save_pretrained(str(out_dir))
+    trainer.save_model(str(out_dir))
     try:
         tokenizer.save_pretrained(str(out_dir))
     except Exception as exc:
-        print(f"  [warn] tokenizer.save_pretrained failed: {exc}", file=sys.stderr)
+        print(f"  [warn] tokenizer.save_pretrained failed: {exc}",
+              file=sys.stderr)
 
     # ── Held-out predictions + métricas ──
-    print("  Generating held-out predictions for metrics …", file=sys.stderr)
-    predictions = generate_predictions(model, tokenizer, val_examples, device)
+    print("  Generating held-out predictions for metrics …",
+          file=sys.stderr)
+    # `trainer.model` es el peft-wrapped model con el adapter entrenado.
+    predictions = generate_predictions(
+        trainer.model, tokenizer, val_examples, device,
+    )
     metrics = evaluate_predictions(val_examples, predictions)
     return metrics
 
@@ -607,7 +649,7 @@ def generate_predictions(
 
     Cada sample: input = prompt, output = generación greedy de
     máx 200 tokens. No hacemos sampling ni temperature porque queremos
-    reproducibilidad para BLEU/sim mediciones.
+    reproducibilidad para BLEU/sim/pref_win mediciones.
     """
     import torch
     model.eval()
@@ -649,18 +691,18 @@ def generate_predictions(
 def print_stats(stats: dict, *, exclude_review_only: bool) -> None:
     """Print del resumen del mining (post-fetch_draft_pairs)."""
     print("== Mining stats ==", file=sys.stderr)
-    print(f"  Total rows (approved_editar + rejected): {stats['n_total_rows']}",
-          file=sys.stderr)
-    print(f"  Gold pairs (approved_editar):            {stats['n_gold']}",
-          file=sys.stderr)
-    print(f"  Anti-pattern (rejected):                 {stats['n_anti']}",
-          file=sys.stderr)
-    print(f"  Review-only rows (extra_json flag):      "
+    print(f"  Total rows (approved_editar + rejected): "
+          f"{stats['n_total_rows']}", file=sys.stderr)
+    print(f"  Gold preference pairs (approved_editar):  "
+          f"{stats['n_gold']}", file=sys.stderr)
+    print(f"  Rejected rows skipped (no chosen):        "
+          f"{stats.get('n_rejected_skipped', 0)}", file=sys.stderr)
+    print(f"  Review-only rows (extra_json flag):       "
           f"{stats['n_review_only_total']}  "
           f"({stats['review_only_ratio'] * 100:.1f}%)",
           file=sys.stderr)
     if exclude_review_only:
-        print(f"  Excluded by --exclude-review-only:       "
+        print(f"  Excluded by --exclude-review-only:        "
               f"{stats['n_review_only_excluded']}",
               file=sys.stderr)
 
@@ -675,17 +717,27 @@ def print_metrics_report(metrics: dict) -> None:
         file=sys.stderr,
     )
     print(
-        f"  Similarity (char-level) mean={metrics['sim_mean']:.3f}  "
+        f"  Similarity (char-level, vs chosen) mean={metrics['sim_mean']:.3f}  "
         f"min={metrics['sim_min']:.3f}  max={metrics['sim_max']:.3f}",
+        file=sys.stderr,
+    )
+    print(
+        f"  Preference win rate (pred more like chosen than rejected): "
+        f"{metrics['pref_win_rate'] * 100:.1f}%",
         file=sys.stderr,
     )
     print("\n== 5 random held-out samples ==", file=sys.stderr)
     for i, sample in enumerate(metrics.get("samples", []), start=1):
-        print(f"\n  --- Sample {i} ---", file=sys.stderr)
-        print(f"  bot_draft: {sample['bot_draft'][:200]}", file=sys.stderr)
-        print(f"  target:    {sample['target_sent_text'][:200]}", file=sys.stderr)
-        print(f"  pred:      {sample['prediction'][:200]}", file=sys.stderr)
-        print(f"  bleu1={sample['bleu1']:.3f}  sim={sample['sim']:.3f}",
+        win_marker = "✓" if sample.get("pref_win") else "✗"
+        print(f"\n  --- Sample {i} {win_marker} ---", file=sys.stderr)
+        print(f"  rejected (bot_draft):  {sample['rejected_bot_draft'][:200]}",
+              file=sys.stderr)
+        print(f"  chosen (sent_text):    {sample['chosen_sent_text'][:200]}",
+              file=sys.stderr)
+        print(f"  prediction:            {sample['prediction'][:200]}",
+              file=sys.stderr)
+        print(f"  bleu1={sample['bleu1']:.3f}  sim={sample['sim']:.3f}  "
+              f"pref_win={sample['pref_win']}",
               file=sys.stderr)
 
 
@@ -694,10 +746,15 @@ def print_metrics_report(metrics: dict) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Fine-tune del modelo de drafts WhatsApp via LoRA",
+        description="Fine-tune del modelo de drafts WhatsApp via DPO + LoRA",
     )
-    ap.add_argument("--epochs", type=int, default=3)
-    ap.add_argument("--lr", type=float, default=1e-4)
+    # DPO con LoRA converge en menos epochs que SFT — default 1 (vs 3
+    # del SFT viejo). Más epochs sin más data overfit-prone.
+    ap.add_argument("--epochs", type=int, default=1)
+    # 5e-6 es la recipe TRL para DPO+LoRA. SFT viejo usaba 1e-4 — DPO
+    # con LoRA necesita lr ~10x más bajo porque el contrastive loss
+    # tiene gradients más fuertes que cross-entropy.
+    ap.add_argument("--lr", type=float, default=5e-6)
     ap.add_argument("--batch-size", type=int, default=4,
                     help="Batch size por device (default 4 para CPU/MPS).")
     ap.add_argument("--exclude-review-only", action="store_true",
@@ -706,32 +763,30 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true",
                     help="Build pairs + report stats; NO entrena.")
     ap.add_argument("--max-train-samples", type=int, default=None,
-                    help="Cap del training set después del split (debug/perf). "
-                         "Default: usar todo.")
+                    help="Cap del training set después del split "
+                         "(debug/perf). Default: usar todo.")
     args = ap.parse_args()
 
-    print("== fine-tune drafts WhatsApp (LoRA) ==", file=sys.stderr)
+    print("== fine-tune drafts WhatsApp (DPO + LoRA) ==", file=sys.stderr)
     print(f"  Base model: {DRAFTS_BASE_MODEL}", file=sys.stderr)
     print(f"  Adapter dir: {DRAFTS_FT_ADAPTER_DIR}", file=sys.stderr)
 
     data = fetch_draft_pairs(exclude_review_only=args.exclude_review_only)
     print_stats(data["stats"], exclude_review_only=args.exclude_review_only)
 
-    # Build examples: gold + anti combinados.
-    examples = (
-        [build_training_example(item, is_anti=False) for item in data["gold"]]
-        + [build_training_example(item, is_anti=True) for item in data["anti"]]
-    )
-    pos = sum(1 for ex in examples if ex["weight"] >= 1.0)
-    neg = sum(1 for ex in examples if ex["weight"] < 1.0)
-    print(f"\n  Training examples: total={len(examples)} "
-          f"gold={pos} anti={neg}", file=sys.stderr)
+    # Build DPO triplets desde gold (approved_editar). Las rows
+    # 'rejected' (sin chosen alternativo) ya se descartaron en
+    # fetch_draft_pairs.
+    examples = [build_dpo_example(item) for item in data["gold"]]
+    print(f"\n  DPO training examples: {len(examples)} preference pairs",
+          file=sys.stderr)
 
     if len(examples) < MIN_PAIRS:
         print(
-            f"\n[error] datos insuficientes: {len(examples)} pares < {MIN_PAIRS} mínimo. "
-            f"Esperá más feedback (más decisions /editar y /no en RagNet).\n"
-            f"  Tip: `rag draft stats` para ver el conteo actual.",
+            f"\n[error] datos insuficientes: {len(examples)} pares < "
+            f"{MIN_PAIRS} mínimo. "
+            f"Esperá más feedback (más decisions /editar en RagNet).\n"
+            f"  Tip: `rag drafts stats` para ver el conteo actual.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -757,7 +812,7 @@ def main() -> None:
     DRAFTS_FT_ADAPTER_DIR.mkdir(parents=True, exist_ok=True)
     print(f"  Training → {DRAFTS_FT_ADAPTER_DIR}", file=sys.stderr)
     t0 = time.time()
-    metrics = train_lora(
+    metrics = train_dpo(
         train_examples, val_examples,
         out_dir=DRAFTS_FT_ADAPTER_DIR,
         epochs=args.epochs, lr=args.lr, batch_size=args.batch_size,
@@ -770,6 +825,7 @@ def main() -> None:
     try:
         meta = {
             "trained_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "method": "dpo+lora",
             "base_model": DRAFTS_BASE_MODEL,
             "epochs": args.epochs,
             "lr": args.lr,
@@ -777,11 +833,11 @@ def main() -> None:
             "lora_r": LORA_R,
             "lora_alpha": LORA_ALPHA,
             "lora_dropout": LORA_DROPOUT,
+            "dpo_beta": DPO_BETA,
             "exclude_review_only": args.exclude_review_only,
             "n_train": len(train_examples),
             "n_val": len(val_examples),
-            "n_gold": pos,
-            "n_anti": neg,
+            "n_gold": len(examples),
             "elapsed_sec": elapsed,
             "metrics": {
                 k: v for k, v in metrics.items() if k != "samples"
@@ -793,13 +849,14 @@ def main() -> None:
         print(f"  Meta saved → {DRAFTS_FT_ADAPTER_DIR / 'ft_meta.json'}",
               file=sys.stderr)
     except Exception as exc:
-        print(f"  [warn] writing ft_meta.json failed: {exc}", file=sys.stderr)
+        print(f"  [warn] writing ft_meta.json failed: {exc}",
+              file=sys.stderr)
 
     print(
         "\n  Adapter saved. Para activar el endpoint preview con este "
         "adapter:\n"
         "    export RAG_DRAFTS_FT=1\n"
-        "  El listener TS NO usa este modelo (sigue con qwen2.5:14b en prod). "
+        "  El listener TS NO usa este modelo (sigue con qwen2.5:7b en prod). "
         "Solo el endpoint /api/draft/preview lo carga para A/B manual.",
         file=sys.stderr,
     )

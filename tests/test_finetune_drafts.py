@@ -1,16 +1,19 @@
-"""Tests for the WhatsApp drafts fine-tune pipeline (2026-04-29 GC#3).
+"""Tests for the WhatsApp drafts fine-tune pipeline (DPO+LoRA, 2026-05-01).
 
 Cubre:
-  1. Mining de pairs desde rag_draft_decisions (gold + anti-pattern).
+  1. Mining de preference pairs desde rag_draft_decisions (solo gold —
+     decision='approved_editar'). Las rows 'rejected' se descartan
+     porque DPO requiere AMBOS chosen y rejected; si el user rechaza
+     un draft sin escribir alternativa, no hay chosen.
   2. Filtro --exclude-review-only.
-  3. Insuficiente data (<100 pares) → exit code 1 con mensaje claro.
+  3. Insuficiente data (<100 pares gold) → exit code 1.
   4. Endpoint /api/draft/preview con flag OFF → echo del baseline.
   5. Endpoint con flag ON pero adapter missing → silent fallback + log.
   6. Smoke test del CLI `rag draft stats --plain`.
 
-NO requiere peft / transformers — los tests stubean el import del
-modelo. Si esos paquetes están instalados, los tests siguen pasando
-porque siguen el mismo path mock.
+NO requiere peft / transformers / trl — los tests stubean el import
+del modelo. Si esos paquetes están instalados, los tests siguen
+pasando porque siguen el mismo path mock.
 """
 from __future__ import annotations
 
@@ -70,10 +73,17 @@ def _seed_decision(
 # ── Test 1: mining de pairs ───────────────────────────────────────────────
 
 
-def test_mining_pairs_returns_gold_and_anti(state_db):
-    """Con DB poblada simulada → fetch_draft_pairs devuelve N gold + M anti."""
-    # 2 approved_editar (gold), 3 rejected (anti), 1 approved_si (ignorado),
-    # 1 expired (ignorado).
+def test_mining_pairs_returns_gold_only_skips_rejected(state_db):
+    """DPO requiere preference pairs completos (chosen + rejected).
+
+    `decision='approved_editar'` → row gold (chosen=sent_text,
+    rejected=bot_draft).
+    `decision='rejected'` → no hay chosen alternativo → SKIP. El
+    contador `n_rejected_skipped` documenta cuánta señal se descarta.
+    `decision='approved_si'` / 'expired' → fuera de la query SQL.
+    """
+    # 2 approved_editar (gold), 3 rejected (skipped), 1 approved_si
+    # (ignorado por SQL), 1 expired (ignorado por SQL).
     _seed_decision(draft_id="g1", decision="approved_editar",
                    bot_draft="draft1", sent_text="edited1")
     _seed_decision(draft_id="g2", decision="approved_editar",
@@ -88,15 +98,37 @@ def test_mining_pairs_returns_gold_and_anti(state_db):
     data = finetune_drafts.fetch_draft_pairs(exclude_review_only=False)
 
     assert len(data["gold"]) == 2
-    assert len(data["anti"]) == 3
+    # `anti` queda vacía siempre — DPO no usa pseudo-anti-patterns.
+    assert len(data["anti"]) == 0
     assert data["stats"]["n_gold"] == 2
-    assert data["stats"]["n_anti"] == 3
-    # Total = gold + anti, no incluye approved_si/expired.
+    assert data["stats"]["n_anti"] == 0
+    assert data["stats"]["n_rejected_skipped"] == 3
+    # Total rows leídas del SQL (approved_editar + rejected, sin
+    # approved_si/expired) = 5.
     assert data["stats"]["n_total_rows"] == 5
 
     # Verificá que las gold rows tienen sent_text correcto.
-    gold_targets = sorted(item["sent_text"] for item in data["gold"])
-    assert gold_targets == ["edited1", "edited2"]
+    gold_chosen = sorted(item["sent_text"] for item in data["gold"])
+    assert gold_chosen == ["edited1", "edited2"]
+
+
+def test_mining_skips_degenerate_pair_chosen_equals_rejected(state_db):
+    """Si sent_text == bot_draft (preference vacía) → skip silently.
+
+    DPO log-ratio = log p(chosen) - log p(rejected) = 0 cuando son
+    iguales → gradient = 0 → el sample no aporta nada y solo dilye
+    el batch. Edge case raro (no debería ocurrir en captura real
+    porque sería approved_si) pero defensivo.
+    """
+    _seed_decision(draft_id="ok", decision="approved_editar",
+                   bot_draft="hola", sent_text="che hola!")
+    _seed_decision(draft_id="degen", decision="approved_editar",
+                   bot_draft="igual", sent_text="igual")
+
+    data = finetune_drafts.fetch_draft_pairs()
+    # Solo el non-degenerate sobrevive.
+    assert len(data["gold"]) == 1
+    assert data["gold"][0]["draft_id"] == "ok"
 
 
 # ── Test 2: filtro --exclude-review-only ─────────────────────────────────
@@ -104,8 +136,13 @@ def test_mining_pairs_returns_gold_and_anti(state_db):
 
 def test_exclude_review_only_filters_correctly(state_db):
     """Rows con extra_json.review_only=true se excluyen cuando flag ON,
-    se incluyen cuando flag OFF (default). Default = signal real igual."""
-    # Mix: 2 gold normales + 1 gold review-only + 1 anti review-only.
+    se incluyen cuando flag OFF (default). Default = signal real igual.
+
+    Nota: `decision='rejected'` rows se descartan SIEMPRE (DPO no las
+    usa). Acá sembramos una rejected review-only solo para confirmar
+    que el flag review-only la cuenta antes que el rejected-skip.
+    """
+    # Mix: 2 gold normales + 1 gold review-only + 1 rejected review-only.
     _seed_decision(draft_id="g_normal", decision="approved_editar",
                    bot_draft="d1", sent_text="e1")
     _seed_decision(draft_id="g_normal2", decision="approved_editar",
@@ -116,17 +153,23 @@ def test_exclude_review_only_filters_correctly(state_db):
     _seed_decision(draft_id="r_review", decision="rejected",
                    bot_draft="d4", extra={"review_only": True})
 
-    # Default: incluir review-only. 3 gold + 1 anti = 4 totales.
+    # Default: incluir review-only. 3 gold (2 normales + 1 review-only).
+    # La rejected review-only se cuenta primero como review-only
+    # (=2 total), después como rejected-skipped.
     data_inc = finetune_drafts.fetch_draft_pairs(exclude_review_only=False)
     assert len(data_inc["gold"]) == 3
-    assert len(data_inc["anti"]) == 1
+    assert len(data_inc["anti"]) == 0
+    assert data_inc["stats"]["n_rejected_skipped"] == 1
     assert data_inc["stats"]["n_review_only_total"] == 2
     assert data_inc["stats"]["n_review_only_excluded"] == 0
 
-    # Con flag: 2 gold + 0 anti = 2 totales.
+    # Con flag: 2 gold sobreviven (review-only excluidos antes del
+    # rejected-skip → la rejected review-only NO incrementa el
+    # rejected_skipped count).
     data_exc = finetune_drafts.fetch_draft_pairs(exclude_review_only=True)
     assert len(data_exc["gold"]) == 2
     assert len(data_exc["anti"]) == 0
+    assert data_exc["stats"]["n_rejected_skipped"] == 0
     assert data_exc["stats"]["n_review_only_total"] == 2
     assert data_exc["stats"]["n_review_only_excluded"] == 2
 
@@ -159,13 +202,20 @@ def test_insufficient_data_exits_with_clear_message(state_db, monkeypatch):
 
 
 def test_dry_run_with_enough_pairs_exits_zero(state_db, monkeypatch):
-    """Con ≥100 pares + --dry-run → reporta stats sin entrenar y returns
-    (no SystemExit non-zero). Verifica el happy path del dry-run."""
-    # 60 gold + 50 anti = 110 totales (>100 mínimo).
-    for i in range(60):
+    """Con ≥100 GOLD + --dry-run → reporta stats sin entrenar y returns.
+
+    DPO requiere preference pairs completos: 100 gold (approved_editar
+    con sent_text != bot_draft). Las rows 'rejected' YA NO cuentan
+    porque no aportan a DPO sin un chosen alternativo.
+    """
+    # 110 gold (>100 mínimo). Nota: el threshold MIN_PAIRS=100 es
+    # sobre GOLD, no gold+rejected.
+    for i in range(110):
         _seed_decision(draft_id=f"g{i}", decision="approved_editar",
                        bot_draft=f"draft{i}", sent_text=f"sent{i}")
-    for i in range(50):
+    # Sembramos 5 rejected para verificar que se cuentan como skipped
+    # pero NO bloquean el dry-run.
+    for i in range(5):
         _seed_decision(draft_id=f"r{i}", decision="rejected",
                        bot_draft=f"baddraft{i}")
 
@@ -255,14 +305,27 @@ def test_preview_endpoint_helper_never_raises(monkeypatch, tmp_path):
 # ── Test 6: smoke `rag drafts stats --plain` ──────────────────────────────
 
 
-def test_cli_drafts_stats_plain_runs_without_error(state_db):
+def test_cli_drafts_stats_plain_runs_without_error(
+    state_db, monkeypatch, tmp_path,
+):
     """Smoke: el CLI `rag drafts stats --plain` corre sin error y
     produce output esperado (total + breakdown + 30d window).
 
     Usa CliRunner para no spawnar subproceso (más rápido + determinista
     bajo conftest's autouse fixtures). Equivalente funcional a
     `subprocess.run(['rag', 'drafts', 'stats', '--plain'])`.
+
+    Nota: aislamos `DRAFTS_FT_ADAPTER_DIR` a tmp_path para que el test
+    no lea el adapter REAL del user (que existe en
+    ~/.local/share/obsidian-rag/drafts_ft/ y haría fallar el assert
+    "not trained yet"). Bug pre-existente arreglado en el refactor
+    DPO 2026-05-01.
     """
+    # Aislá el adapter dir — sin esto, el test lee el adapter del
+    # filesystem real del user.
+    isolated_adapter = tmp_path / "drafts_ft_isolated"
+    monkeypatch.setattr(rag, "DRAFTS_FT_ADAPTER_DIR", isolated_adapter)
+
     # Sembramos algo para que stats tenga qué reportar.
     _seed_decision(draft_id="d1", decision="approved_si",
                    bot_draft="hi", sent_text="hi")
@@ -313,13 +376,13 @@ def test_bleu1_and_similarity_basic_sanity():
 
 def test_split_train_val_no_leak_by_draft_id():
     """Stratified split por draft_id evita que el mismo draft aparezca
-    en train Y val."""
+    en train Y val. Schema DPO: {prompt, chosen, rejected, draft_id}."""
     examples = [
-        {"draft_id": "d1", "prompt": "p", "target": "t", "weight": 1.0},
-        {"draft_id": "d2", "prompt": "p", "target": "t", "weight": 1.0},
-        {"draft_id": "d3", "prompt": "p", "target": "t", "weight": 1.0},
-        {"draft_id": "d4", "prompt": "p", "target": "t", "weight": 1.0},
-        {"draft_id": "d5", "prompt": "p", "target": "t", "weight": 1.0},
+        {"draft_id": "d1", "prompt": "p", "chosen": "c", "rejected": "r"},
+        {"draft_id": "d2", "prompt": "p", "chosen": "c", "rejected": "r"},
+        {"draft_id": "d3", "prompt": "p", "chosen": "c", "rejected": "r"},
+        {"draft_id": "d4", "prompt": "p", "chosen": "c", "rejected": "r"},
+        {"draft_id": "d5", "prompt": "p", "chosen": "c", "rejected": "r"},
     ]
     train, val = finetune_drafts.split_train_val(examples, val_frac=0.4)
     train_ids = {ex["draft_id"] for ex in train}
@@ -328,3 +391,64 @@ def test_split_train_val_no_leak_by_draft_id():
     assert train_ids.isdisjoint(val_ids)
     # Total preserved.
     assert len(train) + len(val) == 5
+
+
+# ── Test 7: build_dpo_example shape ───────────────────────────────────────
+
+
+def test_build_dpo_example_shape_and_content():
+    """`build_dpo_example` produce el formato TRL DPOTrainer espera:
+    {prompt: str, chosen: str, rejected: str, draft_id: str}.
+    El prompt MATCHEA producción (sin incluir bot_draft).
+    """
+    item = {
+        "draft_id": "abc123",
+        "contact_name": "Lu",
+        "original_msgs": [
+            {"text": "che fer cómo va?"},
+            {"text": "todo joya?"},
+        ],
+        "bot_draft": "Estimada Lu, todo en orden, gracias por consultar.",
+        "sent_text": "joya che, vos? todo bien?",
+    }
+    out = finetune_drafts.build_dpo_example(item)
+
+    # Schema TRL.
+    assert set(out.keys()) == {"prompt", "chosen", "rejected", "draft_id"}
+    assert out["draft_id"] == "abc123"
+    # chosen = sent_text (la respuesta real del user).
+    assert out["chosen"] == "joya che, vos? todo bien?"
+    # rejected = bot_draft (el corporate que el modelo propuso).
+    assert out["rejected"].startswith("Estimada Lu")
+    # Prompt incluye contacto + contexto, NO el bot_draft (matchea
+    # producción, donde el modelo solo ve el contexto y debe generar).
+    assert "Lu" in out["prompt"]
+    assert "che fer cómo va?" in out["prompt"]
+    assert "Estimada Lu" not in out["prompt"]
+    # Termina con el "## Tu respuesta:" cue.
+    assert out["prompt"].rstrip().endswith("## Tu respuesta:")
+
+
+def test_preference_win_correctly_classifies():
+    """`preference_win`: True si pred se parece más al chosen que al
+    rejected. Es la métrica única de DPO held-out eval.
+    """
+    # Pred idéntico a chosen → win garantizado.
+    assert finetune_drafts.preference_win(
+        pred="dale, todo joya",
+        chosen="dale, todo joya",
+        rejected="estimado señor, todo en orden",
+    ) is True
+    # Pred idéntico a rejected → loss.
+    assert finetune_drafts.preference_win(
+        pred="estimado señor, todo en orden",
+        chosen="dale, todo joya",
+        rejected="estimado señor, todo en orden",
+    ) is False
+    # Pred a mitad de camino → tie → False (la spec dice "strictly
+    # greater" para win, evita pseudo-wins por jitter numérico).
+    assert finetune_drafts.preference_win(
+        pred="hola",
+        chosen="hola",
+        rejected="hola",
+    ) is False

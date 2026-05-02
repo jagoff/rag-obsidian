@@ -384,6 +384,48 @@
     .ft-conv-correction .ft-conv-text {
       font-style: italic;
     }
+
+    /* Strip compacto para el trigger de pushes no-conversacionales
+     * (anticipate, proactive_push, brief). NO es chat — es metadata. */
+    .ft-trigger-strip {
+      display: flex;
+      gap: 8px;
+      align-items: baseline;
+      font-size: 11px;
+      color: var(--muted);
+      padding: 4px 0;
+      border-bottom: 1px dashed var(--border);
+      margin-bottom: 6px;
+    }
+    .ft-trigger-label {
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      font-weight: 600;
+      flex-shrink: 0;
+    }
+    .ft-trigger-text {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11px;
+      color: var(--fg);
+      opacity: 0.85;
+      word-break: break-all;
+    }
+
+    /* Bloque prominente con el output del modelo (pushes anticipate /
+     * proactive_push). Tipografía mediana, line-height generoso, soporta
+     * markdown crudo (wikilinks, emoji, code spans inline). */
+    .ft-model-output {
+      font-size: 14px;
+      line-height: 1.5;
+      color: var(--fg);
+      padding: 10px 12px;
+      background: var(--card-bg);
+      border-left: 3px solid var(--badge-anticipate, #fb923c);
+      border-radius: 0 6px 6px 0;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+      overflow-wrap: break-word;
+    }
     .ft-conv-text {
       flex: 1;
       color: var(--fg);
@@ -612,97 +654,91 @@
 
       /* ── buildConversationContext ── render contexto de conversación
        *  según el stream (qué dijo el user vs qué respondió el modelo). */
+      /* Devuelve { title, body } donde title va al header de la card y body
+       * son los bloques (trigger compacto + bubbles según stream). */
       function buildConversationContext(item) {
         const m = item.meta || {};
         const blocks = [];
+        let title = null;
 
         if (item.stream === 'retrieval_answer') {
+          // Conversación real: chat-bubbles user → modelo
+          title = 'Pregunta y respuesta';
           if (m.user_query || item.label) {
-            blocks.push(`<div class="ft-conv ft-conv-user">
-              <span class="ft-conv-role">user</span>
-              <span class="ft-conv-text">${escapeHtml(m.user_query || item.label)}</span>
-            </div>`);
+            blocks.push(bubble('user', escapeHtml(m.user_query || item.label), 'user'));
           }
           if (m.model_response) {
-            blocks.push(`<div class="ft-conv ft-conv-model">
-              <span class="ft-conv-role">modelo</span>
-              <span class="ft-conv-text">${escapeHtml(m.model_response)}</span>
-            </div>`);
+            blocks.push(bubble('modelo', escapeHtml(m.model_response), 'model'));
           } else {
-            blocks.push(`<div class="ft-conv ft-conv-model ft-conv-faded">
-              <span class="ft-conv-role">modelo</span>
-              <span class="ft-conv-text">(respuesta no cacheada — abrí la conversación para verla)</span>
-            </div>`);
+            blocks.push(bubble('modelo',
+              '<i>(respuesta no cacheada — abrí la conversación para verla)</i>',
+              'model faded'));
           }
           if (m.conversation_path) {
-            const url = `obsidian://open?vault=Notes&file=${encodeURIComponent(m.conversation_path.replace(/\.md$/, ''))}`;
-            blocks.push(`<div class="ft-conv-link"><a href="${url}" target="_blank">→ abrir conversación en Obsidian</a></div>`);
+            blocks.push(vaultLink(m.conversation_path, 'abrir conversación en Obsidian'));
           }
+
         } else if (item.stream === 'draft_wa') {
-          // STIMULUS: el mensaje del contacto que disparó el draft
+          // Conversación real: contacto → bot → tu edit
+          title = `Draft a ${escapeHtml(m.contact || 'contacto')}`;
           if (m.contact_msg) {
-            blocks.push(`<div class="ft-conv ft-conv-stimulus">
-              <span class="ft-conv-role">${escapeHtml(m.contact)}</span>
-              <span class="ft-conv-text">${escapeHtml(m.contact_msg)}</span>
-            </div>`);
+            blocks.push(bubble(m.contact || 'contacto', escapeHtml(m.contact_msg), 'user'));
           }
-          // RESPONSE: lo que el bot redactó
           if (m.bot_draft) {
-            blocks.push(`<div class="ft-conv ft-conv-model">
-              <span class="ft-conv-role">bot drafteó</span>
-              <span class="ft-conv-text">${escapeHtml(m.bot_draft)}</span>
-            </div>`);
+            blocks.push(bubble('bot drafteó', escapeHtml(m.bot_draft), 'model'));
           }
-          // CORRECTION: lo que vos editaste si difiere (gold humano)
           if (m.sent_text && m.sent_text !== m.bot_draft) {
-            blocks.push(`<div class="ft-conv ft-conv-correction">
-              <span class="ft-conv-role">corregido</span>
-              <span class="ft-conv-text">${escapeHtml(m.sent_text)}</span>
+            blocks.push(bubble('vos enviaste', escapeHtml(m.sent_text), 'correction'));
+          }
+
+        } else if (item.stream === 'anticipate' || item.stream === 'proactive_push') {
+          // NO es conversación real — es un push del modelo gatillado por una
+          // condición. Trigger va como STRIP COMPACTO arriba, mensaje del
+          // modelo como BLOQUE PROMINENTE abajo.
+          const triggerText = m.trigger || m.kind;
+          if (triggerText) {
+            blocks.push(`<div class="ft-trigger-strip">
+              <span class="ft-trigger-label">disparado por</span>
+              <span class="ft-trigger-text">${escapeHtml(triggerText)}</span>
             </div>`);
           }
-        } else if (item.stream === 'anticipate') {
-          // STIMULUS: el trigger que disparó al modelo a generar el push
-          if (m.trigger) {
-            blocks.push(`<div class="ft-conv ft-conv-stimulus">
-              <span class="ft-conv-role">trigger</span>
-              <span class="ft-conv-text">${escapeHtml(m.trigger)}</span>
-            </div>`);
-          }
-          // RESPONSE: el push que el modelo decidió emitir
-          if (m.message_preview) {
-            blocks.push(`<div class="ft-conv ft-conv-model">
-              <span class="ft-conv-role">decidió pushear</span>
-              <span class="ft-conv-text">${escapeHtml(m.message_preview)}</span>
-            </div>`);
-          }
-        } else if (item.stream === 'proactive_push') {
-          // STIMULUS: el kind del push (qué tipo de evento lo disparó)
-          if (m.kind) {
-            blocks.push(`<div class="ft-conv ft-conv-stimulus">
-              <span class="ft-conv-role">trigger</span>
-              <span class="ft-conv-text">${escapeHtml(m.kind)}</span>
-            </div>`);
-          }
-          // RESPONSE: el contenido del push (preferimos message_preview real
-          // sobre reason — message_preview es el texto que efectivamente salió,
-          // reason es el motivo interno).
           const responseText = m.message_preview || m.reason;
           if (responseText) {
-            blocks.push(`<div class="ft-conv ft-conv-model">
-              <span class="ft-conv-role">push del modelo</span>
-              <span class="ft-conv-text">${escapeHtml(responseText)}</span>
+            title = item.stream === 'anticipate'
+              ? 'Push anticipatorio'
+              : 'Push proactivo';
+            blocks.push(`<div class="ft-model-output">
+              ${escapeHtml(responseText)}
             </div>`);
           }
+
         } else if (item.stream === 'brief') {
-          // Para briefs el label ya es el path; no hay snippet del contenido.
-          // Mostrar link al brief en el vault.
+          title = 'Brief generado por el modelo';
           if (item.item_id) {
-            const url = `obsidian://open?vault=Notes&file=${encodeURIComponent(item.item_id.replace(/\.md$/, ''))}`;
-            blocks.push(`<div class="ft-conv-link"><a href="${url}" target="_blank">→ abrir brief en Obsidian</a></div>`);
+            blocks.push(`<div class="ft-trigger-strip">
+              <span class="ft-trigger-label">brief en</span>
+              <span class="ft-trigger-text">${escapeHtml(item.item_id)}</span>
+            </div>`);
+            blocks.push(vaultLink(item.item_id, 'abrir brief en Obsidian'));
           }
         }
 
-        return blocks.length ? `<div class="ft-conversation">${blocks.join('')}</div>` : '';
+        const bodyHtml = blocks.length
+          ? `<div class="ft-conversation">${blocks.join('')}</div>`
+          : '';
+        return { title, body: bodyHtml };
+      }
+
+      function bubble(roleText, htmlText, roleClass) {
+        return `<div class="ft-conv ft-conv-${roleClass}">
+          <span class="ft-conv-role">${escapeHtml(roleText)}</span>
+          <span class="ft-conv-text">${htmlText}</span>
+        </div>`;
+      }
+
+      function vaultLink(relpath, linkText) {
+        const url = `obsidian://open?vault=Notes&file=${encodeURIComponent(relpath.replace(/\.md$/, ''))}`;
+        return `<div class="ft-conv-link"><a href="${url}" target="_blank">→ ${escapeHtml(linkText)}</a></div>`;
       }
 
       /* ── renderCard ── */
@@ -718,16 +754,19 @@
         const color = STREAM_COLORS[item.stream] || '#888';
         const badgeText = STREAM_LABELS[item.stream] || item.stream;
         const meta  = buildMeta(item);
-        const label = item.label || item.item_id;
-        const conversation = buildConversationContext(item);
+        const ctx = buildConversationContext(item);
+        // Title viene del context builder cuando aplica (todos los streams
+        // post-2026-05-01 tarde tienen title contextual). Fallback al label
+        // crudo del item para forward-compat con streams futuros.
+        const heading = ctx.title || item.label || item.item_id;
 
         card.innerHTML = `
           <div class="ft-card-header">
             <span class="ft-badge" style="background:${color}">${escapeHtml(badgeText)}</span>
             <span class="ft-ts">${formatRelTime(item.ts)}</span>
           </div>
-          <div class="ft-label">${escapeHtml(label)}</div>
-          ${conversation}
+          <div class="ft-label">${escapeHtml(heading)}</div>
+          ${ctx.body}
           ${meta ? `<div class="ft-meta">${escapeHtml(meta)}</div>` : ''}
           <div class="ft-actions">
             <button class="btn-pos" title="Positivo" aria-label="Votar positivo">👍</button>

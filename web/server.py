@@ -1805,24 +1805,47 @@ app.mount(
     name="static",
 )
 
-# ── /memory: mem-vault UI mounted as a sub-application ───────────────────
+# ── /mem-vault: mem-vault UI mounted as a sub-application ────────────────
 # Boot mem-vault's FastAPI app once (Qdrant + mem0 are expensive) and let
-# it serve everything under /memory/*. Same origin as the rest of the web
-# UI so links + cookies + CSP work without surprises. Best-effort: if the
-# mem-vault package isn't installed in this venv (it lives in a separate
-# repo, optional dep) we just skip the mount and the link in the navbar
-# will 404 — easy to spot but doesn't crash the rest of the server.
+# it serve everything under /mem-vault/*. Same origin as the rest of the
+# web UI so links + cookies + CSP work without surprises. Best-effort: if
+# the mem-vault package isn't installed in this venv (it lives in a
+# separate repo, optional dep) we just skip the mount and the link in the
+# navbar will 404 — easy to spot but doesn't crash the rest of the server.
+#
+# Renamed from /memory → /mem-vault on 2026-05-02 to align the public URL
+# (https://ra.ai/mem-vault) with the project name. The legacy /memory path
+# is kept as a 308 redirect below so bookmarks + external links keep
+# working without a flag day.
 try:
     from mem_vault.ui.server import create_app as _mem_vault_create_app  # type: ignore[import-not-found]
 
     _mem_vault_app = _mem_vault_create_app()
-    app.mount("/memory", _mem_vault_app, name="mem-vault-ui")
-    print("[mem-vault] UI mounted at /memory", file=sys.stderr, flush=True)
+    app.mount("/mem-vault", _mem_vault_app, name="mem-vault-ui")
+    print("[mem-vault] UI mounted at /mem-vault", file=sys.stderr, flush=True)
+
+    # Redirect legacy /memory → /mem-vault. 308 preserves the method
+    # (HTMX uses GET for the dashboard fetches, but a future PATCH /api/v1
+    # call wouldn't get downgraded to GET like a 301/302 would).
+    from fastapi.responses import RedirectResponse as _MemVaultRedirect
+
+    @app.get("/memory")
+    @app.get("/memory/{path:path}")
+    async def _memory_legacy_redirect(request: Request, path: str = ""):
+        # Preserve the suffix and any query string so bookmarks like
+        # /memory/?focus=foo land at /mem-vault/?focus=foo cleanly.
+        suffix = f"/{path}" if path else "/"
+        qs = request.url.query
+        target = f"/mem-vault{suffix}"
+        if qs:
+            target = f"{target}?{qs}"
+        return _MemVaultRedirect(url=target, status_code=308)
+
 except Exception as _exc:  # pragma: no cover — best-effort wiring
     print(
         f"[mem-vault] UI not mounted ({_exc}). "
         "Install with `uv pip install --editable /path/to/mem-vault[ui,hybrid]` "
-        "if you want /memory to work.",
+        "if you want /mem-vault to work.",
         file=sys.stderr,
         flush=True,
     )

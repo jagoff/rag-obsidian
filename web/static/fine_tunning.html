@@ -714,12 +714,23 @@
       function fadeRemove(card) {
         const uid = card.dataset.uid;
         card.classList.add('fading');
-        card.addEventListener('transitionend', () => {
+        // setTimeout fallback: transitionend a veces no dispara (browsers
+        // quisquillosos con `border` en transition shorthand, o si la card
+        // tenía display:none implícito en algún ancestor). El timeout >= la
+        // duración del transition (300ms) garantiza la remoción aunque el
+        // event nunca llegue. Doble-fire es seguro: card.remove() es
+        // idempotente y activeIds.delete() también.
+        let removed = false;
+        const removeOnce = () => {
+          if (removed) return;
+          removed = true;
           card.remove();
           activeIds.delete(uid);
           updateSubtitle();
           updateEmpty();
-        }, { once: true });
+        };
+        card.addEventListener('transitionend', removeOnce, { once: true });
+        setTimeout(removeOnce, 350);
       }
 
       /* ── acciones remotas ── */

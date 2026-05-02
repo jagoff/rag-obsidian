@@ -13713,6 +13713,29 @@ def _get_local_embedder():
             # makes sentence_transformers hit the hub HEAD endpoint and fail
             # offline.
             _local_embedder = SentenceTransformer("BAAI/bge-m3", device=_dev)
+            # MPS cache cleanup wrapper — mismo patrón que get_reranker()
+            # / get_nli_model(). El bge-m3 local hace `encode()` (no
+            # `predict()`), pero el comportamiento de MPS es idéntico:
+            # cada call deja tensors fragmentados que solo se liberan
+            # con torch.mps.empty_cache(). Sin esto, en sesiones largas
+            # contribuye al bloat de unified memory junto al reranker
+            # (caso real 2026-05-02: vmmap del web/server.py mostró 8 GB
+            # en "owned unmapped (graphics)").
+            #
+            # Override: RAG_LOCAL_EMBED_NO_CLEANUP=1 para tests que
+            # necesiten determinismo del MPS allocator.
+            if _dev == "mps" and os.environ.get("RAG_LOCAL_EMBED_NO_CLEANUP", "").strip() not in ("1", "true", "yes"):
+                _orig_encode = _local_embedder.encode
+                def _encode_with_cleanup(*args, **kwargs):
+                    try:
+                        return _orig_encode(*args, **kwargs)
+                    finally:
+                        try:
+                            import torch as _torch
+                            _torch.mps.empty_cache()
+                        except Exception:
+                            pass
+                _local_embedder.encode = _encode_with_cleanup
         except Exception as _exc:
             if os.environ.get("RAG_DEBUG"):
                 print(f"[local-embed] unavailable ({_exc}) — falling back to ollama", flush=True)
@@ -63219,6 +63242,23 @@ def get_nli_model():
             else:
                 device = "cpu"
             _nli_model = CrossEncoder(_NLI_MODEL_NAME, max_length=512, device=device)
+            # MPS cache cleanup wrapper — mismo patrón que get_reranker().
+            # Cada predict del NLI model deja tensors fragmentados en el
+            # MPS allocator. Sin cleanup post-call, en sesiones largas
+            # contribuye al bloat de "owned unmapped (graphics)" junto al
+            # reranker. Override: RAG_NLI_NO_CLEANUP=1.
+            if device == "mps" and os.environ.get("RAG_NLI_NO_CLEANUP", "").strip() not in ("1", "true", "yes"):
+                _orig_nli_predict = _nli_model.predict
+                def _nli_predict_with_cleanup(*args, **kwargs):
+                    try:
+                        return _orig_nli_predict(*args, **kwargs)
+                    finally:
+                        try:
+                            import torch as _torch
+                            _torch.mps.empty_cache()
+                        except Exception:
+                            pass
+                _nli_model.predict = _nli_predict_with_cleanup
         except Exception as exc:
             _silent_log("nli_load_failed", exc)
             return None

@@ -23029,6 +23029,13 @@ def fine_tunning_queue(limit: int = 20) -> dict:
             # Mostrar bot_draft + sent_text (cuando approved_editar) → el user
             # puntúa si la respuesta era apropiada vs lo que terminó mandando.
             try:
+                # Exclude synthetic drafts (`synthetic-%` prefix) — son rows
+                # generadas por el augmenter del fine-tune del LoRA del modelo
+                # de drafts, no son drafts REALES que el bot redactó para
+                # contactos. Medido 2026-05-01: 4720 synthetic vs 24 reales,
+                # con bot_drafts repetidos 30-43 veces cada uno → la queue se
+                # llenaba de duplicados de "Genial, muchas gracias por la
+                # actualización." y similares. Sólo puntuamos drafts reales.
                 cur = conn.execute("""
                     SELECT d.draft_id, d.contact_name, d.original_msgs_json,
                            d.bot_draft, d.sent_text, d.decision, d.ts
@@ -23040,6 +23047,7 @@ def fine_tunning_queue(limit: int = 20) -> dict:
                     WHERE d.ts >= datetime('now', '-7 days')
                       AND d.bot_draft IS NOT NULL
                       AND length(d.bot_draft) > 0
+                      AND d.draft_id NOT LIKE 'synthetic-%'
                       AND ftr.id IS NULL
                       AND (fts.snoozed_until_ts IS NULL
                            OR fts.snoozed_until_ts < datetime('now'))

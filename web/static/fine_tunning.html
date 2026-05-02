@@ -697,11 +697,15 @@
         // Ambos botones fire-and-remove al primer click — el textarea de
         // comment se removió post 2026-05-01 evening (audit del día 1
         // mostró 0 comments en 20 negatives → fricción inútil).
+        // `heading` es el title que ya armó buildConversationContext +
+        // fallbacks (ctx.title || item.label || item.item_id) — lo reusamos
+        // como el `label` que sale al backend para que la row en
+        // rag_ft_panel_ratings tenga texto humano-legible.
         btnPos.addEventListener('click', () => {
-          handleRate(item.stream, item.item_id, 1, label, null, item.session_id, card);
+          handleRate(item.stream, item.item_id, 1, heading, null, item.session_id, card);
         });
         btnNeg.addEventListener('click', () => {
-          handleRate(item.stream, item.item_id, -1, label, null, item.session_id, card);
+          handleRate(item.stream, item.item_id, -1, heading, null, item.session_id, card);
         });
         btnSnooze.addEventListener('click', () => {
           handleSnooze(item.stream, item.item_id, card);

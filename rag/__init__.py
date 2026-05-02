@@ -15837,6 +15837,31 @@ def get_reranker():
         # silent_errors.jsonl for the operator to inspect.
         if _reranker_ft_enabled():
             _apply_reranker_lora_adapter(_reranker, RERANKER_FT_ADAPTER_DIR)
+        # MPS cache cleanup wrapper — diagnóstico empírico 2026-05-02
+        # confirmó que `predict()` acumula memoria fragmentada en el MPS
+        # allocator de PyTorch. Cada call deja tensors temporales que el
+        # backend retiene hasta `torch.mps.empty_cache()`. Con el
+        # reranker pinned (RAG_RERANKER_NEVER_UNLOAD=1, default web
+        # server), nunca se unloadeaba → 8 GB de "owned unmapped
+        # (graphics)" en pocos minutos según vmmap. El daemon periódico
+        # (rag-mps-cache-drop) ayuda pero bajo tráfico activo no
+        # alcanza — la mejor defensa es liberar SIEMPRE inmediatamente
+        # después de cada predict().
+        #
+        # Override: `RAG_RERANKER_NO_CLEANUP=1` desactiva el wrap (tests
+        # que necesiten determinismo del MPS allocator).
+        if device == "mps" and os.environ.get("RAG_RERANKER_NO_CLEANUP", "").strip() not in ("1", "true", "yes"):
+            _orig_predict = _reranker.predict
+            def _predict_with_cleanup(*args, **kwargs):
+                try:
+                    return _orig_predict(*args, **kwargs)
+                finally:
+                    try:
+                        import torch as _torch
+                        _torch.mps.empty_cache()
+                    except Exception:
+                        pass
+            _reranker.predict = _predict_with_cleanup
     return _reranker
 
 
@@ -16206,6 +16231,67 @@ def _memory_pressure_watchdog_loop(threshold: float, interval: int) -> None:
             _silent_log("memory_watchdog_loop", exc)
 
 
+def _periodic_mps_cache_drop_loop(interval: int) -> None:
+    """Loop daemon que periódicamente libera memoria fragmentada del MPS
+    allocator de PyTorch — SIN descargar modelos.
+
+    Diagnóstico empírico 2026-05-02 (vmmap del web/server.py PID vivo):
+        owned unmapped (graphics): 8.0 GB en 12 regiones
+
+    Esa categoría son allocations del Metal Performance Shaders backend.
+    Cada `predict()` del reranker (BAAI/bge-reranker-v2-m3, 600 MB),
+    cada `predict()` del NLI model (mDeBERTa, 600 MB) y cada `encode()`
+    del bge-m3 local embedder (~500 MB) reservan tensors temporales en
+    MPS. PyTorch los recicla pero el MPS allocator es agresivo y NO
+    devuelve la memoria al sistema operativo hasta `torch.mps.empty_cache()`.
+
+    En el codepath actual `empty_cache()` SOLO se invoca dentro de
+    `maybe_unload_reranker()` y `maybe_unload_nli_model()`. Si el operador
+    setea `RAG_RERANKER_NEVER_UNLOAD=1` (default en el web server según
+    el plist), el reranker se queda pinned, los modelos siguen vivos pero
+    el MPS allocator acumula memoria fragmentada con cada query → 8 GB
+    en pocos minutos → unified memory presure → swap activo → ollama no
+    consigue VRAM para cargar modelos → drafts del listener fallan en
+    cascada con "❌ no pude generar draft (LLM no respondió o timeout)".
+
+    `torch.mps.empty_cache()` libera la memoria pre-allocada NO usada por
+    los tensors live. Es safe llamarlo en cualquier momento — los modelos
+    cargados (weights, KV cache, buffers de inferencia activa) NO se
+    afectan. Solo se devuelve la memoria que ya estaba "free internamente"
+    pero retenida por el allocator.
+
+    Cadencia: 60s default. Más frecuente no aporta (la fragmentación
+    crece linealmente con el tráfico, no exponencial), menos frecuente
+    deja crecer mucho el bloat entre flushes.
+
+    Override: `RAG_MPS_CACHE_DROP_INTERVAL=0` apaga el daemon. Cualquier
+    valor > 0 lo activa con ese intervalo en segundos.
+    """
+    while True:
+        try:
+            time.sleep(interval)
+            _torch_mps_empty_cache()
+            # gc.collect() ayuda a liberar tensors orphan (referencias
+            # circulares en buffers de Python) que MPS no tocaría hasta
+            # que Python los recolecte.
+            import gc as _gc
+            _gc.collect()
+        except Exception as exc:
+            _silent_log("mps_cache_drop_loop", exc)
+
+
+def _torch_mps_empty_cache() -> None:
+    """Best-effort MPS cache drop. No-op si torch/MPS no está disponible
+    (Intel mac o ambiente sin MPS).
+    """
+    try:
+        import torch
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+    except Exception:
+        pass
+
+
 def start_memory_pressure_watchdog() -> bool:
     """Arrancar el watchdog como daemon thread. Idempotente.
 
@@ -16215,6 +16301,14 @@ def start_memory_pressure_watchdog() -> bool:
     Llamar desde el startup de long-running processes: `rag serve`, web
     server FastAPI startup, ambient agent daemon. El CLI one-shot NO
     necesita el watchdog (el proceso termina antes del primer tick).
+
+    Además del watchdog de presión, arranca un loop periódico de
+    `torch.mps.empty_cache()` (cada 60s default) que libera la memoria
+    fragmentada del MPS allocator sin descargar modelos. Ver doc-block
+    en `_periodic_mps_cache_drop_loop` para el rationale completo —
+    confirmamos empíricamente con vmmap que el web/server.py llegaba
+    a 8 GB de "owned unmapped (graphics)" porque ningún codepath
+    invocaba empty_cache() salvo al unload, y el reranker está pinned.
     """
     global _memory_watchdog_started
     with _memory_watchdog_lock:
@@ -16241,6 +16335,27 @@ def start_memory_pressure_watchdog() -> bool:
             daemon=True,
         )
         t.start()
+        # Lanzar también el daemon periódico de MPS cache drop. Independiente
+        # del threshold de memory pressure — corre siempre, libera memoria
+        # fragmentada cada N segundos. Si el operador desactiva el watchdog
+        # de pressure (RAG_MEMORY_PRESSURE_DISABLE=1) el cache drop también
+        # se desactiva — son la misma defensa de memoria.
+        try:
+            mps_interval = int(os.environ.get("RAG_MPS_CACHE_DROP_INTERVAL", "60"))
+        except ValueError:
+            mps_interval = 60
+        if mps_interval > 0:
+            t_mps = threading.Thread(
+                target=_periodic_mps_cache_drop_loop,
+                args=(mps_interval,),
+                name="rag-mps-cache-drop",
+                daemon=True,
+            )
+            t_mps.start()
+            print(
+                f"[mps-cache-drop] started interval={mps_interval}s",
+                flush=True,
+            )
         _memory_watchdog_started = True
         print(
             f"[memory-watchdog] started threshold={threshold}% interval={interval}s",
@@ -63068,16 +63183,6 @@ _NLI_NEVER_UNLOAD = os.environ.get("RAG_NLI_NEVER_UNLOAD", "").strip() not in ("
 _nli_model = None
 _nli_last_use: float = 0.0
 _nli_lock = threading.Lock()
-
-
-def _torch_mps_empty_cache() -> None:
-    """Best-effort MPS cache drop. No-op if torch/MPS unavailable."""
-    try:
-        import torch
-        if torch.backends.mps.is_available():
-            torch.mps.empty_cache()
-    except Exception:
-        pass
 
 
 def get_nli_model():

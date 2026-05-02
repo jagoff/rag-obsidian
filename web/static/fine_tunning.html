@@ -372,6 +372,18 @@
       color: var(--badge-retrieval_answer, #2563eb);
       border-color: var(--badge-retrieval_answer, #2563eb);
     }
+    .ft-conv-stimulus .ft-conv-role {
+      color: var(--muted);
+      border-color: var(--border);
+      background: var(--card-bg);
+    }
+    .ft-conv-correction .ft-conv-role {
+      color: var(--badge-draft_wa, #059669);
+      border-color: var(--badge-draft_wa, #059669);
+    }
+    .ft-conv-correction .ft-conv-text {
+      font-style: italic;
+    }
     .ft-conv-text {
       flex: 1;
       color: var(--fg);
@@ -627,30 +639,58 @@
             blocks.push(`<div class="ft-conv-link"><a href="${url}" target="_blank">→ abrir conversación en Obsidian</a></div>`);
           }
         } else if (item.stream === 'draft_wa') {
+          // STIMULUS: el mensaje del contacto que disparó el draft
+          if (m.contact_msg) {
+            blocks.push(`<div class="ft-conv ft-conv-stimulus">
+              <span class="ft-conv-role">${escapeHtml(m.contact)}</span>
+              <span class="ft-conv-text">${escapeHtml(m.contact_msg)}</span>
+            </div>`);
+          }
+          // RESPONSE: lo que el bot redactó
           if (m.bot_draft) {
             blocks.push(`<div class="ft-conv ft-conv-model">
               <span class="ft-conv-role">bot drafteó</span>
               <span class="ft-conv-text">${escapeHtml(m.bot_draft)}</span>
             </div>`);
           }
+          // CORRECTION: lo que vos editaste si difiere (gold humano)
           if (m.sent_text && m.sent_text !== m.bot_draft) {
-            blocks.push(`<div class="ft-conv ft-conv-user">
-              <span class="ft-conv-role">vos editaste</span>
+            blocks.push(`<div class="ft-conv ft-conv-correction">
+              <span class="ft-conv-role">corregido</span>
               <span class="ft-conv-text">${escapeHtml(m.sent_text)}</span>
             </div>`);
           }
         } else if (item.stream === 'anticipate') {
+          // STIMULUS: el trigger que disparó al modelo a generar el push
+          if (m.trigger) {
+            blocks.push(`<div class="ft-conv ft-conv-stimulus">
+              <span class="ft-conv-role">trigger</span>
+              <span class="ft-conv-text">${escapeHtml(m.trigger)}</span>
+            </div>`);
+          }
+          // RESPONSE: el push que el modelo decidió emitir
           if (m.message_preview) {
             blocks.push(`<div class="ft-conv ft-conv-model">
-              <span class="ft-conv-role">push del modelo</span>
+              <span class="ft-conv-role">decidió pushear</span>
               <span class="ft-conv-text">${escapeHtml(m.message_preview)}</span>
             </div>`);
           }
         } else if (item.stream === 'proactive_push') {
-          if (m.reason) {
+          // STIMULUS: el kind del push (qué tipo de evento lo disparó)
+          if (m.kind) {
+            blocks.push(`<div class="ft-conv ft-conv-stimulus">
+              <span class="ft-conv-role">trigger</span>
+              <span class="ft-conv-text">${escapeHtml(m.kind)}</span>
+            </div>`);
+          }
+          // RESPONSE: el contenido del push (preferimos message_preview real
+          // sobre reason — message_preview es el texto que efectivamente salió,
+          // reason es el motivo interno).
+          const responseText = m.message_preview || m.reason;
+          if (responseText) {
             blocks.push(`<div class="ft-conv ft-conv-model">
               <span class="ft-conv-role">push del modelo</span>
-              <span class="ft-conv-text">${escapeHtml(m.reason)}</span>
+              <span class="ft-conv-text">${escapeHtml(responseText)}</span>
             </div>`);
           }
         } else if (item.stream === 'brief') {

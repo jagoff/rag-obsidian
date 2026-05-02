@@ -22996,6 +22996,7 @@ def fine_tunning_queue(limit: int = 20) -> dict:
                            ac.kind,
                            ac.message_preview,
                            ac.score,
+                           ac.reason,
                            ac.ts
                     FROM rag_anticipate_candidates ac
                     LEFT JOIN rag_anticipate_feedback af
@@ -23014,13 +23015,23 @@ def fine_tunning_queue(limit: int = 20) -> dict:
                     LIMIT 10
                 """)
                 for row in cur.fetchall():
-                    dedup_key, kind, preview, score, ts = row
+                    dedup_key, kind, preview, score, reason_trigger, ts = row
                     items.append({
                         "item_id": dedup_key,
                         "stream": "anticipate",
-                        "label": preview or kind,   # message_preview si existe, else kind
+                        "label": preview or kind,
                         "ts": ts,
-                        "meta": {"kind": kind, "score": score},
+                        "meta": {
+                            "kind": kind,
+                            "score": score,
+                            # `reason` es el TRIGGER que disparó al modelo
+                            # (ej "event in 17min, top_score=1.07" o
+                            # "age=17d, kind=inline"). Es el "stimulus" que
+                            # decidió generar el push — el user puntúa si la
+                            # decisión del modelo fue acertada DADO ese trigger.
+                            "trigger": reason_trigger,
+                            "message_preview": preview,
+                        },
                     })
             except Exception as exc_a:
                 _silent_log("fine_tunning_queue_anticipate_error", str(exc_a))
@@ -23099,8 +23110,8 @@ def fine_tunning_queue(limit: int = 20) -> dict:
             # puntúa si la respuesta era apropiada vs lo que terminó mandando.
             try:
                 cur = conn.execute("""
-                    SELECT d.draft_id, d.contact_name, d.bot_draft, d.sent_text,
-                           d.decision, d.ts
+                    SELECT d.draft_id, d.contact_name, d.original_msgs_json,
+                           d.bot_draft, d.sent_text, d.decision, d.ts
                     FROM rag_draft_decisions d
                     LEFT JOIN rag_ft_panel_ratings ftr
                       ON ftr.stream = 'draft_wa' AND ftr.item_id = d.draft_id
@@ -23122,11 +23133,29 @@ def fine_tunning_queue(limit: int = 20) -> dict:
                       d.ts DESC
                     LIMIT 15
                 """)
+                import json as _json_dw
                 for row in cur.fetchall():
-                    draft_id, contact, bot_draft, sent_text, decision, ts_d = row
+                    (draft_id, contact, original_msgs_json,
+                     bot_draft, sent_text, decision, ts_d) = row
                     short = (bot_draft or "")[:80]
                     if len(bot_draft or "") > 80:
                         short += "…"
+                    # Parse original messages (JSON array de {id, text, ts}) →
+                    # texto plano concatenado para mostrar como "stimulus" del
+                    # contacto al que el bot drafteó respuesta.
+                    contact_msg = None
+                    try:
+                        msgs = _json_dw.loads(original_msgs_json or "[]")
+                        if isinstance(msgs, list) and msgs:
+                            texts = [m.get("text", "") for m in msgs
+                                     if isinstance(m, dict) and m.get("text")]
+                            if texts:
+                                joined = "\n".join(texts).strip()
+                                contact_msg = joined[:300] + (
+                                    "…" if len(joined) > 300 else ""
+                                )
+                    except Exception:
+                        contact_msg = None
                     items.append({
                         "item_id": draft_id,
                         "stream": "draft_wa",
@@ -23134,6 +23163,7 @@ def fine_tunning_queue(limit: int = 20) -> dict:
                         "ts": ts_d,
                         "meta": {
                             "contact": contact,
+                            "contact_msg": contact_msg,
                             "bot_draft": bot_draft,
                             "sent_text": sent_text,
                             "decision": decision,

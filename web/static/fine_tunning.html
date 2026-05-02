@@ -577,28 +577,22 @@
       const emptyEl   = document.getElementById('ft-empty');
       const subtitleEl = document.getElementById('ft-count');
 
-      /* Sólo OUTPUTS DEL MODELO. retrieval (queries del user) y whatsapp_msg
-       * (chunks del corpus) se removieron post 2026-05-01 evening. */
+      /* Sólo CONVERSACIONES REALES. Pushes (brief/anticipate/proactive_push)
+       * removidos post 2026-05-01 evening — no tienen respuesta correcta
+       * objetiva y meten ruido en el dataset. */
       const STREAM_COLORS = {
         retrieval_answer: 'var(--badge-retrieval_answer, #2563eb)',
-        brief:            'var(--badge-brief, #a855f7)',
-        anticipate:       'var(--badge-anticipate, #fb923c)',
         draft:            'var(--badge-draft, #10b981)',
         draft_wa:         'var(--badge-draft_wa, #059669)',
-        proactive_push:   'var(--badge-proactive_push, #f59e0b)',
         style:            'var(--badge-style, #ec4899)',
         tool_routing:     'var(--badge-tool_routing, #eab308)',
         read_summary:     'var(--badge-read_summary, #06b6d4)',
       };
 
-      /* Labels human-readable por stream — sólo OUTPUTS DEL MODELO */
       const STREAM_LABELS = {
         retrieval_answer: '💬 respuesta',
-        brief:            '📓 brief',
-        anticipate:       '🔮 push',
         draft:            '✉️ draft',
         draft_wa:         '💚 wa-draft',
-        proactive_push:   '📣 proactive',
         style:            '🎨 estilo',
         tool_routing:     '🛠 tool',
         read_summary:     '📄 read',
@@ -636,18 +630,9 @@
         if (item.stream === 'retrieval_answer') {
           if (item.top_score != null) parts.push(`score=${item.top_score.toFixed(3)}`);
           if (item.paths && item.paths.length) parts.push(`${item.paths.length} paths`);
-        } else if (item.stream === 'brief') {
-          if (item.meta && item.meta.negatives != null) {
-            parts.push(`${item.meta.negatives} neg, ${item.meta.mutes || 0} mute`);
-          }
-        } else if (item.stream === 'anticipate') {
-          if (item.meta && item.meta.kind)  parts.push(`kind=${item.meta.kind}`);
-          if (item.meta && item.meta.score != null) parts.push(`score=${item.meta.score.toFixed(2)}`);
         } else if (item.stream === 'draft' || item.stream === 'draft_wa') {
           if (item.meta && item.meta.contact) parts.push(`a ${item.meta.contact}`);
           if (item.meta && item.meta.decision) parts.push(`decisión: ${item.meta.decision}`);
-        } else if (item.stream === 'proactive_push') {
-          if (item.meta && item.meta.kind) parts.push(`kind=${item.meta.kind}`);
         }
         return parts.join(' · ');
       }
@@ -691,37 +676,9 @@
             blocks.push(bubble('vos enviaste', escapeHtml(m.sent_text), 'correction'));
           }
 
-        } else if (item.stream === 'anticipate' || item.stream === 'proactive_push') {
-          // NO es conversación real — es un push del modelo gatillado por una
-          // condición. Trigger va como STRIP COMPACTO arriba, mensaje del
-          // modelo como BLOQUE PROMINENTE abajo.
-          const triggerText = m.trigger || m.kind;
-          if (triggerText) {
-            blocks.push(`<div class="ft-trigger-strip">
-              <span class="ft-trigger-label">disparado por</span>
-              <span class="ft-trigger-text">${escapeHtml(triggerText)}</span>
-            </div>`);
-          }
-          const responseText = m.message_preview || m.reason;
-          if (responseText) {
-            title = item.stream === 'anticipate'
-              ? 'Push anticipatorio'
-              : 'Push proactivo';
-            blocks.push(`<div class="ft-model-output">
-              ${escapeHtml(responseText)}
-            </div>`);
-          }
-
-        } else if (item.stream === 'brief') {
-          title = 'Brief generado por el modelo';
-          if (item.item_id) {
-            blocks.push(`<div class="ft-trigger-strip">
-              <span class="ft-trigger-label">brief en</span>
-              <span class="ft-trigger-text">${escapeHtml(item.item_id)}</span>
-            </div>`);
-            blocks.push(vaultLink(item.item_id, 'abrir brief en Obsidian'));
-          }
         }
+        // NOTE: branches anticipate / proactive_push / brief removidas
+        // post 2026-05-01 evening (pushes meten ruido — no se puntúan).
 
         const bodyHtml = blocks.length
           ? `<div class="ft-conversation">${blocks.join('')}</div>`

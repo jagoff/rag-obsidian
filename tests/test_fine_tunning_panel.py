@@ -141,7 +141,7 @@ def test_queue_excludes_query_without_answer(client, seeded_conn):
 
 def test_post_rate_persists_row(client, seeded_conn):
     body = {
-        "stream": "brief",
+        "stream": "draft_wa",
         "item_id": "04-Archive/.../2026-04-29-morning.md",
         "rating": -1,
         "label": "morning brief 2026-04-29",
@@ -155,7 +155,7 @@ def test_post_rate_persists_row(client, seeded_conn):
         "SELECT stream, item_id, rating, comment FROM rag_ft_panel_ratings"
     ).fetchone()
     assert row is not None
-    assert row[0] == "brief"
+    assert row[0] == "draft_wa"
     assert row[1] == "04-Archive/.../2026-04-29-morning.md"
     assert row[2] == -1
     assert row[3] == "muy genérico"
@@ -165,7 +165,7 @@ def test_post_rate_persists_row(client, seeded_conn):
 
 def test_post_rate_invalid_rating_returns_422(client, seeded_conn):
     body = {
-        "stream": "brief",
+        "stream": "draft_wa",
         "item_id": "42",
         "rating": 0,
         "label": "x",
@@ -190,7 +190,7 @@ def test_post_rate_invalid_stream_returns_422(client, seeded_conn):
 # ── Test 8 ─────────────────────────────────────────────────────────────────
 
 def test_post_snooze_persists_state(client, seeded_conn):
-    body = {"stream": "brief", "item_id": "42", "hours": 24}
+    body = {"stream": "draft_wa", "item_id": "draft-42", "hours": 24}
     r = client.post("/api/fine_tunning/snooze", json=body)
     assert r.status_code == 200
 
@@ -198,7 +198,7 @@ def test_post_snooze_persists_state(client, seeded_conn):
         """
         SELECT snoozed_until_ts
         FROM rag_ft_active_queue_state
-        WHERE item_id = '42' AND stream = 'brief'
+        WHERE item_id = 'draft-42' AND stream = 'draft_wa'
         """
     ).fetchone()
     assert row is not None

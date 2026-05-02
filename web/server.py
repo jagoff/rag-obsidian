@@ -22867,16 +22867,15 @@ def vault_health_api() -> dict:
 
 # ── Fine-tunning panel ──────────────────────────────────────────────────
 # Endpoints del panel de labeling humano para acelerar los learning loops.
-# Diseño (post 2026-05-01 evening): el panel SÓLO expone outputs del MODELO
-# en contexto de conversación. NO se puntúa input humano (queries crudas,
-# mensajes WhatsApp del corpus) — eso no acelera el aprendizaje.
+# Diseño (post 2026-05-01 evening, refinado tras feedback del user): el
+# panel SÓLO expone CONVERSACIONES REALES donde el modelo respondió en un
+# contexto evaluable. NO se puntúa: input humano (queries / mensajes WA
+# del corpus) NI pushes del modelo (briefs / anticipate / proactive) —
+# los pushes no tienen "respuesta correcta" objetiva y meten ruido.
 #
 # Streams válidos en /api/fine_tunning/rate:
-#   retrieval_answer  — respuesta del LLM a una query (con contexto del turn)
-#   brief             — morning/today/digest generado por el modelo
+#   retrieval_answer  — respuesta del LLM a una query del chat web
 #   draft / draft_wa  — drafts que el bot redactó para responder a contactos
-#   anticipate        — pushes anticipatorios generados por el modelo
-#   proactive_push    — morning briefs / archive / etc del proactive_log
 #   style / tool_routing / read_summary — extensible (no populated todavía)
 #
 # Las tablas rag_ft_panel_ratings y rag_ft_active_queue_state se crean en
@@ -22911,8 +22910,7 @@ class FineTunningRateRequest(BaseModel):
     @classmethod
     def _stream_valid(cls, v: str) -> str:
         _valid = {
-            "retrieval_answer", "brief", "draft", "draft_wa",
-            "anticipate", "proactive_push",
+            "retrieval_answer", "draft", "draft_wa",
             "style", "tool_routing", "read_summary",
         }
         if v not in _valid:
@@ -22950,91 +22948,13 @@ def fine_tunning_queue(limit: int = 20) -> dict:
         )
         clamped = max(1, min(int(limit), 50))
         with _ragvec_state_conn() as conn:
-            # ── Brief: últimos 10 con reactions negativas/mute sin rating panel ──
-            try:
-                cur = conn.execute("""
-                    SELECT bf.dedup_key,
-                           MAX(bf.ts)                                             AS last_ts,
-                           SUM(CASE WHEN bf.rating='positive' THEN 1 ELSE 0 END) AS pos,
-                           SUM(CASE WHEN bf.rating='negative' THEN 1 ELSE 0 END) AS neg,
-                           SUM(CASE WHEN bf.rating='mute'     THEN 1 ELSE 0 END) AS mute
-                    FROM rag_brief_feedback bf
-                    LEFT JOIN rag_ft_panel_ratings ftr
-                      ON ftr.stream = 'brief' AND ftr.item_id = bf.dedup_key
-                    LEFT JOIN rag_ft_active_queue_state fts
-                      ON fts.stream = 'brief' AND fts.item_id = bf.dedup_key
-                    WHERE bf.ts >= datetime('now', '-30 days')
-                      AND ftr.id IS NULL
-                      AND (fts.snoozed_until_ts IS NULL
-                           OR fts.snoozed_until_ts < datetime('now'))
-                    GROUP BY bf.dedup_key
-                    HAVING (neg + mute) >= 1 AND pos < 1
-                    ORDER BY last_ts DESC
-                    LIMIT 10
-                """)
-                for row in cur.fetchall():
-                    items.append({
-                        "item_id": row[0],
-                        "stream": "brief",
-                        "label": row[0],   # vault_relpath sirve de label
-                        "ts": row[1],
-                        "meta": {
-                            "positive": row[2],
-                            "negative": row[3],
-                            "mute": row[4],
-                        },
-                    })
-            except Exception as exc_b:
-                _silent_log("fine_tunning_queue_brief_error", str(exc_b))
-
-            # ── Anticipate: candidates pusheados sin reaction ni rating panel ──
-            # Schema real: id, ts, kind, score, dedup_key, selected, sent,
-            #              reason, message_preview  (NO tiene columna "label")
-            try:
-                cur = conn.execute("""
-                    SELECT ac.dedup_key,
-                           ac.kind,
-                           ac.message_preview,
-                           ac.score,
-                           ac.reason,
-                           ac.ts
-                    FROM rag_anticipate_candidates ac
-                    LEFT JOIN rag_anticipate_feedback af
-                      ON af.dedup_key = ac.dedup_key
-                    LEFT JOIN rag_ft_panel_ratings ftr
-                      ON ftr.stream = 'anticipate' AND ftr.item_id = ac.dedup_key
-                    LEFT JOIN rag_ft_active_queue_state fts
-                      ON fts.stream = 'anticipate' AND fts.item_id = ac.dedup_key
-                    WHERE ac.sent = 1
-                      AND ac.ts >= datetime('now', '-7 days')
-                      AND af.id IS NULL
-                      AND ftr.id IS NULL
-                      AND (fts.snoozed_until_ts IS NULL
-                           OR fts.snoozed_until_ts < datetime('now'))
-                    ORDER BY ac.ts DESC
-                    LIMIT 10
-                """)
-                for row in cur.fetchall():
-                    dedup_key, kind, preview, score, reason_trigger, ts = row
-                    items.append({
-                        "item_id": dedup_key,
-                        "stream": "anticipate",
-                        "label": preview or kind,
-                        "ts": ts,
-                        "meta": {
-                            "kind": kind,
-                            "score": score,
-                            # `reason` es el TRIGGER que disparó al modelo
-                            # (ej "event in 17min, top_score=1.07" o
-                            # "age=17d, kind=inline"). Es el "stimulus" que
-                            # decidió generar el push — el user puntúa si la
-                            # decisión del modelo fue acertada DADO ese trigger.
-                            "trigger": reason_trigger,
-                            "message_preview": preview,
-                        },
-                    })
-            except Exception as exc_a:
-                _silent_log("fine_tunning_queue_anticipate_error", str(exc_a))
+            # NOTE: streams `brief`, `anticipate`, `proactive_push` removidos el
+            # 2026-05-01 evening (post user feedback): los pushes son difíciles
+            # de puntuar (no tienen "respuesta correcta" objetiva — son una
+            # decisión del modelo de cuándo interrumpir al user) y meten ruido
+            # en el dataset de fine-tune. El panel deja sólo CONVERSACIONES
+            # REALES donde sí hay un "qué dijo el modelo dado este contexto":
+            # retrieval_answer (chat web) y draft_wa (drafts WA a contactos).
 
             # ── Retrieval ANSWER: respuestas del modelo en contexto de conversación ──
             # El user puntúa si la RESPUESTA del modelo fue útil (qué dijo, no qué
@@ -23172,65 +23092,16 @@ def fine_tunning_queue(limit: int = 20) -> dict:
             except Exception as exc_dw:
                 _silent_log("fine_tunning_queue_draft_wa_error", str(exc_dw))
 
-            # ── Proactive push: morning briefs / archive / etc sin rating panel ──
-            # Schema rag_proactive_log: id, ts, kind, sent, reason, extra_json
-            try:
-                cur = conn.execute("""
-                    SELECT p.id, p.kind, p.reason, p.extra_json, p.ts
-                    FROM rag_proactive_log p
-                    LEFT JOIN rag_ft_panel_ratings ftr
-                      ON ftr.stream = 'proactive_push'
-                      AND ftr.item_id = CAST(p.id AS TEXT)
-                    LEFT JOIN rag_ft_active_queue_state fts
-                      ON fts.stream = 'proactive_push'
-                      AND fts.item_id = CAST(p.id AS TEXT)
-                    WHERE p.ts >= datetime('now', '-7 days')
-                      AND p.sent = 1
-                      AND ftr.id IS NULL
-                      AND (fts.snoozed_until_ts IS NULL
-                           OR fts.snoozed_until_ts < datetime('now'))
-                    ORDER BY p.ts DESC
-                    LIMIT 10
-                """)
-                import json as _json_pp
-                for row in cur.fetchall():
-                    pid, kind, reason, extra_json, ts_p = row
-                    extra = {}
-                    if extra_json:
-                        try:
-                            extra = _json_pp.loads(extra_json) or {}
-                        except Exception:
-                            extra = {}
-                    # El label TIENE que mostrar el contenido real del push
-                    # para que el user pueda puntuar con sentido. Bug
-                    # observado 2026-05-01: cuando `reason` era null y no
-                    # leíamos `extra.message_preview`, terminaba como
-                    # `[anticipate-orphan_surface] anticipate-orphan_surface`
-                    # — el kind repetido. Con el preview ahora se ve algo
-                    # como "🔗 Nota nueva sin links: [[2026-04-30]] · 0 wikilinks…".
-                    preview = (extra.get("message_preview") or "").strip()
-                    if preview:
-                        label_main = preview[:200]
-                    elif reason:
-                        label_main = reason[:200]
-                    else:
-                        label_main = "(sin contenido — kind genérico, ver meta)"
-                    items.append({
-                        "item_id": str(pid),
-                        "stream": "proactive_push",
-                        "label": label_main,
-                        "ts": ts_p,
-                        "meta": {"kind": kind, "reason": reason, **extra},
-                    })
-            except Exception as exc_pp:
-                _silent_log("fine_tunning_queue_proactive_push_error", str(exc_pp))
-
-            # NOTE: stream `whatsapp_msg` (chunks WA del corpus) eliminado el
-            # 2026-05-01 evening. Razón: lo que escribió la GENTE en sus chats
-            # no es output del modelo — puntuar input humano no acelera el
-            # aprendizaje. El panel sólo expone outputs del modelo en contexto
-            # de conversación (retrieval_answer, brief, anticipate, draft_wa,
-            # proactive_push).
+            # NOTE: streams `whatsapp_msg` / `brief` / `anticipate` /
+            # `proactive_push` removidos el 2026-05-01 evening. Razón
+            # combinada: (1) los chunks WA del corpus son input humano, no
+            # output del modelo; (2) los pushes (brief / anticipate /
+            # proactive_push) no tienen una "respuesta correcta" objetiva
+            # — son decisiones de cuándo interrumpir, no qué decir — y meten
+            # ruido en el dataset de fine-tune. El panel deja sólo
+            # CONVERSACIONES REALES donde sí hay un "qué dijo el modelo dado
+            # este contexto": retrieval_answer (chat web) y draft_wa
+            # (drafts WA a contactos).
 
     except Exception as exc:
         try:

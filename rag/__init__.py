@@ -23975,7 +23975,7 @@ _COMMAND_GROUPS: list[tuple[str, list[str]]] = [
     ("Briefs & cabos sueltos", ["morning", "today", "digest", "pendientes", "followup"]),
     ("Hygiene & lifecycle", ["dead", "archive", "ignore", "maintenance"]),
     ("Analytics & quality", ["dashboard", "log", "eval", "tune", "rate", "open", "gaps", "emergent", "insights", "patterns"]),
-    ("Indexing, config & ops", ["index", "watch", "serve", "stats", "session", "setup", "vault", "state", "silence", "ambient", "weather"]),
+    ("Indexing, config & ops", ["index", "watch", "serve", "stats", "session", "setup", "stop", "vault", "state", "silence", "ambient", "weather"]),
 ]
 
 
@@ -52019,6 +52019,273 @@ def setup(remove: bool):
             f"wa-tasks,online-tune,consolidate,ingest-whatsapp,ingest-gmail,ingest-reminders}}"
             f".{{log,error.log}}[/dim]"
         )
+
+
+# ── Daemons RagNet (whatsapp-*) y deps externas (ollama / qdrant) ──────────
+#
+# Estos labels NO están en `_services_spec` (vienen del repo `whatsapp-listener`
+# y de instaladores externos), pero `rag stop` necesita poder bootoutearlos
+# para parar "todo el sistema completo". Hardcodearlos acá es el approach
+# más simple — son estables y bien conocidos. Si en el futuro algún label
+# cambia, el bootout falla con exit=3 (no encontrado) y lo reportamos como
+# "ya estaba parado", no como error.
+#
+# El detalle por tier:
+#  - rag-net  → la cara de WhatsApp del sistema (RagNet). Drafts, listener,
+#               bridge, healthcheck, vault-sync. Default ON en `rag stop`
+#               porque sin RagNet la UX del sistema queda a medias (web sí,
+#               WhatsApp no).
+#  - ollama   → runtime LLM. Compartido con mem-vault, draft generators y
+#               cualquier otro agente local. Default OFF porque pararlo
+#               rompe mem-vault.
+#  - qdrant   → vector store de mem-vault. Default OFF por la misma razón.
+_RAG_NET_LABELS: tuple[str, ...] = (
+    "com.fer.whatsapp-bridge",
+    "com.fer.whatsapp-listener",
+    "com.fer.whatsapp-listener-healthcheck",
+    "com.fer.whatsapp-vault-sync",
+)
+_OLLAMA_LABELS: tuple[str, ...] = (
+    "homebrew.mxcl.ollama",
+    "com.ollama.ollama",
+    "com.fer.ollama-env-init",
+)
+_QDRANT_LABELS: tuple[str, ...] = (
+    "com.fer.qdrant",
+)
+
+
+def _bootout_label(label: str, *, dry_run: bool = False, timeout: int = 15) -> dict:
+    """`launchctl bootout gui/$UID/<label>` con timeout + manejo de exit codes.
+
+    Devuelve {"ok": bool, "exit_code": int, "stderr": str, "skipped": bool}.
+
+    Códigos tratados como "OK" (no error, ya estaba parado o no existía):
+        exit=3   → service not loaded (ya bootouted)
+        exit=113 → "Could not find service" (mismo escenario)
+    """
+    import subprocess
+    if dry_run:
+        return {"ok": True, "exit_code": 0, "stderr": "", "skipped": True}
+    uid = os.getuid()
+    try:
+        proc = subprocess.run(
+            ["launchctl", "bootout", f"gui/{uid}/{label}"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        rc = proc.returncode
+        stderr = (proc.stderr or "").strip()
+        # 0 = bootouted; 3 / 113 = ya estaba parado (no es error real).
+        ok = rc in (0, 3, 113)
+        return {"ok": ok, "exit_code": rc, "stderr": stderr, "skipped": False}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "exit_code": 124, "stderr": f"timeout {timeout}s", "skipped": False}
+    except OSError as exc:
+        return {"ok": False, "exit_code": -1, "stderr": f"OSError: {exc}", "skipped": False}
+
+
+@cli.command()
+@click.option(
+    "--with-rag-net/--without-rag-net", default=True,
+    help="Incluir daemons de RagNet/WhatsApp (whatsapp-bridge/listener/"
+         "healthcheck/vault-sync). Default: sí.",
+)
+@click.option(
+    "--with-ollama", is_flag=True, default=False,
+    help="Detener también ollama (homebrew.mxcl.ollama + com.ollama.ollama + "
+         "ollama-env-init). Default OFF: ollama es compartido con mem-vault y "
+         "otros agentes locales — pararlo rompe esos flujos.",
+)
+@click.option(
+    "--with-qdrant", is_flag=True, default=False,
+    help="Detener también qdrant (com.fer.qdrant). Default OFF: compartido "
+         "con mem-vault.",
+)
+@click.option(
+    "--all", "stop_all", is_flag=True, default=False,
+    help="Atajo para --with-ollama + --with-qdrant + --with-rag-net.",
+)
+@click.option(
+    "--yes", "-y", is_flag=True, help="No pedir confirmación.",
+)
+@click.option(
+    "--dry-run", is_flag=True, help="Mostrar qué pararía pero no ejecutar.",
+)
+def stop(
+    with_rag_net: bool,
+    with_ollama: bool,
+    with_qdrant: bool,
+    stop_all: bool,
+    yes: bool,
+    dry_run: bool,
+) -> None:
+    """Parar TODO el sistema: daemons obsidian-rag-*, RagNet, web server.
+
+    Orden importante para evitar loops de auto-restart:
+
+    1. Primero `daemon-watchdog` y `wake-hook` (los que re-bootstrappean
+       a otros cada 5 min / post-wake). Si los pararamos al final, ellos
+       ya rebootstrappearon a los anteriores.
+    2. Después el resto de daemons managed (`_services_spec`) y manual
+       (cloudflare-tunnel, lgbm-train, etc).
+    3. Opcional: RagNet (whatsapp-*) si `--with-rag-net` (default ON).
+    4. Opcional: ollama / qdrant si `--with-ollama` / `--with-qdrant`
+       (default OFF — son compartidos con mem-vault).
+
+    Para volver a levantar todo: `rag setup` re-bootstrappea los managed.
+    Los plists quedan en disco — bootout solo unloadea de launchd. Los
+    deps externos (whatsapp-listener / ollama / qdrant) los volvés a
+    arrancar con su propio `launchctl bootstrap` o desde su repo origen.
+
+    NOTA: macOS auto-loadea los `~/Library/LaunchAgents/*.plist` al
+    próximo login del usuario. Para parada permanente, usar `rag setup
+    --remove` (borra los plists del disco).
+    """
+    if stop_all:
+        with_ollama = True
+        with_qdrant = True
+        with_rag_net = True
+
+    # ── Construir la lista ordenada de labels a bootoutear ──────────────
+    # 1. Watchdog + wake-hook PRIMERO (para que no rebootstrap-een lo demás)
+    PRIORITY_FIRST = (
+        "com.fer.obsidian-rag-daemon-watchdog",
+        "com.fer.obsidian-rag-wake-hook",
+    )
+
+    # 2. Resto del set obsidian-rag (managed + manual_keep)
+    all_obsidian_rag = [lbl for lbl, _cat in _all_daemon_labels()]
+    rest_obsidian_rag = [lbl for lbl in all_obsidian_rag if lbl not in PRIORITY_FIRST]
+    # Ordenar para output reproducible (priority first nunca cambia de posición)
+    rest_obsidian_rag.sort()
+
+    targets: list[tuple[str, str]] = []  # (label, category)
+    for lbl in PRIORITY_FIRST:
+        if lbl in all_obsidian_rag:
+            targets.append((lbl, "watchdog"))
+    targets.extend((lbl, "obsidian-rag") for lbl in rest_obsidian_rag)
+    if with_rag_net:
+        targets.extend((lbl, "rag-net") for lbl in _RAG_NET_LABELS)
+    if with_qdrant:
+        targets.extend((lbl, "qdrant") for lbl in _QDRANT_LABELS)
+    if with_ollama:
+        targets.extend((lbl, "ollama") for lbl in _OLLAMA_LABELS)
+
+    if not targets:
+        console.print("[yellow]No hay nada que parar.[/yellow]")
+        return
+
+    # ── Confirmación ─────────────────────────────────────────────────────
+    n_total = len(targets)
+    n_watchdog = sum(1 for _, c in targets if c == "watchdog")
+    n_obsidian = sum(1 for _, c in targets if c == "obsidian-rag")
+    n_ragnet = sum(1 for _, c in targets if c == "rag-net")
+    n_ollama = sum(1 for _, c in targets if c == "ollama")
+    n_qdrant = sum(1 for _, c in targets if c == "qdrant")
+
+    console.print()
+    console.print(f"[bold]rag stop[/bold] — voy a parar [cyan]{n_total}[/cyan] daemons:")
+    console.print(f"  [dim]·[/dim] watchdog/wake-hook : {n_watchdog}")
+    console.print(f"  [dim]·[/dim] obsidian-rag-*     : {n_obsidian}")
+    if with_rag_net:
+        console.print(f"  [dim]·[/dim] RagNet (whatsapp-*): {n_ragnet}")
+    else:
+        console.print("  [dim]·[/dim] RagNet (whatsapp-*): [yellow]skip[/yellow] (--without-rag-net)")
+    if with_qdrant:
+        console.print(f"  [dim]·[/dim] qdrant             : {n_qdrant}")
+    else:
+        console.print("  [dim]·[/dim] qdrant             : [yellow]skip[/yellow] (default — compartido con mem-vault)")
+    if with_ollama:
+        console.print(f"  [dim]·[/dim] ollama             : {n_ollama}")
+    else:
+        console.print("  [dim]·[/dim] ollama             : [yellow]skip[/yellow] (default — compartido con mem-vault)")
+    console.print()
+
+    if dry_run:
+        console.print("[dim]Dry-run — no ejecuto nada.[/dim]")
+        for lbl, cat in targets:
+            console.print(f"  [dim]would-bootout[/dim] [{cat}] {lbl}")
+        return
+
+    if not yes:
+        if not click.confirm("¿Seguir?", default=False):
+            console.print("[yellow]Cancelado.[/yellow]")
+            return
+
+    # ── Ejecución ────────────────────────────────────────────────────────
+    ok_count = 0
+    already_count = 0  # ya estaba parado (exit 3 / 113)
+    fail_count = 0
+
+    for label, category in targets:
+        slug = (
+            label.replace("com.fer.obsidian-rag-", "")
+            if category in ("watchdog", "obsidian-rag")
+            else label
+        )
+        result = _bootout_label(label)
+
+        # Distinguir "bootouted ahora" (rc=0) vs "ya estaba parado" (rc=3/113).
+        if result["ok"] and result["exit_code"] == 0:
+            console.print(f"[green]✓[/green] [{category}] {slug}")
+            ok_count += 1
+            _log_daemon_run_event(
+                label=label, action="bootout",
+                exit_code=0, reason="rag stop",
+            )
+        elif result["ok"]:
+            console.print(f"[dim]·[/dim] [{category}] {slug} [dim](ya estaba parado)[/dim]")
+            already_count += 1
+        else:
+            stderr_hint = result["stderr"][:120] if result["stderr"] else ""
+            console.print(
+                f"[red]✗[/red] [{category}] {slug} → exit={result['exit_code']}"
+                + (f" — {stderr_hint}" if stderr_hint else "")
+            )
+            fail_count += 1
+            _log_daemon_run_event(
+                label=label, action="bootout",
+                exit_code=result["exit_code"], reason="rag stop (failed)",
+            )
+
+    # ── Summary ──────────────────────────────────────────────────────────
+    console.print()
+    if fail_count == 0:
+        console.print(
+            f"[green]✓[/green] sistema detenido — "
+            f"{ok_count} parados, {already_count} ya estaban"
+        )
+    else:
+        console.print(
+            f"[yellow]parados {ok_count}, ya estaban {already_count}, "
+            f"[red]{fail_count} fallidos[/red][/yellow]"
+        )
+    console.print()
+    console.print("[dim]Para volver a arrancar:[/dim]")
+    console.print("  [dim]·[/dim] obsidian-rag : [cyan]rag setup[/cyan]")
+    if with_rag_net:
+        console.print(
+            "  [dim]·[/dim] RagNet       : "
+            "[cyan]launchctl bootstrap gui/$(id -u) "
+            "~/Library/LaunchAgents/com.fer.whatsapp-listener.plist[/cyan] "
+            "(idem bridge / healthcheck / vault-sync)"
+        )
+    if with_qdrant:
+        console.print(
+            "  [dim]·[/dim] qdrant       : "
+            "[cyan]launchctl bootstrap gui/$(id -u) "
+            "~/Library/LaunchAgents/com.fer.qdrant.plist[/cyan]"
+        )
+    if with_ollama:
+        console.print(
+            "  [dim]·[/dim] ollama       : "
+            "[cyan]brew services start ollama[/cyan] "
+            "(o `launchctl bootstrap` del plist correspondiente)"
+        )
+    console.print(
+        "[dim](Plists quedan en disco; macOS los re-loadea solo al próximo "
+        "login. Para borrarlos: `rag setup --remove`.)[/dim]"
+    )
 
 
 @cli.group()

@@ -941,6 +941,11 @@ rag contact-note NOMBRE OBSERVACION [--category X --source-kind X]  # anota info
 
 # Automation
 rag setup [--remove]                       # install/remove 31 launchd services (anticipate incluido 2026-04-24)
+rag stop [--all] [--with-rag-net/--without-rag-net] [--with-ollama] [--with-qdrant] [-y] [--dry-run]
+                                            # parar todo el sistema: daemons obsidian-rag-* + RagNet (default).
+                                            # ollama/qdrant default OFF (compartidos con mem-vault).
+                                            # bootouta watchdog/wake-hook PRIMERO para evitar auto-restart.
+                                            # plists quedan en disco — `rag setup` los vuelve a levantar.
 
 # Tests
 .venv/bin/python -m pytest tests/ -q

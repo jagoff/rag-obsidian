@@ -181,10 +181,16 @@ def test_load_prompt_synthesis_v2_includes_rules():
 
 def test_load_prompt_latest_is_highest_version():
     """`version=latest` devuelve la versión mayor en disco. Para
-    synthesis debería ser v2 (el que agregamos hoy)."""
+    synthesis debería ser v3 desde 2026-05-03 (refactor de tono).
+
+    Cuando se agregue v4, este test va a fallar — actualizar al pin
+    nuevo. NO usar `_latest_version_for(synthesis)` para evitar tautología:
+    queremos verificar que `latest` resuelve al disco real, no que dos
+    funciones coinciden entre sí.
+    """
     latest = rag.load_prompt("synthesis", version="latest")
-    v2 = rag.load_prompt("synthesis", version="v2")
-    assert latest == v2
+    v3 = rag.load_prompt("synthesis", version="v3")
+    assert latest == v3
 
 
 def test_load_prompt_explicit_v1_returns_pre_refusal():
@@ -231,9 +237,13 @@ def test_prompt_version_for_returns_name_dot_version():
 
 
 def test_prompt_version_for_resolves_latest():
-    """El valor loggeado debe ser la versión concreta, no "latest"."""
+    """El valor loggeado debe ser la versión concreta, no "latest".
+
+    2026-05-03: synthesis bumpó a v3 con el refactor de tono. Cuando salga
+    v4 hay que actualizar el pin acá.
+    """
     got = rag.prompt_version_for("synthesis", "latest")
-    assert got == "synthesis.v2"
+    assert got == "synthesis.v3"
     assert "latest" not in got
 
 

@@ -60,9 +60,33 @@ def test_synthesis_prompt_still_requires_2plus_sources():
         "SYNTHESIS prompt must still require 2+ sources for valid synthesis"
 
 
-def test_synthesis_prompt_forbids_external_knowledge():
-    """Rule 1 no debe debilitarse — sin conocimiento externo."""
-    assert "Sin parafraseos, intros ni conocimiento externo" in rag.SYSTEM_RULES_SYNTHESIS
+def test_synthesis_prompt_permits_external_markers_with_required_envelope():
+    """Refactor de tono 2026-05-03: el prompt deja de prohibir 'conocimiento
+    externo' a secas y pasa a PERMITIRLO si está envuelto en
+    `<<ext>>...<</ext>>`. La invariante crítica preservada: los HECHOS
+    PUNTUALES del vault siguen viniendo del CONTEXTO — solo el tejido
+    narrativo (intros, conectores, marco general) puede venir del modelo,
+    siempre marcado.
+
+    Pre-fix v2 prohibía 'parafraseos, intros ni conocimiento externo' a
+    secas — eso producía respuestas correctas pero secas (user feedback
+    "respuesta seca, incongruente con el storytelling"). v3 invierte: el
+    marco externo es alentado, pero solo dentro del envelope `<<ext>>`.
+
+    Tests gatean ambos lados del nuevo contrato:
+      (a) el envelope `<<ext>>` se menciona explícitamente en el prompt,
+      (b) la regla de hechos del CONTEXTO sigue presente.
+    """
+    prompt = rag.SYSTEM_RULES_SYNTHESIS
+    assert "<<ext>>" in prompt, (
+        "v3 debe mencionar el envelope `<<ext>>` que delimita marco externo "
+        "vs hechos del vault. Si se removió, el modelo va a mezclar ambos."
+    )
+    # Los hechos siguen viniendo del CONTEXTO — solo el tejido es libre.
+    assert "CONTEXTO" in prompt, (
+        "El prompt debe seguir anclando los HECHOS al CONTEXTO; el cambio "
+        "de tono no aplica a los datos puntuales."
+    )
 
 
 # ── COMPARISON refusal ───────────────────────────────────────────────────────
@@ -86,14 +110,40 @@ def test_comparison_prompt_no_longer_permits_single_source_response():
         f"COMPARISON prompt still contains the hallucination-enabling phrase: {forbidden!r}"
 
 
-def test_comparison_prompt_keeps_structure_directive():
-    """Cuando hay ≥2 fuentes, el prompt debe seguir pidiendo el formato
-    '[Fuente A] dice X / [Fuente B] dice Y / Diferencia clave: …'."""
-    assert "Diferencia clave" in rag.SYSTEM_RULES_COMPARISON
+def test_comparison_prompt_keeps_structure_directive_as_fallback():
+    """La estructura formal '[A] dice X / [B] dice Y / Diferencia clave: ...'
+    sigue presente en v3 — pero como FALLBACK para temas técnicos, no como
+    directiva forzada para toda comparación. Para temas humanos / reflexivos
+    el prompt habilita prosa narrativa.
+
+    Test gatea solo que la frase canonical 'Diferencia clave' siga
+    apareciendo (los call sites + telemetría buscan esa cadena para
+    detectar comparaciones bien formadas).
+    """
+    assert "Diferencia clave" in rag.SYSTEM_RULES_COMPARISON, (
+        "La frase 'Diferencia clave' debe seguir apareciendo en el prompt "
+        "(aunque sea como ejemplo del fallback). Telemetría downstream la usa "
+        "para detectar comparaciones bien formadas."
+    )
 
 
-def test_comparison_prompt_forbids_external_knowledge():
-    assert "Sin parafraseos, intros ni conocimiento externo" in rag.SYSTEM_RULES_COMPARISON
+def test_comparison_prompt_permits_external_markers_with_required_envelope():
+    """Mismo cambio que synthesis.v3: marco externo PERMITIDO si está
+    dentro de `<<ext>>...<</ext>>`. Hechos puntuales sobre cada lado de la
+    comparación siguen anclados al CONTEXTO.
+    """
+    prompt = rag.SYSTEM_RULES_COMPARISON
+    assert "<<ext>>" in prompt
+    assert "CONTEXTO" in prompt
+    # Invariante específica de comparison: NO inventar el lado faltante
+    # desde conocimiento general (la principal hallucination que el refusal
+    # intentaba cerrar — sigue prohibida).
+    assert "NUNCA inventes el lado faltante" in prompt or \
+           "NUNCA inventar el lado faltante" in prompt, (
+        "v3 debe seguir prohibiendo explícitamente inventar el lado "
+        "faltante de la comparación desde conocimiento general — esa es "
+        "la hallucination raíz que el refusal del 2026-04-22 cerró."
+    )
 
 
 # ── Cross-check: LOOKUP baseline not regressed ───────────────────────────────

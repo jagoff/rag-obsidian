@@ -18305,14 +18305,24 @@ _NAME_PRESERVATION_RULE = _load_rule_body("name_preservation.v1")
 # que hacen `SYSTEM_RULES_STRICT` directo siguen funcionando sin tocarse.
 # Para canary rollout con un env var (`RAG_PROMPT_SYNTHESIS_VERSION=v1`) usar
 # `system_prompt_for_intent()` que resuelve la version on-demand cada vez.
-SYSTEM_RULES = load_prompt("system_rules", version="v1")
-SYSTEM_RULES_STRICT = load_prompt("strict", version="v1")
-SYSTEM_RULES_CHAT = load_prompt("chat", version="v1")
-SYSTEM_RULES_WEB = load_prompt("web", version="v1")
-SYSTEM_RULES_LOOKUP = load_prompt("lookup", version="v1")
-SYSTEM_RULES_SYNTHESIS = load_prompt("synthesis", version="latest")  # v2 default
-SYSTEM_RULES_COMPARISON = load_prompt("comparison", version="latest")  # v2 default
-_SERVE_CHAT_SYSTEM = load_prompt("serve_meta", version="v1")
+#
+# 2026-05-03: las constantes pasan de `v1` hardcoded a `latest`. Motivación:
+# el refactor de tono (system_rules.v2, chat.v2, web.v2, synthesis.v3,
+# comparison.v3 — cambio "respuesta seca → mix conversacional/narrativo
+# con libertad para LLM") quedaba inactivo en los call sites legacy si las
+# constantes seguían pegadas a v1. Con `latest` cada bump nuevo se activa
+# automáticamente al próximo import + el rollback `RAG_PROMPT_<NAME>_VERSION=v1`
+# sigue disponible (resuelto al import time para constantes; runtime para
+# `system_prompt_for_intent()`). Strict y lookup no tienen v2 en disco así
+# que `latest` resuelve a v1 igual — no cambia nada.
+SYSTEM_RULES = load_prompt("system_rules", version="latest")  # v2 default (2026-05-03)
+SYSTEM_RULES_STRICT = load_prompt("strict", version="latest")  # v1 default (sin v2 en disco)
+SYSTEM_RULES_CHAT = load_prompt("chat", version="latest")  # v2 default (2026-05-03)
+SYSTEM_RULES_WEB = load_prompt("web", version="latest")  # v2 default (2026-05-03)
+SYSTEM_RULES_LOOKUP = load_prompt("lookup", version="latest")  # v1 default (sin v2 en disco)
+SYSTEM_RULES_SYNTHESIS = load_prompt("synthesis", version="latest")  # v3 default (2026-05-03)
+SYSTEM_RULES_COMPARISON = load_prompt("comparison", version="latest")  # v3 default (2026-05-03)
+_SERVE_CHAT_SYSTEM = load_prompt("serve_meta", version="latest")  # v1 default (sin v2 en disco)
 
 
 def _prompt_name_for_intent(intent: str | None, loose: bool) -> str:

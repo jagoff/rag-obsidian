@@ -10009,6 +10009,86 @@ _CHAT_PREWARM_INTERVAL = int(os.environ.get("OBSIDIAN_RAG_CHAT_PREWARM_INTERVAL"
 _CHAT_PREWARMER_STARTED = False
 
 
+def _chat_prewarm_targets() -> list[tuple[str, int]]:
+    """Resolver the (model, num_ctx) pairs that the prewarm cycle has to pin.
+
+    Pin BOTH the main chat model AND the fast-path/lookup model.
+
+    Why both: el modelo del fast-path (`_LOOKUP_MODEL`, default qwen2.5:3b)
+    lo comparten dos call sites con `num_ctx` distinto:
+
+      - helpers (paraphrases, HyDE, intent, NLI) → `HELPER_OPTIONS` con
+        `num_ctx=1024` (rag/__init__.py:2698-2702).
+      - chat fast-path → `_LOOKUP_NUM_CTX=4096` (rag/__init__.py:258).
+
+    Si un helper corre primero deja el modelo cargado con
+    `context_length=1024`. Cuando llega un chat fast-path con `num_ctx=4096`
+    ollama tiene que reinicializar la KV cache — en MPS bajo memory pressure
+    ese reinit puede tomar 60-120s y dispara
+    `phase=synthesis exc=timed out ttft_ms=90005` con
+    `got_first_token=False`. Bug observado 2026-05-03 (web.log line 46072).
+    El propio `CHAT_OPTIONS` (rag/__init__.py:2687-2691) ya advierte el
+    mismatch para el modelo principal — esta función extiende la misma
+    protección al lookup model.
+
+    Pre-pinear con `num_ctx=_LOOKUP_NUM_CTX` (=4096) fuerza al modelo a
+    quedar cargado con `context_length=4096` desde el boot, matcheando el
+    fast-path. Los helpers con `num_ctx=1024` hacen un reinit a ctx menor
+    (downgrade), órdenes más rápido que el upgrade que disparó el timeout.
+
+    Costo: +~2.2GB VRAM pinneada (qwen2.5:3b Q4_K_M). Total con qwen2.5:7b
+    + bge-m3 + reranker queda ≈10GB resident — safe en 36GB unified memory
+    con command-r NOT también resident.
+
+    Dedup si el operador setea `OBSIDIAN_RAG_WEB_CHAT_MODEL` al mismo
+    valor que `_LOOKUP_MODEL` — evita doble ping al mismo (modelo, num_ctx)
+    por ciclo.
+    """
+    main_model = _resolve_web_chat_model()
+    targets: list[tuple[str, int]] = [(main_model, _WEB_CHAT_NUM_CTX)]
+    if _LOOKUP_MODEL != main_model:
+        targets.append((_LOOKUP_MODEL, _LOOKUP_NUM_CTX))
+    return targets
+
+
+def _run_chat_prewarm_cycle() -> None:
+    """Run one prewarm cycle: ping every (model, num_ctx) pair from
+    `_chat_prewarm_targets()` with `num_predict=1`.
+
+    Per-model failures are caught & logged but never propagated — el otro
+    modelo del par se sigue intentando, y el thread loop sigue vivo.
+
+    Tiny ping — 1 token is enough to re-pin KV cache + model weights.
+    `keep_alive` se resuelve via `chat_keep_alive(model)`: -1 (forever)
+    para modelos chicos, "20m" para grandes (guard 2026-04-21 post Mac-
+    freeze regression). El prewarm interval (~240s) queda por debajo del
+    clamp de 20m, así que modelos grandes siguen warm entre pings sin
+    pinearse wired forever.
+
+    Uses the bounded streaming client so a stuck-load daemon can't wedge
+    this thread forever and mask the next real request.
+    """
+    for model, num_ctx in _chat_prewarm_targets():
+        try:
+            _OLLAMA_STREAM_CLIENT.chat(
+                model=model,
+                messages=[
+                    {"role": "system", "content": _WEB_SYSTEM_PROMPT},
+                    {"role": "user", "content": "."},
+                ],
+                options={"num_predict": 1, "num_ctx": num_ctx,
+                         "temperature": 0, "seed": 42},
+                stream=False,
+                think=False,   # match the probe + main chat path
+                keep_alive=chat_keep_alive(model),
+            )
+            print(f"[chat-prewarm] {model} pinned (num_ctx={num_ctx})", flush=True)
+        except Exception as exc:
+            # Silent fail per-model: ollama down, model not loaded, network
+            # blip. Next cycle retries. Never crash the daemon thread.
+            print(f"[chat-prewarm] skipped {model}: {exc}", flush=True)
+
+
 def _ensure_chat_model_prewarmer() -> None:
     """Start the chat-model prewarm loop once. Idempotent."""
     global _CHAT_PREWARMER_STARTED
@@ -10022,36 +10102,15 @@ def _ensure_chat_model_prewarmer() -> None:
         # Subsequent cycles run every _CHAT_PREWARM_INTERVAL.
         time.sleep(15)
         while True:
+            if _CHAT_INFLIGHT > 0:
+                time.sleep(15)
+                continue
             try:
-                if _CHAT_INFLIGHT > 0:
-                    time.sleep(15)
-                    continue
-                model = _resolve_web_chat_model()
-                # Tiny ping — 1 token is enough to re-pin KV cache + model weights.
-                # keep_alive se resuelve via chat_keep_alive(model): -1 (forever)
-                # para modelos chicos, "20m" para grandes (guard 2026-04-21 post
-                # Mac-freeze regression). El prewarm interval (~240s) queda por
-                # debajo del clamp de 20m, así que modelos grandes siguen warm
-                # entre pings sin pinearse wired forever.
-                # Uses the bounded streaming client so a stuck-load daemon can't
-                # wedge this thread forever and mask the next real request.
-                _OLLAMA_STREAM_CLIENT.chat(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": _WEB_SYSTEM_PROMPT},
-                        {"role": "user", "content": "."},
-                    ],
-                    options={"num_predict": 1, "num_ctx": _WEB_CHAT_NUM_CTX,
-                             "temperature": 0, "seed": 42},
-                    stream=False,
-                    think=False,   # match the probe + main chat path
-                    keep_alive=chat_keep_alive(model),
-                )
-                print(f"[chat-prewarm] {model} pinned", flush=True)
+                _run_chat_prewarm_cycle()
             except Exception as exc:
-                # Silent fail: ollama down, model not loaded, network blip.
-                # Next cycle retries. Never crash the daemon thread.
-                print(f"[chat-prewarm] skipped: {exc}", flush=True)
+                # Outer guard: cualquier excepción no-cubierta del cycle entero
+                # (ej. _resolve_web_chat_model fallando) no debe matar el thread.
+                print(f"[chat-prewarm] cycle skipped: {exc}", flush=True)
             time.sleep(_CHAT_PREWARM_INTERVAL)
 
     threading.Thread(target=loop, name="chat-model-prewarmer", daemon=True).start()

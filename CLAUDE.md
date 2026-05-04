@@ -1714,6 +1714,52 @@ Detecta comandos tipo "recordame llamar a Juan mañana 9am" en el textarea del c
 
 **Tests**: [`tests/test_chat_remind_inline.py`](tests/test_chat_remind_inline.py) — 10 casos cubriendo el detector standalone (happy / ambiguo / sin-trigger / empty / question-with-temporal-word) + el wire-up end-to-end (`/api/chat` emite `created` SSE event con shape correcto, `_create_reminder` se llama con args parseados, queries normales NO disparan).
 
+## Query decomposition + RRF fusion (2026-05-04, prototype, default OFF)
+
+Módulo nuevo [`rag/query_decompose.py`](rag/query_decompose.py): cuando `RAG_QUERY_DECOMPOSE=1`, `retrieve()` detecta queries multi-aspecto ("compará X vs Y", "tanto X como Y", "diferencia entre P y Q"), descompone en N sub-queries y ejecuta los retrieves en paralelo. Resultados se fusionan con [Reciprocal Rank Fusion](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf) (k=60, formula `score(d) = Σ 1/(k + rank_i(d))`). Apunta específicamente a la métrica más débil del eval: chains `chain_success`.
+
+**Detector híbrido** (regex + LLM fallback):
+  - **Regex** (sin costo LLM, ~70% de casos obvios): patterns para `X vs Y`, `compará X con Y`, `diferencia entre P y Q`, `tanto X como Y`, `X y también Y`, `X así como Y`, `qué tengo sobre X y Y`. Detecta + extrae los aspectos en una sola pasada.
+  - **LLM fallback** (qwen2.5:3b vía `_helper_client`, deterministic via `HELPER_OPTIONS`): cuando el regex no matchea, una llamada JSON-only `{"is_multi_aspect": bool, "sub_queries": [...]}`. Silent-fail en timeout / parse-error → tratar como single-aspect.
+  - Cache LRU 256 entries (positive + negative), thread-safe. Cleared con `clear_cache()`.
+
+**Pre-gates** (`should_consider_decomposition`):
+  - Token floor: `<6 tokens` → no descomponer (singles-fact típicos), salvo que regex explícita matchee (bypass).
+  - Single-fact: `cuándo / dónde / qué hora / cuánto / quién` interrogativos cortos.
+  - Conjunción dentro de nombre propio compuesto: heurística para "Juan y María".
+  - Scope explícito (`folder` / `tag` / `path`): la decomposition no aporta valor.
+
+**Wire-up** ([`rag/__init__.py`](rag/__init__.py) `retrieve()`):
+  - Insertado después del paso 2 (auto-filter), antes del paso 3 (multi-query expansion).
+  - Sólo activa cuando `history is None` y `variants is None` — multi-turn caller decide su propia descomposición.
+  - Las N sub-retrieves corren con `concurrent.futures.ThreadPoolExecutor(max_workers=min(N, RAG_QUERY_DECOMPOSE_MAX_WORKERS=3))`. Cada worker hace `os.environ.pop("RAG_QUERY_DECOMPOSE")` antes de la llamada recursiva (evita recursión infinita).
+  - RRF fuse sobre la unión de paths devueltos por cada sub-retrieve (k=60, top_k=k del caller). Tiebreak determinístico por path lex.
+  - Telemetría: `extra_json.decomposed`, `n_sub_queries`, `decompose_ms` (a `to_log_event` desde `rr.timing` + `rr.filters_applied`).
+
+**Default OFF** (env var no seteada): retrieve hot-path tiene 0% overhead — single `os.environ.get` check al inicio del bloque. Cuando ON, regex + cache lookup ~10µs en miss; LLM fallback ~500ms-1s por query con regex-miss.
+
+**Env vars**:
+  - `RAG_QUERY_DECOMPOSE=1` — activa el feature.
+  - `RAG_QUERY_DECOMPOSE_LLM_FALLBACK=0` — limita a regex-only (no LLM fallback).
+  - `RAG_QUERY_DECOMPOSE_MAX_WORKERS=3` — cap del threadpool.
+
+**Tests**: [`tests/test_query_decompose.py`](tests/test_query_decompose.py) — 66 casos: regex match per pattern, LLM fallback con JSON malformado / excepción / `is_multi_aspect=false`, cache hit/eviction, RRF formula + tiebreak determinístico, pre-gates por scope, integration end-to-end con `retrieve()` mockeado.
+
+**Eval impact** (medido 2026-05-04, queries.yaml current set, n=54 singles / 9 chains, baseline post-vault-reorg):
+  - **Cero efecto en queries normales**: el detector salta tempranamente vía pre-gate (singles típicos son <6 tokens y/o single-fact interrogatives). Resultados bit-idénticos a flag-OFF en singles set.
+  - **Sub-set de queries multi-aspecto**: las chains de queries.yaml NO usan patrones decomposition-friendly (mayoría son follow-ups con pronombre tipo "y la otra", "y los acordes"). Por construcción del prototype el feature no se dispara en chains existentes — es una capa para queries adicionales que el user pueda escribir tipo "compará X con Y".
+  - **Regla pragmática**: feature ON queda como infra disponible, NO promovido a default hasta que (a) tengamos chains golden con patrón multi-aspecto (TODO: extender `queries.yaml`), o (b) se observe lift en producción real.
+
+**Cuándo NO descompone** (gates duros):
+  - Query corta (<6 tokens) sin regex match.
+  - Filtro path/folder/tag explícito → la fusion no aporta sobre un scope ya estrecho.
+  - History-aware retrieve (multi-turn): el caller decide.
+  - Single-fact interrogativos.
+
+**Sub-retrieve workers**: cada uno corre `auto_filter=False`, `multi_query=True` (paráfrasis del expand_queries habituales), `precise=False`, `hyde=False`. La intención es que cada sub-aspecto se beneficie del recall normal pero NO re-trigger decomposition (env pop scoped al worker).
+
+**Fall-through robusto**: si todas las sub-retrieves devuelven 0 candidates, o cualquier excepción rompe el bloque, caemos al pipeline normal con la query original — silent-log a `_silent_log("query_decompose.outer", exc)` para diagnóstico sin tumbar el retrieve.
+
 ## Wave-8 gotchas — pipeline de filtros + carry-over (2026-04-28)
 
 Tres patrones que se mordieron durante la wave-8 de la eval Playwright. Documentados acá porque cualquiera de los tres puede repetirse silenciosamente y costar una sesión entera de debug.

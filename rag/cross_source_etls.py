@@ -558,7 +558,6 @@ def _parse_credit_card_xlsx(path: Path) -> dict | None:
     n = len(rows)
     i = 0
     in_purchases_block = False
-    in_payments_block = False
     while i < n:
         row = rows[i]
         text = _row_text(row).lower()
@@ -632,21 +631,17 @@ def _parse_credit_card_xlsx(path: Path) -> dict | None:
         # Bloques de movimientos: "Pago de tarjeta y devoluciones" (skipear) /
         # "Tarjeta de <holder>" (capturar movimientos hasta "Total de ...")
         if "pago de tarjeta y devoluciones" in text:
-            in_payments_block = True
             in_purchases_block = False
         elif text.startswith("tarjeta de ") and "terminada en" in text:
             in_purchases_block = True
-            in_payments_block = False
             if holder is None:
                 m = re.search(r"tarjeta de (.+?)\s*-", text, re.IGNORECASE)
                 if m:
                     holder = m.group(1).strip().title()
         elif text.startswith("total de ") and ("terminada en" in text or "tarjeta" in text):
             in_purchases_block = False
-            in_payments_block = False
         elif text.startswith("otros conceptos"):
             in_purchases_block = False
-            in_payments_block = False
         elif in_purchases_block and len(row) >= 5:
             # Fila de movimiento: (fecha, descripción, cuotas, comprobante, ARS, USD)
             desc = (str(row[1]).strip() if row[1] else "").strip()
@@ -1070,7 +1065,6 @@ def _sync_reminders_notes(vault_root: Path) -> dict:
         return {"ok": False, "reason": "apple_disabled"}
     now = datetime.now()
     pending = _fetch_reminders_due(now, horizon_days=180, max_items=500)
-    completed: list[dict] = []  # see docstring
     if not pending:
         return {"ok": True, "files_written": 0, "reason": "no_data"}
 

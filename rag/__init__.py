@@ -17639,7 +17639,7 @@ def _personalized_pagerank(
     nodes = list(adj.keys())
     if not nodes:
         return {}
-    n = len(nodes)
+    len(nodes)
     # Filter seed set to known nodes; drop unknowns silently.
     if isinstance(seed_paths, (list, tuple)):
         seed_set = {p for p in seed_paths if p in adj}
@@ -22178,7 +22178,6 @@ def collect_ranker_features(
         return []
 
     # Filters identical to retrieve()'s default path.
-    filters_applied: dict = {}
     search_query = question
     folder: str | None = None
     tag: str | None = None
@@ -38963,9 +38962,9 @@ def _append_to_daily_note(
     date_header = f"## {when.strftime('%Y-%m-%d')}"
     time_label = when.strftime("%H:%M")
     try:
-        rel = note_path.relative_to(VAULT_PATH)
+        note_path.relative_to(VAULT_PATH)
     except ValueError:
-        rel = note_path
+        pass
     stem = note_path.stem
     entry = f"- [{time_label}] [[{stem}|{title}]] → `{folder}/`"
 
@@ -57426,7 +57425,7 @@ def _train_paraphrases_from_feedback(
                 f"  AND q.variants_json IS NOT NULL "
                 f"  AND q.variants_json != '' "
             ).fetchall()
-    except Exception as exc:
+    except Exception:
         stats["errors"] += 1
         return stats
     for q, variants_json in rows:
@@ -57590,7 +57589,7 @@ def _health_corpus_snapshot() -> dict:
         out["error"] = repr(exc)
     # Per-source breakdown from a cheap SQL query.
     try:
-        with _ragvec_state_conn() as conn:
+        with _ragvec_state_conn():
             # rag_queries doesn't have source — we infer from paths_json.
             # Prefer using the collection's meta if available.
             pass

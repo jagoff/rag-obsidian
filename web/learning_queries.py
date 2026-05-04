@@ -1628,7 +1628,7 @@ def _whisper_logprob_over_time(days: int) -> dict:
     dates = _date_range(days)
 
     def _do() -> dict:
-        per_day = {d: {"sum": 0.0, "n": 0} for d in dates}
+        {d: {"sum": 0.0, "n": 0} for d in dates}
         with _ragvec_state_conn() as conn:
             rows = conn.execute(
                 "SELECT DATE(transcribed_at, 'unixepoch') AS d, "
@@ -2207,7 +2207,6 @@ def _health_vault_freshness() -> dict:
     activo). Tomamos el MÁS reciente — si hay queries pero no filings, el
     vault sigue activo aunque el indexer no haya tenido nada que archivar."""
     from rag import _ragvec_state_conn, _sql_read_with_retry
-    import time as _time
 
     def _do() -> dict:
         with _ragvec_state_conn() as conn:

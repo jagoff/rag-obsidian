@@ -1006,7 +1006,7 @@ def verify_answer_nli(
         import numpy as np
 
         # Construir todos los pares (sentence, chunk) para batch inference
-        n_sentences = len(sentences)
+        len(sentences)
         n_chunks = len(chunks)
         pairs: list[tuple[str, str]] = []
         for sent in sentences:

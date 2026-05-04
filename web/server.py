@@ -1755,7 +1755,7 @@ def _on_shutdown(fn: "Callable[[], None]") -> "Callable[[], None]":
 
 
 from contextlib import asynccontextmanager
-from typing import Callable, AsyncIterator
+from typing import AsyncIterator
 
 
 @asynccontextmanager
@@ -2441,6 +2441,93 @@ def _build_propose_create_override(today: datetime | None = None) -> str:
     )
 
 
+# Idle sweeper — evict reranker from MPS tras inactividad. Antes vivía
+# inline dentro de `_warmup()`, lo extraje a top-level con stop event +
+# singleton check (mismo patrón que samplers) para que el lifespan
+# shutdown corte el daemon thread y los tests no acumulen zombies que
+# segfaultean al teardown del módulo.
+_IDLE_SWEEPER_THREAD: "threading.Thread | None" = None
+_IDLE_SWEEPER_STOP = threading.Event()
+
+
+def _start_idle_sweeper() -> None:
+    """Arranca el daemon thread del idle sweeper. Idempotente."""
+    global _IDLE_SWEEPER_THREAD
+    if _IDLE_SWEEPER_THREAD is not None and _IDLE_SWEEPER_THREAD.is_alive():
+        return
+    _IDLE_SWEEPER_STOP.clear()
+
+    def _idle_sweeper() -> None:
+        """Evict the reranker from MPS after `_RERANKER_IDLE_TTL` of no
+        activity. Keeps the Mac responsive when the user walks away from
+        chat — 2-3 GB of unified memory freed on idle.
+
+        After eviction, schedules a deferred pre-warm 60s later so the
+        reranker is hot again before the likely next request. The
+        pre-warm runs in its own daemon thread and MUST NOT block the
+        sweeper loop.
+
+        When `RAG_RERANKER_NEVER_UNLOAD=1` (env var) the sweeper loop
+        still runs but skips `maybe_unload_reranker()` entirely.
+        """
+        from rag import maybe_unload_reranker, get_reranker
+        _never_unload = os.environ.get(
+            "RAG_RERANKER_NEVER_UNLOAD", "",
+        ).strip() not in ("", "0", "false", "no")
+        if _never_unload:
+            print(
+                "[idle-sweep] RAG_RERANKER_NEVER_UNLOAD=1 — reranker pinned, "
+                "sweeper disabled",
+                flush=True,
+            )
+        while not _IDLE_SWEEPER_STOP.is_set():
+            try:
+                # `wait()` retorna True si el stop event se setea →
+                # exit limpio (vs `time.sleep(120)` que ataba el thread
+                # 2 minutos al shutdown).
+                if _IDLE_SWEEPER_STOP.wait(timeout=120):
+                    return
+                if _never_unload:
+                    continue
+                if maybe_unload_reranker():
+                    print("[idle-sweep] reranker unloaded from MPS", flush=True)
+
+                    def _deferred_rewarm() -> None:
+                        # Mismo trato: wait con stop event, exit limpio
+                        # si el server cae antes de los 60s.
+                        if _IDLE_SWEEPER_STOP.wait(timeout=60):
+                            return
+                        try:
+                            get_reranker()
+                            print(
+                                "[idle-sweep] reranker pre-warmed (deferred)",
+                                flush=True,
+                            )
+                        except Exception:
+                            pass
+
+                    threading.Thread(
+                        target=_deferred_rewarm,
+                        name="reranker-rewarm",
+                        daemon=True,
+                    ).start()
+            except Exception:
+                pass
+
+    _IDLE_SWEEPER_THREAD = threading.Thread(
+        target=_idle_sweeper, name="idle-sweeper", daemon=True,
+    )
+    _IDLE_SWEEPER_THREAD.start()
+
+
+@_on_shutdown
+def _stop_idle_sweeper() -> None:
+    """Señaliza al idle sweeper + join breve."""
+    _IDLE_SWEEPER_STOP.set()
+    if _IDLE_SWEEPER_THREAD is not None:
+        _IDLE_SWEEPER_THREAD.join(timeout=2.0)
+
+
 @_on_startup
 def _warmup() -> None:
     """Hydrate the home cache and kick the bg prewarmer; DO NOT pin the
@@ -2667,49 +2754,7 @@ def _warmup() -> None:
                 flush=True,
             )
 
-    def _idle_sweeper() -> None:
-        """Evict the reranker from MPS after `_RERANKER_IDLE_TTL` of no
-        activity. Keeps the Mac responsive when the user walks away from
-        chat — 2-3 GB of unified memory freed on idle.
-
-        After eviction, schedules a deferred pre-warm 60s later so the
-        reranker is hot again before the likely next request (user returns
-        to chat after a short break). The pre-warm runs in its own daemon
-        thread and MUST NOT block the sweeper loop.
-
-        When `RAG_RERANKER_NEVER_UNLOAD=1` (env var) the sweeper loop
-        still runs but skips `maybe_unload_reranker()` entirely — the
-        reranker stays pinned in MPS VRAM at all times. Use this on a
-        36 GB unified-memory Mac where the ~2-3 GB cost is acceptable and
-        eliminating the 9s cold-reload hit after idle eviction is worth it.
-        """
-        from rag import maybe_unload_reranker, get_reranker
-        _never_unload = os.environ.get("RAG_RERANKER_NEVER_UNLOAD", "").strip() not in ("", "0", "false", "no")
-        if _never_unload:
-            print("[idle-sweep] RAG_RERANKER_NEVER_UNLOAD=1 — reranker pinned, sweeper disabled", flush=True)
-        while True:
-            try:
-                time.sleep(120)
-                if _never_unload:
-                    continue
-                if maybe_unload_reranker():
-                    print("[idle-sweep] reranker unloaded from MPS", flush=True)
-
-                    def _deferred_rewarm() -> None:
-                        time.sleep(60)
-                        try:
-                            get_reranker()
-                            print("[idle-sweep] reranker pre-warmed (deferred)", flush=True)
-                        except Exception:
-                            pass
-
-                    threading.Thread(
-                        target=_deferred_rewarm, name="reranker-rewarm", daemon=True
-                    ).start()
-            except Exception:
-                pass
-
-    threading.Thread(target=_idle_sweeper, name="idle-sweeper", daemon=True).start()
+    _start_idle_sweeper()
 
 
 @app.get("/")
@@ -6404,7 +6449,6 @@ async def tts(req: TTSRequest):
     if not clean:
         raise HTTPException(status_code=400, detail="texto vacío post-limpieza")
     voice = req.voice if re.match(r"^[A-Za-zÀ-ÿ]{1,32}$", req.voice or "") else "Monica"
-    fd = None
     out_path = None
     try:
         fh = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
@@ -6623,8 +6667,6 @@ def _resolve_scope(scope: str | None) -> list[tuple[str, "Path"]]:
 # alguien agregaba un compound nuevo y olvidaba updater el starter.
 from rag.iberian_leak_filter import (  # noqa: E402  -- imports al top hechos arriba
     _COMPOUND_STARTER_TAIL_RE,
-    _IBERIAN_LEAK_COMPILED,
-    _IBERIAN_LEAK_REPLACEMENTS,
 )
 from rag.iberian_leak_filter import replace_iberian_leaks as _replace_iberian_leaks  # noqa: E402
 
@@ -9068,7 +9110,6 @@ def _parse_credit_card_xlsx(path: Path) -> dict | None:
     n = len(rows)
     i = 0
     in_purchases_block = False
-    in_payments_block = False
     in_other_charges_block = False
     # Trackeamos la última fecha vista en filas de movimiento para
     # heredarla en filas que vienen con col[0] vacía (multi-consumo
@@ -9149,11 +9190,9 @@ def _parse_credit_card_xlsx(path: Path) -> dict | None:
         # Bloques de movimientos: "Pago de tarjeta y devoluciones" (skipear) /
         # "Tarjeta de <holder>" (capturar movimientos hasta "Total de ...")
         if "pago de tarjeta y devoluciones" in text:
-            in_payments_block = True
             in_purchases_block = False
         elif text.startswith("tarjeta de ") and "terminada en" in text:
             in_purchases_block = True
-            in_payments_block = False
             # Extraer holder si aún no lo tenemos
             if holder is None:
                 m = re.search(r"tarjeta de (.+?)\s*-", text, re.IGNORECASE)
@@ -9161,11 +9200,9 @@ def _parse_credit_card_xlsx(path: Path) -> dict | None:
                     holder = m.group(1).strip().title()
         elif text.startswith("total de ") and ("terminada en" in text or "tarjeta" in text):
             in_purchases_block = False
-            in_payments_block = False
             in_other_charges_block = False
         elif text.startswith("otros conceptos"):
             in_purchases_block = False
-            in_payments_block = False
             in_other_charges_block = True
         elif text.startswith("aviso importante") or text.startswith("total a pagar"):
             # Cierra el bloque de otros conceptos — el footer legal ya
@@ -13140,7 +13177,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         _n_notes = len({m.get("file", "") for m in result["metas"]})
         _n_variants = len(result.get("query_variants", []))
         _filters = result.get("filters_applied") or {}
-        retrieval_signals = {
+        {
             "confidence_label": _conf_label,
             "confidence_score": round(_conf, 2),
             "n_notes": _n_notes,
@@ -18096,7 +18133,7 @@ def _build_logs_index_payload() -> dict:
             status, err_count = _classify_file_status(stderr_path, recent_lines)
 
         # mtime más reciente entre los files.
-        mtime_max = max((f["mtime_age_s"] for f in svc["files"]), default=10**9)
+        max((f["mtime_age_s"] for f in svc["files"]), default=10**9)
         # El archivo más reciente determina el "primary mtime" para
         # ordenar la lista por actividad.
         mtime_min_age = min((f["mtime_age_s"] for f in svc["files"]), default=10**9)
@@ -18318,8 +18355,8 @@ def _build_global_errors_payload(window_s: int, level_filter: str) -> dict:
                 base = base[: -len(".log")]; kind = "stdout"
 
             raw = _read_tail_lines(path, _LOG_GLOBAL_TAIL_PER_FILE)
-            mtime_dt = datetime.fromtimestamp(stat.st_mtime)
-            n_total = len(raw)
+            datetime.fromtimestamp(stat.st_mtime)
+            len(raw)
             last_ts: str | None = None
             for idx, ln in enumerate(raw):
                 level = _classify_log_line(ln)
@@ -23264,7 +23301,7 @@ def fine_tunning_queue(limit: int = 20) -> dict:
             _ragvec_state_conn,
             _silent_log,
         )
-        clamped = max(1, min(int(limit), 50))
+        max(1, min(int(limit), 50))
         with _ragvec_state_conn() as conn:
             # NOTE: streams `brief`, `anticipate`, `proactive_push` removidos el
             # 2026-05-01 evening (post user feedback): los pushes son difíciles
@@ -23458,15 +23495,6 @@ def fine_tunning_rate(req: FineTunningRateRequest) -> dict:
     )
 
     now = _dt.datetime.now().isoformat()
-    row = {
-        "ts": now,
-        "stream": req.stream,
-        "item_id": req.item_id,
-        "rating": req.rating,
-        "label": req.label,
-        "comment": req.comment,
-        "session_id": req.session_id,
-    }
 
     def _do_insert() -> None:
         with _ragvec_state_conn() as conn:

@@ -31,7 +31,6 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-import rag as _rag
 
 __all__ = [
     "RUNBOOKS_DIR",
@@ -209,7 +208,7 @@ def distill_conversation(
     Si ``apply=False``, escribe sólo el plan (no toca filesystem).
     """
     body = conv["body"]
-    fm = conv["frontmatter"]
+    conv["frontmatter"]
     turns = _split_turns(body)
     if not turns:
         return {"runbook_path": None, "written": False, "reason": "no-turns"}

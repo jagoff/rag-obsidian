@@ -3,9 +3,7 @@ web/learning_queries.py: una función pública por sección, cada una
 envuelve reads con _sql_read_with_retry, devuelve shape estable.
 Tasks 3 y 5 implementan funciones específicas."""
 
-import json
 import sqlite3
-from typing import Any
 from datetime import datetime, timedelta
 
 

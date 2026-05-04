@@ -100,9 +100,7 @@ import signal
 import subprocess
 import threading
 import time
-from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 
 _started = False
@@ -495,7 +493,7 @@ def _restart_ollama_daemon() -> tuple[bool, str]:
             )
             if result.returncode == 0:
                 return True, "kickstarted_homebrew"
-        except Exception as exc:
+        except Exception:
             pass  # fallthrough to .app path
 
     # 2) Ollama.app path: kill all ollama procs then reopen.

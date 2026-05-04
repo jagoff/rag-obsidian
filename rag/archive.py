@@ -338,7 +338,7 @@ def archive_dead_notes(
             suffix = Path(dst_rel).suffix
             parent_rel = str(Path(dst_rel).parent)
             for i in range(2, 50):
-                tag = datetime.now().strftime("%Y-%m")
+                datetime.now().strftime("%Y-%m")
                 candidate = (
                     f"{parent_rel}/{stem}-{i}{suffix}" if parent_rel != "."
                     else f"{stem}-{i}{suffix}"

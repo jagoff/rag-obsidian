@@ -22255,6 +22255,15 @@ _MEMORY_BUFFER_MAX = 1440  # 24h @ 60s
 _MEMORY_SAMPLE_INTERVAL = 60.0
 _MEMORY_BUFFER: deque = deque(maxlen=_MEMORY_BUFFER_MAX)
 _MEMORY_LOCK = threading.Lock()
+# Cooperative shutdown para el sampler. Mismo patrón que
+# `_STATUS_PROBE_STOP` y `_ERROR_QUEUE_STOP`. Necesario para que el
+# lifespan shutdown pare el daemon thread limpiamente — sin esto, los
+# tests que crean múltiples `TestClient(app)` acumulaban N threads
+# zombies tocando `_MEMORY_BUFFER` después del module teardown,
+# causando segfaults intermitentes en el suite full
+# (`web/server.py:22550 in loop` en el traceback de fatal Python error).
+_MEMORY_SAMPLER_THREAD: "threading.Thread | None" = None
+_MEMORY_SAMPLER_STOP = threading.Event()
 
 _MEMORY_CATEGORIES = ("rag", "ollama", "sqlite-vec", "whatsapp")
 
@@ -22524,7 +22533,14 @@ def _memory_trim_file() -> None:
 
 @_on_startup
 def _start_memory_sampler() -> None:
+    """Arranca el daemon thread del memory sampler. Idempotente: si ya hay
+    un thread vivo (caso suite de tests con múltiples TestClient
+    consecutivos), reutilizamos en lugar de spawnear duplicados."""
+    global _MEMORY_SAMPLER_THREAD
+    if _MEMORY_SAMPLER_THREAD is not None and _MEMORY_SAMPLER_THREAD.is_alive():
+        return
     _memory_load_history()
+    _MEMORY_SAMPLER_STOP.clear()
 
     def loop() -> None:
         import random as _r
@@ -22533,9 +22549,10 @@ def _start_memory_sampler() -> None:
         # queries writer) que arrancan al mismo startup. Sin jitter cada 60s
         # los 3 writers colisionaban simultáneo, saturaban el WAL lock, y
         # uno perdía el sample (~64/semana en el audit 2026-04-23).
-        time.sleep(_r.uniform(0, 30))
+        if _MEMORY_SAMPLER_STOP.wait(timeout=_r.uniform(0, 30)):
+            return
         trim_counter = 0
-        while True:
+        while not _MEMORY_SAMPLER_STOP.is_set():
             sample = _sample_memory()
             if sample:
                 with _MEMORY_LOCK:
@@ -22547,9 +22564,29 @@ def _start_memory_sampler() -> None:
                     trim_counter = 0
             # Per-cycle jitter ±5s para evitar drift hacia realineamiento
             # después del primer offset. Rango [55, 65] sobre interval 60s.
-            time.sleep(_MEMORY_SAMPLE_INTERVAL + _r.uniform(-5, 5))
+            # `wait()` retorna True si el stop event fue set → exit limpio.
+            if _MEMORY_SAMPLER_STOP.wait(
+                timeout=_MEMORY_SAMPLE_INTERVAL + _r.uniform(-5, 5)
+            ):
+                return
 
-    threading.Thread(target=loop, name="memory-sampler", daemon=True).start()
+    _MEMORY_SAMPLER_THREAD = threading.Thread(
+        target=loop, name="memory-sampler", daemon=True,
+    )
+    _MEMORY_SAMPLER_THREAD.start()
+
+
+@_on_shutdown
+def _stop_memory_sampler() -> None:
+    """Señaliza al memory sampler que pare + join breve.
+
+    `daemon=True` garantiza que el thread no bloquea el exit si por
+    alguna razón el shutdown callback no llega (ej. SIGKILL). El path
+    normal sale via `_MEMORY_SAMPLER_STOP.set()` desde acá.
+    """
+    _MEMORY_SAMPLER_STOP.set()
+    if _MEMORY_SAMPLER_THREAD is not None:
+        _MEMORY_SAMPLER_THREAD.join(timeout=2.0)
 
 
 @app.get("/api/system-memory")
@@ -22647,6 +22684,9 @@ _CPU_LIVE_INTERVAL = 2.0
 _CPU_BUFFER: deque = deque(maxlen=_CPU_BUFFER_MAX)
 _CPU_LOCK = threading.Lock()
 _CPU_NCORES = os.cpu_count() or 1
+# Cooperative shutdown — ver doc-block en `_MEMORY_SAMPLER_STOP`.
+_CPU_SAMPLER_THREAD: "threading.Thread | None" = None
+_CPU_SAMPLER_STOP = threading.Event()
 
 
 def _parse_cputime(s: str) -> float | None:
@@ -22797,7 +22837,14 @@ def _cpu_trim_file() -> None:
 
 @_on_startup
 def _start_cpu_sampler() -> None:
+    """Arranca el daemon thread del CPU sampler. Idempotente — ver
+    doc-block en `_start_memory_sampler` para el rationale del
+    singleton check."""
+    global _CPU_SAMPLER_THREAD
+    if _CPU_SAMPLER_THREAD is not None and _CPU_SAMPLER_THREAD.is_alive():
+        return
     _cpu_load_history()
+    _CPU_SAMPLER_STOP.clear()
 
     def loop() -> None:
         import random as _r
@@ -22808,12 +22855,17 @@ def _start_cpu_sampler() -> None:
         # Initial jitter 0-30s para desynchroñar el primer write con el
         # memory-sampler. Ver el comentario equivalente en
         # `_start_memory_sampler` para el razonamiento.
-        time.sleep(_r.uniform(0, 30))
+        if _CPU_SAMPLER_STOP.wait(timeout=_r.uniform(0, 30)):
+            return
         trim_counter = 0
-        while True:
+        while not _CPU_SAMPLER_STOP.is_set():
             # Per-cycle jitter ±5s; evita la re-sincronización progresiva
-            # hacia colisiones con otros samplers.
-            time.sleep(_CPU_SAMPLE_INTERVAL + _r.uniform(-5, 5))
+            # hacia colisiones con otros samplers. `wait()` retorna True
+            # si el stop event fue set → exit limpio sin esperar el tick.
+            if _CPU_SAMPLER_STOP.wait(
+                timeout=_CPU_SAMPLE_INTERVAL + _r.uniform(-5, 5)
+            ):
+                return
             sample = _sample_cpu(state)
             if sample:
                 with _CPU_LOCK:
@@ -22824,7 +22876,19 @@ def _start_cpu_sampler() -> None:
                     _cpu_trim_file()
                     trim_counter = 0
 
-    threading.Thread(target=loop, name="cpu-sampler", daemon=True).start()
+    _CPU_SAMPLER_THREAD = threading.Thread(
+        target=loop, name="cpu-sampler", daemon=True,
+    )
+    _CPU_SAMPLER_THREAD.start()
+
+
+@_on_shutdown
+def _stop_cpu_sampler() -> None:
+    """Señaliza al CPU sampler que pare + join breve. Mismo patrón que
+    `_stop_memory_sampler`."""
+    _CPU_SAMPLER_STOP.set()
+    if _CPU_SAMPLER_THREAD is not None:
+        _CPU_SAMPLER_THREAD.join(timeout=2.0)
 
 
 @app.get("/api/system-cpu")

@@ -30,8 +30,18 @@ def isolated_finances(tmp_path, monkeypatch):
 
     Returns `(finance_dir, vault_root)`. Tests drop xlsx files in
     `finance_dir` and call `_sync_credit_cards_notes(vault_root)`.
+
+    Post-split (2026-05-04) `MOZE_BACKUP_DIR` vive en
+    `rag.cross_source_etls`. La función `_sync_credit_cards_notes`
+    resuelve el binding en SU módulo (no via `rag.*`), así que hay
+    que monkeypatchear ambos paths para que el override tome efecto:
+
+    - `rag.cross_source_etls.MOZE_BACKUP_DIR` — el lookup real
+    - `rag.MOZE_BACKUP_DIR` — re-export vía `from rag.cross_source_etls import *`,
+      lo dejamos coherente para tests que lean de `rag` directo.
     """
     import rag
+    import rag.cross_source_etls as _cse
 
     finance_dir = tmp_path / "Finances"
     finance_dir.mkdir()
@@ -39,6 +49,7 @@ def isolated_finances(tmp_path, monkeypatch):
     vault_root.mkdir()
 
     # Point the sync at our test dir, not iCloud.
+    monkeypatch.setattr(_cse, "MOZE_BACKUP_DIR", finance_dir)
     monkeypatch.setattr(rag, "MOZE_BACKUP_DIR", finance_dir)
 
     return finance_dir, vault_root

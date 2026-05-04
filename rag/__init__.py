@@ -5530,7 +5530,12 @@ def _ttl_for_intent(intent: str | None) -> int:
     return _SEMANTIC_CACHE_DEFAULT_TTL
 
 
-def _cached_entry_is_stale(paths: list[str], cached_ts: float) -> bool:
+def _cached_entry_is_stale(
+    paths: list[str],
+    cached_ts: float,
+    *,
+    mtime_cache: dict[str, float | None] | None = None,
+) -> bool:
     """Return True if any of the cached entry's source paths has mtime > cached_ts.
 
     Post 2026-04-23 per-entry freshness check. The corpus_hash no longer
@@ -5557,6 +5562,13 @@ def _cached_entry_is_stale(paths: list[str], cached_ts: float) -> bool:
       a silent cache miss that forces a full retrieve+LLM round-trip.
     - Unresolvable vault_path / permission error → assume fresh (same
       rationale: don't blow up the cache for infra issues).
+
+    `mtime_cache` (2026-05-04 perf): si el caller itera sobre muchas
+    cached rows en el mismo lookup pass (`semantic_cache_lookup`),
+    pasarle un dict vacío `{}` permite memoizar (path → mtime|None) —
+    el mismo path repetido en N entries paga 1 stat() en vez de N. None
+    preserva el behavior legacy (sin memoization). Empíricamente con 5
+    entries × 2 paths solapados: 10 stat() → 2 (reducción 80%).
     """
     if not paths:
         return False
@@ -5567,12 +5579,22 @@ def _cached_entry_is_stale(paths: list[str], cached_ts: float) -> bool:
     for p in paths:
         try:
             full = vault / p
-            if not full.exists():
+            full_key = str(full)
+            if mtime_cache is not None and full_key in mtime_cache:
+                mt = mtime_cache[full_key]
+            else:
+                if not full.exists():
+                    mt = None
+                else:
+                    mt = full.stat().st_mtime
+                if mtime_cache is not None:
+                    mtime_cache[full_key] = mt
+            if mt is None:
                 # Source missing — coarse-grained corpus_hash delta will
                 # catch this on the next index; don't force an unnecessary
                 # cache miss here.
                 continue
-            if full.stat().st_mtime > cached_ts:
+            if mt > cached_ts:
                 return True
         except Exception:
             # Permission error / race → assume fresh (best-effort).
@@ -5661,6 +5683,12 @@ def semantic_cache_lookup(
 
     best_cos = -1.0
     best = None
+    # Memoization local: (full_path → mtime|None) reusable entre
+    # entries del mismo lookup. Si N entries citan el mismo set de
+    # notas (caso típico — el corpus no es disjoint), reduce stat()
+    # calls de O(entries × paths) a O(unique paths). Win medido: 80%
+    # reducción con 5 entries × 2 paths solapados.
+    _mtime_cache: dict[str, float | None] = {}
     for row in rows:
         rid, ts_str, question, blob, dim, intent, ttl_seconds, response, paths_json, scores_json, top_score = row
         # TTL filter — parse ts as ISO-8601.
@@ -5697,7 +5725,7 @@ def semantic_cache_lookup(
             # Per-entry freshness check (post 2026-04-23): skip rows whose
             # source notes have been edited after we stored the response.
             paths = json.loads(paths_json) if paths_json else []
-            if _cached_entry_is_stale(paths, cached_ts):
+            if _cached_entry_is_stale(paths, cached_ts, mtime_cache=_mtime_cache):
                 probe["skipped_stale"] += 1
                 continue
             if cos > best_cos or best is None:
@@ -19270,6 +19298,20 @@ class ChatTurnResult:
             # (RAG_MMR=0 + RAG_MMR_FOLDER_PENALTY=0) o no-op (ya diverso).
             # >0 = N slots reordenados por MMR post-rerank pre top-k cap.
             "mmr_applied": int(rr.get("mmr_applied", 0) or 0),
+            # Query decomposition (prototype 2026-05-04, opt-in via
+            # RAG_QUERY_DECOMPOSE=1). decomposed=True cuando el detector
+            # marcó la query como multi-aspecto y se ejecutó RRF fusion.
+            # n_sub_queries=N (≥2 cuando decomposed). decompose_ms = costo
+            # del detector (regex + opcional LLM helper qwen2.5:3b).
+            "decomposed": bool(
+                (rr.filters_applied or {}).get("decomposed", False),
+            ),
+            "n_sub_queries": int(
+                (rr.filters_applied or {}).get("n_sub_queries", 0) or 0,
+            ),
+            "decompose_ms": int(
+                (rr.timing or {}).get("decompose_ms", 0) or 0,
+            ),
         }
 
 
@@ -19730,6 +19772,194 @@ def retrieve(
             _silent_log("retrieve.backfill_created_ts", exc)
         filters_applied["since"] = datetime.fromtimestamp(date_range[0]).strftime("%Y-%m-%d")
         filters_applied["until"] = datetime.fromtimestamp(date_range[1]).strftime("%Y-%m-%d")
+
+    # ── Query decomposition + RRF fusion (gated, opt-in) ─────────────────
+    # Prototype 2026-05-04 (rag/query_decompose.py): cuando
+    # `RAG_QUERY_DECOMPOSE=1`, detectamos si la query es multi-aspecto
+    # ("compará X vs Y", "tanto X como Y", "diferencia entre P y Q") y
+    # ejecutamos N sub-retrieves en paralelo, fusionando resultados con
+    # Reciprocal Rank Fusion (k=60). Apunta a chains chain_success.
+    #
+    # Default OFF (env var no seteada) → 0% overhead. ON = single regex
+    # check (~10µs) + cache lookup. Si NO matchea regex y no hay
+    # filtros explícitos, cae al LLM helper (qwen2.5:3b, ~500ms-1s).
+    # Resultado cacheado en LRU 256.
+    if (
+        os.environ.get("RAG_QUERY_DECOMPOSE", "").strip().lower()
+        in ("1", "true", "yes", "on")
+        and not folder
+        and not tag
+        and history is None
+        and variants is None
+    ):
+        try:
+            from rag.query_decompose import (
+                decompose_query as _decompose_query,
+                env_use_llm_fallback as _decompose_env_llm,
+                env_max_workers as _decompose_env_max_workers,
+                rrf_fuse as _decompose_rrf_fuse,
+                should_consider_decomposition as _decompose_pre_gate,
+            )
+            _t_decompose = time.perf_counter()
+            _sub_queries: list[str] | None = None
+            if _decompose_pre_gate(
+                search_query,
+                folder=folder, tag=tag, source=source,
+            ):
+                _sub_queries = _decompose_query(
+                    search_query,
+                    use_llm_fallback=_decompose_env_llm(),
+                )
+            _decompose_ms_total = (time.perf_counter() - _t_decompose) * 1000
+            if _sub_queries and len(_sub_queries) > 1:
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+
+                def _decompose_sub_retrieve(sub_q: str) -> dict:
+                    saved = os.environ.pop("RAG_QUERY_DECOMPOSE", None)
+                    try:
+                        return retrieve(
+                            col, sub_q, k, folder=folder,
+                            history=None, tag=tag,
+                            precise=False, multi_query=True,
+                            auto_filter=False,
+                            date_range=date_range,
+                            summary=None,
+                            variants=None,
+                            rerank_pool=rerank_pool,
+                            exclude_paths=exclude_paths,
+                            exclude_path_prefixes=exclude_path_prefixes,
+                            seen_titles=seen_titles,
+                            source=source,
+                            intent=intent,
+                            hyde=False,
+                            caller=caller,
+                            counter=counter,
+                        )
+                    finally:
+                        if saved is not None:
+                            os.environ["RAG_QUERY_DECOMPOSE"] = saved
+
+                _t_sub = time.perf_counter()
+                _max_workers = min(
+                    len(_sub_queries),
+                    _decompose_env_max_workers(),
+                )
+                _sub_results: list[dict] = []
+                with ThreadPoolExecutor(max_workers=_max_workers) as _ex:
+                    _futs = {
+                        _ex.submit(_decompose_sub_retrieve, sq): sq
+                        for sq in _sub_queries
+                    }
+                    for _f in as_completed(_futs):
+                        try:
+                            _sub_results.append(_f.result())
+                        except Exception as _exc:
+                            _silent_log("query_decompose.sub_retrieve", _exc)
+                _decompose_subretrieve_ms = (time.perf_counter() - _t_sub) * 1000
+
+                _rankings: list[list[str]] = []
+                _path_to_data: dict[str, tuple[str, dict, float]] = {}
+                _graph_acc: list[tuple[str, dict]] = []
+                _graph_seen: set[str] = set()
+                _vault_scope_acc: list[str] = []
+                _fast_paths: list[bool] = []
+                for _r in _sub_results:
+                    if not _r:
+                        continue
+                    _sub_metas = _r.get("metas", []) or []
+                    _sub_docs = _r.get("docs", []) or []
+                    _sub_scores = _r.get("scores", []) or []
+                    _ranking_paths: list[str] = []
+                    for _i, _m in enumerate(_sub_metas):
+                        if not isinstance(_m, dict):
+                            continue
+                        _p = _m.get("file") or ""
+                        if not _p:
+                            continue
+                        _ranking_paths.append(_p)
+                        if _p not in _path_to_data:
+                            _doc = _sub_docs[_i] if _i < len(_sub_docs) else ""
+                            _sc = (
+                                _sub_scores[_i]
+                                if _i < len(_sub_scores) else 0.0
+                            )
+                            _path_to_data[_p] = (_doc, _m, float(_sc))
+                    if _ranking_paths:
+                        _rankings.append(_ranking_paths)
+                    for _gd, _gm in zip(
+                        _r.get("graph_docs", []) or [],
+                        _r.get("graph_metas", []) or [],
+                    ):
+                        _gp = (
+                            (_gm or {}).get("file", "")
+                            if isinstance(_gm, dict) else ""
+                        )
+                        if _gp and _gp not in _graph_seen:
+                            _graph_seen.add(_gp)
+                            _graph_acc.append((_gd, _gm))
+                    _fast_paths.append(bool(_r.get("fast_path", False)))
+                    for _v in (_r.get("vault_scope") or []):
+                        if _v not in _vault_scope_acc:
+                            _vault_scope_acc.append(_v)
+
+                if _rankings:
+                    _fused_paths = _decompose_rrf_fuse(
+                        _rankings, k=60, top_k=k,
+                    )
+                    _fused_docs: list[str] = []
+                    _fused_metas: list[dict] = []
+                    _fused_scores: list[float] = []
+                    for _fp in _fused_paths:
+                        _data = _path_to_data.get(_fp)
+                        if _data is None:
+                            continue
+                        _fd, _fm, _fsc = _data
+                        _fused_docs.append(_fd)
+                        _fused_metas.append(_fm)
+                        _fused_scores.append(_fsc)
+                    _timing["total_ms"] = (
+                        time.perf_counter() - _t_retrieve_start
+                    ) * 1000
+                    _timing["decompose_ms"] = float(_decompose_ms_total)
+                    _timing["decompose_subretrieve_ms"] = float(
+                        _decompose_subretrieve_ms,
+                    )
+                    filters_applied["decomposed"] = True
+                    filters_applied["n_sub_queries"] = len(_sub_queries)
+                    try:
+                        _final_paths = [
+                            (_m or {}).get("file") for _m in _fused_metas
+                            if (_m or {}).get("file")
+                        ]
+                        if _final_paths:
+                            log_impressions(
+                                question, _final_paths, source=caller,
+                            )
+                    except Exception as _exc:
+                        _silent_log(
+                            "query_decompose.log_impressions", _exc,
+                        )
+                    return RetrieveResult(
+                        docs=_fused_docs,
+                        metas=_fused_metas,
+                        scores=_fused_scores,
+                        confidence=(
+                            _fused_scores[0] if _fused_scores
+                            else float("-inf")
+                        ),
+                        search_query=search_query,
+                        filters_applied=filters_applied,
+                        query_variants=list(_sub_queries),
+                        graph_docs=[_gd for _gd, _ in _graph_acc[:2]],
+                        graph_metas=[_gm for _, _gm in _graph_acc[:2]],
+                        timing=dict(_timing),
+                        fast_path=any(_fast_paths),
+                        intent=intent,
+                        vault_scope=_vault_scope_acc,
+                    )
+                # Fall through si las sub-retrieves no devolvieron nada.
+        except Exception as _de_exc:
+            _silent_log("query_decompose.outer", _de_exc)
 
     # 3. Multi-query expansion (original + 2 paraphrases).
     #    When `variants` is pre-supplied (e.g. from reformulate_and_expand),

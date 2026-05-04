@@ -70,17 +70,21 @@ def test_wa_injection_still_gated_by_query_match():
 
 def test_gate_regex_matches_expected_patterns():
     """The regex itself must match the common triggers — sanity check
-    that we didn't accidentally narrow it to a single word."""
-    import re
+    that we didn't accidentally narrow it to a single word.
 
-    # Extract the regex literal from the source
-    idx = SERVER_PY.find("_wa_in_query = bool(")
-    snippet = SERVER_PY[idx : idx + 400]
-    # Find the pattern string (between r" and ")
-    start = snippet.find('re.search(r"') + len('re.search(r"')
-    end = snippet.find('"', start)
-    pattern = snippet[start:end]
-    compiled = re.compile(pattern, re.IGNORECASE)
+    Moved from inline re.search(...) to the module-level constant
+    _WA_INTENT_RE (2026-05-04 perf fix) — we import the compiled object
+    directly instead of parsing source to extract the pattern string.
+    """
+    import importlib
+    import sys
+
+    # Import server module to get the compiled constant
+    root = Path(__file__).resolve().parent.parent
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    server = importlib.import_module("web.server")
+    compiled = server._WA_INTENT_RE
 
     # Positive matches: all of these mention WhatsApp meaningfully
     for positive in [

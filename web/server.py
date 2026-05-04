@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
@@ -513,6 +514,21 @@ _WA_LIST_SCHEDULED_TRIGGER_RE = re.compile(
     r"qu[eé]\s+(?:program[eé]|tengo\s+programado\w*))\b",
     re.IGNORECASE,
 )
+
+# Singleton pre-compiled — evita re.compile() por request en /api/chat.
+# CPython no cachea compilaciones con flags inline, así que la versión
+# `re.search(r"...", q, re.IGNORECASE)` recompilaba ~30 veces/min.
+_WA_INTENT_RE = re.compile(
+    r"\b(whatsapp|\bwa\b|mensaje|chat de|último[s]? chat)",
+    re.IGNORECASE,
+)
+
+# Singleton executor para el WA fetch prefetch en /api/chat.
+# Pre-fix se creaba un ThreadPoolExecutor(max_workers=1) POR REQUEST
+# (~0.5-2ms de thread creation + overhead OS). El singleton vive
+# mientras dure el proceso y sus threads se reusan entre requests.
+# max_workers=2 permite overlap en burst sin starvar el OS thread pool.
+_WA_FETCH_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="wa-fetch")
 
 
 def _detect_whatsapp_list_scheduled_intent(q: str) -> tuple[str, dict] | None:
@@ -5916,23 +5932,25 @@ def notes_autocomplete(
         }
     corpus = _load_corpus(col)
 
-    # Dedupe paths — _load_corpus tiene 1 row por chunk, una nota grande
-    # aparece N veces. Igual con folders. Mantenemos el primer title
-    # encontrado por path para mostrar como display name.
-    paths_seen: dict[str, str] = {}
-    folders_seen: set[str] = set()
-    for m in corpus.get("metas") or []:
-        f = (m.get("file") or "").strip()
-        if f and f not in paths_seen:
-            paths_seen[f] = (m.get("note") or "").strip()
-        folder = (m.get("folder") or "").strip()
-        if folder:
-            folders_seen.add(folder)
-        # Folders virtuales (cada prefix path/foo/bar → path, path/foo).
-        for i, _ in enumerate(f.split("/")[:-1]):
-            prefix = "/".join(f.split("/")[: i + 1])
-            if prefix:
-                folders_seen.add(prefix)
+    # Dedupe index pre-computado en el rebuild del corpus cache (una vez,
+    # no en cada keypress). Fallback a iteración si el cache es de un proceso
+    # viejo que no tiene los nuevos campos.
+    paths_seen: dict[str, str] = corpus.get("paths_deduped")  # type: ignore[assignment]
+    folders_seen: set[str] = corpus.get("folders_deduped")  # type: ignore[assignment]
+    if paths_seen is None:
+        paths_seen = {}
+        folders_seen = set()
+        for m in corpus.get("metas") or []:
+            f = (m.get("file") or "").strip()
+            if f and f not in paths_seen:
+                paths_seen[f] = (m.get("note") or "").strip()
+            folder = (m.get("folder") or "").strip()
+            if folder:
+                folders_seen.add(folder)
+            for i, _ in enumerate(f.split("/")[:-1]):
+                prefix = "/".join(f.split("/")[: i + 1])
+                if prefix:
+                    folders_seen.add(prefix)
 
     def _rank(item_path: str, kind: str, title: str) -> tuple[int, int, str]:
         """Ranking: lower-is-better. Tuple sort por (bucket, length, alpha)."""
@@ -6360,12 +6378,16 @@ class TTSRequest(BaseModel):
 
 
 @app.post("/api/tts")
-def tts(req: TTSRequest):
+async def tts(req: TTSRequest):
     """Render text with macOS `say` (default voice Mónica) to WAV bytes.
 
     Local-only: no cloud. WAV chosen over AIFF because browser support is
     universal. Text capped and markdown-stripped so the voice doesn't
     read out backticks and brackets.
+
+    Async para no bloquear el Starlette threadpool: `say` puede tardar
+    hasta 45s en textos largos — con la versión sync, 5 TTS concurrentes
+    saturaban los workers compartidos con /api/chat.
     """
     import tempfile  # noqa: PLC0415
     from fastapi.responses import Response  # noqa: PLC0415
@@ -6387,7 +6409,8 @@ def tts(req: TTSRequest):
         fh = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
         out_path = fh.name
         fh.close()
-        subprocess.run(
+        await asyncio.to_thread(
+            subprocess.run,
             ["say", "-v", voice, "--file-format=WAVE",
              "--data-format=LEI16@22050", "-o", out_path, clean],
             check=True, capture_output=True, timeout=45,
@@ -11219,7 +11242,7 @@ class QueryRequest(BaseModel):
 
 @app.post("/api/query")
 @app.post("/query")  # legacy alias — mantiene compat con clientes apuntando al wire del rag serve
-def api_query(req: QueryRequest, request: Request) -> dict:
+async def api_query(req: QueryRequest, request: Request) -> dict:
     """Sync JSON wrapper sobre `multi_retrieve` + (optional) ollama.chat.
 
     Endpoint dedicado para el WhatsApp listener (reemplazo del `/query`
@@ -11379,6 +11402,7 @@ def api_query(req: QueryRequest, request: Request) -> dict:
         f"Pregunta: {question}\n\nResponde concisamente en español rioplatense."
     )
 
+    _API_QUERY_GEN_TIMEOUT = 120.0  # s — evita que Ollama colgado bloquee el handler para siempre
     _t_gen_start = time.perf_counter()
     try:
         web_model = _resolve_web_chat_model()
@@ -11392,18 +11416,43 @@ def api_query(req: QueryRequest, request: Request) -> dict:
             "num_ctx": _WEB_CHAT_NUM_CTX,
             "num_predict": req.num_predict,
         }
-        resp = ollama.chat(
-            model=web_model,
-            messages=[
-                {"role": "system", "content": _WEB_SYSTEM_PROMPT},
-                {"role": "user", "content": user_msg},
-            ],
-            options=_opts,
-            stream=False,
-            think=False,
-            keep_alive=chat_keep_alive(web_model),
+        _messages = [
+            {"role": "system", "content": _WEB_SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg},
+        ]
+        _keep_alive = chat_keep_alive(web_model)
+        resp = await asyncio.wait_for(
+            asyncio.to_thread(
+                ollama.chat,
+                model=web_model,
+                messages=_messages,
+                options=_opts,
+                stream=False,
+                think=False,
+                keep_alive=_keep_alive,
+            ),
+            timeout=_API_QUERY_GEN_TIMEOUT,
         )
         answer = (resp.message.content or "").strip()
+    except asyncio.TimeoutError:
+        t_gen_timeout = time.perf_counter() - _t_gen_start
+        print(
+            f"[api-query-error] phase=llm timeout={_API_QUERY_GEN_TIMEOUT}s",
+            flush=True,
+        )
+        try:
+            log_query_event({
+                "cmd": "api_query.timeout",
+                "q": question[:200],
+                "session": req.session_id,
+                "t_retrieve": round(t_retrieve, 3),
+                "t_gen": round(t_gen_timeout, 3),
+                "top_score": round(confidence, 3),
+            })
+        except Exception:
+            pass
+        from fastapi import HTTPException
+        raise HTTPException(status_code=504, detail="generation timeout (120s)")
     except Exception as exc:
         print(
             f"[api-query-error] phase=llm "
@@ -12468,38 +12517,33 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # el submit ocurría SIEMPRE aunque en ~70% de queries el
         # resultado se descartaba sin usarse. Ahorra 25-180ms de I/O
         # SQLite al messages.db del bridge en la gran mayoría del
-        # tráfico web. El check es un regex plano sobre `question`
-        # (disponible desde el inicio del endpoint), sub-microsegundo.
-        from concurrent.futures import ThreadPoolExecutor
-        _wa_in_query = bool(
-            re.search(r"\b(whatsapp|\bwa\b|mensaje|chat de|último[s]? chat)",
-                      question, re.IGNORECASE)
-        )
+        # tráfico web. El check es un regex pre-compilado a nivel de
+        # módulo (_WA_INTENT_RE) — evita re.compile() implícito por
+        # request que CPython no cachea cuando se pasan flags inline.
+        _wa_in_query = bool(_WA_INTENT_RE.search(question))
         _wa_executor: ThreadPoolExecutor | None = None
         _wa_future = None
         _t_wa_start = time.perf_counter()
         if _wa_in_query:
-            # Crear el executor + submit en un try/except que garantice
-            # cleanup si submit falla (raro: RuntimeError si el executor
-            # quedó broken, ResourceError si no hay threads libres).
-            # 2026-04-24 audit: pre-fix, si `submit` lanzaba después de
-            # que `ThreadPoolExecutor()` tuvo éxito, el executor quedaba
-            # "vivo" pero sin future y el finally downstream (que chequea
-            # `if _wa_future is None`) ni siquiera entraba al path con
-            # el shutdown. Thread leak silencioso. Ahora si falla submit,
-            # shutdown inmediato y dejamos ambos en None — el handler
-            # downstream trata el caso como "WA fetch no fired".
+            # Reusar el singleton _WA_FETCH_EXECUTOR en vez de crear un
+            # ThreadPoolExecutor(max_workers=1) POR REQUEST. Pre-fix
+            # el overhead de thread creation (~0.5-2ms) se pagaba en el
+            # ~30% del tráfico que matcheaba WA intent. El singleton
+            # vive mientras dure el proceso; sus threads se reusan.
+            # El finally downstream ya NO llama shutdown() — el executor
+            # es compartido y no debe cerrarse entre requests. Si submit
+            # falla, igual dejamos _wa_future en None para que el handler
+            # downstream trate el caso como "WA fetch no fired".
             try:
-                _wa_executor = ThreadPoolExecutor(max_workers=1)
+                _wa_executor = _WA_FETCH_EXECUTOR
                 _wa_future = _wa_executor.submit(_fetch_whatsapp_unread, 24, 8)
             except Exception as _exc:
                 print(
                     f"[chat-wa-executor-submit-failed] {type(_exc).__name__}: {_exc}",
                     flush=True,
                 )
-                if _wa_executor is not None:
-                    _wa_executor.shutdown(wait=False)
-                    _wa_executor = None
+                # Singleton — no hacer shutdown(); sólo limpiar la ref local.
+                _wa_executor = None
                 _wa_future = None
 
         # Conversation-aware reformulation is a qwen2.5:3b call that costs
@@ -13331,9 +13375,8 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 wa_recent = _wa_future.result(timeout=2.0)
             except Exception:
                 wa_recent = []
-            finally:
-                if _wa_executor is not None:
-                    _wa_executor.shutdown(wait=False)
+            # Sin finally shutdown(): _WA_FETCH_EXECUTOR es singleton de módulo,
+            # sus threads se reusan entre requests y no deben cerrarse acá.
         _t_wa_end = time.perf_counter()
         _t_wa_wait_ms = int((_t_wa_end - _t_wa_wait_start) * 1000)
         # `_wa_in_query` ya se computó arriba (antes del submit) — mismo
@@ -15137,20 +15180,36 @@ def transcripts_dashboard(nofresh: int = 0) -> HTMLResponse:
             corr_by_source = dict(conn.execute(
                 "SELECT source, COUNT(*) FROM rag_audio_corrections GROUP BY source"
             ).fetchall())
-            # Logprob histogram — buckets de 0.2
-            buckets = [
-                ("> -0.2 (excelente)", "avg_logprob > -0.2"),
-                ("-0.4 a -0.2 (alta)", "avg_logprob > -0.4 AND avg_logprob <= -0.2"),
-                ("-0.6 a -0.4 (media)", "avg_logprob > -0.6 AND avg_logprob <= -0.4"),
-                ("-0.8 a -0.6 (baja)", "avg_logprob > -0.8 AND avg_logprob <= -0.6"),
-                ("< -0.8 (LLM correct)", "avg_logprob <= -0.8"),
+            # Logprob histogram — buckets de 0.2. Una sola query GROUP BY
+            # en vez de 5 queries individuales (N+1 eliminado).
+            _hist_labels = {
+                "high":     "> -0.2 (excelente)",
+                "high_mid": "-0.4 a -0.2 (alta)",
+                "mid":      "-0.6 a -0.4 (media)",
+                "low":      "-0.8 a -0.6 (baja)",
+                "critical": "< -0.8 (LLM correct)",
+            }
+            _hist_order = ["high", "high_mid", "mid", "low", "critical"]
+            _hist_raw = dict(conn.execute(
+                """
+                SELECT
+                    CASE
+                        WHEN avg_logprob > -0.2 THEN 'high'
+                        WHEN avg_logprob > -0.4 THEN 'high_mid'
+                        WHEN avg_logprob > -0.6 THEN 'mid'
+                        WHEN avg_logprob > -0.8 THEN 'low'
+                        ELSE 'critical'
+                    END AS bucket,
+                    COUNT(*) AS n
+                FROM rag_audio_transcripts
+                WHERE avg_logprob IS NOT NULL
+                GROUP BY bucket
+                """,
+            ).fetchall())
+            hist = [
+                (_hist_labels[k], _hist_raw.get(k, 0))
+                for k in _hist_order
             ]
-            hist = []
-            for label, where in buckets:
-                n = conn.execute(
-                    f"SELECT COUNT(*) FROM rag_audio_transcripts WHERE {where}"
-                ).fetchone()[0]
-                hist.append((label, n))
             # Vocab — totales y por source
             n_vocab = conn.execute(
                 "SELECT COUNT(*) FROM rag_whisper_vocab"

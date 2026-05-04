@@ -4245,6 +4245,10 @@ def _load_behavior_priors() -> dict:
         # válido independiente del TTL → refresh loaded_at + return.
         # Si max_ts cambió, caemos al rebuild path. Si SQL falla, fallback
         # al TTL early-return original (mejor stale que romper retrieve).
+        # `_prefetched_max_ts` captura el MAX(ts) que el TTL fast-path ya
+        # leyó. Si está seteado, _read_priors lo reutiliza evitando abrir
+        # una segunda conn solo para releer el mismo valor.
+        _prefetched_max_ts: str | None = None
         if (
             _behavior_priors_cache is not None
             and _behavior_priors_cache_loaded_at is not None
@@ -4255,7 +4259,9 @@ def _load_behavior_priors() -> dict:
                 if _curr_max_ts == _behavior_priors_cache_key_sql:
                     _behavior_priors_cache_loaded_at = time.monotonic()
                     return _behavior_priors_cache
-                # max_ts cambió → cache stale, fall through al rebuild path
+                # max_ts cambió → cache stale, fall through al rebuild path.
+                # Guardamos el valor ya leído para evitar re-leerlo en _read_priors.
+                _prefetched_max_ts = _curr_max_ts
             except Exception:
                 # SQL down → fallback al TTL fast-path (stale > broken)
                 if (time.monotonic() - _behavior_priors_cache_loaded_at) < _BEHAVIOR_PRIORS_TTL_SECONDS:
@@ -4263,7 +4269,9 @@ def _load_behavior_priors() -> dict:
 
         def _read_priors():
             with _ragvec_state_conn() as conn:
-                max_ts = _sql_max_ts(conn, "rag_behavior")
+                # Reutilizar MAX(ts) ya leído por el TTL fast-path si está
+                # disponible — evita una segunda query MAX(ts) a SQLite.
+                max_ts = _prefetched_max_ts if _prefetched_max_ts is not None else _sql_max_ts(conn, "rag_behavior")
                 if max_ts is None:
                     snapshot = _compute_behavior_priors_from_groups([])
                     snapshot["hash"] = "sql:empty"
@@ -11688,6 +11696,26 @@ def _load_corpus(col: SqliteVecCollection, *, hint_count: int | None = None) -> 
                 for t in raw_links:
                     backlinks.setdefault(t, set()).add(path)
 
+        # Dedupe index para notes_autocomplete — computado UNA vez en rebuild,
+        # no en cada keypress (~8k chunks × N keypresses = GIL contention).
+        # paths_deduped: primer título encontrado por path (dict preserva orden).
+        # folders_deduped: union de meta.folder + prefijos virtuales de cada path.
+        paths_deduped: dict[str, str] = {}
+        folders_deduped: set[str] = set()
+        for m in metas:
+            f = (m.get("file") or "").strip()
+            if f and f not in paths_deduped:
+                paths_deduped[f] = (m.get("note") or "").strip()
+            folder = (m.get("folder") or "").strip()
+            if folder:
+                folders_deduped.add(folder)
+            # Folders virtuales: cada prefix de f excepto el último segmento.
+            parts = f.split("/")
+            for i in range(len(parts) - 1):
+                prefix = "/".join(parts[: i + 1])
+                if prefix:
+                    folders_deduped.add(prefix)
+
         new_cache = {
             "count": n, "collection_id": cid,
             "ids": ids, "docs": docs, "metas": metas,
@@ -11695,6 +11723,8 @@ def _load_corpus(col: SqliteVecCollection, *, hint_count: int | None = None) -> 
             "title_to_paths": title_to_paths,
             "outlinks": outlinks,    # path → [linked titles]
             "backlinks": backlinks,  # title → {paths that link to it}
+            "paths_deduped": paths_deduped,
+            "folders_deduped": folders_deduped,
         }
         _corpus_cache = new_cache
         return new_cache
@@ -40223,6 +40253,12 @@ def _find_duplicate_calendar_event(
     return None
 
 
+_BIRTHDAY_INTENT_RE = re.compile(
+    r"\b(cumple|cumpleañ?os?|anivers[aá]rios?)\b",
+    re.IGNORECASE,
+)
+
+
 def _validate_calendar_recurrence(
     recurrence_text_from_llm: str | None,
     original_query: str | None,
@@ -40248,10 +40284,7 @@ def _validate_calendar_recurrence(
     if not query:
         return recurrence_fixed or None, issues
 
-    has_birthday = bool(
-        re.search(r"\b(cumple|cumpleañ?os?|anivers[aá]rios?)\b",
-                  query, re.IGNORECASE)
-    )
+    has_birthday = bool(_BIRTHDAY_INTENT_RE.search(query))
     if has_birthday and not recurrence_fixed:
         issues.append("birthday/anniversary detected, forced recurrence=yearly")
         recurrence_fixed = "yearly"
@@ -42962,6 +42995,14 @@ _MORNING_PLACEHOLDER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Pre-compiled patterns used inside _sanitize_morning_parts inner loop.
+# CPython does not cache re.match/re.search literals across calls when
+# flags differ from the default — pre-compiling avoids repeated compilation
+# on every bullet in the focus list.
+_BRIEF_DATE_DAILY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_BRIEF_DATE_WEEKLY_RE = re.compile(r"^\d{4}-W\d{1,2}$")
+_BRIEF_DATE_MONTHLY_RE = re.compile(r"^\d{4}-\d{2}$")
+
 
 def _is_placeholder_bullet(text: str) -> bool:
     """True si el bullet del LLM es solo prosa de relleno tipo 'Nada quedó
@@ -43096,9 +43137,9 @@ def _sanitize_morning_parts(parts: dict, ev: dict) -> dict:
                 # Drop YYYY-MM-DD, YYYY-WNN, YYYY-MM, _index — patterns that
                 # are *always* daemon-generated regardless of where they live.
                 if (
-                    re.match(r"^\d{4}-\d{2}-\d{2}$", title)
-                    or re.match(r"^\d{4}-W\d{1,2}$", title)
-                    or re.match(r"^\d{4}-\d{2}$", title)
+                    _BRIEF_DATE_DAILY_RE.match(title)
+                    or _BRIEF_DATE_WEEKLY_RE.match(title)
+                    or _BRIEF_DATE_MONTHLY_RE.match(title)
                     or title == "_index"
                     or title in daemon_titles
                 ):

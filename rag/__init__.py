@@ -119,6 +119,12 @@ from rag._shutdown import shutdown_joblib_loky_pool as _shutdown_joblib_loky_poo
 atexit.register(_shutdown_joblib_loky_pool)
 # === END LOKY SEMAPHORE LEAK FIX ============================================
 
+# Contextual Retrieval (Anthropic Sept 2024) — gated por
+# `RAG_CONTEXTUAL_RETRIEVAL=1`. Importado top-level porque es un módulo
+# liviano (sin imports pesados) y el pipeline de indexing lo invoca
+# en hot path. Ver `rag/contextual_retrieval.py` para contract.
+from rag import contextual_retrieval as _contextual_retrieval  # noqa: E402
+
 import click
 import difflib
 import sqlite_vec
@@ -7615,6 +7621,30 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             "CREATE INDEX IF NOT EXISTS ix_rag_ft_active_queue_state_snoozed"
             " ON rag_ft_active_queue_state(snoozed_until_ts)"
             " WHERE snoozed_until_ts IS NOT NULL",
+        ),
+    ),
+    (
+        # Contextual Retrieval (Anthropic, Sept 2024) — cache durable de los
+        # summaries por chunk. PK = (doc_id, chunk_idx, chunk_hash) garantiza
+        # idempotencia: cualquier cambio en el body del chunk → hash distinto
+        # → miss → regenera. Sobrevive a `rag index --reset` (cache puro,
+        # no se borra con la collection sqlite-vec): un re-embed reusa los
+        # hits sin re-LLM. Versionado por `prompt_version` (en `chunk_hash`)
+        # para invalidar todo al bumpear prompt o modelo helper. Ver
+        # `rag/contextual_retrieval.py` para contract completo.
+        "rag_chunk_contexts",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_chunk_contexts ("
+            " doc_id TEXT NOT NULL,"
+            " chunk_idx INTEGER NOT NULL,"
+            " chunk_hash TEXT NOT NULL,"
+            " summary TEXT NOT NULL,"
+            " prompt_version TEXT NOT NULL,"
+            " created_ts TEXT NOT NULL,"
+            " PRIMARY KEY (doc_id, chunk_idx, chunk_hash)"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_chunk_contexts_doc"
+            " ON rag_chunk_contexts(doc_id)",
         ),
     ),
 )
@@ -26319,6 +26349,19 @@ def _index_single_file(
     embed_texts = [c[0] for c in chunks]
     display_texts = [c[1] for c in chunks]
     parent_texts = [c[2] for c in chunks]
+    # Contextual Retrieval (Anthropic, Sept 2024) — gated por
+    # `RAG_CONTEXTUAL_RETRIEVAL=1`. Si está OFF (default), `contextualize_chunks`
+    # devuelve `embed_texts` sin tocar (bit-idéntico al pre-feature).
+    # Si ON, prependea al embed_text un summary corto que ubica al chunk
+    # dentro del documento. Display_texts NO se modifican — el contexto
+    # vive sólo en el embedding, no en snippets ni en parent_text.
+    embed_texts = _contextual_retrieval.contextualize_chunks(
+        embed_texts=embed_texts,
+        display_texts=display_texts,
+        doc_id=doc_id_prefix,
+        parent_doc_text=text,
+        doc_metadata={"title": path.stem, "folder": folder, "note": path.stem},
+    )
     embeddings = embed(embed_texts)
 
     try:
@@ -26772,6 +26815,17 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
         embed_texts = [c[0] for c in chunks]
         display_texts = [c[1] for c in chunks]
         parent_texts = [c[2] for c in chunks]
+        # Contextual Retrieval (Anthropic, Sept 2024) — mismo wrap que
+        # `_index_single_file`. Gated por `RAG_CONTEXTUAL_RETRIEVAL=1`.
+        # Display_texts/parent_texts no se mutan — el contexto vive
+        # sólo en el embedding.
+        embed_texts = _contextual_retrieval.contextualize_chunks(
+            embed_texts=embed_texts,
+            display_texts=display_texts,
+            doc_id=doc_id_prefix,
+            parent_doc_text=text,
+            doc_metadata={"title": path.stem, "folder": folder, "note": path.stem},
+        )
         embeddings = embed(embed_texts)
 
         # Metadata carries hash + searchable frontmatter fields for filtering.
@@ -26967,9 +27021,14 @@ def _peek_index_lock_holder() -> str:
                    "Single-vault only — los cross-source ETLs (MOZE, WA, Gmail, ...) "
                    "se skippean si el vault no es el target canónico (ver `cross_source_target` "
                    "en ~/.config/obsidian-rag/vaults.json).")
+@click.option("--contextual", is_flag=True,
+              help="Activar Contextual Retrieval (Anthropic Sept 2024) "
+                   "para esta invocación. Setea RAG_CONTEXTUAL_RETRIEVAL=1 "
+                   "internamente. Combinar con --reset para full re-embed "
+                   "con contextos chunk-level (~1 LLM call por chunk).")
 def index(reset: bool, no_contradict: bool, source_opt: str | None,
           since_opt: str | None, dry_run: bool, max_chats: int | None,
-          vault_scope: str | None):
+          vault_scope: str | None, contextual: bool):
     """Indexar notas del vault (incremental, detecta cambios por hash).
 
     En el camino incremental, cada nota nueva o modificada pasa por un check
@@ -27039,11 +27098,39 @@ def index(reset: bool, no_contradict: bool, source_opt: str | None,
             _, _vault_path = resolved[0]
             _vault_ctx = _with_vault(_vault_path)
             _vault_ctx.__enter__()
+        # Contextual Retrieval: el flag CLI fuerza ON el env var sólo para
+        # esta invocación. Snap+restore manual para no contaminar shell
+        # del user si lanzó `rag index --contextual` sin el export. Si ya
+        # estaba seteado por el shell, este snap+restore es no-op.
+        _ctx_prev_env = os.environ.get("RAG_CONTEXTUAL_RETRIEVAL")
+        if contextual:
+            os.environ["RAG_CONTEXTUAL_RETRIEVAL"] = "1"
+            _contextual_retrieval.stats_reset()
+            console.print(
+                "[cyan]Contextual Retrieval activo[/cyan] — cada chunk "
+                "obtiene un summary contextual via qwen2.5:3b. "
+                "Cache: rag_chunk_contexts en telemetry.db."
+            )
         try:
             _do_index(reset, no_contradict, source_opt, since_opt, dry_run, max_chats)
+            if contextual:
+                snap = _contextual_retrieval.stats_snapshot()
+                console.print(
+                    f"[dim]Contextual Retrieval stats: "
+                    f"hits={snap.get('hits', 0)} · "
+                    f"misses={snap.get('misses', 0)} · "
+                    f"errors={snap.get('errors', 0)} · "
+                    f"skipped_short={snap.get('skipped_short', 0)}[/dim]"
+                )
         finally:
             if _vault_ctx is not None:
                 _vault_ctx.__exit__(None, None, None)
+            # Restaurar el env var aunque _do_index haya raiseado.
+            if contextual:
+                if _ctx_prev_env is None:
+                    os.environ.pop("RAG_CONTEXTUAL_RETRIEVAL", None)
+                else:
+                    os.environ["RAG_CONTEXTUAL_RETRIEVAL"] = _ctx_prev_env
     finally:
         _index_lock_ctx.__exit__(None, None, None)
 

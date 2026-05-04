@@ -5530,7 +5530,12 @@ def _ttl_for_intent(intent: str | None) -> int:
     return _SEMANTIC_CACHE_DEFAULT_TTL
 
 
-def _cached_entry_is_stale(paths: list[str], cached_ts: float) -> bool:
+def _cached_entry_is_stale(
+    paths: list[str],
+    cached_ts: float,
+    *,
+    mtime_cache: dict[str, float | None] | None = None,
+) -> bool:
     """Return True if any of the cached entry's source paths has mtime > cached_ts.
 
     Post 2026-04-23 per-entry freshness check. The corpus_hash no longer
@@ -5557,6 +5562,13 @@ def _cached_entry_is_stale(paths: list[str], cached_ts: float) -> bool:
       a silent cache miss that forces a full retrieve+LLM round-trip.
     - Unresolvable vault_path / permission error → assume fresh (same
       rationale: don't blow up the cache for infra issues).
+
+    `mtime_cache` (2026-05-04 perf): si el caller itera sobre muchas
+    cached rows en el mismo lookup pass (`semantic_cache_lookup`),
+    pasarle un dict vacío `{}` permite memoizar (path → mtime|None) —
+    el mismo path repetido en N entries paga 1 stat() en vez de N. None
+    preserva el behavior legacy (sin memoization). Empíricamente con 5
+    entries × 2 paths solapados: 10 stat() → 2 (reducción 80%).
     """
     if not paths:
         return False
@@ -5567,12 +5579,22 @@ def _cached_entry_is_stale(paths: list[str], cached_ts: float) -> bool:
     for p in paths:
         try:
             full = vault / p
-            if not full.exists():
+            full_key = str(full)
+            if mtime_cache is not None and full_key in mtime_cache:
+                mt = mtime_cache[full_key]
+            else:
+                if not full.exists():
+                    mt = None
+                else:
+                    mt = full.stat().st_mtime
+                if mtime_cache is not None:
+                    mtime_cache[full_key] = mt
+            if mt is None:
                 # Source missing — coarse-grained corpus_hash delta will
                 # catch this on the next index; don't force an unnecessary
                 # cache miss here.
                 continue
-            if full.stat().st_mtime > cached_ts:
+            if mt > cached_ts:
                 return True
         except Exception:
             # Permission error / race → assume fresh (best-effort).
@@ -5661,6 +5683,12 @@ def semantic_cache_lookup(
 
     best_cos = -1.0
     best = None
+    # Memoization local: (full_path → mtime|None) reusable entre
+    # entries del mismo lookup. Si N entries citan el mismo set de
+    # notas (caso típico — el corpus no es disjoint), reduce stat()
+    # calls de O(entries × paths) a O(unique paths). Win medido: 80%
+    # reducción con 5 entries × 2 paths solapados.
+    _mtime_cache: dict[str, float | None] = {}
     for row in rows:
         rid, ts_str, question, blob, dim, intent, ttl_seconds, response, paths_json, scores_json, top_score = row
         # TTL filter — parse ts as ISO-8601.
@@ -5697,7 +5725,7 @@ def semantic_cache_lookup(
             # Per-entry freshness check (post 2026-04-23): skip rows whose
             # source notes have been edited after we stored the response.
             paths = json.loads(paths_json) if paths_json else []
-            if _cached_entry_is_stale(paths, cached_ts):
+            if _cached_entry_is_stale(paths, cached_ts, mtime_cache=_mtime_cache):
                 probe["skipped_stale"] += 1
                 continue
             if cos > best_cos or best is None:

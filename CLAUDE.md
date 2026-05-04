@@ -41,17 +41,31 @@ Esta regla NO cambia entre sesiones — es el comportamiento default. El usuario
 
 ## Agent dispatch rule
 
-**Any task that will edit ≥3 files MUST go through `pm` first.** No preguntas — invocar directamente:
+**Invocar `pm` ANTES de empezar cuando se cumple AL MENOS UNO de estos triggers** (criterio cualitativo — el file count es hint, no gate):
+
+1. **Cruza ≥2 agent domains** (ej. retrieval + brief-curator, llm + ingestion, integrations + vault-health).
+2. **Toca un invariant listado** en [`pm.md`](.claude/agents/pm.md) → sección "Invariants you must surface": schema version `_COLLECTION_BASE`, eval floor (singles/chains CI bounds), reranker `device="mps"` + `float16`, HELPER model binding (`reformulate_query` + `qwen2.5:3b`), confidence gates (`CONFIDENCE_RERANK_MIN`, `CONFIDENCE_DEEP_THRESHOLD`), Ollama `keep_alive=-1`, session-id regex, local-first rule (no cloud APIs nuevas).
+3. **Hay peers activos** (`mcp__claude-peers__list_peers(scope: "repo")` > 1) Y su `set_summary` se solapa con el zone que vas a tocar — el PM coordina o recomienda `send_message` al peer.
+4. **No sabés qué agent owns la work** — el PM rutea.
+
+Invocación directa:
 
 ```
 Agent(subagent_type: "pm", prompt: "<goal + context + ruled-out + invariants at risk>")
 ```
 
-The PM returns a dispatch plan (tasks, dependencies, parallel-safe flags, risks, validation). The main session executes the plan by spawning the named agents in the prescribed order — never silently skips PM and improvises.
+El PM devuelve dispatch plan (tasks, dependencies, parallel-safe flags, risks, validation). La sesión principal ejecuta el plan spawneando los agents nombrados — nunca improvisa sobre un plan.
 
-Tasks that touch ≤2 files go directly to the owning agent (`rag-retrieval`, `rag-llm`, `rag-brief-curator`, `rag-ingestion`, `rag-vault-health`, `rag-integrations`, `developer-{1,2,3}`). Roster + ownership lives in `.claude/agents/README.md`.
+**Skip PM** (ir directo al owning agent o hacerlo inline) cuando:
 
-When peers are active (`mcp__claude-peers__list_peers(scope: "repo")` returns >1), even ≤2-file tasks may need PM coordination — flag overlapping zones before editing.
+- **Edits mecánicos**: rename masivo, ruff/format, bump de versión, imports auto-ordenados, fix de typo — sin importar si toca 15 archivos.
+- **Single-domain**, incluso con N archivos del mismo subsystem (ej. 5 archivos todos dentro de `rag-ingestion`).
+- **Exploración / Q&A / review de diffs** — no hay edits.
+- **Fix trivial + obvio** en archivo que ya sabés qué agent owns (el PM mismo dice "don't invent ceremony" en [`pm.md`](.claude/agents/pm.md) líneas 105, 112).
+
+Roster + ownership por agent vive en [`.claude/agents/README.md`](.claude/agents/README.md). Owning agents: `rag-retrieval`, `rag-llm`, `rag-brief-curator`, `rag-ingestion`, `rag-vault-health`, `rag-integrations`, `developer-{1,2,3}` (generalistas para CLI scaffolding, tests, mcp_server.py, plists, bug fixes cross-subsystem).
+
+**Señal de smell** (no regla dura): si vas a tocar ≥3 archivos Y no podés nombrar un único agent owner → probablemente sí necesitás PM. Si podés nombrarlo, andá directo.
 
 ### Custom agent profiles requieren reload de la sesión
 

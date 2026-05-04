@@ -10836,6 +10836,24 @@ def _drain_conversation_writers() -> None:
 
 
 @_on_shutdown
+def _signal_rag_daemon_loops() -> None:
+    """Señalizar a los daemon loops cooperativos de `rag` que paren.
+
+    Hace que `_wal_checkpointer_loop`, `_memory_pressure_watchdog_loop`
+    y `_periodic_mps_cache_drop_loop` retornen en <1s en vez de quedarse
+    bloqueados hasta el próximo tick (hasta 60s con MPS cache drop
+    default). Los threads son `daemon=True` así que el proceso baja
+    igual; el beneficio es shutdown más limpio + menos race con la
+    DB cuando uvicorn drena.
+    """
+    try:
+        from rag import request_daemon_shutdown as _rds
+        _rds()
+    except Exception as exc:
+        print(f"[lifespan-shutdown] _signal_rag_daemon_loops falló: {exc}", flush=True)
+
+
+@_on_shutdown
 def _shutdown_joblib_loky_pool() -> None:
     """Drain el joblib/loky reusable executor al stop del lifespan de FastAPI.
 

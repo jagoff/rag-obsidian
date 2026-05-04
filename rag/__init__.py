@@ -6021,6 +6021,15 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             # last N days by path). Without it the path-only index requires
             # a filter pass on ts for every bucket.
             "CREATE INDEX IF NOT EXISTS ix_rag_behavior_path_ts ON rag_behavior(path, ts)",
+            # Composite (source, event, ts) — cubre los queries con
+            # `WHERE source='brief' AND event IN (...)` (training data
+            # generation, _brief_synthetic_cases) y los GROUP BY event
+            # filtrados por source (web/learning_queries.py dashboard).
+            # `source` es low-cardinality (~5 valores: cli, whatsapp,
+            # web, brief, ambient) → índice compacto, evita full scan
+            # de ~50K rows en 90d. Quick win audit 2026-05-04.
+            "CREATE INDEX IF NOT EXISTS ix_rag_behavior_source_event_ts "
+            "ON rag_behavior(source, event, ts)",
             # Mismo escenario que `ix_rag_queries_trace_id` arriba: el
             # partial-index sobre `trace_id` vive AHORA en
             # `_migrate_trace_id_columns()` para que corra DESPUÉS del
@@ -6049,6 +6058,15 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             # SUM(CASE WHEN ...) sobre json_extract en hot path.
             "CREATE INDEX IF NOT EXISTS ix_rag_feedback_corrective "
             "ON rag_feedback(json_extract(extra_json, '$.corrective_path'))",
+            # Composite (rating, ts) — cubre los queries en hot path
+            # `WHERE rating != 0 AND ts > ?` (retrieve() llama
+            # _compute_source_feedback_amplification per-request) y
+            # `WHERE rating = 1 AND ts > ?` (training data gen del
+            # nightly tune). `rating` es ultra-low-cardinality (3
+            # valores: -1, 0, 1) → índice compacto. Quick win audit
+            # 2026-05-04.
+            "CREATE INDEX IF NOT EXISTS ix_rag_feedback_rating_ts "
+            "ON rag_feedback(rating, ts)",
         ),
     ),
     (
@@ -6458,6 +6476,14 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             # Audit R2-7 #2.
             "CREATE INDEX IF NOT EXISTS ix_rag_anticipate_candidates_kind_ts"
             " ON rag_anticipate_candidates(kind, ts)",
+            # Composite (sent, id DESC) para `_anticipate_fetch_log` con
+            # `only_sent=True` (rag/anticipatory.py:754) y el audit query
+            # `MAX(ts) WHERE sent=1` (scripts/audit_telemetry_health.py).
+            # `sent` es boolean → 2 valores → índice ultra-compacto.
+            # Permite reverse-scan sin sort sobre id DESC. Quick win
+            # audit 2026-05-04.
+            "CREATE INDEX IF NOT EXISTS ix_rag_anticipate_candidates_sent_id"
+            " ON rag_anticipate_candidates(sent, id DESC)",
         ),
     ),
     (
@@ -13642,6 +13668,28 @@ _memory_watchdog_lock = threading.Lock()
 _wal_checkpointer_started = False
 _wal_checkpointer_lock = threading.Lock()
 
+# Shutdown signal para daemon loops. Cada loop hace
+# `_daemon_shutdown_event.wait(timeout=interval)` en lugar de
+# `time.sleep(interval)` — así un caller externo (lifespan handler de
+# FastAPI, signal handler, test fixture) puede pedir shutdown limpio
+# llamando `request_daemon_shutdown()` y los loops responden en <1s
+# en vez de quedarse bloqueados hasta el próximo tick (hasta 60s con
+# el MPS cache drop default). Los threads siguen siendo `daemon=True`
+# así que un proceso que muere por SIGKILL no necesita esto — el
+# beneficio es tests más rápidos + shutdown ordenado del web server.
+_daemon_shutdown_event = threading.Event()
+
+
+def request_daemon_shutdown() -> None:
+    """Señalizar a todos los daemon loops cooperativos que terminen.
+
+    Idempotente. Llamar desde lifespan handlers, signal handlers o
+    teardown de tests. Los loops chequean el event en cada `wait()`
+    (en vez de `time.sleep`) y retornan en cuanto está set. NO hace
+    join — los threads son `daemon=True`.
+    """
+    _daemon_shutdown_event.set()
+
 
 def _wal_checkpoint_once(path: str) -> tuple[bool, int]:
     """Ejecuta `PRAGMA wal_checkpoint(PASSIVE)` sobre una DB.
@@ -13680,7 +13728,10 @@ def _wal_checkpointer_loop(interval: int) -> None:
     # resolvemos los paths acá para tolerar reconfigs futuras.
     while True:
         try:
-            time.sleep(interval)
+            # `wait()` retorna True si el event fue set (shutdown solicitado),
+            # False si timeout — equivalente a sleep pero interruptible.
+            if _daemon_shutdown_event.wait(timeout=interval):
+                return
             for name in ("ragvec.db", _TELEMETRY_DB_FILENAME):
                 _wal_checkpoint_once(str(DB_PATH / name))
         except Exception as exc:
@@ -13866,7 +13917,8 @@ def _memory_pressure_watchdog_loop(threshold: float, interval: int) -> None:
     """Loop del thread daemon. Corre hasta que el proceso termina."""
     while True:
         try:
-            time.sleep(interval)
+            if _daemon_shutdown_event.wait(timeout=interval):
+                return
             pct = _system_memory_used_pct()
             if pct is None:
                 continue
@@ -13937,7 +13989,8 @@ def _periodic_mps_cache_drop_loop(interval: int) -> None:
     """
     while True:
         try:
-            time.sleep(interval)
+            if _daemon_shutdown_event.wait(timeout=interval):
+                return
             _torch_mps_empty_cache()
             # gc.collect() ayuda a liberar tensors orphan (referencias
             # circulares en buffers de Python) que MPS no tocaría hasta

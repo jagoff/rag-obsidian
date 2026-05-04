@@ -60474,3 +60474,29 @@ from rag.cli.vault import (  # noqa: E402, F401
 cli = _cli_group_root  # restaurar attribute (sub-package quedó en sys.modules)
 del _cli_group_root
 cli.add_command(vault)  # registrar el grupo extraído manualmente
+
+
+# ── Allowlist opcional de top-level CLI commands (RAG_CLI_KEEP) ──────────────
+# Controlada por el env var `RAG_CLI_KEEP` (CSV de nombres de comandos). Si
+# está seteada, oculta del Click tree todos los comandos top-level que no
+# estén en la lista — `rag --help` muestra solo los que quedan, y los demás
+# devuelven `No such command` aunque el código sigue presente en el módulo.
+# Default (var ausente o vacía) = no filtra nada.
+#
+# Uso: el harness en `.devin/mcp-profiles/` inyecta esta var cuando un
+# profile define `rag_cli_keep`. Esto NO reduce el harness del agente
+# (los MCP no llaman al CLI) — sirve para limpiar `rag --help` y reducir
+# distracciones en sesiones acotadas. Es backwards-compatible.
+def _apply_cli_keep_filter() -> None:
+    raw = os.environ.get("RAG_CLI_KEEP", "").strip()
+    if not raw:
+        return
+    keep = {n.strip() for n in raw.split(",") if n.strip()}
+    if not keep:
+        return
+    for name in list(cli.commands.keys()):
+        if name not in keep:
+            cli.commands.pop(name)
+
+
+_apply_cli_keep_filter()

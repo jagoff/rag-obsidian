@@ -8,5 +8,5 @@
     "time"
   ],
   "rag_mcp_tools": ["query", "read_note", "list_notes", "stats"],
-  "rag_cli_groups": ["core", "ops"]
+  "rag_cli_keep": ["chat", "query", "index", "stats", "start", "stop", "status", "log", "capture", "do"]
 }

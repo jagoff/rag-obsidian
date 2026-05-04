@@ -83,18 +83,25 @@ El harness inyecta `RAG_MCP_TOOLS` en `env` de la entry `obsidian-rag` al
 aplicar el profile. Si el set vacío matchea ninguna tool, el MCP loggea
 WARN al stderr y arranca sin tools (no crash).
 
-### 3. Grupos del CLI `rag` (qué subcommands se cargan)
+### 3. Top-level commands del CLI `rag` (qué subcommands se ven)
 
-Análogo: el CLI `rag` lee `RAG_CLI_GROUPS` y filtra qué grupos se registran
-al boot del Click app. **Esto NO reduce el harness del agente** — solo
-afecta `rag --help` y autocomplete para humanos. Está implementado por
-consistencia con los otros niveles, pero el ahorro real está en (1) y (2).
+Análogo: el CLI `rag` lee `RAG_CLI_KEEP` (CSV de nombres de comandos
+top-level) y oculta del Click tree todos los demás. **Esto NO reduce el
+harness del agente** — los MCP no llaman al CLI. Sirve para limpiar
+`rag --help` (de ~100 commands a un puñado) y reducir distracciones en
+sesiones acotadas.
+
+Implementado como allowlist (no como "grupos") porque el CLI es flat:
+~100 `@cli.command()` sin metadata de grupo. Mantener una lista
+explícita de comandos a conservar es más simple y preciso.
 
 ```json
 {
-  "rag_cli_groups": ["core", "ops"]
+  "rag_cli_keep": ["chat", "query", "index", "stats", "start", "stop", "status"]
 }
 ```
+
+Default (var ausente) = todos los comandos visibles.
 
 ## Profiles disponibles
 
@@ -102,7 +109,8 @@ consistencia con los otros niveles, pero el ahorro real está en (1) y (2).
   Baseline / restore. Auto-regenerable: `rag-harness sync-full`.
 - **`rag-only`**: foco en query/edición de vault. 4 MCPs (`obsidian-rag`,
   `obsidian`, `filesystem`, `time`), 4 tools del RAG (`query`, `read_note`,
-  `list_notes`, `stats`), 2 grupos del CLI (`core`, `ops`). Pensado para
+  `list_notes`, `stats`), 10 commands del CLI (`chat`, `query`, `index`,
+  `stats`, `start`, `stop`, `status`, `log`, `capture`, `do`). Pensado para
   sesiones de "leer y consultar el vault" sin necesidad de comms ni cloud.
 
 Para crear más: `rag-harness new <nombre> --from rag-only` y editar a mano.

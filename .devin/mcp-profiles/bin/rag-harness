@@ -123,15 +123,15 @@ def _build_mcp_section(profile: dict, inventory: dict) -> dict:
     if "obsidian-rag" in out:
         env = out["obsidian-rag"].setdefault("env", {})
         tools = profile.get("rag_mcp_tools")
-        groups = profile.get("rag_cli_groups")
+        keep = profile.get("rag_cli_keep")
         if tools:
             env["RAG_MCP_TOOLS"] = ",".join(tools)
         else:
             env.pop("RAG_MCP_TOOLS", None)
-        if groups:
-            env["RAG_CLI_GROUPS"] = ",".join(groups)
+        if keep:
+            env["RAG_CLI_KEEP"] = ",".join(keep)
         else:
-            env.pop("RAG_CLI_GROUPS", None)
+            env.pop("RAG_CLI_KEEP", None)
 
     return out
 
@@ -267,10 +267,10 @@ def cmd_diff(a: str, b: str):
         click.echo(f"\nrag_mcp_tools:")
         click.echo(f"  {a}: {sorted(ta) if ta else '<all>'}")
         click.echo(f"  {b}: {sorted(tb) if tb else '<all>'}")
-    ga = set(pa.get("rag_cli_groups") or [])
-    gb = set(pb.get("rag_cli_groups") or [])
+    ga = set(pa.get("rag_cli_keep") or [])
+    gb = set(pb.get("rag_cli_keep") or [])
     if ga or gb:
-        click.echo(f"\nrag_cli_groups:")
+        click.echo(f"\nrag_cli_keep:")
         click.echo(f"  {a}: {sorted(ga) if ga else '<all>'}")
         click.echo(f"  {b}: {sorted(gb) if gb else '<all>'}")
 
@@ -311,7 +311,7 @@ def cmd_sync_full():
         "description": "Snapshot del set completo. Baseline para restore. Auto-regenerable: `rag-harness sync-full`.",
         "mcps": keys,
         "rag_mcp_tools": None,
-        "rag_cli_groups": None,
+        "rag_cli_keep": None,
     }
     _save_json(full_path, full)
     click.echo(f"full.json regenerado con {len(keys)} MCPs.")

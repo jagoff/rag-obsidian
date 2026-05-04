@@ -18715,6 +18715,190 @@ def _titles_from_paths(paths: list[str] | None, limit: int = 6) -> list[str]:
     return seen
 
 
+# ── Anaphora resolver (Quick Win #1, 2026-05-04) ─────────────────────────────
+# Quick-win dedicated upstream del reformulate. Detecta queries cortas tipo
+# "y en Madrid?", "y para mañana?", "y la otra opción?" y las re-escribe con
+# contexto del turno previo ANTES de llegar a `retrieve()`. Razón: el bug
+# wave-8 mostró que `reformulate_query` no siempre expande la referencia
+# anafórica (regresa la query tal cual o sólo la "limpia") y eso tira el
+# retrieve a chunks irrelevantes en chains multi-turn.
+#
+# Diseño:
+#   - Detector regex-only (microsegundos) que decide si vale gastar 1 helper
+#     LLM call. False cuando la query es self-contained (≥8 tokens y no
+#     empieza con conector). Default 0% overhead cuando no aplica.
+#   - Resolver llama qwen2.5:3b con HELPER_OPTIONS (deterministic, seed=42).
+#     Cache LRU 128 entries por (history_hash, query) — sesiones largas con
+#     refresh del mismo turn no re-pagan el LLM call.
+#   - Silent-fail → return original query (mismo contract que
+#     `reformulate_query`).
+#   - Telemetría en `extra_json`: anaphora_resolved (bool),
+#     anaphora_original (str), anaphora_rewritten (str).
+#   - Gate: `RAG_ANAPHORA_RESOLVER` (default ON, "0"/"false"/"no" la apaga).
+#     Esto es quick-win, no experimental — debería estar prendido en prod
+#     desde día uno.
+#
+# NO modifica `reformulate_query` existente — corre upstream (en
+# `multi_retrieve`) ANTES de la primera llamada a `retrieve()`.
+
+# Conectores típicos en español rioplatense que indican follow-up con
+# referencia anafórica al turno anterior. Ordenados longest-first para
+# que la regex no haga match parcial cuando hay un prefix más largo
+# (ej. "y para" antes que "y").
+_ANAPHORA_CONNECTORS_RE = re.compile(
+    r"^\s*(?:"
+    r"y\s+para\b"
+    r"|y\s+en\b"
+    r"|y\s+de\b"
+    r"|y\s+la\b"
+    r"|y\s+el\b"
+    r"|y\s+los\b"
+    r"|y\s+las\b"
+    r"|y\s+eso\b"
+    r"|y\s+otro\b"
+    r"|y\s+otra\b"
+    r"|también\b"
+    r"|tambien\b"
+    r"|ahora\b"
+    r"|pero\b"
+    r"|y\b"
+    r")",
+    re.IGNORECASE,
+)
+
+# Token threshold debajo del cual la query es "corta" y candidata a
+# anaphora resolution incluso sin un conector explícito. 8 tokens captura
+# casos reales tipo "qué pasa con eso?" / "y la otra?" sin meter ruido
+# en queries autónomas tipo "qué es el ikigai en mi vault" (5 tokens
+# pero auto-contenida) — la regla compuesta es <8 tokens **o** comienza
+# con conector. Una query corta SIN conector sigue siendo no-anafórica
+# porque el detector requiere `len(history) >= 1` AND (corta OR conector).
+_ANAPHORA_SHORT_TOKEN_THRESHOLD = 8
+
+
+def _is_anaphoric_query(query: str, history: list[dict] | None) -> bool:
+    """True si la query parece referirse al turno previo y necesita
+    expansión usando contexto.
+
+    Reglas:
+      - Si no hay historial → False (no hay nada a qué referirse).
+      - Si la query empieza con un conector (`y`, `pero`, `también`,
+        `ahora`, `y para`, `y en`, etc.) → True.
+      - Si la query tiene <8 tokens → True (queries cortas en chats
+        casi siempre son follow-ups).
+      - En cualquier otro caso → False (self-contained).
+
+    No llama al LLM. Microsegundos. Seguro para usar inline en el hot path.
+    """
+    if not query or not history or len(history) < 1:
+        return False
+    q_stripped = query.strip()
+    if not q_stripped:
+        return False
+    # Conector explícito → siempre anafórica.
+    if _ANAPHORA_CONNECTORS_RE.match(q_stripped):
+        return True
+    # Query corta → asumir anafórica (chats con history rara vez tienen
+    # follow-ups self-contained <8 tokens).
+    tokens = q_stripped.split()
+    if len(tokens) < _ANAPHORA_SHORT_TOKEN_THRESHOLD:
+        return True
+    return False
+
+
+# LRU cache 128 entries por (history_hash, query). El cache vive al nivel
+# del módulo así sobrevive entre llamadas del mismo proceso (web server,
+# rag serve, etc.) y entre turnos de la misma sesión.
+@functools.lru_cache(maxsize=128)
+def _cached_anaphora_resolution(
+    history_hash: str, query: str, history_blob: str,
+) -> str:
+    """Backing store del LRU cache de `_resolve_anaphora`. El history_hash
+    se usa como cache key (rápido, fixed-size) pero pasamos el
+    history_blob raw también para reconstruir el prompt sin tener que
+    almacenar la list[dict] (lru_cache exige hashable args).
+    """
+    prompt = (
+        "Tu tarea: reescribir la query actual del usuario expandiendo "
+        "cualquier referencia anafórica (pronombres, demostrativos, "
+        "elipsis) usando el historial. Reglas:\n"
+        "1. Si la query ya es self-contained (todas las entidades "
+        "explícitas, sin conectores), devolvela tal cual.\n"
+        "2. Si la query empieza con un conector ('y', 'pero', 'también', "
+        "'ahora', 'y para', 'y en', etc.), expandí la referencia: tomá "
+        "la entidad o tema del último turno y completala.\n"
+        "3. NO inventes entidades que no aparezcan en el historial o la "
+        "query.\n"
+        "4. Mantené el registro y la longitud aproximada.\n\n"
+        f"Historial:\n{history_blob}\n\n"
+        f"Query actual: \"{query}\"\n\n"
+        "Respondé SOLO con la query reescrita, sin explicación ni comillas."
+    )
+    try:
+        resp = _helper_client().chat(
+            model=HELPER_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options={**HELPER_OPTIONS, "num_ctx": 1024, "num_predict": 96},
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        )
+        raw = (resp.message.content or "").strip().strip('"').strip("'")
+        # Defensive: si el helper devolvió string vacío o algo absurdo
+        # (ej. una explicación pegada), fallback a la original. Un
+        # output >3× la longitud del input es señal de que el modelo
+        # se fue por la tangente.
+        if not raw:
+            return query
+        if len(raw) > 3 * max(len(query), 30):
+            return query
+        return raw
+    except Exception as exc:
+        try:
+            _silent_log("anaphora_resolver_failed", exc)
+        except Exception:
+            pass
+        return query
+
+
+def _resolve_anaphora(query: str, history: list[dict]) -> str:
+    """Reescribe `query` expandiendo referencias anafóricas usando los
+    últimos turnos de `history`. Cache LRU 128 entries.
+
+    Silent-fail → devuelve la query original si el helper LLM falla
+    (timeout, 503, etc.). Mismo contract que `reformulate_query`.
+
+    La signature es estable: callers nunca ven una excepción, y el
+    return type es siempre `str`.
+    """
+    if not query or not history:
+        return query
+    # Tomamos los últimos 4 turnos (2 user + 2 asistente máx) como contexto.
+    # Más de eso satura el helper sin signal extra para anaphora resolution
+    # (qué se dijo en el turno -3 raramente cambia "y eso?" en el turno N).
+    recent = history[-4:]
+    history_blob = "\n".join(
+        f"{'Usuario' if m.get('role') == 'user' else 'Asistente'}: "
+        f"{(m.get('content') or '')[:240]}"
+        for m in recent
+    )
+    if not history_blob.strip():
+        return query
+    history_hash = hashlib.sha256(
+        history_blob.encode("utf-8", errors="replace"),
+    ).hexdigest()[:16]
+    return _cached_anaphora_resolution(history_hash, query, history_blob)
+
+
+def _anaphora_resolver_enabled() -> bool:
+    """Gate: `RAG_ANAPHORA_RESOLVER` env var. Default ON.
+
+    Acepta "0" / "false" / "no" para apagar; cualquier otro valor (incl.
+    unset / vacío) lo deja prendido. Mismo patrón que
+    `_entity_lookup_enabled()`.
+    """
+    val = os.environ.get("RAG_ANAPHORA_RESOLVER", "").strip().lower()
+    return val not in ("0", "false", "no")
+
+
 def reformulate_query(
     question: str,
     history: list[dict],
@@ -19433,6 +19617,20 @@ class ChatTurnResult:
             # (RAG_MMR=0 + RAG_MMR_FOLDER_PENALTY=0) o no-op (ya diverso).
             # >0 = N slots reordenados por MMR post-rerank pre top-k cap.
             "mmr_applied": int(rr.get("mmr_applied", 0) or 0),
+            # Anaphora resolver telemetry (Quick Win #1, 2026-05-04). Los
+            # valores vienen de `multi_retrieve` via `rr.extras`. Default
+            # silent: bool=False + strings vacíos. Cuando dispara, el
+            # rewrite queda persistido en extra_json del query log para
+            # poder medir tasa de rewrite en queries reales.
+            "anaphora_resolved": bool(
+                (rr.extras or {}).get("anaphora_resolved", False),
+            ),
+            "anaphora_original": str(
+                (rr.extras or {}).get("anaphora_original", "") or "",
+            ),
+            "anaphora_rewritten": str(
+                (rr.extras or {}).get("anaphora_rewritten", "") or "",
+            ),
         }
 
 
@@ -21721,6 +21919,39 @@ def multi_retrieve(
         )
     _retrieve_fn = deep_retrieve if deep else retrieve
 
+    # ── Anaphora resolver (Quick Win #1) — upstream del retrieve ─────────
+    # Si la query es follow-up corto / con conector ("y en Madrid?",
+    # "y para mañana?"), expandimos la referencia con contexto del
+    # turno previo ANTES de pasarla al per-vault retrieve(). Mismo
+    # rewrite para todos los vaults (consistencia + 1 sola helper call
+    # cross-vault). Silent-fail → query original.
+    _anaphora_telemetry: dict = {
+        "anaphora_resolved": False,
+        "anaphora_original": "",
+        "anaphora_rewritten": "",
+    }
+    if (
+        _anaphora_resolver_enabled()
+        and history
+        and _is_anaphoric_query(question, history)
+    ):
+        _anaphora_original = question
+        _anaphora_rewritten = _resolve_anaphora(question, history)
+        # Sólo marcamos `resolved=True` si el helper devolvió algo
+        # distinto. Cuando devuelve la query original (silent-fail o
+        # query auto-contenida según el LLM), no inflamos la telemetría
+        # con falsos positivos.
+        if (
+            _anaphora_rewritten
+            and _anaphora_rewritten.strip() != _anaphora_original.strip()
+        ):
+            _anaphora_telemetry = {
+                "anaphora_resolved": True,
+                "anaphora_original": _anaphora_original,
+                "anaphora_rewritten": _anaphora_rewritten,
+            }
+            question = _anaphora_rewritten
+
     # Camino corto: un solo vault → evitamos el overhead de merge.
     if len(vaults) == 1:
         name, path = vaults[0]
@@ -21742,6 +21973,17 @@ def multi_retrieve(
         # uno). Via __setitem__ funciona con RetrieveResult y con dicts
         # legacy (tests que mockean _retrieve_fn con un dict plano).
         r["vault_scope"] = [name]
+        # Surface anaphora telemetry so `to_log_event` puede leerla del
+        # `extras` y mandarla al rag_queries.extra_json. Defensivo:
+        # mockeos del retrieve_fn pueden devolver dicts sin `extras`.
+        try:
+            _r_extras = r.get("extras") if hasattr(r, "get") else None
+            if _r_extras is None:
+                _r_extras = {}
+                r["extras"] = _r_extras
+            _r_extras.update(_anaphora_telemetry)
+        except Exception:
+            pass
         return r
 
     all_items: list[tuple[float, str, dict]] = []
@@ -21845,6 +22087,9 @@ def multi_retrieve(
         fast_path=_multi_fast_path,
         contradiction_penalty_applied=_mv_contradiction_count,
         mmr_applied=int(_mv_mmr_count_acc),
+        # Anaphora telemetry surfaced para que `to_log_event` lo levante
+        # al rag_queries.extra_json (resolved/original/rewritten).
+        extras=dict(_anaphora_telemetry),
     )
 
 
@@ -55629,6 +55874,10 @@ _CONFIG_VARS: tuple[tuple[str, str, str, str], ...] = (
      "ε-exploration: 10% chance de swap top-3 con rank 4-7. Generado counterfactuals para tune online."),
     ("RAG_EXPAND_MIN_TOKENS", "4", "int",
      "Queries con <N tokens skippean expand_queries() (paraphrase)."),
+    ("RAG_ANAPHORA_RESOLVER", "1", "bool",
+     "Quick Win #1: resolver de anáfora upstream del retrieve para "
+     "queries follow-up tipo 'y en Madrid?'. Default ON; \"0\"/\"false\""
+     "/\"no\" la apaga."),
 
     # — Feature #2 & friends
     ("RAG_SCORE_CALIBRATION", "", "bool",

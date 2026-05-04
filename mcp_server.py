@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import threading
 import time
 
@@ -42,6 +43,40 @@ os.environ.setdefault("TQDM_DISABLE", "1")
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("obsidian-rag")
+
+
+# Allowlist opcional de tools — controlada por `RAG_MCP_TOOLS` (CSV).
+# Default (var ausente o vacía) = todas las tools registradas. Acepta el
+# nombre completo (`rag_query`) o el sufijo corto (`query`). El harness
+# (.devin/mcp-profiles/) inyecta este env var para reducir la superficie
+# del MCP cuando el usuario activa un profile acotado. Diseñado para que
+# nada cambie si el var no está seteado — backwards-compatible.
+def _allowed_tools() -> set[str] | None:
+    raw = os.environ.get("RAG_MCP_TOOLS", "").strip()
+    if not raw:
+        return None
+    return {t.strip() for t in raw.split(",") if t.strip()}
+
+
+_ALLOWED_TOOLS = _allowed_tools()
+_REGISTERED_TOOLS: list[str] = []
+_SKIPPED_TOOLS: list[str] = []
+
+
+def _maybe_tool(fn):
+    """Wrapper sobre `mcp.tool()` que respeta `RAG_MCP_TOOLS`.
+
+    Si el env var no está seteado o lista la tool (por nombre completo o
+    por sufijo sin `rag_`), la registra normalmente. Caso contrario la
+    deja como función Python sin exponer al protocolo MCP.
+    """
+    name = fn.__name__
+    short = name[4:] if name.startswith("rag_") else name
+    if _ALLOWED_TOOLS is None or name in _ALLOWED_TOOLS or short in _ALLOWED_TOOLS:
+        _REGISTERED_TOOLS.append(name)
+        return mcp.tool()(fn)
+    _SKIPPED_TOOLS.append(name)
+    return fn
 
 # Lazy-import `rag` — Claude Code spawns one MCP server per session, and
 # importing rag.py pulls in torch + sentence-transformers + sqlite-vec (~4 GB
@@ -93,7 +128,7 @@ def _load_rag():
     return _rag
 
 
-@mcp.tool()
+@_maybe_tool
 def rag_query(
     question: str,
     k: int = 5,
@@ -209,7 +244,7 @@ def rag_query(
     return out
 
 
-@mcp.tool()
+@_maybe_tool
 def rag_read_note(path: str) -> str:
     """Read the full contents of a note from the vault.
 
@@ -249,7 +284,7 @@ def rag_read_note(path: str) -> str:
         return f"Error: failed to read {path} ({e})"
 
 
-@mcp.tool()
+@_maybe_tool
 def rag_list_notes(
     folder: str | None = None,
     tag: str | None = None,
@@ -290,7 +325,7 @@ def rag_list_notes(
     return list(seen.values())
 
 
-@mcp.tool()
+@_maybe_tool
 def rag_links(
     query: str,
     k: int = 5,
@@ -328,7 +363,7 @@ def rag_links(
     ]
 
 
-@mcp.tool()
+@_maybe_tool
 def rag_stats() -> dict:
     """Return indexing metadata: chunk count, models, collection name."""
     _touch()
@@ -363,7 +398,7 @@ def rag_stats() -> dict:
 #     success).
 
 
-@mcp.tool()
+@_maybe_tool
 def rag_capture(
     text: str,
     tags: list[str] | None = None,
@@ -415,7 +450,7 @@ def rag_capture(
     return {"path": str(rel), "created": True}
 
 
-@mcp.tool()
+@_maybe_tool
 def rag_save_note(
     text: str,
     title: str,
@@ -503,7 +538,7 @@ def rag_save_note(
     return {"path": str(rel), "created": True}
 
 
-@mcp.tool()
+@_maybe_tool
 def rag_create_reminder(
     title: str,
     when: str = "",
@@ -558,7 +593,7 @@ def rag_create_reminder(
                 "raw": raw}
 
 
-@mcp.tool()
+@_maybe_tool
 def rag_create_event(
     title: str,
     start: str,
@@ -617,7 +652,7 @@ def rag_create_event(
                 "raw": raw}
 
 
-@mcp.tool()
+@_maybe_tool
 def rag_followup(
     days: int = 30,
     status: str | None = None,
@@ -655,6 +690,20 @@ def rag_followup(
 
 
 def main() -> None:
+    # Log al stderr qué tools quedaron registradas. Útil para debug del
+    # harness: si `RAG_MCP_TOOLS` está mal escrito todas las tools quedan
+    # fuera y el MCP arranca vacío. El log queda en el stderr del MCP, que
+    # Claude Code y Devin redirigen a sus logs de sesión.
+    if _ALLOWED_TOOLS is not None:
+        sys.stderr.write(
+            f"[obsidian-rag-mcp] RAG_MCP_TOOLS allowlist activa "
+            f"(registered={_REGISTERED_TOOLS} skipped={_SKIPPED_TOOLS})\n"
+        )
+        if not _REGISTERED_TOOLS:
+            sys.stderr.write(
+                "[obsidian-rag-mcp] WARN: el allowlist no matcheó ninguna tool. "
+                "Revisar valores en RAG_MCP_TOOLS.\n"
+            )
     mcp.run()
 
 

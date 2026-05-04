@@ -1,0 +1,12 @@
+{
+  "name": "rag-only",
+  "description": "Foco en obsidian-rag + obsidian + memoria. Reduce harness al mínimo útil para una sesión de query/edición de vault. Sin integraciones cloud, sin browser automation, sin comms.",
+  "mcps": [
+    "obsidian-rag",
+    "obsidian",
+    "filesystem",
+    "time"
+  ],
+  "rag_mcp_tools": ["query", "read_note", "list_notes", "stats"],
+  "rag_cli_groups": ["core", "ops"]
+}

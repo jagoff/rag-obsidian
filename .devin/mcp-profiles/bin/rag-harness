@@ -1,0 +1,356 @@
+#!/usr/bin/env -S uv run --quiet python3
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["click>=8.1"]
+# ///
+"""rag-harness — switch entre profiles de MCPs / tools / CLI groups.
+
+Diseño:
+- `inventory.json` es el source-of-truth: mirror del `mcpServers` de `~/.claude.json`.
+  Se regenera con `rag-harness sync-inventory`.
+- `profiles/<name>.json` define qué subset del inventory activar:
+    {
+      "name": "...",
+      "description": "...",
+      "mcps": ["obsidian-rag", ...],         # keys del inventory
+      "rag_mcp_tools": ["query", ...] | null, # null = todas las tools
+      "rag_cli_groups": ["core", ...] | null  # null = todos los grupos
+    }
+- `rag-harness use <name>` reescribe `~/.claude.json` y `~/.config/devin/config.json`:
+  * `mcpServers` queda solo con los keys del profile.
+  * Si la entry `obsidian-rag` está en el profile, se le injecta
+    `env.RAG_MCP_TOOLS` (CSV) y `env.RAG_CLI_GROUPS` (CSV) cuando aplique.
+  * Backup automático de los configs originales (`*.bak.<ts>`).
+
+Después del switch hay que **reabrir la sesión** (Claude Code / Devin)
+para que el harness se recompile.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import sys
+import time
+from pathlib import Path
+
+import click
+
+ROOT = Path(__file__).resolve().parent.parent
+PROFILES_DIR = ROOT / "profiles"
+INVENTORY = ROOT / "inventory.json"
+ACTIVE_FILE = ROOT / ".active"
+
+# Targets que reescribimos
+CLAUDE_CONFIG = Path.home() / ".claude.json"
+DEVIN_CONFIG = Path.home() / ".config" / "devin" / "config.json"
+
+
+def _load_json(path: Path) -> dict:
+    with path.open() as f:
+        return json.load(f)
+
+
+def _save_json(path: Path, data: dict) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    tmp.replace(path)
+
+
+def _backup(path: Path) -> Path | None:
+    if not path.exists():
+        return None
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    bak = path.with_suffix(path.suffix + f".bak-harness-{ts}")
+    shutil.copy2(path, bak)
+    return bak
+
+
+def _list_profiles() -> list[Path]:
+    return sorted(PROFILES_DIR.glob("*.json"))
+
+
+def _read_profile(name: str) -> dict:
+    p = PROFILES_DIR / f"{name}.json"
+    if not p.exists():
+        click.echo(f"profile '{name}' no existe en {PROFILES_DIR}", err=True)
+        sys.exit(1)
+    return _load_json(p)
+
+
+def _read_inventory() -> dict:
+    if not INVENTORY.exists():
+        click.echo(
+            f"inventory.json no existe. Corré `rag-harness sync-inventory` primero.",
+            err=True,
+        )
+        sys.exit(1)
+    return _load_json(INVENTORY)
+
+
+def _active_name() -> str | None:
+    if ACTIVE_FILE.exists():
+        return ACTIVE_FILE.read_text().strip() or None
+    return None
+
+
+def _build_mcp_section(profile: dict, inventory: dict) -> dict:
+    """Construye el dict mcpServers a partir del inventory + keys del profile.
+
+    Si el profile incluye `obsidian-rag` y define `rag_mcp_tools` o
+    `rag_cli_groups`, los injecta como env vars en la entry correspondiente.
+    """
+    out: dict[str, dict] = {}
+    missing: list[str] = []
+    for key in profile["mcps"]:
+        if key not in inventory:
+            missing.append(key)
+            continue
+        # Deep copy via json round-trip (no shared refs con el inventory)
+        out[key] = json.loads(json.dumps(inventory[key]))
+
+    if missing:
+        click.echo(
+            f"warning: profile pide {missing} pero no están en inventory.json. "
+            f"Se ignoran. Considerá `rag-harness sync-inventory`.",
+            err=True,
+        )
+
+    # Inyectar env vars en obsidian-rag si corresponde
+    if "obsidian-rag" in out:
+        env = out["obsidian-rag"].setdefault("env", {})
+        tools = profile.get("rag_mcp_tools")
+        groups = profile.get("rag_cli_groups")
+        if tools:
+            env["RAG_MCP_TOOLS"] = ",".join(tools)
+        else:
+            env.pop("RAG_MCP_TOOLS", None)
+        if groups:
+            env["RAG_CLI_GROUPS"] = ",".join(groups)
+        else:
+            env.pop("RAG_CLI_GROUPS", None)
+
+    return out
+
+
+def _apply_to_target(
+    target: Path,
+    mcp_section: dict,
+    inventory_keys: set[str],
+    dry_run: bool,
+) -> None:
+    """Aplica el profile a un target.
+
+    Importante: solo toca keys que estén en `inventory_keys`. MCPs presentes
+    en el target pero ajenos al inventory (ej. `engram`/`mem-vault` específicos
+    de Devin) se preservan sin cambios — el harness no los gestiona.
+    """
+    if not target.exists():
+        click.echo(f"  - {target}: no existe (skip)")
+        return
+    data = _load_json(target)
+    current = dict(data.get("mcpServers") or {})
+
+    # Preservar MCPs ajenos al inventory
+    untouched = {k: v for k, v in current.items() if k not in inventory_keys}
+    new_section = dict(untouched)
+    new_section.update(mcp_section)
+
+    before_managed = {k for k in current if k in inventory_keys}
+    after_managed = set(mcp_section.keys())
+    added = sorted(after_managed - before_managed)
+    removed = sorted(before_managed - after_managed)
+    preserved = sorted(untouched.keys())
+
+    if dry_run:
+        click.echo(f"  - {target}:")
+        if added:
+            click.echo(f"      + {', '.join(added)}")
+        if removed:
+            click.echo(f"      - {', '.join(removed)}")
+        if preserved:
+            click.echo(f"      = (preservados, fuera del inventory) {', '.join(preserved)}")
+        if not added and not removed:
+            click.echo(f"      (sin cambios en mcpServers gestionados)")
+        return
+
+    bak = _backup(target)
+    data["mcpServers"] = new_section
+    _save_json(target, data)
+    click.echo(f"  - {target}: ok (backup: {bak.name if bak else '-'})")
+
+
+@click.group()
+def cli():
+    """rag-harness — toggle de MCPs / tools / CLI groups del agente."""
+
+
+@cli.command("list")
+def cmd_list():
+    """Lista los profiles disponibles + cuál está activo."""
+    active = _active_name()
+    click.echo(f"profiles disponibles ({PROFILES_DIR}):")
+    for p in _list_profiles():
+        prof = _load_json(p)
+        marker = " *" if prof["name"] == active else "  "
+        desc = prof.get("description", "").split("\n")[0]
+        click.echo(f"{marker} {prof['name']:<16} {desc}")
+    if active:
+        click.echo(f"\nactivo: {active}")
+    else:
+        click.echo("\nactivo: <ninguno> (config sin tocar por harness)")
+
+
+@cli.command("show")
+@click.argument("name", required=False)
+def cmd_show(name: str | None):
+    """Muestra el contenido de un profile (default: el activo)."""
+    name = name or _active_name()
+    if not name:
+        click.echo("no hay profile activo. Pasá el nombre o ejecutá `rag-harness use <name>`.", err=True)
+        sys.exit(1)
+    prof = _read_profile(name)
+    click.echo(json.dumps(prof, indent=2))
+
+
+@cli.command("use")
+@click.argument("name")
+@click.option("--dry-run", is_flag=True, help="No escribe nada, solo muestra qué cambiaría.")
+def cmd_use(name: str, dry_run: bool):
+    """Activa un profile (reescribe ~/.claude.json y ~/.config/devin/config.json)."""
+    profile = _read_profile(name)
+    inventory = _read_inventory()
+    mcp_section = _build_mcp_section(profile, inventory)
+
+    click.echo(f"profile '{name}' → {len(mcp_section)} MCPs activos:")
+    for k in sorted(mcp_section.keys()):
+        click.echo(f"    - {k}")
+
+    if mcp_section.get("obsidian-rag", {}).get("env"):
+        env = mcp_section["obsidian-rag"]["env"]
+        click.echo("\nenv inyectado en obsidian-rag:")
+        for k, v in env.items():
+            if k.startswith("RAG_"):
+                click.echo(f"    {k}={v}")
+
+    inventory_keys = set(inventory.keys())
+    click.echo("\nescribiendo:" if not dry_run else "\n[dry-run] cambios:")
+    _apply_to_target(CLAUDE_CONFIG, mcp_section, inventory_keys, dry_run)
+    _apply_to_target(DEVIN_CONFIG, mcp_section, inventory_keys, dry_run)
+
+    if not dry_run:
+        ACTIVE_FILE.write_text(name + "\n")
+        click.echo(f"\nactivo: {name}")
+        click.echo("→ reabrí la sesión (Claude Code / Devin) para que tome efecto.")
+
+
+@cli.command("diff")
+@click.argument("a")
+@click.argument("b")
+def cmd_diff(a: str, b: str):
+    """Compara dos profiles (qué MCPs/tools/groups difieren)."""
+    pa = _read_profile(a)
+    pb = _read_profile(b)
+    sa, sb = set(pa["mcps"]), set(pb["mcps"])
+    only_a = sorted(sa - sb)
+    only_b = sorted(sb - sa)
+    common = sorted(sa & sb)
+    click.echo(f"common ({len(common)}): {', '.join(common) or '-'}")
+    click.echo(f"solo {a} ({len(only_a)}): {', '.join(only_a) or '-'}")
+    click.echo(f"solo {b} ({len(only_b)}): {', '.join(only_b) or '-'}")
+    ta = set(pa.get("rag_mcp_tools") or [])
+    tb = set(pb.get("rag_mcp_tools") or [])
+    if ta or tb:
+        click.echo(f"\nrag_mcp_tools:")
+        click.echo(f"  {a}: {sorted(ta) if ta else '<all>'}")
+        click.echo(f"  {b}: {sorted(tb) if tb else '<all>'}")
+    ga = set(pa.get("rag_cli_groups") or [])
+    gb = set(pb.get("rag_cli_groups") or [])
+    if ga or gb:
+        click.echo(f"\nrag_cli_groups:")
+        click.echo(f"  {a}: {sorted(ga) if ga else '<all>'}")
+        click.echo(f"  {b}: {sorted(gb) if gb else '<all>'}")
+
+
+@cli.command("sync-inventory")
+def cmd_sync_inventory():
+    """Regenera inventory.json desde el ~/.claude.json actual.
+
+    Usalo cuando agregaste un MCP nuevo manualmente y querés que los
+    profiles puedan referenciarlo. Hace backup del inventory previo.
+    """
+    if not CLAUDE_CONFIG.exists():
+        click.echo(f"{CLAUDE_CONFIG} no existe", err=True)
+        sys.exit(1)
+    data = _load_json(CLAUDE_CONFIG)
+    mcps = data.get("mcpServers") or {}
+    if not mcps:
+        click.echo(f"{CLAUDE_CONFIG} no tiene mcpServers", err=True)
+        sys.exit(1)
+    if INVENTORY.exists():
+        _backup(INVENTORY)
+    _save_json(INVENTORY, mcps)
+    click.echo(f"inventory.json regenerado con {len(mcps)} MCPs:")
+    for k in sorted(mcps.keys()):
+        click.echo(f"    - {k}")
+
+
+@cli.command("sync-full")
+def cmd_sync_full():
+    """Regenera profiles/full.json para que liste todos los MCPs del inventory."""
+    inventory = _read_inventory()
+    full_path = PROFILES_DIR / "full.json"
+    if full_path.exists():
+        _backup(full_path)
+    keys = sorted(inventory.keys())
+    full = {
+        "name": "full",
+        "description": "Snapshot del set completo. Baseline para restore. Auto-regenerable: `rag-harness sync-full`.",
+        "mcps": keys,
+        "rag_mcp_tools": None,
+        "rag_cli_groups": None,
+    }
+    _save_json(full_path, full)
+    click.echo(f"full.json regenerado con {len(keys)} MCPs.")
+
+
+@cli.command("restore")
+def cmd_restore():
+    """Restaura ~/.claude.json y ~/.config/devin/config.json desde el backup más reciente."""
+    for target in (CLAUDE_CONFIG, DEVIN_CONFIG):
+        if not target.exists():
+            continue
+        baks = sorted(target.parent.glob(target.name + ".bak-harness-*"))
+        if not baks:
+            click.echo(f"  - {target}: sin backups, skip")
+            continue
+        latest = baks[-1]
+        shutil.copy2(latest, target)
+        click.echo(f"  - {target}: restaurado desde {latest.name}")
+    if ACTIVE_FILE.exists():
+        ACTIVE_FILE.unlink()
+    click.echo("\nactivo: <ninguno>. Reabrí la sesión.")
+
+
+@cli.command("new")
+@click.argument("name")
+@click.option("--from", "from_", default=None, help="Profile base para copiar (default: el activo, sino full).")
+def cmd_new(name: str, from_: str | None):
+    """Crea un profile nuevo a partir de otro."""
+    base = from_ or _active_name() or "full"
+    src = _read_profile(base)
+    src["name"] = name
+    src["description"] = f"Derived from {base}. Editar a mano."
+    dst = PROFILES_DIR / f"{name}.json"
+    if dst.exists():
+        click.echo(f"profile '{name}' ya existe", err=True)
+        sys.exit(1)
+    _save_json(dst, src)
+    click.echo(f"creado: {dst}")
+
+
+if __name__ == "__main__":
+    cli()

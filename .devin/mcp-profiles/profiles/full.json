@@ -1,0 +1,31 @@
+{
+  "name": "full",
+  "description": "Snapshot del set completo. Baseline para restore. Equivalente a no tener harness aplicado. Auto-regenerable: `rag-harness sync-full`.",
+  "mcps": [
+    "apple-mcp",
+    "claude-peers",
+    "context7",
+    "exa",
+    "fetch",
+    "filesystem",
+    "github",
+    "gmail-send",
+    "google-drive",
+    "markitdown",
+    "n8n-mcp",
+    "netflix-search",
+    "obsidian",
+    "obsidian-rag",
+    "ollama",
+    "playwright",
+    "semgrep",
+    "sequential-thinking",
+    "shadcn",
+    "time",
+    "weather",
+    "whatsapp",
+    "youtube-transcript"
+  ],
+  "rag_mcp_tools": null,
+  "rag_cli_groups": null
+}

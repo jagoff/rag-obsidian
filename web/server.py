@@ -8778,15 +8778,21 @@ def _fetch_whatsapp_unreplied(hours: int = 48, max_chats: int = 5) -> list[dict]
     return out
 
 
-# MOZE (Money app) export — user drops `MOZE_YYYYMMDD_HHMMSS.csv` into the
-# iCloud `/Finances` folder (que también aloja los `.xlsx` de resúmenes de
-# tarjeta — ver `_fetch_credit_cards`). Tomamos el CSV más nuevo y lo
-# parseamos local; sin red, sin API. Dates: MM/DD/YYYY (US); Price: ES
-# decimals ("2026,74"). Gastos vienen como negativos → abs() para mostrar.
+# MOZE (Tally4 app) export — user drops `MOZE_YYYYMMDD_HHMMSS.csv` en el
+# container iCloud de Tally4 (`iCloud~amoos~Tally4/Documents`). Antes
+# compartía dir con los xlsx de tarjetas (`CloudDocs/Finances`) pero el user
+# separó las fuentes el 2026-05-04. Tomamos el CSV más nuevo y lo parseamos
+# local; sin red, sin API. Dates: MM/DD/YYYY (US); Price: ES decimals
+# ("2026,74"). Gastos vienen como negativos → abs() para mostrar.
 #
-# Migración 2026-04-26: el dir antes era `/Backup`. Si en el futuro el user
-# vuelve a moverlo, el override por env vive en `_FINANCE_DIR_ENV`.
+# Override por env: `OBSIDIAN_RAG_MOZE_DIR` para MOZE,
+# `OBSIDIAN_RAG_FINANCE_DIR` para tarjetas (nombre legacy preservado).
+_MOZE_DIR_ENV = "OBSIDIAN_RAG_MOZE_DIR"
 _FINANCE_DIR_ENV = "OBSIDIAN_RAG_FINANCE_DIR"
+_MOZE_BACKUP_DIR = Path(
+    os.environ.get(_MOZE_DIR_ENV, "")
+    or (Path.home() / "Library/Mobile Documents/iCloud~amoos~Tally4/Documents")
+)
 _FINANCE_BACKUP_DIR = Path(
     os.environ.get(_FINANCE_DIR_ENV, "")
     or (Path.home() / "Library/Mobile Documents/com~apple~CloudDocs/Finances")
@@ -8807,7 +8813,7 @@ def _fetch_finance(now: datetime | None = None) -> dict | None:
     now = now or datetime.now()
     try:
         csvs = sorted(
-            _FINANCE_BACKUP_DIR.glob("MOZE_*.csv"),
+            _MOZE_BACKUP_DIR.glob("MOZE_*.csv"),
             key=lambda p: p.stat().st_mtime,
             reverse=True,
         )
@@ -8939,7 +8945,9 @@ def _fetch_finance(now: datetime | None = None) -> dict | None:
 
 # Resúmenes de tarjeta de crédito — el banco emite un `.xlsx` por ciclo
 # (Santander Río exporta `Último resumen - <Marca> <Últimos4>.xlsx`) y el
-# user lo deja caer en el mismo dir iCloud `/Finances` que los CSV de MOZE.
+# user lo deja caer en el dir iCloud `CloudDocs/Finances` (post 2026-05-04
+# este dir solo aloja tarjetas + PDFs; los CSV de MOZE viven aparte en el
+# container Tally4 — ver `_MOZE_BACKUP_DIR`).
 # Naming esperado: empieza con "Último resumen" (con o sin acento) — usamos
 # globs case-insensitive para tolerar variaciones del banco.
 #
@@ -14954,11 +14962,11 @@ def dashboard_page() -> FileResponse:
 
 # ── /finance — dashboard de finanzas (MOZE + tarjetas + transferencias) ─────
 #
-# Página HTML que hidrata vía `/api/finance`. Lee la carpeta iCloud
-# `Finances/` (override por `OBSIDIAN_RAG_FINANCE_DIR`) y agrega:
-#   - Transacciones MOZE (categorizadas, multi-mes) — fuente PRIMARIA
-#   - Tarjetas de crédito (xlsx del banco) — sección aparte
-#   - Transferencias bancarias (PDF Santander) — sección aparte
+# Página HTML que hidrata vía `/api/finance`. Lee dos carpetas iCloud:
+#   - `iCloud~amoos~Tally4/Documents` (override `OBSIDIAN_RAG_MOZE_DIR`):
+#     CSVs MOZE — fuente PRIMARIA de transacciones categorizadas.
+#   - `CloudDocs/Finances` (override `OBSIDIAN_RAG_FINANCE_DIR`):
+#     xlsx de tarjetas + PDFs de transferencias del banco.
 #
 # El user pidió: "tablero igual estéticamente al resto, exclusivamente de
 # finanzas". El payload se cachea 60s (la data cambia cuando el user

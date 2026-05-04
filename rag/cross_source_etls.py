@@ -26,6 +26,7 @@ from rag._constants import _GOOGLE_TOKEN_PATH
 __all__ = [
     # MOZE helpers
     "MOZE_BACKUP_DIR",
+    "TARJETAS_BACKUP_DIR",
     "MOZE_VAULT_SUBPATH",
     "MOZE_MONTH_ES",
     "_moze_pnum",
@@ -121,7 +122,17 @@ __all__ = [
 
 # ── MOZE finanzas ─────────────────────────────────────────────────────────────
 
+# MOZE (Tally4 app) export → vive en su propio container iCloud desde el
+# 2026-05-04. Antes compartía dir con los xlsx de tarjetas (CloudDocs/Finances)
+# pero el user separó las fuentes. Override: `OBSIDIAN_RAG_MOZE_DIR`.
 MOZE_BACKUP_DIR = Path(
+    os.environ.get("OBSIDIAN_RAG_MOZE_DIR", "")
+    or (Path.home() / "Library/Mobile Documents/iCloud~amoos~Tally4/Documents")
+)
+# Tarjetas de crédito (xlsx del banco) + PDFs de transferencias siguen en
+# `CloudDocs/Finances`. Override: `OBSIDIAN_RAG_FINANCE_DIR` (nombre legacy
+# preservado para no romper setups existentes que ya lo tenían apuntando ahí).
+TARJETAS_BACKUP_DIR = Path(
     os.environ.get("OBSIDIAN_RAG_FINANCE_DIR", "")
     or (Path.home() / "Library/Mobile Documents/com~apple~CloudDocs/Finances")
 )
@@ -855,14 +866,14 @@ def _card_render_note(card: dict) -> str:
 
 def _sync_credit_cards_notes(vault_root: Path) -> dict:
     """Regenerate per-cycle credit-card notes from the xlsx exports in
-    `MOZE_BACKUP_DIR` (same `/Finances` folder). Mirrors the MOZE pattern:
-    one note per (card, cycle), hash-skip if content is unchanged, prune
-    notes whose source xlsx no longer exists.
+    `TARJETAS_BACKUP_DIR` (`CloudDocs/Finances` por default). Mirrors the
+    MOZE pattern: one note per (card, cycle), hash-skip if content is
+    unchanged, prune notes whose source xlsx no longer exists.
     """
     try:
         seen: set[Path] = set()
         for pattern in ("Último resumen*.xlsx", "Ultimo resumen*.xlsx"):
-            for p in MOZE_BACKUP_DIR.glob(pattern):
+            for p in TARJETAS_BACKUP_DIR.glob(pattern):
                 seen.add(p)
         files = sorted(seen, key=lambda p: p.name)
     except Exception as exc:

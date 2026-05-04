@@ -1,8 +1,14 @@
 """Backend del dashboard de finanzas (`/finance`).
 
-Lee la carpeta iCloud `Finances/` (la misma que el home/credit-cards usan,
-override por `OBSIDIAN_RAG_FINANCE_DIR`) y la consolida en un payload con
-shape estable que el frontend renderiza sin checks defensivos.
+Lee dos carpetas iCloud (separadas desde el 2026-05-04):
+
+- ``iCloud~amoos~Tally4/Documents`` (env `OBSIDIAN_RAG_MOZE_DIR`):
+  CSVs ``MOZE_*.csv``.
+- ``CloudDocs/Finances`` (env `OBSIDIAN_RAG_FINANCE_DIR`):
+  xlsx de tarjetas + PDFs de transferencias.
+
+Y consolida en un payload con shape estable que el frontend renderiza sin
+checks defensivos.
 
 Fuentes soportadas:
 
@@ -52,8 +58,8 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 # Cache compartido — clave = tupla (path, mtime) ordenada de TODOS los
-# archivos relevantes en _FINANCE_BACKUP_DIR. Re-export de cualquier
-# archivo invalida; agregar/quitar archivos también.
+# archivos relevantes en _MOZE_BACKUP_DIR + _FINANCE_BACKUP_DIR. Re-export
+# de cualquier archivo invalida; agregar/quitar archivos también.
 _DASHBOARD_CACHE: dict = {"key": None, "payload": None}
 _DASHBOARD_CACHE_LOCK = threading.Lock()
 
@@ -744,12 +750,20 @@ def _transfers_summary(transfers: list[dict], now: datetime, months: int = 12) -
 # ── Snapshot público ─────────────────────────────────────────────────────
 
 
-def snapshot(finance_dir: Path | None = None, now: datetime | None = None, months: int = 12, window_days: int = 30) -> dict:
+def snapshot(
+    finance_dir: Path | None = None,
+    now: datetime | None = None,
+    months: int = 12,
+    window_days: int = 30,
+    moze_dir: Path | None = None,
+) -> dict:
     """Snapshot completo para `/api/finance`. Cache LRU por (paths, mtimes).
 
     Args:
-        finance_dir: Override del dir (para tests). Default: ``_FINANCE_BACKUP_DIR``
-            de web.server (que respeta `OBSIDIAN_RAG_FINANCE_DIR`).
+        finance_dir: Override del dir de tarjetas/PDFs (para tests). Default:
+            ``_FINANCE_BACKUP_DIR`` de web.server (env `OBSIDIAN_RAG_FINANCE_DIR`).
+        moze_dir: Override del dir de MOZE CSV (para tests). Default:
+            ``_MOZE_BACKUP_DIR`` de web.server (env `OBSIDIAN_RAG_MOZE_DIR`).
         now: Override de "now" (para tests). Default: `datetime.now()`.
         months: Cuántos meses de serie temporal devolver (default 12).
         window_days: Ventana para los KPI por categoría / top stores
@@ -760,21 +774,36 @@ def snapshot(finance_dir: Path | None = None, now: datetime | None = None, month
         convención web/.
     """
     now = now or datetime.now()
-    if finance_dir is None:
-        from web.server import _FINANCE_BACKUP_DIR  # type: ignore
+    # Resolución de paths:
+    # - Ambos None → defaults de web.server (los reales del usuario).
+    # - Solo `finance_dir` pasado → asumir mismo dir para MOZE (back-compat
+    #   con tests pre-split y con setups donde ambas fuentes vivían juntas).
+    # - Solo `moze_dir` pasado → simétrico (poco común pero defensivo).
+    if finance_dir is None and moze_dir is None:
+        from web.server import _FINANCE_BACKUP_DIR, _MOZE_BACKUP_DIR  # type: ignore
         finance_dir = _FINANCE_BACKUP_DIR
+        moze_dir = _MOZE_BACKUP_DIR
+    elif moze_dir is None:
+        moze_dir = finance_dir
+    elif finance_dir is None:
+        finance_dir = moze_dir
 
-    if not finance_dir.exists():
-        return _empty_payload(now, "finance_dir_missing", str(finance_dir))
+    # MOZE dir missing es OK si igual hay tarjetas/PDFs en finance_dir.
+    # Solo abortamos si NINGUNO de los dos existe.
+    if not finance_dir.exists() and not moze_dir.exists():
+        return _empty_payload(now, "finance_dir_missing", str(finance_dir), str(moze_dir))
 
     # Cache key: tupla con (str(path), mtime) de cada archivo CSV/PDF/XLSX
-    # del dir. Re-export de cualquier archivo invalida; agregar/quitar
+    # de ambos dirs. Re-export de cualquier archivo invalida; agregar/quitar
     # archivos también.
     try:
-        all_files = list(finance_dir.glob("MOZE_*.csv")) \
-            + list(finance_dir.glob("Último resumen*.xlsx")) \
-            + list(finance_dir.glob("Ultimo resumen*.xlsx")) \
+        moze_files = list(moze_dir.glob("MOZE_*.csv")) if moze_dir.exists() else []
+        finance_files = (
+            list(finance_dir.glob("Último resumen*.xlsx"))
+            + list(finance_dir.glob("Ultimo resumen*.xlsx"))
             + list(finance_dir.glob("*.pdf"))
+        ) if finance_dir.exists() else []
+        all_files = moze_files + finance_files
         cache_key = tuple(sorted((str(p), p.stat().st_mtime) for p in all_files))
         # Incluir window_days/months en la key porque distintas vistas
         # del mismo dataset cachean por separado.
@@ -787,17 +816,18 @@ def snapshot(finance_dir: Path | None = None, now: datetime | None = None, month
             if _DASHBOARD_CACHE.get("key") == cache_key:
                 return _DASHBOARD_CACHE["payload"]
 
-    transactions, moze_sources = _load_moze_rows(finance_dir)
-    transfers, pdf_sources = _load_pdf_transfers(finance_dir)
-    cards = _load_credit_cards(finance_dir)
+    transactions, moze_sources = _load_moze_rows(moze_dir) if moze_dir.exists() else ([], [])
+    transfers, pdf_sources = _load_pdf_transfers(finance_dir) if finance_dir.exists() else ([], [])
+    cards = _load_credit_cards(finance_dir) if finance_dir.exists() else []
 
     if not transactions and not transfers and not cards:
-        return _empty_payload(now, "no_data", str(finance_dir))
+        return _empty_payload(now, "no_data", str(finance_dir), str(moze_dir))
 
     payload = {
         "meta": {
             "generated_at": now.isoformat(timespec="seconds"),
             "finance_dir": str(finance_dir),
+            "moze_dir": str(moze_dir),
             "months": months,
             "window_days": window_days,
             "moze_sources": moze_sources,
@@ -828,12 +858,13 @@ def snapshot(finance_dir: Path | None = None, now: datetime | None = None, month
     return payload
 
 
-def _empty_payload(now: datetime, reason: str, finance_dir: str) -> dict:
+def _empty_payload(now: datetime, reason: str, finance_dir: str, moze_dir: str = "") -> dict:
     """Shape válido pero vacío. El frontend pinta "sin datos" sin crashear."""
     return {
         "meta": {
             "generated_at": now.isoformat(timespec="seconds"),
             "finance_dir": finance_dir,
+            "moze_dir": moze_dir,
             "reason": reason,
             "moze_sources": [],
             "pdf_sources": [],

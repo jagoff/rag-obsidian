@@ -8,9 +8,10 @@ Tests use real openpyxl-built xlsx fixtures (same builder used by
 `test_credit_cards_parser.py`) and a temp vault under `tmp_path` so the
 sync writes real .md files we can read back and assert on.
 
-`MOZE_BACKUP_DIR` (the source dir for both MOZE CSV + tarjetas xlsx) is
-monkeypatched to a fresh tmp_path subdir per test — we never touch the
-real iCloud `/Finances` folder.
+`TARJETAS_BACKUP_DIR` (the source dir of xlsx del banco) is monkeypatched
+a un tmp_path subdir per test — we never touch the real iCloud `/Finances`
+folder. Post 2026-05-04 split, MOZE vive en otro container y NO interfiere
+con el sync de tarjetas.
 """
 from __future__ import annotations
 
@@ -26,18 +27,16 @@ from tests.test_credit_cards_parser import _make_card_xlsx
 
 @pytest.fixture
 def isolated_finances(tmp_path, monkeypatch):
-    """Fresh temp dir for xlsx + temp vault + monkeypatched MOZE_BACKUP_DIR.
+    """Fresh temp dir for xlsx + temp vault + monkeypatched TARJETAS_BACKUP_DIR.
 
     Returns `(finance_dir, vault_root)`. Tests drop xlsx files in
     `finance_dir` and call `_sync_credit_cards_notes(vault_root)`.
 
-    Post-split (2026-05-04) `MOZE_BACKUP_DIR` vive en
-    `rag.cross_source_etls`. La función `_sync_credit_cards_notes`
-    resuelve el binding en SU módulo (no via `rag.*`), así que hay
-    que monkeypatchear ambos paths para que el override tome efecto:
+    `_sync_credit_cards_notes` resuelve el binding en `rag.cross_source_etls`,
+    así que monkeypatcheamos ambos paths para que el override tome efecto:
 
-    - `rag.cross_source_etls.MOZE_BACKUP_DIR` — el lookup real
-    - `rag.MOZE_BACKUP_DIR` — re-export vía `from rag.cross_source_etls import *`,
+    - `rag.cross_source_etls.TARJETAS_BACKUP_DIR` — el lookup real
+    - `rag.TARJETAS_BACKUP_DIR` — re-export vía `from rag.cross_source_etls import *`,
       lo dejamos coherente para tests que lean de `rag` directo.
     """
     import rag
@@ -49,8 +48,8 @@ def isolated_finances(tmp_path, monkeypatch):
     vault_root.mkdir()
 
     # Point the sync at our test dir, not iCloud.
-    monkeypatch.setattr(_cse, "MOZE_BACKUP_DIR", finance_dir)
-    monkeypatch.setattr(rag, "MOZE_BACKUP_DIR", finance_dir)
+    monkeypatch.setattr(_cse, "TARJETAS_BACKUP_DIR", finance_dir)
+    monkeypatch.setattr(rag, "TARJETAS_BACKUP_DIR", finance_dir, raising=False)
 
     return finance_dir, vault_root
 

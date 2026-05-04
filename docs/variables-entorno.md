@@ -288,6 +288,24 @@ Dónde cae la ingesta MOZE dentro del vault. Default: `02-Areas/Personal/Finanza
 export OBSIDIAN_RAG_MOZE_FOLDER="02-Areas/Finanzas/MOZE"
 ```
 
+### `OBSIDIAN_RAG_MOZE_DIR`
+Carpeta iCloud donde el app Tally4 guarda los `MOZE_*.csv`. Default:
+`~/Library/Mobile Documents/iCloud~amoos~Tally4/Documents` (separado de
+`Finances/` desde el 2026-05-04).
+
+```bash
+export OBSIDIAN_RAG_MOZE_DIR="~/Library/Mobile Documents/iCloud~amoos~Tally4/Documents"
+```
+
+### `OBSIDIAN_RAG_FINANCE_DIR`
+Carpeta iCloud donde el banco deja los `Último resumen*.xlsx` (tarjetas)
+y los PDFs de transferencias. Default:
+`~/Library/Mobile Documents/com~apple~CloudDocs/Finances`.
+
+```bash
+export OBSIDIAN_RAG_FINANCE_DIR="~/Library/Mobile Documents/com~apple~CloudDocs/Finances"
+```
+
 ### `OBSIDIAN_RAG_WATCH_EXCLUDE_FOLDERS`
 Carpetas del vault que `rag watch` ignora. Coma-separadas.
 

@@ -906,11 +906,22 @@ atexit.register(_flush_log_queue)
 _BACKGROUND_SQL_QUEUE_MAX = int(os.environ.get("RAG_BG_QUEUE_MAX", "10000"))
 _BACKGROUND_SQL_QUEUE: queue.Queue = queue.Queue(maxsize=_BACKGROUND_SQL_QUEUE_MAX)
 _BACKGROUND_SQL_QUEUE_DROPS = 0
+# Event de shutdown — ver doc-block en `_flush_bg_sql_queue`. Tests
+# que instancian múltiples TestClient(app) acumulaban este thread
+# colgado en `queue.get()` bloqueante; al teardown del módulo,
+# Python colectaba primitivas que el thread necesitaba → segfault
+# intermitente. El loop ahora hace `get(timeout=1.0)` y chequea el
+# event cada segundo; tanto atexit como cualquier caller pueden
+# pedir shutdown limpio sin esperar un sentinel.
+_BACKGROUND_SQL_SHUTDOWN = threading.Event()
 
 
 def _background_sql_writer_loop() -> None:
-    while True:
-        item = _BACKGROUND_SQL_QUEUE.get()
+    while not _BACKGROUND_SQL_SHUTDOWN.is_set():
+        try:
+            item = _BACKGROUND_SQL_QUEUE.get(timeout=1.0)
+        except queue.Empty:
+            continue
         try:
             if item is None:
                 return
@@ -935,17 +946,18 @@ _BACKGROUND_SQL_THREAD.start()
 def _flush_bg_sql_queue() -> None:
     """Drain pendientes y join al shutdown.
 
-    Sin esto, el thread queda colgado en `_BACKGROUND_SQL_QUEUE.get()`
-    cuando Python empieza el teardown del módulo: las primitivas que
-    el thread necesita ya están siendo colectadas → segfault
-    intermitente en suite full de tests (`rag/__init__.py:914 in
-    _background_sql_writer_loop` en el traceback). Mismo patrón que
-    `_flush_log_queue` arriba — sentinel None + join bounded.
-    Drops en queue al shutdown son aceptables porque la cache es una
-    optimización de velocidad, no path de correctness.
+    Doble-vía para cubrir tanto exit normal como teardown abrupto de
+    tests: setea el `_BACKGROUND_SQL_SHUTDOWN` event (loop sale en
+    <1s al chequearlo en cada `get(timeout=1.0)`), Y manda el sentinel
+    None para drenar inmediatamente si el thread está libre. Drops
+    son aceptables — la cache es speed opt, no correctness path.
     """
     try:
-        _BACKGROUND_SQL_QUEUE.put_nowait(None)
+        _BACKGROUND_SQL_SHUTDOWN.set()
+        try:
+            _BACKGROUND_SQL_QUEUE.put_nowait(None)
+        except Exception:
+            pass
         _BACKGROUND_SQL_THREAD.join(timeout=2.0)
     except Exception:
         pass

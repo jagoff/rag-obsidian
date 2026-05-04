@@ -2929,6 +2929,47 @@ MIN_CHUNK = 150    # chars — merge smaller chunks with neighbor
 MAX_CHUNK = 800    # chars — bge-m3 accepts ~2048 tokens; 800 chars ≈ 200 tokens
                    # sweet spot: enough context per chunk, prefix doesn't dominate
 
+def _conversations_indexable(rel_path: str) -> bool:
+    """True si esta path es de `99-AI/conversations/` y la env var
+    ``RAG_INDEX_CONVERSATIONS_BOT_ONLY=1`` está activa.
+
+    Cuando se activa, el indexer agarra la conversation pero el body es
+    pre-procesado por ``_strip_conversation_user_queries`` para quitar las
+    líneas blockquote (queries del user) y la línea ``**Sources**:`` —
+    sólo queda la respuesta del bot. Esto preserva el conocimiento
+    operativo que sobrevivió a borrados de sources sin reintroducir el
+    feedback loop que motivó la exclusión original (decisión 2026-04-20):
+    al no indexar el query del user, una pregunta nueva NO matchea la
+    pregunta vieja por similitud lexical, y la respuesta vieja sólo
+    aparece cuando el contenido de la respuesta misma es relevante.
+
+    Off por default. Para activar, setear la env var en los plists de
+    ``com.fer.obsidian-rag-watch`` y reindexar.
+    """
+    if not rel_path.startswith("04-Archive/99-obsidian-system/99-AI/conversations/"):
+        return False
+    return os.getenv("RAG_INDEX_CONVERSATIONS_BOT_ONLY", "0") == "1"
+
+
+def _strip_conversation_user_queries(raw: str) -> str:
+    """Pre-procesa el raw de una conversation para indexing: quita las
+    líneas blockquote (`> ...` = query del user) y los bloques `**Sources**:`
+    (citas de notas concretas, ya cubiertas por retrieval directo).
+
+    Preserva frontmatter completo y los headers ``## Turn N``. El resultado
+    es lo que se chunkea — sólo la respuesta del bot queda searchable.
+    """
+    out_lines: list[str] = []
+    for line in raw.splitlines():
+        s = line.lstrip()
+        if s.startswith("> ") or s.strip() == ">":
+            continue
+        if s.startswith("**Sources**"):
+            continue
+        out_lines.append(line)
+    return "\n".join(out_lines)
+
+
 def is_excluded(rel_path: str) -> bool:
     """Skip hidden paths, system-backed folders and auto-generated content.
 
@@ -2978,6 +3019,7 @@ def is_excluded(rel_path: str) -> bool:
         rel_path.startswith(system_prefix + "99-Mentions/")
         or rel_path.startswith(system_prefix + "99-AI/memory/")
         or rel_path.startswith(system_prefix + "99-AI/external-ingest/")
+        or _conversations_indexable(rel_path)
     ):
         return True
     claude_prefix = "03-Resources/Claude/"
@@ -25112,6 +25154,12 @@ def _index_single_file(
         return "empty"
 
     raw = path.read_text(encoding="utf-8", errors="ignore")
+    # Conversations bot-only mode: si el path es de 99-AI/conversations/ y
+    # `RAG_INDEX_CONVERSATIONS_BOT_ONLY=1`, transformamos el raw antes de
+    # cualquier procesamiento. Eso asegura que el hash refleja el contenido
+    # destinado al index (sólo bot answers), no el original con queries.
+    if _conversations_indexable(doc_id_prefix):
+        raw = _strip_conversation_user_queries(raw)
     # Hash incluye mtimes de imágenes embebidas — si una screenshot en la
     # nota se updateó pero el .md no cambió, seguimos forzando reindex
     # para picar el OCR nuevo. `_file_hash_with_images` devuelve el hash
@@ -26992,6 +27040,15 @@ def query(
     _top_src = (result.get("metas") or [{}])[0].get("source")
     _gate = confidence_threshold_for_source(_top_src)
     if result["confidence"] < _gate and not force:
+        # Stale-source detector: antes de dar "no tengo", chequeamos si una
+        # query similar fue contestada antes con sources que ya no existen.
+        # Si match → appendeamos hint apuntando al runbook destilado o a la
+        # conversation original. No reemplaza el "no tengo" — solo agrega
+        # contexto rescatable.
+        try:
+            stale_hint = stale_source_hint(question)
+        except Exception:
+            stale_hint = None
         suggestion = (
             "Mandá `/capture pregunta-abierta: " + question
             + "` para guardarla como pregunta abierta y que la próxima vez la encuentre."
@@ -27002,6 +27059,8 @@ def query(
             f"usá --force para llamar al LLM igual)\n\n"
             f"{suggestion}"
         )
+        if stale_hint:
+            msg = msg + "\n\n" + stale_hint
         if plain:
             click.echo(msg)
         else:
@@ -27012,6 +27071,9 @@ def query(
                 f"usá --force para llamar al LLM igual)[/dim]"
             )
             console.print(f"[dim]💡 {suggestion}[/dim]")
+            if stale_hint:
+                console.print()
+                console.print(Markdown(stale_hint))
             print_sources(result)
             render_related(find_related(col, result["metas"]))
         log_query_event({
@@ -45909,6 +45971,81 @@ def dead(min_age_days: int, query_window_days: int, limit: int,
 
 # Archive subsystem extracted to rag.archive (split 2026-05-04)
 from rag.archive import *  # noqa: F401, F403
+
+# Conversation distiller — recover knowledge from chats whose sources
+# have evaporated. CLI command `rag distill-conversations` defined below.
+from rag.conversation_distiller import *  # noqa: F401, F403
+
+# Stale-source detector — surface past answers whose cited notes no
+# longer exist. Used by `rag query` low-confidence path and `web/server.py`
+# /api/chat fallback path.
+from rag.stale_source_detector import *  # noqa: F401, F403
+
+
+@cli.command(name="distill-conversations")
+@click.option("--apply", is_flag=True,
+              help="Escribir las notas. Sin este flag es dry-run.")
+@click.option("--min-confidence", default=0.5, show_default=True, type=float,
+              help="Confianza mínima de la conversation (frontmatter confidence_avg)")
+@click.option("--limit", default=None, type=int,
+              help="Cap absoluto de conversations destiladas en una corrida")
+@click.option("--all", "include_present", is_flag=True,
+              help="Destila también conversations cuyas sources siguen presentes")
+def distill_conversations_cmd(apply: bool, min_confidence: float,
+                              limit: int | None, include_present: bool):
+    """Destila respuestas de conversations cuyas fuentes ya no existen.
+
+    Walks `04-Archive/99-obsidian-system/99-AI/conversations/`, encuentra
+    conversations con `confidence_avg >= --min-confidence` y al menos una
+    source missing, y reescribe los bot answers como notas runbook bajo
+    `03-Resources/runbooks/from-conversations/<slug>.md`. Las notas
+    runbook quedan indexadas (no excluidas), así que la próxima vez que
+    preguntes lo mismo, RAG retrieve la respuesta destilada.
+
+    Idempotente: cada conversation se destila una vez (stamp
+    `distilled_to:` en su frontmatter).
+    """
+    import click as _click
+    from rich.console import Console
+    from rich.table import Table
+    console = Console()
+    res = run_distillation(
+        VAULT_PATH,
+        apply=apply,
+        min_confidence=min_confidence,
+        limit=limit,
+        require_missing_source=not include_present,
+    )
+    title = (
+        f"📚 Distill — {res['candidates']} candidate(s) "
+        f"({'apply' if apply else 'dry-run'})"
+    )
+    console.print(f"\n[bold]{title}[/bold]")
+    if not res["distilled"] and not res["skipped"]:
+        console.print("[green]Nada que destilar.[/green]")
+        return
+    if res["distilled"]:
+        tbl = Table(show_header=True, header_style="bold")
+        tbl.add_column("conf", justify="right")
+        tbl.add_column("missing", justify="right")
+        tbl.add_column("conv")
+        tbl.add_column("→ runbook")
+        for d in res["distilled"]:
+            tbl.add_row(
+                f"{d['confidence']:.2f}",
+                str(d["missing"]),
+                d["conv"][:60] + ("…" if len(d["conv"]) > 60 else ""),
+                d["runbook"] or "—",
+            )
+        console.print(tbl)
+    if res["skipped"]:
+        console.print(f"\n[dim]{len(res['skipped'])} skipped[/dim]")
+        for s in res["skipped"][:5]:
+            console.print(f"  [dim]· {s['conv']} — {s['reason']}[/dim]")
+    if not apply:
+        console.print(
+            "\n[yellow]Dry-run.[/yellow] Corré con [bold]--apply[/bold] "
+            "para escribir las notas.")
 
 
 @cli.command()

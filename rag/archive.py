@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import rag as _rag
@@ -20,6 +21,8 @@ __all__ = [
     "ARCHIVE_GATE_DEFAULT",
     "ARCHIVE_LOG_PATH",
     "_ARCHIVE_OPT_OUT_TYPES",
+    "CITATION_PROMOTE_THRESHOLD",
+    "CITATION_WINDOW_DAYS",
     "_archive_target_path",
     "_archive_resolve_collision",
     "_is_archive_opt_out",
@@ -28,11 +31,24 @@ __all__ = [
     "_append_archive_batch",
     "_log_archive_event",
     "_archive_move_one",
+    "_load_conversation_citations",
     "archive_dead_notes",
     "_render_archive_result",
     "_write_archive_report",
     "_push_archive_notification",
 ]
+
+# ── PROMOTE-ON-CITE GUARDRAIL (added 2026-05-04) ────────────────────────────
+# Una nota citada como source en N+ conversations recientes está sosteniendo
+# conocimiento operativo activo (procedimientos, URLs, runbooks). Si el
+# detector de dead notes la propone para archivar, la frenamos: el user la
+# está usando en chats aunque no la haya editado. Sin este check, las notas
+# útiles de `00-Inbox/` se evaporaban por inactividad de edición y al día
+# siguiente RAG decía "no tengo nada" sobre el mismo tema (caso AWS
+# Organizations 2026-05-04).
+CITATION_PROMOTE_THRESHOLD = int(os.getenv("RAG_ARCHIVE_CITE_THRESHOLD", "2"))
+CITATION_WINDOW_DAYS = int(os.getenv("RAG_ARCHIVE_CITE_WINDOW_DAYS", "30"))
+_CONVERSATIONS_REL = "04-Archive/99-obsidian-system/99-AI/conversations"
 
 # ── ARCHIVER (rag archive) ───────────────────────────────────────────────────
 # Cyclical cleanup: mueve las notas detectadas por `find_dead_notes` a
@@ -203,6 +219,70 @@ def _archive_move_one(
     }
 
 
+def _load_conversation_citations(
+    vault: Path,
+    window_days: int = CITATION_WINDOW_DAYS,
+) -> dict[str, int]:
+    """Escanea ``99-AI/conversations/*.md`` y devuelve un counter
+    ``{vault_relative_path: citation_count}`` con cuántas conversations
+    recientes citan cada nota como source.
+
+    Window basado en ``created`` del frontmatter; si falta, en mtime.
+    Solo se cuentan paths que parecen notas markdown (descarta pseudo-URIs
+    como ``whatsapp://...`` que no son archivables).
+
+    Cache no persistente — se invoca una vez por corrida de
+    ``archive_dead_notes`` y muere con el proceso. Para 121 conversations
+    típicas, la pasada cuesta < 200 ms.
+    """
+    counter: dict[str, int] = {}
+    conv_dir = vault / _CONVERSATIONS_REL
+    if not conv_dir.is_dir():
+        return counter
+    cutoff = datetime.now() - timedelta(days=window_days)
+    fm_re = re.compile(r"^---\n(.*?)\n---", re.DOTALL)
+    for f in conv_dir.rglob("*.md"):
+        try:
+            txt = f.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        m = fm_re.match(txt)
+        if not m:
+            continue
+        # Window check via frontmatter `created`; fallback al mtime del file.
+        created_str = ""
+        for line in m.group(1).splitlines():
+            if line.startswith("created:"):
+                created_str = line.split(":", 1)[1].strip()
+                break
+        try:
+            if created_str:
+                created = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+                if created.tzinfo is not None:
+                    created = created.replace(tzinfo=None)
+            else:
+                created = datetime.fromtimestamp(f.stat().st_mtime)
+        except Exception:
+            created = datetime.fromtimestamp(f.stat().st_mtime)
+        if created < cutoff:
+            continue
+        # Parse `sources:` block — lista YAML simple, una entrada por línea.
+        in_sources = False
+        for line in m.group(1).splitlines():
+            stripped = line.rstrip()
+            if stripped.startswith("sources:"):
+                in_sources = True
+                continue
+            if in_sources:
+                if stripped.startswith("  - ") or stripped.startswith("- "):
+                    src = stripped.split("-", 1)[1].strip().strip('"').strip("'")
+                    if src and not src.startswith(("whatsapp://", "http://", "https://")):
+                        counter[src] = counter.get(src, 0) + 1
+                elif stripped and not stripped.startswith(" "):
+                    in_sources = False
+    return counter
+
+
 def archive_dead_notes(
     col: "object",
     vault: Path,
@@ -219,6 +299,10 @@ def archive_dead_notes(
     plan: list[dict] = []
     skipped: list[dict] = []
     seen_dst: set[str] = set()
+    # Promote-on-cite: pre-cargo el counter una sola vez por corrida. Si la
+    # carpeta de conversations no existe (vault recién inicializado, tests),
+    # el dict queda vacío y el check abajo es no-op.
+    citations = _load_conversation_citations(vault)
     for c in candidates:
         src_rel = c["path"]
         src_full = vault / src_rel
@@ -232,6 +316,15 @@ def archive_dead_notes(
             continue
         if _is_archive_opt_out(raw):
             skipped.append({"path": src_rel, "reason": "opt-out"})
+            continue
+        cite_count = citations.get(src_rel, 0)
+        if cite_count >= CITATION_PROMOTE_THRESHOLD:
+            # Knowledge being actively cited in chat → no archive. The user
+            # is using this note even if it hasn't been edited recently.
+            skipped.append({
+                "path": src_rel,
+                "reason": f"cited-{cite_count}x-in-{CITATION_WINDOW_DAYS}d",
+            })
             continue
         dst_rel = _archive_target_path(src_rel)
         if dst_rel == src_rel:

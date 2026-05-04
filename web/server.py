@@ -11323,6 +11323,17 @@ def api_query(req: QueryRequest, request: Request) -> dict:
         # No hay retrieval — devolvemos answer canned y dejamos al
         # listener decidir si formatea o pasa raw.
         canned = "No encontré información relevante en tus notas."
+        # Stale-source detector: si una query similar fue contestada antes
+        # con sources que ya no existen, anexamos un hint para que el user
+        # sepa que la respuesta está rescatable (conv archivada o runbook
+        # destilado).
+        try:
+            from rag.stale_source_detector import stale_source_hint
+            hint = stale_source_hint(question)
+            if hint:
+                canned = canned + "\n\n" + hint
+        except Exception:
+            pass
         return {
             "answer": canned,
             "sources": [],

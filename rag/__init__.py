@@ -47745,9 +47745,17 @@ def wake_up(ctx, dry_run: bool, skip_index: bool, skip_bookmarks: bool,
             force=False,
         )))
     if not skip_radars:
-        # patterns/emergent escriben notas al vault si detectan algo
+        # feedback-patterns/emergent escriben notas al vault si detectan algo
         # relevante; push=False para no mandar WhatsApp en mute hours.
-        steps.append(("rag patterns", patterns, dict(
+        #
+        # 2026-05-04: el nombre era `patterns` hasta el commit 887ece3 que
+        # introdujo `@cli.group("patterns")` para detección cross-source.
+        # El group shadowea al command viejo, así que el rename correcto
+        # en Python es `feedback_patterns` (y el CLI name "feedback-patterns",
+        # lo que usa el plist `_patterns_plist`). Acá faltaba renombrar la
+        # referencia Python → `wake-up` exit-loopeaba con `NameError: name
+        # 'patterns' is not defined` cada 04:00 desde entonces.
+        steps.append(("rag feedback-patterns", feedback_patterns, dict(
             last=500, min_share=0.30, dry_run=False, push=False,
         )))
         steps.append(("rag emergent", emergent, dict(
@@ -49730,8 +49738,8 @@ def _vault_cleanup_plist(rag_bin: str) -> str:
   </dict>
   <key>RunAtLoad</key><false/>
   <key>KeepAlive</key><false/>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/cleanup-vault.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/cleanup-vault.error.log</string>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/vault-cleanup.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/vault-cleanup.error.log</string>
 </dict>
 </plist>
 """
@@ -51122,18 +51130,81 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
     ]
 
 
+# ── Install gates: pre-requisitos por label ─────────────────────────────────
+#
+# Cada entry es `(check_fn, hint)`. Si `check_fn()` devuelve False, `rag setup`
+# NO instala el plist y muestra `hint` para que el user sepa cómo activar.
+# Re-correr `rag setup` después del pre-req instala el plist.
+#
+# Por qué este gate existe: sin él, un plist se carga y falla cada cadencia
+# cuando falta la credencial / opt-in. Polución de logs + `daemons status`
+# con rows en rojo que el user no mira hasta que rompe algo más visible.
+# Aprendido el 2026-05-04 del daemon `ingest-gmail` en exit-loop hace 4 días
+# sin alerta, + `mood-poll` cargado sin opt-in consumiendo nothing visible.
+def _google_token_exists() -> bool:
+    """Gmail + Drive comparten token — un OAuth flow cubre ambos."""
+    return _GOOGLE_TOKEN_PATH.is_file()
+
+
+def _calendar_creds_exist() -> bool:
+    return (Path.home() / ".calendar-mcp" / "credentials.json").is_file()
+
+
+def _mood_daemon_opted_in() -> bool:
+    """True si el user hizo `rag mood enable` (crea el state file)."""
+    return (Path.home() / ".local/share/obsidian-rag/mood_enabled").is_file()
+
+
+_INSTALL_GATES: dict[str, tuple] = {
+    "com.fer.obsidian-rag-ingest-calendar": (
+        _calendar_creds_exist,
+        "falta [dim]~/.calendar-mcp/credentials.json[/dim] (correr OAuth flow primero)",
+    ),
+    "com.fer.obsidian-rag-ingest-gmail": (
+        _google_token_exists,
+        "falta [dim]~/.config/obsidian-rag/google_token.json[/dim] "
+        "(correr `rag ingest-gmail` una vez para disparar el OAuth flow)",
+    ),
+    "com.fer.obsidian-rag-ingest-drive": (
+        _google_token_exists,
+        "falta [dim]~/.config/obsidian-rag/google_token.json[/dim] "
+        "(correr `rag ingest-gmail` una vez para disparar el OAuth flow — "
+        "Gmail y Drive comparten token)",
+    ),
+    "com.fer.obsidian-rag-mood-poll": (
+        _mood_daemon_opted_in,
+        "mood-poll es opt-in — activar con [cyan]rag mood enable[/cyan] "
+        "+ [cyan]rag setup[/cyan]",
+    ),
+}
+
+
 def _services_spec_manual() -> list[dict]:
     """Daemons launchd que existen en disco pero NO tienen factory en código.
     Instalados a mano por el usuario. `rag setup` no los toca; el control
     plane (`rag daemons status / reconcile`) los monitorea pero no los
     regenera. Si alguno se rompe, el fix es manual (re-copiar plist desde
     backup o regenerarlo en su repo origen).
+
+    Limpieza 2026-05-04: se removieron 4 entries que llevaban meses como
+    "fantasmas" — sin plist en disco, sin log, con tick `-` en cada
+    `daemons status`:
+
+      - `cloudflare-tunnel` + `cloudflare-tunnel-watcher`: se instalan
+        aparte cuando el user decide exponer web vía `cloudflared`. Si
+        están corriendo, aparecen en `daemons status` por launchctl;
+        no hace falta el registry para eso.
+      - `lgbm-train`, `paraphrases-train`: jobs de fine-tuning que se
+        corren a mano (`rag tune …`), no tienen plist automatizado.
+        Dejarlos en el registry les asignaba un slot en el dashboard
+        que solo decía "missing".
+
+    Los 3 restantes SÍ tienen histórico de ejecución (logs en
+    `~/.local/share/obsidian-rag/{log-rotate,spotify-poll,synth-refresh}.log`
+    de 2026-04/05) — se mantienen mientras el user decida si los usa
+    o los archiva.
     """
     return [
-        {"label": "com.fer.obsidian-rag-cloudflare-tunnel", "category": "manual_keep"},
-        {"label": "com.fer.obsidian-rag-cloudflare-tunnel-watcher", "category": "manual_keep"},
-        {"label": "com.fer.obsidian-rag-lgbm-train", "category": "manual_keep"},
-        {"label": "com.fer.obsidian-rag-paraphrases-train", "category": "manual_keep"},
         {"label": "com.fer.obsidian-rag-synth-refresh", "category": "manual_keep"},
         {"label": "com.fer.obsidian-rag-spotify-poll", "category": "manual_keep"},
         {"label": "com.fer.obsidian-rag-log-rotate", "category": "manual_keep"},
@@ -51947,17 +52018,32 @@ def setup(remove: bool):
             else:
                 console.print(f"[dim]· no estaba instalado: {label}[/dim]")
             continue
-        # Calendar gate: sin OAuth config, instalar el plist sólo loggearía
-        # errors cada hora. Skipear con nota — el user re-corre `rag setup`
-        # tras el OAuth flow.
-        if label == "com.fer.obsidian-rag-ingest-calendar":
-            cal_creds = Path.home() / ".calendar-mcp" / "credentials.json"
-            if not cal_creds.is_file():
-                console.print(
-                    f"[yellow]·[/yellow] skip {label}: falta "
-                    f"[dim]~/.calendar-mcp/credentials.json[/dim] "
-                    f"(correr OAuth flow primero)"
-                )
+        # Install gates: si falta un pre-requisito (credencial / opt-in file),
+        # skipear el install con nota. El plist cargado sin su pre-req solo
+        # exit-loopea cada cadencia polucionando logs sin hacer nada útil
+        # ("deuda silenciosa" — el `daemons status` lo marca ok:false pero
+        # el user no lo nota hasta que abre health). Mejor no cargarlo;
+        # re-corriendo `rag setup` después del pre-req se activa.
+        #
+        # Si el plist YA existía en disco de un `rag setup` previo (pre-gate)
+        # y el gate ahora no pasa (ej. el user borró el token), además de
+        # skipear el re-install, removemos el plist viejo del disco — sino
+        # el bootout de arriba ya lo descargó pero macOS lo re-loadea al
+        # próximo login. Una limpieza honesta.
+        gate = _INSTALL_GATES.get(label)
+        if gate is not None:
+            check_fn, hint = gate
+            if not check_fn():
+                if plist_path.exists():
+                    plist_path.unlink()
+                    console.print(
+                        f"[yellow]·[/yellow] skip {label}: {hint} "
+                        f"[dim](plist viejo removido del disco)[/dim]"
+                    )
+                else:
+                    console.print(
+                        f"[yellow]·[/yellow] skip {label}: {hint}"
+                    )
                 continue
         plist_path.write_text(content, encoding="utf-8")
         try:

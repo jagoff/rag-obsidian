@@ -25,6 +25,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
+from rag.iberian_leak_filter import replace_iberian_leaks
+
 if TYPE_CHECKING:
     pass
 
@@ -150,6 +152,18 @@ _REFUSAL_PATTERNS = (
 )
 _REFUSAL_RE = re.compile("|".join(_REFUSAL_PATTERNS), re.IGNORECASE)
 
+# ──────────────────────────────────────────────────────────────────────
+# Module-level compiled regex (Fix 1: avoid per-call re.compile)
+# ──────────────────────────────────────────────────────────────────────
+_SPLIT_CODE_FENCE_RE = re.compile(r"```[\s\S]*?```", re.MULTILINE)
+_SPLIT_TABLE_RE = re.compile(r"^(\|[^\n]*\|\s*\n){2,}", re.MULTILINE)
+_SPLIT_LIST_RE = re.compile(
+    r"^(?:[-*+]\s+[^\n]+\n?){2,}|^(?:\d+\.\s+[^\n]+\n?){2,}",
+    re.MULTILINE,
+)
+_SPLIT_SENTENCE_RE = re.compile(r"(?<=[.!?])\s+(?=[A-ZÁÉÍÓÚÑ¿¡])")
+_NORM_WS_RE = re.compile(r"\s+")
+
 
 def _is_refusal(text: str) -> bool:
     """True if the text matches a known refusal pattern."""
@@ -199,15 +213,8 @@ def split_claims(text: str) -> list[Claim]:
     # then split prose between them on sentence boundaries.
     claims: list[Claim] = []
 
-    code_fence_re = re.compile(r"```[\s\S]*?```", re.MULTILINE)
-    table_re = re.compile(r"^(\|[^\n]*\|\s*\n){2,}", re.MULTILINE)
-    list_re = re.compile(
-        r"^(?:[-*+]\s+[^\n]+\n?){2,}|^(?:\d+\.\s+[^\n]+\n?){2,}",
-        re.MULTILINE,
-    )
-
     blocks: list[tuple[int, int, str]] = []
-    for pattern in (code_fence_re, table_re, list_re):
+    for pattern in (_SPLIT_CODE_FENCE_RE, _SPLIT_TABLE_RE, _SPLIT_LIST_RE):
         for m in pattern.finditer(text):
             blocks.append((m.start(), m.end(), m.group(0).strip()))
 
@@ -255,8 +262,7 @@ def _split_prose(prose: str, base_offset: int) -> list[Claim]:
 
     claims: list[Claim] = []
     # Sentence boundary: punctuation followed by whitespace + capital letter.
-    sentence_re = re.compile(r"(?<=[.!?])\s+(?=[A-ZÁÉÍÓÚÑ¿¡])")
-    parts = sentence_re.split(prose)
+    parts = _SPLIT_SENTENCE_RE.split(prose)
 
     offset = 0
     for part in parts:
@@ -436,17 +442,17 @@ def _pp_task_repair(
         )},
     ]
     try:
+        _repair_model = _rag._postprocess_model()
         resp = _rag._chat_capped_client().chat(
-            model=_rag._postprocess_model(),
+            model=_repair_model,
             messages=messages,
             options=_rag._postprocess_options(),
             stream=False,
-            keep_alive=_rag.chat_keep_alive(_rag._postprocess_model()),
+            keep_alive=_rag.chat_keep_alive(_repair_model),
         )
         # 2026-04-29: filter PT→ES post-gen. La respuesta reparada se
         # le muestra al user en CLI y web — sin filter, leaks pt del
         # repair pueden llegar al usuario.
-        from rag.iberian_leak_filter import replace_iberian_leaks
         repair_full = replace_iberian_leaks((resp.message.content or "").strip())
     except Exception as exc:
         _rag._silent_log("postprocess_repair_failed", exc)
@@ -494,20 +500,20 @@ def _pp_task_critique(
         f"Contexto de las fuentes:\n{context}"
     )
     try:
+        _critique_model = _rag._postprocess_model()
         resp = _rag._chat_capped_client().chat(
-            model=_rag._postprocess_model(),
+            model=_critique_model,
             messages=[
                 {"role": "system", "content": critique_system},
                 {"role": "user", "content": critique_user},
             ],
             options=_rag._postprocess_options(),
             stream=False,
-            keep_alive=_rag.chat_keep_alive(_rag._postprocess_model()),
+            keep_alive=_rag.chat_keep_alive(_critique_model),
         )
         # 2026-04-29: filter PT→ES post-gen. La crítica regenera la
         # respuesta y el caller la pinta directo en CLI/web — sin
         # filter, leaks pt llegan al user.
-        from rag.iberian_leak_filter import replace_iberian_leaks
         crit_full = replace_iberian_leaks((resp.message.content or "").strip())
     except Exception as exc:
         _rag._silent_log("postprocess_critique_failed", exc)
@@ -518,7 +524,7 @@ def _pp_task_critique(
 
     # Normalise whitespace for comparison — avoid spurious "changed" when the
     # LLM just reflowed the paragraph.
-    norm = lambda s: re.sub(r"\s+", " ", s.strip())
+    norm = lambda s: _NORM_WS_RE.sub(" ", s.strip())
     changed = norm(crit_full) != norm(full_orig)
     return {
         "ran": True,

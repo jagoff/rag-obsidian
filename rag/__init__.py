@@ -2709,7 +2709,7 @@ def _apply_mmr_reorder(
     for _, expanded, _ in pool:
         tokens.append(_mmr_tokens(expanded if isinstance(expanded, str) else ""))
     selected_idx: list[int] = [0]  # always keep the highest-relevance first
-    remaining = list(range(1, len(pool)))
+    remaining: set[int] = set(range(1, len(pool)))
     while remaining:
         best_idx = None
         best_mmr = -1e18
@@ -2727,7 +2727,7 @@ def _apply_mmr_reorder(
         if best_idx is None:
             break
         selected_idx.append(best_idx)
-        remaining.remove(best_idx)
+        remaining.discard(best_idx)
     reordered = [pool[i] for i in selected_idx]
     return reordered + tail
 
@@ -22553,6 +22553,15 @@ def silence(kind: str | None, off: bool, do_list: bool):
 # also used by `emergent` and `patterns` pushes.
 
 
+_AMBIENT_CONFIG_CACHE: tuple[str, float, dict | None] | None = None
+_AMBIENT_CONFIG_CACHE_TTL_S = 10.0
+
+
+def _invalidate_ambient_config_cache() -> None:
+    global _AMBIENT_CONFIG_CACHE
+    _AMBIENT_CONFIG_CACHE = None
+
+
 def _ambient_config() -> dict | None:
     """Read the ambient config. Returns None if disabled / missing.
 
@@ -22566,20 +22575,37 @@ def _ambient_config() -> dict | None:
     Backward compat: si detecta `chat_id`/`bot_token` (legacy bot schema)
     loggea warning una vez y retorna None — el usuario debe re-habilitar
     desde el bot de WhatsApp para regenerar la config.
+
+    In-process cache (TTL 10s): evita json.loads + stat en cada hook call.
+    El cache key incluye `str(AMBIENT_CONFIG_PATH)` — si los tests redirigen
+    el path via monkeypatch, el cache se invalida automáticamente.
+    Invalidado también por `_save_raw_ambient_config` y `_invalidate_ambient_config_cache`.
     """
+    global _AMBIENT_CONFIG_CACHE
+    now = time.time()
+    current_path = str(AMBIENT_CONFIG_PATH)
+    if _AMBIENT_CONFIG_CACHE is not None:
+        cached_path, cached_ts, cached_cfg = _AMBIENT_CONFIG_CACHE
+        if cached_path == current_path and now - cached_ts < _AMBIENT_CONFIG_CACHE_TTL_S:
+            return cached_cfg
+
     # Kill switch global via env var (audit 2026-04-25 R2-Wikilinks #5).
     # Útil para silenciar el ambient hook sin tocar el config.json — ej.
     # cuando el user está debugueando algo que dispara muchos saves o
     # quiere correr `rag index --reset` sin spam de notificaciones.
     if os.environ.get("RAG_AMBIENT_DISABLED", "").lower() in ("1", "true", "yes"):
+        _AMBIENT_CONFIG_CACHE = (current_path, now, None)
         return None
     if not AMBIENT_CONFIG_PATH.is_file():
+        _AMBIENT_CONFIG_CACHE = (current_path, now, None)
         return None
     try:
         c = json.loads(AMBIENT_CONFIG_PATH.read_text(encoding="utf-8"))
     except Exception:
+        _AMBIENT_CONFIG_CACHE = (current_path, now, None)
         return None
     if c.get("enabled") is False:
+        _AMBIENT_CONFIG_CACHE = (current_path, now, None)
         return None
     if c.get("chat_id") or c.get("bot_token"):
         # Legacy bot schema — refuse silently (the CLI `ambient status`
@@ -22589,8 +22615,10 @@ def _ambient_config() -> dict | None:
             "warning": "legacy_bot_config_ignored",
             "hint": "Re-habilitar desde el bot de WhatsApp (schema ahora es {jid, enabled}).",
         })
+        _AMBIENT_CONFIG_CACHE = (current_path, now, None)
         return None
     if not c.get("jid"):
+        _AMBIENT_CONFIG_CACHE = (current_path, now, None)
         return None
     # Normalize allowed_folders: strip trailing slashes, drop empties.
     # Case-sensitive on purpose — the vault uses PARA folders like
@@ -22605,6 +22633,7 @@ def _ambient_config() -> dict | None:
         c["allowed_folders"] = folders or None  # None → default at read site
     else:
         c["allowed_folders"] = None
+    _AMBIENT_CONFIG_CACHE = (current_path, now, c)
     return c
 
 
@@ -32842,67 +32871,71 @@ def _collect_week_evidence(
     start_iso = start.isoformat(timespec="seconds")
     end_iso = end.isoformat(timespec="seconds")
     index_contrad: list[dict] = []
-    try:
-        with _ragvec_state_conn() as _conn:
-            for ts_str, subj, targets_json in _conn.execute(
-                "SELECT ts, subject_path, contradicts_json FROM rag_contradictions "
-                "WHERE ts >= ? AND ts < ?",
-                (start_iso, end_iso),
-            ):
-                try:
-                    targets = json.loads(targets_json) if targets_json else []
-                except Exception:
-                    continue
-                if not isinstance(targets, list) or not targets:
-                    continue
-                index_contrad.append({
-                    "ts": ts_str,
-                    "subject_path": subj or "",
-                    "targets": [
-                        {"path": c.get("path", ""), "why": c.get("why", "")}
-                        for c in targets if isinstance(c, dict)
-                    ],
-                })
-    except Exception as _exc:
-        try:
-            _silent_log("week_evidence_contradictions_sql_failed", _exc)
-        except Exception:
-            pass
-
     query_contrad: list[dict] = []
     low_conf: list[dict] = []
     try:
         with _ragvec_state_conn() as _conn:
-            for ts_str, q_text, top_score, extra_json in _conn.execute(
-                "SELECT ts, q, top_score, extra_json FROM rag_queries "
-                "WHERE ts >= ? AND ts < ? AND cmd = 'query'",
-                (start_iso, end_iso),
-            ):
+            try:
+                for ts_str, subj, targets_json in _conn.execute(
+                    "SELECT ts, subject_path, contradicts_json FROM rag_contradictions "
+                    "WHERE ts >= ? AND ts < ?",
+                    (start_iso, end_iso),
+                ):
+                    try:
+                        targets = json.loads(targets_json) if targets_json else []
+                    except Exception:
+                        continue
+                    if not isinstance(targets, list) or not targets:
+                        continue
+                    index_contrad.append({
+                        "ts": ts_str,
+                        "subject_path": subj or "",
+                        "targets": [
+                            {"path": c.get("path", ""), "why": c.get("why", "")}
+                            for c in targets if isinstance(c, dict)
+                        ],
+                    })
+            except Exception as _exc:
                 try:
-                    extra = json.loads(extra_json) if extra_json else {}
+                    _silent_log("week_evidence_contradictions_sql_failed", _exc)
                 except Exception:
-                    extra = {}
-                contrad = extra.get("contradictions") if isinstance(extra, dict) else None
-                if isinstance(contrad, list) and contrad:
-                    for c in contrad:
-                        if isinstance(c, dict) and c.get("path"):
-                            query_contrad.append({
+                    pass
+            try:
+                for ts_str, q_text, top_score, extra_json in _conn.execute(
+                    "SELECT ts, q, top_score, extra_json FROM rag_queries "
+                    "WHERE ts >= ? AND ts < ? AND cmd = 'query'",
+                    (start_iso, end_iso),
+                ):
+                    try:
+                        extra = json.loads(extra_json) if extra_json else {}
+                    except Exception:
+                        extra = {}
+                    contrad = extra.get("contradictions") if isinstance(extra, dict) else None
+                    if isinstance(contrad, list) and contrad:
+                        for c in contrad:
+                            if isinstance(c, dict) and c.get("path"):
+                                query_contrad.append({
+                                    "ts": ts_str,
+                                    "q": q_text or "",
+                                    "path": c.get("path", ""),
+                                    "why": c.get("why", ""),
+                                })
+                    if isinstance(top_score, (int, float)) and top_score <= CONFIDENCE_RERANK_MIN:
+                        q_clean = (q_text or "").strip()
+                        if q_clean:
+                            low_conf.append({
                                 "ts": ts_str,
-                                "q": q_text or "",
-                                "path": c.get("path", ""),
-                                "why": c.get("why", ""),
+                                "q": q_clean,
+                                "top_score": float(top_score),
                             })
-                if isinstance(top_score, (int, float)) and top_score <= CONFIDENCE_RERANK_MIN:
-                    q_clean = (q_text or "").strip()
-                    if q_clean:
-                        low_conf.append({
-                            "ts": ts_str,
-                            "q": q_clean,
-                            "top_score": float(top_score),
-                        })
+            except Exception as _exc:
+                try:
+                    _silent_log("week_evidence_queries_sql_failed", _exc)
+                except Exception:
+                    pass
     except Exception as _exc:
         try:
-            _silent_log("week_evidence_queries_sql_failed", _exc)
+            _silent_log("week_evidence_conn_failed", _exc)
         except Exception:
             pass
 
@@ -48209,6 +48242,7 @@ def _save_raw_ambient_config(cfg: dict) -> None:
     AMBIENT_CONFIG_PATH.write_text(
         json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8"
     )
+    _invalidate_ambient_config_cache()
 
 
 @ambient.group("folders")
@@ -56465,37 +56499,39 @@ def _snapshot_create() -> dict:
             })
     except Exception:
         pass
-    # 3. Learned paraphrases (Feature #9).
+    # 3. Learned paraphrases (Feature #9) + 4. Feedback — share one conn.
     try:
         with _ragvec_state_conn() as conn:
-            rows = conn.execute(
-                "SELECT q_normalized, paraphrase, hit_count, "
-                "       created_ts, last_used_ts "
-                "FROM rag_learned_paraphrases"
-            ).fetchall()
-        for q, p, hits, ct, lut in rows:
-            snap["learned_paraphrases"].append({
-                "q_normalized": q, "paraphrase": p,
-                "hit_count": hits,
-                "created_ts": ct, "last_used_ts": lut,
-            })
-    except Exception:
-        pass
-    # 4. Feedback — positives + corrective_paths (the valuable stuff).
-    try:
-        with _ragvec_state_conn() as conn:
-            rows = conn.execute(
-                "SELECT ts, turn_id, rating, q, scope, paths_json, extra_json "
-                "FROM rag_feedback "
-                "WHERE rating = 1 OR "
-                "      (json_extract(extra_json, '$.corrective_path') IS NOT NULL "
-                "       AND json_extract(extra_json, '$.corrective_path') != '')"
-            ).fetchall()
-        for ts, tid, r, q, sc, pj, ej in rows:
-            snap["feedback"].append({
-                "ts": ts, "turn_id": tid, "rating": r, "q": q,
-                "scope": sc, "paths_json": pj, "extra_json": ej,
-            })
+            try:
+                rows = conn.execute(
+                    "SELECT q_normalized, paraphrase, hit_count, "
+                    "       created_ts, last_used_ts "
+                    "FROM rag_learned_paraphrases"
+                ).fetchall()
+                for q, p, hits, ct, lut in rows:
+                    snap["learned_paraphrases"].append({
+                        "q_normalized": q, "paraphrase": p,
+                        "hit_count": hits,
+                        "created_ts": ct, "last_used_ts": lut,
+                    })
+            except Exception:
+                pass
+            # 4. Feedback — positives + corrective_paths (the valuable stuff).
+            try:
+                rows = conn.execute(
+                    "SELECT ts, turn_id, rating, q, scope, paths_json, extra_json "
+                    "FROM rag_feedback "
+                    "WHERE rating = 1 OR "
+                    "      (json_extract(extra_json, '$.corrective_path') IS NOT NULL "
+                    "       AND json_extract(extra_json, '$.corrective_path') != '')"
+                ).fetchall()
+                for ts, tid, r, q, sc, pj, ej in rows:
+                    snap["feedback"].append({
+                        "ts": ts, "turn_id": tid, "rating": r, "q": q,
+                        "scope": sc, "paths_json": pj, "extra_json": ej,
+                    })
+            except Exception:
+                pass
     except Exception:
         pass
     return snap

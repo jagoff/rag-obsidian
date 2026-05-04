@@ -14,9 +14,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-# Mirror of rag/__init__.py:10746 — redefined here to avoid a circular
-# import.  Both definitions must stay in sync.
-_GOOGLE_TOKEN_PATH = Path.home() / ".config/obsidian-rag/google_token.json"
+from rag._constants import _GOOGLE_TOKEN_PATH
 
 __all__ = [
     "_LAUNCH_AGENTS_DIR", "_RAG_LOG_DIR", "_GOOGLE_TOKEN_PATH",

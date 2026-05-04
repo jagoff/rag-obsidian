@@ -21,6 +21,8 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from rag._constants import _GOOGLE_TOKEN_PATH
+
 __all__ = [
     # MOZE helpers
     "MOZE_BACKUP_DIR",
@@ -1000,7 +1002,6 @@ _GOOGLE_KEYS_CANDIDATES = (
     Path.home() / ".config/obsidian-rag/google_credentials.json",
     Path.home() / ".gmail-mcp/gcp-oauth.keys.json",
 )
-_GOOGLE_TOKEN_PATH = Path.home() / ".config/obsidian-rag/google_token.json"
 _GOOGLE_SCOPES = (
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/drive.readonly",
@@ -1330,7 +1331,7 @@ def _google_keys_path() -> Path | None:
     return None
 
 
-def _load_google_credentials(allow_interactive: bool = True):
+def _load_google_credentials(allow_interactive: bool = True) -> "google.oauth2.credentials.Credentials | None":
     """Return Google OAuth `Credentials` for Gmail + Drive (readonly), or None.
 
     Lookup order: cached token → refresh if expired → first-time interactive
@@ -2050,7 +2051,7 @@ def _sync_youtube_transcripts(vault_root: Path, batch: int = _YT_TRANSCRIPT_BATC
 
 # ── Spotify ───────────────────────────────────────────────────────────────────
 
-def _spotify_client(allow_interactive: bool = True):
+def _spotify_client(allow_interactive: bool = True) -> "spotipy.Spotify | None":
     """Return an authenticated `spotipy.Spotify` instance, or None."""
     import sys as _sys
     _rag = _sys.modules.get("rag")

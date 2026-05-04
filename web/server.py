@@ -23203,7 +23203,7 @@ def fine_tunning_queue(limit: int = 20) -> dict:
 
 
 @app.post("/api/fine_tunning/rate")
-async def fine_tunning_rate(req: FineTunningRateRequest) -> dict:
+def fine_tunning_rate(req: FineTunningRateRequest) -> dict:
     """Persiste rating en rag_ft_panel_ratings + upsertea rag_ft_active_queue_state
     para que el item no vuelva a aparecer en el próximo /queue refresh.
 
@@ -23433,7 +23433,7 @@ def _fanout_ft_rating_to_downstream(req) -> None:
 
 
 @app.post("/api/fine_tunning/snooze")
-async def fine_tunning_snooze(req: FineTunningSnoozeRequest) -> dict:
+def fine_tunning_snooze(req: FineTunningSnoozeRequest) -> dict:
     """Pospone un item para que no aparezca en /queue hasta después de
     ``hours`` horas (default 24, máx 168 = 1 semana)."""
     import datetime as _dt  # noqa: PLC0415

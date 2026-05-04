@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from datetime import datetime
 from pathlib import Path
+
+import rag as _rag
 
 __all__ = [
     "_ARCHIVE_ROOT",
@@ -87,8 +90,7 @@ def _is_archive_opt_out(raw: str) -> bool:
     Both forms are honored — list form was silently unmatched before because
     stringifying the list yielded `"['moc', 'reference']"`.
     """
-    from rag import parse_frontmatter
-    fm = parse_frontmatter(raw)
+    fm = _rag.parse_frontmatter(raw)
     if str(fm.get("archive", "")).strip().lower() == "never":
         return True
     raw_type = fm.get("type")
@@ -136,10 +138,9 @@ def _open_archive_batch() -> Path:
     batches but with an `archive-` prefix so `rag file --undo` doesn't pick
     it up accidentally.
     """
-    from rag import FILING_BATCHES_DIR
-    FILING_BATCHES_DIR.mkdir(parents=True, exist_ok=True)
+    _rag.FILING_BATCHES_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    path = FILING_BATCHES_DIR / f"archive-{ts}.jsonl"
+    path = _rag.FILING_BATCHES_DIR / f"archive-{ts}.jsonl"
     path.touch()
     return path
 
@@ -152,24 +153,16 @@ def _append_archive_batch(batch_path: Path, entry: dict) -> None:
 
 
 def _log_archive_event(event: dict) -> None:
-    from rag import (
-        _ragvec_state_conn,
-        _sql_append_event,
-        _map_archive_row,
-        _log_archive_event_background_default,
-        _enqueue_background_sql,
-        _sql_write_with_retry,
-    )
     e = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
 
     def _do() -> None:
-        with _ragvec_state_conn() as conn:
-            _sql_append_event(conn, "rag_archive_log",
-                               _map_archive_row(e))
-    if _log_archive_event_background_default():
-        _enqueue_background_sql(_do, "archive_sql_write_failed")
+        with _rag._ragvec_state_conn() as conn:
+            _rag._sql_append_event(conn, "rag_archive_log",
+                                   _rag._map_archive_row(e))
+    if _rag._log_archive_event_background_default():
+        _rag._enqueue_background_sql(_do, "archive_sql_write_failed")
     else:
-        _sql_write_with_retry(_do, "archive_sql_write_failed")
+        _rag._sql_write_with_retry(_do, "archive_sql_write_failed")
 
 
 def _archive_move_one(
@@ -180,14 +173,12 @@ def _archive_move_one(
     old path (now gone → sqlite-vec deletes its chunks) + new path (fresh chunks
     under the new `file=` metadata key).
     """
-    import shutil
-    from rag import VAULT_PATH, _index_single_file
-    src = (VAULT_PATH / src_rel).resolve()
-    src.relative_to(VAULT_PATH.resolve())
+    src = (_rag.VAULT_PATH / src_rel).resolve()
+    src.relative_to(_rag.VAULT_PATH.resolve())
     if not src.is_file():
         raise FileNotFoundError(src_rel)
-    dst = (VAULT_PATH / dst_rel).resolve()
-    dst.relative_to(VAULT_PATH.resolve())
+    dst = (_rag.VAULT_PATH / dst_rel).resolve()
+    dst.relative_to(_rag.VAULT_PATH.resolve())
     if dst.exists():
         raise FileExistsError(dst_rel)
     raw = src.read_text(encoding="utf-8", errors="ignore")
@@ -198,11 +189,11 @@ def _archive_move_one(
     # Clean old path from sqlite-vec + add new path. Both best-effort — the next
     # full `rag index` would converge regardless.
     try:
-        _index_single_file(col, src, skip_contradict=True)
+        _rag._index_single_file(col, src, skip_contradict=True)
     except Exception:
         pass
     try:
-        _index_single_file(col, dst, skip_contradict=True)
+        _rag._index_single_file(col, dst, skip_contradict=True)
     except Exception:
         pass
     return {
@@ -358,12 +349,11 @@ def _write_archive_report(result: dict, apply: bool) -> Path | None:
     Appends a dated section if the file already exists (monthly cadence can
     hit the same file twice if triggered manually between cycles).
     """
-    from rag import VAULT_PATH
     plan = result["plan"]
     skipped = result["skipped"]
     if not plan and not skipped:
         return None
-    reviews_dir = VAULT_PATH / "04-Archive/99-obsidian-system/99-AI/reviews"
+    reviews_dir = _rag.VAULT_PATH / "04-Archive/99-obsidian-system/99-AI/reviews"
     reviews_dir.mkdir(parents=True, exist_ok=True)
     ym = datetime.now().strftime("%Y-%m")
     path = reviews_dir / f"{ym}-archive.md"
@@ -412,8 +402,7 @@ def _push_archive_notification(result: dict, apply: bool) -> bool:
     if ambient isn't configured. Message is compact: counts + top-3 folders.
     """
     from collections import Counter
-    from rag import _ambient_config, _ambient_whatsapp_send, _ambient_log_event
-    cfg = _ambient_config()
+    cfg = _rag._ambient_config()
     if cfg is None:
         return False
     plan = result["plan"]
@@ -434,8 +423,8 @@ def _push_archive_notification(result: dict, apply: bool) -> bool:
     if result["skipped"]:
         lines.append(f"\n_{len(result['skipped'])} skipped_")
     msg = "\n".join(lines)
-    sent = _ambient_whatsapp_send(cfg["jid"], msg)
-    _ambient_log_event({
+    sent = _rag._ambient_whatsapp_send(cfg["jid"], msg)
+    _rag._ambient_log_event({
         "cmd": "archive_push",
         "n_plan": len(plan),
         "n_applied": len(result["applied"]),

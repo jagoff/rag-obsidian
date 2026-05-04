@@ -641,6 +641,25 @@ def cmd_watch_install(interval: float):
     bin_path = Path(__file__).resolve()
     log_dir = Path.home() / ".local" / "share" / "rag-harness"
     log_dir.mkdir(parents=True, exist_ok=True)
+
+    # `uv run --script` con metadata PEP 723 inline. launchd no respeta de
+    # forma confiable el shebang `#!/usr/bin/env -S uv run ...` cuando el
+    # script está en ProgramArguments[0] — termina lanzándolo con system
+    # python que no tiene `click` y el daemon rebota en loop. Invocamos uv
+    # directo para evitar ese rabbit hole.
+    uv_path = ""
+    for candidate in (
+        Path.home() / ".local" / "bin" / "uv",
+        Path("/opt/homebrew/bin/uv"),
+        Path("/usr/local/bin/uv"),
+    ):
+        if candidate.exists():
+            uv_path = str(candidate)
+            break
+    if not uv_path:
+        click.echo("error: no encuentro `uv` en ~/.local/bin ni homebrew", err=True)
+        sys.exit(1)
+
     content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -649,6 +668,10 @@ def cmd_watch_install(interval: float):
   <string>{_PLIST_LABEL}</string>
   <key>ProgramArguments</key>
   <array>
+    <string>{uv_path}</string>
+    <string>run</string>
+    <string>--quiet</string>
+    <string>--script</string>
     <string>{bin_path}</string>
     <string>watch</string>
     <string>--interval</string>
@@ -665,7 +688,7 @@ def cmd_watch_install(interval: float):
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>/usr/local/bin:/usr/bin:/bin:/Users/{Path.home().name}/.local/bin</string>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/{Path.home().name}/.local/bin</string>
   </dict>
 </dict>
 </plist>

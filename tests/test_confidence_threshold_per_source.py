@@ -54,6 +54,7 @@ def test_threshold_calibrated_values_w3_9():
         "drive":     0.010,   # docs cortos en la fase actual del ingester
         "contacts":  0.012,   # bodies medianos, signal alto
         "safari":    0.012,   # title + body de bookmark/history
+        "pillow":    0.015,   # sleep tracker, baseline (no eval data yet)
     }
     assert rag.CONFIDENCE_RERANK_MIN_PER_SOURCE == expected, (
         "Per-source thresholds drifted from W3.9 calibration. "

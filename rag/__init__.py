@@ -3222,6 +3222,7 @@ CONFIDENCE_RERANK_MIN_PER_SOURCE: dict[str, float] = {
     "contacts":  0.012,   # bodies medianos, signal alto
     "safari":    0.012,   # title + body de bookmark/history
     "drive":     0.010,   # docs cortos en la fase actual del ingester
+    "pillow":    0.015,   # sleep tracker; corpus local-only pero source registrada en VALID_SOURCES
 }
 
 

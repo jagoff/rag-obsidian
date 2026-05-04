@@ -155,6 +155,7 @@ from rag import (  # noqa: E402
     resolve_vault_paths,
     save_session,
     session_history,
+    _summarize_conversation_history,
     TOPIC_SHIFT_COSINE,
 )
 
@@ -13491,7 +13492,41 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             )
             if _src_hint:
                 _system_msgs.append({"role": "system", "content": _src_hint})
-            _turn_history = history or []
+            # ── Quick Win #5: Selective history summarisation ─────────────
+            # When the user has ≥2 turns already in history (i.e., at least
+            # one completed exchange), replace the raw N-1 prior turns with a
+            # 2-3 sentence summary, keeping only the last turn verbatim.
+            # This dramatically reduces context tokens for long sessions
+            # while preserving the topic thread.
+            #
+            # Gate: RAG_HISTORY_SUMMARY (default ON, set to "0"/"false"/"no"
+            # to disable).  When ≤1 turn or feature is OFF, falls back to
+            # the original raw concatenation.
+            _RAG_HISTORY_SUMMARY_ON = os.environ.get(
+                "RAG_HISTORY_SUMMARY", "1"
+            ).strip().lower() not in ("0", "false", "no", "")
+            if _RAG_HISTORY_SUMMARY_ON and len(history or []) > 2:
+                # history is a flat message list; pairs of (user, assistant)
+                # messages = turns.  history[:-2] = all but last turn.
+                _prior_msgs = history[:-2]
+                _last_turn  = history[-2:]
+                _hist_summary = _summarize_conversation_history(
+                    _prior_msgs, sess["id"]
+                )
+                if _hist_summary:
+                    _turn_history = [
+                        {
+                            "role": "system",
+                            "content": (
+                                "[Resumen de la conversación previa]\n"
+                                + _hist_summary
+                            ),
+                        }
+                    ] + _last_turn
+                else:
+                    _turn_history = history or []
+            else:
+                _turn_history = history or []
         tool_messages: list[dict] = (
             _system_msgs
             + _turn_history
@@ -22315,6 +22350,15 @@ _MEMORY_BUFFER_MAX = 1440  # 24h @ 60s
 _MEMORY_SAMPLE_INTERVAL = 60.0
 _MEMORY_BUFFER: deque = deque(maxlen=_MEMORY_BUFFER_MAX)
 _MEMORY_LOCK = threading.Lock()
+# Cooperative shutdown — mismo patrón que `_STATUS_PROBE_STOP` y
+# `_ERROR_QUEUE_STOP`. Sin esto, los tests que crean múltiples
+# `TestClient(app)` acumulaban N daemon threads zombies tocando los
+# buffers shared después del module teardown, causando segfaults
+# intermitentes en el suite full (`web/server.py:22550 in loop`).
+# Singleton check evita spawnear duplicados cuando el lifespan
+# startup corre más de una vez en el mismo proceso.
+_MEMORY_SAMPLER_THREAD: "threading.Thread | None" = None
+_MEMORY_SAMPLER_STOP = threading.Event()
 
 _MEMORY_CATEGORIES = ("rag", "ollama", "sqlite-vec", "whatsapp")
 
@@ -22584,7 +22628,14 @@ def _memory_trim_file() -> None:
 
 @_on_startup
 def _start_memory_sampler() -> None:
+    """Arranca el daemon thread del memory sampler. Idempotente: si ya
+    hay uno vivo (caso suite con múltiples TestClient consecutivos),
+    no spawnea duplicados."""
+    global _MEMORY_SAMPLER_THREAD
+    if _MEMORY_SAMPLER_THREAD is not None and _MEMORY_SAMPLER_THREAD.is_alive():
+        return
     _memory_load_history()
+    _MEMORY_SAMPLER_STOP.clear()
 
     def loop() -> None:
         import random as _r
@@ -22593,9 +22644,10 @@ def _start_memory_sampler() -> None:
         # queries writer) que arrancan al mismo startup. Sin jitter cada 60s
         # los 3 writers colisionaban simultáneo, saturaban el WAL lock, y
         # uno perdía el sample (~64/semana en el audit 2026-04-23).
-        time.sleep(_r.uniform(0, 30))
+        if _MEMORY_SAMPLER_STOP.wait(timeout=_r.uniform(0, 30)):
+            return
         trim_counter = 0
-        while True:
+        while not _MEMORY_SAMPLER_STOP.is_set():
             sample = _sample_memory()
             if sample:
                 with _MEMORY_LOCK:
@@ -22605,11 +22657,25 @@ def _start_memory_sampler() -> None:
                 if trim_counter >= 60:  # once an hour
                     _memory_trim_file()
                     trim_counter = 0
-            # Per-cycle jitter ±5s para evitar drift hacia realineamiento
-            # después del primer offset. Rango [55, 65] sobre interval 60s.
-            time.sleep(_MEMORY_SAMPLE_INTERVAL + _r.uniform(-5, 5))
+            # Per-cycle jitter ±5s; `wait()` retorna True ni bien stop event
+            # se setea → exit limpio sin esperar el tick completo.
+            if _MEMORY_SAMPLER_STOP.wait(
+                timeout=_MEMORY_SAMPLE_INTERVAL + _r.uniform(-5, 5)
+            ):
+                return
 
-    threading.Thread(target=loop, name="memory-sampler", daemon=True).start()
+    _MEMORY_SAMPLER_THREAD = threading.Thread(
+        target=loop, name="memory-sampler", daemon=True,
+    )
+    _MEMORY_SAMPLER_THREAD.start()
+
+
+@_on_shutdown
+def _stop_memory_sampler() -> None:
+    """Señaliza al memory sampler que pare + join breve."""
+    _MEMORY_SAMPLER_STOP.set()
+    if _MEMORY_SAMPLER_THREAD is not None:
+        _MEMORY_SAMPLER_THREAD.join(timeout=2.0)
 
 
 @app.get("/api/system-memory")
@@ -22707,6 +22773,9 @@ _CPU_LIVE_INTERVAL = 2.0
 _CPU_BUFFER: deque = deque(maxlen=_CPU_BUFFER_MAX)
 _CPU_LOCK = threading.Lock()
 _CPU_NCORES = os.cpu_count() or 1
+# Cooperative shutdown — ver doc-block en `_MEMORY_SAMPLER_STOP`.
+_CPU_SAMPLER_THREAD: "threading.Thread | None" = None
+_CPU_SAMPLER_STOP = threading.Event()
 
 
 def _parse_cputime(s: str) -> float | None:
@@ -22857,7 +22926,12 @@ def _cpu_trim_file() -> None:
 
 @_on_startup
 def _start_cpu_sampler() -> None:
+    """Idempotente — ver doc-block en `_start_memory_sampler`."""
+    global _CPU_SAMPLER_THREAD
+    if _CPU_SAMPLER_THREAD is not None and _CPU_SAMPLER_THREAD.is_alive():
+        return
     _cpu_load_history()
+    _CPU_SAMPLER_STOP.clear()
 
     def loop() -> None:
         import random as _r
@@ -22868,12 +22942,17 @@ def _start_cpu_sampler() -> None:
         # Initial jitter 0-30s para desynchroñar el primer write con el
         # memory-sampler. Ver el comentario equivalente en
         # `_start_memory_sampler` para el razonamiento.
-        time.sleep(_r.uniform(0, 30))
+        if _CPU_SAMPLER_STOP.wait(timeout=_r.uniform(0, 30)):
+            return
         trim_counter = 0
-        while True:
+        while not _CPU_SAMPLER_STOP.is_set():
             # Per-cycle jitter ±5s; evita la re-sincronización progresiva
-            # hacia colisiones con otros samplers.
-            time.sleep(_CPU_SAMPLE_INTERVAL + _r.uniform(-5, 5))
+            # hacia colisiones con otros samplers. `wait()` permite exit
+            # limpio sin esperar el tick completo.
+            if _CPU_SAMPLER_STOP.wait(
+                timeout=_CPU_SAMPLE_INTERVAL + _r.uniform(-5, 5)
+            ):
+                return
             sample = _sample_cpu(state)
             if sample:
                 with _CPU_LOCK:
@@ -22884,7 +22963,18 @@ def _start_cpu_sampler() -> None:
                     _cpu_trim_file()
                     trim_counter = 0
 
-    threading.Thread(target=loop, name="cpu-sampler", daemon=True).start()
+    _CPU_SAMPLER_THREAD = threading.Thread(
+        target=loop, name="cpu-sampler", daemon=True,
+    )
+    _CPU_SAMPLER_THREAD.start()
+
+
+@_on_shutdown
+def _stop_cpu_sampler() -> None:
+    """Señaliza al CPU sampler + join breve."""
+    _CPU_SAMPLER_STOP.set()
+    if _CPU_SAMPLER_THREAD is not None:
+        _CPU_SAMPLER_THREAD.join(timeout=2.0)
 
 
 @app.get("/api/system-cpu")

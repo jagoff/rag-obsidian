@@ -42,6 +42,17 @@ from web import server as server_mod
 from web import tools as tools_mod
 
 
+@pytest.fixture(autouse=True)
+def _isolate_db_path(tmp_path):
+    import rag as _rag
+    snap = _rag.DB_PATH
+    _rag.DB_PATH = tmp_path / "ragvec"
+    try:
+        yield
+    finally:
+        _rag.DB_PATH = snap
+
+
 # ── 1. Tool wrapper ────────────────────────────────────────────────────────
 
 

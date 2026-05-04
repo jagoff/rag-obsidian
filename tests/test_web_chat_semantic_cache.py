@@ -30,6 +30,17 @@ from web.server import app
 import rag
 
 
+@pytest.fixture(autouse=True)
+def _isolate_db_path(tmp_path):
+    import rag as _rag
+    snap = _rag.DB_PATH
+    _rag.DB_PATH = tmp_path / "ragvec"
+    try:
+        yield
+    finally:
+        _rag.DB_PATH = snap
+
+
 # SSE parser viene de conftest (consolidado 2026-04-25). El _OllamaMock LOCAL
 # queda porque el semantic-hit-replay path debe dar `calls == []`, y la
 # AssertionError custom acá documenta esa invariante.

@@ -439,14 +439,13 @@ def upsert_events(col, events: list[CalEvent]) -> int:
     embed_texts = [_embed_prefix(e, b) for e, b in zip(events, bodies)]
     embeddings = rag.embed(embed_texts)
 
-    for ev in events:
-        key = _event_file_key(ev)
-        try:
-            existing = col.get(where={"file": key}, include=[])
-            if existing.get("ids"):
-                col.delete(ids=existing["ids"])
-        except Exception:
-            pass
+    keys = [_event_file_key(ev) for ev in events]
+    try:
+        existing = col.get(where={"file": {"$in": keys}}, include=[])
+        if existing.get("ids"):
+            col.delete(ids=existing["ids"])
+    except Exception:
+        pass
 
     ids = [_event_doc_id(e) for e in events]
     metas: list[dict] = []
@@ -484,17 +483,15 @@ def delete_cancelled(col, calendar_id: str, event_ids: list[str]) -> int:
     """Remove rows for cancelled events. Returns count deleted."""
     if not event_ids:
         return 0
-    n = 0
-    for eid in event_ids:
-        key = f"{DOC_ID_PREFIX}://{calendar_id}/{eid}"
-        try:
-            got = col.get(where={"file": key}, include=[])
-            if got.get("ids"):
-                col.delete(ids=got["ids"])
-                n += 1
-        except Exception:
-            continue
-    return n
+    keys = [f"{DOC_ID_PREFIX}://{calendar_id}/{eid}" for eid in event_ids]
+    try:
+        got = col.get(where={"file": {"$in": keys}}, include=[])
+        if got.get("ids"):
+            col.delete(ids=got["ids"])
+            return len(got["ids"])
+    except Exception:
+        pass
+    return 0
 
 
 # ── Orchestration ──────────────────────────────────────────────────────────

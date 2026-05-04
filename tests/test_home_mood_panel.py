@@ -29,6 +29,17 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "web"))
 
 
+@pytest.fixture(autouse=True)
+def _isolate_db_path(tmp_path):
+    import rag as _rag
+    snap = _rag.DB_PATH
+    _rag.DB_PATH = tmp_path / "ragvec"
+    try:
+        yield
+    finally:
+        _rag.DB_PATH = snap
+
+
 @pytest.fixture
 def fetch_mood():
     """Importa _fetch_mood freshly. El módulo `web.server` es pesado

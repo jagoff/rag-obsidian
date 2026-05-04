@@ -448,7 +448,7 @@ def test_query_vault_flag_routes_to_named_vault(tmp_registry, tmp_path, monkeypa
     _stub_query_pipeline_past_retrieve(monkeypatch)
 
     result = CliRunner().invoke(
-        rag.cli, ["query", "--plain", "--no-multi", "--vault", "work", "test"],
+        rag.cli, ["query", "--plain", "--vault", "work", "test"],
     )
 
     assert result.exit_code == 0, result.output
@@ -478,7 +478,7 @@ def test_query_without_vault_uses_default_get_db(tmp_registry, tmp_path, monkeyp
     monkeypatch.setattr(rag, "get_db_for", boom_get_db_for)
     _stub_query_pipeline_past_retrieve(monkeypatch)
 
-    result = CliRunner().invoke(rag.cli, ["query", "--plain", "--no-multi", "test"])
+    result = CliRunner().invoke(rag.cli, ["query", "--plain", "test"])
 
     assert result.exit_code == 0, result.output
     assert get_db_called["n"] == 1

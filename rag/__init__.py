@@ -51,6 +51,7 @@ import concurrent.futures
 import contextlib
 import csv
 import fcntl
+import functools
 import hashlib
 import heapq
 import json
@@ -1321,6 +1322,81 @@ def _log_ft_rating_event_background_default() -> bool:
     """
     val = os.environ.get("RAG_LOG_FT_RATING_ASYNC", "1").strip().lower()
     return val not in ("0", "false", "no", "off")
+
+
+def _log_ambient_event_background_default() -> bool:
+    """True cuando las writes de ``_ambient_log_event`` deben ir al queue async.
+
+    Default ON desde 2026-05-04. ``_ambient_log_event`` dispara en cada save
+    del vault con el daemon ambient ON (alta frecuencia); moverlo al queue
+    elimina la contención WAL del hot path de indexing.
+
+    Override: ``RAG_LOG_AMBIENT_ASYNC=0`` fuerza sync (útil para tests que
+    leen ``rag_ambient`` inmediatamente post-write).
+    El conftest setea ``0`` para preservar el contract sincrónico del suite.
+    """
+    val = os.environ.get("RAG_LOG_AMBIENT_ASYNC", "").strip().lower()
+    return val not in ("0", "false", "no")
+
+
+def _log_contradictions_event_background_default() -> bool:
+    """True cuando las writes de ``_log_contradictions`` deben ir al queue async.
+
+    Default ON desde 2026-05-04. ``_log_contradictions`` escribe en cada
+    reindex de notas con contradicciones detectadas; el queue absorbe el
+    retry budget off-thread sin bloquear el pipeline de indexing.
+
+    Override: ``RAG_LOG_CONTRADICTIONS_ASYNC=0`` fuerza sync (útil para tests
+    que leen ``rag_contradictions`` inmediatamente post-write).
+    El conftest setea ``0`` para preservar el contract sincrónico del suite.
+    """
+    val = os.environ.get("RAG_LOG_CONTRADICTIONS_ASYNC", "").strip().lower()
+    return val not in ("0", "false", "no")
+
+
+def _log_archive_event_background_default() -> bool:
+    """True cuando las writes de ``_log_archive_event`` deben ir al queue async.
+
+    Default ON desde 2026-05-04. ``rag archive`` escribe una row por nota
+    archivada; el queue permite que el comando UI retorne sin esperar el
+    retry budget WAL.
+
+    Override: ``RAG_LOG_ARCHIVE_ASYNC=0`` fuerza sync (útil para tests que
+    leen ``rag_archive_log`` inmediatamente post-write).
+    El conftest setea ``0`` para preservar el contract sincrónico del suite.
+    """
+    val = os.environ.get("RAG_LOG_ARCHIVE_ASYNC", "").strip().lower()
+    return val not in ("0", "false", "no")
+
+
+def _log_tune_event_background_default() -> bool:
+    """True cuando las writes de ``_log_tune_event`` deben ir al queue async.
+
+    Default ON desde 2026-05-04. Aunque ``rag tune`` es baja frecuencia,
+    cada write individual puede ser pesado bajo contención WAL si el indexer
+    o el web server están activos al mismo tiempo.
+
+    Override: ``RAG_LOG_TUNE_ASYNC=0`` fuerza sync (útil para tests que
+    leen ``rag_tune`` inmediatamente post-write).
+    El conftest setea ``0`` para preservar el contract sincrónico del suite.
+    """
+    val = os.environ.get("RAG_LOG_TUNE_ASYNC", "").strip().lower()
+    return val not in ("0", "false", "no")
+
+
+def _log_surface_event_background_default() -> bool:
+    """True cuando las writes de ``_surface_log_run`` deben ir al queue async.
+
+    Default ON desde 2026-05-04. ``_surface_log_run`` escribe un batch de
+    rows (un ``surface_run`` + N ``surface_pair``) dentro de un único
+    ``_sql_write_with_retry``; el queue despacha el batch completo off-thread.
+
+    Override: ``RAG_LOG_SURFACE_ASYNC=0`` fuerza sync (útil para tests que
+    leen ``rag_surface_log`` inmediatamente post-write).
+    El conftest setea ``0`` para preservar el contract sincrónico del suite.
+    """
+    val = os.environ.get("RAG_LOG_SURFACE_ASYNC", "").strip().lower()
+    return val not in ("0", "false", "no")
 
 
 def log_query_event(event: dict) -> None:
@@ -5782,7 +5858,10 @@ def semantic_cache_stats() -> dict:
 # writes to ragvec.db no longer block hot-path telemetry writes. Readers run
 # in parallel (WAL).
 
-RAG_STATE_SQL = os.environ.get("RAG_STATE_SQL", "").strip() == "1"
+# RAG_STATE_SQL was removed 2026-05-04: post-T10 SQL is the only telemetry
+# path — the JSONL fallback writers were stripped in commit 81e32b4. The env
+# var may still be present in launchd plists as a deployment-symmetry trail
+# but is not read by any code. See CLAUDE.md §Env vars for history.
 
 # DDL statements. All tables prefixed `rag_` to avoid collision with sqlite-vec
 # internal tables (`vec_*`, `meta_*`). `ts TEXT` stores ISO-8601 strings. Each
@@ -8127,7 +8206,9 @@ def _read_queries_for_log(
     return events
 
 
-def _read_feedback_map_for_log() -> dict[str, int]:
+def _read_feedback_map_for_log(
+    turn_ids: frozenset[str] | None = None,
+) -> dict[str, int]:
     """Read `{turn_id: +1|-1}` from `rag_feedback` for the CLI renderer's
     thumb-emoji column. Replaces the pre-T10 tail-read of `FEEDBACK_PATH`
     (`feedback.jsonl`).
@@ -8139,16 +8220,30 @@ def _read_feedback_map_for_log() -> dict[str, int]:
 
     Rows without `turn_id` (global scope feedback) are skipped — they
     can't attach to a specific query row in the rendered table.
+
+    `turn_ids` — when provided, restricts the SELECT to only those ids via
+    an IN clause. The caller always knows which turn_ids it fetched from
+    `rag_queries`, so passing them avoids a full-table scan when feedback
+    has accumulated thousands of rows.
     """
     try:
         with _ragvec_state_conn() as conn:
-            # ORDER BY ts ASC so the dict-build loop overwrites older
-            # ratings with newer ones per turn_id (latest wins).
-            cursor = conn.execute(
-                "SELECT turn_id, rating FROM rag_feedback "
-                "WHERE turn_id IS NOT NULL AND turn_id != '' "
-                "ORDER BY ts ASC"
-            )
+            if turn_ids:
+                placeholders = ",".join("?" * len(turn_ids))
+                cursor = conn.execute(
+                    "SELECT turn_id, rating FROM rag_feedback "
+                    f"WHERE turn_id IN ({placeholders}) "
+                    "ORDER BY ts ASC",
+                    tuple(turn_ids),
+                )
+            else:
+                # ORDER BY ts ASC so the dict-build loop overwrites older
+                # ratings with newer ones per turn_id (latest wins).
+                cursor = conn.execute(
+                    "SELECT turn_id, rating FROM rag_feedback "
+                    "WHERE turn_id IS NOT NULL AND turn_id != '' "
+                    "ORDER BY ts ASC"
+                )
             out: dict[str, int] = {}
             for tid, rating in cursor.fetchall():
                 try:
@@ -9546,13 +9641,12 @@ def auto_index_vault(vault_path: Path) -> dict:
             # the real on-disk state.
             if orphans:
                 with _collection_write_lock():
-                    for orphan in orphans:
-                        if (vault_path / orphan).is_file():
-                            continue  # false positive from stale rglob
-                        stale = col.get(where={"file": orphan}, include=[])
+                    confirmed = [o for o in orphans if not (vault_path / o).is_file()]
+                    if confirmed:
+                        stale = col.get(where={"file": {"$in": confirmed}}, include=[])
                         if stale["ids"]:
                             col.delete(ids=stale["ids"])
-                            removed += 1
+                            removed += len(stale["ids"])
 
     state[key] = _t.time()
     _auto_index_state_save(state)
@@ -12376,6 +12470,8 @@ def _index_urls(
 
 SCREENTIME_VAULT_SUBPATH = "03-Resources/Screentime"
 _SCREENTIME_BACKFILL_DAYS = 30
+_SCREENTIME_DAILY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.md$")
+_SCREENTIME_MONTHLY_RE = re.compile(r"^\d{4}-\d{2}\.md$")
 
 
 def _sync_screentime_notes(
@@ -12484,16 +12580,13 @@ def _sync_screentime_notes(
     # Prune días que ya cayeron fuera de la ventana de backfill (>30d).
     # Conservadoramente, solo borramos archivos *.md cuyo nombre matchea
     # YYYY-MM-DD o YYYY-MM y NO está en current_set.
-    import re as _re
-    daily_re = _re.compile(r"^\d{4}-\d{2}-\d{2}\.md$")
-    monthly_re = _re.compile(r"^\d{4}-\d{2}\.md$")
     for p in target_dir.glob("*.md"):
         if p.name in current_set:
             continue
-        if daily_re.match(p.name):
+        if _SCREENTIME_DAILY_RE.match(p.name):
             # Daily fuera de ventana — preservar (histórico).
             continue
-        if monthly_re.match(p.name):
+        if _SCREENTIME_MONTHLY_RE.match(p.name):
             # Monthly fuera de ventana — preservar también.
             continue
         # Otros archivos no tocamos (puede haber notas user-creadas).
@@ -19763,7 +19856,10 @@ def _surface_log_run(summary: dict, pairs: list[dict]) -> None:
                     conn, "rag_surface_log",
                     _map_surface_row({"ts": ts, "cmd": "surface_pair", **p}),
                 )
-    _sql_write_with_retry(_do, "surface_sql_write_failed")
+    if _log_surface_event_background_default():
+        _enqueue_background_sql(_do, "surface_sql_write_failed")
+    else:
+        _sql_write_with_retry(_do, "surface_sql_write_failed")
 
 
 def _suggest_tags_for_note(
@@ -24248,7 +24344,10 @@ def _log_contradictions(
         with _ragvec_state_conn() as conn:
             _sql_append_event(conn, "rag_contradictions",
                                _map_contradiction_row(event))
-    _sql_write_with_retry(_do, "contradictions_sql_write_failed")
+    if _log_contradictions_event_background_default():
+        _enqueue_background_sql(_do, "contradictions_sql_write_failed")
+    else:
+        _sql_write_with_retry(_do, "contradictions_sql_write_failed")
 
 
 def _frontmatter_contradicts_set(path: Path) -> set[str]:
@@ -25045,7 +25144,10 @@ def _ambient_log_event(event: dict) -> None:
     def _do() -> None:
         with _ragvec_state_conn() as conn:
             _sql_append_event(conn, "rag_ambient", _map_ambient_row(e))
-    _sql_write_with_retry(_do, "ambient_sql_write_failed")
+    if _log_ambient_event_background_default():
+        _enqueue_background_sql(_do, "ambient_sql_write_failed")
+    else:
+        _sql_write_with_retry(_do, "ambient_sql_write_failed")
 
 
 # `_ambient_whatsapp_send` moved to `rag.integrations.whatsapp` (Phase 1b,
@@ -28813,7 +28915,6 @@ def watch(debounce: float, all_vaults: bool):
               help="Filtrar por fecha de creación. Acepta '7d'/'2w'/'3m'/'1y' o ISO (YYYY-MM-DD).")
 @click.option("--hyde/--no-hyde", "hyde", default=None, help="Forzar HyDE on/off independiente de --precise (decoupling 2026-04-25). Default (None) = legacy bundle: sigue a precise.")
 @click.option("--multi", is_flag=True, help="Activa multi-query expansion (default: off desde 2026-04-21, bench mostró −29% P95 singles sin pérdida de quality)")
-@click.option("--no-multi", is_flag=True, help="[deprecated] no-op — multi-query está off por default")
 @click.option("--no-auto-filter", is_flag=True, help="Desactiva inferencia de filtros")
 @click.option("--raw", is_flag=True, help="Skip LLM — muestra chunks recuperados directo")
 @click.option("--loose", is_flag=True, help="Permite prosa externa del LLM (marcada con ⚠)")
@@ -28841,7 +28942,7 @@ def watch(debounce: float, all_vaults: bool):
 def query(
     question: str, k: int, folder: str | None, tag: str | None,
     since: str | None,
-    hyde: bool | None, multi: bool, no_multi: bool, no_auto_filter: bool,
+    hyde: bool | None, multi: bool, no_auto_filter: bool,
     raw: bool, loose: bool, force: bool,
     session_id: str | None, continue_: bool, plain: bool,
     counter: bool, no_deep: bool, critique: bool,
@@ -29072,13 +29173,10 @@ def query(
     # expansion happens inside retrieve() as before.
     # Post 2026-04-21: default multi=OFF (bench mostró −29% P95 singles,
     # −85% P95 chains, sin pérdida de hit@5/MRR). `--multi` opt-in para
-    # volver al comportamiento previo; `--no-multi` legacy no-op para no
-    # romper scripts existentes.
+    # volver al comportamiento previo.
     effective_question = question
     pre_variants: list[str] | None = None
-    # `no_multi` legacy flag: si está presente, domina sobre `multi` (explícito
-    # gana sobre default). `multi` flag activa paraphrase solo si usuario opt-in.
-    _multi_enabled = multi and not no_multi
+    _multi_enabled = multi
     # Fase B.3: skip reformulate para metadata-only intents cuando adaptive routing ON.
     # Con RAG_ADAPTIVE_ROUTING=0 (default) _should_skip_reformulate() siempre False
     # → comportamiento bit-identical al anterior.
@@ -30151,7 +30249,6 @@ def _handle_chat_create_intent(question: str) -> tuple[bool, dict | None]:
 @click.option("--precise", is_flag=True, help="HyDE + reformulación (más preciso, ~5s extra)")
 @click.option("--hyde/--no-hyde", "hyde", default=None, help="Forzar HyDE on/off independiente de --precise. Default (None) = respeta --precise (legacy bundling).")
 @click.option("--multi", is_flag=True, help="Activa multi-query expansion (default: off desde 2026-04-21, bench mostró −85% P95 chains sin pérdida de quality)")
-@click.option("--no-multi", is_flag=True, help="[deprecated] no-op — multi-query está off por default")
 @click.option("--no-auto-filter", is_flag=True, help="Desactiva inferencia de filtros")
 @click.option("--session", "session_id", default=None,
               help="ID de sesión (reanuda si existe, crea si no). Admite 'tg:<chat_id>' etc.")
@@ -30170,7 +30267,7 @@ def chat(
     k: int, folder: str | None, tag: str | None,
     since: str | None, precise: bool,
     hyde: bool | None,
-    multi: bool, no_multi: bool, no_auto_filter: bool,
+    multi: bool, no_auto_filter: bool,
     session_id: str | None, resume: bool, counter: bool,
     deep_mode: bool,
     vault_scope: str | None,
@@ -30248,7 +30345,7 @@ def chat(
         flags.append(f"tag: #{tag}")
     if pinned_date_range:
         flags.append(f"desde: {datetime.fromtimestamp(pinned_date_range[0]).strftime('%Y-%m-%d')}")
-    _multi_enabled = multi and not no_multi
+    _multi_enabled = multi
     features = []
     if precise:
         features.append("HyDE")
@@ -34037,7 +34134,10 @@ def _log_tune_event(event: dict) -> None:
     def _do() -> None:
         with _ragvec_state_conn() as conn:
             _sql_append_event(conn, "rag_tune", _map_tune_row(ev))
-    _sql_write_with_retry(_do, "tune_sql_write_failed")
+    if _log_tune_event_background_default():
+        _enqueue_background_sql(_do, "tune_sql_write_failed")
+    else:
+        _sql_write_with_retry(_do, "tune_sql_write_failed")
 
 
 def _backup_ranker_config() -> Path | None:
@@ -35614,7 +35714,11 @@ def log(n: int, low_confidence: bool, with_feedback: bool,
 
     # Feedback annotations: always load so the renderer can paint the
     # thumb column when any feedback exists, even without --feedback.
-    fb_by_turn = _read_feedback_map_for_log()
+    # Pass the known turn_ids to avoid a full-table scan of rag_feedback.
+    known_turn_ids = frozenset(
+        e["turn_id"] for e in entries if e.get("turn_id")
+    )
+    fb_by_turn = _read_feedback_map_for_log(known_turn_ids or None)
 
     if with_feedback:
         entries = [e for e in entries if e.get("turn_id") in fb_by_turn]
@@ -48385,7 +48489,10 @@ def _log_archive_event(event: dict) -> None:
         with _ragvec_state_conn() as conn:
             _sql_append_event(conn, "rag_archive_log",
                                _map_archive_row(e))
-    _sql_write_with_retry(_do, "archive_sql_write_failed")
+    if _log_archive_event_background_default():
+        _enqueue_background_sql(_do, "archive_sql_write_failed")
+    else:
+        _sql_write_with_retry(_do, "archive_sql_write_failed")
 
 
 def _archive_move_one(
@@ -57956,48 +58063,27 @@ def run_maintenance(
             results["feedback_golden_error"] = str(e)
 
     # 6. Log rotation.
-    # When RAG_STATE_SQL=1 the JSONL files are no-longer written (T3 swap),
-    # so we run SQL-aware rotation against the rag_* tables + clean up the
-    # one-shot `.bak.<ts>` migration artefacts. When the flag is off we keep
-    # the legacy JSONL rotation path unchanged.
+    # Post-T10 (2026-04-19) SQL is the only telemetry path; RAG_STATE_SQL was
+    # removed from code 2026-05-04. SQL-aware rotation runs unconditionally.
     if not skip_logs:
-        if RAG_STATE_SQL:
-            # Audit 2026-04-26 (BUG #22): force re-ensure DDL antes de
-            # rotation. Daemons long-lived no veían nuevos `_migrate_*`
-            # del código → ALTERs nunca corrían.
-            try:
-                with _TELEMETRY_DDL_LOCK:
-                    _TELEMETRY_DDL_ENSURED_PATHS.clear()
-                results["ddl_re_ensured"] = True
-            except Exception as e:
-                results["ddl_re_ensure_error"] = str(e)
-            try:
-                results["sql_rotation"] = _sql_rotate_log_tables(dry_run=dry_run)
-            except Exception as e:
-                results["sql_rotation_error"] = str(e)
-            try:
-                results["bak_cleanup"] = _cleanup_bak_files(dry_run=dry_run)
-            except Exception as e:
-                results["bak_cleanup_error"] = str(e)
-            # Keep JSONL rotation section empty for renderer compatibility so
-            # downstream callers that already branch on "log_rotation" don't
-            # explode when the flag is on.
-            results["log_rotation"] = {}
-        else:
-            rotated = {}
-            for label, path in _JSONL_LOG_PATHS:
-                if dry_run:
-                    try:
-                        sz = path.stat().st_size if path.is_file() else 0
-                        if sz >= _JSONL_ROTATE_BYTES:
-                            rotated[label] = f"would rotate ({sz / 1024:.0f} KB)"
-                    except OSError:
-                        pass
-                else:
-                    r = _rotate_jsonl(path)
-                    if r:
-                        rotated[label] = r
-            results["log_rotation"] = rotated
+        # Audit 2026-04-26 (BUG #22): force re-ensure DDL before rotation.
+        # Long-lived daemons missed new `_migrate_*` ALTERs.
+        try:
+            with _TELEMETRY_DDL_LOCK:
+                _TELEMETRY_DDL_ENSURED_PATHS.clear()
+            results["ddl_re_ensured"] = True
+        except Exception as e:
+            results["ddl_re_ensure_error"] = str(e)
+        try:
+            results["sql_rotation"] = _sql_rotate_log_tables(dry_run=dry_run)
+        except Exception as e:
+            results["sql_rotation_error"] = str(e)
+        try:
+            results["bak_cleanup"] = _cleanup_bak_files(dry_run=dry_run)
+        except Exception as e:
+            results["bak_cleanup_error"] = str(e)
+        # Keep "log_rotation" key for renderer compatibility.
+        results["log_rotation"] = {}
 
     # 7. Ignored notes orphans
     if dry_run:
@@ -58305,18 +58391,6 @@ def _validate_cutover_state() -> list[dict]:
         bak_lines = _count_jsonl_lines(bak)
         # SQL count
         try:
-            if not RAG_STATE_SQL:
-                # Feature flag off = table either empty or never created.
-                # Still report, but flag so the user knows why SQL=0.
-                entry.update({
-                    "status": "flag_off",
-                    "bak_lines": bak_lines,
-                    "sql_rows": None,
-                    "delta_pct": None,
-                    "bak_file": bak.name,
-                })
-                results.append(entry)
-                continue
             with _ragvec_state_conn() as conn:
                 row = conn.execute(
                     f"SELECT COUNT(*) FROM {table}"  # noqa: S608 - hardcoded table list
@@ -58569,7 +58643,7 @@ def maintenance(dry_run: bool, skip_reindex: bool, skip_logs: bool, verbose: boo
     if rotated:
         for label, detail in rotated.items():
             console.print(f"  [bold]Log rotation:[/bold] {label} — {detail}")
-    elif not RAG_STATE_SQL:
+    else:
         console.print("  [bold]Log rotation:[/bold] [dim]all under threshold[/dim]")
 
     # ── SQL log rotation (flag ON) ──
@@ -60100,8 +60174,8 @@ _CONFIG_VARS: tuple[tuple[str, str, str, str], ...] = (
      "Override del vault activo. Gana sobre vaults.json y _DEFAULT_VAULT."),
     ("RAG_TIMEZONE", "America/Argentina/Buenos_Aires", "tz",
      "IANA tz usado por _parse_natural_datetime para ISO con tzinfo."),
-    ("RAG_STATE_SQL", "1", "bool",
-     "Post-T10 es no-op (SQL es el único path). Seteado en launchd plists para simetría."),
+    # RAG_STATE_SQL removed from code 2026-05-04; plists still set it as
+    # deployment-trail for faster rollback. No code reads the value.
 
     # — Ollama / models
     ("OLLAMA_KEEP_ALIVE", "20m", "duration",
@@ -60224,6 +60298,7 @@ _CONFIG_VARS: tuple[tuple[str, str, str, str], ...] = (
 )
 
 
+@functools.lru_cache(maxsize=1)
 def _collect_env_var_names_from_source() -> set[str]:
     """Scan rag.py for all RAG_*/OBSIDIAN_RAG_*/OLLAMA_* env var references.
 
@@ -60233,13 +60308,13 @@ def _collect_env_var_names_from_source() -> set[str]:
 
     Best-effort: parses via regex, not AST. Any false positives get shown
     with no description which is fine.
+    Result is cached (lru_cache maxsize=1) — same process → same source.
     """
-    import re as _re
     try:
         src = Path(__file__).read_text(encoding="utf-8", errors="ignore")
     except Exception:
         return set()
-    pattern = _re.compile(
+    pattern = re.compile(
         r'(?:os\.environ\.get|os\.environ\[)\s*\(?\s*["\']'
         r'((?:OBSIDIAN_RAG|RAG|OLLAMA)_[A-Z][A-Z0-9_]*)["\']'
     )
@@ -61829,8 +61904,8 @@ def ask_cli(
         console.print(f"[cyan]❯[/cyan] [italic]{q_preview}[/italic]")
         console.print()
 
-    # Delegate to the existing `query` command. `--quick` maps to
-    # --no-multi + --no-deep; other defaults left untouched so the
+    # Delegate to the existing `query` command. `--quick` maps to --no-deep;
+    # multi stays off (default). Other defaults left untouched so the
     # caller's UX mirrors `rag query` semantics exactly.
     ctx.invoke(
         query,
@@ -61838,7 +61913,6 @@ def ask_cli(
         k=5, folder=None, tag=None, since=None,
         hyde=False,
         multi=False,
-        no_multi=quick,
         no_auto_filter=False,
         raw=False, loose=False, force=False,
         session_id=session_id, continue_=continue_,
@@ -65097,11 +65171,57 @@ def _extract_entities_single(text: str) -> list:
     return out
 
 
+_GLINER_BATCH_SIZE = int(os.environ.get("RAG_GLINER_BATCH_SIZE", "64"))
+
+
 def _extract_entities_batch(texts: list) -> list:
-    """Batch: list-of-clustered-dicts paralelo al input."""
+    """Batch: list-of-clustered-dicts paralelo al input.
+
+    Uses GLiNER's native batch inference (model.inference) — one forward
+    pass per up to _GLINER_BATCH_SIZE texts instead of N separate passes.
+    Falls back to the per-text path on any batch exception so a bad chunk
+    never aborts the whole batch.
+    """
     if not texts:
         return []
-    return [_cluster_entities(_extract_entities_single(t)) for t in texts]
+    model = _get_gliner_model()
+    if model is None:
+        return [_cluster_entities(_extract_entities_single(t)) for t in texts]
+    try:
+        all_raw = model.inference(
+            texts,
+            list(_ENTITY_LABELS),
+            batch_size=_GLINER_BATCH_SIZE,
+        )
+    except Exception as exc:
+        try:
+            _silent_log("gliner_batch_predict_failed", exc)
+        except Exception:
+            pass
+        return [_cluster_entities(_extract_entities_single(t)) for t in texts]
+
+    results = []
+    for raw in all_raw:
+        candidates = []
+        for e in raw:
+            score = float(e.get("score", 0.0))
+            if score < _ENTITY_CONFIDENCE_MIN:
+                continue
+            etext = (e.get("text") or "").strip()
+            elabel = (e.get("label") or "").lower().strip()
+            if not etext or elabel not in _ENTITY_LABELS:
+                continue
+            if elabel == "person":
+                etext_lower = etext.lower()
+                if etext_lower in _ENTITY_STOPWORDS_PERSON:
+                    continue
+                if _ENTITY_PHONE_ID_RE.match(etext):
+                    continue
+            if len(etext) < 3:
+                continue
+            candidates.append((etext, elabel, score))
+        results.append(_cluster_entities(candidates))
+    return results
 
 
 def _upsert_entities_for_chunk(

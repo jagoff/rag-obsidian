@@ -2,7 +2,11 @@
 
 Read-only audit comparing SQL row counts vs the source JSONL line
 count of the most recent .bak.<ts>. Purpose: gate before T10 strips
-the JSONL fallback. SQL ≥ JSONL = safe; SQL < JSONL = lost rows.
+the JSONL fallback. SQL >= JSONL = safe; SQL < JSONL = lost rows.
+
+Note: RAG_STATE_SQL was removed 2026-05-04 (post-T10 SQL is the only
+path). Tests that exercised the flag-off branch were deleted; the
+remaining tests exercise the SQL path directly.
 """
 from __future__ import annotations
 
@@ -46,30 +50,11 @@ def _seed_bak(state_dir: Path, jsonl: str, lines: int, ts: int = 1700000000) -> 
     return bak
 
 
-def test_validate_cutover_flag_off_returns_flag_off_for_each_source(tmp_path, monkeypatch):
-    """With RAG_STATE_SQL=False (flag off), the validator reports
-    'flag_off' so the user knows SQL side wasn't consulted."""
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    state_dir = tmp_path / ".local/share/obsidian-rag"
-    state_dir.mkdir(parents=True)
-    _seed_bak(state_dir, "queries.jsonl", 100)
-    monkeypatch.setattr(rag, "RAG_STATE_SQL", False)
-
-    results = rag._validate_cutover_state()
-    # At least the seeded source should appear.
-    q_results = [r for r in results if r["source"] == "queries.jsonl"]
-    assert q_results, "queries.jsonl should be in the results"
-    assert q_results[0]["status"] == "flag_off"
-    assert q_results[0]["bak_lines"] == 100
-    assert q_results[0]["sql_rows"] is None
-
-
 def test_validate_cutover_missing_bak_reports_no_bak(tmp_path, monkeypatch):
     """A source with no .bak.<ts> file → status='no_bak' (migration
     hasn't happened yet, or the source never had a JSONL)."""
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     (tmp_path / ".local/share/obsidian-rag").mkdir(parents=True)
-    monkeypatch.setattr(rag, "RAG_STATE_SQL", False)
 
     results = rag._validate_cutover_state()
     # Every seeded source should be no_bak since we didn't create any.
@@ -85,7 +70,6 @@ def test_validate_cutover_sql_greater_than_jsonl_is_ok(tmp_path, monkeypatch):
     state_dir = tmp_path / ".local/share/obsidian-rag"
     state_dir.mkdir(parents=True)
     _seed_bak(state_dir, "queries.jsonl", 100)
-    monkeypatch.setattr(rag, "RAG_STATE_SQL", True)
 
     import contextlib
 
@@ -120,7 +104,6 @@ def test_validate_cutover_sql_slightly_less_is_warn(tmp_path, monkeypatch):
     state_dir = tmp_path / ".local/share/obsidian-rag"
     state_dir.mkdir(parents=True)
     _seed_bak(state_dir, "queries.jsonl", 1000)
-    monkeypatch.setattr(rag, "RAG_STATE_SQL", True)
 
     import contextlib
 
@@ -150,7 +133,6 @@ def test_validate_cutover_sql_way_less_is_fail(tmp_path, monkeypatch):
     state_dir = tmp_path / ".local/share/obsidian-rag"
     state_dir.mkdir(parents=True)
     _seed_bak(state_dir, "queries.jsonl", 1000)
-    monkeypatch.setattr(rag, "RAG_STATE_SQL", True)
 
     import contextlib
 
@@ -182,9 +164,23 @@ def test_validate_cutover_uses_newest_bak(tmp_path, monkeypatch):
     state_dir.mkdir(parents=True)
     _seed_bak(state_dir, "queries.jsonl", 100, ts=1700000000)
     _seed_bak(state_dir, "queries.jsonl", 200, ts=1700000500)  # newer
-    monkeypatch.setattr(rag, "RAG_STATE_SQL", False)
 
-    results = rag._validate_cutover_state()
+    import contextlib
+
+    @contextlib.contextmanager
+    def fake_conn_ctx():
+        class C:
+            def execute(self, sql):
+                class R: pass
+                r = R()
+                r.fetchone = lambda: (200,)
+                return r
+            def close(self): pass
+        yield C()
+
+    with patch.object(rag, "_ragvec_state_conn", fake_conn_ctx):
+        results = rag._validate_cutover_state()
+
     q = [r for r in results if r["source"] == "queries.jsonl"][0]
     assert q["bak_lines"] == 200, "must pick the newest .bak by ts suffix"
     assert q["bak_file"].endswith(".bak.1700000500")

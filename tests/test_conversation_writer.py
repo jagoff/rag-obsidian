@@ -232,7 +232,7 @@ def test_malformed_frontmatter_raises(tmp_vault):
         write_turn(tmp_vault, sid, t)
 
 
-# ── T5: SQL-backed index (RAG_STATE_SQL=1) ───────────────────────────────────
+# ── T5: SQL-backed index ─────────────────────────────────────────────────────
 
 
 @pytest.fixture
@@ -245,10 +245,9 @@ def sql_env(tmp_path, monkeypatch):
 
 @pytest.fixture
 def flag_off(tmp_path, monkeypatch):
-    """Legacy flag-OFF fixture — kept for test-signature compatibility.
-    Post-T10 the flag is inert, so this is an alias for sql_env."""
+    """Alias for sql_env — kept for test-name compatibility.
+    RAG_STATE_SQL was removed 2026-05-04; the env var is a no-op trail."""
     monkeypatch.setattr(rag, "DB_PATH", tmp_path)
-    monkeypatch.delenv("RAG_STATE_SQL", raising=False)
     return tmp_path / rag._TELEMETRY_DB_FILENAME
 
 
@@ -302,7 +301,7 @@ def test_read_returns_none_when_both_missing(sql_env):
 
 
 def test_flag_off_is_inert_post_t10(flag_off):
-    """Post-T10 RAG_STATE_SQL is inert — writer still lands in SQL regardless."""
+    """RAG_STATE_SQL env var absent — writer still lands in SQL (flag removed 2026-05-04)."""
     sid = "web:t5-flag-inert"
     rel = "04-Archive/99-obsidian-system/99-AI/conversations/sql-only.md"
     persist_conversation_index_entry(sid, rel)

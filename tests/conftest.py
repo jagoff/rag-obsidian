@@ -484,6 +484,23 @@ def _force_ft_rating_sync(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _force_ambient_contradictions_archive_tune_surface_sync(monkeypatch):
+    """2026-05-04: cinco writers adicionales pasaron a async por default
+    (``_log_ambient_event``, ``_log_contradictions``, ``_log_archive_event``,
+    ``_log_tune_event``, ``_surface_log_run``). Forzamos sync en todos los tests
+    para que reads de sus tablas sean inmediatos post-write.
+
+    Override per-test con ``monkeypatch.setenv("RAG_LOG_<X>_ASYNC", "1")``.
+    """
+    monkeypatch.setenv("RAG_LOG_AMBIENT_ASYNC", "0")
+    monkeypatch.setenv("RAG_LOG_CONTRADICTIONS_ASYNC", "0")
+    monkeypatch.setenv("RAG_LOG_ARCHIVE_ASYNC", "0")
+    monkeypatch.setenv("RAG_LOG_TUNE_ASYNC", "0")
+    monkeypatch.setenv("RAG_LOG_SURFACE_ASYNC", "0")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _snapshot_rag_local_embed_env():
     """`_maybe_auto_enable_local_embed` (rag.py:6970) mutates `os.environ`
     directly when the CLI group runs for query-like subcommands. Any test that
@@ -516,7 +533,7 @@ def _drain_log_queue():
     que el background write aterrizara.
 
     Esta fixture solo drena la queue; la detección de drift en
-    `RAG_STATE_SQL` / `DB_PATH` / `VAULT_PATH` / `_TELEMETRY_DB_FILENAME`
+    `DB_PATH` / `VAULT_PATH` / `_TELEMETRY_DB_FILENAME`
     vive en el hook `pytest_runtest_protocol` más abajo, que corre FUERA
     del orden LIFO de fixtures (la única forma de validar después de que
     `monkeypatch.undo()` se haya ejecutado).
@@ -554,9 +571,9 @@ def _drain_log_queue():
 def pytest_runtest_protocol(item, nextitem):
     """Snapshot pre-test → run protocol → validate drift post-everything.
 
-    Captura `DB_PATH` / `VAULT_PATH` / `RAG_STATE_SQL` /
-    `_TELEMETRY_DB_FILENAME` ANTES de que las fixtures setup corran (al
-    inicio del protocolo), y los compara DESPUÉS de que todas las
+    Captura `DB_PATH` / `VAULT_PATH` / `_TELEMETRY_DB_FILENAME` ANTES de
+    que las fixtures setup corran (al inicio del protocolo), y los compara
+    DESPUÉS de que todas las
     fixtures + monkeypatch hayan teardowneado. Drift acá = el test (o
     una fixture en su scope) mutó un global y no se deshizo, lo cual
     contamina los tests siguientes — restauramos al snapshot para
@@ -567,7 +584,6 @@ def pytest_runtest_protocol(item, nextitem):
         snap = {
             "DB_PATH": _rag.DB_PATH,
             "VAULT_PATH": _rag.VAULT_PATH,
-            "RAG_STATE_SQL": _rag.RAG_STATE_SQL,
             "_TELEMETRY_DB_FILENAME": _rag._TELEMETRY_DB_FILENAME,
         }
     except Exception:

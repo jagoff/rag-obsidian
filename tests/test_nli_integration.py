@@ -168,7 +168,7 @@ def test_query_nli_enabled_calls_split_and_ground(monkeypatch):
     monkeypatch.setattr(rag, "log_query_event", lambda ev: logged.update(ev))
 
     runner = CliRunner()
-    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "que dice el vault"])
+    result = runner.invoke(rag.cli, ["query", "--plain", "que dice el vault"])
 
     assert result.exit_code == 0, result.output
     assert len(split_calls) == 1
@@ -193,7 +193,7 @@ def test_query_nli_disabled_by_default_skips_grounding(monkeypatch):
     monkeypatch.setattr(rag, "log_query_event", lambda ev: logged.update(ev))
 
     runner = CliRunner()
-    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "que dice el vault"])
+    result = runner.invoke(rag.cli, ["query", "--plain", "que dice el vault"])
 
     assert result.exit_code == 0, result.output
     assert split_calls == [], "split_claims must not be called when NLI is OFF"
@@ -219,7 +219,7 @@ def test_query_nli_skips_for_count_intent(monkeypatch):
     monkeypatch.setattr(rag, "log_query_event", lambda ev: logged.update(ev))
 
     runner = CliRunner()
-    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "cuantas notas"])
+    result = runner.invoke(rag.cli, ["query", "--plain", "cuantas notas"])
 
     assert result.exit_code == 0, result.output
     assert split_calls == [], "split_claims must not run for count intent"
@@ -243,7 +243,7 @@ def test_query_nli_skips_for_list_intent(monkeypatch):
     monkeypatch.setattr(rag, "log_query_event", lambda ev: None)
 
     runner = CliRunner()
-    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "listame las notas"])
+    result = runner.invoke(rag.cli, ["query", "--plain", "listame las notas"])
 
     assert result.exit_code == 0, result.output
     assert split_calls == []
@@ -267,7 +267,7 @@ def test_query_nli_skips_for_recent_intent(monkeypatch):
     monkeypatch.setattr(rag, "log_query_event", lambda ev: None)
 
     runner = CliRunner()
-    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "ultimas notas"])
+    result = runner.invoke(rag.cli, ["query", "--plain", "ultimas notas"])
 
     assert result.exit_code == 0, result.output
     assert split_calls == []
@@ -292,7 +292,7 @@ def test_query_nli_skips_for_agenda_intent(monkeypatch):
     monkeypatch.setattr(rag, "log_query_event", lambda ev: None)
 
     runner = CliRunner()
-    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "mi agenda"])
+    result = runner.invoke(rag.cli, ["query", "--plain", "mi agenda"])
 
     assert result.exit_code == 0, result.output
     assert split_calls == []
@@ -319,7 +319,7 @@ def test_synthesis_not_in_skip_intents_and_grounding_runs(monkeypatch):
     monkeypatch.setattr(rag, "log_query_event", lambda ev: logged.update(ev))
 
     runner = CliRunner()
-    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "que dice el vault"])
+    result = runner.invoke(rag.cli, ["query", "--plain", "que dice el vault"])
 
     assert result.exit_code == 0, result.output
     assert len(ground_calls) == 1, "grounding must run for non-skip-intent semantic path"
@@ -337,7 +337,7 @@ def test_query_nli_ground_returns_none_no_crash_no_summary(monkeypatch):
     monkeypatch.setattr(rag, "log_query_event", lambda ev: logged.update(ev))
 
     runner = CliRunner()
-    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "test query"])
+    result = runner.invoke(rag.cli, ["query", "--plain", "test query"])
 
     assert result.exit_code == 0, result.output
     assert logged.get("grounding_summary") is None
@@ -357,7 +357,7 @@ def test_query_nli_grounding_summary_logged_with_contradicted(monkeypatch):
     monkeypatch.setattr(rag, "log_query_event", lambda ev: logged.update(ev))
 
     runner = CliRunner()
-    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "test contradictions"])
+    result = runner.invoke(rag.cli, ["query", "--plain", "test contradictions"])
 
     assert result.exit_code == 0, result.output
     summary = logged.get("grounding_summary")
@@ -383,7 +383,7 @@ def test_query_nli_empty_response_no_crash(monkeypatch):
     monkeypatch.setattr(rag, "log_query_event", lambda ev: logged.update(ev))
 
     runner = CliRunner()
-    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "test empty"])
+    result = runner.invoke(rag.cli, ["query", "--plain", "test empty"])
 
     assert result.exit_code == 0, result.output
     assert ground_calls == [], "ground must not be called when full is empty"
@@ -408,7 +408,7 @@ def test_query_nli_refusal_claim_still_calls_ground(monkeypatch):
     monkeypatch.setattr(rag, "log_query_event", lambda ev: logged.update(ev))
 
     runner = CliRunner()
-    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "test refusal"])
+    result = runner.invoke(rag.cli, ["query", "--plain", "test refusal"])
 
     assert result.exit_code == 0, result.output
     assert len(ground_calls) == 1, "ground_claims_nli must be called even for refusal claims"
@@ -430,7 +430,7 @@ def test_query_nli_fast_path_grounding_still_runs(monkeypatch):
     monkeypatch.setattr(rag, "log_query_event", lambda ev: logged.update(ev))
 
     runner = CliRunner()
-    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "fast path test"])
+    result = runner.invoke(rag.cli, ["query", "--plain", "fast path test"])
 
     assert result.exit_code == 0, result.output
     assert len(ground_calls) == 1, "grounding must run regardless of fast_path flag"
@@ -561,7 +561,7 @@ def test_query_nli_ground_exception_no_crash_response_delivered(monkeypatch):
     monkeypatch.setattr(rag, "log_query_event", lambda ev: logged.update(ev))
 
     runner = CliRunner()
-    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "test exception"])
+    result = runner.invoke(rag.cli, ["query", "--plain", "test exception"])
 
     assert result.exit_code == 0, (
         f"query must not crash when ground_claims_nli raises: {result.output}"
@@ -587,7 +587,7 @@ def test_query_nli_split_exception_no_crash_ground_not_called(monkeypatch):
     monkeypatch.setattr(rag, "log_query_event", lambda ev: logged.update(ev))
 
     runner = CliRunner()
-    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "test split fail"])
+    result = runner.invoke(rag.cli, ["query", "--plain", "test split fail"])
 
     assert result.exit_code == 0, result.output
     assert "Respuesta del vault." in result.output
@@ -619,7 +619,7 @@ def test_query_log_event_sql_failure_no_crash(monkeypatch):
     monkeypatch.setattr(rag, "_ragvec_state_conn", _broken_conn)
 
     runner = CliRunner()
-    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "test log failure"])
+    result = runner.invoke(rag.cli, ["query", "--plain", "test log failure"])
 
     assert result.exit_code == 0, (
         f"query must not crash when DB write fails: {result.output}"
@@ -651,7 +651,7 @@ def test_query_nli_disabled_by_false_string(monkeypatch):
     monkeypatch.setattr(rag, "log_query_event", lambda ev: logged.update(ev))
 
     runner = CliRunner()
-    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "test false string"])
+    result = runner.invoke(rag.cli, ["query", "--plain", "test false string"])
 
     assert result.exit_code == 0, result.output
     assert split_calls == []

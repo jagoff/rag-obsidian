@@ -92,7 +92,6 @@ from rag import (  # noqa: E402
     _LOG_QUEUE,
     _LOOKUP_MODEL,
     _LOOKUP_NUM_CTX,
-    RAG_STATE_SQL,
     _SQL_STATE_ERROR_LOG,
     _enqueue_background_sql,
     _log_sql_state_error,
@@ -6539,72 +6538,41 @@ def query_history(limit: int = 200) -> dict:
     Filters to chat-bound commands so /save, /reindex, internal eval runs,
     etc. don't pollute the history list.
 
-    Source of truth post-cutover 2026-04-19 is the SQL `rag_queries` table
-    (JSONL writes are gated off by RAG_STATE_SQL=1). Falls back to
-    `queries.jsonl` if SQL path is off or fails, so pre-cutover installs
-    keep working.
+    Source of truth: SQL `rag_queries` table (post-T10 2026-04-19, SQL is
+    the only path — the JSONL fallback was removed when RAG_STATE_SQL became
+    a permanent no-op).
     """
     limit = max(1, min(int(limit or 200), 1000))
     # `web` = web chat endpoint (default cmd in /api/chat log_query_event);
     # `query`/`chat`/`ask` = CLI paths; older rows may have empty cmd.
     keep_cmds = {"query", "chat", "ask", "web"}
-    out: list[str] = []
-
-    if RAG_STATE_SQL:
-        try:
-            # Pull ≥limit rows and dedup, newest-first, then reverse to
-            # oldest→newest for the UI. Over-fetch by 4x so consecutive
-            # duplicates don't starve the returned window.
-            with _ragvec_state_conn() as conn:
-                rows = conn.execute(
-                    "SELECT q, cmd FROM rag_queries "
-                    "ORDER BY id DESC LIMIT ?",
-                    (limit * 4,),
-                ).fetchall()
-            seen_prev: str | None = None
-            picked: list[str] = []
-            for q, cmd in rows:  # newest → oldest
-                cmd = (cmd or "").strip()
-                if cmd and cmd not in keep_cmds:
-                    continue
-                q = (q or "").strip()
-                if not q or q == seen_prev:
-                    continue
-                picked.append(q)
-                seen_prev = q
-                if len(picked) >= limit:
-                    break
-            out = list(reversed(picked))
-            if out:
-                return {"history": out}
-            # SQL returned zero rows — fall through to JSONL for older data.
-        except Exception as exc:
-            _log_sql_state_error("history_sql_read_failed", err=repr(exc))
-
-    if not LOG_PATH.is_file():
-        return {"history": []}
     try:
-        with LOG_PATH.open("r", encoding="utf-8", errors="replace") as fh:
-            for raw in fh:
-                raw = raw.strip()
-                if not raw:
-                    continue
-                try:
-                    rec = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-                cmd = rec.get("cmd") or ""
-                if cmd and cmd not in keep_cmds:
-                    continue
-                q = (rec.get("q") or "").strip()
-                if not q:
-                    continue
-                if out and out[-1] == q:
-                    continue
-                out.append(q)
-    except OSError:
+        # Pull ≥limit rows and dedup, newest-first, then reverse to
+        # oldest→newest for the UI. Over-fetch by 4x so consecutive
+        # duplicates don't starve the returned window.
+        with _ragvec_state_conn() as conn:
+            rows = conn.execute(
+                "SELECT q, cmd FROM rag_queries "
+                "ORDER BY id DESC LIMIT ?",
+                (limit * 4,),
+            ).fetchall()
+        seen_prev: str | None = None
+        picked: list[str] = []
+        for q, cmd in rows:  # newest → oldest
+            cmd = (cmd or "").strip()
+            if cmd and cmd not in keep_cmds:
+                continue
+            q = (q or "").strip()
+            if not q or q == seen_prev:
+                continue
+            picked.append(q)
+            seen_prev = q
+            if len(picked) >= limit:
+                break
+        return {"history": list(reversed(picked))}
+    except Exception as exc:
+        _log_sql_state_error("history_sql_read_failed", err=repr(exc))
         return {"history": []}
-    return {"history": out[-limit:]}
 
 
 def _resolve_scope(scope: str | None) -> list[tuple[str, "Path"]]:

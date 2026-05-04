@@ -510,13 +510,13 @@ def upsert_threads(col, threads: list[GmailThread]) -> int:
                 continue
             raise
 
-    for t in threads:
-        try:
-            existing = col.get(where={"file": _thread_file_key(t)}, include=[])
-            if existing.get("ids"):
-                col.delete(ids=existing["ids"])
-        except Exception:
-            pass
+    keys = [_thread_file_key(t) for t in threads]
+    try:
+        existing = col.get(where={"file": {"$in": keys}}, include=[])
+        if existing.get("ids"):
+            col.delete(ids=existing["ids"])
+    except Exception:
+        pass
 
     ids = [_thread_doc_id(t) for t in threads]
     metas: list[dict] = []
@@ -545,17 +545,15 @@ def upsert_threads(col, threads: list[GmailThread]) -> int:
 
 
 def delete_threads(col, thread_ids: list[str]) -> int:
-    n = 0
-    for tid in thread_ids:
-        key = f"{DOC_ID_PREFIX}://thread/{tid}"
-        try:
-            got = col.get(where={"file": key}, include=[])
-            if got.get("ids"):
-                col.delete(ids=got["ids"])
-                n += 1
-        except Exception:
-            continue
-    return n
+    keys = [f"{DOC_ID_PREFIX}://thread/{tid}" for tid in thread_ids]
+    try:
+        got = col.get(where={"file": {"$in": keys}}, include=[])
+        if got.get("ids"):
+            col.delete(ids=got["ids"])
+            return len(got["ids"])
+    except Exception:
+        pass
+    return 0
 
 
 # ── History-based incremental sync ────────────────────────────────────────

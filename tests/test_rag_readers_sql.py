@@ -62,8 +62,7 @@ def _reset_caches(monkeypatch) -> None:
 
 @pytest.fixture
 def sql_env(tmp_path, monkeypatch):
-    """Flag ON + DB_PATH + JSONL paths redirected."""
-    monkeypatch.setattr(rag, "RAG_STATE_SQL", True)
+    """DB_PATH + JSONL paths redirected (post-T10, SQL-only)."""
     monkeypatch.setattr(rag, "DB_PATH", tmp_path)
     _redirect_jsonl_paths(monkeypatch, tmp_path / "jsonl")
     _reset_caches(monkeypatch)
@@ -72,11 +71,8 @@ def sql_env(tmp_path, monkeypatch):
 
 @pytest.fixture
 def jsonl_env(tmp_path, monkeypatch):
-    """Legacy flag-OFF fixture — kept for test-signature compatibility.
-    Post-T10 the flag is inert, so this is effectively an alias for sql_env
-    pointing at a tmp DB. Tests that relied on JSONL-only behavior have been
-    rewritten to assert the new SQL-only semantics."""
-    monkeypatch.setattr(rag, "RAG_STATE_SQL", True)
+    """Alias for sql_env — kept for test-signature compatibility (post-T10
+    SQL is the only path; RAG_STATE_SQL removed from code 2026-05-04)."""
     monkeypatch.setattr(rag, "DB_PATH", tmp_path)
     _redirect_jsonl_paths(monkeypatch, tmp_path / "jsonl")
     _reset_caches(monkeypatch)

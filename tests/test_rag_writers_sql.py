@@ -45,9 +45,7 @@ def _open_db(tmp_path: Path) -> sqlite3.Connection:
 
 @pytest.fixture
 def sql_env(tmp_path, monkeypatch):
-    """Flag ON + DB_PATH redirected. Writers will use tmp_path/telemetry.db."""
-    monkeypatch.setattr(rag, "RAG_STATE_SQL", True)
-    monkeypatch.setattr(web_server, "RAG_STATE_SQL", True)
+    """DB_PATH redirected. Writers use tmp_path/telemetry.db (post-T10 SQL-only)."""
     monkeypatch.setattr(rag, "DB_PATH", tmp_path)
     # Redirect all JSONL paths too so any accidental JSONL write is detectable
     # and doesn't land in the real ~/.local/share/obsidian-rag/.
@@ -57,10 +55,7 @@ def sql_env(tmp_path, monkeypatch):
 
 @pytest.fixture
 def jsonl_env(tmp_path, monkeypatch):
-    """Flag OFF — JSONL paths redirected + any SQL write would go to a DB that
-    we can still inspect to assert nothing was written."""
-    monkeypatch.setattr(rag, "RAG_STATE_SQL", False)
-    monkeypatch.setattr(web_server, "RAG_STATE_SQL", False)
+    """Alias for sql_env — post-T10 RAG_STATE_SQL removed; SQL always used."""
     monkeypatch.setattr(rag, "DB_PATH", tmp_path)
     _redirect_jsonl_paths(monkeypatch, tmp_path / "jsonl")
     yield tmp_path

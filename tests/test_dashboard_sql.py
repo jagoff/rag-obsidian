@@ -44,11 +44,8 @@ def _redirect_paths(monkeypatch, base: Path) -> None:
 
 @pytest.fixture
 def sql_env(tmp_path, monkeypatch):
-    """Flag ON + DB_PATH redirected; data_dir (JSONL) pointed at tmp."""
-    monkeypatch.setattr(rag, "RAG_STATE_SQL", True)
+    """DB_PATH redirected; data_dir pointed at tmp (post-T10 SQL-only)."""
     monkeypatch.setattr(rag, "DB_PATH", tmp_path)
-    # server.py has its own module-level RAG_STATE_SQL import — patch both.
-    monkeypatch.setattr(web_server, "RAG_STATE_SQL", True)
     _redirect_paths(monkeypatch, tmp_path)
     # Redirect Path.home so `data_dir = Path.home() / ".local/share/obsidian-rag"`
     # resolves to an isolated tmp location — no reliance on real host JSONL.
@@ -60,9 +57,7 @@ def sql_env(tmp_path, monkeypatch):
 
 @pytest.fixture
 def jsonl_env(tmp_path, monkeypatch):
-    """Flag OFF + Path.home redirected."""
-    monkeypatch.setattr(rag, "RAG_STATE_SQL", False)
-    monkeypatch.setattr(web_server, "RAG_STATE_SQL", False)
+    """Alias for sql_env — post-T10 RAG_STATE_SQL removed; SQL always used."""
     monkeypatch.setattr(rag, "DB_PATH", tmp_path)
     _redirect_paths(monkeypatch, tmp_path)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))

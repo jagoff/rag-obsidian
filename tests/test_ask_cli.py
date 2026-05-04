@@ -2,7 +2,7 @@
 
 Validates:
 - `rag ask "..."` delegates to query() with default args.
-- --quick maps to no_multi=True, no_deep=True.
+- --quick maps to no_deep=True (multi stays off by default).
 - --source passes through.
 - --session / --continue passed through.
 - --plain disables banner.
@@ -35,7 +35,7 @@ def test_ask_delegates_to_query(monkeypatch):
     assert captured.get("question") == "cuál es mi ikigai?"
 
 
-def test_ask_quick_sets_no_multi_and_no_deep(monkeypatch):
+def test_ask_quick_sets_no_deep(monkeypatch):
     captured: dict = {}
 
     def fake_query(**kwargs):
@@ -46,8 +46,8 @@ def test_ask_quick_sets_no_multi_and_no_deep(monkeypatch):
     runner = CliRunner()
     result = runner.invoke(rag.cli, ["ask", "--quick", "test"])
     assert result.exit_code == 0, result.output
-    assert captured.get("no_multi") is True
     assert captured.get("no_deep") is True
+    assert "no_multi" not in captured
 
 
 def test_ask_default_no_quick_flags_off(monkeypatch):
@@ -61,8 +61,8 @@ def test_ask_default_no_quick_flags_off(monkeypatch):
     runner = CliRunner()
     result = runner.invoke(rag.cli, ["ask", "test"])
     assert result.exit_code == 0, result.output
-    assert captured.get("no_multi") is False
     assert captured.get("no_deep") is False
+    assert "no_multi" not in captured
 
 
 def test_ask_source_passes_through(monkeypatch):

@@ -175,7 +175,7 @@ def test_query_citation_repair_calls_helper_model_not_chat(monkeypatch):
     monkeypatch.setattr(rag, "log_query_event", lambda ev: None)
 
     runner = CliRunner()
-    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "q"])
+    result = runner.invoke(rag.cli, ["query", "--plain", "q"])
     assert result.exit_code == 0, result.output
     assert len(call_models) == 2, f"expected stream + repair, got {call_models}"
     # First call is streaming generation — uses chat model (big-chat-model via patch)
@@ -220,7 +220,7 @@ def test_query_citation_repair_respects_legacy_override(monkeypatch):
     monkeypatch.setattr(rag, "log_query_event", lambda ev: None)
 
     runner = CliRunner()
-    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "q"])
+    result = runner.invoke(rag.cli, ["query", "--plain", "q"])
     assert result.exit_code == 0, result.output
     # Both calls route through the chat model (legacy behavior)
     assert call_models == ["big-chat-model", "big-chat-model"]
@@ -257,7 +257,7 @@ def test_query_critique_calls_helper_model(monkeypatch):
     monkeypatch.setattr(rag, "log_query_event", lambda ev: None)
 
     runner = CliRunner()
-    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "--critique", "q"])
+    result = runner.invoke(rag.cli, ["query", "--plain", "--critique", "q"])
     assert result.exit_code == 0, result.output
     assert len(call_models) == 2
     assert call_models[0] == "big-chat-model"  # streaming gen
@@ -321,7 +321,7 @@ def test_citation_repair_fires_with_2_bad_default(monkeypatch):
     monkeypatch.setattr(rag, "log_query_event", lambda ev: logged.update(ev))
 
     runner = CliRunner()
-    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "q"])
+    result = runner.invoke(rag.cli, ["query", "--plain", "q"])
     assert result.exit_code == 0, result.output
     assert call_modes == [True, False], "repair should fire at threshold boundary"
     assert logged.get("citation_repaired") is True
@@ -352,7 +352,7 @@ def test_citation_repair_skipped_with_3_bad_at_new_default(monkeypatch):
     monkeypatch.setattr(rag, "log_query_event", lambda ev: logged.update(ev))
 
     runner = CliRunner()
-    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "q"])
+    result = runner.invoke(rag.cli, ["query", "--plain", "q"])
     assert result.exit_code == 0, result.output
     assert call_modes == [True], "repair must be skipped with 3 bad (above new default)"
     assert logged.get("citation_repaired") is False

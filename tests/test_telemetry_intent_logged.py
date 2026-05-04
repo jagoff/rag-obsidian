@@ -74,7 +74,7 @@ def test_log_event_includes_intent_in_happy_path(monkeypatch):
     monkeypatch.setattr(rag, "log_query_event", lambda ev: logged.update(ev))
 
     runner = CliRunner()
-    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "--no-cache", "q"])
+    result = runner.invoke(rag.cli, ["query", "--plain", "--no-cache", "q"])
     assert result.exit_code == 0, result.output
     assert logged.get("intent") == "semantic"
     assert logged.get("cmd") == "query"
@@ -90,7 +90,7 @@ def test_log_event_includes_intent_on_no_docs(monkeypatch):
     monkeypatch.setattr(rag, "log_query_event", lambda ev: logged.update(ev))
 
     runner = CliRunner()
-    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "--no-cache", "q"])
+    result = runner.invoke(rag.cli, ["query", "--plain", "--no-cache", "q"])
     assert result.exit_code == 0
     assert logged.get("intent") == "semantic"
     assert logged.get("answered") is False
@@ -104,7 +104,7 @@ def test_log_event_includes_intent_on_confidence_gate(monkeypatch):
     monkeypatch.setattr(rag, "log_query_event", lambda ev: logged.update(ev))
 
     runner = CliRunner()
-    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "--no-cache", "q"])
+    result = runner.invoke(rag.cli, ["query", "--plain", "--no-cache", "q"])
     assert result.exit_code == 0
     assert logged.get("intent") == "semantic"
     assert logged.get("gated_low_confidence") is True

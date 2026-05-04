@@ -162,7 +162,7 @@ def test_citation_repair_replaces_full_on_success(monkeypatch):
     monkeypatch.setattr(rag, "log_query_event", lambda ev: logged.update(ev))
 
     runner = CliRunner()
-    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "test question"])
+    result = runner.invoke(rag.cli, ["query", "--plain", "test question"])
 
     assert result.exit_code == 0, result.output
     assert REPAIRED_ANSWER in result.output
@@ -212,7 +212,7 @@ def test_citation_repair_keeps_original_when_repair_also_bad(monkeypatch):
     monkeypatch.setattr(rag, "log_query_event", lambda ev: logged.update(ev))
 
     runner = CliRunner()
-    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "test question"])
+    result = runner.invoke(rag.cli, ["query", "--plain", "test question"])
 
     assert result.exit_code == 0, result.output
     assert INITIAL_ANSWER in result.output
@@ -255,7 +255,7 @@ def test_citation_repair_keeps_original_when_repair_returns_empty(monkeypatch):
     monkeypatch.setattr(rag, "log_query_event", lambda ev: logged.update(ev))
 
     runner = CliRunner()
-    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "test question"])
+    result = runner.invoke(rag.cli, ["query", "--plain", "test question"])
 
     assert result.exit_code == 0, result.output
     assert INITIAL_ANSWER in result.output
@@ -298,7 +298,7 @@ def test_citation_repair_skipped_when_too_many_bad_citations(monkeypatch):
     monkeypatch.setattr(rag, "log_query_event", lambda ev: logged.update(ev))
 
     runner = CliRunner()
-    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "test question"])
+    result = runner.invoke(rag.cli, ["query", "--plain", "test question"])
 
     assert result.exit_code == 0, result.output
     assert INITIAL_ANSWER in result.output
@@ -344,7 +344,7 @@ def test_citation_repair_fires_for_few_bad_citations(monkeypatch):
     monkeypatch.setattr(rag, "log_query_event", lambda ev: logged.update(ev))
 
     runner = CliRunner()
-    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "test question"])
+    result = runner.invoke(rag.cli, ["query", "--plain", "test question"])
 
     assert result.exit_code == 0, result.output
     assert REPAIRED in result.output
@@ -379,7 +379,7 @@ def test_citation_repair_bad_threshold_env_override(monkeypatch):
     monkeypatch.setattr(rag, "log_query_event", lambda ev: logged.update(ev))
 
     runner = CliRunner()
-    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "test question"])
+    result = runner.invoke(rag.cli, ["query", "--plain", "test question"])
 
     assert result.exit_code == 0, result.output
     assert INITIAL in result.output
@@ -409,7 +409,7 @@ def test_critique_off_by_default_no_second_call(monkeypatch):
     monkeypatch.setattr(rag, "log_query_event", lambda ev: logged.update(ev))
 
     runner = CliRunner()
-    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "test question"])
+    result = runner.invoke(rag.cli, ["query", "--plain", "test question"])
 
     assert result.exit_code == 0, result.output
     assert call_log == ["streaming"], f"Unexpected extra calls: {call_log}"
@@ -447,7 +447,7 @@ def test_critique_replaces_answer_when_different(monkeypatch):
     monkeypatch.setattr(rag, "log_query_event", lambda ev: logged.update(ev))
 
     runner = CliRunner()
-    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "--critique", "test question"])
+    result = runner.invoke(rag.cli, ["query", "--plain", "--critique", "test question"])
 
     assert result.exit_code == 0, result.output
     assert CRITIQUE_IMPROVED in result.output
@@ -487,7 +487,7 @@ def test_critique_keeps_original_when_same(monkeypatch):
     monkeypatch.setattr(rag, "log_query_event", lambda ev: logged.update(ev))
 
     runner = CliRunner()
-    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "--critique", "test question"])
+    result = runner.invoke(rag.cli, ["query", "--plain", "--critique", "test question"])
 
     assert result.exit_code == 0, result.output
     assert ORIGINAL in result.output

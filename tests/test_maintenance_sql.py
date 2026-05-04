@@ -4,7 +4,7 @@ Covers:
   - `_sql_rotate_log_tables` — per-table retention, conditional VACUUM, flag gate.
   - `_cleanup_bak_files` — purge `.bak.<unix_ts>` files older than 30 days.
   - `_rollback_state_migration` — restore baks + DROP rag_* tables.
-  - `run_maintenance` integration when RAG_STATE_SQL=1.
+  - `run_maintenance` integration (post-T10 SQL-only, RAG_STATE_SQL removed).
 
 Never touches the live DB — every fixture points DB_PATH at tmp_path and
 redirects Path.home() via monkeypatch so the state_dir lookups land in a
@@ -45,7 +45,6 @@ def sql_env(tmp_path, monkeypatch):
     db_dir = state_dir / "ragvec"
     db_dir.mkdir(parents=True, exist_ok=True)
 
-    monkeypatch.setattr(rag, "RAG_STATE_SQL", True)
     monkeypatch.setattr(rag, "DB_PATH", db_dir)
     monkeypatch.setenv("HOME", str(home))
     # Path.home() reads $HOME on POSIX so the env override is enough, but
@@ -53,23 +52,6 @@ def sql_env(tmp_path, monkeypatch):
     # computes state_dir at call time, so no extra patching required.
     # Initialise telemetry.db so _sql_rotate_log_tables / _rollback_state_migration
     # find the tables via _ragvec_state_conn().
-    conn = _open_db(db_dir / rag._TELEMETRY_DB_FILENAME)
-    conn.close()
-    yield {"home": home, "state_dir": state_dir, "db_dir": db_dir,
-            "db_path": db_dir / rag._TELEMETRY_DB_FILENAME}
-
-
-@pytest.fixture
-def jsonl_env(tmp_path, monkeypatch):
-    """Flag OFF counterpart for rotation_skipped_when_flag_off."""
-    home = tmp_path / "home"
-    state_dir = home / ".local/share/obsidian-rag"
-    state_dir.mkdir(parents=True, exist_ok=True)
-    db_dir = state_dir / "ragvec"
-    db_dir.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(rag, "RAG_STATE_SQL", False)
-    monkeypatch.setattr(rag, "DB_PATH", db_dir)
-    monkeypatch.setenv("HOME", str(home))
     conn = _open_db(db_dir / rag._TELEMETRY_DB_FILENAME)
     conn.close()
     yield {"home": home, "state_dir": state_dir, "db_dir": db_dir,
@@ -171,41 +153,6 @@ def test_rotation_different_retentions_per_table(sql_env):
         conn.close()
 
 
-def test_rotation_skipped_when_flag_off(jsonl_env, monkeypatch):
-    """run_maintenance with flag OFF must not touch rag_* tables."""
-    # Seed an ancient row.
-    conn = sqlite3.connect(str(jsonl_env["db_path"]))
-    try:
-        now = time.time()
-        _seed_rows(conn, "rag_queries", [_iso_days_ago(500, now)], {"q": "a"})
-    finally:
-        conn.close()
-
-    # Skip side-effects we don't care about.
-    monkeypatch.setattr(rag, "auto_index_vault", lambda *a, **k: {"kind": "no_changes",
-                                                                     "indexed": 0, "removed": 0,
-                                                                     "scanned": 0, "took_ms": 0})
-    monkeypatch.setattr(rag, "cleanup_sessions", lambda: 0)
-    monkeypatch.setattr(rag, "_find_orphan_collections", lambda: [])
-    monkeypatch.setattr(rag, "_prune_orphan_segment_dirs", lambda dry_run=False: {
-        "count": 0, "bytes_freed": 0, "paths": []})
-    monkeypatch.setattr(rag, "_vec_wal_checkpoint", lambda dry_run=False: {
-        "ok": True, "before_bytes": 0, "after_bytes": 0})
-    monkeypatch.setattr(rag, "_rebuild_feedback_golden_from_sql_feedback",
-                         lambda conn: {"positives": [], "negatives": []})
-    monkeypatch.setattr(rag, "find_dead_notes", lambda *a, **k: [])
-    monkeypatch.setattr(rag, "get_db", lambda: _DummyCol())
-    monkeypatch.setattr(rag, "get_urls_db", lambda: _DummyCol())
-
-    results = rag.run_maintenance(dry_run=False, skip_reindex=True, skip_logs=False)
-    assert "sql_rotation" not in results
-    assert "bak_cleanup" not in results
-    # Row still there → no SQL rotation ran.
-    conn = sqlite3.connect(str(jsonl_env["db_path"]))
-    try:
-        assert conn.execute("SELECT COUNT(*) FROM rag_queries").fetchone()[0] == 1
-    finally:
-        conn.close()
 
 
 class _DummyCol:
@@ -476,8 +423,8 @@ def test_rollback_refuses_when_no_baks(sql_env, monkeypatch):
 # ── Maintenance summary integration ──────────────────────────────────────────
 
 def test_maintenance_summary_includes_sql_section(sql_env, monkeypatch):
-    """run_maintenance under RAG_STATE_SQL=1 produces an `sql_rotation`
-    key with `rows_deleted` per table."""
+    """run_maintenance produces an `sql_rotation` key with `rows_deleted`
+    per table (post-T10 SQL-only path, unconditional)."""
     # Seed a queries row + a memory row, both old.
     conn = sqlite3.connect(str(sql_env["db_path"]))
     now = time.time()

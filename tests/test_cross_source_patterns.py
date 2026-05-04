@@ -28,6 +28,17 @@ import rag
 from rag import cross_source_patterns as csp
 
 
+@pytest.fixture(autouse=True)
+def _isolate_db_path(tmp_path):
+    import rag as _rag
+    snap = _rag.DB_PATH
+    _rag.DB_PATH = tmp_path / "ragvec"
+    try:
+        yield
+    finally:
+        _rag.DB_PATH = snap
+
+
 def _today() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 

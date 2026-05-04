@@ -571,19 +571,18 @@ def upsert_chunks(
     embed_texts = [_embed_prefix(c) for c in chunks]
     embeddings = rag.embed(embed_texts)
 
-    # Delete existing rows for these chunks (idempotent).
-    for c in chunks:
-        key = _chunk_file_key(c)
-        try:
-            existing = col.get(where={"file": key}, include=[])
-            if existing.get("ids"):
-                col.delete(ids=existing["ids"])
-        except Exception:
-            # Defensive: collection I/O issues are best-effort here — if
-            # delete fails, the add below may produce duplicates which the
-            # caller can catch via periodic maintenance. Better than
-            # dropping the whole batch.
-            pass
+    # Delete existing rows for these chunks (idempotent) — one batch query.
+    keys = list({_chunk_file_key(c) for c in chunks})
+    try:
+        existing = col.get(where={"file": {"$in": keys}}, include=[])
+        if existing.get("ids"):
+            col.delete(ids=existing["ids"])
+    except Exception:
+        # Defensive: collection I/O issues are best-effort here — if
+        # delete fails, the add below may produce duplicates which the
+        # caller can catch via periodic maintenance. Better than
+        # dropping the whole batch.
+        pass
 
     ids = [_chunk_doc_id(c, i) for i, c in enumerate(chunks)]
     docs = [c.body for c in chunks]

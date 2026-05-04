@@ -2280,6 +2280,215 @@ def source_recency_multiplier(
     return float(_math.pow(2.0, -(age_days / halflife)))
 
 
+# ── Quick Win #3: recency boost dinámico por intent (2026-05-04) ────────────
+# Capa de modifiers ENCIMA de SOURCE_RECENCY_HALFLIFE_DAYS. La idea: queries
+# time-sensitive ("qué hago mañana", "próximo turno", "hoy") quieren un boost
+# muchísimo más fuerte de notas recientes que queries históricas ("qué
+# hablamos el año pasado", "cuando estaba en Grecia"). En vez de tunear los
+# halflifes globales — que afectan al pipeline entero — clasificamos la
+# query como recent / historical / neutral y multiplicamos el halflife
+# default por un factor:
+#
+#   recent      → halflife × 0.3  (decay 3.3× más rápido → boost agresivo)
+#   historical  → halflife × 3.0  (decay 3× más lento → notas viejas siguen
+#                                  jugando)
+#   neutral     → halflife × 1.0  (no-op, comportamiento histórico)
+#
+# Un halflife None (vault, calendar, contacts) queda None siempre — no tiene
+# sentido decaer notas que no tienen edad relevante (un evento de calendar
+# es atemporal hasta que el filtro temporal lo selecciona).
+#
+# Detector regex-puro, case-insensitive, español + inglés, determinístico,
+# 0% LLM. Patterns ordenados de más específico a más general.
+
+_TEMPORAL_INTENT_RECENT_RE = re.compile(
+    r"\b(?:"
+    # Español temporal cercano
+    r"pr[oó]xim[oa]s?|"                       # próximo / próxima / próximos
+    r"cu[aá]ndo|"                              # cuándo (no "cuando estaba/iba")
+    r"ma[ñn]ana|"                              # mañana
+    r"hoy|"                                    # hoy
+    r"ayer|"                                   # ayer (cercano, contextual)
+    r"esta\s+semana|"                          # esta semana
+    r"este\s+mes|"                             # este mes
+    r"esta\s+tarde|esta\s+noche|"             # esta tarde / esta noche
+    r"ahora(?:\s+mismo)?|"                     # ahora / ahora mismo
+    r"pendiente(?:s)?|"                        # pendientes
+    r"sin\s+leer|"                             # sin leer (unread)
+    r"reciente(?:s|mente)?|"                   # reciente / recientes / recientemente
+    r"[uú]ltim[oa]s?|"                         # último / última / últimos
+    r"siguiente(?:s)?|"                        # siguiente / siguientes
+    # Inglés temporal cercano
+    r"next|"                                   # next (meeting, week, etc.)
+    r"upcoming|"                               # upcoming
+    r"tomorrow|"                               # tomorrow
+    r"today|"                                  # today
+    r"yesterday|"                              # yesterday
+    r"this\s+week|this\s+month|"              # this week / this month
+    r"this\s+afternoon|this\s+evening|"       # this afternoon / evening
+    r"right\s+now|"                            # right now
+    r"unread|"                                 # unread
+    r"latest|recent(?:ly)?|"                   # latest / recent / recently
+    r"current(?:ly)?"                          # current / currently
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Para el patrón "próxima reunión / next meeting" pedimos co-ocurrencia con
+# un sustantivo conversacional/agenda — eso evita que "el próximo paso" en
+# notas de proyecto (sin tinte temporal) caiga en recent. NO obligatorio,
+# es un refuerzo: el regex de arriba ya cubre "próxima reunión" via "próxima"
+# stand-alone.
+
+_TEMPORAL_INTENT_HISTORICAL_RE = re.compile(
+    r"\b(?:"
+    # Español pasado lejano
+    r"el\s+a[ñn]o\s+pasado|"                   # el año pasado
+    r"a[ñn]o\s+pasado|"                        # año pasado
+    r"el\s+mes\s+pasado|mes\s+pasado|"        # el mes pasado / mes pasado
+    r"la\s+semana\s+pasada|semana\s+pasada|"  # la semana pasada
+    r"hace\s+(?:un|una|\d+|mucho|tanto)\s+|"  # hace X tiempo (un mes, 3 años, mucho)
+    r"hace\s+a[ñn]os|hace\s+meses|"           # hace años / hace meses
+    r"hace\s+rato|hace\s+tiempo|"             # hace rato / hace tiempo
+    r"antes\s+de|"                             # antes de
+    r"cuando\s+(?:estaba|era|viv[ií]a|trabajaba|estudiaba|estuve|fui|fuimos|tenia|ten[ií]a)|"  # cuando estaba/era/etc
+    r"hist[oó]ric[oa]s?|"                     # histórico / histórica
+    # Inglés pasado lejano
+    r"last\s+year|last\s+month|last\s+week|" # last year/month/week
+    r"\d+\s+(?:years?|months?|weeks?)\s+ago|" # X years ago
+    r"years?\s+ago|months?\s+ago|"            # years ago / months ago
+    r"a\s+long\s+time\s+ago|long\s+ago|"      # a long time ago
+    r"back\s+(?:in|when)|"                     # back in / back when
+    r"when\s+I\s+(?:was|lived|worked|studied|used\s+to)|"  # when I was/lived/worked
+    r"history\s+of|historical(?:ly)?|"        # history of / historical
+    r"in\s+the\s+past|"                        # in the past
+    r"previously"                              # previously
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Multiplicadores per-intent. Default OFF significa "neutral" → 1.0 (no-op,
+# halflife sin cambios). Tuneables si los floors de eval lo justifican; los
+# valores actuales son conservadores (0.3 / 3.0) — un boost agresivo pero
+# acotado: un halflife de 60d en WA queda en 18d para recent, 180d para
+# historical (cabe la conversación de hace 6 meses sin colapsar a 0.5×).
+_INTENT_RECENCY_MULTIPLIERS: dict[str, float] = {
+    "recent":     0.3,
+    "historical": 3.0,
+    "neutral":    1.0,
+}
+
+
+def _query_temporal_intent(query: str) -> str:
+    """Clasifica la intent temporal de la query → recent | historical | neutral.
+
+    Regex puro, case-insensitive, español + inglés. Determinístico (misma
+    query → mismo intent siempre). Sin LLM, sin estado.
+
+    Reglas de precedencia:
+      1. Si matchea historical → "historical". Las pistas de pasado
+         distante son menos ambiguas que las de presente (el regex de
+         "hace X tiempo" o "el año pasado" no se confunde con prosa
+         neutra). Chequeamos primero para que "qué hablamos el año
+         pasado" no se confunda con "esta semana".
+      2. Si matchea recent → "recent".
+      3. Default → "neutral".
+
+    Empty / None / no-string input → "neutral" (defensivo, no rompe a
+    callers que olvidan validar).
+    """
+    if not query or not isinstance(query, str):
+        return "neutral"
+    text = query.strip()
+    if not text:
+        return "neutral"
+    # Historical primero: las pistas de pasado distante son más fuertes
+    # que las de "ahora" (un "hace 3 años" gana sobre cualquier otra
+    # cosa en la misma query).
+    if _TEMPORAL_INTENT_HISTORICAL_RE.search(text):
+        return "historical"
+    if _TEMPORAL_INTENT_RECENT_RE.search(text):
+        return "recent"
+    return "neutral"
+
+
+def source_recency_halflife_for_intent(
+    source: str, intent: str,
+) -> float | None:
+    """Halflife default per source ajustado por la intent temporal.
+
+    `None` halflife (vault, calendar, contacts) queda `None` SIEMPRE —
+    fuentes atemporales no tienen sentido decaer aunque la query pida
+    "lo más reciente".
+
+    Fallback defensivo:
+      - source desconocida → None (defer a `source_recency_multiplier`
+        cuyo lookup en SOURCE_RECENCY_HALFLIFE_DAYS también devuelve None).
+      - intent desconocido → multiplicador 1.0 (= halflife default).
+    """
+    base = SOURCE_RECENCY_HALFLIFE_DAYS.get(source)
+    if base is None:
+        return None
+    mult = _INTENT_RECENCY_MULTIPLIERS.get(intent, 1.0)
+    return base * mult
+
+
+def _intent_recency_enabled() -> bool:
+    """Gate del feature. Default ON desde 2026-05-04 (Quick Win #3).
+
+    Setear ``RAG_INTENT_RECENCY=0`` desactiva el wiring y `retrieve()`
+    cae al `source_recency_multiplier` legacy (sin ajuste por intent).
+    Útil para A/B contra el baseline cuando el eval gate se mueva y
+    haya que aislar la causa.
+    """
+    val = os.environ.get("RAG_INTENT_RECENCY", "").strip().lower()
+    return val not in ("0", "false", "no", "off")
+
+
+def source_recency_multiplier_with_intent(
+    source: str, created_ts: float | str | None, intent: str,
+    *, now: float | None = None,
+) -> float:
+    """Variante de `source_recency_multiplier` que respeta la intent
+    temporal de la query. Cuando el feature está apagado o el intent es
+    `neutral`, devuelve EXACTAMENTE lo mismo que `source_recency_multiplier`
+    (bit-idéntico — no introduce drift).
+
+    Usa `source_recency_halflife_for_intent` para decidir el halflife
+    efectivo y replica el cálculo de decay (epoch parsing + age en días
+    + `2 ** -(age/halflife)`) para no depender del `_*_HALFLIFE_DAYS`
+    global del módulo en este path.
+
+    Casos triviales (idénticos al legacy):
+      - halflife None (vault/calendar/contacts) → 1.0
+      - halflife <= 0 → 1.0
+      - created_ts None → 1.0
+      - parse error → 1.0
+    """
+    if not _intent_recency_enabled() or intent == "neutral":
+        return source_recency_multiplier(source, created_ts, now=now)
+    halflife = source_recency_halflife_for_intent(source, intent)
+    if halflife is None or halflife <= 0:
+        return 1.0
+    if created_ts is None:
+        return 1.0
+    try:
+        if isinstance(created_ts, (int, float)):
+            ts_epoch = float(created_ts)
+        else:
+            s = str(created_ts)
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00") if s.endswith("Z") else s)
+            if dt.tzinfo is not None:
+                dt = dt.astimezone().replace(tzinfo=None)
+            ts_epoch = dt.timestamp()
+    except (TypeError, ValueError):
+        return 1.0
+    now_epoch = now if now is not None else time.time()
+    age_days = max(0.0, (now_epoch - ts_epoch) / 86400.0)
+    import math as _math
+    return float(_math.pow(2.0, -(age_days / halflife)))
+
+
 def _conv_dedup_window(
     scored_pairs: list[tuple], *, window_s: float = 1800.0,
 ) -> list[tuple]:
@@ -19183,6 +19392,14 @@ class RetrieveResult:
     # el caller pasó counter=True, o cuando MMR fue no-op (ya estaba
     # diverso). Surfaced en extra_json del query log.
     mmr_applied: int = 0
+    # Quick Win #3 — recency boost por intent (2026-05-04). El detector
+    # `_query_temporal_intent` clasifica la query en {recent, historical,
+    # neutral} y, cuando RAG_INTENT_RECENCY=1 (default ON), `retrieve()`
+    # multiplica el halflife default por 0.3/3.0/1.0 al computar el
+    # multiplicador de recency. Surfaced acá para que `to_log_event`
+    # persista el intent a `rag_queries.extra_json.temporal_intent` y
+    # podamos medir distribución + impact en eval / online-tune.
+    temporal_intent: str = "neutral"
 
     # ── Retrocompat dict access ─────────────────────────────────────────
 
@@ -19617,6 +19834,7 @@ class ChatTurnResult:
             # (RAG_MMR=0 + RAG_MMR_FOLDER_PENALTY=0) o no-op (ya diverso).
             # >0 = N slots reordenados por MMR post-rerank pre top-k cap.
             "mmr_applied": int(rr.get("mmr_applied", 0) or 0),
+<<<<<<< HEAD
             # Anaphora resolver telemetry (Quick Win #1, 2026-05-04). Los
             # valores vienen de `multi_retrieve` via `rr.extras`. Default
             # silent: bool=False + strings vacíos. Cuando dispara, el
@@ -19645,6 +19863,12 @@ class ChatTurnResult:
             "decompose_ms": int(
                 (rr.timing or {}).get("decompose_ms", 0) or 0,
             ),
+            # Quick Win #3 (2026-05-04): intent temporal detectado
+            # (recent | historical | neutral). Permite medir distribución
+            # en producción + correlación con hit@5 / abandono. Default
+            # "neutral" cuando RAG_INTENT_RECENCY=0 o el detector no
+            # encontró pistas.
+            "temporal_intent": rr.get("temporal_intent", "neutral") or "neutral",
         }
 
 
@@ -20062,12 +20286,18 @@ def retrieve(
     _col_count = col.count()
     _t_retrieve_start = time.perf_counter()
     _timing: dict[str, float] = {}
+    # Quick Win #3 (2026-05-04): clasificar intent temporal una sola vez al
+    # inicio. Regex puro sobre la `question` original (NO sobre la
+    # reformulación posterior — la signal vive en cómo el user escribió la
+    # query, no en cómo el helper la parafraseó). Determinístico.
+    _temporal_intent = _query_temporal_intent(question)
     if _col_count == 0:
         return RetrieveResult(
             docs=[], metas=[], scores=[], confidence=float("-inf"),
             search_query=question, query_variants=[question],
             timing=dict(_timing),
             intent=intent,
+            temporal_intent=_temporal_intent,
         )
 
     # 1. Reformulate vs history (precise mode)
@@ -20808,8 +21038,12 @@ def retrieve(
         # score (lo acerca a cero) → chunks penalizados en WA terminan
         # ranking MÁS alto que en vault. Para preservar ordering: si
         # final < 0, dividir por src_mult en vez de multiplicar.
-        src_mult = source_weight(src) * source_recency_multiplier(
-            src, meta.get("created_ts"),
+        # Quick Win #3 (2026-05-04): recency multiplier ahora es intent-aware.
+        # `recent` boost-ea notas frescas (halflife × 0.3), `historical`
+        # las relaja (halflife × 3.0), `neutral` mantiene el comportamiento
+        # legacy. Gate `RAG_INTENT_RECENCY` (default ON) controla el feature.
+        src_mult = source_weight(src) * source_recency_multiplier_with_intent(
+            src, meta.get("created_ts"), _temporal_intent,
         )
         if src_mult != 1.0 and src_mult > 0:
             if final >= 0:
@@ -21359,6 +21593,7 @@ def retrieve(
         intent=intent,
         contradiction_penalty_applied=int(_contradiction_penalty_count),
         mmr_applied=int(_mmr_applied_count),
+        temporal_intent=_temporal_intent,
     )
 
 
@@ -27701,6 +27936,8 @@ def query(
                 result.get("contradiction_penalty_applied", 0) or 0,
             ),
             "mmr_applied": int(result.get("mmr_applied", 0) or 0),
+            # Quick Win #3 (2026-05-04) — recency boost por intent.
+            "temporal_intent": result.get("temporal_intent", "neutral") or "neutral",
         })
         if plain:
             click.echo("Sin resultados.")

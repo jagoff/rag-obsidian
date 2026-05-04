@@ -46829,6 +46829,195 @@ def wa_scheduled_send(dry_run: bool, late_threshold_min: int,
     )
 
 
+# ── `rag ingest-cross-source` — worker unificado para los ingesters ────────
+#
+# Consolidación 2026-05-04: antes eran 7 plists con cadencias variadas
+# (gmail/calendar/reminders 1h, calls/safari/drive 4×/día, pillow 1×/día).
+# Ahora 1 plist cada 1h que despacha sub-ingesters según TTL per-source.
+#
+# WhatsApp NO se consolidó acá: cadencia 15 min (5× más freq que este
+# wrapper), es el único hot-path del cross-source. Queda como plist aparte.
+
+_INGEST_TTL_SECONDS: dict[str, int] = {
+    # hourly — alineados con el wrapper (van a correr cada vez que el
+    # wrapper dispare y hayan pasado ≥ TTL).
+    "gmail":     3600,
+    "calendar":  3600,
+    "reminders": 3600,
+    # batch 6h — los 3 que antes corrían a :00, :15 y :00 en slots
+    # alternados. Acá corren cuando el wrapper los detecta due.
+    "calls":    21600,
+    "safari":   21600,
+    "drive":    21600,
+    # daily — el archivo de iCloud sólo cambia 1×/día post wake-up.
+    "pillow":   86400,
+}
+
+# Horas-del-día "preferidas" per-source. Si está presente, el sub-ingester
+# solo corre en el rango [hour, hour+1). Útil para `pillow` que sólo tiene
+# sentido post wake-up (archivo iCloud refresca ~9am).
+_INGEST_PREFERRED_HOUR: dict[str, int] = {
+    "pillow": 9,
+}
+
+_INGEST_CURSORS_PATH = Path.home() / ".local/share/obsidian-rag/ingest_cursors.json"
+
+
+def _ingest_cursors_load() -> dict[str, float]:
+    """Read {source: last_run_unix_seconds} from disk. Silent-fail on any
+    error (corrupt JSON, missing file, permissions) → returns empty dict."""
+    try:
+        if not _INGEST_CURSORS_PATH.is_file():
+            return {}
+        raw = json.loads(_INGEST_CURSORS_PATH.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return {}
+        return {str(k): float(v) for k, v in raw.items()
+                if isinstance(v, (int, float))}
+    except Exception as exc:
+        _silent_log("ingest_cursors_load", exc)
+        return {}
+
+
+def _ingest_cursors_mark(source: str) -> None:
+    """Update cursor for `source` to now. Atomic write (tmp → rename)."""
+    try:
+        _INGEST_CURSORS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        cursors = _ingest_cursors_load()
+        cursors[source] = time.time()
+        tmp = _INGEST_CURSORS_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cursors, indent=2), encoding="utf-8")
+        tmp.replace(_INGEST_CURSORS_PATH)
+    except Exception as exc:
+        _silent_log("ingest_cursors_mark", exc)
+
+
+@cli.command("ingest-cross-source")
+@click.option("--dry-run", is_flag=True,
+              help="Mostrar qué fuentes correría según TTL sin ejecutar.")
+@click.option(
+    "--force", "force_sources", multiple=True,
+    type=click.Choice(tuple(_INGEST_TTL_SECONDS.keys())),
+    help="Forzar una fuente ignorando TTL (repetible: --force gmail --force drive).",
+)
+@click.option(
+    "--only", "only_sources", multiple=True,
+    type=click.Choice(tuple(_INGEST_TTL_SECONDS.keys())),
+    help="Correr SÓLO las fuentes listadas (ignora el resto del TTL map).",
+)
+@click.pass_context
+def ingest_cross_source(
+    ctx: click.Context, dry_run: bool,
+    force_sources: tuple[str, ...], only_sources: tuple[str, ...],
+):
+    """Wrapper unificado de ingesters cross-source — cada 1h via launchd.
+
+    Itera el TTL map (`_INGEST_TTL_SECONDS`) y dispara cada sub-ingester
+    que esté "due" (edad desde último run ≥ TTL). Los cursors per-source
+    viven en `~/.local/share/obsidian-rag/ingest_cursors.json`.
+
+    Consolidación 2026-05-04: reemplaza 7 plists individuales
+    (ingest-{gmail,calendar,reminders,calls,safari,drive,pillow}). Cada
+    sub-ingester sigue siendo invocable standalone via `rag index
+    --source X` para debug / manual refresh.
+
+    Gates por credencial se aplican acá (no en el install): si el token
+    de Gmail / Drive no existe, skip silencioso (update del cursor para
+    no re-intentar cada 1h). Igual para calendar sin creds y pillow sin
+    archivo iCloud.
+
+    WhatsApp NO se consolida acá (cadencia 15 min, hot path).
+    """
+    cursors = _ingest_cursors_load()
+    now_ts = time.time()
+    now_dt = datetime.now()
+
+    targets = list(only_sources) if only_sources else list(_INGEST_TTL_SECONDS.keys())
+    force_set = set(force_sources)
+
+    summary: list[str] = []
+    for source in targets:
+        ttl = _INGEST_TTL_SECONDS.get(source)
+        if ttl is None:
+            continue  # only_sources puede incluir algo fuera del TTL map
+
+        last = cursors.get(source, 0.0)
+        age_s = now_ts - last
+
+        # Rich parsea `[foo]` como tag de estilo; usamos bullets "·" en
+        # vez de brackets para que el source name no lo swallow-ee.
+        preferred = _INGEST_PREFERRED_HOUR.get(source)
+        if preferred is not None and now_dt.hour != preferred and source not in force_set:
+            console.print(
+                f"[dim]·[/dim] skip · {source} "
+                f"[dim](preferred hour={preferred:02d}:00, now={now_dt.hour:02d}:00)[/dim]"
+            )
+            continue
+
+        if source in force_set:
+            reason = "forced"
+        elif age_s < ttl:
+            remaining = ttl - age_s
+            console.print(
+                f"[dim]·[/dim] skip · {source} "
+                f"[dim](last run {age_s/60:.0f}min ago, TTL {ttl/60:.0f}min, "
+                f"next in {remaining/60:.0f}min)[/dim]"
+            )
+            continue
+        else:
+            reason = f"due (age {age_s/3600:.1f}h, TTL {ttl/3600:.1f}h)"
+
+        # Cred gates — skip + mark cursor para no re-intentar en la próxima
+        # hora (si el user configura el token, el cursor force el next run
+        # después de TTL naturalmente).
+        if source in ("gmail", "drive") and not _google_token_exists():
+            console.print(
+                f"[yellow]·[/yellow] skip · {source}: sin "
+                f"[dim]~/.config/obsidian-rag/google_token.json[/dim]"
+            )
+            _ingest_cursors_mark(source)
+            continue
+        if source == "calendar" and not _calendar_creds_exist():
+            console.print(
+                f"[yellow]·[/yellow] skip · {source}: sin "
+                f"[dim]~/.calendar-mcp/credentials.json[/dim]"
+            )
+            _ingest_cursors_mark(source)
+            continue
+
+        console.print(f"[bold cyan]▸[/bold cyan] {source} [dim]({reason})[/dim]")
+        if dry_run:
+            continue
+
+        t0 = time.perf_counter()
+        try:
+            ctx.invoke(
+                index,
+                reset=False, no_contradict=False,
+                source_opt=source, since_opt=None,
+                dry_run=False, max_chats=None, vault_scope=None,
+            )
+            _ingest_cursors_mark(source)
+            dt_s = time.perf_counter() - t0
+            summary.append(f"{source}={dt_s:.1f}s")
+        except SystemExit as e:
+            # Click commands pueden exitear con 1 si hay lock contention
+            # (_index_process_lock). Tratamos igual — el próximo tick reintenta.
+            if e.code and e.code != 0:
+                console.print(f"  [yellow]·[/yellow] exit {e.code} (reintenta próximo tick)")
+            else:
+                _ingest_cursors_mark(source)
+        except Exception as exc:
+            console.print(f"  [red]✗[/red] {type(exc).__name__}: {exc}")
+            _silent_log(f"ingest_cross_source_{source}", exc)
+
+    console.print()
+    if summary:
+        console.print(f"[dim]ran:[/dim] {' · '.join(summary)}")
+    else:
+        console.print("[dim]nothing due this tick.[/dim]")
+
+
 @cli.command("wa-fast")
 @click.option("--dry-run", is_flag=True,
               help="No envía al bridge ni toca status — solo reporta.")
@@ -50165,6 +50354,55 @@ def _ingest_whatsapp_plist(rag_bin: str) -> str:
 """
 
 
+def _ingest_cross_source_plist(rag_bin: str) -> str:
+    """Worker unificado cross-source — every 1h. Consolidación 2026-05-04.
+
+    Reemplaza 7 plists individuales (ingest-{gmail,calendar,reminders,
+    calls,safari,drive,pillow}). El comando `rag ingest-cross-source`
+    itera cada sub-ingester y lo dispara si la edad desde el último run
+    supera su TTL (`_INGEST_TTL_SECONDS`):
+
+      - gmail / calendar / reminders : 1h (hourly)
+      - calls / safari / drive       : 6h
+      - pillow                       : 24h (+ gate 9am)
+
+    Cursors per-source en `~/.local/share/obsidian-rag/ingest_cursors.json`
+    (JSON flat, atomic write). Gates por creds se aplican acá (no en
+    el install) — skip silencioso + cursor update si el token no existe.
+
+    WhatsApp NO está acá (cadencia 15 min, plist propio).
+
+    RunAtLoad=true: corre inmediato al instalar / post-reboot para que
+    un user nuevo vea data cross-source en la primera hora (en vez de
+    esperar la próxima hora redonda).
+    """
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-ingest-cross-source</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{rag_bin}</string>
+    <string>ingest-cross-source</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+    <key>OLLAMA_KEEP_ALIVE</key><string>20m</string>
+  </dict>
+  <key>StartInterval</key><integer>3600</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/ingest-cross-source.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/ingest-cross-source.error.log</string>
+</dict>
+</plist>
+"""
+
+
 def _ingest_gmail_plist(rag_bin: str) -> str:
     """Cross-source: Gmail ingester, cada 1h.
 
@@ -51028,41 +51266,19 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
         # RAG_ANTICIPATE_DISABLED=1.
         ("com.fer.obsidian-rag-anticipate", "com.fer.obsidian-rag-anticipate.plist",
          _anticipate_plist(rag_bin)),
-        # Cross-source ingesters (2026-04-21) — Phase 1.a-1.d ya implementados
-        # en código; estos plists los ponen en loop para que el corpus
-        # cross-source esté fresh sin intervención manual. Calendar se skipea
-        # al install si `~/.calendar-mcp/credentials.json` no existe — el
-        # usuario corre el OAuth flow primero (ver docstring de
-        # `_ingest_calendar_plist`), después re-corre `rag setup`.
+        # Cross-source ingesters (consolidación 2026-05-04) — antes eran 8
+        # plists separados; ahora 2:
+        #   - `ingest-whatsapp` queda aparte (cadencia 15 min, hot path).
+        #   - `ingest-cross-source` (1h) wrappea gmail/calendar/reminders/
+        #     calls/safari/drive/pillow con TTL per-source + gates por
+        #     credencial. Los sub-ingesters siguen invocables standalone
+        #     via `rag index --source X` para debug / manual refresh.
         ("com.fer.obsidian-rag-ingest-whatsapp",
          "com.fer.obsidian-rag-ingest-whatsapp.plist",
          _ingest_whatsapp_plist(rag_bin)),
-        ("com.fer.obsidian-rag-ingest-gmail",
-         "com.fer.obsidian-rag-ingest-gmail.plist",
-         _ingest_gmail_plist(rag_bin)),
-        ("com.fer.obsidian-rag-ingest-reminders",
-         "com.fer.obsidian-rag-ingest-reminders.plist",
-         _ingest_reminders_plist(rag_bin)),
-        ("com.fer.obsidian-rag-ingest-calendar",
-         "com.fer.obsidian-rag-ingest-calendar.plist",
-         _ingest_calendar_plist(rag_bin)),
-        # Missing ingesters (2026-04-30) — calls + safari son locales,
-        # drive requiere OAuth. Completar la cobertura cross-source.
-        ("com.fer.obsidian-rag-ingest-calls",
-         "com.fer.obsidian-rag-ingest-calls.plist",
-         _ingest_calls_plist(rag_bin)),
-        ("com.fer.obsidian-rag-ingest-safari",
-         "com.fer.obsidian-rag-ingest-safari.plist",
-         _ingest_safari_plist(rag_bin)),
-        ("com.fer.obsidian-rag-ingest-drive",
-         "com.fer.obsidian-rag-ingest-drive.plist",
-         _ingest_drive_plist(rag_bin)),
-        # Pillow sleep tracker ingester (2026-04-30) — corre 1×/día a las
-        # 09:30 (post wake-up) para cargar la noche anterior desde el
-        # export de iCloud. Silent-fail si Pillow no instalado / no sync.
-        ("com.fer.obsidian-rag-ingest-pillow",
-         "com.fer.obsidian-rag-ingest-pillow.plist",
-         _ingest_pillow_plist(rag_bin)),
+        ("com.fer.obsidian-rag-ingest-cross-source",
+         "com.fer.obsidian-rag-ingest-cross-source.plist",
+         _ingest_cross_source_plist(rag_bin)),
         # Mood signal poller (2026-04-30) — cada 30min junta señales de
         # Spotify + journal + WA outbound + queries + calendar y
         # recomputa el score diario. Behind opt-in: el plist se carga
@@ -51157,25 +51373,22 @@ _DEPRECATED_LABELS: frozenset[str] = frozenset({
     # Consolidados en `wa-fast` el 2026-05-04:
     "com.fer.obsidian-rag-reminder-wa-push",
     "com.fer.obsidian-rag-wa-scheduled-send",
+    # Consolidados en `ingest-cross-source` el 2026-05-04:
+    "com.fer.obsidian-rag-ingest-gmail",
+    "com.fer.obsidian-rag-ingest-calendar",
+    "com.fer.obsidian-rag-ingest-reminders",
+    "com.fer.obsidian-rag-ingest-calls",
+    "com.fer.obsidian-rag-ingest-safari",
+    "com.fer.obsidian-rag-ingest-drive",
+    "com.fer.obsidian-rag-ingest-pillow",
 })
 
 
+# Post-consolidación 2026-05-04: los gates de gmail/calendar/drive se
+# movieron DENTRO del comando `ingest-cross-source` (skip silencioso +
+# cursor update por-source si la creds no existe). Este dict queda sólo
+# para labels que aún viven como plist individual en `_services_spec`.
 _INSTALL_GATES: dict[str, tuple] = {
-    "com.fer.obsidian-rag-ingest-calendar": (
-        _calendar_creds_exist,
-        "falta [dim]~/.calendar-mcp/credentials.json[/dim] (correr OAuth flow primero)",
-    ),
-    "com.fer.obsidian-rag-ingest-gmail": (
-        _google_token_exists,
-        "falta [dim]~/.config/obsidian-rag/google_token.json[/dim] "
-        "(correr `rag ingest-gmail` una vez para disparar el OAuth flow)",
-    ),
-    "com.fer.obsidian-rag-ingest-drive": (
-        _google_token_exists,
-        "falta [dim]~/.config/obsidian-rag/google_token.json[/dim] "
-        "(correr `rag ingest-gmail` una vez para disparar el OAuth flow — "
-        "Gmail y Drive comparten token)",
-    ),
     "com.fer.obsidian-rag-mood-poll": (
         _mood_daemon_opted_in,
         "mood-poll es opt-in — activar con [cyan]rag mood enable[/cyan] "

@@ -49,6 +49,12 @@ rag-harness diff full rag-only           # comparar dos profiles
 rag-harness new mio --from rag-only      # crear profile nuevo
 rag-harness cost                         # estimar tokens del profile activo + comparativa
 rag-harness wrap rag-only -- <comando>   # aplicar profile, correr comando, restaurar
+rag-harness suggest [--apply]            # recomendar profile basado en cwd + history
+rag-harness default <name>               # setear profile default
+rag-harness default --apply              # aplicar el default
+rag-harness watch [--interval N]         # daemon que re-aplica el profile si lo pisan
+rag-harness watch-install [--interval N] # instalar LaunchAgent del watcher
+rag-harness watch-uninstall              # desinstalar el LaunchAgent
 rag-harness sync-inventory               # regenerar inventory desde ~/.claude.json
 rag-harness sync-full                    # regenerar profiles/full.json
 rag-harness restore                      # volver al backup más reciente
@@ -172,6 +178,62 @@ switchear permanentemente.
 **Limitación**: solo afecta procesos NUEVOS. Una sesión de Claude Code
 ya abierta no ve el cambio (su harness se compiló al boot). El wrap es
 útil para spawneo de procesos nuevos durante su ventana de validez.
+
+## `watch` — daemon anti-drift
+
+Otras herramientas (Claude Code, scripts, integraciones) pueden regenerar
+`~/.claude.json` y pisar tu profile. El watcher pollea `mtime` cada N
+segundos y detecta drift comparando con lo que el profile activo pide.
+Cuando detecta drift, re-aplica el profile sin tocar MCPs ajenos al
+inventory.
+
+```bash
+rag-harness watch --once         # 1 ciclo (testing)
+rag-harness watch --interval 5   # foreground (Ctrl-C para parar)
+rag-harness watch-install        # LaunchAgent que arranca al login
+rag-harness watch-uninstall
+```
+
+Logs en `~/.local/share/rag-harness/watcher.{out,err}.log`. Label del
+plist: `com.fer.rag-harness-watcher`.
+
+Anti-loop guard: el watcher hashea el contenido que escribió y si el
+mtime cambia pero el hash matchea, asume que es su propio write y no
+re-actúa.
+
+## `suggest` — recomendar profile basado en contexto
+
+Heurística simple sobre cwd + shell history (zsh / bash) + git repo.
+
+```bash
+$ rag-harness suggest
+sugerencia: dev
+razones:
+  - estás en otro repo (whatsapp-listener) → dev
+$ rag-harness suggest --apply         # aplica la sugerencia
+```
+
+Reglas (orden = prioridad):
+1. `playwright` en history o `/web/` en cwd → `debug-web`
+2. `wa-tasks`/`whatsapp`/`gmail-send`/`rag morning`/`rag today` → `comms`
+3. `rag capture`/`rag save`/`rag inbox`/`rag file` → `writing`
+4. cwd contiene `obsidian-rag` + `rag query`/`rag chat` → `rag-only`
+5. otro repo (no obsidian-rag) → `dev`
+6. fallback → `rag-only`
+
+## `default` + hook con `rag start`
+
+```bash
+rag-harness default rag-only      # setea
+rag-harness default                # muestra
+rag-harness default --apply        # aplica el default
+rag-harness default --clear        # borra
+```
+
+`rag start` lee el `.active` y `.default` y los muestra en el preview
+como info (no aplica nada automático). Si están desincronizados, marca
+`(≠ default)`. Útil para no perderse el estado del harness al levantar
+el sistema.
 
 ## Backups
 

@@ -2159,8 +2159,14 @@ _COLLECTION_BASE = "obsidian_notes_v11"  # v11: removed temporal tokens (A/B 202
 # in docs/design-cross-source-corpus.md §10.6.
 VALID_SOURCES: frozenset[str] = frozenset(
     {"vault", "calendar", "gmail", "whatsapp", "reminders", "messages",
-     "contacts", "calls", "safari", "drive", "pillow"}
+     "contacts", "calls", "safari", "drive"}
 )
+# `pillow` (iOS sleep tracker) tiene un ingester propio en
+# `rag index --source pillow` pero NO entra al corpus vectorial — datos
+# viven en `rag_sleep_sessions` y se consumen vía home + brief. Por eso
+# NO está en VALID_SOURCES (que filtra qué sources son indexables al
+# corpus). El handler CLI lo despacha antes de la validación, ver más
+# abajo "if src == 'pillow'".
 
 # Per-source weight applied multiplicatively to the final rerank+feature
 # score. Vault stays at 1.00 so the default path is a no-op; anything
@@ -2176,11 +2182,6 @@ SOURCE_WEIGHTS: dict[str, float] = {
     "calls":     0.80,   # log entries: factual but semantically thin
     "whatsapp":  0.75,
     "messages":  0.75,
-    # `pillow` está en VALID_SOURCES por trazabilidad (ingester registrado
-    # en `rag index --source pillow`) pero NO escribe al corpus vectorial
-    # — sus datos viven en `rag_sleep_sessions` y se consumen vía home
-    # panel + brief, no via retrieve. Weight inerte (nunca se aplica).
-    "pillow":    0.50,
 }
 
 # Recency half-life per source, in days. None → no decay applied (chunks
@@ -2209,7 +2210,6 @@ SOURCE_RECENCY_HALFLIFE_DAYS: dict[str, float | None] = {
     "whatsapp":    60.0,
     "messages":    60.0,
     "calls":       60.0,
-    "pillow":     None,   # local-only, no compite en retrieve (ver SOURCE_WEIGHTS)
 }
 
 # Retention windows per source, in days. None → keep forever. Used at
@@ -2227,7 +2227,6 @@ SOURCE_RETENTION_DAYS: dict[str, int | None] = {
     "whatsapp":   180,
     "messages":   180,
     "calls":      180,
-    "pillow":     None,   # local-only en rag_sleep_sessions, retention manual
 }
 
 
@@ -26150,6 +26149,34 @@ def _do_index(reset: bool, no_contradict: bool, source_opt: str | None,
     asume que `VAULT_PATH` + `COLLECTION_NAME` ya apuntan al vault target."""
     if source_opt:
         src = source_opt.strip().lower()
+        # `pillow` se despacha ANTES del check de VALID_SOURCES porque NO
+        # escribe al corpus vectorial — su ingester escribe a
+        # `rag_sleep_sessions` (telemetry) y mantiene a pillow fuera de
+        # SOURCE_WEIGHTS / SOURCE_RECENCY_HALFLIFE_DAYS / SOURCE_RETENTION_DAYS
+        # (no compite en retrieve). El bloque debajo lo procesa idéntico
+        # al handler legacy que vivía después del switch general.
+        if src == "pillow":
+            # Pillow (iOS sleep tracker) export → telemetry.db. Local-only,
+            # silent-fail si el archivo de iCloud no existe o el usuario
+            # no tiene Pillow Pro instalado.
+            from rag.integrations.pillow_sleep import ingest as _ingest_pillow
+            summary = _ingest_pillow()
+            if summary.get("skipped"):
+                console.print(
+                    f"[dim]pillow: {summary.get('reason', 'skipped')} "
+                    f"({summary['file']})[/dim]"
+                )
+                return
+            console.print(_fmt_ingest_summary(
+                "pillow",
+                total=summary["total_parsed"],
+                indexed=summary["ingested"],
+                deleted=0,
+                duration_s=summary["elapsed_ms"] / 1000.0,
+                dry_run=bool(dry_run),
+                extra=f"{summary['mood_signals']} mood signals",
+            ))
+            return
         if src not in VALID_SOURCES:
             console.print(
                 f"[red]Fuente inválida:[/red] {src}. "
@@ -26327,28 +26354,6 @@ def _do_index(reset: bool, no_contradict: bool, source_opt: str | None,
                     f"bm {summary['bookmarks_indexed']} · "
                     f"rl {rl}"
                 ),
-            ))
-            return
-        if src == "pillow":
-            # Pillow (iOS sleep tracker) export → telemetry.db. Local-only,
-            # silent-fail si el archivo de iCloud no existe o el usuario
-            # no tiene Pillow Pro instalado.
-            from rag.integrations.pillow_sleep import ingest as _ingest_pillow
-            summary = _ingest_pillow()
-            if summary.get("skipped"):
-                console.print(
-                    f"[dim]pillow: {summary.get('reason', 'skipped')} "
-                    f"({summary['file']})[/dim]"
-                )
-                return
-            console.print(_fmt_ingest_summary(
-                "pillow",
-                total=summary["total_parsed"],
-                indexed=summary["ingested"],
-                deleted=0,
-                duration_s=summary["elapsed_ms"] / 1000.0,
-                dry_run=bool(dry_run),
-                extra=f"{summary['mood_signals']} mood signals",
             ))
             return
         console.print(
@@ -48264,6 +48269,28 @@ def start(
         console.print("  [dim]·[/dim] catch-up index          : [yellow]skip[/yellow] (--no-index)")
     else:
         console.print("  [dim]·[/dim] catch-up index          : [cyan]rag index[/cyan] incremental")
+
+    # ── Hook informativo con rag-harness (no toca configs) ────────────────
+    # Si hay un profile activo en `.devin/mcp-profiles/.active`, lo mostramos
+    # como contexto. Si hay un default seteado y no coincide con el activo,
+    # avisamos. NO aplicamos nada automático — eso lo decide el usuario con
+    # `rag-harness use <name>` o `rag-harness default --apply`.
+    try:
+        _harness_root = Path(__file__).resolve().parent.parent / ".devin" / "mcp-profiles"
+        _active_path = _harness_root / ".active"
+        _default_path = _harness_root / ".default"
+        if _active_path.exists() or _default_path.exists():
+            active_p = _active_path.read_text().strip() if _active_path.exists() else None
+            default_p = _default_path.read_text().strip() if _default_path.exists() else None
+            if active_p:
+                console.print(f"  [dim]·[/dim] rag-harness profile     : [cyan]{active_p}[/cyan]"
+                              + (" [yellow](≠ default)[/yellow]" if default_p and default_p != active_p else ""))
+            elif default_p:
+                console.print(f"  [dim]·[/dim] rag-harness default     : [yellow]{default_p}[/yellow] (no aplicado — `rag-harness default --apply`)")
+    except Exception:
+        # Hook informativo — un error acá no debe romper `rag start`
+        pass
+
     console.print()
 
     if dry_run:

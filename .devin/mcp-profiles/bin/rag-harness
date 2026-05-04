@@ -528,5 +528,295 @@ def cmd_cost(profile_name: str | None):
     click.echo("Tools de MCPs externos (github, playwright, etc.) usan estimate de 5 tools × 150 tokens.")
 
 
+# ── Watch daemon — re-aplica el profile si los configs son pisados ──────────
+# Caso de uso: Claude Code (u otra herramienta) regenera ~/.claude.json y
+# pisa nuestro profile. Con el watcher corriendo, detectamos el cambio y
+# re-aplicamos en segundos.
+#
+# Implementación: polling de mtime cada `--interval` segundos (default 10).
+# Cuando detectamos cambio, comparamos el `mcpServers` actual con el que el
+# profile activo produciría — si difieren, re-aplicamos. Para evitar loops
+# (nuestra propia escritura cambia el mtime), guardamos un hash del contenido
+# que escribimos y lo comparamos antes de re-aplicar.
+
+import hashlib
+
+
+def _mcp_section_hash(section: dict) -> str:
+    s = json.dumps(section, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(s.encode()).hexdigest()
+
+
+@cli.command("watch")
+@click.option("--interval", type=float, default=10.0, help="Segundos entre polls (default 10).")
+@click.option("--once", is_flag=True, help="Hacer 1 ciclo y salir (para testing).")
+def cmd_watch(interval: float, once: bool):
+    """Daemon que re-aplica el profile activo si los configs son pisados.
+
+    Lee `.active` al arrancar y en cada ciclo. Si no hay profile activo,
+    duerme y vuelve a chequear (no aborta). Loggea al stdout — útil para
+    LaunchAgent que captura StandardOutPath.
+    """
+    import time as _time
+
+    inventory = _read_inventory()
+    inventory_keys = set(inventory.keys())
+
+    last_mtime = {p: 0.0 for p in (CLAUDE_CONFIG, DEVIN_CONFIG)}
+    last_hash = {p: "" for p in (CLAUDE_CONFIG, DEVIN_CONFIG)}
+
+    click.echo(f"[watch] iniciando — interval={interval}s")
+    while True:
+        active = _active_name()
+        if not active:
+            click.echo("[watch] no hay profile activo — durmiendo")
+            if once:
+                return
+            _time.sleep(interval)
+            continue
+
+        try:
+            profile = _read_profile(active)
+        except SystemExit:
+            click.echo(f"[watch] profile '{active}' no se puede leer — durmiendo")
+            if once:
+                return
+            _time.sleep(interval)
+            continue
+
+        expected = _build_mcp_section(profile, inventory)
+        expected_hash = _mcp_section_hash(expected)
+
+        for target in (CLAUDE_CONFIG, DEVIN_CONFIG):
+            if not target.exists():
+                continue
+            mtime = target.stat().st_mtime
+            if mtime == last_mtime[target]:
+                continue
+            last_mtime[target] = mtime
+
+            data = _load_json(target)
+            current = dict(data.get("mcpServers") or {})
+            # Solo comparamos los keys del inventory (lo que nosotros gestionamos)
+            current_managed = {k: v for k, v in current.items() if k in inventory_keys}
+            current_hash = _mcp_section_hash(current_managed)
+
+            if current_hash == last_hash[target]:
+                # Ya escribimos esto antes — no es drift, es nuestro propio write
+                continue
+
+            if current_hash == expected_hash:
+                # Coincide con lo que el profile pide — todo bien, nada que hacer
+                last_hash[target] = current_hash
+                continue
+
+            # Drift detectado — re-aplicar
+            click.echo(f"[watch] drift en {target.name} — re-aplicando '{active}'")
+            untouched = {k: v for k, v in current.items() if k not in inventory_keys}
+            new_section = dict(untouched)
+            new_section.update(expected)
+            data["mcpServers"] = new_section
+            _save_json(target, data)
+            last_mtime[target] = target.stat().st_mtime
+            last_hash[target] = expected_hash
+
+        if once:
+            return
+        _time.sleep(interval)
+
+
+_PLIST_LABEL = "com.fer.rag-harness-watcher"
+
+
+def _plist_path() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{_PLIST_LABEL}.plist"
+
+
+@cli.command("watch-install")
+@click.option("--interval", type=float, default=10.0)
+def cmd_watch_install(interval: float):
+    """Instala un LaunchAgent que corre `rag-harness watch` al login."""
+    plist = _plist_path()
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    bin_path = Path(__file__).resolve()
+    log_dir = Path.home() / ".local" / "share" / "rag-harness"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{_PLIST_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{bin_path}</string>
+    <string>watch</string>
+    <string>--interval</string>
+    <string>{interval}</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>{log_dir}/watcher.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>{log_dir}/watcher.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin:/Users/{Path.home().name}/.local/bin</string>
+  </dict>
+</dict>
+</plist>
+"""
+    plist.write_text(content)
+    click.echo(f"plist escrito: {plist}")
+    # Bootstrap (carga + arranca)
+    import subprocess
+    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", str(plist)], check=False)
+    r = subprocess.run(
+        ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist)],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        click.echo(f"warning: launchctl bootstrap falló: {r.stderr}", err=True)
+    else:
+        click.echo(f"daemon levantado. logs en {log_dir}/watcher.{{out,err}}.log")
+
+
+@cli.command("watch-uninstall")
+def cmd_watch_uninstall():
+    """Desinstala el LaunchAgent del watcher."""
+    import subprocess
+    plist = _plist_path()
+    if plist.exists():
+        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", str(plist)], check=False)
+        plist.unlink()
+        click.echo(f"plist removido: {plist}")
+    else:
+        click.echo("no había plist instalado")
+
+
+# ── Default profile + suggest ────────────────────────────────────────────────
+
+DEFAULT_FILE = ROOT / ".default"
+
+
+@cli.command("default")
+@click.argument("name", required=False)
+@click.option("--clear", is_flag=True, help="Borrar el default.")
+@click.option("--apply", "do_apply", is_flag=True, help="Aplicar el default ahora.")
+def cmd_default(name: str | None, clear: bool, do_apply: bool):
+    """Set / show / clear / apply el profile default.
+
+    `default <name>` setea, `default` solo muestra, `default --clear` borra,
+    `default --apply` aplica el default actual (equivalente a `use <default>`).
+    """
+    if clear:
+        if DEFAULT_FILE.exists():
+            DEFAULT_FILE.unlink()
+        click.echo("default removido")
+        return
+
+    if do_apply:
+        if not DEFAULT_FILE.exists():
+            click.echo("no hay default seteado", err=True)
+            sys.exit(1)
+        cmd_use.callback(DEFAULT_FILE.read_text().strip(), False)  # type: ignore[attr-defined]
+        return
+
+    if name:
+        # Validar que el profile existe
+        _read_profile(name)
+        DEFAULT_FILE.write_text(name + "\n")
+        click.echo(f"default seteado: {name}")
+        click.echo("→ aplicalo cuando quieras con `rag-harness default --apply`")
+        return
+
+    if DEFAULT_FILE.exists():
+        click.echo(f"default actual: {DEFAULT_FILE.read_text().strip()}")
+    else:
+        click.echo("no hay default seteado")
+
+
+def _suggest_profile() -> tuple[str, list[str]]:
+    """Recomienda un profile basado en cwd + recent shell history.
+
+    Devuelve (profile_name, [razones]). La heurística es deliberadamente
+    simple — la idea es que el usuario vea por qué se sugiere algo y pueda
+    agregar reglas según su workflow.
+    """
+    import subprocess
+    cwd = str(Path.cwd())
+    reasons: list[str] = []
+
+    # Señal 1: cwd
+    if "obsidian-rag" in cwd:
+        reasons.append(f"cwd contiene 'obsidian-rag' → priorizar perfiles RAG")
+        rag_match = True
+    else:
+        rag_match = False
+
+    # Señal 2: shell history (zsh primero, bash después)
+    history_text = ""
+    for h in (Path.home() / ".zsh_history", Path.home() / ".bash_history"):
+        if h.exists():
+            try:
+                history_text = h.read_text(errors="ignore")[-50000:]  # últimos 50k chars
+                break
+            except OSError:
+                continue
+
+    # Señal 3: git branch / repo
+    git_status = ""
+    try:
+        r = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                           capture_output=True, text=True, cwd=cwd)
+        if r.returncode == 0:
+            git_status = r.stdout.strip()
+    except FileNotFoundError:
+        pass
+
+    # Reglas (orden = prioridad)
+    h = history_text.lower()
+    if "playwright" in h or "/web/" in cwd or cwd.endswith("/web"):
+        reasons.append("señal de frontend/playwright → debug-web")
+        return ("debug-web", reasons)
+
+    if any(t in h for t in ["wa-tasks", "whatsapp", "gmail-send", "rag morning", "rag today"]):
+        reasons.append("señal de comms/briefs en history → comms")
+        return ("comms", reasons)
+
+    if any(t in h for t in ["rag capture", "rag save", "rag inbox", "rag file"]):
+        reasons.append("señal de captura/escritura al vault → writing")
+        return ("writing", reasons)
+
+    if rag_match and any(t in h for t in ["rag query", "rag chat", "rag stats"]):
+        reasons.append("uso reciente de rag query/chat → rag-only")
+        return ("rag-only", reasons)
+
+    if git_status and "obsidian-rag" not in git_status:
+        reasons.append(f"estás en otro repo ({Path(git_status).name}) → dev")
+        return ("dev", reasons)
+
+    reasons.append("fallback (no hay señales claras)")
+    return ("rag-only", reasons)
+
+
+@cli.command("suggest")
+@click.option("--apply", "do_apply", is_flag=True, help="Aplicar el profile sugerido.")
+def cmd_suggest(do_apply: bool):
+    """Recomienda un profile basado en cwd + shell history."""
+    name, reasons = _suggest_profile()
+    click.echo(f"sugerencia: {name}")
+    click.echo("razones:")
+    for r in reasons:
+        click.echo(f"  - {r}")
+    if do_apply:
+        click.echo()
+        cmd_use.callback(name, False)  # type: ignore[attr-defined]
+
+
 if __name__ == "__main__":
     cli()

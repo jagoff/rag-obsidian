@@ -1,0 +1,16 @@
+{
+  "name": "dev",
+  "description": "Sesiones de desarrollo: código + contexto del vault. Pensado para cuando estás laburando en otros repos y querés tener el RAG a mano sin las integraciones de comms ni cloud.",
+  "mcps": [
+    "obsidian-rag",
+    "github",
+    "context7",
+    "filesystem",
+    "time",
+    "claude-peers",
+    "sequential-thinking"
+  ],
+  "rag_mcp_tools": ["query", "read_note", "list_notes", "links", "stats"],
+  "rag_mcp_terse": true,
+  "rag_cli_keep": ["chat", "query", "index", "stats", "start", "stop", "status", "log", "do"]
+}

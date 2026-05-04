@@ -124,6 +124,7 @@ def _build_mcp_section(profile: dict, inventory: dict) -> dict:
         env = out["obsidian-rag"].setdefault("env", {})
         tools = profile.get("rag_mcp_tools")
         keep = profile.get("rag_cli_keep")
+        terse = profile.get("rag_mcp_terse")
         if tools:
             env["RAG_MCP_TOOLS"] = ",".join(tools)
         else:
@@ -132,6 +133,10 @@ def _build_mcp_section(profile: dict, inventory: dict) -> dict:
             env["RAG_CLI_KEEP"] = ",".join(keep)
         else:
             env.pop("RAG_CLI_KEEP", None)
+        if terse:
+            env["RAG_MCP_TOOLS_TERSE"] = "1"
+        else:
+            env.pop("RAG_MCP_TOOLS_TERSE", None)
 
     return out
 
@@ -229,12 +234,12 @@ def cmd_use(name: str, dry_run: bool):
     for k in sorted(mcp_section.keys()):
         click.echo(f"    - {k}")
 
-    if mcp_section.get("obsidian-rag", {}).get("env"):
-        env = mcp_section["obsidian-rag"]["env"]
+    rag_env = (mcp_section.get("obsidian-rag") or {}).get("env") or {}
+    rag_env_keys = {k: v for k, v in rag_env.items() if k.startswith("RAG_")}
+    if rag_env_keys:
         click.echo("\nenv inyectado en obsidian-rag:")
-        for k, v in env.items():
-            if k.startswith("RAG_"):
-                click.echo(f"    {k}={v}")
+        for k, v in rag_env_keys.items():
+            click.echo(f"    {k}={v}")
 
     inventory_keys = set(inventory.keys())
     click.echo("\nescribiendo:" if not dry_run else "\n[dry-run] cambios:")
@@ -350,6 +355,177 @@ def cmd_new(name: str, from_: str | None):
         sys.exit(1)
     _save_json(dst, src)
     click.echo(f"creado: {dst}")
+
+
+@cli.command("wrap", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
+@click.argument("name")
+@click.argument("command", nargs=-1, type=click.UNPROCESSED, required=True)
+def cmd_wrap(name: str, command: tuple[str, ...]):
+    """Aplica un profile, corre un comando, y restaura el profile previo.
+
+    Útil para correr UN comando con un set distinto de MCPs/tools sin
+    switchear permanentemente. Ej:
+
+        rag-harness wrap rag-only -- claude --print "explicame X"
+
+    Limitación: solo afecta procesos NUEVOS que arranquen mientras el
+    wrap está activo (ej. una sesión recién lanzada de Claude Code).
+    Sesiones ya abiertas no ven el cambio — su harness se compiló al boot.
+    """
+    import subprocess
+
+    if not command:
+        click.echo("falta el comando a ejecutar después del profile", err=True)
+        sys.exit(2)
+
+    previous = _active_name()
+    click.echo(f"[wrap] profile previo: {previous or '<ninguno>'}")
+    click.echo(f"[wrap] activando '{name}' temporalmente…")
+
+    profile = _read_profile(name)
+    inventory = _read_inventory()
+    mcp_section = _build_mcp_section(profile, inventory)
+    inventory_keys = set(inventory.keys())
+    _apply_to_target(CLAUDE_CONFIG, mcp_section, inventory_keys, dry_run=False)
+    _apply_to_target(DEVIN_CONFIG, mcp_section, inventory_keys, dry_run=False)
+    ACTIVE_FILE.write_text(name + "\n")
+
+    try:
+        click.echo(f"[wrap] ejecutando: {' '.join(command)}")
+        result = subprocess.run(list(command))
+        exit_code = result.returncode
+    finally:
+        click.echo(f"[wrap] restaurando profile previo: {previous or '<ninguno>'}")
+        # Si había profile previo, lo re-aplicamos (estado consistente).
+        # Si NO había, aplicamos `full` para dejar el estado equivalente
+        # a "harness sin tocar" — más predecible que un restore desde
+        # backup, que puede venir de una corrida anterior.
+        target_name = previous if previous and (PROFILES_DIR / f"{previous}.json").exists() else "full"
+        target_profile = _read_profile(target_name)
+        target_section = _build_mcp_section(target_profile, inventory)
+        _apply_to_target(CLAUDE_CONFIG, target_section, inventory_keys, dry_run=False)
+        _apply_to_target(DEVIN_CONFIG, target_section, inventory_keys, dry_run=False)
+        if previous:
+            ACTIVE_FILE.write_text(previous + "\n")
+        else:
+            if ACTIVE_FILE.exists():
+                ACTIVE_FILE.unlink()
+    sys.exit(exit_code)
+
+
+# ── Estimación de costo de tokens ────────────────────────────────────────────
+# Aproximación pragmática: contamos chars del JSON descriptor de cada MCP
+# server entry + chars de docstrings/firmas de las tools del MCP propio.
+# Para MCPs externos no podemos invocar `tools/list` sin hacer un handshake
+# stdio completo — usamos un estimate fijo por MCP basado en bytes del
+# `command`/`args`/`env`. Tokens ≈ chars / 4 (rule of thumb GPT/Claude).
+
+def _estimate_mcp_descriptor_tokens(entry: dict) -> int:
+    """Tokens aproximados del descriptor del MCP server (sin tools)."""
+    s = json.dumps(entry, separators=(",", ":"))
+    return max(50, len(s) // 4)
+
+
+def _estimate_obsidian_rag_tools_tokens(profile: dict) -> tuple[int, int]:
+    """Tokens aproximados de las tools del MCP de obsidian-rag.
+
+    Devuelve (tokens_total, tools_count). Lee `mcp_server.py` y parsea
+    los `def rag_*` con sus docstrings; si el profile define
+    `rag_mcp_tools`, filtra; si define `rag_mcp_terse=true`, recorta el
+    docstring al primer párrafo antes de contar.
+    """
+    import re as _re
+    repo_root = ROOT.parent.parent
+    src = repo_root / "mcp_server.py"
+    if not src.exists():
+        return (0, 0)
+    text = src.read_text()
+    # Match "def rag_<name>(...)<...>: ... <docstring> ..."
+    pat = _re.compile(
+        r'^def (rag_\w+)\([^)]*\)[^:]*:\s*\n\s*"""(.*?)"""',
+        _re.DOTALL | _re.MULTILINE,
+    )
+    allowed = set(profile.get("rag_mcp_tools") or [])
+    terse = bool(profile.get("rag_mcp_terse"))
+
+    total_chars = 0
+    count = 0
+    for m in pat.finditer(text):
+        fn_name = m.group(1)
+        short = fn_name[4:]
+        if allowed and fn_name not in allowed and short not in allowed:
+            continue
+        doc = m.group(2).strip()
+        if terse:
+            doc = doc.split("\n\n", 1)[0].strip()
+        # Aproximación: nombre + signature + docstring
+        descriptor = f"{fn_name}: {doc}"
+        total_chars += len(descriptor)
+        count += 1
+    return (total_chars // 4, count)
+
+
+@cli.command("cost")
+@click.option("--profile", "-p", "profile_name", default=None,
+              help="Profile a estimar (default: el activo).")
+def cmd_cost(profile_name: str | None):
+    """Estima los tokens que el profile inyecta al system prompt.
+
+    Aproximación grosera (chars/4). Útil para comparar profiles entre sí,
+    no como número absoluto exacto. Para tools del MCP de obsidian-rag
+    parseamos `mcp_server.py` (precisa). Para los otros MCPs estimamos
+    el descriptor del entry — NO contamos las tools que cada MCP expone
+    porque eso requeriría hacer un handshake stdio con cada uno.
+    """
+    if profile_name:
+        profile = _read_profile(profile_name)
+    else:
+        active = _active_name()
+        profile = _read_profile(active) if active else _read_profile("full")
+
+    inventory = _read_inventory()
+
+    # Para comparar, calculamos siempre el costo de TODOS los profiles
+    profiles_data = []
+    for p_path in _list_profiles():
+        p = _load_json(p_path)
+        section = _build_mcp_section(p, inventory)
+
+        mcp_descriptor_tokens = sum(
+            _estimate_mcp_descriptor_tokens(entry)
+            for entry in section.values()
+        )
+        rag_tokens, rag_tool_count = _estimate_obsidian_rag_tools_tokens(p)
+        # Estimate ~150 tokens/tool para MCPs externos (rough avg)
+        external_mcps = [k for k in section.keys() if k != "obsidian-rag"]
+        external_tools_estimate = len(external_mcps) * 5 * 150  # ~5 tools avg, ~150 tk c/u
+
+        total = mcp_descriptor_tokens + rag_tokens + external_tools_estimate
+        profiles_data.append({
+            "name": p["name"],
+            "mcps": len(section),
+            "rag_tools": rag_tool_count,
+            "tokens": total,
+            "active": p["name"] == profile["name"],
+        })
+
+    # Imprimir tabla
+    full_total = next((p["tokens"] for p in profiles_data if p["name"] == "full"), None)
+    click.echo(f"{'profile':<14} {'mcps':>5} {'rag-tools':>10} {'tokens_est':>12}  {'delta_vs_full':>16}")
+    click.echo("-" * 64)
+    for p in sorted(profiles_data, key=lambda x: x["tokens"], reverse=True):
+        marker = " *" if p["active"] else "  "
+        delta = ""
+        if full_total and p["name"] != "full":
+            d = p["tokens"] - full_total
+            pct = (100 * d) // full_total if full_total else 0
+            delta = f"{d:+,} ({pct:+d}%)"
+        click.echo(
+            f"{marker} {p['name']:<11} {p['mcps']:>5} {p['rag_tools']:>10} "
+            f"{p['tokens']:>12,}  {delta:>16}"
+        )
+    click.echo("\nNota: estimación grosera (chars/4). Útil para comparar profiles.")
+    click.echo("Tools de MCPs externos (github, playwright, etc.) usan estimate de 5 tools × 150 tokens.")
 
 
 if __name__ == "__main__":

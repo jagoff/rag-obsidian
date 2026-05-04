@@ -1,0 +1,14 @@
+{
+  "name": "debug-web",
+  "description": "Debugging del frontend del RAG (web/server.py + JS). Playwright para automation, filesystem para logs/builds, RAG en modo lectura mínima. Sin comms ni cloud.",
+  "mcps": [
+    "obsidian-rag",
+    "playwright",
+    "filesystem",
+    "github",
+    "time"
+  ],
+  "rag_mcp_tools": ["query", "read_note"],
+  "rag_mcp_terse": true,
+  "rag_cli_keep": ["chat", "query", "stats", "start", "stop", "status", "log"]
+}

@@ -27,5 +27,6 @@
     "youtube-transcript"
   ],
   "rag_mcp_tools": null,
+  "rag_mcp_terse": false,
   "rag_cli_keep": null
 }

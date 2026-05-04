@@ -1,0 +1,14 @@
+{
+  "name": "writing",
+  "description": "Redacción de notas largas y captura activa al vault. Habilita rag_capture / rag_save_note / rag_create_reminder / rag_create_event. Sin docstring terse para que el agente vea bien las firmas de las write-tools (más sensibles a errores que las de lectura).",
+  "mcps": [
+    "obsidian-rag",
+    "obsidian",
+    "filesystem",
+    "apple-mcp",
+    "time"
+  ],
+  "rag_mcp_tools": ["query", "read_note", "list_notes", "stats", "capture", "save_note", "create_reminder", "create_event", "links"],
+  "rag_mcp_terse": false,
+  "rag_cli_keep": ["chat", "query", "capture", "do", "stats", "start", "stop", "status"]
+}

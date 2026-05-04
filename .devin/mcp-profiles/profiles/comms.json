@@ -1,0 +1,15 @@
+{
+  "name": "comms",
+  "description": "Componer mensajes y replies con contexto del vault. WhatsApp + Gmail + Apple stack + RAG en modo lectura. Sin tools de captura/escritura del RAG (las notas las generan otros flujos).",
+  "mcps": [
+    "obsidian-rag",
+    "whatsapp",
+    "gmail-send",
+    "apple-mcp",
+    "obsidian",
+    "time"
+  ],
+  "rag_mcp_tools": ["query", "read_note"],
+  "rag_mcp_terse": true,
+  "rag_cli_keep": ["chat", "query", "stats", "start", "stop", "status"]
+}

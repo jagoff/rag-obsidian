@@ -75,3 +75,5 @@ ra-home-current.png
 /*.txt
 CLAUDE.original.md
 .devin/mcp-profiles/inventory.json
+.devin/mcp-profiles/.active
+.devin/mcp-profiles/**/*.bak-harness-*

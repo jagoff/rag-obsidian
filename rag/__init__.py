@@ -7099,6 +7099,30 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
     (
+        # rag_conversation_summaries — cache de resúmenes de historial de
+        # conversación para el web chat.  Cada row guarda el resumen LLM
+        # de los N-1 turns previos de una sesión.  Clave compuesta
+        # (session_id, history_hash) — session_id para aislamiento
+        # cross-sesión, history_hash = sha256[:16] del JSON de los turns
+        # previos.  La columna `summary` almacena el texto producido por
+        # qwen2.5:3b (HELPER_OPTIONS, determinista).
+        #
+        # Retention 30 días: la info es transitoria y se vuelve a generar
+        # si se necesita; after 30d es basura, la limpia `rag maintenance`.
+        "rag_conversation_summaries",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_conversation_summaries ("
+            " session_id TEXT NOT NULL,"
+            " history_hash TEXT NOT NULL,"
+            " summary TEXT NOT NULL,"
+            " ts TEXT NOT NULL,"
+            " PRIMARY KEY (session_id, history_hash)"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_conv_summaries_ts "
+            "ON rag_conversation_summaries(ts)",
+        ),
+    ),
+    (
         # Status probe samples — one row per (timestamp, service_id) for
         # the uptime heatmap on /status. Populated by web/server.py
         # `_persist_status_samples` que se cuelga al final de cada
@@ -18760,6 +18784,112 @@ def _compress_turns(turns: list[dict]) -> str:
     except Exception:
         return ""
     return (resp.message.content or "").strip()
+
+
+def _summarize_conversation_history(
+    history: list[dict],
+    session_id: str,
+) -> str:
+    """Summarize N-1 prior turns of a web chat history into 2-3 dense sentences.
+
+    Designed for `web/server.py` use: `history` is in message format
+    ``[{"role": "user"|"assistant", "content": "..."}]``.
+
+    The function caches results by ``(session_id, history_hash)`` in
+    ``rag_conversation_summaries`` (telemetry.db, 30d retention).  Cache key
+    includes ``session_id`` for cross-session safety — the same N-1 messages
+    in a different session context should not share a summary.
+
+    When the LLM call fails, returns a raw-concatenation fallback of the
+    prior turns (no exception raised — silent fail).
+
+    Invariants:
+    - Uses ``HELPER_OPTIONS`` (temperature=0, seed=42) — deterministic.
+    - Uses ``qwen2.5:3b`` (HELPER_MODEL) — same as ``_compress_turns``.
+    - ``keep_alive=OLLAMA_KEEP_ALIVE`` on every Ollama call.
+    - ``_bump_silent_log_counter()`` called on all silent-error paths.
+    """
+    import hashlib as _hashlib
+    import json as _json
+
+    if not history:
+        return ""
+
+    history_hash = _hashlib.sha256(
+        _json.dumps(history, ensure_ascii=False, sort_keys=False).encode()
+    ).hexdigest()[:16]
+
+    # ── Cache lookup ──────────────────────────────────────────────────────────
+    try:
+        with _ragvec_state_conn() as _conn:
+            row = _conn.execute(
+                "SELECT summary FROM rag_conversation_summaries"
+                " WHERE session_id = ? AND history_hash = ?",
+                (session_id, history_hash),
+            ).fetchone()
+        if row:
+            return row[0]
+    except Exception as _e:
+        _silent_log("conversation_summary_cache_read_error", {"error": str(_e)})
+        _bump_silent_log_counter()
+
+    # ── Build fallback concatenation ─────────────────────────────────────────
+    # Used both as the LLM input *and* as the return value if the LLM fails.
+    fallback_parts: list[str] = []
+    for msg in history:
+        role = msg.get("role", "")
+        content = (msg.get("content") or "").strip()
+        if not content:
+            continue
+        label = "Usuario" if role == "user" else "Asistente"
+        fallback_parts.append(f"{label}: {content[:500]}")
+    fallback_text = "\n".join(fallback_parts)
+
+    # ── LLM summarise ────────────────────────────────────────────────────────
+    prompt = (
+        "Condensá esta conversación previa entre usuario y asistente en "
+        "2-3 oraciones que capturen: (a) qué preguntó el usuario, "
+        "(b) qué respondiste, (c) qué notas/fuentes citaste. "
+        "Sé conciso y factual.\n\n"
+        f"Conversación previa:\n{fallback_text}\n\n"
+        "Resumen:"
+    )
+    summary = ""
+    try:
+        resp = _helper_client().chat(
+            model=HELPER_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options={**HELPER_OPTIONS, "num_predict": 200, "num_ctx": 2048},
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        )
+        summary = (resp.message.content or "").strip()
+    except Exception as _e:
+        _silent_log("conversation_summary_llm_error", {"error": str(_e)})
+        _bump_silent_log_counter()
+        return fallback_text  # silent-fail → raw concat fallback
+
+    if not summary:
+        return fallback_text
+
+    # ── Cache write ───────────────────────────────────────────────────────────
+    from datetime import datetime as _datetime
+
+    _now_iso = _datetime.now().isoformat(timespec="seconds")
+    try:
+        with _ragvec_state_conn() as _conn:
+            _conn.execute(
+                "INSERT OR REPLACE INTO rag_conversation_summaries"
+                " (session_id, history_hash, summary, ts)"
+                " VALUES (?, ?, ?, ?)",
+                (session_id, history_hash, summary, _now_iso),
+            )
+            _conn.commit()
+    except Exception as _e:
+        _silent_log("conversation_summary_cache_write_error", {"error": str(_e)})
+        _bump_silent_log_counter()
+        # Cache write failure is non-fatal — we already have the summary
+
+    return summary
 
 
 def build_where(
@@ -53578,6 +53708,28 @@ def run_maintenance(
             results["feedback_orphans"] = 0
     else:
         results["feedback_orphans"] = _prune_feedback_orphans(VAULT_PATH)
+
+    # 12b. Conversation summaries 30d retention
+    # rag_conversation_summaries accumula resúmenes de historial para el
+    # web chat.  Los datos son transitorios (se regeneran si se necesitan)
+    # — 30 días es más que suficiente para cualquier sesión activa.
+    try:
+        with _ragvec_state_conn() as _cs_conn:
+            if not dry_run:
+                _cs_cur = _cs_conn.execute(
+                    "DELETE FROM rag_conversation_summaries"
+                    " WHERE ts < datetime('now', '-30 days')"
+                )
+                _cs_conn.commit()
+                results["conv_summaries_pruned"] = _cs_cur.rowcount
+            else:
+                _cs_cur = _cs_conn.execute(
+                    "SELECT COUNT(*) FROM rag_conversation_summaries"
+                    " WHERE ts < datetime('now', '-30 days')"
+                )
+                results["conv_summaries_pruned"] = (_cs_cur.fetchone() or [0])[0]
+    except Exception as _cs_e:
+        results["conv_summaries_pruned_error"] = str(_cs_e)
 
     # 13. Ollama health (read-only)
     results["ollama"] = _check_ollama_health()

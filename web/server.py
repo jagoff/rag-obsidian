@@ -155,6 +155,7 @@ from rag import (  # noqa: E402
     resolve_vault_paths,
     save_session,
     session_history,
+    _summarize_conversation_history,
     TOPIC_SHIFT_COSINE,
 )
 
@@ -13491,7 +13492,41 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             )
             if _src_hint:
                 _system_msgs.append({"role": "system", "content": _src_hint})
-            _turn_history = history or []
+            # ── Quick Win #5: Selective history summarisation ─────────────
+            # When the user has ≥2 turns already in history (i.e., at least
+            # one completed exchange), replace the raw N-1 prior turns with a
+            # 2-3 sentence summary, keeping only the last turn verbatim.
+            # This dramatically reduces context tokens for long sessions
+            # while preserving the topic thread.
+            #
+            # Gate: RAG_HISTORY_SUMMARY (default ON, set to "0"/"false"/"no"
+            # to disable).  When ≤1 turn or feature is OFF, falls back to
+            # the original raw concatenation.
+            _RAG_HISTORY_SUMMARY_ON = os.environ.get(
+                "RAG_HISTORY_SUMMARY", "1"
+            ).strip().lower() not in ("0", "false", "no", "")
+            if _RAG_HISTORY_SUMMARY_ON and len(history or []) > 2:
+                # history is a flat message list; pairs of (user, assistant)
+                # messages = turns.  history[:-2] = all but last turn.
+                _prior_msgs = history[:-2]
+                _last_turn  = history[-2:]
+                _hist_summary = _summarize_conversation_history(
+                    _prior_msgs, sess["id"]
+                )
+                if _hist_summary:
+                    _turn_history = [
+                        {
+                            "role": "system",
+                            "content": (
+                                "[Resumen de la conversación previa]\n"
+                                + _hist_summary
+                            ),
+                        }
+                    ] + _last_turn
+                else:
+                    _turn_history = history or []
+            else:
+                _turn_history = history or []
         tool_messages: list[dict] = (
             _system_msgs
             + _turn_history

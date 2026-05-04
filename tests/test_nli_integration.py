@@ -255,7 +255,7 @@ def test_query_nli_skips_for_recent_intent(monkeypatch):
     monkeypatch.setenv("RAG_NLI_GROUNDING", "1")
     _apply_base_patches_query(monkeypatch)
     monkeypatch.setattr(rag, "classify_intent", lambda q, tags, folders: ("recent", {}))
-    monkeypatch.setattr(rag, "handle_recent", lambda col, params, limit=20: [])
+    monkeypatch.setattr(rag, "handle_recent", lambda col, params, limit=20, *, question=None: [])
     monkeypatch.setattr(rag, "render_file_list", lambda title, files: None)
 
     split_calls: list = []

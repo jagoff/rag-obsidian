@@ -55,9 +55,11 @@ def isolated_state_db(tmp_path, monkeypatch):
     es per-test porque pytest crea un tmp_path único, así que no hay
     cross-talk entre tests aunque corran en paralelo.
 
-    Neutralizamos `_log_ambient` para que las escrituras de auditoría
-    no traten de tocar `rag_ambient` (que requeriría
-    `_ensure_telemetry_tables` y desviaría el foco del SUT).
+    Neutralizamos `_log_ambient` y `_notify_ambient_scheduled_outcome`
+    para que no generen side effects de escritura (auditoría, notificaciones
+    WA) que desviarían el foco del SUT. Sin esto, los monkeypatches de
+    `_whatsapp_send_to_jid` capturan AMBAS llamadas (mensaje programado +
+    notificación al ambient) en lugar de solo la que testea el test.
     """
     db_path = tmp_path / "state.db"
 
@@ -72,6 +74,8 @@ def isolated_state_db(tmp_path, monkeypatch):
 
     monkeypatch.setattr(rag, "_ragvec_state_conn", _fake_conn)
     monkeypatch.setattr(wa_scheduled, "_log_ambient",
+                        lambda *a, **kw: None)
+    monkeypatch.setattr(wa_scheduled, "_notify_ambient_scheduled_outcome",
                         lambda *a, **kw: None)
     return db_path
 

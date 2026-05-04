@@ -162,7 +162,15 @@ def test_corpus_hash_bucket_default_is_500(monkeypatch, tmp_path):
 
 
 def test_corpus_hash_cached_memoizes(monkeypatch, tmp_path):
-    """Once computed, repeat calls with same chunk count return from memo."""
+    """Once computed, repeat calls with same chunk count return from memo.
+
+    Post 2026-04-30 refactor: `_corpus_hash_cached` ya no llama a
+    `_compute_corpus_hash` (que adentro re-hacía `col.count()`). Ahora
+    usa `_hash_chunk_count(cnt)` con el `cnt` ya leído, evitando un
+    segundo round-trip a SQL. Spyeamos esa función para validar la
+    memoization — la condición real es que el cache hit no recompute
+    el hash, sin importar cuántas veces se llame `col.count()`.
+    """
     monkeypatch.setattr(rag, "_resolve_vault_path", lambda: tmp_path)
     (tmp_path / "a.md").write_text("# a")
     # Reset memo so test is deterministic.
@@ -170,13 +178,13 @@ def test_corpus_hash_cached_memoizes(monkeypatch, tmp_path):
         rag._corpus_hash_memo["hash"] = None
         rag._corpus_hash_memo["chunk_count"] = None
     calls = {"n": 0}
-    real = rag._compute_corpus_hash
+    real = rag._hash_chunk_count
 
-    def spy(col):
+    def spy(cnt):
         calls["n"] += 1
-        return real(col)
+        return real(cnt)
 
-    monkeypatch.setattr(rag, "_compute_corpus_hash", spy)
+    monkeypatch.setattr(rag, "_hash_chunk_count", spy)
     h1 = rag._corpus_hash_cached(_FakeCol(5))
     h2 = rag._corpus_hash_cached(_FakeCol(5))
     h3 = rag._corpus_hash_cached(_FakeCol(5))

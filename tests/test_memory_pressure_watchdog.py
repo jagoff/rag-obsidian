@@ -253,9 +253,17 @@ def test_start_watchdog_skips_non_darwin(monkeypatch):
 
 
 def test_start_watchdog_idempotent(monkeypatch):
-    """Second call should NOT spawn a second thread — returns True (already running)."""
+    """Second call should NOT spawn new threads — returns True (already running).
+
+    Post 2026-05-02: `start_memory_pressure_watchdog` arranca DOS daemon
+    threads en la primera llamada (watchdog + MPS cache drop loop). Los
+    calls subsiguientes son no-op porque `_memory_watchdog_started`
+    queda en True. El test cuenta threads totales: 2 en la primera
+    llamada, 0 nuevos en las siguientes.
+    """
     monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.delenv("RAG_MEMORY_PRESSURE_DISABLE", raising=False)
+    monkeypatch.delenv("RAG_MPS_CACHE_DROP_INTERVAL", raising=False)
 
     threads_started = []
     original_thread = threading.Thread
@@ -268,13 +276,22 @@ def test_start_watchdog_idempotent(monkeypatch):
     monkeypatch.setattr(threading, "Thread", _tracked_thread)
 
     assert rag.start_memory_pressure_watchdog() is True
+    n_after_first = len(threads_started)
     assert rag.start_memory_pressure_watchdog() is True
     assert rag.start_memory_pressure_watchdog() is True
-    assert len(threads_started) == 1
+    # Watchdog (1) + MPS cache drop loop (1) en la primera llamada;
+    # subsiguientes son no-op.
+    assert n_after_first == 2
+    assert len(threads_started) == n_after_first
 
 
 def test_start_watchdog_respects_custom_threshold(monkeypatch):
-    """Env var RAG_MEMORY_PRESSURE_THRESHOLD is propagated to the loop."""
+    """Env var RAG_MEMORY_PRESSURE_THRESHOLD is propagated to the loop.
+
+    Verifica que el watchdog principal recibe los args (threshold, interval)
+    desde las env vars. Filtra el thread del MPS cache drop loop (su tupla
+    de args es (mps_interval,) — un solo elemento, no dos).
+    """
     monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.delenv("RAG_MEMORY_PRESSURE_DISABLE", raising=False)
     monkeypatch.setenv("RAG_MEMORY_PRESSURE_THRESHOLD", "95")
@@ -291,7 +308,10 @@ def test_start_watchdog_respects_custom_threshold(monkeypatch):
     monkeypatch.setattr(threading, "Thread", _capture_thread)
 
     rag.start_memory_pressure_watchdog()
-    assert captured_args == [(95.0, 30)]
+    # El watchdog principal usa args=(threshold, interval) — 2 elementos.
+    # El MPS cache drop loop usa args=(mps_interval,) — 1 elemento.
+    watchdog_args = [a for a in captured_args if len(a) == 2]
+    assert watchdog_args == [(95.0, 30)]
 
 
 def test_start_watchdog_invalid_threshold_falls_back(monkeypatch):

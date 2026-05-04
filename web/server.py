@@ -113,7 +113,6 @@ from rag import (  # noqa: E402
     _build_tasks_system_rules as _rag_build_tasks_system_rules,
     _collect_scoped_tasks_evidence_multi as _rag_collect_scoped_tasks_evidence_multi,
     _collect_today_evidence,
-    _fetch_calendar_ahead,
     _fetch_calendar_today,
     _fetch_chrome_bookmarks_used,
     _fetch_drive_evidence,
@@ -5558,7 +5557,7 @@ def list_contacts(q: str = "", kind: str = "any", limit: int = 20) -> dict:
 
 
 @app.get("/api/model")
-def get_chat_model() -> dict:
+def get_active_chat_model() -> dict:
     """Return the chat model that /api/chat would use right now."""
     return {"model": _resolve_web_chat_model()}
 

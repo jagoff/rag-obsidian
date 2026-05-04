@@ -49,7 +49,6 @@ del _k, _v
 import atexit
 import concurrent.futures
 import contextlib
-import csv
 import fcntl
 import functools
 import hashlib
@@ -71,7 +70,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     import numpy as np
@@ -931,6 +930,28 @@ _BACKGROUND_SQL_THREAD = threading.Thread(
     target=_background_sql_writer_loop, daemon=True, name="rag-bg-sql-writer"
 )
 _BACKGROUND_SQL_THREAD.start()
+
+
+def _flush_bg_sql_queue() -> None:
+    """Drain pendientes y join al shutdown.
+
+    Sin esto, el thread queda colgado en `_BACKGROUND_SQL_QUEUE.get()`
+    cuando Python empieza el teardown del módulo: las primitivas que
+    el thread necesita ya están siendo colectadas → segfault
+    intermitente en suite full de tests (`rag/__init__.py:914 in
+    _background_sql_writer_loop` en el traceback). Mismo patrón que
+    `_flush_log_queue` arriba — sentinel None + join bounded.
+    Drops en queue al shutdown son aceptables porque la cache es una
+    optimización de velocidad, no path de correctness.
+    """
+    try:
+        _BACKGROUND_SQL_QUEUE.put_nowait(None)
+        _BACKGROUND_SQL_THREAD.join(timeout=2.0)
+    except Exception:
+        pass
+
+
+atexit.register(_flush_bg_sql_queue)
 
 
 def _enqueue_background_sql(write_fn, error_tag: str) -> None:
@@ -12119,7 +12140,7 @@ def maybe_normalize_typos(question: str, col) -> str | None:
         return None
     if bm25 is None or not hasattr(bm25, "idf"):
         return None
-    vocab = _corpus_vocab_set(col)
+    vocab = _corpus_vocab_set(col)  # noqa: F811 — local var shadows re-exported CLI symbol
     if not vocab:
         return None
 
@@ -17933,7 +17954,7 @@ def _suggest_tags_for_note(
     Returns picked list (may be empty). Shared by `rag autotag` and `rag inbox`.
     """
     c = _load_corpus(col)
-    vocab = sorted(c["tags"])
+    vocab = sorted(c["tags"])  # noqa: F811 — local var shadows re-exported CLI symbol
     if not vocab or not body.strip():
         return []
     prompt = (
@@ -33771,7 +33792,7 @@ def autotag(path: str, apply: bool, max_tags: int):
 
     col = get_db()
     c = _load_corpus(col)
-    vocab = sorted(c["tags"])
+    vocab = sorted(c["tags"])  # noqa: F811 — local var shadows re-exported CLI symbol
     raw = note_path.read_text(encoding="utf-8", errors="ignore")
     fm = parse_frontmatter(raw)
     current_tags = _normalize_fm_tags(fm)
@@ -40814,7 +40835,7 @@ def _create_calendar_event(
     if recurrence is None:
         try:
             import objc  # noqa: PLC0415
-            from Foundation import NSBundle, NSDate, NSURL  # noqa: PLC0415
+            from Foundation import NSBundle, NSDate  # noqa: PLC0415
 
             ek_bundle = NSBundle.bundleWithPath_(
                 "/System/Library/Frameworks/EventKit.framework"
@@ -47316,7 +47337,6 @@ def distill_conversations_cmd(apply: bool, min_confidence: float,
     Idempotente: cada conversation se destila una vez (stamp
     `distilled_to:` en su frontmatter).
     """
-    import click as _click
     from rich.console import Console
     from rich.table import Table
     console = Console()

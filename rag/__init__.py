@@ -46829,6 +46829,53 @@ def wa_scheduled_send(dry_run: bool, late_threshold_min: int,
     )
 
 
+@cli.command("wa-fast")
+@click.option("--dry-run", is_flag=True,
+              help="No envía al bridge ni toca status — solo reporta.")
+@click.pass_context
+def wa_fast(ctx: click.Context, dry_run: bool):
+    """Worker unificado de WhatsApp time-sensitive — cada 5 min via launchd.
+
+    Corre en serie los 2 sub-jobs light que comparten cadencia y
+    naturaleza ("procesar outbound-queue cada 5 min"):
+
+      1. `remind-wa`         — Apple Reminders próximos a vencer → WA push
+      2. `wa-scheduled-send` — mensajes programados del user que vencieron
+
+    Unificado el 2026-05-04 (antes eran `reminder-wa-push` y
+    `wa-scheduled-send` como plists separados con la misma cadencia
+    exacta). Tradeoff: si uno falla el otro corre igual (try/except por
+    job). Beneficio: 1 plist, 1 log, 1 cold-start de `import rag`
+    (~3-4s ahorrados cada 5 min = 10+ min/día de CPU y RAM).
+
+    **No incluye `wa-tasks`** porque esa tiene cadencia de 30 min +
+    es LLM-heavy (una call de qwen2.5:3b por chat con delta). Fusionarla
+    acá saturaría Ollama — queda como daemon aparte.
+    """
+    # Sub-job 1: remind-wa (Reminders → WA push). Defaults de los flags
+    # del comando standalone (5 min window, 24h max overdue).
+    console.print("[bold cyan]▸ remind-wa[/bold cyan]")
+    try:
+        ctx.invoke(remind_wa, dry_run=dry_run, window_min=5, max_overdue_min=1440)
+    except Exception as exc:
+        console.print(f"[red]✗ remind-wa fail:[/red] {exc!r}")
+        _silent_log("wa_fast_remind_wa_fail", exc)
+
+    # Sub-job 2: wa-scheduled-send (outbound queue). Defaults del
+    # comando standalone (late-threshold=5 min, max-retries=5, cap 20
+    # por run).
+    console.print("[bold cyan]▸ wa-scheduled-send[/bold cyan]")
+    try:
+        ctx.invoke(
+            wa_scheduled_send,
+            dry_run=dry_run, late_threshold_min=5,
+            max_retries=5, max_per_run=20,
+        )
+    except Exception as exc:
+        console.print(f"[red]✗ wa-scheduled-send fail:[/red] {exc!r}")
+        _silent_log("wa_fast_scheduled_send_fail", exc)
+
+
 # ── `rag bridge` — manage the WhatsApp bridge daemon ────────────────
 #
 # Constants para el bridge daemon. Rutas hardcodeadas porque los plists
@@ -49439,40 +49486,37 @@ def _today_plist(rag_bin: str, hour: int = 22, minute: int = 0) -> str:
 """
 
 
-def _reminder_wa_push_plist(rag_bin: str) -> str:
-    """Apple Reminders → WhatsApp push — every 5 minutes.
+def _wa_fast_plist(rag_bin: str) -> str:
+    """Worker unificado WhatsApp time-sensitive — every 5 minutes.
 
-    Reads pending Reminders via `_fetch_reminders_due`, filters to the
-    `[now - 5min, now + 5min]` window (matching the cadence), and pushes
-    each unmarked one to the ambient JID through the local bridge.
-    Idempotent via `rag_reminder_wa_pushed` (PK reminder_id) — a single
-    reminder is notified once even if the cron fires several times before
-    the user dismisses it.
+    Consolidación 2026-05-04: antes eran 2 plists separados con cadencia
+    idéntica (`reminder-wa-push` + `wa-scheduled-send`, ambos 5 min).
+    Se unificaron en un solo worker (`rag wa-fast`) que corre los 2
+    sub-jobs en serie. Ahorra 1 cold-start (~3-4s de `import rag`) cada
+    5 min = ~10+ min/día de CPU evitada. Ambos jobs son idempotentes
+    (tablas `rag_reminder_wa_pushed` y `rag_whatsapp_scheduled`
+    respectivamente), así que si un run se salta por Mac dormida /
+    launchd backoff, el siguiente recupera los pendings.
 
-    Tighter cadence than `wa-tasks` (5min vs 30min) because reminder
-    push is time-sensitive: a reminder set for "10 minutes from now"
-    on a 30min cron would notify ~25min after due, which defeats the
-    feature. 5min is the sweet spot — overlapping window means even a
-    cron that misses one cycle (machine sleep / launchd backoff)
-    catches the reminder on the next run.
+    Sub-jobs:
+      1. `remind-wa`         — Apple Reminders próximos a vencer → WA
+      2. `wa-scheduled-send` — mensajes programados del user que vencieron
 
-    Cost per cycle: one osascript call (Reminders.app), one or two SQL
-    upserts when there's something to push, zero LLM calls. Sub-200ms
-    typical.
+    NO incluye `wa-tasks` (cadencia 30min, LLM-heavy por chat). Fusionar
+    ese acá saturaría Ollama.
 
-    Silent-fail on missing ambient.json or `reminder_push_enabled=false`
-    in the config — exit 0 with `reason` field in the summary so the
-    log is informative without flooding stderr.
+    Silent-fail end-to-end: cada sub-job corre en try/except — si uno
+    crashea, el otro corre igual. El worker siempre exit 0.
     """
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>com.fer.obsidian-rag-reminder-wa-push</string>
+  <key>Label</key><string>com.fer.obsidian-rag-wa-fast</string>
   <key>ProgramArguments</key>
   <array>
     <string>{rag_bin}</string>
-    <string>remind-wa</string>
+    <string>wa-fast</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
@@ -49483,56 +49527,8 @@ def _reminder_wa_push_plist(rag_bin: str) -> str:
   </dict>
   <key>StartInterval</key><integer>300</integer>
   <key>RunAtLoad</key><false/>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/reminder-wa-push.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/reminder-wa-push.error.log</string>
-</dict>
-</plist>
-"""
-
-
-def _wa_scheduled_send_plist(rag_bin: str) -> str:
-    """Scheduled WhatsApp messages → bridge dispatcher — every 5 minutes.
-
-    Pickea rows de `rag_whatsapp_scheduled` con `status='pending'` y
-    `scheduled_for_utc <= now`, las manda al bridge local
-    (whatsapp-mcp), y las mueve a `sent` / `sent_late` / `failed`.
-    Cadencia idéntica a `reminder-wa-push` (5min) — ambos son
-    time-sensitive y comparten el mismo trade-off precisión vs CPU.
-    Si la Mac quedó dormida y un mensaje de las 9am se procesa a las
-    11:30, el row queda en `sent_late` con `delta_minutes` populado
-    para que el dashboard lo muestre en naranja (decisión del user:
-    mejor llegar tarde que no llegar).
-
-    Idempotente vía la propia tabla — cada row tiene un `status` que
-    avanza monotónicamente. El bridge caído NO marca `sent`: deja
-    `pending` con `attempt_count++` y reintenta en el próximo ciclo.
-    Tras 5 fallos consecutivos pasa a `failed` (configurable via
-    --max-retries) y se muestra en el dashboard para reenvío manual.
-
-    Silent-fail completo: el comando wrappea todo en try/except y
-    siempre exit 0 — no romper launchd ni dejar el plist en backoff.
-    """
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-wa-scheduled-send</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>wa-scheduled-send</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-  </dict>
-  <key>StartInterval</key><integer>300</integer>
-  <key>RunAtLoad</key><false/>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/wa-scheduled-send.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/wa-scheduled-send.error.log</string>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/wa-fast.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/wa-fast.error.log</string>
 </dict>
 </plist>
 """
@@ -50988,22 +50984,13 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
          _archive_plist(rag_bin)),
         ("com.fer.obsidian-rag-wa-tasks", "com.fer.obsidian-rag-wa-tasks.plist",
          _wa_tasks_plist(rag_bin)),
-        # Reminder push — Apple Reminders due en una ventana corta se
-        # notifican al JID ambient via WhatsApp bridge. Cron a 5min
-        # porque la feature es time-sensitive (un reminder en 10min
-        # tiene que llegar antes de los 10min, no a los 25min como con
-        # el cron de wa-tasks).
-        ("com.fer.obsidian-rag-reminder-wa-push",
-         "com.fer.obsidian-rag-reminder-wa-push.plist",
-         _reminder_wa_push_plist(rag_bin)),
-        # Scheduled WhatsApp messages — el user programa un mensaje
-        # ("mandale a Grecia mañana 9hs ...") y este worker pickea el
-        # row cuando vence y lo dispara al bridge. Misma cadencia que
-        # reminder-wa-push (5min) por la misma razón: precisión sin
-        # ráfagas de CPU. Idempotente vía status enum en la tabla.
-        ("com.fer.obsidian-rag-wa-scheduled-send",
-         "com.fer.obsidian-rag-wa-scheduled-send.plist",
-         _wa_scheduled_send_plist(rag_bin)),
+        # WA workers time-sensitive (5 min) — worker unificado que corre
+        # `remind-wa` + `wa-scheduled-send` en serie. Consolidación
+        # 2026-05-04: antes eran 2 plists separados (mismo cron, mismo
+        # budget), ahora 1. Ver `_wa_fast_plist` docstring para rationale.
+        ("com.fer.obsidian-rag-wa-fast",
+         "com.fer.obsidian-rag-wa-fast.plist",
+         _wa_fast_plist(rag_bin)),
         ("com.fer.obsidian-rag-auto-harvest", "com.fer.obsidian-rag-auto-harvest.plist",
          _auto_harvest_plist(rag_bin)),
         # Active-learning nudge (C.6, 2026-04-29) — Lunes 10am: cuenta
@@ -51153,6 +51140,24 @@ def _calendar_creds_exist() -> bool:
 def _mood_daemon_opted_in() -> bool:
     """True si el user hizo `rag mood enable` (crea el state file)."""
     return (Path.home() / ".local/share/obsidian-rag/mood_enabled").is_file()
+
+
+# ── Labels deprecated ──────────────────────────────────────────────────────
+#
+# Plists que EXISTIERON en `_services_spec` y fueron consolidados/removidos.
+# `rag setup` los bootouts + borra de disco para cerrar el gap de migración
+# (sino el plist viejo sigue cargado y corriendo en paralelo con su reemplazo,
+# doble notificación / doble envío / race conditions).
+#
+# Una vez que todos los usuarios hayan corrido `rag setup` al menos una vez
+# post-consolidación, el entry correspondiente se puede remover de acá —
+# pero mantenerlo no cuesta nada (es un set chico) y protege contra rollback
+# parcial (user revertió a versión vieja y después volvió a la nueva).
+_DEPRECATED_LABELS: frozenset[str] = frozenset({
+    # Consolidados en `wa-fast` el 2026-05-04:
+    "com.fer.obsidian-rag-reminder-wa-push",
+    "com.fer.obsidian-rag-wa-scheduled-send",
+})
 
 
 _INSTALL_GATES: dict[str, tuple] = {
@@ -52002,6 +52007,23 @@ def setup(remove: bool):
         return
     _LAUNCH_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
     _RAG_LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    # ── Cleanup de labels deprecated ─────────────────────────────────────
+    # Bootout + unlink plists que fueron consolidados / removidos de
+    # `_services_spec`. Sin este pass, el plist viejo sigue cargado en
+    # paralelo con su reemplazo → doble envío / race conditions.
+    for deprecated in _DEPRECATED_LABELS:
+        dep_plist = _LAUNCH_AGENTS_DIR / f"{deprecated}.plist"
+        if dep_plist.exists():
+            subprocess.run(
+                ["launchctl", "unload", str(dep_plist)],
+                check=False, capture_output=True,
+            )
+            dep_plist.unlink()
+            console.print(
+                f"[dim]·[/dim] deprecated: {deprecated} "
+                f"[dim](bootouted + removido del disco)[/dim]"
+            )
 
     for label, fname, content in _services_spec(rag_bin):
         plist_path = _LAUNCH_AGENTS_DIR / fname

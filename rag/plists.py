@@ -21,6 +21,7 @@ __all__ = [
     "_rag_binary", "_watch_plist", "_serve_plist", "_web_plist",
     "_digest_plist", "_morning_plist", "_today_plist", "_wa_fast_plist",
     "_emergent_plist", "_patterns_plist", "_archive_plist",
+    "_distill_plist",
     "_consolidate_plist", "_vault_cleanup_plist", "_anticipate_plist",
     "_maintenance_plist", "_calibration_plist", "_auto_harvest_plist",
     "_active_learning_nudge_plist", "_online_tune_plist",
@@ -564,6 +565,50 @@ def _archive_plist(rag_bin: str) -> str:
   </dict>
   <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/archive.log</string>
   <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/archive.error.log</string>
+</dict>
+</plist>
+"""
+
+
+def _distill_plist(rag_bin: str) -> str:
+    """Weekly conversation distiller — domingos 22:30. Rescata bot answers
+    de conversations cuyas sources se evaporaron, escribiéndolos como
+    runbook indexable bajo ``03-Resources/runbooks/from-conversations/``.
+
+    Idempotente vía stamp ``distilled_to:`` en el frontmatter del original;
+    re-corridas saltean lo ya destilado. Slot domingo 22:30 elegido para:
+    correr DESPUÉS del ``digest`` semanal (Dom 22:00) y ANTES del primer
+    ``archive`` mensual del lunes 1, así si una conversation cita una
+    nota que está por archivarse, el runbook destilado queda indexado
+    antes de que el original desaparezca (defense-in-depth con la regla
+    promote-on-cite del archive).
+    """
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-distill</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{rag_bin}</string>
+    <string>distill-conversations</string>
+    <string>--apply</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key><integer>0</integer>
+    <key>Hour</key><integer>22</integer>
+    <key>Minute</key><integer>30</integer>
+  </dict>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/distill.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/distill.error.log</string>
 </dict>
 </plist>
 """
@@ -1954,6 +1999,12 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
          _patterns_plist(rag_bin)),
         ("com.fer.obsidian-rag-archive", "com.fer.obsidian-rag-archive.plist",
          _archive_plist(rag_bin)),
+        # Weekly conversation distiller — rescata bot answers de
+        # conversations con sources missing antes de que el conocimiento
+        # quede sólo en logs no-indexados. Defense-in-depth con
+        # promote-on-cite del archive (commit `e89c42f`, 2026-05-04).
+        ("com.fer.obsidian-rag-distill", "com.fer.obsidian-rag-distill.plist",
+         _distill_plist(rag_bin)),
         ("com.fer.obsidian-rag-wa-tasks", "com.fer.obsidian-rag-wa-tasks.plist",
          _wa_tasks_plist(rag_bin)),
         # WA workers time-sensitive (5 min) — worker unificado que corre

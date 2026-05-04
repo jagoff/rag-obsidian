@@ -52509,14 +52509,18 @@ def stop(
     4. Opcional: ollama / qdrant si `--with-ollama` / `--with-qdrant`
        (default OFF — son compartidos con mem-vault).
 
-    Para volver a levantar todo: `rag setup` re-bootstrappea los managed.
-    Los plists quedan en disco — bootout solo unloadea de launchd. Los
-    deps externos (whatsapp-listener / ollama / qdrant) los volvés a
-    arrancar con su propio `launchctl bootstrap` o desde su repo origen.
+    Para volver a levantar todo: `rag start` (regenera plists desde
+    código + bootstrap + catch-up index). Los deps externos compartidos
+    (ollama / qdrant) los volvés a arrancar con su propio `launchctl
+    bootstrap` o desde su repo origen — NO se archivan aunque estén en
+    los targets (categoría `ollama`/`qdrant`) porque son compartidos
+    con mem-vault y otros agentes locales.
 
-    NOTA: macOS auto-loadea los `~/Library/LaunchAgents/*.plist` al
-    próximo login del usuario. Para parada permanente, usar `rag setup
-    --remove` (borra los plists del disco).
+    Archivado de plists: después del bootout, los `.plist` de
+    `obsidian-rag-*` y `rag-net` se mueven a
+    `~/Library/LaunchAgents/.archive-rag-stop-<timestamp>/` para que
+    macOS NO los auto-loadee al próximo login. Así "rag off" = "nada
+    rag corre, ni ahora ni al rebootear". `rag start` los recrea.
     """
     if stop_all:
         with_ollama = True
@@ -52637,9 +52641,42 @@ def stop(
             f"[yellow]parados {ok_count}, ya estaban {already_count}, "
             f"[red]{fail_count} fallidos[/red][/yellow]"
         )
+    # ── Archivar plists bootouted ────────────────────────────────────────
+    # Por qué: macOS auto-loadea `~/Library/LaunchAgents/*.plist` al
+    # próximo login. Sin este paso, `rag stop` vale solo hasta el próximo
+    # reboot/login — ahí los plists vuelven a arrancar aunque el user no
+    # haya corrido `rag start`. Moviendolos a `.archive-rag-stop-<ts>/`
+    # garantiza "si rag está off, al login nada arranca". `rag start` los
+    # regenera desde código via `setup()` — son artefactos, no hay
+    # pérdida de estado.
+    import datetime as _dt
+    import shutil as _shutil
+    archive_root = _LAUNCH_AGENTS_DIR / f".archive-rag-stop-{_dt.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    archived = 0
+    archive_skip_categories = {"ollama", "qdrant"}  # compartidos con mem-vault
+    for label, category in targets:
+        if category in archive_skip_categories:
+            continue
+        plist_path = _LAUNCH_AGENTS_DIR / f"{label}.plist"
+        if not plist_path.is_file():
+            continue
+        archive_root.mkdir(parents=True, exist_ok=True)
+        try:
+            _shutil.move(str(plist_path), str(archive_root / f"{label}.plist"))
+            archived += 1
+        except OSError as exc:
+            console.print(f"[yellow]·[/yellow] no pude archivar {label}: {exc}")
+    if archived:
+        console.print()
+        console.print(
+            f"[dim]·[/dim] [cyan]{archived}[/cyan] plists movidos a "
+            f"[dim]{archive_root}[/dim] "
+            "[dim](no van a auto-loadearse al próximo login)[/dim]"
+        )
+
     console.print()
     console.print("[dim]Para volver a arrancar:[/dim]")
-    console.print("  [dim]·[/dim] obsidian-rag : [cyan]rag setup[/cyan]")
+    console.print("  [dim]·[/dim] obsidian-rag : [cyan]rag start[/cyan] [dim](o `rag setup` para solo regenerar plists)[/dim]")
     if with_rag_net:
         console.print(
             "  [dim]·[/dim] RagNet       : "

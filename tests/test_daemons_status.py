@@ -39,8 +39,9 @@ def _isolate_db_path(tmp_path):
 # ── 1. _services_spec_manual() shape y count ──────────────────────────────────
 
 def test_services_spec_manual_returns_7_entries():
+    # 2026-05-04 consolidation: 7 → 3 manual entries.
     specs = rag._services_spec_manual()
-    assert len(specs) == 7
+    assert len(specs) == 3
 
 
 def test_services_spec_manual_shape():
@@ -53,13 +54,11 @@ def test_services_spec_manual_shape():
 
 
 def test_services_spec_manual_known_labels():
+    # 2026-05-04 consolidation: cloudflare-tunnel*, lgbm-train, paraphrases-train
+    # removidos del manual spec. Quedan 3.
     specs = rag._services_spec_manual()
     labels = {s["label"] for s in specs}
     expected = {
-        "com.fer.obsidian-rag-cloudflare-tunnel",
-        "com.fer.obsidian-rag-cloudflare-tunnel-watcher",
-        "com.fer.obsidian-rag-lgbm-train",
-        "com.fer.obsidian-rag-paraphrases-train",
         "com.fer.obsidian-rag-synth-refresh",
         "com.fer.obsidian-rag-spotify-poll",
         "com.fer.obsidian-rag-log-rotate",

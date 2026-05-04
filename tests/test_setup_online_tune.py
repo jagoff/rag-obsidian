@@ -290,8 +290,10 @@ def test_services_spec_total_count():
     #   vocab nightly 03:15 con cmd `whisper vocab refresh` post
     #   2026-05-01).
     #
-    # Total: 23 base + 7 ingesters + 4 helpers + 1 wake-hook = 35.
-    assert len(specs) == 35
+    # 2026-05-04 consolidation: 8 cross-source ingesters → 1 ingest-cross-source
+    # + 2 WA workers (wa-scheduled-send, reminder-wa-push) → wa-fast.
+    # Net: 35 → 28 services.
+    assert len(specs) == 28
 
 
 def test_services_spec_includes_maintenance():
@@ -363,12 +365,15 @@ def test_vault_cleanup_plist_valid_xml():
 # ── Cross-source ingesters (2026-04-21) ────────────────────────────────────
 
 def test_services_spec_includes_ingesters():
+    # 2026-05-04 consolidation: gmail/reminders/calendar merged into
+    # ingest-cross-source; whatsapp keeps its own plist.
     specs = rag_module._services_spec(RAG_BIN)
     labels = {s[0] for s in specs}
     assert "com.fer.obsidian-rag-ingest-whatsapp" in labels
-    assert "com.fer.obsidian-rag-ingest-gmail" in labels
-    assert "com.fer.obsidian-rag-ingest-reminders" in labels
-    assert "com.fer.obsidian-rag-ingest-calendar" in labels
+    assert "com.fer.obsidian-rag-ingest-cross-source" in labels
+    assert "com.fer.obsidian-rag-ingest-gmail" not in labels
+    assert "com.fer.obsidian-rag-ingest-reminders" not in labels
+    assert "com.fer.obsidian-rag-ingest-calendar" not in labels
 
 
 @pytest.mark.parametrize("fn_name,expected_source,expected_interval", [

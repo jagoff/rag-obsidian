@@ -612,34 +612,34 @@ def test_stream_does_not_emit_degraded_when_fast(stub_fetchers):
 
 
 def test_reminder_wa_push_plist_shape():
-    """El plist debe llevar el binario, el comando `remind-wa`, un
-    StartInterval razonable, y los logs apuntando al directorio
-    estándar de obsidian-rag."""
+    """2026-05-04 consolidation: remind-wa + wa-scheduled-send merged into
+    wa-fast. Test redirected to _wa_fast_plist."""
     import rag
 
-    xml = rag._reminder_wa_push_plist("/usr/local/bin/rag")
-    assert "<key>Label</key><string>com.fer.obsidian-rag-reminder-wa-push</string>" in xml
-    assert "<string>remind-wa</string>" in xml
+    xml = rag._wa_fast_plist("/usr/local/bin/rag")
+    assert "<key>Label</key><string>com.fer.obsidian-rag-wa-fast</string>" in xml
+    assert "<string>wa-fast</string>" in xml
     assert "<string>/usr/local/bin/rag</string>" in xml
-    # 5min cadence — tighter than the 30min wa-tasks cron.
+    # 5min cadence preserved.
     assert "<key>StartInterval</key><integer>300</integer>" in xml
-    assert "reminder-wa-push.log" in xml
-    assert "reminder-wa-push.error.log" in xml
+    assert "wa-fast.log" in xml
+    assert "wa-fast.error.log" in xml
 
 
 def test_reminder_wa_push_plist_in_services_spec():
-    """`_services_spec` debe listarlo así `rag setup` lo instala."""
+    """`_services_spec` debe listar wa-fast así `rag setup` lo instala."""
     import rag
 
     spec = rag._services_spec("/usr/local/bin/rag")
     labels = [s[0] for s in spec]
-    assert "com.fer.obsidian-rag-reminder-wa-push" in labels
+    assert "com.fer.obsidian-rag-wa-fast" in labels
+    assert "com.fer.obsidian-rag-reminder-wa-push" not in labels
     # Asociado al filename canónico — `rag setup` usa este path para
     # escribir en ~/Library/LaunchAgents/.
-    entry = next(s for s in spec if s[0] == "com.fer.obsidian-rag-reminder-wa-push")
-    assert entry[1] == "com.fer.obsidian-rag-reminder-wa-push.plist"
+    entry = next(s for s in spec if s[0] == "com.fer.obsidian-rag-wa-fast")
+    assert entry[1] == "com.fer.obsidian-rag-wa-fast.plist"
     # XML consistent con el generator.
-    assert "remind-wa" in entry[2]
+    assert "wa-fast" in entry[2]
 
 
 # ── SQL persistence + /api/status/home ─────────────────────────────────────

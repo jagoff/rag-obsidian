@@ -27,11 +27,9 @@ _HAS_PLUTIL = shutil.which("plutil") is not None
 _RAG_BIN = "/tmp/rag"  # rag_bin arg, no se invoca; sólo se interpola
 
 # Labels conocidos del spec manual (T2)
+# 2026-05-04 consolidation: cloudflare-tunnel, cloudflare-tunnel-watcher,
+# lgbm-train y paraphrases-train se removieron del manual spec; quedan 3.
 _EXPECTED_MANUAL_LABELS = frozenset({
-    "com.fer.obsidian-rag-cloudflare-tunnel",
-    "com.fer.obsidian-rag-cloudflare-tunnel-watcher",
-    "com.fer.obsidian-rag-lgbm-train",
-    "com.fer.obsidian-rag-paraphrases-train",
     "com.fer.obsidian-rag-synth-refresh",
     "com.fer.obsidian-rag-spotify-poll",
     "com.fer.obsidian-rag-log-rotate",
@@ -115,10 +113,10 @@ def test_calibration_plist_no_shell_comment_plutil(tmp_path: Path):
 
 
 def test_services_spec_manual_shape():
-    """`_services_spec_manual()` retorna 7 dicts con shape correcta."""
+    """`_services_spec_manual()` retorna 3 dicts con shape correcta."""
     spec = rag._services_spec_manual()
     assert isinstance(spec, list), "Debe retornar list"
-    assert len(spec) == 7, f"Esperado 7 manuales, got {len(spec)}"
+    assert len(spec) == 3, f"Esperado 3 manuales, got {len(spec)}"
     labels = set()
     for item in spec:
         assert isinstance(item, dict), f"Cada item debe ser dict, got {type(item)}"

@@ -740,79 +740,156 @@ def cmd_default(name: str | None, clear: bool, do_apply: bool):
         click.echo("no hay default seteado")
 
 
-def _suggest_profile() -> tuple[str, list[str]]:
-    """Recomienda un profile basado en cwd + recent shell history.
+def _gather_signals() -> dict:
+    """Recolecta señales del entorno: cwd, history, git repo.
 
-    Devuelve (profile_name, [razones]). La heurística es deliberadamente
-    simple — la idea es que el usuario vea por qué se sugiere algo y pueda
-    agregar reglas según su workflow.
+    Devuelve dict con campos primitivos para que las reglas de scoring
+    sean fáciles de testear y extender.
     """
     import subprocess
     cwd = str(Path.cwd())
-    reasons: list[str] = []
 
-    # Señal 1: cwd
-    if "obsidian-rag" in cwd:
-        reasons.append(f"cwd contiene 'obsidian-rag' → priorizar perfiles RAG")
-        rag_match = True
-    else:
-        rag_match = False
-
-    # Señal 2: shell history (zsh primero, bash después)
+    # Shell history
     history_text = ""
     for h in (Path.home() / ".zsh_history", Path.home() / ".bash_history"):
         if h.exists():
             try:
-                history_text = h.read_text(errors="ignore")[-50000:]  # últimos 50k chars
+                history_text = h.read_text(errors="ignore")[-50000:]
                 break
             except OSError:
                 continue
 
-    # Señal 3: git branch / repo
-    git_status = ""
+    # Git repo
+    git_root = ""
     try:
-        r = subprocess.run(["git", "rev-parse", "--show-toplevel"],
-                           capture_output=True, text=True, cwd=cwd)
+        r = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, cwd=cwd,
+        )
         if r.returncode == 0:
-            git_status = r.stdout.strip()
+            git_root = r.stdout.strip()
     except FileNotFoundError:
         pass
 
-    # Reglas (orden = prioridad)
-    h = history_text.lower()
-    if "playwright" in h or "/web/" in cwd or cwd.endswith("/web"):
-        reasons.append("señal de frontend/playwright → debug-web")
-        return ("debug-web", reasons)
+    return {
+        "cwd": cwd,
+        "history_lower": history_text.lower(),
+        "git_root": git_root,
+        "in_obsidian_rag": "obsidian-rag" in cwd,
+        "git_repo_name": Path(git_root).name if git_root else "",
+    }
 
-    if any(t in h for t in ["wa-tasks", "whatsapp", "gmail-send", "rag morning", "rag today"]):
-        reasons.append("señal de comms/briefs en history → comms")
-        return ("comms", reasons)
 
-    if any(t in h for t in ["rag capture", "rag save", "rag inbox", "rag file"]):
-        reasons.append("señal de captura/escritura al vault → writing")
-        return ("writing", reasons)
+# Reglas de scoring: cada regla devuelve (puntos, razón) si aplica, None si no.
+# Los puntos se acumulan sobre el profile target. El profile con más puntos
+# gana. Si empate, tie-breaker = orden alfabético del profile (estable).
+def _scoring_rules() -> list[tuple[str, callable]]:
+    """Lista de (profile_target, predicate_fn). predicate_fn devuelve
+    `(puntos, razón)` o `None`. La idea es que sea trivial agregar reglas
+    nuevas — cada una es independiente.
+    """
+    def _r_playwright(s):
+        h, c = s["history_lower"], s["cwd"]
+        if "playwright" in h:
+            return (4, "history reciente con playwright")
+        if "/web/" in c or c.endswith("/web"):
+            return (3, "cwd dentro de /web/")
+        return None
 
-    if rag_match and any(t in h for t in ["rag query", "rag chat", "rag stats"]):
-        reasons.append("uso reciente de rag query/chat → rag-only")
-        return ("rag-only", reasons)
+    def _r_comms(s):
+        h = s["history_lower"]
+        hits = [t for t in ("wa-tasks", "whatsapp", "gmail-send", "rag morning", "rag today")
+                if t in h]
+        if hits:
+            return (len(hits) * 2, f"history con {hits}")
+        return None
 
-    if git_status and "obsidian-rag" not in git_status:
-        reasons.append(f"estás en otro repo ({Path(git_status).name}) → dev")
-        return ("dev", reasons)
+    def _r_writing(s):
+        h = s["history_lower"]
+        hits = [t for t in ("rag capture", "rag save", "rag inbox", "rag file")
+                if t in h]
+        if hits:
+            return (len(hits) * 2, f"history con {hits}")
+        return None
 
-    reasons.append("fallback (no hay señales claras)")
-    return ("rag-only", reasons)
+    def _r_rag_only_history(s):
+        h = s["history_lower"]
+        hits = [t for t in ("rag query", "rag chat", "rag stats", "rag links")
+                if t in h]
+        if not hits:
+            return None
+        # Bonus si además estás en obsidian-rag
+        pts = len(hits) * 2 + (3 if s["in_obsidian_rag"] else 0)
+        return (pts, f"history con {hits}" + (" + cwd obsidian-rag" if s["in_obsidian_rag"] else ""))
+
+    def _r_dev_other_repo(s):
+        if s["git_root"] and "obsidian-rag" not in s["git_root"]:
+            return (3, f"git repo = {s['git_repo_name']} (no obsidian-rag)")
+        return None
+
+    def _r_rag_only_cwd(s):
+        # Señal de fallback: estar en obsidian-rag sin nada más
+        if s["in_obsidian_rag"]:
+            return (1, "cwd contiene obsidian-rag (señal débil)")
+        return None
+
+    return [
+        ("debug-web", _r_playwright),
+        ("comms",     _r_comms),
+        ("writing",   _r_writing),
+        ("rag-only",  _r_rag_only_history),
+        ("dev",       _r_dev_other_repo),
+        ("rag-only",  _r_rag_only_cwd),
+    ]
+
+
+def _suggest_profile() -> tuple[str, dict[str, int], dict[str, list[str]]]:
+    """Devuelve (profile_top, scores_por_profile, razones_por_profile).
+
+    Si todos los scores son 0, fallback a `rag-only`.
+    """
+    signals = _gather_signals()
+    scores: dict[str, int] = {}
+    reasons: dict[str, list[str]] = {}
+    for target, rule in _scoring_rules():
+        result = rule(signals)
+        if result is None:
+            continue
+        pts, reason = result
+        scores[target] = scores.get(target, 0) + pts
+        reasons.setdefault(target, []).append(f"+{pts} {reason}")
+
+    if not scores:
+        return ("rag-only", {"rag-only": 0}, {"rag-only": ["fallback (sin señales)"]})
+
+    # Pick top: max score, tie-breaker = nombre alfabético (estable)
+    top = max(scores.items(), key=lambda kv: (kv[1], -ord(kv[0][0])))
+    return (top[0], scores, reasons)
 
 
 @cli.command("suggest")
 @click.option("--apply", "do_apply", is_flag=True, help="Aplicar el profile sugerido.")
-def cmd_suggest(do_apply: bool):
-    """Recomienda un profile basado en cwd + shell history."""
-    name, reasons = _suggest_profile()
-    click.echo(f"sugerencia: {name}")
+@click.option("--all", "show_all", is_flag=True, help="Mostrar el ranking completo, no solo el top.")
+def cmd_suggest(do_apply: bool, show_all: bool):
+    """Recomienda un profile basado en cwd + shell history + git repo.
+
+    Scoring ponderado: cada señal aporta puntos al profile correspondiente.
+    El profile con más puntos gana. Útil para ver POR QUÉ se sugiere algo
+    y agregar reglas nuevas según tu workflow.
+    """
+    name, scores, reasons = _suggest_profile()
+    click.echo(f"sugerencia: {name} (score: {scores.get(name, 0)})")
     click.echo("razones:")
-    for r in reasons:
-        click.echo(f"  - {r}")
+    for r in reasons.get(name, []):
+        click.echo(f"  {r}")
+
+    if show_all and len(scores) > 1:
+        click.echo("\nranking completo:")
+        for p, sc in sorted(scores.items(), key=lambda kv: kv[1], reverse=True):
+            click.echo(f"  {p:<12} score={sc}")
+            for r in reasons.get(p, []):
+                click.echo(f"    {r}")
+
     if do_apply:
         click.echo()
         cmd_use.callback(name, False)  # type: ignore[attr-defined]

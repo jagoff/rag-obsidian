@@ -41,10 +41,16 @@ def test_warmup_has_parallel_target_helpers():
 
 def test_warmup_run_spawns_threads_not_serial_calls():
     """`_run()` inside `warmup_async` must spawn a list of Threads, not
-    call the helpers directly (which would serialize them)."""
+    call the helpers directly (which would serialize them).
+
+    Slice de 12k chars (no 6k): la docstring + los 5 helpers `_wu_*`
+    ocupan >6k antes de llegar al `_run()` que arranca los threads.
+    Bumped 2026-05-04 cuando los chat-model warmup gained un doc-block
+    extenso sobre num_ctx alignment.
+    """
     idx = RAG_PY.find("def warmup_async() -> None")
     assert idx >= 0
-    block = RAG_PY[idx : idx + 6000]
+    block = RAG_PY[idx : idx + 12000]
     # The parallel implementation builds a `threads = [...]` list
     assert "threads = [" in block, (
         "expected `threads = [...]` list-comprehension of warmup targets"
@@ -60,7 +66,7 @@ def test_warmup_run_spawns_threads_not_serial_calls():
 def test_warmup_targets_list_has_all_five():
     """The `targets` list in `_run` should name all 5 warmup targets."""
     idx = RAG_PY.find("def warmup_async() -> None")
-    block = RAG_PY[idx : idx + 6000]
+    block = RAG_PY[idx : idx + 12000]
     targets_idx = block.find("targets = [")
     assert targets_idx >= 0
     targets_block = block[targets_idx : targets_idx + 600]

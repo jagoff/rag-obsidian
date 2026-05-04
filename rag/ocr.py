@@ -765,16 +765,20 @@ _CITA_VALID_KINDS = frozenset({"event", "reminder", "note"})
 # Audit 2026-04-25 R2-OCR #1: timeout explícito del detector LLM (qwen2.5:3b).
 # Sin esto, una llamada colgada bloquea el endpoint /api/chat/upload-image
 # por minutos. El detector va a través de `rag._helper_client()`, que ya
-# fija este mismo valor en `_TimedOllamaProxy(timeout=30.0)` —
+# fija este mismo valor en `_TimedOllamaProxy(timeout=60.0)` —
 # `_DETECTOR_TIMEOUT` documenta el contrato del lado consumidor (ocr.py)
 # y permite testearlo sin importar implementación.
 #
-# 30s cubre cold-load de qwen2.5:3b (~10s en MPS) + inference típica
-# (1-3s) con margen para retry interno del cliente. Si esto cambia,
-# actualizar también `rag.__init__._helper_client()` para mantenerlos
-# en sync (el test `test_detector_client_honors_timeout_contract` lo
-# verifica).
-_DETECTOR_TIMEOUT: float = 30.0
+# 60s cubre cold-load de qwen2.5:3b (~10s en MPS) + inference típica
+# (1-3s) con margen para retry interno del cliente, más holgura para
+# casos de contención del helper semaphore. Si esto cambia, actualizar
+# también `rag.__init__._helper_client()` para mantenerlos en sync (el
+# test `test_detector_client_honors_timeout_contract` lo verifica).
+#
+# 2026-05-04: bumped 30→60 para sincronizar con el valor real del
+# `_helper_client()` post-2026-04-30 (queries OCR en cluster con otros
+# helpers competían por el semaphore y disparaban timeouts a 30s).
+_DETECTOR_TIMEOUT: float = 60.0
 
 
 def _cita_detect_enabled() -> bool:

@@ -53,6 +53,11 @@ import rag
     "web.chat.metachat",
     "serve.chat",     # rag serve HTTP
     "serve.received", # idem
+    "serve.tasks",    # /query short-circuit → tasks/agenda
+    "serve.error",    # /query|/chat raised exception
+    "serve.metachat", # /query short-circuit → metachat (greetings)
+    "serve.weather_fallback",  # weather fallback al RAG path
+    "serve.finance",  # /query short-circuit → finance/cards
     "do",             # rag do <instruccion>
     "links",          # rag links
     "prep",           # rag prep <tema>
@@ -82,8 +87,6 @@ def test_is_user_query_allowlist(cmd):
     "watch",
     "wa-tasks",
     "web.tasks",
-    "serve.tasks",
-    "serve.error",
     "test",
 ])
 def test_is_user_query_denies_jobs(cmd):

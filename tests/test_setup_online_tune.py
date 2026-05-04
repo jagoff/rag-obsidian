@@ -293,7 +293,9 @@ def test_services_spec_total_count():
     # 2026-05-04 consolidation: 8 cross-source ingesters → 1 ingest-cross-source
     # + 2 WA workers (wa-scheduled-send, reminder-wa-push) → wa-fast.
     # Net: 35 → 28 services.
-    assert len(specs) == 28
+    # 2026-05-04 (PM): +1 distill-conversations weekly (semanal Sunday 02:00).
+    # Net: 28 → 29.
+    assert len(specs) == 29
 
 
 def test_services_spec_includes_maintenance():

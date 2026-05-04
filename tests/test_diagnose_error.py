@@ -27,6 +27,21 @@ import web.server as _server
 _client = TestClient(_server.app)
 
 
+@pytest.fixture(autouse=True)
+def _bypass_admin_token():
+    """Bypass `_require_admin_token` para todos los tests del file.
+
+    El commit 88d9a21 (2026-04-30) protegió 8 endpoints con
+    `Depends(_require_admin_token)`. Los tests no setean el header
+    `Authorization: Bearer <token>` — todos rebotaban con 401. Override
+    via `app.dependency_overrides` (idiomático FastAPI), con cleanup
+    en teardown para no contaminar otros suites.
+    """
+    _server.app.dependency_overrides[_server._require_admin_token] = lambda: None
+    yield
+    _server.app.dependency_overrides.pop(_server._require_admin_token, None)
+
+
 # ── Model resolution ─────────────────────────────────────────────────────
 
 

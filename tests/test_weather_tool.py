@@ -3,7 +3,25 @@ import json
 from unittest.mock import patch, MagicMock
 import io
 
+import pytest
+
 import rag
+
+
+@pytest.fixture(autouse=True)
+def _clear_wttr_cache():
+    """Limpia el cache TTL de wttr.in entre tests.
+
+    `rag.integrations.weather._WTTR_CACHE` (introducido cuando el código
+    se movió desde `rag/__init__.py`) memoiza respuestas exitosas. Sin
+    cleanup, un test que mockea respuesta exitosa contamina los siguientes
+    que mockean fallas de red — el cached dict se devuelve y la falla
+    nunca se ejerce.
+    """
+    from rag.integrations import weather as _w
+    _w._WTTR_CACHE.clear()
+    yield
+    _w._WTTR_CACHE.clear()
 
 # ── Sample wttr.in response (minimal) ─────────────────────────────────────
 

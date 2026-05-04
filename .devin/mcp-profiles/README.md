@@ -201,25 +201,39 @@ Anti-loop guard: el watcher hashea el contenido que escribió y si el
 mtime cambia pero el hash matchea, asume que es su propio write y no
 re-actúa.
 
-## `suggest` — recomendar profile basado en contexto
+## `suggest` — recomendar profile (scoring ponderado)
 
-Heurística simple sobre cwd + shell history (zsh / bash) + git repo.
+Cada señal del entorno (cwd, shell history, git repo) aporta puntos a uno
+o más profiles. El profile con mayor score total gana. Útil para entender
+POR QUÉ algo se recomienda y agregar reglas según tu workflow.
 
 ```bash
-$ rag-harness suggest
-sugerencia: dev
+$ rag-harness suggest --all
+sugerencia: rag-only (score: 10)
 razones:
-  - estás en otro repo (whatsapp-listener) → dev
-$ rag-harness suggest --apply         # aplica la sugerencia
+  +9 history con ['rag chat', 'rag stats', 'rag links'] + cwd obsidian-rag
+  +1 cwd contiene obsidian-rag (señal débil)
+
+ranking completo:
+  rag-only     score=10
+  comms        score=6
+  writing      score=2
 ```
 
-Reglas (orden = prioridad):
-1. `playwright` en history o `/web/` en cwd → `debug-web`
-2. `wa-tasks`/`whatsapp`/`gmail-send`/`rag morning`/`rag today` → `comms`
-3. `rag capture`/`rag save`/`rag inbox`/`rag file` → `writing`
-4. cwd contiene `obsidian-rag` + `rag query`/`rag chat` → `rag-only`
-5. otro repo (no obsidian-rag) → `dev`
-6. fallback → `rag-only`
+`--apply` aplica la sugerencia top.
+
+Reglas actuales (cada una suma puntos al target si su predicate matchea):
+- `playwright` en history → `debug-web` (+4); cwd dentro de `/web/` → +3
+- `wa-tasks`/`whatsapp`/`gmail-send`/`rag morning`/`rag today` →
+  `comms` (+2 por hit)
+- `rag capture`/`rag save`/`rag inbox`/`rag file` → `writing` (+2 por hit)
+- `rag query`/`rag chat`/`rag stats`/`rag links` → `rag-only` (+2 por
+  hit, +3 bonus si cwd es obsidian-rag)
+- git repo distinto a obsidian-rag → `dev` (+3)
+- cwd contiene obsidian-rag → `rag-only` (+1, fallback débil)
+
+Para agregar una regla: editá `_scoring_rules()` en
+[`bin/rag-harness`](./bin/rag-harness). Cada regla es independiente.
 
 ## `default` + hook con `rag start`
 
@@ -231,9 +245,17 @@ rag-harness default --clear        # borra
 ```
 
 `rag start` lee el `.active` y `.default` y los muestra en el preview
-como info (no aplica nada automático). Si están desincronizados, marca
-`(≠ default)`. Útil para no perderse el estado del harness al levantar
-el sistema.
+como info. Si están desincronizados, marca `(≠ default)`. Para que
+`rag start` aplique automáticamente el default antes de levantar los
+daemons, pasá `--apply-default`:
+
+```bash
+rag start --apply-default          # aplica default + levanta daemons
+rag start --apply-default --yes    # sin confirmación
+```
+
+Sin la flag, `rag start` se queda solo con el preview informativo (no
+toca configs).
 
 ## Backups
 

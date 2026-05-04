@@ -66,7 +66,7 @@ def test_wake_up_dry_run_skips_everything():
 
     with patch.object(rag_module, "index", side_effect=lambda *a, **kw: called.append("index")), \
          patch.object(rag_module, "maintenance", side_effect=lambda *a, **kw: called.append("maintenance")), \
-         patch.object(rag_module, "patterns", side_effect=lambda *a, **kw: called.append("patterns")), \
+         patch.object(rag_module, "feedback_patterns", side_effect=lambda *a, **kw: called.append("patterns")), \
          patch.object(rag_module, "emergent", side_effect=lambda *a, **kw: called.append("emergent")), \
          patch.object(rag_module, "morning", side_effect=lambda *a, **kw: called.append("morning")), \
          patch.object(rag_module.ollama, "chat", side_effect=lambda *a, **kw: called.append("ollama")):
@@ -186,7 +186,7 @@ def test_wake_up_runs_steps_in_declared_order():
          patch.object(rag_module, "bookmarks_sync", new=_stub("bookmarks")), \
          patch.object(rag_wa_tasks_mod, "wa_tasks", new=_stub("wa_tasks")), \
          patch.object(rag_module, "maintenance", new=_stub("maintenance")), \
-         patch.object(rag_module, "patterns", new=_stub("patterns")), \
+         patch.object(rag_module, "feedback_patterns", new=_stub("patterns")), \
          patch.object(rag_module, "emergent", new=_stub("emergent")), \
          patch.object(rag_module, "morning", new=_stub("morning")), \
          patch.object(rag_module.ollama, "chat",
@@ -220,7 +220,7 @@ def test_wake_up_continues_after_step_failure():
          patch.object(rag_module, "bookmarks_sync", new=_stub("bookmarks")), \
          patch.object(rag_wa_tasks_mod, "wa_tasks", new=_stub("wa_tasks")), \
          patch.object(rag_module, "maintenance", new=_explode), \
-         patch.object(rag_module, "patterns", new=_stub("patterns")), \
+         patch.object(rag_module, "feedback_patterns", new=_stub("patterns")), \
          patch.object(rag_module, "emergent", new=_stub("emergent")), \
          patch.object(rag_module, "morning", new=_stub("morning")), \
          patch.object(rag_module.ollama, "chat",
@@ -252,7 +252,7 @@ def test_wake_up_ollama_warmup_uses_keep_alive_minus_one():
          patch.object(rag_module, "bookmarks_sync", new=lambda *a, **kw: None), \
          patch.object(rag_wa_tasks_mod, "wa_tasks", new=lambda *a, **kw: None), \
          patch.object(rag_module, "maintenance", new=lambda *a, **kw: None), \
-         patch.object(rag_module, "patterns", new=lambda *a, **kw: None), \
+         patch.object(rag_module, "feedback_patterns", new=lambda *a, **kw: None), \
          patch.object(rag_module, "emergent", new=lambda *a, **kw: None), \
          patch.object(rag_module, "morning", new=lambda *a, **kw: None), \
          patch.object(rag_module.ollama, "chat", side_effect=_capture), \

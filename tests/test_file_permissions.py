@@ -108,7 +108,14 @@ def test_harden_oauth_cache_perms_is_idempotent(tmp_path, monkeypatch):
     os.chmod(goog, 0o644)
     os.chmod(spot, 0o644)
 
-    # We have to re-point the module globals at the fake paths for this run.
+    # Re-point al sub-módulo donde realmente vive (post-split 2026-05-04).
+    # `_harden_oauth_cache_perms` resuelve `_GOOGLE_TOKEN_PATH` y
+    # `_SPOTIFY_TOKEN_PATH` en `rag.cross_source_etls`, no via `rag.*`
+    # (re-export). Patchear sólo `rag.X` no afecta el lookup real —
+    # mismo patrón que `test_credit_cards_sync` (commit d19736d).
+    import rag.cross_source_etls as _cse
+    monkeypatch.setattr(_cse, "_GOOGLE_TOKEN_PATH", goog)
+    monkeypatch.setattr(_cse, "_SPOTIFY_TOKEN_PATH", spot)
     monkeypatch.setattr(rag, "_GOOGLE_TOKEN_PATH", goog)
     monkeypatch.setattr(rag, "_SPOTIFY_TOKEN_PATH", spot)
 

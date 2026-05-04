@@ -48204,6 +48204,13 @@ def stop(
 @click.option(
     "--dry-run", is_flag=True, help="Mostrar qué levantaría pero no ejecutar.",
 )
+@click.option(
+    "--apply-default", is_flag=True, default=False,
+    help="Antes de levantar daemons, aplicar el profile default de "
+         "rag-harness (.devin/mcp-profiles/.default). Si no hay default "
+         "seteado, no hace nada. Útil para garantizar un harness consistente "
+         "después de un reboot o un wrap mal cerrado.",
+)
 @click.pass_context
 def start(
     ctx: click.Context,
@@ -48214,6 +48221,7 @@ def start(
     no_index: bool,
     yes: bool,
     dry_run: bool,
+    apply_default: bool,
 ) -> None:
     """Levantar TODO el sistema y reindexar al último minuto de uso.
 
@@ -48295,6 +48303,15 @@ def start(
 
     if dry_run:
         console.print("[dim]Dry-run — no ejecuto nada.[/dim]")
+        if apply_default:
+            try:
+                _hd = Path(__file__).resolve().parent.parent / ".devin" / "mcp-profiles" / ".default"
+                if _hd.exists():
+                    console.print(f"  [dim]would-apply[/dim] [harness] profile default = {_hd.read_text().strip()}")
+                else:
+                    console.print("  [dim]would-skip[/dim] [harness] no hay default seteado")
+            except Exception:
+                pass
         console.print("  [dim]would-call[/dim] [managed] rag setup")
         if with_ollama:
             for lbl in _OLLAMA_LABELS:
@@ -48313,6 +48330,36 @@ def start(
         if not click.confirm("¿Seguir?", default=True):
             console.print("[yellow]Cancelado.[/yellow]")
             return
+
+    # ── Apply rag-harness default (opt-in via --apply-default) ───────────
+    # No-op si no hay default seteado. Falla suave si el harness no está
+    # disponible — no debe bloquear `rag start` por un problema cosmético.
+    if apply_default:
+        try:
+            _harness_default = (
+                Path(__file__).resolve().parent.parent
+                / ".devin" / "mcp-profiles" / ".default"
+            )
+            if _harness_default.exists():
+                _default_name = _harness_default.read_text().strip()
+                console.print()
+                console.print(f"[bold cyan]▸ rag-harness default[/bold cyan] → aplicando '{_default_name}'")
+                _hb = Path.home() / ".local" / "bin" / "rag-harness"
+                if _hb.exists():
+                    import subprocess as _sp
+                    _r = _sp.run([str(_hb), "use", _default_name], capture_output=True, text=True)
+                    if _r.returncode == 0:
+                        console.print(f"  [green]✓[/green] profile '{_default_name}' aplicado")
+                        console.print("  [dim](las sesiones existentes de Claude Code / Devin no ven el cambio hasta reabrir)[/dim]")
+                    else:
+                        console.print(f"  [yellow]![/yellow] rag-harness use falló: {_r.stderr.strip()[:200]}")
+                else:
+                    console.print(f"  [yellow]![/yellow] rag-harness no está en {_hb} — instalá el symlink primero")
+            else:
+                console.print()
+                console.print("[dim]--apply-default pasado pero no hay default seteado — skip[/dim]")
+        except Exception as _exc:
+            console.print(f"[dim]--apply-default falló silenciosamente: {_exc!r}[/dim]")
 
     # ── 1. obsidian-rag-* via setup callback ─────────────────────────────
     # `setup` regenera los plists desde código (captura overrides del

@@ -37,6 +37,17 @@ _STATIC_DIR = Path(_server.STATIC_DIR)
 _client = TestClient(_server.app)
 
 
+@pytest.fixture(autouse=True)
+def _bypass_admin_token():
+    """Bypass `_require_admin_token` (ver test_diagnose_error.py para
+    rationale completo). Necesario para los tests de
+    `/api/diagnose-error/execute` y `/api/auto-fix*`.
+    """
+    _server.app.dependency_overrides[_server._require_admin_token] = lambda: None
+    yield
+    _server.app.dependency_overrides.pop(_server._require_admin_token, None)
+
+
 # ── Classifier ───────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("line, expected", [
@@ -180,16 +191,25 @@ def test_api_logs_index_shape(monkeypatch, tmp_path: Path):
 
     Stub `_LOG_DIRS` para que el test sea determinístico (no depende de
     los logs reales del usuario).
+
+    Las líneas de error necesitan al menos UN timestamp reciente
+    (post audit 2026-04-29: `_has_recent_timestamp` early-out evita
+    daemons stale eternos en rojo). Usamos `datetime.now()` para
+    inyectar ts fresh en el mock.
     """
+    from datetime import datetime
+    _now_iso = datetime.now().isoformat(timespec="seconds")
     fake_dir = tmp_path / "obsidian-rag"
     fake_dir.mkdir()
-    (fake_dir / "watch.log").write_text("[heartbeat] alive=true\n")
+    (fake_dir / "watch.log").write_text(f"{_now_iso} [heartbeat] alive=true\n")
     (fake_dir / "watch.error.log").write_text(
-        "Traceback (most recent call last):\n"
+        f"{_now_iso} Traceback (most recent call last):\n"
         "  File 'foo'\n"
-        "OperationalError: no such column: trace_id\n"
+        f"{_now_iso} OperationalError: no such column: trace_id\n"
     )
-    (fake_dir / "anticipate.log").write_text("Selected: foo\nno pusheado: ok\n")
+    (fake_dir / "anticipate.log").write_text(
+        f"{_now_iso} Selected: foo\n{_now_iso} no pusheado: ok\n"
+    )
     (fake_dir / "anticipate.error.log").write_text("")
 
     monkeypatch.setattr(_server, "_LOG_DIRS", (fake_dir,))
@@ -222,12 +242,16 @@ def test_api_logs_index_shape(monkeypatch, tmp_path: Path):
 
 def test_api_logs_index_orders_errors_first(monkeypatch, tmp_path: Path):
     """Services con error van arriba de los ok."""
+    from datetime import datetime
+    _now_iso = datetime.now().isoformat(timespec="seconds")
     fake_dir = tmp_path / "obsidian-rag"
     fake_dir.mkdir()
-    (fake_dir / "alpha.log").write_text("ok line\n")
-    (fake_dir / "beta.log").write_text("ok line\n")
+    (fake_dir / "alpha.log").write_text(f"{_now_iso} ok line\n")
+    (fake_dir / "beta.log").write_text(f"{_now_iso} ok line\n")
     (fake_dir / "alpha.error.log").write_text("")
-    (fake_dir / "beta.error.log").write_text("Traceback\nValueError: bad\n")
+    (fake_dir / "beta.error.log").write_text(
+        f"{_now_iso} Traceback\n{_now_iso} ValueError: bad\n"
+    )
     # Forzar mtime del beta.log más viejo así no gana por recencia.
     os.utime(fake_dir / "beta.log", (1000, 1000))
 
@@ -416,15 +440,24 @@ def test_logs_page_served():
 # ── Global feed (/api/logs/errors) ────────────────────────────────────
 
 def test_api_logs_errors_aggregates_across_files(monkeypatch, tmp_path: Path):
-    """El feed global mergea líneas de varios archivos ordenadas por ts desc."""
+    """El feed global mergea líneas de varios archivos ordenadas por ts desc.
+
+    Timestamps relativos a `now` para no caer fuera de la ventana de
+    24h del filtro `since_seconds=86400`.
+    """
+    from datetime import datetime, timedelta
+    now = datetime.now()
+    ts_recent = (now - timedelta(minutes=5)).isoformat(timespec="seconds")
+    ts_older = (now - timedelta(minutes=15)).isoformat(timespec="seconds")
+    ts_oldest = (now - timedelta(minutes=30)).isoformat(timespec="seconds")
     fake_dir = tmp_path / "obsidian-rag"
     fake_dir.mkdir()
     (fake_dir / "alpha.log").write_text(
-        "2026-04-26T10:00:00 something fine\n"
-        "2026-04-26T11:00:00 OperationalError: alpha bad\n"
+        f"{ts_oldest} something fine\n"
+        f"{ts_recent} OperationalError: alpha bad\n"
     )
     (fake_dir / "beta.log").write_text(
-        "2026-04-26T10:30:00 RuntimeError: beta bad\n"
+        f"{ts_older} RuntimeError: beta bad\n"
     )
     monkeypatch.setattr(_server, "_LOG_DIRS", (fake_dir,))
     monkeypatch.setattr(_server, "_LOG_GLOBAL_CACHE", {})
@@ -434,9 +467,9 @@ def test_api_logs_errors_aggregates_across_files(monkeypatch, tmp_path: Path):
     d = resp.json()
     assert d["lines_total"] == 2
     # Más reciente primero.
-    assert d["lines"][0]["text"].startswith("2026-04-26T11:00:00 OperationalError")
+    assert d["lines"][0]["text"].startswith(f"{ts_recent} OperationalError")
     assert d["lines"][0]["service"] == "alpha"
-    assert d["lines"][1]["text"].startswith("2026-04-26T10:30:00 RuntimeError")
+    assert d["lines"][1]["text"].startswith(f"{ts_older} RuntimeError")
     assert d["lines"][1]["service"] == "beta"
     # Counts agregados.
     assert d["counts_by_level"]["error"] == 2
@@ -445,27 +478,16 @@ def test_api_logs_errors_aggregates_across_files(monkeypatch, tmp_path: Path):
     assert services == {"alpha": 1, "beta": 1}
 
 
-def test_api_logs_errors_synthetic_ts_for_lines_without_ts(monkeypatch, tmp_path: Path):
-    """Cuando una línea no tiene ts, el feed global usa mtime - offset
-    como timestamp aproximado y la marca con `ts_synthetic=true`."""
-    fake_dir = tmp_path / "obsidian-rag"
-    fake_dir.mkdir()
-    log = fake_dir / "no-ts.log"
-    log.write_text(
-        "OperationalError: bad thing happened\n"
-        "Another error line\n"
-    )
-    monkeypatch.setattr(_server, "_LOG_DIRS", (fake_dir,))
-    monkeypatch.setattr(_server, "_LOG_GLOBAL_CACHE", {})
-
-    resp = _client.get("/api/logs/errors?since_seconds=86400&level=error&nocache=1")
-    assert resp.status_code == 200
-    lines = resp.json()["lines"]
-    assert len(lines) == 2
-    for ln in lines:
-        assert ln["ts_synthetic"] is True
-        assert ln["ts"] is not None
-        assert ln["service"] == "no-ts"
+# test_api_logs_errors_synthetic_ts_for_lines_without_ts borrado 2026-05-04.
+# El feature de synthetic-ts via mtime (líneas sin ts heredaban
+# `mtime - i*1s` como timestamp aproximado) se removió deliberadamente
+# en el audit 2026-04-29 — generaba "errores eternos" donde líneas
+# históricas sin ts heredaban un ts reciente sintético y reaparecían
+# en el feed cada vez que el archivo era refrescado por otra escritura.
+# Ver el comentario extenso en `web/server.py::_build_global_errors_payload`
+# (alrededor de la línea 18244-18259). Líneas sin ts inline Y sin last_ts
+# previo en el archivo ahora se skipean — el test testaba el comportamiento
+# viejo, ya no existe lo que verificaba.
 
 
 def test_api_logs_errors_filters_old_files(monkeypatch, tmp_path: Path):
@@ -492,12 +514,17 @@ def test_api_logs_errors_filters_old_files(monkeypatch, tmp_path: Path):
 
 def test_api_logs_errors_warn_error_level(monkeypatch, tmp_path: Path):
     """level=warn_error incluye warns + errors. level=error sólo errors."""
+    from datetime import datetime, timedelta
+    now = datetime.now()
+    ts1 = (now - timedelta(minutes=20)).isoformat(timespec="seconds")
+    ts2 = (now - timedelta(minutes=10)).isoformat(timespec="seconds")
+    ts3 = (now - timedelta(minutes=5)).isoformat(timespec="seconds")
     fake_dir = tmp_path / "obsidian-rag"
     fake_dir.mkdir()
     (fake_dir / "demo.log").write_text(
-        "2026-04-26T10:00:00 normal info line\n"
-        "2026-04-26T10:01:00 warnings.warn('foo')\n"
-        "2026-04-26T10:02:00 OperationalError: bad\n"
+        f"{ts1} normal info line\n"
+        f"{ts2} warnings.warn('foo')\n"
+        f"{ts3} OperationalError: bad\n"
     )
     monkeypatch.setattr(_server, "_LOG_DIRS", (fake_dir,))
     monkeypatch.setattr(_server, "_LOG_GLOBAL_CACHE", {})

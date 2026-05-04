@@ -302,11 +302,25 @@ def test_cli_file_dry_run_never_moves_files(tmp_vault, monkeypatch):
 
 @pytest.fixture
 def tmp_vault_with_batch(tmp_vault, monkeypatch):
-    """Misma fixture + redirige FILING_BATCHES_DIR al tmp_path."""
+    """Misma fixture + redirige FILING_BATCHES_DIR + VAULT_WRITE_LOCK_PATH al tmp_path.
+
+    El lock global vive en `~/.local/share/obsidian-rag/.write.lock` por
+    default. Sin aislar, los tests de `rag file --apply` toman ese lock
+    real y conflictúan con cualquier mutator del usuario corriendo en
+    paralelo (ej. `rag index --reset` largo) — el test recibe "otro
+    mutator tiene el lock", no aplica nada, y los asserts fallan
+    silenciosamente. El monkeypatch al lock path local elimina la
+    bomba de tiempo. Aprendido al fixearlo el 2026-05-04 cuando había
+    un `rag index` real corriendo en el background.
+    """
     vault, col = tmp_vault
     monkeypatch.setattr(
         rag, "FILING_BATCHES_DIR",
         vault.parent / "filing_batches",
+    )
+    monkeypatch.setattr(
+        rag, "VAULT_WRITE_LOCK_PATH",
+        vault.parent / ".write.lock",
     )
     return vault, col
 

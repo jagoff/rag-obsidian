@@ -29,6 +29,7 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 import web.server as _server
@@ -36,6 +37,16 @@ import web.server as _server
 
 _STATIC_DIR = Path(_server.STATIC_DIR)
 _client = TestClient(_server.app)
+
+
+@pytest.fixture(autouse=True)
+def _bypass_admin_token():
+    """Bypass `_require_admin_token` (ver test_diagnose_error.py para
+    rationale completo). Necesario para los tests de `/api/status/action`.
+    """
+    _server.app.dependency_overrides[_server._require_admin_token] = lambda: None
+    yield
+    _server.app.dependency_overrides.pop(_server._require_admin_token, None)
 
 
 # ── Endpoint shape ───────────────────────────────────────────────────

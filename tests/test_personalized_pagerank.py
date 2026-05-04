@@ -32,23 +32,27 @@ def test_ppr_empty_graph_returns_empty():
     assert rag._personalized_pagerank({}, ["A"]) == {}
 
 
-def test_ppr_empty_seed_falls_back_to_uniform():
-    """No seeds → classical PageRank (uniform teleport)."""
+def test_ppr_empty_seed_returns_empty():
+    """No seeds → empty dict (post 2026-04-26 audit M3).
+
+    Pre-fix devolvía global PageRank, lo que hacía silencioso un bug
+    arriba (caller pasaba seeds vacíos sin querer y recibía algo
+    "razonable" igual). Ahora devolvemos `{}` para que el caller caiga
+    explícitamente al global por su path normal — comentario explícito
+    en `rag/__init__.py:_personalized_pagerank`.
+    """
     adj = _uniform_adj()
-    ppr = rag._personalized_pagerank(adj, [])
-    pr = rag._graph_pagerank(adj, iterations=15)
-    # Should match classical PageRank within numerical noise.
-    for k in adj:
-        assert abs(ppr.get(k, 0.0) - pr.get(k, 0.0)) < 1e-4
+    assert rag._personalized_pagerank(adj, []) == {}
 
 
-def test_ppr_unknown_seeds_fall_back_to_uniform():
-    """Seeds not in adj → fallback to uniform teleport."""
+def test_ppr_unknown_seeds_return_empty():
+    """Seeds not in adj → empty dict (mismo cambio que arriba).
+
+    Si todos los seeds son unknown, el caller debe enterarse y caer al
+    global por su path normal — no recibir un fallback silencioso.
+    """
     adj = _uniform_adj()
-    ppr = rag._personalized_pagerank(adj, ["NOT_IN_GRAPH"])
-    pr = rag._graph_pagerank(adj, iterations=15)
-    for k in adj:
-        assert abs(ppr.get(k, 0.0) - pr.get(k, 0.0)) < 1e-4
+    assert rag._personalized_pagerank(adj, ["NOT_IN_GRAPH"]) == {}
 
 
 def test_ppr_partial_unknown_seeds_filter():

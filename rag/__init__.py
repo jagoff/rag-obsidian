@@ -52376,6 +52376,31 @@ _QDRANT_LABELS: tuple[str, ...] = (
 )
 
 
+def _loaded_launchd_labels(timeout: int = 5) -> set[str]:
+    """Set de labels actualmente cargados en `gui/$UID` via `launchctl list`.
+
+    Una sola llamada para evitar N forks (un `launchctl print` por label es
+    lento). Si falla, devuelve set vacío — el caller debe asumir "no sé" y
+    no usarlo para gating destructivo.
+    """
+    import subprocess
+    try:
+        proc = subprocess.run(
+            ["launchctl", "list"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return set()
+    if proc.returncode != 0:
+        return set()
+    out: set[str] = set()
+    for line in (proc.stdout or "").splitlines()[1:]:  # skip header
+        parts = line.split("\t")
+        if len(parts) >= 3 and parts[2]:
+            out.add(parts[2].strip())
+    return out
+
+
 def _bootout_label(label: str, *, dry_run: bool = False, timeout: int = 15) -> dict:
     """`launchctl bootout gui/$UID/<label>` con timeout + manejo de exit codes.
 
@@ -52557,30 +52582,67 @@ def stop(
         return
 
     # ── Confirmación ─────────────────────────────────────────────────────
-    n_total = len(targets)
-    n_watchdog = sum(1 for _, c in targets if c == "watchdog")
-    n_obsidian = sum(1 for _, c in targets if c == "obsidian-rag")
-    n_ragnet = sum(1 for _, c in targets if c == "rag-net")
-    n_ollama = sum(1 for _, c in targets if c == "ollama")
-    n_qdrant = sum(1 for _, c in targets if c == "qdrant")
+    # Pre-chequear qué labels están realmente cargados para mostrar conteos
+    # honestos ("activos vs ya parados") en vez de mentirle al user con el
+    # total bruto de plists registrados.
+    loaded = _loaded_launchd_labels()
+    loaded_known = bool(loaded)  # False = launchctl list falló, no sé
+
+    def _split(cat: str) -> tuple[int, int]:
+        """(activos, ya_parados) en la categoría según el set 'loaded'."""
+        cat_targets = [lbl for lbl, c in targets if c == cat]
+        if not loaded_known:
+            return len(cat_targets), 0
+        active = sum(1 for lbl in cat_targets if lbl in loaded)
+        return active, len(cat_targets) - active
+
+    a_watch, p_watch = _split("watchdog")
+    a_obs, p_obs = _split("obsidian-rag")
+    a_rn, p_rn = _split("rag-net")
+    a_oll, p_oll = _split("ollama")
+    a_qd, p_qd = _split("qdrant")
+    n_active = a_watch + a_obs + a_rn + a_oll + a_qd
+    n_stopped = p_watch + p_obs + p_rn + p_oll + p_qd
+    n_total = n_active + n_stopped
+
+    def _fmt(active: int, stopped: int) -> str:
+        if not loaded_known:
+            return f"{active + stopped} [dim](status desconocido)[/dim]"
+        if stopped == 0:
+            return f"[cyan]{active}[/cyan] activos"
+        if active == 0:
+            return f"[dim]{stopped} ya parados[/dim]"
+        return f"[cyan]{active}[/cyan] activos, [dim]{stopped} ya parados[/dim]"
 
     console.print()
-    console.print(f"[bold]rag stop[/bold] — voy a parar [cyan]{n_total}[/cyan] daemons:")
-    console.print(f"  [dim]·[/dim] watchdog/wake-hook : {n_watchdog}")
-    console.print(f"  [dim]·[/dim] obsidian-rag-*     : {n_obsidian}")
+    if loaded_known:
+        console.print(
+            f"[bold]rag stop[/bold] — [cyan]{n_active}[/cyan] activos, "
+            f"[dim]{n_stopped} ya parados[/dim] (de {n_total} registrados):"
+        )
+    else:
+        console.print(
+            f"[bold]rag stop[/bold] — voy a parar [cyan]{n_total}[/cyan] daemons "
+            f"[dim](launchctl list falló, no pude verificar status)[/dim]:"
+        )
+    console.print(f"  [dim]·[/dim] watchdog/wake-hook : {_fmt(a_watch, p_watch)}")
+    console.print(f"  [dim]·[/dim] obsidian-rag-*     : {_fmt(a_obs, p_obs)}")
     if with_rag_net:
-        console.print(f"  [dim]·[/dim] RagNet (whatsapp-*): {n_ragnet}")
+        console.print(f"  [dim]·[/dim] RagNet (whatsapp-*): {_fmt(a_rn, p_rn)}")
     else:
         console.print("  [dim]·[/dim] RagNet (whatsapp-*): [yellow]skip[/yellow] (--without-rag-net)")
     if with_qdrant:
-        console.print(f"  [dim]·[/dim] qdrant             : {n_qdrant}")
+        console.print(f"  [dim]·[/dim] qdrant             : {_fmt(a_qd, p_qd)}")
     else:
         console.print("  [dim]·[/dim] qdrant             : [yellow]skip[/yellow] (default — compartido con mem-vault)")
     if with_ollama:
-        console.print(f"  [dim]·[/dim] ollama             : {n_ollama}")
+        console.print(f"  [dim]·[/dim] ollama             : {_fmt(a_oll, p_oll)}")
     else:
         console.print("  [dim]·[/dim] ollama             : [yellow]skip[/yellow] (default — compartido con mem-vault)")
     console.print()
+    if loaded_known and n_active == 0:
+        console.print("[green]✓[/green] [dim]nada activo — no hay nada que parar.[/dim]")
+        # Igual seguimos para archivar plists residuales si --yes/--dry-run.
 
     if dry_run:
         console.print("[dim]Dry-run — no ejecuto nada.[/dim]")

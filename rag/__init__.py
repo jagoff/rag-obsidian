@@ -11909,6 +11909,103 @@ def maybe_normalize_typos(question: str, col) -> str | None:
     return "".join(parts) if changed else None
 
 
+# ── LLM typo correction (Quick Win #4, 2026-05-04) ───────────────────────────
+# Motivation: bge-m3 embeddings are semantically robust to typos, but BM25 in
+# the scoring formula is NOT — a single missspelled token (e.g. "asor", "biba",
+# "psicologa", "hatercito") can drop the relevant doc out of BM25 candidates
+# entirely. Measured hit@5 drop: 2-4pp on typo-heavy queries, especially proper
+# nouns and domain-specific terms.
+#
+# The vocab-bounded corrector (maybe_normalize_typos) already exists for
+# borderline-confidence retrieval, but it only knows corpus BM25 tokens. It
+# cannot correct "asor" → "Astor" unless "Astor" appears in the BM25 index
+# and survives the levenshtein cap. LLM correction is broader — it knows
+# the language + names + common AR-spelling conventions.
+#
+# Gate: RAG_TYPO_CORRECTION env var (default ON). LRU cache 256 entries so
+# the same misspelled query in a session pays the LLM cost only once.
+#
+# Invariants:
+#   - Uses qwen2.5:3b + HELPER_OPTIONS (temperature=0, seed=42) — deterministic.
+#   - Sanity check: if the corrected query is > 1.5× len(original), reject it
+#     (LLM went off-topic / added explanation).
+#   - Silent fail: any exception → return original query unchanged.
+#   - This corrector runs FIRST in expand_queries(), BEFORE anaphora resolver
+#     (Quick Win #1) and BEFORE reformulate_query. Order: typo → anaphora →
+#     reformulate → expand.
+#
+# Coexistence with vocab-bounded corrector:
+#   - This LLM path runs at expand_queries() entry (pre-embed).
+#   - maybe_normalize_typos runs post-retrieve in query() for borderline
+#     confidence results. They target complementary error classes.
+
+_LLM_TYPO_CACHE_MAX = 256
+_llm_typo_cache: OrderedDict[str, str] = OrderedDict()
+_llm_typo_cache_lock = threading.Lock()
+
+_TYPO_CORRECTION_ENABLED = os.environ.get(
+    "RAG_TYPO_CORRECTION", "1"
+).strip().lower() not in ("0", "false", "no")
+
+
+def _correct_typos_llm(query: str) -> str:
+    """Corregí typos de `query` usando qwen2.5:3b (HELPER_OPTIONS, deterministic).
+
+    Devuelve la query corregida, o la original si no hay correcciones
+    necesarias / el LLM se fue de tema / la feature está desactivada.
+
+    Reglas:
+      - Prompt pide SOLO la query corregida sin explicación.
+      - Sanity check: si el resultado tiene > 1.5× len(original) → rechazar.
+      - LRU cache 256 entries (key = query original) → misma query paga el
+        LLM solo una vez por proceso.
+      - Silent fail en cualquier excepción → devuelve original.
+    """
+    if not _TYPO_CORRECTION_ENABLED:
+        return query
+    if not query or not query.strip():
+        return query
+
+    with _llm_typo_cache_lock:
+        hit = _llm_typo_cache.get(query)
+        if hit is not None:
+            _llm_typo_cache.move_to_end(query)
+            return hit
+
+    prompt = (
+        "Corregí los errores de tipeo de la siguiente query SIN cambiar la "
+        "intención ni la longitud semántica. Si la query ya está correcta, "
+        "devolvela tal cual. SOLO devolvé la query corregida, sin explicación.\n\n"
+        f"Query: {query}"
+    )
+    try:
+        resp = _helper_client().chat(
+            model=HELPER_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options={**HELPER_OPTIONS, "num_predict": 80},
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        )
+        corrected = (resp.message.content or "").strip()
+        # Sanity: strip quotes that some models add around the answer
+        if corrected and corrected[0] in ('"', "'") and corrected[-1] in ('"', "'"):
+            corrected = corrected[1:-1].strip()
+        # Sanity check: LLM went off-topic if output is > 1.5× original length
+        if not corrected or len(corrected) > 1.5 * len(query):
+            corrected = query
+    except Exception:
+        corrected = query
+
+    with _llm_typo_cache_lock:
+        _llm_typo_cache[corrected if corrected else query] = corrected
+        # Use the original query as cache key so we can look it up next time
+        _llm_typo_cache[query] = corrected
+        _llm_typo_cache.move_to_end(query)
+        while len(_llm_typo_cache) > _LLM_TYPO_CACHE_MAX:
+            _llm_typo_cache.popitem(last=False)
+
+    return corrected
+
+
 # ── Person-mention enrichment ────────────────────────────────────────────────
 # When a chat query mentions a person/entity by name, inject the matching
 # 99 Mentions @/<name>.md body + Apple Contacts data as a preamble so the LLM
@@ -14544,6 +14641,15 @@ def _record_learned_paraphrase(
         return False
 
 
+# Thread-local state que expand_queries() muta para exponer al caller
+# (query()) el delta de typo correction. Se usa lista de 1 elemento para
+# mutabilidad desde una inner function sin `nonlocal`. El GIL garantiza
+# que expand_queries runs serially dentro de cada retrieve() — no hace
+# falta lock. Reset a [None] en cada llamada a expand_queries().
+_expand_last_llm_typo_original: list[str | None] = [None]
+_expand_last_llm_typo_corrected: list[str | None] = [None]
+
+
 def expand_queries(question: str) -> list[str]:
     """Generate 2 paraphrases for multi-query retrieval. Returns [original, p1, p2].
 
@@ -14564,6 +14670,28 @@ def expand_queries(question: str) -> list[str]:
     RAG_LEARNED_PARAPHRASES (default ON).
     """
     global _expand_cache_dirty
+
+    # ── Quick Win #4: LLM typo correction (2026-05-04) ──────────────────────
+    # Corre PRIMERO, antes del cache y del gate de tokens, para que el resto
+    # del pipeline trabaje sobre la query corregida. El corrector tiene su
+    # propio LRU cache de 256 entries (en _llm_typo_cache) así que queries
+    # repetidas no pagan el costo del LLM. Si la corrección cambia la query,
+    # se expone como `_llm_typo_original` en la variable de módulo para que
+    # query() lo registre en extra_json.
+    # Coexistencia: maybe_normalize_typos sigue corriendo post-retrieve en
+    # query() para borderline-confidence results — ambos caminos son
+    # complementarios.
+    _llm_typo_original_for_log: str | None = None
+    corrected_question = _correct_typos_llm(question)
+    if corrected_question != question:
+        _llm_typo_original_for_log = question
+        question = corrected_question
+    # Exponer el delta al caller (query()) via thread-local para logging.
+    # Usamos una variable de módulo protegida por el GIL — expand_queries
+    # corre single-threaded dentro de cada retrieve() call.
+    _expand_last_llm_typo_original[0] = _llm_typo_original_for_log
+    _expand_last_llm_typo_corrected[0] = corrected_question if _llm_typo_original_for_log else None
+
     tokens = question.strip().split()
     # Audit 2026-04-26 (L1): consultar cache ANTES del gate de tokens.
     # Pre-fix: el gate bailaba antes del cache lookup, queries cortas
@@ -27041,6 +27169,11 @@ def query(
         counter=counter,
     )
 
+    # Resetear el estado de LLM typo correction antes de retrieve() para
+    # que el logging al final refleje ESTA query, no una anterior.
+    _expand_last_llm_typo_original[0] = None
+    _expand_last_llm_typo_corrected[0] = None
+
     def _do_retrieve():
         result = retrieve(**_retrieve_kwargs)
         # Auto-deep: if first-pass confidence is borderline, run iterative
@@ -27525,6 +27658,14 @@ def query(
         # Intent shadow observability (Opción C Fase 0 — 2026-04-23).
         "intent_shadow": _intent_shadow_query,
         "typo_corrected": _typo_corrected,
+        # Quick Win #4 (2026-05-04): LLM-based typo correction delta.
+        # `llm_typo_corrected` es True si expand_queries() corrigió la query
+        # via qwen2.5:3b antes del embed. `llm_typo_original` guarda la query
+        # antes de la corrección para análisis posterior. Ambos son None si
+        # la feature no disparó (query ya correcta o gate OFF).
+        "llm_typo_corrected": _expand_last_llm_typo_original[0] is not None,
+        "llm_typo_original": _expand_last_llm_typo_original[0],
+        "llm_typo_corrected_text": _expand_last_llm_typo_corrected[0],
         # GC#2.A telemetry fix 2026-04-22 — intent lived only in top-level
         # query() state pre-fix; extra_json logging made 97% of rag_queries
         # rows show `intent=NULL`, breaking any analytics on intent share.

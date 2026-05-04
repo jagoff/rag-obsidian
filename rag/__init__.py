@@ -71,7 +71,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     import numpy as np
@@ -19400,6 +19400,21 @@ class RetrieveResult:
     # persista el intent a `rag_queries.extra_json.temporal_intent` y
     # podamos medir distribución + impact en eval / online-tune.
     temporal_intent: str = "neutral"
+    # LLM-as-judge rerank (2026-05-04): condicional, dispara cuando el
+    # cross-encoder no diferencia (top_score < RAG_LLM_JUDGE_THRESHOLD,
+    # default 0.5) Y len(candidates) >= 5 Y RAG_LLM_JUDGE=1. El judge usa
+    # qwen2.5:3b para scorear top-20 candidates 0-10 y blendea con el
+    # cross-encoder via alpha (default 0.5). Apunta a +5-15pp hit@5 en
+    # queries dificiles a costa de +1-2s latencia tail. Default OFF —
+    # overhead 0% cuando flag OFF. Ver `rag/llm_judge.py` para contrato
+    # + criterio cuando NO dispara. Telemetry surfaced en extra_json del
+    # query log para evaluar pre-promocion.
+    llm_judge_fired: bool = False
+    llm_judge_ms: int = 0
+    llm_judge_top_score_before: float = 0.0
+    llm_judge_top_score_after: float = 0.0
+    llm_judge_parse_failed: bool = False
+    llm_judge_n_candidates: int = 0
 
     # ── Retrocompat dict access ─────────────────────────────────────────
 
@@ -19834,7 +19849,6 @@ class ChatTurnResult:
             # (RAG_MMR=0 + RAG_MMR_FOLDER_PENALTY=0) o no-op (ya diverso).
             # >0 = N slots reordenados por MMR post-rerank pre top-k cap.
             "mmr_applied": int(rr.get("mmr_applied", 0) or 0),
-<<<<<<< HEAD
             # Anaphora resolver telemetry (Quick Win #1, 2026-05-04). Los
             # valores vienen de `multi_retrieve` via `rr.extras`. Default
             # silent: bool=False + strings vacíos. Cuando dispara, el
@@ -19869,6 +19883,24 @@ class ChatTurnResult:
             # "neutral" cuando RAG_INTENT_RECENCY=0 o el detector no
             # encontró pistas.
             "temporal_intent": rr.get("temporal_intent", "neutral") or "neutral",
+            # LLM-as-judge rerank (2026-05-04). False/0 cuando RAG_LLM_JUDGE=0
+            # (default) o cuando top_score >= threshold (judge no disparo).
+            # True con ms>0 + before/after cuando el judge corrio. `parse_failed`
+            # surface para detectar regresiones del helper LLM en JSON output.
+            "llm_judge_fired": bool(rr.get("llm_judge_fired", False)),
+            "llm_judge_ms": int(rr.get("llm_judge_ms", 0) or 0),
+            "llm_judge_top_score_before": float(
+                rr.get("llm_judge_top_score_before", 0.0) or 0.0,
+            ),
+            "llm_judge_top_score_after": float(
+                rr.get("llm_judge_top_score_after", 0.0) or 0.0,
+            ),
+            "llm_judge_parse_failed": bool(
+                rr.get("llm_judge_parse_failed", False),
+            ),
+            "llm_judge_n_candidates": int(
+                rr.get("llm_judge_n_candidates", 0) or 0,
+            ),
         }
 
 
@@ -20807,6 +20839,62 @@ def retrieve(
         scores = reranker.predict(pairs, show_progress_bar=False)
         _timing["rerank_ms"] = (time.perf_counter() - _t0) * 1000
 
+    # ── LLM-as-judge condicional (2026-05-04) ─────────────────────────────
+    # Cuando el cross-encoder no logra diferenciar candidatos (top score
+    # bajo), gastamos un round-trip al helper LLM (qwen2.5:3b) para que
+    # evalue semanticamente cual chunk responde realmente. Vale 1-2s de
+    # tail latency a cambio de potencial +5-15pp hit@5 en queries duras.
+    #
+    # Default OFF (gated por `RAG_LLM_JUDGE=1`). Cuando OFF:
+    #   - `should_fire_judge()` short-circuit en el master gate
+    #   - Cero overhead, mismo comportamiento que pre-feature
+    #
+    # Trigger condition (todos deben cumplirse):
+    #   1. RAG_LLM_JUDGE=1 (master gate)
+    #   2. top_score < RAG_LLM_JUDGE_THRESHOLD (default 0.5)
+    #   3. len(candidates) >= RAG_LLM_JUDGE_MIN_CANDIDATES (default 5)
+    #
+    # Skip implicito (no llegamos al gate):
+    #   - fast_path_taken: scores son sinteticos del fast-path, el judge
+    #     no debe dispararse aca (queries faciles donde sem+BM25 coinciden).
+    #   - propose_intent: caller ya filtro antes, no llegamos a retrieve.
+    #   - scope estrecho: respetamos el filter del caller, no agregamos
+    #     ruido con el judge en pools chicas.
+    #
+    # Silent fail: si el LLM call falla o JSON parse falla, devolvemos
+    # los scores del cross-encoder intactos (graceful degrade).
+    _llm_judge_telemetry: dict = {
+        "llm_judge_fired": False,
+        "llm_judge_ms": 0,
+        "llm_judge_top_score_before": 0.0,
+        "llm_judge_top_score_after": 0.0,
+        "llm_judge_parse_failed": False,
+        "llm_judge_n_candidates": 0,
+    }
+    if not fast_path_taken and len(scores) > 0:
+        try:
+            from rag.llm_judge import (
+                judge_and_blend as _llm_judge_and_blend,
+                should_fire_judge as _llm_should_fire_judge,
+            )
+            _ce_top = float(max(scores))
+            if _llm_should_fire_judge(_ce_top, len(scores)):
+                # Armamos pares (doc_text_para_judge, meta) usando el
+                # `expanded` (parent) — mismo input que el reranker vio.
+                _judge_pairs = [
+                    (e, c[1] if isinstance(c[1], dict) else {})
+                    for e, c in zip(expanded, candidates)
+                ]
+                _ce_scores = [float(s) for s in scores]
+                _blended_scores, _llm_judge_telemetry = _llm_judge_and_blend(
+                    question, _judge_pairs, _ce_scores,
+                )
+                # Si el judge corrio OK, reemplazamos scores. Si fallo
+                # (parse_failed=True), _blended_scores == _ce_scores.
+                scores = _blended_scores
+        except Exception as _llm_judge_exc:
+            _silent_log("llm_judge.outer", _llm_judge_exc)
+
     # Capturar el comienzo del score-loop block (scoring + recency + tag +
     # title_match + PPR + behavior priors). Este rango es el gap más
     # grande entre rerank_ms y graph_expand_ms según producción 2026-04-24:
@@ -21594,6 +21682,20 @@ def retrieve(
         contradiction_penalty_applied=int(_contradiction_penalty_count),
         mmr_applied=int(_mmr_applied_count),
         temporal_intent=_temporal_intent,
+        llm_judge_fired=bool(_llm_judge_telemetry.get("llm_judge_fired", False)),
+        llm_judge_ms=int(_llm_judge_telemetry.get("llm_judge_ms", 0)),
+        llm_judge_top_score_before=float(
+            _llm_judge_telemetry.get("llm_judge_top_score_before", 0.0),
+        ),
+        llm_judge_top_score_after=float(
+            _llm_judge_telemetry.get("llm_judge_top_score_after", 0.0),
+        ),
+        llm_judge_parse_failed=bool(
+            _llm_judge_telemetry.get("llm_judge_parse_failed", False),
+        ),
+        llm_judge_n_candidates=int(
+            _llm_judge_telemetry.get("llm_judge_n_candidates", 0),
+        ),
     )
 
 
@@ -22429,6 +22531,16 @@ def multi_retrieve(
     filters_applied: dict = {}
     _mv_contradiction_count_acc = 0
     _mv_mmr_count_acc = 0
+    # LLM judge aggregation (2026-05-04): el judge corre per-vault dentro
+    # de cada `_retrieve_fn` call. Acumulamos OR(fired) + SUM(ms) +
+    # OR(parse_failed) para que el caller multi-vault tenga visibilidad
+    # del costo total agregado. n_candidates suma para reflejar pool combinado.
+    _mv_llm_judge_fired_acc = False
+    _mv_llm_judge_ms_acc = 0
+    _mv_llm_judge_parse_failed_acc = False
+    _mv_llm_judge_n_candidates_acc = 0
+    _mv_llm_judge_top_score_before_max = 0.0
+    _mv_llm_judge_top_score_after_max = 0.0
     # 2026-05-01 (afternoon): probé paralelizar per-vault con
     # ThreadPoolExecutor y rebotó contra `_bm25_inflight_lock` que es
     # GIL-serialised by design (CLAUDE.md línea 126 — paralelizar BM25
@@ -22475,6 +22587,23 @@ def multi_retrieve(
             pass
         try:
             _mv_mmr_count_acc += int(r.get("mmr_applied", 0) or 0)
+        except Exception:
+            pass
+        try:
+            if r.get("llm_judge_fired", False):
+                _mv_llm_judge_fired_acc = True
+            _mv_llm_judge_ms_acc += int(r.get("llm_judge_ms", 0) or 0)
+            if r.get("llm_judge_parse_failed", False):
+                _mv_llm_judge_parse_failed_acc = True
+            _mv_llm_judge_n_candidates_acc += int(
+                r.get("llm_judge_n_candidates", 0) or 0,
+            )
+            _before = float(r.get("llm_judge_top_score_before", 0.0) or 0.0)
+            _after = float(r.get("llm_judge_top_score_after", 0.0) or 0.0)
+            if _before > _mv_llm_judge_top_score_before_max:
+                _mv_llm_judge_top_score_before_max = _before
+            if _after > _mv_llm_judge_top_score_after_max:
+                _mv_llm_judge_top_score_after_max = _after
         except Exception:
             pass
         # Merge graph-expanded context from all vaults
@@ -22527,6 +22656,12 @@ def multi_retrieve(
         # Anaphora telemetry surfaced para que `to_log_event` lo levante
         # al rag_queries.extra_json (resolved/original/rewritten).
         extras=dict(_anaphora_telemetry),
+        llm_judge_fired=bool(_mv_llm_judge_fired_acc),
+        llm_judge_ms=int(_mv_llm_judge_ms_acc),
+        llm_judge_top_score_before=float(_mv_llm_judge_top_score_before_max),
+        llm_judge_top_score_after=float(_mv_llm_judge_top_score_after_max),
+        llm_judge_parse_failed=bool(_mv_llm_judge_parse_failed_acc),
+        llm_judge_n_candidates=int(_mv_llm_judge_n_candidates_acc),
     )
 
 

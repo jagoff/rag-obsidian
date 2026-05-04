@@ -52084,6 +52084,62 @@ def _bootout_label(label: str, *, dry_run: bool = False, timeout: int = 15) -> d
         return {"ok": False, "exit_code": -1, "stderr": f"OSError: {exc}", "skipped": False}
 
 
+def _bootstrap_label(label: str, *, dry_run: bool = False, timeout: int = 30) -> dict:
+    """`launchctl bootstrap gui/$UID <plist>` con timeout + manejo de exit codes.
+
+    Simétrico a `_bootout_label` — usado por `rag start` para levantar daemons
+    EXTERNOS (RagNet whatsapp-*, ollama, qdrant) cuyos plists viven en
+    `~/Library/LaunchAgents/` pero NO están managed por `_services_spec`.
+    Para los managed (`obsidian-rag-*`) seguimos por `setup.callback()` que
+    los regenera desde código y los carga vía `launchctl load`.
+
+    Devuelve {"ok": bool, "exit_code": int, "stderr": str, "skipped": bool,
+              "missing_plist": bool}.
+
+    Códigos / casos tratados como OK:
+        exit=0                                → loaded (success)
+        exit=37                               → "Operation already in progress"
+        stderr contiene "already loaded" /
+            "already bootstrapped"            → ya estaba cargado (no error real)
+    """
+    import subprocess
+    if dry_run:
+        return {"ok": True, "exit_code": 0, "stderr": "",
+                "skipped": True, "missing_plist": False}
+    plist = _LAUNCH_AGENTS_DIR / f"{label}.plist"
+    if not plist.is_file():
+        return {"ok": False, "exit_code": -1,
+                "stderr": "plist no existe en disco",
+                "skipped": False, "missing_plist": True}
+    uid = os.getuid()
+    try:
+        proc = subprocess.run(
+            ["launchctl", "bootstrap", f"gui/{uid}", str(plist)],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        rc = proc.returncode
+        stderr = (proc.stderr or "").strip()
+        stderr_lc = stderr.lower()
+        # 0 = loaded; 37 = ya en progreso; "already loaded/bootstrapped" en
+        # stderr = ya estaba cargado (rc varía por versión de launchctl).
+        ok = (
+            rc in (0, 37)
+            or "already loaded" in stderr_lc
+            or "already bootstrapped" in stderr_lc
+            or "service is disabled" in stderr_lc  # opt-in necesario, no es error fatal
+        )
+        return {"ok": ok, "exit_code": rc, "stderr": stderr,
+                "skipped": False, "missing_plist": False}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "exit_code": 124,
+                "stderr": f"timeout {timeout}s",
+                "skipped": False, "missing_plist": False}
+    except OSError as exc:
+        return {"ok": False, "exit_code": -1,
+                "stderr": f"OSError: {exc}",
+                "skipped": False, "missing_plist": False}
+
+
 @cli.command()
 @click.option(
     "--with-rag-net/--without-rag-net", default=True,
@@ -52286,6 +52342,250 @@ def stop(
         "[dim](Plists quedan en disco; macOS los re-loadea solo al próximo "
         "login. Para borrarlos: `rag setup --remove`.)[/dim]"
     )
+
+
+@cli.command()
+@click.option(
+    "--with-rag-net/--without-rag-net", default=True,
+    help="Levantar también daemons de RagNet/WhatsApp (whatsapp-bridge/"
+         "listener/healthcheck/vault-sync). Default: sí — sin RagNet la UX "
+         "del sistema queda a medias (web sí, WhatsApp no).",
+)
+@click.option(
+    "--with-ollama", is_flag=True, default=False,
+    help="Levantar también ollama (homebrew.mxcl.ollama + com.ollama.ollama "
+         "+ ollama-env-init). Default OFF: ollama suele estar siempre up; "
+         "usalo si lo bajaste con `rag stop --with-ollama`.",
+)
+@click.option(
+    "--with-qdrant", is_flag=True, default=False,
+    help="Levantar también qdrant (com.fer.qdrant). Default OFF.",
+)
+@click.option(
+    "--all", "start_all", is_flag=True, default=False,
+    help="Atajo para --with-rag-net + --with-ollama + --with-qdrant.",
+)
+@click.option(
+    "--no-index", is_flag=True, default=False,
+    help="Saltear el catch-up incremental al final (default: sí lo corre, "
+         "para que el corpus quede al último minuto de uso).",
+)
+@click.option(
+    "--yes", "-y", is_flag=True, help="No pedir confirmación.",
+)
+@click.option(
+    "--dry-run", is_flag=True, help="Mostrar qué levantaría pero no ejecutar.",
+)
+@click.pass_context
+def start(
+    ctx: click.Context,
+    with_rag_net: bool,
+    with_ollama: bool,
+    with_qdrant: bool,
+    start_all: bool,
+    no_index: bool,
+    yes: bool,
+    dry_run: bool,
+) -> None:
+    """Levantar TODO el sistema y reindexar al último minuto de uso.
+
+    Simétrico a `rag stop`. Idempotente — re-correrlo recarga lo que esté
+    caído sin romper lo que ya está vivo. Orden:
+
+    1. `rag setup` — regenera + carga los `obsidian-rag-*` (managed) desde
+       código (incluye watch / web / digest / morning / today / ingesters
+       cross-source / wa-tasks / online-tune / watchdog / wake-hook / ...).
+    2. Externos vía `launchctl bootstrap` desde `~/Library/LaunchAgents/`:
+       ollama (si `--with-ollama`), qdrant (si `--with-qdrant`), RagNet
+       (whatsapp-*) si `--with-rag-net` (default ON).
+    3. Catch-up index incremental (`rag index`, sin `--reset`) — re-indexa
+       todo lo que cambió desde el último run del watcher (típicamente
+       minutos; si la Mac estuvo dormida varias horas, captura ese gap).
+       Skip con `--no-index`.
+
+    Si un externo no tiene plist en disco, lo reporta como "missing" y
+    sigue — instalalo desde su repo origen ([whatsapp-listener](https://github.com/jagoff/whatsapp-listener)
+    para RagNet, [mem-vault](https://github.com/jagoff/mem-vault) para
+    qdrant, `brew install ollama` para ollama) y re-corré `rag start`.
+    """
+    if start_all:
+        with_ollama = True
+        with_qdrant = True
+        with_rag_net = True
+
+    rag_bin = _rag_binary()
+    if not Path(rag_bin).is_file():
+        console.print(f"[red]No encuentro el binario `rag`:[/red] {rag_bin}")
+        console.print("[dim]Instalá primero: uv tool install --reinstall --editable '.[entities]'[/dim]")
+        return
+
+    managed_count = len(_services_spec(rag_bin))
+
+    # ── Preview ──────────────────────────────────────────────────────────
+    console.print()
+    console.print("[bold]rag start[/bold] — voy a levantar el sistema:")
+    console.print(f"  [dim]·[/dim] obsidian-rag-* (managed): {managed_count} daemons via [cyan]rag setup[/cyan]")
+    if with_rag_net:
+        console.print(f"  [dim]·[/dim] RagNet (whatsapp-*)     : {len(_RAG_NET_LABELS)} daemons")
+    else:
+        console.print("  [dim]·[/dim] RagNet (whatsapp-*)     : [yellow]skip[/yellow] (--without-rag-net)")
+    if with_qdrant:
+        console.print(f"  [dim]·[/dim] qdrant                  : {len(_QDRANT_LABELS)} daemons")
+    else:
+        console.print("  [dim]·[/dim] qdrant                  : [yellow]skip[/yellow] (default — usalo si bajaste qdrant)")
+    if with_ollama:
+        console.print(f"  [dim]·[/dim] ollama                  : {len(_OLLAMA_LABELS)} daemons")
+    else:
+        console.print("  [dim]·[/dim] ollama                  : [yellow]skip[/yellow] (default — suele estar siempre up)")
+    if no_index:
+        console.print("  [dim]·[/dim] catch-up index          : [yellow]skip[/yellow] (--no-index)")
+    else:
+        console.print("  [dim]·[/dim] catch-up index          : [cyan]rag index[/cyan] incremental")
+    console.print()
+
+    if dry_run:
+        console.print("[dim]Dry-run — no ejecuto nada.[/dim]")
+        console.print("  [dim]would-call[/dim] [managed] rag setup")
+        if with_ollama:
+            for lbl in _OLLAMA_LABELS:
+                console.print(f"  [dim]would-bootstrap[/dim] [ollama] {lbl}")
+        if with_qdrant:
+            for lbl in _QDRANT_LABELS:
+                console.print(f"  [dim]would-bootstrap[/dim] [qdrant] {lbl}")
+        if with_rag_net:
+            for lbl in _RAG_NET_LABELS:
+                console.print(f"  [dim]would-bootstrap[/dim] [rag-net] {lbl}")
+        if not no_index:
+            console.print("  [dim]would-call[/dim] [index] rag index (incremental)")
+        return
+
+    if not yes:
+        if not click.confirm("¿Seguir?", default=True):
+            console.print("[yellow]Cancelado.[/yellow]")
+            return
+
+    # ── 1. obsidian-rag-* via setup callback ─────────────────────────────
+    # `setup` regenera los plists desde código (captura overrides del
+    # schedule auto-tune + cualquier cambio en _services_spec) y los
+    # carga vía `launchctl load`. Ya es idempotente.
+    console.print()
+    console.print("[bold cyan]▸ obsidian-rag-* (managed daemons)[/bold cyan]")
+    try:
+        ctx.invoke(setup, remove=False)
+    except Exception as exc:
+        console.print(f"[red]✗[/red] setup falló: {exc!r}")
+        # No abortar — los externos podrían levantarse igual.
+        _silent_log("rag_start_setup_failed", exc)
+
+    # ── 2. Externos: ollama → qdrant → rag-net ───────────────────────────
+    # Orden: ollama primero (todos dependen de él para LLM), después
+    # qdrant (mem-vault no es runtime-blocking pero si el user lo pidió
+    # quiere que esté up antes de que RagNet arranque a chatear), por
+    # último RagNet (consume web + ollama).
+    ext_targets: list[tuple[str, str]] = []
+    if with_ollama:
+        ext_targets.extend((lbl, "ollama") for lbl in _OLLAMA_LABELS)
+    if with_qdrant:
+        ext_targets.extend((lbl, "qdrant") for lbl in _QDRANT_LABELS)
+    if with_rag_net:
+        ext_targets.extend((lbl, "rag-net") for lbl in _RAG_NET_LABELS)
+
+    ext_ok = ext_already = ext_fail = ext_missing = 0
+    if ext_targets:
+        console.print()
+        console.print("[bold cyan]▸ daemons externos[/bold cyan]")
+        for label, category in ext_targets:
+            result = _bootstrap_label(label)
+            if result["missing_plist"]:
+                console.print(
+                    f"[yellow]·[/yellow] [{category}] {label} "
+                    f"[dim](sin plist en disco — instalalo desde su repo)[/dim]"
+                )
+                ext_missing += 1
+            elif result["ok"] and result["exit_code"] == 0:
+                console.print(f"[green]✓[/green] [{category}] {label}")
+                ext_ok += 1
+                _log_daemon_run_event(
+                    label=label, action="bootstrap",
+                    exit_code=0, reason="rag start",
+                )
+            elif result["ok"]:
+                console.print(
+                    f"[dim]·[/dim] [{category}] {label} "
+                    f"[dim](ya estaba cargado)[/dim]"
+                )
+                ext_already += 1
+            else:
+                stderr_hint = result["stderr"][:120] if result["stderr"] else ""
+                console.print(
+                    f"[red]✗[/red] [{category}] {label} → exit={result['exit_code']}"
+                    + (f" — {stderr_hint}" if stderr_hint else "")
+                )
+                ext_fail += 1
+                _log_daemon_run_event(
+                    label=label, action="bootstrap",
+                    exit_code=result["exit_code"], reason="rag start (failed)",
+                )
+
+    # ── 3. Catch-up incremental index ────────────────────────────────────
+    # Por qué: `rag setup` cargó el watcher pero éste solo escucha file
+    # system events EN VIVO — si la Mac estuvo dormida o el watcher no
+    # corría, los archivos editados en ese período no se reindexan
+    # automáticamente. Un `rag index` incremental (hash-based) cubre el
+    # gap. Sincrónico para que el user vea el output en tiempo real.
+    #
+    # El comando `index` ya tiene su propio process-lock (300s wait); si
+    # otro `rag index` arrancó por un cron justo ahora, este invoke
+    # espera o falla limpio con sys.exit(1) — lo capturamos.
+    if not no_index:
+        console.print()
+        console.print("[bold cyan]▸ catch-up index (incremental)[/bold cyan]")
+        try:
+            ctx.invoke(
+                index,
+                reset=False,
+                no_contradict=False,
+                source_opt=None,
+                since_opt=None,
+                dry_run=False,
+                max_chats=None,
+                vault_scope=None,
+            )
+        except SystemExit as e:
+            if e.code != 0:
+                console.print(
+                    "[yellow]·[/yellow] catch-up skip "
+                    "(otro `rag index` activo, retry manual con `rag index`)"
+                )
+        except Exception as exc:
+            console.print(f"[yellow]·[/yellow] catch-up falló: {exc!r}")
+            _silent_log("rag_start_index_failed", exc)
+
+    # ── Summary ──────────────────────────────────────────────────────────
+    console.print()
+    if ext_fail == 0:
+        console.print("[bold green]✓ sistema levantado[/bold green]")
+    else:
+        console.print(
+            f"[yellow]sistema levantado parcialmente — "
+            f"[red]{ext_fail} externo(s) fallidos[/red][/yellow]"
+        )
+    if ext_targets:
+        parts = []
+        if ext_ok:
+            parts.append(f"{ext_ok} cargados")
+        if ext_already:
+            parts.append(f"{ext_already} ya estaban")
+        if ext_missing:
+            parts.append(f"[yellow]{ext_missing} sin plist[/yellow]")
+        if ext_fail:
+            parts.append(f"[red]{ext_fail} fallidos[/red]")
+        console.print(f"  [dim]externos:[/dim] {', '.join(parts)}")
+    console.print()
+    console.print("[dim]Verificar:[/dim]")
+    console.print("  [dim]·[/dim] [cyan]rag daemons status[/cyan]    — health del control plane")
+    console.print(f"  [dim]·[/dim] [cyan]tail -f {_RAG_LOG_DIR}/web.log[/cyan]  — FastAPI server")
+    console.print("  [dim]·[/dim] [cyan]curl -s http://127.0.0.1:8765/health | jq[/cyan]")
 
 
 @cli.group()

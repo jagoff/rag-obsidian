@@ -103,14 +103,14 @@ uv tool install --reinstall --editable '.[entities,stt]'
 # 3. Primer indexado del vault (10-30 min según vault size + Mac)
 rag index
 
-# 4. Instalar los 16 daemons (watch, web, digest, morning, today, anticipate,
-#    wa-scheduled-send, ingest-{whatsapp,gmail,calendar,reminders}, etc.)
-#    Idempotente — re-correr recarga.
-rag setup
+# 4. Levantar el sistema completo: daemons obsidian-rag-* + RagNet + catch-up
+#    incremental al último minuto de uso. Idempotente. Para parar todo:
+#    `rag stop` (default ON RagNet, OFF ollama/qdrant).
+rag start
 
 # 5. Verificar que el sistema está sano
 rag health                       # snapshot unificado: corpus, latencia, feedback, calibration
-launchctl list | grep obsidian-rag    # los 16 servicios deben aparecer
+launchctl list | grep obsidian-rag    # los 35 servicios deben aparecer
 ```
 
 **Dependencias del sistema** (Homebrew):
@@ -451,8 +451,10 @@ Skips: frontmatter, fenced/inline code, existing wikilinks, markdown links, HTML
 
 | Comando | Función |
 |---|---|
-| `rag setup` | Instala los 16 launchd plists `com.fer.obsidian-rag-*` (watch, web, digest, morning, today, anticipate, ingest-{whatsapp,gmail,calendar,reminders}, wa-tasks, reminder-wa-push, **wa-scheduled-send**, maintenance, calibrate, auto-harvest, online-tune, …). Idempotente — re-correr recarga. Ver tabla completa en [§Automation (launchd)](#automation-launchd). |
-| `rag setup --remove` | Desinstala todos los servicios. |
+| `rag start [--all] [--without-rag-net] [--no-index] [-y] [--dry-run]` | **Levanta TODO el sistema** y reindexa al último minuto de uso. Simétrico a `rag stop`. Orden: (1) `rag setup` regenera + carga los 35 `obsidian-rag-*` managed; (2) opcionalmente bootstrap-ea daemons externos (RagNet `whatsapp-*` default ON, ollama / qdrant default OFF); (3) corre `rag index` incremental para capturar cambios de archivos editados desde el último tick del watcher (cubre el gap si la Mac estuvo dormida). Idempotente. |
+| `rag setup` | Instala los 16 launchd plists `com.fer.obsidian-rag-*` (watch, web, digest, morning, today, anticipate, ingest-{whatsapp,gmail,calendar,reminders}, wa-tasks, reminder-wa-push, **wa-scheduled-send**, maintenance, calibrate, auto-harvest, online-tune, …). Idempotente — re-correr recarga. Subset de `rag start` (no incluye externos ni catch-up). Ver tabla completa en [§Automation (launchd)](#automation-launchd). |
+| `rag setup --remove` | Desinstala todos los servicios obsidian-rag-* (borra plists del disco). |
+| `rag stop [--all] [--without-rag-net] [--with-ollama] [--with-qdrant] [-y] [--dry-run]` | **Para TODO el sistema** en un solo comando. Inverso de `rag start`. Orden: watchdog/wake-hook primero (para que no rebootstrap-een), después el resto de obsidian-rag-*, opcional RagNet (default ON), opcional ollama/qdrant (default OFF — son compartidos con mem-vault). |
 | `rag wa-scheduled-send [--dry-run] [--late-threshold-min 5] [--max-retries 5] [--max-per-run 20]` | Worker manual del envío de mensajes de WhatsApp programados. Lo dispara automáticamente el plist `com.fer.obsidian-rag-wa-scheduled-send` cada 5 min, pero podés correrlo a mano para debug — `--dry-run` calcula sin enviar ni mover status. Idempotente: cada row se mueve `pending`→`sent`/`sent_late`/`failed` en una sola transacción. |
 | `rag remind-wa [--dry-run] [--window-min 5] [--max-overdue-min 1440]` | Worker manual del push de Apple Reminders próximos a vencer al JID ambient. Cron equivalente: `com.fer.obsidian-rag-reminder-wa-push` cada 5 min. Idempotente vía `rag_reminder_wa_pushed`. |
 | `rag ambient {status,disable,test,log}` | Manage del ambient hook (ver [§Ambient Agent](#ambient-agent-co-autor-del-inbox)). |
@@ -658,7 +660,15 @@ Expuestos por `obsidian-rag-mcp` vía stdio. Registro en `~/.claude.json` (Claud
 5. El `rag today` brief incluye un widget "WhatsApp pendientes hoy" que destaca rows que quedaron `pending` cuando ya deberían haber salido — señal de que el worker no está corriendo. Ver [recovery.md §2](./docs/recovery.md#2-el-daemon-wa-scheduled-send-no-está-enviando-mensajes-programados) para el fix.
 
 ```bash
-rag setup                      # install/recarga (los 16 servicios)
+rag start                      # levanta TODO el sistema + reindex al último minuto (RagNet incluido)
+rag start --all                # idem + ollama + qdrant
+rag start --no-index -y        # solo bootstrap, sin catch-up index
+rag start --dry-run            # mostrar qué levantaría sin ejecutar
+
+rag stop                       # para TODO en un solo comando (inverso de rag start)
+rag stop --all -y              # incluye ollama + qdrant + sin confirmación
+
+rag setup                      # subset de rag start: install/recarga managed (los 35 servicios)
 rag setup --remove             # uninstall
 launchctl list | grep obsidian-rag
 launchctl unload ~/Library/LaunchAgents/com.fer.obsidian-rag-watch.plist

@@ -14456,6 +14456,56 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         full = "".join(parts)
         _t_done = time.perf_counter()
 
+        # ── Citation NLI verifier (Quick Win #2) ─────────────────────────────
+        # Corre después del stream, antes del `done` event.
+        # RAG_NLI_MODE=off (default) → no-op.
+        # RAG_NLI_MODE=mark → agrega "(?) " a oraciones no verificadas.
+        # RAG_NLI_MODE=strip → elimina oraciones no verificadas.
+        # Silent-fail: cualquier excepción → full no se modifica.
+        # Telemetría: nli_verified_count / nli_unverified_count /
+        # nli_unverified_sentences se reportan en done + log_query_event.
+        _nli_verified_count: int = 0
+        _nli_unverified_count: int = 0
+        _nli_unverified_sentences: list[str] = []
+        try:
+            from rag.postprocess import _nli_mode, verify_answer_nli, apply_nli_mode
+            _nli_mode_val = _nli_mode()
+            if _nli_mode_val != "off" and full.strip() and result.get("docs"):
+                _nli_results = verify_answer_nli(
+                    full,
+                    list(result["docs"]),
+                )
+                if _nli_results:
+                    _nli_verified_count = sum(1 for r in _nli_results if r.verified)
+                    _nli_unverified_count = sum(1 for r in _nli_results if not r.verified)
+                    _nli_unverified_sentences = [
+                        r.sentence for r in _nli_results if not r.verified
+                    ]
+                    _full_nli = apply_nli_mode(full, _nli_results, _nli_mode_val)
+                    if _full_nli != full:
+                        full = _full_nli
+                        # Emitir el texto corregido como token adicional para que
+                        # el cliente pueda reemplazar el contenido mostrado.
+                        yield _sse("nli_correction", {
+                            "text": full,
+                            "mode": _nli_mode_val,
+                            "verified": _nli_verified_count,
+                            "unverified": _nli_unverified_count,
+                        })
+                    print(
+                        f"[citation-nli] mode={_nli_mode_val} "
+                        f"verified={_nli_verified_count} "
+                        f"unverified={_nli_unverified_count}",
+                        flush=True,
+                    )
+        except Exception as _nli_exc:
+            print(
+                f"[citation-nli] wire-up error (silent-fail): "
+                f"{type(_nli_exc).__name__}: {_nli_exc}",
+                flush=True,
+            )
+        # ─────────────────────────────────────────────────────────────────────
+
         # Timing breakdown for diagnostics
         _t_reform_ms = int((_t_reform_end - _t_reform_start) * 1000)
         _t_retrieve_ms = int((_t_retrieve_end - _t_retrieve_start) * 1000)
@@ -14654,6 +14704,12 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             # `_DEEP_LOW_CONF_BYPASS` para los thresholds.
             "deep_retrieve_iterations": result.get("deep_retrieve_iterations"),
             "deep_retrieve_exit_reason": result.get("deep_retrieve_exit_reason"),
+            # Citation NLI verifier (Quick Win #2) — sólo presente cuando
+            # RAG_NLI_MODE != "off". Valores 0/[] cuando el mode está OFF o
+            # el verifier no se invocó (corpus vacío, error silencioso, etc.).
+            "nli_verified_count": _nli_verified_count,
+            "nli_unverified_count": _nli_unverified_count,
+            "nli_unverified_sentences": _nli_unverified_sentences[:5],  # cap 5 para no inflar el log
         })
 
         yield _sse("done", {
@@ -14678,6 +14734,10 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 name in _SOURCE_INTENT_META
                 for name, _args in _forced_tool_pairs
             ),
+            # Citation NLI verifier counts (Quick Win #2).
+            # 0/0 cuando RAG_NLI_MODE="off" (default) — zero-cost readthrough.
+            "nli_verified_count": _nli_verified_count,
+            "nli_unverified_count": _nli_unverified_count,
         })
 
         _spawn_conversation_writer(

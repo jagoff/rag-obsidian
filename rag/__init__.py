@@ -2176,6 +2176,11 @@ SOURCE_WEIGHTS: dict[str, float] = {
     "calls":     0.80,   # log entries: factual but semantically thin
     "whatsapp":  0.75,
     "messages":  0.75,
+    # `pillow` está en VALID_SOURCES por trazabilidad (ingester registrado
+    # en `rag index --source pillow`) pero NO escribe al corpus vectorial
+    # — sus datos viven en `rag_sleep_sessions` y se consumen vía home
+    # panel + brief, no via retrieve. Weight inerte (nunca se aplica).
+    "pillow":    0.50,
 }
 
 # Recency half-life per source, in days. None → no decay applied (chunks
@@ -2204,6 +2209,7 @@ SOURCE_RECENCY_HALFLIFE_DAYS: dict[str, float | None] = {
     "whatsapp":    60.0,
     "messages":    60.0,
     "calls":       60.0,
+    "pillow":     None,   # local-only, no compite en retrieve (ver SOURCE_WEIGHTS)
 }
 
 # Retention windows per source, in days. None → keep forever. Used at
@@ -2221,6 +2227,7 @@ SOURCE_RETENTION_DAYS: dict[str, int | None] = {
     "whatsapp":   180,
     "messages":   180,
     "calls":      180,
+    "pillow":     None,   # local-only en rag_sleep_sessions, retention manual
 }
 
 
@@ -60476,12 +60483,21 @@ del _cli_group_root
 cli.add_command(vault)  # registrar el grupo extraído manualmente
 
 
-# ── Allowlist opcional de top-level CLI commands (RAG_CLI_KEEP) ──────────────
+# ── Allowlist opcional de CLI commands (RAG_CLI_KEEP) ─────────────────────────
 # Controlada por el env var `RAG_CLI_KEEP` (CSV de nombres de comandos). Si
-# está seteada, oculta del Click tree todos los comandos top-level que no
-# estén en la lista — `rag --help` muestra solo los que quedan, y los demás
-# devuelven `No such command` aunque el código sigue presente en el módulo.
-# Default (var ausente o vacía) = no filtra nada.
+# está seteada, oculta del Click tree todos los comandos que no estén en la
+# lista — `rag --help` muestra solo los que quedan. Default (var ausente o
+# vacía) = no filtra nada.
+#
+# Sintaxis aceptada (mezclable):
+#   - `query` — comando top-level
+#   - `vault` — grupo top-level entero (todos sus subcomandos)
+#   - `vault.add,vault.list` — solo esos subcomandos del grupo `vault`
+#
+# Si listás `vault.add` sin listar `vault` también, el grupo queda con
+# solo `add` visible. Si listás `vault` (sin dot) Y `vault.add`, el dot
+# gana: solo `add` queda. La regla es "si hay algún `vault.X` listado, el
+# grupo solo conserva los X listados; sino, conserva todo".
 #
 # Uso: el harness en `.devin/mcp-profiles/` inyecta esta var cuando un
 # profile define `rag_cli_keep`. Esto NO reduce el harness del agente
@@ -60491,12 +60507,34 @@ def _apply_cli_keep_filter() -> None:
     raw = os.environ.get("RAG_CLI_KEEP", "").strip()
     if not raw:
         return
-    keep = {n.strip() for n in raw.split(",") if n.strip()}
-    if not keep:
+    entries = {n.strip() for n in raw.split(",") if n.strip()}
+    if not entries:
         return
+
+    top_keep: set[str] = set()
+    sub_keep: dict[str, set[str]] = {}
+    for entry in entries:
+        if "." in entry:
+            group, sub = entry.split(".", 1)
+            top_keep.add(group)
+            sub_keep.setdefault(group, set()).add(sub)
+        else:
+            top_keep.add(entry)
+
     for name in list(cli.commands.keys()):
-        if name not in keep:
+        if name not in top_keep:
             cli.commands.pop(name)
+            continue
+        # Si el comando es un grupo Y tiene restricciones de subcomandos,
+        # filtramos el .commands del grupo. Si no es un grupo (Click.Command
+        # plano) o no hay restricciones, lo dejamos como está.
+        if name in sub_keep:
+            grp = cli.commands[name]
+            if hasattr(grp, "commands") and isinstance(grp.commands, dict):
+                allowed = sub_keep[name]
+                for sub_name in list(grp.commands.keys()):
+                    if sub_name not in allowed:
+                        grp.commands.pop(sub_name)
 
 
 _apply_cli_keep_filter()

@@ -58,22 +58,59 @@ def _allowed_tools() -> set[str] | None:
     return {t.strip() for t in raw.split(",") if t.strip()}
 
 
+def _terse_mode() -> bool:
+    """`RAG_MCP_TOOLS_TERSE=1` recorta los docstrings al primer párrafo.
+
+    Los docstrings completos van como descriptores al system prompt del
+    cliente (Claude Code / Devin). Algunas tools tienen 30+ líneas
+    explicando edge cases, validaciones y formato — útil para el
+    desarrollador, ruido para el agente. En modo terse dejamos solo el
+    primer párrafo (la línea sumario + descripción inmediata).
+    """
+    return os.environ.get("RAG_MCP_TOOLS_TERSE", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _trim_docstring(fn):
+    """Reescribe `fn.__doc__` dejando solo el primer párrafo.
+
+    Mutación in-place: FastMCP lee `fn.__doc__` cuando registra la tool,
+    así que basta con reasignar antes de pasarla a `mcp.tool()`. No
+    cambia el comportamiento runtime — solo la metadata expuesta.
+    """
+    doc = fn.__doc__ or ""
+    # Primer párrafo: hasta la primera línea en blanco. Conservamos los
+    # \n internos del párrafo para que el sumario multi-línea se vea bien.
+    paragraphs = doc.strip().split("\n\n", 1)
+    if paragraphs:
+        fn.__doc__ = paragraphs[0].strip()
+    return fn
+
+
 _ALLOWED_TOOLS = _allowed_tools()
+_TERSE = _terse_mode()
 _REGISTERED_TOOLS: list[str] = []
 _SKIPPED_TOOLS: list[str] = []
 
 
 def _maybe_tool(fn):
-    """Wrapper sobre `mcp.tool()` que respeta `RAG_MCP_TOOLS`.
+    """Wrapper sobre `mcp.tool()` que respeta `RAG_MCP_TOOLS` y `RAG_MCP_TOOLS_TERSE`.
 
-    Si el env var no está seteado o lista la tool (por nombre completo o
-    por sufijo sin `rag_`), la registra normalmente. Caso contrario la
-    deja como función Python sin exponer al protocolo MCP.
+    Si el env var `RAG_MCP_TOOLS` no está seteado o lista la tool (por
+    nombre completo o por sufijo sin `rag_`), la registra normalmente.
+    Caso contrario la deja como función Python sin exponer al protocolo MCP.
+
+    Si `RAG_MCP_TOOLS_TERSE=1`, antes de registrar trim el docstring al
+    primer párrafo — reduce ~50% los tokens del descriptor sin afectar
+    funcionalidad.
     """
     name = fn.__name__
     short = name[4:] if name.startswith("rag_") else name
     if _ALLOWED_TOOLS is None or name in _ALLOWED_TOOLS or short in _ALLOWED_TOOLS:
         _REGISTERED_TOOLS.append(name)
+        if _TERSE:
+            fn = _trim_docstring(fn)
         return mcp.tool()(fn)
     _SKIPPED_TOOLS.append(name)
     return fn

@@ -187,6 +187,47 @@ Source weight 0.80 (mismo banda que calls — signal factual rico pero no curado
   - **Infra shipped**: `CONFIDENCE_RERANK_MIN_PER_SOURCE` dict en `rag/__init__.py` (scaffolding — todos los valores = baseline 0.015 hoy) + helper `confidence_threshold_for_source(source)` con fallback al global. Invocado en `query()` y `rag serve` sobre `source` del top-result meta. Tests: [`tests/test_confidence_threshold_per_source.py`](tests/test_confidence_threshold_per_source.py) (9 casos). Test `tests/test_eval_bootstrap.py::test_queries_yaml_all_paths_exist_or_placeholder` ahora acepta paths con prefijos `gmail://` / `whatsapp://` / `calendar://` / `reminders://` / `messages://` como placeholders válidos; sanity-test aparte `test_queries_yaml_cross_source_prefixes_cover_all_valid_sources` detecta drift contra `VALID_SOURCES`. Template de queries cross-source está comentado en [`queries.yaml`](queries.yaml) listo para un-commentar cuando ingesters populen corpus.
   - **Tuning pending**: re-correr `rag eval` + bajar per-source thresholds empíricamente (expected: WA 0.008-0.010, Calendar 0.012, Gmail 0.010-0.012, Reminders 0.012) una vez que ingesters hayan corrido ≥1 semana + haya feedback data. Validar `SOURCE_WEIGHTS` hardcoded (vault 1.00 / calendar 0.95 / reminders 0.90 / gmail 0.85 / WA 0.75 / messages 0.75) contra queries reales. Deferred per §10.8.
 
+## Contextual Retrieval prototype (Anthropic Sept 2024, gated — 2026-05-04)
+
+Prototipo de la técnica de [Contextual Retrieval](https://www.anthropic.com/news/contextual-retrieval) — antes de embeddear cada chunk, qwen2.5:3b genera un summary corto (≤100 tokens) que ubica al chunk dentro de su documento ("Sección sobre el reranker dentro de la nota X"). Anthropic midió −35% retrieval failures y −49% con reranker contra su corpus. Acá es **opt-in via `RAG_CONTEXTUAL_RETRIEVAL=1`**, default OFF — re-embed full del corpus actual cuesta ~8200 LLM calls a qwen2.5:3b (~25-40min) y la ganancia depende del corpus, hay que medir contra `rag eval` antes de promover.
+
+**Módulo**: [`rag/contextual_retrieval.py`](rag/contextual_retrieval.py) (~370 LOC). API pública: `contextualize_chunks(embed_texts, display_texts, doc_id, parent_doc_text, doc_metadata) → list[str]`. Cuando flag OFF retorna `embed_texts` sin tocar (bit-idéntico al pre-feature, mismo identity-check).
+
+**Wire-up**: invocado entre `chunks = semantic_chunks(...)` y `embed(embed_texts)` en (a) [`_index_single_file`](rag/__init__.py) (incremental indexing, hot path de `rag watch`) y (b) [`_run_index`](rag/__init__.py) (full reindex). Display_texts y parent_texts NO se mutan — el contexto vive sólo en el embedding, no en snippets de UI ni en el reranker title-prefix. Esto es invariante (test: `test_wire_up_on_does_not_contaminate_display`).
+
+**CLI**: `rag index --contextual` setea `RAG_CONTEXTUAL_RETRIEVAL=1` para esta invocación con snap+restore manual del env var. Combinar con `--reset` para full re-embed con contexto. Imprime stats al cierre: hits/misses/errors/skipped_short.
+
+**Cache** (`rag_chunk_contexts` en `telemetry.db`):
+- PK = `(doc_id, chunk_idx, chunk_hash)`. `chunk_hash = sha1[:16](PROMPT_VERSION + chunk_body)` — incluye `PROMPT_VERSION` para invalidar todo al bumpear prompt o helper.
+- **Sobrevive a `rag index --reset`** — cache puro, no se borra con la collection sqlite-vec. Re-embed reusa los hits sin re-LLM.
+- Cuando el body del chunk cambia → `chunk_hash` distinto → miss → regenera (idempotente).
+- Cuando el helper LLM falla (timeout, malformed output) → degraded gracefully a embed_text sin contexto + NO se cachea el fallo (próximo run reintenta).
+- Limpieza manual: `DELETE FROM rag_chunk_contexts;` en `telemetry.db`.
+
+**Cómo activarlo**:
+
+```bash
+export RAG_CONTEXTUAL_RETRIEVAL=1
+rag eval                          # baseline antes (compará contra esto)
+rag index --reset --contextual    # full re-embed con contexto (~25-40min)
+rag eval                          # comparar deltas con CIs
+```
+
+**Restricciones / no-goals**:
+- 100% indexing-time. No tocamos hot path de retrieve/query.
+- No regeneramos summaries en cada query — única fuente de generación es el indexer.
+- Idempotente: re-correr con mismo content_hash skipea sin re-LLM.
+
+**Promote-to-default checklist** (cuando se valide):
+1. `RAG_CONTEXTUAL_RETRIEVAL=1 rag index --reset --contextual` (full re-embed completo).
+2. `rag eval` con CI bootstrap, comparar contra pre-feature baseline.
+3. Si singles + chains hit@5 mejoran fuera del CI noise → promove a default ON; si están dentro del CI → keep gated; si regresionan → revert a OFF y documentar el negative result.
+4. Bumpear `_FILTER_VERSION` (semantic cache poisoning si flag flippea mid-fly).
+
+**Tests**: [`tests/test_contextual_retrieval.py`](tests/test_contextual_retrieval.py) (17 casos cubriendo: helper bounds, cache hit/miss, wire-up flag ON/OFF, display contamination guard, hash determinism + versioning, identity-return en flag OFF).
+
+**Diferencia con `get_context_summary`** (feature pre-existente, también gated): `get_context_summary` produce **un summary por documento** que se prependea a TODOS los chunks de esa nota (compartido). Contextual Retrieval produce **un summary por chunk** que ubica ESE chunk específico dentro del doc. Las dos features son ortogonales — pueden coexistir, ambas opt-in.
+
 ## On-disk state (`~/.local/share/obsidian-rag/`)
 
 ### Telemetry — SQL tables (post-T10 2026-04-19, post-split 2026-04-21)
@@ -194,7 +235,7 @@ Source weight 0.80 (mismo banda que calls — signal factual rico pero no curado
 Telemetry + learning state vive en **dos** databases bajo `~/.local/share/obsidian-rag/ragvec/`:
 
 - **`ragvec.db`** (~104M) — sqlite-vec `meta_*`/`vec_*` tables del corpus + **10 state tables**: `rag_whatsapp_state`, `rag_calendar_state`, `rag_gmail_state`, `rag_reminders_state`, `rag_contacts_state`, `rag_calls_state`, `rag_safari_history_state`, `rag_safari_bookmark_state`, `rag_wa_media_state`, `rag_schema_version`. Sólo cursors + dedup keys de ingesters.
-- **`telemetry.db`** (~36M) — **45+ tablas** operativas: `rag_queries`, `rag_behavior`, `rag_feedback`, `rag_feedback_golden*`, `rag_tune`, `rag_contradictions`, `rag_ambient*`, `rag_brief_*`, `rag_wa_tasks`, `rag_archive_log`, `rag_filing_log`, `rag_eval_runs`, `rag_surface_log`, `rag_proactive_log`, `rag_cpu_metrics`, `rag_memory_metrics`, `system_memory_metrics`, `rag_conversations_index`, `rag_response_cache`, `rag_entities`, `rag_entity_mentions`, `rag_ocr_cache`, `rag_vlm_captions`, `rag_audio_transcripts`, `rag_learned_paraphrases`, `rag_cita_detections`, `rag_score_calibration`, `rag_schema_version`.
+- **`telemetry.db`** (~36M) — **45+ tablas** operativas: `rag_queries`, `rag_behavior`, `rag_feedback`, `rag_feedback_golden*`, `rag_tune`, `rag_contradictions`, `rag_ambient*`, `rag_brief_*`, `rag_wa_tasks`, `rag_archive_log`, `rag_filing_log`, `rag_eval_runs`, `rag_surface_log`, `rag_proactive_log`, `rag_cpu_metrics`, `rag_memory_metrics`, `system_memory_metrics`, `rag_conversations_index`, `rag_response_cache`, `rag_entities`, `rag_entity_mentions`, `rag_ocr_cache`, `rag_vlm_captions`, `rag_audio_transcripts`, `rag_learned_paraphrases`, `rag_cita_detections`, `rag_score_calibration`, `rag_chunk_contexts` (Contextual Retrieval cache, gated 2026-05-04), `rag_schema_version`.
 
 **Split rationale** (`scripts/migrate_ragvec_split.py`, 2026-04-21): cada DB comparte único WAL entre todos sus writers. Mezclar chunks + telemetría en WAL único causaba bursts de lock contention — indexer escribiendo 100 chunks interfería con write sync de cada query log. Separar en 2 DBs permite que cada WAL tenga su propio pattern de writes (indexer bulk vs telemetry append) sin bloquearse entre sí. `_ragvec_state_conn()` resuelve a `telemetry.db` (post-split); ingesters siguen abriendo directamente `ragvec.db` para su state cursor (ver `rag.DB_PATH / "ragvec.db"` en `scripts/ingest_*.py`).
 

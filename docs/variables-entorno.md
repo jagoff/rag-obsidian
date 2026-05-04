@@ -289,9 +289,18 @@ export OBSIDIAN_RAG_MOZE_FOLDER="02-Areas/Finanzas/MOZE"
 ```
 
 ### `OBSIDIAN_RAG_MOZE_DIR`
-Carpeta iCloud donde el app Tally4 guarda los `MOZE_*.csv`. Default:
+Carpeta iCloud donde el app Tally4 guarda los backups `MOZE_*.zip`. Default:
 `~/Library/Mobile Documents/iCloud~amoos~Tally4/Documents` (separado de
 `Finances/` desde el 2026-05-04).
+
+Tally4 4.x no exporta CSV — el zip contiene un `moze.realm` (Realm
+Object Database). El bridge `rag/integrations/tally4_realm.py` corre un
+script Node.js (`scripts/tally4_realm_to_csv.js`) la primera vez que se
+necesita, instala `realm` npm de forma lazy en
+`~/.local/share/obsidian-rag/realm-extractor/`, y deja el CSV
+regenerado en `~/.local/share/obsidian-rag/moze_cache/`. Si node/npm no
+están instalados, falla en silencio y el resto del pipeline cae a
+buscar CSVs históricos.
 
 ```bash
 export OBSIDIAN_RAG_MOZE_DIR="~/Library/Mobile Documents/iCloud~amoos~Tally4/Documents"

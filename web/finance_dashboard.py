@@ -155,8 +155,17 @@ def _fingerprint(date_iso: str, time_str: str, account: str, name: str, store: s
 # ── MOZE CSV ─────────────────────────────────────────────────────────────
 
 
-def _load_moze_rows(finance_dir: Path) -> tuple[list[dict], list[dict]]:
-    """Carga + dedupea TODOS los `MOZE_*.csv` del dir.
+def _load_moze_rows(
+    finance_dir: Path,
+    extra_dirs: tuple[Path, ...] = (),
+) -> tuple[list[dict], list[dict]]:
+    """Carga + dedupea TODOS los `MOZE_*.csv` accesibles.
+
+    Pre 2026-05-04 globeaba solo `finance_dir`. Post-Tally4 el caller
+    puede pasar `extra_dirs` apuntando al cache regenerado desde el
+    backup `.zip` (`~/.local/share/obsidian-rag/moze_cache/`). Tests
+    aislados llaman sin `extra_dirs` para no contaminarse con CSV
+    reales del usuario.
 
     Devuelve `(transactions, sources)`:
 
@@ -171,10 +180,20 @@ def _load_moze_rows(finance_dir: Path) -> tuple[list[dict], list[dict]]:
       rows_dup}` por archivo, para mostrar "leído de N CSVs (M dedupeadas)"
       en el footer del dashboard.
     """
-    csvs = sorted(
-        finance_dir.glob("MOZE_*.csv"),
-        key=lambda p: p.stat().st_mtime,
-    )
+    candidates: list[Path] = []
+    if finance_dir.exists():
+        candidates.extend(finance_dir.glob("MOZE_*.csv"))
+    seen = {p.resolve() for p in candidates}
+    for d in extra_dirs:
+        if not d or not d.exists() or d.resolve() == finance_dir.resolve():
+            continue
+        for p in d.glob("MOZE_*.csv"):
+            rp = p.resolve()
+            if rp in seen:
+                continue
+            seen.add(rp)
+            candidates.append(p)
+    csvs = sorted(candidates, key=lambda p: p.stat().st_mtime)
     if not csvs:
         return ([], [])
 
@@ -774,12 +793,17 @@ def snapshot(
         convención web/.
     """
     now = now or datetime.now()
+    # `using_defaults` distingue invocaciones de producción (sin args, hay
+    # que mirar el cache global de Tally4) de tests que pasan tmpdirs y
+    # necesitan aislamiento total.
+    using_defaults = finance_dir is None and moze_dir is None
+
     # Resolución de paths:
     # - Ambos None → defaults de web.server (los reales del usuario).
     # - Solo `finance_dir` pasado → asumir mismo dir para MOZE (back-compat
     #   con tests pre-split y con setups donde ambas fuentes vivían juntas).
     # - Solo `moze_dir` pasado → simétrico (poco común pero defensivo).
-    if finance_dir is None and moze_dir is None:
+    if using_defaults:
         from web.server import _FINANCE_BACKUP_DIR, _MOZE_BACKUP_DIR  # type: ignore
         finance_dir = _FINANCE_BACKUP_DIR
         moze_dir = _MOZE_BACKUP_DIR
@@ -793,11 +817,25 @@ def snapshot(
     if not finance_dir.exists() and not moze_dir.exists():
         return _empty_payload(now, "finance_dir_missing", str(finance_dir), str(moze_dir))
 
+    # Tally4 backup → CSV cache (silent-fail si node/realm-js no disponible).
+    # Solo en producción (using_defaults) — los tests aislados no tocan
+    # iCloud ni el cache global del usuario.
+    _MOZE_CACHE: Path | None = None
+    if using_defaults:
+        try:
+            from rag.integrations import tally4_realm
+            tally4_realm.ensure_moze_csv(moze_dir)
+            _MOZE_CACHE = tally4_realm.CACHE_DIR
+        except Exception:
+            _MOZE_CACHE = None
+
     # Cache key: tupla con (str(path), mtime) de cada archivo CSV/PDF/XLSX
-    # de ambos dirs. Re-export de cualquier archivo invalida; agregar/quitar
-    # archivos también.
+    # de ambos dirs + el cache de Tally4. Re-export de cualquier archivo
+    # invalida; agregar/quitar archivos también.
     try:
         moze_files = list(moze_dir.glob("MOZE_*.csv")) if moze_dir.exists() else []
+        if _MOZE_CACHE and _MOZE_CACHE.exists() and _MOZE_CACHE != moze_dir:
+            moze_files.extend(_MOZE_CACHE.glob("MOZE_*.csv"))
         finance_files = (
             list(finance_dir.glob("Último resumen*.xlsx"))
             + list(finance_dir.glob("Ultimo resumen*.xlsx"))
@@ -816,7 +854,12 @@ def snapshot(
             if _DASHBOARD_CACHE.get("key") == cache_key:
                 return _DASHBOARD_CACHE["payload"]
 
-    transactions, moze_sources = _load_moze_rows(moze_dir) if moze_dir.exists() else ([], [])
+    extra_moze: tuple[Path, ...] = (_MOZE_CACHE,) if _MOZE_CACHE else ()
+    transactions, moze_sources = (
+        _load_moze_rows(moze_dir, extra_dirs=extra_moze)
+        if moze_dir.exists() or (_MOZE_CACHE and _MOZE_CACHE.exists())
+        else ([], [])
+    )
     transfers, pdf_sources = _load_pdf_transfers(finance_dir) if finance_dir.exists() else ([], [])
     cards = _load_credit_cards(finance_dir) if finance_dir.exists() else []
 

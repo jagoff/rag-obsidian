@@ -145,6 +145,17 @@ MOZE_MONTH_ES = [
 ]
 
 
+def _moze_cache_dir() -> Path | None:
+    """Cache dir donde `tally4_realm.ensure_moze_csv` deja los CSV
+    generados a partir del backup `.zip` de Tally4. Lazy import para no
+    cargar el módulo en boot si nunca se necesita."""
+    try:
+        from rag.integrations.tally4_realm import CACHE_DIR
+        return CACHE_DIR
+    except Exception:
+        return None
+
+
 def _moze_pnum(s: str) -> float:
     """Parse MOZE numeric column: ES decimals, optional thousand dots."""
     s = (s or "").strip().replace(".", "").replace(",", ".")
@@ -164,13 +175,23 @@ def _moze_fmt_ars(n: float) -> str:
 def _moze_parse_latest() -> tuple[Path, list[tuple[datetime, dict]]] | None:
     """Find newest MOZE_*.csv and parse into (date, row) tuples. Dates are
     MM/DD/YYYY; rows with unparseable dates are skipped.
+
+    Post 2026-05-04: si Tally4 dejó un `MOZE_*.zip` más nuevo que el
+    último CSV, lo extraemos primero (silent-fail) — ver
+    `rag.integrations.tally4_realm`.
     """
     try:
-        csvs = sorted(
-            MOZE_BACKUP_DIR.glob("MOZE_*.csv"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
+        from rag.integrations import tally4_realm
+        tally4_realm.ensure_moze_csv(MOZE_BACKUP_DIR)
+    except Exception:
+        pass
+
+    try:
+        csvs: list[Path] = []
+        for d in (MOZE_BACKUP_DIR, _moze_cache_dir()):
+            if d and d.exists():
+                csvs.extend(d.glob("MOZE_*.csv"))
+        csvs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     except Exception:
         return None
     if not csvs:

@@ -8811,12 +8811,21 @@ def _fetch_finance(now: datetime | None = None) -> dict | None:
     from collections import Counter
 
     now = now or datetime.now()
+    # Tally4 backup gate: si hay un `.zip` nuevo, primero lo convertimos
+    # a CSV en el cache local (silent-fail). El glob de abajo cubre tanto
+    # el dir original (CSVs históricos / drops manuales) como el cache.
     try:
-        csvs = sorted(
-            _MOZE_BACKUP_DIR.glob("MOZE_*.csv"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
+        from rag.integrations import tally4_realm
+        tally4_realm.ensure_moze_csv(_MOZE_BACKUP_DIR)
+        cache_dir = tally4_realm.CACHE_DIR
+    except Exception:
+        cache_dir = None
+    try:
+        csvs: list[Path] = []
+        for d in (_MOZE_BACKUP_DIR, cache_dir):
+            if d and d.exists():
+                csvs.extend(d.glob("MOZE_*.csv"))
+        csvs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     except Exception:
         return None
     if not csvs:

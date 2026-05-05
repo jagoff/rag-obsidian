@@ -127,6 +127,27 @@ class LLMBackend(ABC):
         """Chat completion. Returns Ollama-shape dict for compat."""
 
     @abstractmethod
+    def chat_stream(
+        self,
+        model: str,
+        messages: list[dict[str, str]],
+        options: ChatOptions | None = None,
+        keep_alive: str | int = -1,
+        format: str | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Streaming chat. Yields ChatResponse objects.
+
+        Each intermediate yield has `done=False` and `.message.content`
+        containing the incremental token piece. The terminal yield has
+        `done=True, done_reason='stop'` and empty `.message.content`.
+
+        Call sites iterate with:
+            for chunk in backend.chat_stream(...):
+                piece = chunk.message.content
+        """
+
+    @abstractmethod
     def generate(
         self,
         model: str,
@@ -177,6 +198,28 @@ class OllamaBackend(LLMBackend):
         if format is not None:
             call_kwargs["format"] = format
         return self._ollama.chat(**call_kwargs)
+
+    def chat_stream(
+        self,
+        model: str,
+        messages: list[dict[str, str]],
+        options: ChatOptions | None = None,
+        keep_alive: str | int = -1,
+        format: str | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        opts = self._opts_to_dict(options)
+        call_kwargs = dict(
+            model=to_ollama(model),
+            messages=messages,
+            options=opts,
+            keep_alive=keep_alive,
+            stream=True,
+            **kwargs,
+        )
+        if format is not None:
+            call_kwargs["format"] = format
+        yield from self._ollama.chat(**call_kwargs)
 
     def generate(
         self,
@@ -245,6 +288,18 @@ class MLXBackend(LLMBackend):
     `_idle_ttl` (env `RAG_MLX_IDLE_TTL`, default 1800s) is a hint for
     a future watchdog thread; not yet enforced. Eviction today is
     purely capacity-driven.
+
+    ## Streaming semantics (`chat_stream`)
+
+    `chat_stream(...)` yields `ChatResponse` objects via
+    `mlx_lm.stream_generate`. Each intermediate yield has `done=False`
+    and `.message.content` containing the incremental token piece
+    (may be a sub-word fragment, a word, or multiple tokens depending
+    on the MLX flush granularity). The terminal yield has
+    `done=True, done_reason='stop'` and empty `.message.content`.
+
+    Chat template formatting and JSON-mode nudge work identically to
+    `chat()` — the same `_apply_chat_template` helper is called.
     """
 
     name = "mlx"
@@ -329,6 +384,50 @@ class MLXBackend(LLMBackend):
         return ChatResponse(
             model=to_ollama(model),
             message=Message(role="assistant", content=text),
+            done=True,
+            done_reason="stop",
+        )
+
+    def chat_stream(
+        self,
+        model: str,
+        messages: list[dict[str, str]],
+        options: ChatOptions | None = None,
+        keep_alive: str | int = -1,
+        format: str | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        from mlx_lm import stream_generate  # type: ignore[import-not-found]
+        from mlx_lm.sample_utils import make_sampler  # type: ignore[import-not-found]
+        from ollama._types import ChatResponse, Message  # type: ignore[import-not-found]
+
+        opts = options or ChatOptions()
+        mlx_model, tokenizer = self._load(model)
+        prompt = self._apply_chat_template(tokenizer, messages, format=format)
+
+        sampler = make_sampler(temp=opts.temperature, top_p=opts.top_p)
+        if opts.temperature > 0:
+            import mlx.core as mx  # type: ignore[import-not-found]
+
+            mx.random.seed(opts.seed)
+
+        ollama_model = to_ollama(model)
+        for response in stream_generate(
+            mlx_model,
+            tokenizer,
+            prompt,
+            max_tokens=opts.num_predict,
+            sampler=sampler,
+        ):
+            yield ChatResponse(
+                model=ollama_model,
+                message=Message(role="assistant", content=response.text),
+                done=False,
+            )
+
+        yield ChatResponse(
+            model=ollama_model,
+            message=Message(role="assistant", content=""),
             done=True,
             done_reason="stop",
         )

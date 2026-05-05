@@ -19953,6 +19953,14 @@ def retrieve_result_to_log_extras(rr: "RetrieveResult") -> dict:
             ),
             "llm_judge_parse_failed": bool(rr.get("llm_judge_parse_failed", False)),
             "llm_judge_n_candidates": int(rr.get("llm_judge_n_candidates", 0) or 0),
+            # filters_applied: filtros inferidos por retrieve() (source, folder,
+            # tag, date_range). Incluido acá para que web/server.py lo propague
+            # via **retrieve_result_to_log_extras(result) sin acordarse de
+            # agregarlo en gen(). Fix 2026-05-04 — estaba siempre {} porque
+            # ningún call site del path web incluía "filters" en el dict de
+            # log_query_event. _map_queries_row busca key "filters" → col
+            # "filters_json". _filters computado arriba como rr.filters_applied.
+            "filters": _filters,
         }
     except Exception:
         # Nunca levantar excepción desde un helper de telemetría.
@@ -21048,7 +21056,7 @@ def retrieve(
                         _silent_log(
                             "query_decompose.log_impressions", _exc,
                         )
-                    return RetrieveResult(
+                    _decompose_rr = RetrieveResult(
                         docs=_fused_docs,
                         metas=_fused_metas,
                         scores=_fused_scores,
@@ -21066,6 +21074,13 @@ def retrieve(
                         intent=intent,
                         vault_scope=_vault_scope_acc,
                     )
+                    # Cosechar el ContextVar de typo correction populado
+                    # por el último sub-retrieve. Refleja la corrección
+                    # del ÚLTIMO call a `_correct_typos_llm` hecho por
+                    # ese sub-retrieve (mismo behaviour que las globals
+                    # legacy: the last writer wins).
+                    _apply_typo_telemetry(_decompose_rr)
+                    return _decompose_rr
                 # Fall through si las sub-retrieves no devolvieron nada.
         except Exception as _de_exc:
             _silent_log("query_decompose.outer", _de_exc)
@@ -22179,7 +22194,7 @@ def retrieve(
     # log_query_event can persist it — pre 2026-04-22, 42% of `cmd=web`
     # rows in rag_queries.extra_json had intent=NULL because retrieve()
     # never exposed it. See test_intent_logging_web.py.
-    return RetrieveResult(
+    _final_rr = RetrieveResult(
         docs=docs,
         metas=metas,
         scores=final_scores,
@@ -22211,6 +22226,14 @@ def retrieve(
             _llm_judge_telemetry.get("llm_judge_n_candidates", 0),
         ),
     )
+    # Quick Win #4 — cosechar el ContextVar de typo correction populado
+    # por `expand_queries` → `_correct_typos_llm` y aplicarlo al
+    # `RetrieveResult` (in-place). El caller (CLI `query()`, `serve()`,
+    # web `gen()`) lee `result.llm_typo_*` para loggearlo en
+    # `rag_queries.extra_json`. Sin esta cosecha, los 3 fields quedan en
+    # su default (False/None/None) y la telemetría se pierde.
+    _apply_typo_telemetry(_final_rr)
+    return _final_rr
 
 
 # ── Agentic / deep retrieval ─────────────────────────────────────────────────

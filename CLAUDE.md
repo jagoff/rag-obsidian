@@ -319,6 +319,12 @@ Catálogo completo (47+ vars adicionales): [`docs/env-vars-catalog.md`](docs/env
 - `RAG_FINETUNE_MIN_CORRECTIVES` — default 20. Aborta `scripts/finetune_reranker.py` con exit 5 si la señal limpia es insuficiente.
 - `RAG_DRAFT_VIA_RAGNET=1` — legacy override para redirigir TODOS los ambient sends a RagNet en lugar de destinatarios reales. Útil para testing/debugging acotado.
 
+**Replay + privacy**:
+- `RAG_LOG_REPLAY_PAYLOAD=1` — default OFF. Cuando ON, persiste `response_text` (cap 8 KB) + `history_snapshot` (cap 4 KB) en `rag_queries.extra_json`. Contiene PII del vault — opt-in explícito requerido. Los hashes (`corpus_hash`, `response_hash`, `prompt_hash`, `history_hash`) SIEMPRE se persisten (16 chars hex, ~48 bytes/row overhead) independientemente de este flag.
+- `RAG_LOG_RERANK_RAW=1` — default OFF. Cuando ON, persiste `rerank_logits_raw: list[float]` en `rag_queries.extra_json`. Útil sólo para debugging de regresiones del ranker. Combinado con `RAG_LOG_REPLAY_PAYLOAD=1` el storage estimado es ~3.5 MB/sem (50 queries/día × 2.3 KB/row). Storage con ambas flags OFF: ~30 KB/sem (sólo los 3 hashes).
+- Helpers en `rag/__init__.py`: `_replay_hash(text)`, `_truncate_for_replay(text, max_bytes)`, `_build_replay_fields(*, response, history, prompt, corpus_hash, rerank_logits)`. Callers: CLI `query()` (usa `_cache_hash`), CLI `chat()` (usa `_corpus_hash_cached(col)` + `history[:-2]`), `rag serve` main path (usa `_serve_sem_hash`), `web/server.py gen()` (usa `_semantic_cache_hash`).
+- Tests: `tests/test_replay_payload.py` (28 casos: shape con/sin flags, truncation UTF-8, hashes determinísticos, back-compat rows legacy, truthy/falsy variants).
+
 **Misc**:
 - `OBSIDIAN_RAG_NO_APPLE=1` — desactiva integraciones Apple (Calendar/Reminders/Mail/ScreenTime).
 - `RAG_TIMEZONE` — IANA tz para `_parse_natural_datetime` con tzinfo (default `America/Argentina/Buenos_Aires`).

@@ -1896,6 +1896,74 @@ def _render_text(report: dict) -> str:
                 out.append(f"   ⚠️  {ddh['suggestion']}")
         out.append("")
 
+    # Corpus coverage gaps
+    ccg = report.get("corpus_coverage_gaps")
+    if ccg is not None:
+        if ccg.get("error"):
+            out.append(f"📭 Corpus coverage gaps: ERROR — {ccg['error']}")
+        else:
+            total_low = ccg["total_low_score_queries"]
+            unique = ccg["unique_queries_repeated"]
+            alert = ccg["alert"]
+            out.append(
+                f"📭 Corpus coverage gaps: {unique} temas repetidos con baja cobertura "
+                f"({total_low} queries low-score en {ccg['window_days']}d)"
+            )
+            if alert:
+                out.append(
+                    "   ⚠️  ALERT: ≥5 temas distintos sin buena cobertura — "
+                    "considerá indexar contenido o agregar notas al vault."
+                )
+            if ccg["top_candidates"]:
+                out.append(
+                    f"   {'query':<60}  {'n':>4}  {'avg_score':>9}"
+                )
+                out.append(f"   {'─' * 60}  {'─' * 4}  {'─' * 9}")
+                for c in ccg["top_candidates"][:10]:
+                    q_trunc = c["q_normalized"][:60]
+                    out.append(
+                        f"   {q_trunc:<60}  {c['occurrences']:>4}  "
+                        f"{c['avg_top_score']:>9.3f}"
+                    )
+        out.append("")
+
+
+    # CTR retrieval (impression -> open ratio)
+    itor = report.get("impression_to_open_ratio")
+    if itor is not None and not itor.get("error"):
+        ctr_7d = itor.get("ctr_pct_7d", 0.0)
+        imp_7d = itor.get("impressions_7d", 0)
+        op_7d = itor.get("opens_7d", 0)
+        ctr_30d = itor.get("ctr_pct_30d")
+        trend = itor.get("trend_pct")
+        alert = itor.get("alert", False)
+        prefix = "⚠️  👆" if alert else "✓ "
+        baseline_str = (
+            f" | baseline 30d: {ctr_30d:.4f}% (trend {trend:+.1f}% vs 30d)"
+            if ctr_30d is not None and trend is not None
+            else ""
+        )
+        out.append(
+            f"{prefix} CTR retrieval ({itor['window_days']}d): {ctr_7d:.4f}%"
+            f" ({op_7d} opens / {imp_7d:,} impressions){baseline_str}"
+        )
+        breakdown = itor.get("weekly_breakdown", [])
+        if breakdown:
+            out.append("   Breakdown semanal (ultimas 4 semanas):")
+            max_ctr = max((b["ctr_pct"] for b in breakdown), default=1.0) or 1.0
+            for b in breakdown:
+                bar_len = int(b["ctr_pct"] / max_ctr * 20)
+                bar = "█" * bar_len
+                out.append(
+                    f"     {b['week']}  {b['opens']:>5} opens / {b['impressions']:>10,} imp"
+                    f"  CTR {b['ctr_pct']:.4f}%  {bar}"
+                )
+        for reason in itor.get("alert_reasons", []):
+            out.append(f"   ⚠️  {reason}")
+        if itor.get("suggestion"):
+            out.append(f"   Sugerencia: {itor['suggestion']}")
+        out.append("")
+
     # DB size
     db = report.get("db_size", {})
     out.append("💽 DB sizes:")
@@ -1996,6 +2064,33 @@ def _render_text(report: dict) -> str:
             "top_score \u2265 0.4 donde el user se fue igual. "
             "Revisar respuestas del LLM (vacias / alucinaciones)."
         )
+    ddh_hints = report.get("draft_decision_health")
+    if ccg is not None and not ccg.get("error") and ccg.get("alert"):
+        unique_ccg = ccg["unique_queries_repeated"]
+        out.append(
+            f"  • Corpus gaps ALERT: {unique_ccg} temas repetidos sin buena cobertura. "
+            "Revisá la tabla arriba y agregá notas al vault o corré "
+            "`rag index` sobre fuentes relevantes."
+        )
+    if (
+        ddh_hints is not None
+        and not ddh_hints.get("error")
+        and not ddh_hints["dpo_gate_open"]
+    ):
+        gold = ddh_hints["gold_pairs_total"]
+        threshold = ddh_hints["dpo_gate_threshold"]
+        out.append(
+            f"  • DPO fine-tune (drafts WA) BLOQUEADO: {gold}/{threshold} gold pairs. "
+            "Editá más drafts del bot en vez de aprobarlos tal cual — "
+            "cada edición es un par gold para el training."
+        )
+    itor_hints = report.get("impression_to_open_ratio")
+    if itor_hints is not None and itor_hints.get("alert") and not itor_hints.get("error"):
+        out.append(
+            "  • CTR retrieval caído — correr 'rag tune --apply' para re-calibrar "
+            "ranker.json weights (click_prior, dwell_score). "
+            "Verificar que RAG_TRACK_OPENS=1 esté en el plist del serve."
+        )
     if (
         not err.get("total_errors")
         and not (lat and lat.get("outliers"))
@@ -2004,6 +2099,8 @@ def _render_text(report: dict) -> str:
         and (chat is None or chat.get("status") == "healthy")
         and (fcg is None or fcg.get("gate_open") or fcg.get("error"))
         and (ahs_hints is None or not ahs_hints.get("alert"))
+        and (ccg is None or not ccg.get("alert") or ccg.get("error"))
+        and (itor_hints is None or not itor_hints.get("alert"))
     ):
         out.append("  • ✅ Sistema sano. No se requiere acción inmediata.")
     out.append("=" * 72)
@@ -2047,6 +2144,8 @@ def main() -> int:
         report["abandon_high_score"] = None
         report["ranker_blind_spots"] = None
         report["draft_decision_health"] = None
+        report["impression_to_open_ratio"] = None
+        report["corpus_coverage_gaps"] = None
         report["db_unavailable"] = str(TELEMETRY_DB)
     else:
         try:
@@ -2073,6 +2172,8 @@ def main() -> int:
             report["abandon_high_score"] = _audit_abandon_high_score(conn, args.days)
             report["ranker_blind_spots"] = _audit_ranker_blind_spots(conn, days=30)
             report["draft_decision_health"] = _audit_draft_decision_health(conn, args.days)
+            report["impression_to_open_ratio"] = _audit_impression_to_open_ratio(conn, args.days)
+            report["corpus_coverage_gaps"] = _audit_corpus_coverage_gaps(conn, args.days)
         except sqlite3.OperationalError as exc:
             report["query_latency"] = None
             report["cache_health"] = None
@@ -2086,6 +2187,8 @@ def main() -> int:
             report["abandon_high_score"] = None
             report["ranker_blind_spots"] = None
             report["draft_decision_health"] = None
+            report["impression_to_open_ratio"] = None
+            report["corpus_coverage_gaps"] = None
             report["db_error"] = repr(exc)
         finally:
             conn.close()

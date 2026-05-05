@@ -1201,6 +1201,126 @@ def _audit_abandon_high_score(conn, days: int) -> dict:
     return out
 
 
+
+
+def _audit_impression_to_open_ratio(conn, days: int = 7) -> dict:
+    """CTR global del retrieval: chunks mostrados -> clicks (opens).
+
+    Pregunta accionable: que fraccion de los chunks que el ranker devuelve
+    termina siendo abierta por el user? Si baja semana a semana, el ranking
+    esta degradando (trae chunks poco relevantes a top-k visible).
+
+    Baseline medido en produccion 2026-05-04:
+      7d  = 0.065% (180 opens / 275,970 impressions)
+      30d = 0.118% (325 opens / 276,596 impressions)
+      trend = -44.5%.
+
+    Alerta cuando:
+      - trend < -20% vs baseline 30d, con >= 100 impresiones en 7d.
+      - CTR absoluto 7d < 0.02%.
+    """
+    import sqlite3 as _sqlite3
+
+    out = {
+        "window_days": days,
+        "impressions_7d": 0,
+        "opens_7d": 0,
+        "ctr_pct_7d": 0.0,
+        "impressions_30d": 0,
+        "opens_30d": 0,
+        "ctr_pct_30d": None,
+        "trend_pct": None,
+        "alert": False,
+        "alert_reasons": [],
+        "suggestion": "",
+        "weekly_breakdown": [],
+    }
+
+    try:
+        exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='rag_behavior'"
+        ).fetchone()
+    except _sqlite3.OperationalError as exc:
+        out["error"] = repr(exc)
+        return out
+    if exists is None:
+        out["error"] = "table missing: rag_behavior"
+        return out
+
+    row_nd = conn.execute(
+        "SELECT"
+        "  COUNT(DISTINCT CASE WHEN event = 'impression' THEN id END),"
+        "  COUNT(DISTINCT CASE WHEN event = 'open'       THEN id END)"
+        " FROM rag_behavior"
+        " WHERE ts >= datetime('now', ?)",
+        (f"-{days} days",),
+    ).fetchone()
+    impressions_7d = int(row_nd[0] or 0)
+    opens_7d = int(row_nd[1] or 0)
+    ctr_7d = round(100.0 * opens_7d / impressions_7d, 4) if impressions_7d else 0.0
+    out["impressions_7d"] = impressions_7d
+    out["opens_7d"] = opens_7d
+    out["ctr_pct_7d"] = ctr_7d
+
+    row_30d = conn.execute(
+        "SELECT"
+        "  COUNT(DISTINCT CASE WHEN event = 'impression' THEN id END),"
+        "  COUNT(DISTINCT CASE WHEN event = 'open'       THEN id END)"
+        " FROM rag_behavior"
+        " WHERE ts >= datetime('now', '-30 days')",
+    ).fetchone()
+    impressions_30d = int(row_30d[0] or 0)
+    opens_30d = int(row_30d[1] or 0)
+    ctr_30d = round(100.0 * opens_30d / impressions_30d, 4) if impressions_30d else None
+    out["impressions_30d"] = impressions_30d
+    out["opens_30d"] = opens_30d
+    out["ctr_pct_30d"] = ctr_30d
+
+    trend_pct = None
+    if ctr_30d is not None and ctr_30d > 0:
+        trend_pct = round((ctr_7d - ctr_30d) / ctr_30d * 100.0, 1)
+    out["trend_pct"] = trend_pct
+
+    weekly_rows = conn.execute(
+        "SELECT strftime('%Y-W%W', ts) AS week,"
+        "  COUNT(DISTINCT CASE WHEN event = 'impression' THEN id END) AS imp,"
+        "  COUNT(DISTINCT CASE WHEN event = 'open'       THEN id END) AS op"
+        " FROM rag_behavior"
+        " WHERE ts >= datetime('now', '-28 days')"
+        " GROUP BY week"
+        " ORDER BY week ASC",
+    ).fetchall()
+    breakdown = []
+    for r in weekly_rows:
+        imp = int(r[1] or 0)
+        op = int(r[2] or 0)
+        ctr = round(100.0 * op / imp, 4) if imp else 0.0
+        breakdown.append({"week": r[0], "impressions": imp, "opens": op, "ctr_pct": ctr})
+    out["weekly_breakdown"] = breakdown
+
+    alert_reasons = []
+    if impressions_7d >= 100:
+        if trend_pct is not None and trend_pct < -20.0:
+            alert_reasons.append(
+                f"CTR cayo {abs(trend_pct):.1f}% vs baseline 30d "
+                f"({ctr_7d:.4f}% -> desde {ctr_30d:.4f}%)"
+            )
+        if ctr_7d < 0.02:
+            alert_reasons.append(
+                f"CTR absoluto muy bajo: {ctr_7d:.4f}% "
+                "(piso operacional 0.02%) -- el ranker no trae notas que el user abra"
+            )
+    out["alert"] = bool(alert_reasons)
+    out["alert_reasons"] = alert_reasons
+    if alert_reasons:
+        out["suggestion"] = (
+            "Revisar ranker.json weights (click_prior, dwell_score). "
+            "Correr 'rag tune --apply' si hay suficiente data en rag_behavior. "
+            "Verificar que RAG_TRACK_OPENS=1 este seteado en el plist del serve."
+        )
+    return out
+
+
 def _audit_cache_hit_by_intent(conn, days: int) -> dict:
     """Cache hit rate por intent — detecta intents con eligible>=20 y hit_rate<5%."""
     import sqlite3 as _sqlite3
@@ -1452,6 +1572,55 @@ def _audit_corpus_coverage_gaps(conn, days: int) -> dict:
     out["alert"] = out["unique_queries_repeated"] >= 5
     return out
 
+
+
+def _audit_impression_to_open_ratio(conn, days: int = 7) -> dict:
+    """CTR: proporción de queries con al menos un 'open' de behavior.
+
+    Detecta si el user está usando los resultados (abriendo notas) o
+    ignorándolos. Un CTR < 0.5% con alto volumen indica resultados
+    poco relevantes o mala UX de apertura.
+    """
+    from datetime import datetime, timedelta
+    cutoff_iso = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+    out: dict = {
+        "window_days": days,
+        "total_queries": 0,
+        "queries_with_open": 0,
+        "ctr_pct": 0.0,
+        "alert": False,
+    }
+    try:
+        exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='rag_behavior'"
+        ).fetchone()
+        if exists is None:
+            out["error"] = "table missing: rag_behavior"
+            return out
+
+        queries_row = conn.execute(
+            "SELECT COUNT(*) FROM rag_queries WHERE ts >= ? AND q != ''",
+            (cutoff_iso,),
+        ).fetchone()
+        out["total_queries"] = int(queries_row[0] or 0)
+
+        opens_row = conn.execute(
+            """
+            SELECT COUNT(DISTINCT session) FROM rag_behavior
+            WHERE ts >= ? AND event = 'open'
+            """,
+            (cutoff_iso,),
+        ).fetchone()
+        out["queries_with_open"] = int(opens_row[0] or 0)
+
+        total = out["total_queries"]
+        if total > 0:
+            out["ctr_pct"] = round(out["queries_with_open"] / total * 100, 4)
+
+        out["alert"] = total >= 50 and out["ctr_pct"] < 0.5
+    except Exception as exc:
+        out["error"] = repr(exc)
+    return out
 
 
 def _audit_draft_decision_health(conn: sqlite3.Connection, days: int = 30) -> dict:

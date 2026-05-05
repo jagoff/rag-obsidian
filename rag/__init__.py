@@ -2563,6 +2563,16 @@ _INTENT_RECENCY_MULTIPLIERS: dict[str, float] = {
 }
 
 
+@functools.lru_cache(maxsize=256)
+def _query_temporal_intent_cached(text: str) -> str:
+    """Pure inner — sólo el regex match. Determinístico, LRU 256."""
+    if _TEMPORAL_INTENT_HISTORICAL_RE.search(text):
+        return "historical"
+    if _TEMPORAL_INTENT_RECENT_RE.search(text):
+        return "recent"
+    return "neutral"
+
+
 def _query_temporal_intent(query: str) -> str:
     """Clasifica la intent temporal de la query → recent | historical | neutral.
 
@@ -2580,20 +2590,16 @@ def _query_temporal_intent(query: str) -> str:
 
     Empty / None / no-string input → "neutral" (defensivo, no rompe a
     callers que olvidan validar).
+
+    Cache: LRU 256 sobre el inner — queries ya vistas vuelven en O(1)
+    sin re-evaluar 2 regex (~100-200µs por miss).
     """
     if not query or not isinstance(query, str):
         return "neutral"
     text = query.strip()
     if not text:
         return "neutral"
-    # Historical primero: las pistas de pasado distante son más fuertes
-    # que las de "ahora" (un "hace 3 años" gana sobre cualquier otra
-    # cosa en la misma query).
-    if _TEMPORAL_INTENT_HISTORICAL_RE.search(text):
-        return "historical"
-    if _TEMPORAL_INTENT_RECENT_RE.search(text):
-        return "recent"
-    return "neutral"
+    return _query_temporal_intent_cached(text)
 
 
 def source_recency_halflife_for_intent(
@@ -16379,9 +16385,17 @@ def _build_rerank_input(parent: str, meta: dict) -> str:
     return header + parent
 
 
-def get_vocabulary(col: SqliteVecCollection) -> tuple[set[str], set[str]]:
-    """Collect unique tags and folders from the index for intent-based filtering."""
-    c = _load_corpus(col)
+def get_vocabulary(
+    col: SqliteVecCollection, *, hint_count: int | None = None,
+) -> tuple[set[str], set[str]]:
+    """Collect unique tags and folders from the index for intent-based filtering.
+
+    `hint_count` (2026-05-04, perf): cuando el caller ya tiene un
+    `col.count()` autoritativo del retrieve cycle, pasarlo aquí salta
+    el round-trip SQL redundante en `_load_corpus`. Saves ~1-2ms por
+    retrieve (audit 2026-05-04).
+    """
+    c = _load_corpus(col, hint_count=hint_count)
     return c["tags"], c["folders"]
 
 
@@ -19649,8 +19663,13 @@ def _summarize_conversation_history(
     if not history:
         return ""
 
+    # `separators=(',', ':')` quita los espacios default — para hash
+    # computation no aporta nada y reduce ~10-15% los bytes a hashear.
     history_hash = _hashlib.sha256(
-        _json.dumps(history, ensure_ascii=False, sort_keys=False).encode()
+        _json.dumps(
+            history, ensure_ascii=False, sort_keys=False,
+            separators=(",", ":"),
+        ).encode()
     ).hexdigest()[:16]
 
     # ── Cache lookup ──────────────────────────────────────────────────────────
@@ -20907,7 +20926,7 @@ def retrieve(
     # 2. Auto-filter: sniff tag/folder/date from the query against index vocabulary
     filters_applied: dict = {}
     if auto_filter and not folder and not tag:
-        known_tags, known_folders = get_vocabulary(col)
+        known_tags, known_folders = get_vocabulary(col, hint_count=_col_count)
         inferred_folder, inferred_tag = infer_filters(search_query, known_tags, known_folders)
         folder = folder or inferred_folder
         tag = tag or inferred_tag

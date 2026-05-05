@@ -19953,6 +19953,17 @@ def retrieve_result_to_log_extras(rr: "RetrieveResult") -> dict:
             ),
             "llm_judge_parse_failed": bool(rr.get("llm_judge_parse_failed", False)),
             "llm_judge_n_candidates": int(rr.get("llm_judge_n_candidates", 0) or 0),
+            # Quick Win #4 — LLM typo correction telemetry (2026-05-04,
+            # refactor 2026-05-04 evening). Pre-refactor estos campos
+            # vivían en globals (`_expand_last_llm_typo_*[0]`) que el web
+            # multi-thread podía pisar entre requests concurrentes.
+            # Ahora vienen del `RetrieveResult` populado por
+            # `_apply_typo_telemetry(rr)` desde el ContextVar
+            # `_LLM_TYPO_LAST` thread-safe. El bridge los expone al
+            # /api/chat → log_query_event → rag_queries.extra_json.
+            "llm_typo_corrected": bool(rr.get("llm_typo_corrected", False)),
+            "llm_typo_original": rr.get("llm_typo_original"),
+            "llm_typo_corrected_text": rr.get("llm_typo_corrected_text"),
             # filters_applied: filtros inferidos por retrieve() (source, folder,
             # tag, date_range). Incluido acá para que web/server.py lo propague
             # via **retrieve_result_to_log_extras(result) sin acordarse de
@@ -20409,6 +20420,18 @@ class ChatTurnResult:
             "llm_judge_n_candidates": int(
                 rr.get("llm_judge_n_candidates", 0) or 0,
             ),
+            # Quick Win #4 — LLM typo correction telemetry (2026-05-04,
+            # refactor 2026-05-04 evening). Pre-refactor estos campos
+            # vivían en globals (`_expand_last_llm_typo_*[0]`) que el web
+            # multi-thread podía pisar entre requests concurrentes (data
+            # race silencioso → 0 rows con `llm_typo_corrected` para
+            # `cmd=web` en 30 días aunque el feature corre por default).
+            # Ahora vienen del `RetrieveResult` populado por
+            # `_apply_typo_telemetry(rr)` desde el ContextVar
+            # `_LLM_TYPO_LAST` (thread-safe + asyncio-safe).
+            "llm_typo_corrected": bool(rr.get("llm_typo_corrected", False)),
+            "llm_typo_original": rr.get("llm_typo_original"),
+            "llm_typo_corrected_text": rr.get("llm_typo_corrected_text"),
             # filters_applied: filtros inferidos por retrieve() (source,
             # folder, tag, date_range). Faltaba en to_log_event() → el
             # mapper _map_queries_row nunca encontraba el key "filters" en
@@ -23077,6 +23100,14 @@ def multi_retrieve(
     _mv_llm_judge_n_candidates_acc = 0
     _mv_llm_judge_top_score_before_max = 0.0
     _mv_llm_judge_top_score_after_max = 0.0
+    # Quick Win #4 — acumular typo correction telemetry de cada per-vault
+    # retrieve. Política: el primer vault que reportó corrección manda
+    # (la query es la misma cross-vault, así que `_correct_typos_llm` la
+    # corrige idéntico cada vez). Si ningún vault corrigió, los 3 fields
+    # quedan en su default (False/None/None).
+    _mv_typo_corrected_acc: bool = False
+    _mv_typo_original_acc: str | None = None
+    _mv_typo_corrected_text_acc: str | None = None
     # 2026-05-01 (afternoon): probé paralelizar per-vault con
     # ThreadPoolExecutor y rebotó contra `_bm25_inflight_lock` que es
     # GIL-serialised by design (CLAUDE.md línea 126 — paralelizar BM25
@@ -23142,6 +23173,19 @@ def multi_retrieve(
                 _mv_llm_judge_top_score_after_max = _after
         except Exception:
             pass
+        # Quick Win #4 — propagar typo correction telemetry del per-vault
+        # retrieve al multi-vault aggregate. Primer vault que reportó
+        # corrección manda (la query es la misma cross-vault, así que
+        # `_correct_typos_llm` la corrige idéntico cada vez).
+        try:
+            if not _mv_typo_corrected_acc and bool(
+                r.get("llm_typo_corrected", False)
+            ):
+                _mv_typo_corrected_acc = True
+                _mv_typo_original_acc = r.get("llm_typo_original")
+                _mv_typo_corrected_text_acc = r.get("llm_typo_corrected_text")
+        except Exception:
+            pass
         # Merge graph-expanded context from all vaults
         for gd, gm in zip(r.get("graph_docs", []), r.get("graph_metas", [])):
             gm_annotated = dict(gm)
@@ -23198,6 +23242,13 @@ def multi_retrieve(
         llm_judge_top_score_after=float(_mv_llm_judge_top_score_after_max),
         llm_judge_parse_failed=bool(_mv_llm_judge_parse_failed_acc),
         llm_judge_n_candidates=int(_mv_llm_judge_n_candidates_acc),
+        # Quick Win #4 — typo correction telemetry agregada del primer
+        # vault que reportó corrección (loop arriba). Por construcción la
+        # query es la misma cross-vault así que como mucho hay 1 corrección
+        # única, no múltiples deltas conflictivos.
+        llm_typo_corrected=_mv_typo_corrected_acc,
+        llm_typo_original=_mv_typo_original_acc,
+        llm_typo_corrected_text=_mv_typo_corrected_text_acc,
     )
 
 
@@ -34155,6 +34206,556 @@ def tune(queries_file: str, k: int, samples: int, seed: int,
         console.print(
             f"[dim]Stratified eval skipped ({type(exc).__name__}: {exc})[/dim]"
         )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# rag replay — rerun histórico de queries y diff vs. output original
+# Sprint 3 Tarea B
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _replay_load_row(query_id: int) -> "dict | None":
+    """Carga una fila de rag_queries por id, parseando los campos JSON."""
+    try:
+        with _ragvec_state_conn() as conn:
+            cur = conn.execute(
+                "SELECT * FROM rag_queries WHERE id = ?", (query_id,)
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            cols = [d[0] for d in cur.description]
+            data: dict = dict(zip(cols, row))
+            for col in (
+                "variants_json",
+                "paths_json",
+                "scores_json",
+                "filters_json",
+                "bad_citations_json",
+                "extra_json",
+            ):
+                raw = data.get(col)
+                if raw:
+                    try:
+                        data[col] = json.loads(raw)
+                    except (json.JSONDecodeError, TypeError):
+                        data[col] = None
+            return data
+    except Exception as exc:
+        _silent_log("replay_load_row", exc)
+        return None
+
+
+def _replay_cosine(v1: list, v2: list) -> float:
+    """Cosine similarity entre dos vectores."""
+    import math
+
+    if not v1 or not v2 or len(v1) != len(v2):
+        return 0.0
+    dot = sum(a * b for a, b in zip(v1, v2))
+    n1 = math.sqrt(sum(a * a for a in v1))
+    n2 = math.sqrt(sum(b * b for b in v2))
+    if n1 == 0.0 or n2 == 0.0:
+        return 0.0
+    return dot / (n1 * n2)
+
+
+def _replay_query_row(
+    row: dict,
+    *,
+    skip_gen: bool = False,
+    no_cache: bool = True,
+    force: bool = False,
+) -> dict:
+    """Corre retrieve (y opcionalmente gen) sobre una fila histórica de rag_queries.
+
+    Retorna dict con:
+      query_id, ts, q, cmd,
+      verdict: "equivalent" | "path_drift" | "response_drift" | "regression",
+      path_jaccard: float,
+      top3_changed: bool,
+      response_cosine: float | None,
+      response_hash_match: bool | None,
+      corpus_drift: bool,
+      new_paths: list[str],
+      new_top_score: float | None,
+      error: str | None,
+    """
+    import hashlib
+
+    result: dict = {
+        "query_id": row.get("id"),
+        "ts": row.get("ts"),
+        "q": row.get("q", ""),
+        "cmd": row.get("cmd", ""),
+        "verdict": "equivalent",
+        "path_jaccard": 1.0,
+        "top3_changed": False,
+        "response_cosine": None,
+        "response_hash_match": None,
+        "corpus_drift": False,
+        "new_paths": [],
+        "new_top_score": None,
+        "error": None,
+    }
+
+    q = (row.get("q") or "").strip()
+    if not q:
+        result["error"] = "empty_q"
+        result["verdict"] = "regression"
+        return result
+
+    # ── Corpus drift check ─────────────────────────────────────────────────
+    extra = row.get("extra_json") or {}
+    cached_corpus_hash = extra.get("corpus_hash")
+    if cached_corpus_hash:
+        try:
+            col = get_db()
+            current_hash = _compute_corpus_hash(col)
+            if current_hash != cached_corpus_hash:
+                result["corpus_drift"] = True
+                if not force:
+                    result["error"] = "corpus_drift"
+                    result["verdict"] = "regression"
+                    return result
+        except Exception as exc:
+            _silent_log("replay_corpus_hash", exc)
+
+    # ── Env isolation ─────────────────────────────────────────────────────
+    _explore_saved = os.environ.pop("RAG_EXPLORE", None)
+    _cache_saved = os.environ.get("RAG_CACHE_ENABLED")
+    _skip_behavior_saved = os.environ.get("RAG_SKIP_BEHAVIOR_LOG")
+    os.environ["RAG_SKIP_BEHAVIOR_LOG"] = "1"
+    if no_cache:
+        os.environ["RAG_CACHE_ENABLED"] = "0"
+
+    try:
+        # ── Reconstruir filtros ────────────────────────────────────────────
+        filters_raw = row.get("filters_json") or {}
+        source_filter = filters_raw.get("source")
+        folder_filter = filters_raw.get("folder")
+        tag_filter = filters_raw.get("tag")
+        date_range_filter = filters_raw.get("date_range")
+
+        # ── Retrieve ──────────────────────────────────────────────────────
+        rr = multi_retrieve(
+            q,
+            num_results=5,
+            source=source_filter,
+            folder=folder_filter,
+            tag=tag_filter,
+            date_range=date_range_filter,
+            auto_filter=False,
+            hyde=False,
+            precise=False,
+        )
+
+        new_metas = rr.metas if rr else []
+        new_paths = [m.get("file", "") for m in new_metas]
+        new_top_score = rr.top_score if rr else None
+        result["new_paths"] = new_paths
+        result["new_top_score"] = new_top_score
+
+        # ── Path diff ─────────────────────────────────────────────────────
+        orig_paths = row.get("paths_json") or []
+        orig_top5 = set(orig_paths[:5])
+        new_top5 = set(new_paths[:5])
+        union = orig_top5 | new_top5
+        jaccard = len(orig_top5 & new_top5) / len(union) if union else 1.0
+        result["path_jaccard"] = round(jaccard, 4)
+        result["top3_changed"] = set(orig_paths[:3]) != set(new_paths[:3])
+
+        # ── Response diff ─────────────────────────────────────────────────
+        cached_response_text: "str | None" = extra.get("response_text")
+        cached_response_hash: "str | None" = extra.get("response_hash")
+
+        if not skip_gen and new_metas:
+            try:
+                intent = extra.get("intent", "semantic")
+                sys_prompt = system_prompt_for_intent(intent, loose=False)
+                context_str = build_progressive_context(
+                    new_metas[:5],
+                    rr.docs[:5] if rr and rr.docs else [],
+                    max_tokens=3000,
+                )
+                msgs = [
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": f"{q}\n\n{context_str}"},
+                ]
+                response = ollama.chat(
+                    model=resolve_chat_model(),
+                    messages=msgs,
+                    options=CHAT_OPTIONS,
+                    keep_alive=OLLAMA_KEEP_ALIVE,
+                )
+                new_text: str = response["message"]["content"]
+                new_hash = hashlib.sha256(new_text.encode()).hexdigest()[:16]
+
+                if cached_response_text:
+                    try:
+                        v1 = embed(cached_response_text[:1000])
+                        v2 = embed(new_text[:1000])
+                        cos = _replay_cosine(v1, v2)
+                        result["response_cosine"] = round(cos, 4)
+                        if cos < 0.85:
+                            result["verdict"] = "response_drift"
+                    except Exception:
+                        pass
+                elif cached_response_hash:
+                    match = new_hash == cached_response_hash
+                    result["response_hash_match"] = match
+                    if not match:
+                        result["verdict"] = "response_drift"
+            except Exception as exc:
+                _silent_log("replay_gen", exc)
+                result["error"] = f"gen_error: {type(exc).__name__}"
+
+        # ── Verdict final ─────────────────────────────────────────────────
+        if result["verdict"] == "equivalent":
+            if jaccard < 0.4 or result["top3_changed"]:
+                result["verdict"] = "path_drift"
+
+    except Exception as exc:
+        _silent_log("replay_query_row", exc)
+        result["error"] = str(exc)
+        result["verdict"] = "regression"
+    finally:
+        if _explore_saved is not None:
+            os.environ["RAG_EXPLORE"] = _explore_saved
+        else:
+            os.environ.pop("RAG_EXPLORE", None)
+        if _cache_saved is not None:
+            os.environ["RAG_CACHE_ENABLED"] = _cache_saved
+        elif no_cache:
+            os.environ.pop("RAG_CACHE_ENABLED", None)
+        if _skip_behavior_saved is not None:
+            os.environ["RAG_SKIP_BEHAVIOR_LOG"] = _skip_behavior_saved
+        else:
+            os.environ.pop("RAG_SKIP_BEHAVIOR_LOG", None)
+
+    return result
+
+
+def _replay_render_single(
+    result: dict, *, plain: bool = False, as_json: bool = False
+) -> None:
+    """Renderiza un resultado de replay en terminal."""
+    if as_json:
+        click.echo(json.dumps(result, ensure_ascii=False))
+        return
+
+    verdict = result.get("verdict", "?")
+    q = result.get("q", "")[:80]
+    qid = result.get("query_id", "?")
+    ts = (result.get("ts") or "")[:16]
+    jaccard = result.get("path_jaccard", 1.0)
+    top3 = result.get("top3_changed", False)
+    cos = result.get("response_cosine")
+    drift = result.get("corpus_drift", False)
+    err = result.get("error")
+
+    verdict_color = {
+        "equivalent": "green",
+        "path_drift": "yellow",
+        "response_drift": "yellow",
+        "regression": "red",
+    }.get(verdict, "white")
+
+    if plain:
+        top3_str = "changed" if top3 else "same"
+        line = (
+            f"[{verdict}] id={qid} ts={ts} jaccard={jaccard:.2f} top3={top3_str}"
+        )
+        if cos is not None:
+            line += f" cosine={cos:.3f}"
+        if drift:
+            line += " corpus_drift=True"
+        if err:
+            line += f" error={err}"
+        line += f" q={q!r}"
+        click.echo(line)
+    else:
+        _verdict_icon = {
+            "equivalent": "✓",
+            "path_drift": "⚠",
+            "response_drift": "⚠",
+            "regression": "✗",
+        }.get(verdict, "?")
+        console.print(
+            f"[{verdict_color}]{_verdict_icon} [{verdict.upper()}][/{verdict_color}] "
+            f"[dim]id={qid} · {ts}[/dim]"
+        )
+        console.print(f"  [bold]{q}[/bold]")
+        top3_rich = "[yellow]changed[/yellow]" if top3 else "[green]same[/green]"
+        detail = f"  path_jaccard=[cyan]{jaccard:.2f}[/cyan]  top3={top3_rich}"
+        if cos is not None:
+            detail += f"  response_cosine=[cyan]{cos:.3f}[/cyan]"
+        if drift:
+            detail += "  [yellow]corpus_drift[/yellow]"
+        console.print(detail)
+        new_paths = result.get("new_paths", [])
+        if new_paths:
+            console.print(f"  [dim]new top-1: {new_paths[0]}[/dim]")
+        if err:
+            console.print(f"  [red]error: {err}[/red]")
+
+
+@cli.command("replay")
+@click.argument("query_id", type=int, required=False, default=None)
+@click.option(
+    "--diff",
+    "mode",
+    flag_value="diff",
+    default=True,
+    help="Diff vs. output original (default)",
+)
+@click.option(
+    "--explain",
+    "mode",
+    flag_value="explain",
+    help="Solo muestra paths nuevos sin comparar",
+)
+@click.option(
+    "--bulk",
+    is_flag=True,
+    default=False,
+    help="Rerunear múltiples queries del historial",
+)
+@click.option(
+    "--since",
+    default="7d",
+    help="Ventana temporal para --bulk (ej. '7d', '24h'). Default: 7d",
+)
+@click.option(
+    "--limit",
+    default=20,
+    show_default=True,
+    help="Máximo de queries para --bulk",
+)
+@click.option(
+    "--skip-gen",
+    is_flag=True,
+    default=False,
+    help="Solo comparar paths, sin correr LLM gen",
+)
+@click.option(
+    "--no-cache",
+    is_flag=True,
+    default=True,
+    help="Disable semantic cache durante el replay (default ON)",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Continuar aunque haya corpus drift",
+)
+@click.option(
+    "--filter-cmd",
+    default=None,
+    help="Filtrar bulk por cmd (ej. 'web.chat', 'cli')",
+)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Output JSON")
+@click.option("--plain", is_flag=True, default=False, help="Output plano (sin Rich)")
+def replay(
+    query_id: "int | None",
+    mode: str,
+    bulk: bool,
+    since: str,
+    limit: int,
+    skip_gen: bool,
+    no_cache: bool,
+    force: bool,
+    filter_cmd: "str | None",
+    as_json: bool,
+    plain: bool,
+) -> None:
+    """Rerrunear queries históricas y diffear vs. output original.
+
+    \b
+    rag replay <id>            Diff de un query puntual
+    rag replay --bulk          Rerunea los últimos 20 queries (7d)
+    rag replay <id> --explain  Muestra paths nuevos sin comparar
+
+    Exit codes:
+      0 - sin regresion (o --explain)
+      1 - regresion detectada (verdict != equivalent)
+      2 - query_id no encontrado o q vacio
+      3 - corpus drift sin --force
+    """
+    # ── Bulk mode ─────────────────────────────────────────────────────────
+    if bulk:
+        # parse_since returns a Unix timestamp float; convert to ISO-8601 string
+        since_iso: "str | None" = None
+        try:
+            since_ts = parse_since(since)
+            if since_ts is not None:
+                import datetime as _dt
+                since_iso = _dt.datetime.fromtimestamp(
+                    float(since_ts), tz=_dt.timezone.utc
+                ).strftime("%Y-%m-%dT%H:%M:%S")
+        except Exception:
+            since_iso = None
+
+        rows: list[dict] = []
+        try:
+            with _ragvec_state_conn() as conn:
+                where_parts = ["q IS NOT NULL", "q != ''", "LENGTH(q) > 0"]
+                params: list = []
+                if since_iso:
+                    where_parts.append("ts >= ?")
+                    params.append(since_iso)
+                if filter_cmd:
+                    where_parts.append("cmd = ?")
+                    params.append(filter_cmd)
+                where_clause = " AND ".join(where_parts)
+                params.append(limit)
+                cur = conn.execute(
+                    f"SELECT * FROM rag_queries WHERE {where_clause} "
+                    f"ORDER BY ts DESC LIMIT ?",
+                    params,
+                )
+                col_names = [d[0] for d in cur.description]
+                for raw_row in cur.fetchall():
+                    data = dict(zip(col_names, raw_row))
+                    for col in (
+                        "variants_json",
+                        "paths_json",
+                        "scores_json",
+                        "filters_json",
+                        "bad_citations_json",
+                        "extra_json",
+                    ):
+                        raw = data.get(col)
+                        if raw:
+                            try:
+                                data[col] = json.loads(raw)
+                            except (json.JSONDecodeError, TypeError):
+                                data[col] = None
+                    rows.append(data)
+        except Exception as exc:
+            _silent_log("replay_bulk_load", exc)
+            if not plain and not as_json:
+                console.print(f"[red]Error cargando historial:[/red] {exc}")
+            raise SystemExit(2)
+
+        if not rows:
+            if as_json:
+                click.echo(json.dumps({"results": [], "n": 0}))
+            elif plain:
+                click.echo("no queries found")
+            else:
+                console.print("[dim]Sin queries en la ventana.[/dim]")
+            raise SystemExit(0)
+
+        results = []
+        regressions = 0
+        corpus_drifts = 0
+        for r in rows:
+            res = _replay_query_row(
+                r, skip_gen=skip_gen, no_cache=no_cache, force=force
+            )
+            results.append(res)
+            if res["verdict"] != "equivalent":
+                regressions += 1
+            if res.get("corpus_drift"):
+                corpus_drifts += 1
+            if mode != "explain":
+                _replay_render_single(res, plain=plain, as_json=as_json)
+
+        if as_json and mode == "explain":
+            click.echo(
+                json.dumps(
+                    {"results": results, "n": len(results), "regressions": regressions}
+                )
+            )
+        elif not as_json and not plain:
+            color = "red" if regressions > 0 else "green"
+            icon = "✗" if regressions else "✓"
+            console.print(
+                f"\n[{color}]{icon} {regressions}/{len(results)} con drift[/{color}]"
+                + (
+                    f"  [yellow]{corpus_drifts} corpus drift[/yellow]"
+                    if corpus_drifts
+                    else ""
+                )
+            )
+        elif not as_json and plain:
+            click.echo(
+                f"total={len(results)} regressions={regressions} "
+                f"corpus_drifts={corpus_drifts}"
+            )
+
+        if corpus_drifts > 0 and not force:
+            raise SystemExit(3)
+        raise SystemExit(1 if regressions > 0 else 0)
+
+    # ── Single query mode ─────────────────────────────────────────────────
+    if query_id is None:
+        if not plain and not as_json:
+            console.print("[red]Falta query_id. Usa --bulk para modo batch.[/red]")
+        raise SystemExit(2)
+
+    row = _replay_load_row(query_id)
+    if row is None:
+        if as_json:
+            click.echo(json.dumps({"error": "not_found", "query_id": query_id}))
+        elif plain:
+            click.echo(f"error=not_found query_id={query_id}")
+        else:
+            console.print(f"[red]Query {query_id} no encontrado.[/red]")
+        raise SystemExit(2)
+
+    if not (row.get("q") or "").strip():
+        if as_json:
+            click.echo(json.dumps({"error": "empty_q", "query_id": query_id}))
+        elif plain:
+            click.echo(f"error=empty_q query_id={query_id}")
+        else:
+            console.print(f"[red]Query {query_id} tiene q vacio.[/red]")
+        raise SystemExit(2)
+
+    if mode == "explain":
+        result = _replay_query_row(
+            row, skip_gen=True, no_cache=no_cache, force=force
+        )
+        if as_json:
+            click.echo(json.dumps(result, ensure_ascii=False))
+        elif plain:
+            q_val = row.get("q", "")
+            np_val = result.get("new_paths", [])
+            click.echo(f"id={query_id} q={q_val!r} new_paths={np_val}")
+        else:
+            console.print(f"[bold]Replay explain[/bold] - id={query_id}")
+            console.print(f"  q: [italic]{row.get('q', '')[:100]}[/italic]")
+            for i, p in enumerate(result.get("new_paths", [])[:5], 1):
+                console.print(f"  [{i}] {p}")
+            if result.get("error"):
+                console.print(f"  [red]error: {result['error']}[/red]")
+        raise SystemExit(0)
+
+    # ── diff mode (default) ────────────────────────────────────────────────
+    result = _replay_query_row(
+        row, skip_gen=skip_gen, no_cache=no_cache, force=force
+    )
+
+    if result.get("error") == "corpus_drift":
+        if as_json:
+            click.echo(json.dumps({"error": "corpus_drift", "query_id": query_id}))
+        elif plain:
+            click.echo(f"error=corpus_drift query_id={query_id}")
+        else:
+            console.print(
+                f"[yellow]Corpus drift detectado para query {query_id}. "
+                f"Usa --force para continuar igual.[/yellow]"
+            )
+        raise SystemExit(3)
+
+    _replay_render_single(result, plain=plain, as_json=as_json)
+
+    verdict = result.get("verdict", "regression")
+    raise SystemExit(0 if verdict == "equivalent" else 1)
+
+
 
 
 @cli.command()
@@ -52515,6 +53116,16 @@ def serve(host: str, port: int):
             "decompose_ms": int(
                 (result.get("timing") or {}).get("decompose_ms", 0) or 0,
             ),
+            # Quick Win #4 — typo correction telemetry (2026-05-04, refactor
+            # 2026-05-04 evening). Pre-refactor estos 3 fields nunca se
+            # loggeaban en `cmd=serve` aunque el feature corre por default
+            # — las globals legacy `_expand_last_llm_typo_*[0]` solo las
+            # leía el `query()` CLI. Ahora vienen del `RetrieveResult`
+            # populado por `_apply_typo_telemetry(rr)` desde el ContextVar
+            # thread-safe `_LLM_TYPO_LAST`.
+            "llm_typo_corrected": bool(result.get("llm_typo_corrected", False)),
+            "llm_typo_original": result.get("llm_typo_original"),
+            "llm_typo_corrected_text": result.get("llm_typo_corrected_text"),
         })
 
         payload = {

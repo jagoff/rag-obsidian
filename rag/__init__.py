@@ -11739,6 +11739,37 @@ def cache_stats_reset() -> None:
 def embed(texts: list[str]) -> list[list[float]]:
     if not texts:
         return []
+    # Index-time local embedder fast path (RAG_INDEX_LOCAL_EMBED=1).
+    # Reusa el SentenceTransformer (BAAI/bge-m3) que `_get_local_embedder`
+    # ya carga para el query path. Con MPS en Apple Silicon es ~3-5x más
+    # rápido que la ronda RPC a Ollama en batches grandes (medido 2026-05-04
+    # durante el speedup del `rag index --reset`: 18min → ~2min para 6157
+    # chunks). NO afecta el query path: `query_embed_local` sigue usando
+    # su propio entry point (`RAG_LOCAL_EMBED`). Si la carga del modelo
+    # falla (no cache, etc), caemos al path Ollama legacy abajo.
+    #
+    # Cache de embed (`_embed_cache`) se bypassea en este path: durante un
+    # reset full, los embed_texts son first-time y el cache hit-ratio es
+    # casi 0 — no vale la pena el lock contention.
+    if ollama.embed is _ORIGINAL_OLLAMA_EMBED and os.environ.get(
+        "RAG_INDEX_LOCAL_EMBED", ""
+    ).strip().lower() not in ("", "0", "false", "no"):
+        try:
+            _model = _index_embed_local()
+            if _model is not None:
+                arr = _model.encode(
+                    texts,
+                    normalize_embeddings=True,
+                    batch_size=int(os.environ.get("RAG_INDEX_LOCAL_EMBED_BATCH", "64")),
+                    convert_to_numpy=True,
+                    show_progress_bar=False,
+                )
+                return arr.tolist()
+        except Exception as _exc:
+            if os.environ.get("RAG_DEBUG"):
+                print(
+                    f"[index-local-embed] fallback to ollama: {_exc}", flush=True,
+                )
     # Cache invalidation por cambio de modelo (audit 2026-04-25 R2-Embedding #1).
     # Si EMBED_MODEL cambió desde la última vez que populamos el cache,
     # los embeddings cacheados son del modelo viejo (incompatibles
@@ -11981,6 +12012,22 @@ def _get_local_embedder():
                 print(f"[local-embed] unavailable ({_exc}) — falling back to ollama", flush=True)
             _local_embedder = None  # stays None; callers fall back to ollama
     return _local_embedder
+
+
+def _index_embed_local():
+    """Lazy-load BAAI/bge-m3 para el index path (RAG_INDEX_LOCAL_EMBED=1).
+
+    Wrapper alrededor de `_get_local_embedder()` para semántica explícita
+    (el index path NO usa el `_local_embedder_ready` Event que gobierna
+    el query path — el bulk embed acepta esperar la primera carga del
+    modelo, no hay path de fallback rápido como en una query interactiva).
+    Reusa el mismo singleton para no cargar 2 copias del bge-m3 si el
+    proceso de index también sirve queries (caso raro pero posible).
+
+    Returns the loaded SentenceTransformer (con MPS en Apple Silicon),
+    o None si la carga falla — `embed()` cae al path Ollama legacy.
+    """
+    return _get_local_embedder()
 
 
 def query_embed_local(
@@ -27618,7 +27665,13 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
     # el rglob de abajo los absorba. Se gatean por `_is_cross_source_target`
     # — solo corren en el vault home canónico, evitando contaminar vaults
     # secundarios cuando se indexa con `--vault` o env var override.
-    _run_cross_source_etls(VAULT_PATH)
+    # `RAG_SKIP_CROSS_SOURCE_ETLS=1` salta los pre-syncs (uso típico:
+    # `rag index --fast --reset` cuando solo querés reembeber el vault
+    # actual, sin re-pull de gmail/calendar/whatsapp/etc).
+    if os.environ.get("RAG_SKIP_CROSS_SOURCE_ETLS", "").strip().lower() not in ("", "0", "false", "no"):
+        console.print("[dim]Cross-source ETLs salteados (RAG_SKIP_CROSS_SOURCE_ETLS=1).[/dim]")
+    else:
+        _run_cross_source_etls(VAULT_PATH)
 
     # Build file → chunks_in_db map (once) so we can detect stale/orphan chunks.
     existing_all = col.get(include=["metadatas"])
@@ -27665,6 +27718,94 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
         chunks=0, updated=0, skipped=0,
     )
     progress.start()
+
+    # Batching agresivo (2026-05-04): acumular chunks de N notas y mandar
+    # `embed()` en batches grandes en lugar de por nota. Reduce el overhead
+    # RPC contra Ollama (mean 522ms / call → mismo costo amortizado sobre
+    # 64 chunks). Para 6157 chunks: 2101 calls → ~100 calls.
+    #
+    # Gateado por `RAG_INDEX_BATCH_EMBEDS` (default ON, "1"). Si rompe
+    # algo en el wild, exportar `RAG_INDEX_BATCH_EMBEDS=0` lo restaura
+    # al comportamiento legacy (un embed call por nota).
+    #
+    # Tamaño configurable via `RAG_INDEX_BATCH_SIZE` (default 64 chunks).
+    _batch_enabled = os.environ.get(
+        "RAG_INDEX_BATCH_EMBEDS", "1"
+    ).strip().lower() not in ("0", "false", "no")
+    try:
+        _batch_target = int(os.environ.get("RAG_INDEX_BATCH_SIZE", "64"))
+    except (TypeError, ValueError):
+        _batch_target = 64
+    if _batch_target < 1:
+        _batch_target = 1
+
+    # `pending_files`: lista de dicts con todo lo necesario para hacer
+    # `col.add` + entities + url-index UNA VEZ que tenemos los embeddings.
+    # Cada entry: {ids, embed_texts, display_texts, metadatas, doc_id_prefix,
+    #              raw, path, folder, tags}.
+    pending_files: list[dict] = []
+    pending_chunk_count = 0
+
+    def _flush_batch():
+        """Embed all pending files en una llamada y commit a la collection.
+
+        Si la batch de embed entera falla (OOM/timeout/etc), reintenta
+        archivo por archivo para aislar el problema. Files que fallan
+        en el reintento se loggean y se skippean — el resto se commitea.
+        """
+        nonlocal added_chunks, urls_indexed, pending_chunk_count
+        if not pending_files:
+            return
+        all_texts: list[str] = []
+        offsets: list[tuple[int, int]] = []
+        for f in pending_files:
+            start = len(all_texts)
+            all_texts.extend(f["embed_texts"])
+            offsets.append((start, len(all_texts)))
+        embeddings: list | None = None
+        try:
+            embeddings = embed(all_texts)
+        except Exception as exc:
+            _silent_log("index_batch_embed", exc)
+            embeddings = [None] * len(all_texts)
+            for f, (start, _end) in zip(pending_files, offsets):
+                try:
+                    emb_one = embed(f["embed_texts"])
+                    for i, e in enumerate(emb_one):
+                        embeddings[start + i] = e
+                except Exception as inner_exc:
+                    _silent_log("index_batch_embed_per_file", inner_exc)
+                    f["_failed"] = True
+        for f, (start, end) in zip(pending_files, offsets):
+            if f.get("_failed"):
+                continue
+            embs = embeddings[start:end]
+            if any(e is None for e in embs):
+                continue
+            col.add(
+                ids=f["ids"],
+                embeddings=embs,
+                documents=f["display_texts"],
+                metadatas=f["metadatas"],
+            )
+            added_chunks += len(f["ids"])
+            try:
+                _extract_and_index_entities_for_chunks(
+                    f["display_texts"], f["ids"], f["metadatas"], "vault"
+                )
+            except Exception as exc:
+                _silent_log("index_batch_entities", exc)
+            try:
+                urls_indexed += _index_urls(
+                    col_urls, f["doc_id_prefix"], f["raw"],
+                    f["path"].stem, f["folder"], f["tags"],
+                )
+            except Exception:
+                pass
+            indexed_files.add(f["doc_id_prefix"])
+        pending_files.clear()
+        pending_chunk_count = 0
+
     try:
         for path in md_files:
             progress.advance(task_id)
@@ -27748,7 +27889,6 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
                 parent_doc_text=text,
                 doc_metadata={"title": path.stem, "folder": folder, "note": path.stem},
             )
-            embeddings = embed(embed_texts)
 
             # Metadata carries hash + searchable frontmatter fields for filtering.
             base_meta = {
@@ -27773,23 +27913,35 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
                 meta["parent"] = p
                 metadatas.append(meta)
 
-            col.add(
-                ids=ids,
-                embeddings=embeddings,
-                documents=display_texts,
-                metadatas=metadatas,
-            )
-            added_chunks += len(ids)
-            # Entity extraction — see `_index_single_file` for the same hook
-            # on the incremental path; same invariants (gated by
-            # `_entity_extraction_enabled`, silent-fail if gliner absent).
-            _extract_and_index_entities_for_chunks(display_texts, ids, metadatas, "vault")
-            # URL sub-index, same hash gate as the chunk index above.
-            try:
-                urls_indexed += _index_urls(col_urls, doc_id_prefix, raw, path.stem, folder, tags)
-            except Exception:
-                pass
-            indexed_files.add(doc_id_prefix)
+            # Encolar en pending_files; el embed real corre en `_flush_batch`
+            # cuando el contador llega al target. Si batching está OFF,
+            # flusheamos inmediatamente (un file == una embed call, igual
+            # que el comportamiento legacy pre-2026-05-04).
+            pending_files.append({
+                "ids": ids,
+                "embed_texts": embed_texts,
+                "display_texts": display_texts,
+                "metadatas": metadatas,
+                "doc_id_prefix": doc_id_prefix,
+                "raw": raw,
+                "path": path,
+                "folder": folder,
+                "tags": tags,
+            })
+            pending_chunk_count += len(ids)
+
+            if not _batch_enabled or pending_chunk_count >= _batch_target:
+                _flush_batch()
+                # Update progress fields tras flush para que la barra refleje
+                # el progreso real (chunks suben en saltos, no por nota).
+                progress.update(
+                    task_id,
+                    chunks=added_chunks,
+                    updated=updated_files,
+                    skipped=skipped_files,
+                )
+        # Final flush — drena el pending de la última batch parcial.
+        _flush_batch()
         # Final flush of postfix counters antes de stop().
         progress.update(
             task_id,
@@ -27957,9 +28109,15 @@ def _peek_index_lock_holder() -> str:
                    "para esta invocación. Setea RAG_CONTEXTUAL_RETRIEVAL=1 "
                    "internamente. Combinar con --reset para full re-embed "
                    "con contextos chunk-level (~1 LLM call por chunk).")
+@click.option("--fast", is_flag=True,
+              help="Modo rápido: saltea enriquecimientos LLM opcionales "
+                   "(context summary, synthetic questions, contextual retrieval) "
+                   "y los pre-syncs cross-source (gmail/calendar/whatsapp/etc). "
+                   "Acelera ~10x el `--reset` full a cambio de un index sin "
+                   "summaries enriquecidos. Los chunks se embeben igual.")
 def index(reset: bool, no_contradict: bool, source_opt: str | None,
           since_opt: str | None, dry_run: bool, max_chats: int | None,
-          vault_scope: str | None, contextual: bool):
+          vault_scope: str | None, contextual: bool, fast: bool):
     """Indexar notas del vault (incremental, detecta cambios por hash).
 
     En el camino incremental, cada nota nueva o modificada pasa por un check
@@ -28042,6 +28200,29 @@ def index(reset: bool, no_contradict: bool, source_opt: str | None,
                 "obtiene un summary contextual via qwen2.5:3b. "
                 "Cache: rag_chunk_contexts en telemetry.db."
             )
+        # `--fast`: saltea los enriquecimientos LLM opcionales que dominan
+        # el wallclock del reset full (medido 2026-05-04: 10-15min de chat
+        # calls a qwen2.5:3b sobre 50min totales). Snap+restore de las 4
+        # env vars relevantes para no contaminar el shell del user.
+        # Verificación: tras el run, `rag query` sigue funcionando porque
+        # el index sigue conteniendo los embeddings — solo faltan los
+        # summary/synthetic-q opcionales que `retrieve()` ya tolera ausentes.
+        _fast_prev_env: dict[str, str | None] = {}
+        if fast:
+            for _k, _v in (
+                ("OBSIDIAN_RAG_SKIP_CONTEXT_SUMMARY", "1"),
+                ("OBSIDIAN_RAG_SKIP_SYNTHETIC_Q", "1"),
+                ("RAG_CONTEXTUAL_RETRIEVAL", "0"),
+                ("RAG_SKIP_CROSS_SOURCE_ETLS", "1"),
+            ):
+                _fast_prev_env[_k] = os.environ.get(_k)
+                os.environ[_k] = _v
+            console.print(
+                "[cyan]--fast activo[/cyan] — context summary, synthetic "
+                "questions, contextual retrieval y cross-source pre-syncs "
+                "salteados. Para activar batching más agresivo y embed local "
+                "MPS exportá `RAG_INDEX_BATCH_SIZE=128 RAG_INDEX_LOCAL_EMBED=1`."
+            )
         try:
             _do_index(reset, no_contradict, source_opt, since_opt, dry_run, max_chats)
             if contextual:
@@ -28062,6 +28243,13 @@ def index(reset: bool, no_contradict: bool, source_opt: str | None,
                     os.environ.pop("RAG_CONTEXTUAL_RETRIEVAL", None)
                 else:
                     os.environ["RAG_CONTEXTUAL_RETRIEVAL"] = _ctx_prev_env
+            # Idem para las 4 env vars que --fast setea — siempre restaurar.
+            if fast:
+                for _k, _prev in _fast_prev_env.items():
+                    if _prev is None:
+                        os.environ.pop(_k, None)
+                    else:
+                        os.environ[_k] = _prev
     finally:
         _index_lock_ctx.__exit__(None, None, None)
 

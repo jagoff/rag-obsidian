@@ -18,6 +18,7 @@ import sqlite3
 from datetime import datetime, timedelta
 
 from scripts.audit_telemetry_health import (
+    _audit_feedback_corrective_gap,
     check_chat_health,
     check_retrieval_health,
 )
@@ -272,3 +273,134 @@ def test_health_dicts_are_json_serializable(tmp_path):
     # el script con --json va a romper igual en producción.
     json.dumps(ret)
     json.dumps(chat)
+
+
+# ── Tests feedback_corrective_gap ────────────────────────────────────────────
+
+
+def _seed_feedback_db(tmp_path) -> sqlite3.Connection:
+    """Crea una telemetry.db mínima con solo rag_feedback (las columnas
+    que `_audit_feedback_corrective_gap` necesita).
+    """
+    db_path = tmp_path / "telemetry_fb.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """
+        CREATE TABLE rag_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            rating INTEGER NOT NULL,
+            extra_json TEXT
+        )
+        """
+    )
+    conn.commit()
+    return conn
+
+
+def _insert_feedback(
+    conn: sqlite3.Connection,
+    *,
+    rating: int,
+    corrective_path: str | None = None,
+) -> None:
+    extra = None
+    if corrective_path is not None:
+        import json as _json
+        extra = _json.dumps({"corrective_path": corrective_path})
+    conn.execute(
+        "INSERT INTO rag_feedback (ts, rating, extra_json) VALUES (?, ?, ?)",
+        (datetime.now().isoformat(timespec="seconds"), rating, extra),
+    )
+    conn.commit()
+
+
+def test_feedback_cp_gap_empty_table(tmp_path):
+    """Sin ningún feedback → total_neg=0, gate_open=False, rows_to_close=20."""
+    conn = _seed_feedback_db(tmp_path)
+    result = _audit_feedback_corrective_gap(conn)
+    assert result["total_neg"] == 0
+    assert result["has_cp"] == 0
+    assert result["missing_cp"] == 0
+    assert result["pct_covered"] == 0.0
+    assert result["gate_open"] is False
+    assert result["rows_to_close_gate"] == 20
+
+
+def test_feedback_cp_gap_no_cp(tmp_path):
+    """562 negativos sin corrective_path → has_cp=0, gate cerrado."""
+    conn = _seed_feedback_db(tmp_path)
+    for _ in range(562):
+        _insert_feedback(conn, rating=-1)
+    result = _audit_feedback_corrective_gap(conn)
+    assert result["total_neg"] == 562
+    assert result["has_cp"] == 0
+    assert result["missing_cp"] == 562
+    assert result["pct_covered"] == 0.0
+    assert result["gate_open"] is False
+    assert result["rows_to_close_gate"] == 20
+
+
+def test_feedback_cp_gap_partial_cp(tmp_path):
+    """2 negativos con CP sobre 562 → has_cp=2, gate cerrado, faltan 18."""
+    conn = _seed_feedback_db(tmp_path)
+    for _ in range(560):
+        _insert_feedback(conn, rating=-1)
+    _insert_feedback(conn, rating=-1, corrective_path="notas/foo.md")
+    _insert_feedback(conn, rating=-1, corrective_path="notas/bar.md")
+    result = _audit_feedback_corrective_gap(conn)
+    assert result["total_neg"] == 562
+    assert result["has_cp"] == 2
+    assert result["missing_cp"] == 560
+    assert result["pct_covered"] == round(2 / 562 * 100, 2)
+    assert result["gate_open"] is False
+    assert result["rows_to_close_gate"] == 18
+
+
+def test_feedback_cp_gap_gate_open(tmp_path):
+    """20 negativos con CP → gate_open=True, rows_to_close=0."""
+    conn = _seed_feedback_db(tmp_path)
+    for i in range(20):
+        _insert_feedback(conn, rating=-1, corrective_path=f"notas/nota_{i}.md")
+    # Positivos NO deben contar
+    for _ in range(50):
+        _insert_feedback(conn, rating=1)
+    result = _audit_feedback_corrective_gap(conn)
+    assert result["total_neg"] == 20
+    assert result["has_cp"] == 20
+    assert result["gate_open"] is True
+    assert result["rows_to_close_gate"] == 0
+    assert result["pct_covered"] == 100.0
+
+
+def test_feedback_cp_gap_empty_string_cp_does_not_count(tmp_path):
+    """CP con string vacío ("") no cuenta como valid — debe tratarse como missing."""
+    import json as _json
+    conn = _seed_feedback_db(tmp_path)
+    extra = _json.dumps({"corrective_path": ""})
+    conn.execute(
+        "INSERT INTO rag_feedback (ts, rating, extra_json) VALUES (?, ?, ?)",
+        (datetime.now().isoformat(timespec="seconds"), -1, extra),
+    )
+    conn.commit()
+    result = _audit_feedback_corrective_gap(conn)
+    assert result["has_cp"] == 0
+    assert result["missing_cp"] == 1
+
+
+def test_feedback_cp_gap_table_missing(tmp_path):
+    """Si la tabla no existe, devuelve un dict con error (sin raise)."""
+    db_path = tmp_path / "empty.db"
+    conn = sqlite3.connect(str(db_path))
+    result = _audit_feedback_corrective_gap(conn)
+    assert "error" in result
+    assert "rag_feedback" in result["error"]
+
+
+def test_feedback_cp_gap_json_serializable(tmp_path):
+    """El dict de output debe serializar a JSON sin custom default."""
+    import json
+    conn = _seed_feedback_db(tmp_path)
+    _insert_feedback(conn, rating=-1, corrective_path="notas/a.md")
+    result = _audit_feedback_corrective_gap(conn)
+    json.dumps(result)  # no debe raise

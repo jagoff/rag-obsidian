@@ -749,6 +749,348 @@ def check_chat_health(conn: sqlite3.Connection, days: int = 7) -> dict:
     return out
 
 
+def _audit_feedback_corrective_gap(conn: sqlite3.Connection) -> dict:
+    """Gap de corrective_path en feedbacks negativos — gate del LoRA fine-tune.
+
+    El fine-tune del reranker (GC#2.C en CLAUDE.md) requiere ≥20 filas con
+    `corrective_path` limpio en `rag_feedback`. Sin eso el gate de
+    `scripts/finetune_reranker.py` aborta con exit 5. Este check dice
+    exactamente cuántos negativos tienen CP y cuántos faltan para abrir el gate.
+
+    Columnas de output:
+
+    - total_neg: feedbacks con rating < 0
+    - has_cp: de esos, cuántos tienen corrective_path no-null y no-vacío
+    - missing_cp: total_neg - has_cp
+    - pct_covered: has_cp / total_neg * 100 (0.0 si total_neg == 0)
+    - gate_threshold: 20 (hardcoded, mismo que RAG_FINETUNE_MIN_CORRECTIVES)
+    - gate_open: has_cp >= gate_threshold
+    - rows_to_close_gate: max(0, gate_threshold - has_cp)
+    """
+    GATE_THRESHOLD = 20
+    out: dict = {
+        "total_neg": 0,
+        "has_cp": 0,
+        "missing_cp": 0,
+        "pct_covered": 0.0,
+        "gate_threshold": GATE_THRESHOLD,
+        "gate_open": False,
+        "rows_to_close_gate": GATE_THRESHOLD,
+    }
+
+    try:
+        exists = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='rag_feedback'"
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        out["error"] = repr(exc)
+        return out
+    if exists is None:
+        out["error"] = "table missing: rag_feedback"
+        return out
+
+    row = conn.execute(
+        """
+        SELECT
+          COUNT(*) AS total_neg,
+          SUM(CASE WHEN json_extract(extra_json, '$.corrective_path') IS NOT NULL
+                    AND json_extract(extra_json, '$.corrective_path') <> '' THEN 1 ELSE 0 END) AS has_cp
+        FROM rag_feedback
+        WHERE rating < 0
+        """
+    ).fetchone()
+
+    total_neg = int(row[0] or 0)
+    has_cp = int(row[1] or 0)
+    missing_cp = total_neg - has_cp
+    pct_covered = round(has_cp / total_neg * 100, 2) if total_neg > 0 else 0.0
+    gate_open = has_cp >= GATE_THRESHOLD
+    rows_to_close = max(0, GATE_THRESHOLD - has_cp)
+
+    out.update({
+        "total_neg": total_neg,
+        "has_cp": has_cp,
+        "missing_cp": missing_cp,
+        "pct_covered": pct_covered,
+        "gate_open": gate_open,
+        "rows_to_close_gate": rows_to_close,
+    })
+    return out
+
+
+def _audit_harvest_candidates(conn: sqlite3.Connection, days: int = 7) -> dict:
+    """Queries recientes con score bajo que todavía no tienen thumbs.
+
+    Detecta el input listo para `rag feedback harvest`: queries con
+    top_score entre CONFIDENCE_RERANK_MIN (0.015) y 0.35 (zona de
+    respuesta dudosa, no refuse), sin feedback explícito en
+    `rag_feedback`. Son los candidatos más valiosos para labeling activo
+    porque el sistema respondió algo pero sin confianza — y sin
+    corrección humana el ranker nunca aprende.
+
+    Join contra `rag_feedback` por `lower(q)` (no hay columna `session`
+    en `rag_feedback`). Un query que aparece N veces en `rag_queries`
+    pero tiene UNA entrada en `rag_feedback` queda fuera — el usuario
+    ya lo puntuó alguna vez con esa misma query.
+
+    Shape de output:
+
+        {
+            "window_days": 7,
+            "count": 58,          # total sin LIMIT
+            "top_candidates": [
+                {
+                    "query_id": 4374,
+                    "q": "cancelar el del médico",
+                    "top_score": 0.04,
+                    "ts": "2026-04-28T19:49:55",
+                    "cmd": "web",
+                },
+                ...
+            ],
+            "alert": True,        # True si count >= 10
+            "harvest_command": "rag feedback harvest --since 7 --limit 20 --confidence-below 0.35",
+        }
+
+    Thresholds:
+
+    - `top_score >= 0.015`: abajo de esto el sistema se niega a
+      responder (CONFIDENCE_RERANK_MIN). Sin sentido labelear refuses.
+    - `top_score <= 0.35`: arriba de esto la confianza es aceptable —
+      el labeling aporta menos. 0.35 coincide con
+      `CONFIDENCE_DEEP_THRESHOLD` (0.10) × 3.5; elegido para capturar
+      la zona que dispara `deep_retrieve` pero termina con score bajo.
+    - `alert=True` desde count >= 10: arbitrario pero accionable.
+      10 candidatos sin label en 7 días = una sesión de harvest de ~5min.
+    """
+    SCORE_MIN = 0.015
+    SCORE_MAX = 0.35
+    ALERT_THRESHOLD = 10
+    LIMIT = 20
+    CMDS = ("web", "query", "serve.chat")
+
+    out: dict = {
+        "window_days": days,
+        "count": 0,
+        "top_candidates": [],
+        "alert": False,
+        "harvest_command": (
+            f"rag feedback harvest --since {days} --limit {LIMIT} "
+            f"--confidence-below {SCORE_MAX}"
+        ),
+    }
+
+    try:
+        exists = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='rag_queries'"
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        out["error"] = repr(exc)
+        return out
+    if exists is None:
+        out["error"] = "table missing: rag_queries"
+        return out
+
+    cutoff_iso = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+    cmds_placeholder = ", ".join("?" * len(CMDS))
+
+    # Conteo total sin LIMIT (separado para no contaminar el shape con
+    # los 20 rows del top_candidates).
+    count_row = conn.execute(
+        f"""
+        SELECT COUNT(*)
+        FROM rag_queries rq
+        LEFT JOIN rag_feedback rf
+          ON lower(rf.q) = lower(rq.q)
+        WHERE rq.ts >= ?
+          AND rq.top_score BETWEEN ? AND ?
+          AND rq.cmd IN ({cmds_placeholder})
+          AND rq.q != ''
+          AND rf.id IS NULL
+        """,
+        (cutoff_iso, SCORE_MIN, SCORE_MAX, *CMDS),
+    ).fetchone()
+    total_count = int(count_row[0] or 0)
+    out["count"] = total_count
+    out["alert"] = total_count >= ALERT_THRESHOLD
+
+    # Top-N candidatos ordenados por score ascendente (los menos
+    # confiables primero) y ts descendente (más recientes en empate).
+    rows = conn.execute(
+        f"""
+        SELECT
+          rq.id AS query_id,
+          rq.q,
+          ROUND(rq.top_score, 4) AS top_score,
+          rq.ts,
+          rq.cmd
+        FROM rag_queries rq
+        LEFT JOIN rag_feedback rf
+          ON lower(rf.q) = lower(rq.q)
+        WHERE rq.ts >= ?
+          AND rq.top_score BETWEEN ? AND ?
+          AND rq.cmd IN ({cmds_placeholder})
+          AND rq.q != ''
+          AND rf.id IS NULL
+        ORDER BY rq.top_score ASC, rq.ts DESC
+        LIMIT {LIMIT}
+        """,
+        (cutoff_iso, SCORE_MIN, SCORE_MAX, *CMDS),
+    ).fetchall()
+
+    out["top_candidates"] = [
+        {
+            "query_id": r[0],
+            "q": r[1],
+            "top_score": r[2],
+            "ts": r[3],
+            "cmd": r[4],
+        }
+        for r in rows
+    ]
+    return out
+
+
+
+
+def _audit_cross_source_single_source(
+    ragvec_conn: sqlite3.Connection, days: int = 7
+) -> dict:
+    """Detector: queries con múltiples sources DISTINTOS en top-k pero dominio de uno.
+
+    **Blocker conocido (2026-05-04)**: `rag_queries.filters_json` siempre está vacío,
+    así que no sabemos QUÉ sources pidió el user vía CLI flags (`--source X,Y`).
+
+    **Workaround**: miramos los sources REALES en los chunks devueltos (via `paths_json`
+    → lookup en meta_obsidian_notes_v11). Si hay ≥2 sources DISTINTOS pero uno domina
+    >80% de los resultados, es probable que el user pidiera múltiples sources pero el
+    ingester de los otros está roto/ausente. Heurística imperfecta, pero accionable.
+
+    Returns:
+        {
+            "window_days": 7,
+            "queries_analyzed": N,
+            "imbalanced_queries": [
+                {
+                    "ts": "...",
+                    "q": "...",
+                    "sources": {"vault": 4, "whatsapp": 1},
+                    "dominant_source": "vault",
+                    "imbalance_pct": 80.0,
+                }
+            ],
+            "count": M,
+            "alert": bool,
+            "blocker_message": "...",
+            "suggestion": "Verificar si los ingesters de fuentes minoritarias corrieron..."
+        }
+    """
+    out: dict = {
+        "window_days": days,
+        "queries_analyzed": 0,
+        "imbalanced_queries": [],
+        "count": 0,
+        "alert": False,
+        "blocker_message": (
+            "⚠️  BLOCKER OPERACIONAL: `rag_queries.filters_json` siempre está vacío, "
+            "así que no podemos determinar explícitamente qué sources pidió el user. "
+            "Este detector usa heurística basada en fuentes reales de los chunks devueltos."
+        ),
+        "suggestion": (
+            "FIX PROPUESTO: agregar logging de `filters_applied` a "
+            "`retrieve()` en rag/__init__.py para registrar sources pedidos vs. obtenidos. "
+            "Sin esto, el detector sigue siendo heurístico y puede tener falsos positivos."
+        ),
+    }
+
+    try:
+        exists = ragvec_conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='meta_obsidian_notes_v11_741d239c'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        out["error"] = "metadata table inaccesible"
+        return out
+    if exists is None:
+        out["error"] = "metadata table missing"
+        return out
+
+    cutoff_iso = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+
+    # Queries con paths_json no-null y >1 path (top-k > 1).
+    try:
+        queries = ragvec_conn.execute(
+            """
+            SELECT ts, q, paths_json
+            FROM rag_queries
+            WHERE ts >= ? AND paths_json IS NOT NULL
+              AND json_array_length(paths_json) >= 2
+            ORDER BY ts DESC
+            LIMIT 50
+            """,
+            (cutoff_iso,),
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        out["error"] = repr(exc)
+        return out
+
+    out["queries_analyzed"] = len(queries)
+
+    # Para cada query, lookupeá los sources de sus paths en metadata.
+    meta_table = "meta_obsidian_notes_v11_741d239c"
+    imbalanced: list = []
+
+    for ts, query_text, paths_json_str in queries:
+        try:
+            paths = (
+                json.loads(paths_json_str)
+                if isinstance(paths_json_str, str)
+                else paths_json_str
+            )
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        # Lookup sources para cada path
+        sources_counter: Counter = Counter()
+        for path in paths:
+            try:
+                result = ragvec_conn.execute(
+                    f"SELECT source FROM {meta_table} WHERE file = ? LIMIT 1",
+                    (path,),
+                ).fetchone()
+                if result and result[0]:
+                    sources_counter[result[0]] += 1
+            except sqlite3.OperationalError:
+                continue
+
+        # ¿Multi-source con imbalance?
+        if len(sources_counter) >= 2:
+            total = sum(sources_counter.values())
+            dominant_source = sources_counter.most_common(1)[0][0]
+            dominant_count = sources_counter.most_common(1)[0][1]
+            imbalance_pct = round(100.0 * dominant_count / total, 1)
+
+            # Alert threshold: una fuente domina >80% del top-k
+            if imbalance_pct > 80.0:
+                imbalanced.append(
+                    {
+                        "ts": ts,
+                        "q": query_text[:60] if query_text else "",
+                        "sources": dict(sources_counter),
+                        "dominant_source": dominant_source,
+                        "imbalance_pct": imbalance_pct,
+                    }
+                )
+
+    out["imbalanced_queries"] = imbalanced
+    out["count"] = len(imbalanced)
+    out["alert"] = out["count"] >= 3
+
+    return out
+
+
 def _audit_db_size() -> dict:
     """Tamaño físico de las DBs + WAL files. Detección temprana de bloat."""
     out = {}
@@ -937,6 +1279,60 @@ def _render_text(report: dict) -> str:
             out.append(f"  - {issue}")
     out.append("")
 
+    # Feedback corrective_path gap
+    fcg = report.get("feedback_corrective_gap")
+    if fcg is not None:
+        if fcg.get("error"):
+            out.append(f"🎯 Feedback corrective_path gap: ERROR — {fcg['error']}")
+        else:
+            total = fcg["total_neg"]
+            has_cp = fcg["has_cp"]
+            missing = fcg["missing_cp"]
+            pct = fcg["pct_covered"]
+            gate_open = fcg["gate_open"]
+            rows_left = fcg["rows_to_close_gate"]
+            threshold = fcg["gate_threshold"]
+            gate_icon = "✅" if gate_open else "🔒"
+            out.append(
+                f"🎯 Feedback corrective_path gap: "
+                f"{has_cp}/{total} negativos con CP ({pct:.1f}%) "
+                f"— gate LoRA {gate_icon} {'ABIERTO' if gate_open else 'CERRADO'} "
+                f"(threshold: {threshold})"
+            )
+            if not gate_open:
+                out.append(
+                    f"   Faltan {rows_left} corrective_paths para abrir el gate. "
+                    f"Corré `rag feedback backfill` o `rag feedback infer-implicit`."
+                )
+        out.append("")
+
+    # Cross-source single-source detector
+    css = report.get("cross_source_single_source")
+    if css is not None:
+        if css.get("error"):
+            out.append(f"🔀 Cross-source imbalance: ERROR — {css['error']}")
+        elif css.get("blocker_message"):
+            out.append(css["blocker_message"])
+        if css.get("count", 0) > 0:
+            out.append(
+                f"🔀 Cross-source imbalance: {css['count']} queries con "
+                f">80% dominio de una fuente (de {css['queries_analyzed']} analizadas)"
+            )
+            if css["alert"]:
+                out.append("   ⚠️  ALERT TRIGGER: ≥3 queries imbalanceadas")
+            for q_info in css.get("imbalanced_queries", [])[:3]:
+                sources_str = ", ".join(
+                    f"{s}:{c}" for s, c in sorted(q_info["sources"].items())
+                )
+                out.append(
+                    f"     • {q_info['ts']} | {q_info['q']!r} | "
+                    f"sources=[{sources_str}] | domina {q_info['dominant_source']} "
+                    f"({q_info['imbalance_pct']:.0f}%)"
+                )
+            if css.get("suggestion"):
+                out.append(f"   Sugerencia: {css['suggestion'][:90]}...")
+        out.append("")
+
     # DB size
     db = report.get("db_size", {})
     out.append("💽 DB sizes:")
@@ -1021,12 +1417,22 @@ def _render_text(report: dict) -> str:
                 f"  • Chat DEGRADED — {n_issues} issue(s). Revisar p95 "
                 "t_gen, critique_fired_rate, y refusal_rate arriba."
             )
+    if fcg is not None and not fcg.get("error") and not fcg["gate_open"]:
+        rows_left = fcg["rows_to_close_gate"]
+        has_cp = fcg["has_cp"]
+        threshold = fcg["gate_threshold"]
+        out.append(
+            f"  • LoRA fine-tune BLOQUEADO: {has_cp}/{threshold} corrective_paths "
+            f"disponibles (faltan {rows_left}). Corré `rag feedback backfill` o "
+            "`rag feedback infer-implicit --window-seconds 600` para destrabar el gate."
+        )
     if (
         not err.get("total_errors")
         and not (lat and lat.get("outliers"))
         and (ant is None or ant.get("status") == "healthy")
         and (ret is None or ret.get("status") == "healthy")
         and (chat is None or chat.get("status") == "healthy")
+        and (fcg is None or fcg.get("gate_open") or fcg.get("error"))
     ):
         out.append("  • ✅ Sistema sano. No se requiere acción inmediata.")
     out.append("=" * 72)
@@ -1056,12 +1462,16 @@ def main() -> int:
     report["db_size"] = _audit_db_size()
 
     conn = _open_db(TELEMETRY_DB)
+    ragvec_conn = _open_db(RAGVEC_DB)
     if conn is None:
         report["query_latency"] = None
         report["cache_health"] = None
         report["anticipate"] = None
         report["retrieval_health"] = None
         report["chat_health"] = None
+        report["feedback_corrective_gap"] = None
+        report["harvest_candidates"] = None
+        report["cross_source_single_source"] = None
         report["db_unavailable"] = str(TELEMETRY_DB)
     else:
         try:
@@ -1075,15 +1485,29 @@ def main() -> int:
             # `check_anticipate_health` no cubría.
             report["retrieval_health"] = check_retrieval_health(conn, args.days)
             report["chat_health"] = check_chat_health(conn, args.days)
+            report["feedback_corrective_gap"] = _audit_feedback_corrective_gap(conn)
+            report["harvest_candidates"] = _audit_harvest_candidates(conn, args.days)
+            # Cross-source single-source detector (requiere ragvec_conn)
+            if ragvec_conn is not None:
+                report["cross_source_single_source"] = _audit_cross_source_single_source(
+                    ragvec_conn, args.days
+                )
+            else:
+                report["cross_source_single_source"] = None
         except sqlite3.OperationalError as exc:
             report["query_latency"] = None
             report["cache_health"] = None
             report["anticipate"] = None
             report["retrieval_health"] = None
             report["chat_health"] = None
+            report["feedback_corrective_gap"] = None
+            report["harvest_candidates"] = None
+            report["cross_source_single_source"] = None
             report["db_error"] = repr(exc)
         finally:
             conn.close()
+            if ragvec_conn is not None:
+                ragvec_conn.close()
 
     if args.json:
         # Counter no es JSON-serializable directo.

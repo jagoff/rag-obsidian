@@ -10,6 +10,24 @@ Local-first sobre VAULT + corpus locales (sqlite-vec + Ollama + sentence-transfo
 
 Python 3.13, `uv`. Runtime venv: `.venv/bin/python`. Global tool: `~/.local/share/uv/tools/obsidian-rag/`.
 
+## MLX migration (en curso, 2026-05-05)
+
+Migración Ollama → MLX para los 4 LLMs locales. Dispatch + estado en [vault](obsidian://open?vault=Notes&file=04-Archive%2F99-obsidian-system%2F99-AI%2Fsystem%2Fmlx-migration%2Fdispatch).
+
+**Mapping**:
+- `qwen2.5:3b` (HELPER) → [`mlx-community/Qwen2.5-3B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-3B-Instruct-4bit)
+- `qwen2.5:7b` (CHAT default) → [`mlx-community/Qwen2.5-7B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-7B-Instruct-4bit)
+- `command-r` / `qwen2.5:14b` (HQ tier) → [`mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit`](https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit) — para contradiction detector, brief JSON, `rag do`, re-test HyDE
+- experimental → [`mlx-community/Qwen3-4B-Instruct-2507-4bit`](https://huggingface.co/mlx-community/Qwen3-4B-Instruct-2507-4bit) — A/B vs el 3B helper
+
+**Switch runtime**: env var `RAG_LLM_BACKEND={ollama,mlx}`. Default `ollama` durante la migración. Backend abstraction en [`rag/llm_backend.py`](rag/llm_backend.py) con `OllamaBackend` (legacy passthrough) + `MLXBackend` (Ola 2 pendiente). Extra opcional `mlx` en `pyproject.toml` (Apple Silicon only, marker `requires_mlx`).
+
+**Embeddings (bge-m3) NO entran en este scope** — migración separada en [`99-AI/system/embedding-swap-qwen3-8b/`](obsidian://open?vault=Notes&file=04-Archive%2F99-obsidian-system%2F99-AI%2Fsystem%2Fembedding-swap-qwen3-8b%2Fplan).
+
+**Gate de no-regresión** (Ola 4): `rag eval` con bootstrap CIs vs floor (singles `hit@5 88.10% [76.19, 97.62]`, chains `chain_success 50.00% [25.00, 75.00]`). CIs no-overlapping abajo del floor → ROLLBACK automático (mantener Ollama default).
+
+Doc técnica completa en [`docs/mlx-migration.md`](docs/mlx-migration.md).
+
 ## Idioma
 
 Español rioplatense Argentina por default (voseo, vocabulario rioplatense). Regla completa en [`~/.claude/CLAUDE.md`](file:///Users/fer/.claude/CLAUDE.md). Detector pre-emit: si el output contiene `você` / `obrigad` / `essa` / `isso` / CJK / `tú` formal → bug, corregir antes de mandar.

@@ -23,7 +23,7 @@ Without a single owner, these mistakes get re-made every quarter. You are that o
 
 ### Model resolution + sampling
 
-- `resolve_chat_model()` — preference chain `(command-r, qwen2.5:14b, phi4)` with runtime fallback. Note: `phi4` no longer installed (verified 2026-04-17, repo CLAUDE.md). When you change the chain, also update memory `reference_ollama.md`.
+- `resolve_chat_model()` — preference chain `(command-r, qwen2.5:14b, phi4)` with runtime fallback. Note: `phi4` no longer installed (verified 2026-04-17, repo CLAUDE.md). Post-MLX (Ola 5) the chain colapsa a Qwen-only: `command-r` → `mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit`, `qwen2.5:14b` → mismo HF ID (alias colision by design), `phi4` desaparece. La tabla autoritativa de aliasing es `MLX_MODEL_ALIAS` en [`rag/llm_backend.py`](../../rag/llm_backend.py). When you change the chain, también update `MLX_MODEL_ALIAS` y la memoria `reference_ollama.md` (que en Ola 5 se renombra a `reference_mlx.md`).
 - `CHAT_OPTIONS = {num_ctx=4096, num_predict=768}` — don't bump unless prompts grow + you re-measure VRAM headroom.
 - `HELPER_OPTIONS = {temperature=0, seed=42}` — deterministic. Required for eval reproducibility.
 - `keep_alive=-1` on every Ollama call — VRAM resident. Don't pass `0` or omit; it triggers cold reloads + breaks idle-unload semantics.
@@ -53,6 +53,57 @@ Without a single owner, these mistakes get re-made every quarter. You are that o
 - **STT**: `whisper-cli` (ggml-small) — used by WhatsApp listener for voice notes. Pinned model file under `~/.cache/whisper/`.
 - **TTS**: macOS `say` voice "Mónica" → `ffmpeg` → OGG Opus reply. Used by WhatsApp listener for voice replies.
 - You own the *contract* (which models, which voice, what audio format) — the listener implementation lives in `~/whatsapp-listener/listener.ts` (separate repo, owned by `rag-integrations` infra-wise, but the model + voice choices are yours).
+
+## MLX migration (post-2026-05-05)
+
+Migración Ollama → MLX en curso. Doc técnica completa: [`docs/mlx-migration.md`](../../docs/mlx-migration.md). PM doc + estado: [`99-AI/system/mlx-migration/dispatch.md`](obsidian://open?vault=Notes&file=04-Archive%2F99-obsidian-system%2F99-AI%2Fsystem%2Fmlx-migration%2Fdispatch).
+
+### Qué cambia para vos
+
+- **Los prompts siguen siendo tu responsabilidad end-to-end** — strings, model choice (helper vs chat), sampling (`HELPER_OPTIONS` / `CHAT_OPTIONS`), output schemas, parsers. Nada de eso se mueve a otro agent.
+- **Las llamadas concretas pasan por `rag.llm_backend.get_backend()`**, no por `ollama.chat()` / `ollama.generate()` directo. Ola 2 está reescribiendo los 28 call sites (otros slots de `rag-llm` + `rag-brief-curator` + `rag-ingestion` + `rag-vault-health`). Vos seguís decidiendo qué prompt va a qué modelo; el backend resuelve si Ollama o MLX corre la inferencia.
+- **`OllamaBackend` se mantiene durante toda la migración como insurance de rollback**. Recién Ola 5 lo retira. Mientras dure la ventana, cualquier prompt nuevo tiene que andar igual con `RAG_LLM_BACKEND=ollama` y `RAG_LLM_BACKEND=mlx`.
+
+### Invariantes nuevos (sumar a la lista de "Invariants — never break")
+
+- **`RAG_LLM_BACKEND` env var es el kill switch global**. Default `ollama` durante la migración, flippea a `mlx` post-Ola 4. Tests que dependan del backend tienen que setear el env var explícito + `reset_backend()` (no asumir default).
+- **`MLX_MODEL_ALIAS` en [`rag/llm_backend.py`](../../rag/llm_backend.py) es la tabla autoritativa** de qué nombre Ollama mapea a qué HF ID MLX. Cualquier modelo que NO esté en la tabla → fall through (passthrough literal). Si agregás un modelo nuevo al `CHAT_MODEL_PREFERENCE` chain o a un call site específico, **también lo agregás al `MLX_MODEL_ALIAS`** o el backend MLX lo va a tratar como nombre literal y `mlx_lm.load()` va a fallar.
+- **Qwen3-30B-A3B-2507 reemplaza command-r en HQ tier**: contradiction detector, `_render_morning_structured_prompt` (brief JSON), `rag do` tool-loop. La invariante "contradiction detector MUST use chat-tier" sigue intacta — sólo cambia el modelo concreto de chat-tier.
+- **Helper sigue siendo familia Qwen 3B**. Hoy `qwen2.5:3b` (Ollama) → `mlx-community/Qwen2.5-3B-Instruct-4bit` (MLX). El experimental `qwen3:4b` (`mlx-community/Qwen3-4B-Instruct-2507-4bit`) está bajado y mapeado pero **NO es default** hasta CIs no-overlapping arriba del floor en `rag eval`. No lo promuevas sin medir.
+- **HyDE OFF por default sigue vigente, PERO re-evaluar con Qwen3-30B-A3B**. La medición original (qwen2.5:3b drop singles −5pp) fue con helper-tier. Con HQ tier MoE 30B, el resultado puede flippear. Re-test es task de Ola 4.
+- **Tool-calling: `rag do` requiere parser nuevo** — command-r usa format XML-ish propio, Qwen3 usa `<tool_call>...</tool_call>` JSON inline estándar. **No es migración 1:1, es reescritura del parser**. Coordinar en Ola 2 con el slot D de `rag-llm` que toca tool-calling. El tool registry + ReAct trace + max-iter cap + confirmation gate (`--yes`) NO cambian; sólo el parser que extrae las tool calls del output del modelo.
+- **Determinismo helper se mantiene**: `temp=0, seed=42` con `mlx_lm.generate(temp=0.0)` rinde determinismo dentro de MLX. Cross-runtime (Ollama Q4_K_M vs MLX 4-bit group-wise) no es bit-exact — los números de eval pueden moverse al swappear runtime aun con el mismo modelo. Por eso el gate Ola 4 mide CIs vs floor, no exact match.
+
+### `CHAT_MODEL_PREFERENCE` post-MLX
+
+La preference chain hoy (en código): `(command-r, qwen2.5:14b, phi4)`. Con `RAG_LLM_BACKEND=mlx` activo:
+
+| Ollama name (lo que sigue listado en código) | Resuelve en MLX a |
+|---|---|
+| `command-r:latest` / `command-r` | `mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit` |
+| `qwen2.5:14b` | `mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit` (alias colision) |
+| `phi4` | passthrough literal → `mlx_lm.load("phi4")` falla. **Sacar del chain** cuando toques `resolve_chat_model()` próximamente; phi4 ya no estaba instalado en Ollama tampoco. |
+
+Post-Ola 5, cuando `OllamaBackend` se retire, la chain probablemente colapse a un solo entry directo al HF ID. Por ahora mantenerla con nombres Ollama y dejar que `to_mlx()` resuelva.
+
+### VRAM gotcha (importante)
+
+MLX no tiene daemon → cada proceso que llama `get_backend()` con backend MLX carga su copia del modelo en su unified memory. **No replicar el patrón Ollama de "varios procesos comparten un modelo"**. En Ola 3, sólo el daemon `web` (FastAPI) tendrá MLX backend; CLI `rag query` y demás procesos pegarán al `/api/chat` HTTP en lugar de cargar modelos por su cuenta. Si vas a agregar un call site nuevo que corre fuera del daemon `web`, coordinarlo con `rag-infra` antes — puede requerir wrapping en HTTP request al daemon en lugar de llamada local a `get_backend()`.
+
+### Cómo testear localmente
+
+```bash
+# Forzar Ollama (default actual)
+RAG_LLM_BACKEND=ollama .venv/bin/python -m pytest tests/test_prompts.py -q
+
+# Forzar MLX (post-Ola 2)
+RAG_LLM_BACKEND=mlx .venv/bin/python -m pytest tests/test_prompts.py -q -m "not requires_mlx or requires_mlx"
+
+# Bench cross-backend
+.venv/bin/python benchmarks/bench_mlx_vs_ollama.py --dry-run
+```
+
+CI Linux skipea automáticamente tests con marker `requires_mlx` (extra `mlx` no resuelve fuera de Apple Silicon).
 
 ## Invariants — never break
 

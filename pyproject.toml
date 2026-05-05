@@ -120,6 +120,21 @@ finetune = [
     "accelerate>=0.30",
     "trl>=0.11",
 ]
+# Apple MLX backend para LLMs locales — migración Ollama → MLX
+# (2026-05-05, dispatch en 99-AI/system/mlx-migration/).
+#
+# Default-OFF durante la migración: `rag.llm_backend.get_backend()` lee
+# `RAG_LLM_BACKEND` (default `ollama`). Cuando los 4 modelos MLX target
+# (Qwen2.5-3B, Qwen2.5-7B, Qwen3-4B-2507, Qwen3-30B-A3B-2507) estén
+# bajados Y la Ola 4 (eval gate) esté verde → flip a `RAG_LLM_BACKEND=mlx`
+# en los plists. Ola 5 saca `ollama>=0.6.1` del core.
+#
+# `mlx-lm` solo corre en Apple Silicon (sys_platform == 'darwin' +
+# platform_machine == 'arm64'). En CI Linux el extra no se instala y los
+# tests con marker `requires_mlx` se auto-skipean.
+mlx = [
+    "mlx-lm>=0.18; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 
 [project.scripts]
 rag = "rag:cli"

@@ -82,19 +82,22 @@ def test_to_ollama_inverse():
 
 
 # ---------------------------------------------------------------------------
-# 3. get_backend default → OllamaBackend
+# 3. get_backend default → MLXBackend (post-cutover 2026-05-05)
 # ---------------------------------------------------------------------------
 
 
-def test_get_backend_default_ollama(monkeypatch):
+def test_get_backend_default_mlx(monkeypatch):
+    """Post-cutover 2026-05-05: el default de get_backend es MLX. La conftest
+    autouse `_force_ollama_backend_for_tests` setea ollama por test, así que
+    aquí explícitamente desetea para verificar el verdadero default."""
+    pytest.importorskip("mlx_lm")
     monkeypatch.delenv("RAG_LLM_BACKEND", raising=False)
 
-    fake_ollama = _make_fake_ollama()
-    with mock.patch.dict(sys.modules, {"ollama": fake_ollama}):
-        backend = get_backend()
+    from rag.llm_backend import MLXBackend
 
-    assert isinstance(backend, OllamaBackend)
-    assert backend.name == "ollama"
+    backend = get_backend()
+    assert isinstance(backend, MLXBackend)
+    assert backend.name == "mlx"
 
 
 # ---------------------------------------------------------------------------
@@ -184,8 +187,9 @@ def test_mlx_alias_table_complete():
 def test_reset_backend_clears_singleton(monkeypatch):
     fake_ollama = _make_fake_ollama()
 
-    # First call: ollama backend
-    monkeypatch.delenv("RAG_LLM_BACKEND", raising=False)
+    # First call: explicitly ollama (default is mlx post-cutover, but
+    # this test focuses on the singleton-reset semantics not the default)
+    monkeypatch.setenv("RAG_LLM_BACKEND", "ollama")
     with mock.patch.dict(sys.modules, {"ollama": fake_ollama}):
         b1 = get_backend()
     assert isinstance(b1, OllamaBackend)

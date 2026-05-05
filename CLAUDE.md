@@ -2,7 +2,7 @@
 
 Local RAG sobre vault Obsidian. Layout post-split (2026-05-04): `rag/` paquete (`__init__.py` 60.2k LOC core + sub-modules `plists.py`, `cross_source_etls.py`, `postprocess.py`, `archive.py`, `anticipatory.py`, `brief_schedule.py`, `contradictions_penalty.py`, `voice_brief.py`, `whisper.py`, `wa_scheduled.py`, `wa_tasks.py`, `mmr_diversification.py`, `today_correlator.py`, `vault_health.py`, etc) + `mcp_server.py` (thin wrapper) + `web/` (FastAPI server.py 20.6k LOC + static) + `tests/` (6,031 tests, 395 archivos). Re-export pattern: `__init__.py` hace `from rag.X import *  # noqa: F401, F403` con `__all__` explícito en cada sub-módulo para preservar 100% compat (`from rag import _watch_plist`, etc).
 
-Entry points (instalados via `uv tool install --reinstall --editable '.[entities,stt,spotify]'`):
+Entry points (instalados via `uv tool install --reinstall --editable '.[entities,stt,spotify,mlx]'`):
 - `rag` — CLI indexing/querying/chat/productivity/automation
 - `obsidian-rag-mcp` — MCP server (`rag_query`, `rag_read_note`, `rag_list_notes`, `rag_links`, `rag_stats`)
 
@@ -12,7 +12,7 @@ Python 3.13, `uv`. Runtime venv: `.venv/bin/python`. Global tool: `~/.local/shar
 
 ## MLX migration (Ola 2 completa — 2026-05-05)
 
-Migración Ollama → MLX para los 4 LLMs locales. **Estado**: Olas 0+1+2 completas. Pendiente: Ola 3 (cutover plists al nuevo default) y Ola 4 (eval gate + rollback automático). Dispatch + estado en [vault](obsidian://open?vault=Notes&file=04-Archive%2F99-obsidian-system%2F99-AI%2Fsystem%2Fmlx-migration%2Fdispatch).
+Migración Ollama → MLX para los 4 LLMs locales. **Estado**: Olas 0+1+2+3 completas (cutover 2026-05-05 — default `mlx`). Pendiente: Ola 4 (eval gate validation + rollback automático si regresiona). Dispatch + estado en [vault](obsidian://open?vault=Notes&file=04-Archive%2F99-obsidian-system%2F99-AI%2Fsystem%2Fmlx-migration%2Fdispatch).
 
 **Mapping** (todos smoke-tested OK en Apple Silicon, 2026-05-05):
 - `qwen2.5:3b` (HELPER) → [`mlx-community/Qwen2.5-3B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-3B-Instruct-4bit)
@@ -20,7 +20,7 @@ Migración Ollama → MLX para los 4 LLMs locales. **Estado**: Olas 0+1+2 comple
 - `command-r` / `qwen2.5:14b` (HQ tier) → [`mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit`](https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit) — contradiction detector, brief JSON, `rag do`, HyDE
 - experimental → [`mlx-community/Qwen3-4B-Instruct-2507-4bit`](https://huggingface.co/mlx-community/Qwen3-4B-Instruct-2507-4bit) — A/B vs el 3B helper
 
-**Switch runtime**: env var `RAG_LLM_BACKEND={ollama,mlx}`. Default `ollama` hasta que Ola 4 apruebe. Ad-hoc: `RAG_LLM_BACKEND=mlx rag query "..."` funciona end-to-end ahora mismo. Rollback: desunsettear la var; sin cambios de código.
+**Switch runtime**: env var `RAG_LLM_BACKEND={ollama,mlx}`. **Default `mlx` post-cutover 2026-05-05**. Rollback: `RAG_LLM_BACKEND=ollama` exportado en shell o agregado al plist en cuestión; sin cambios de código.
 
 **Backend abstraction** en [`rag/llm_backend.py`](rag/llm_backend.py): `OllamaBackend` (legacy passthrough) + `MLXBackend` con `chat()`, `chat_stream()`, `generate()`, `list_available()` — todos funcionales. Extra opcional `mlx` en `pyproject.toml` (Apple Silicon only, marker `requires_mlx`).
 
@@ -232,7 +232,7 @@ Configs in-code (no env var): `WEAK_NEGATIVE_TOP_SCORE_THRESHOLD=0.4`, `WEAK_NEG
 ## Commands
 
 ```bash
-uv tool install --reinstall --editable '.[entities,stt,spotify]'
+uv tool install --reinstall --editable '.[entities,stt,spotify,mlx]'
 
 # Core
 rag index [--reset] [--no-contradict] [--vault NAME]

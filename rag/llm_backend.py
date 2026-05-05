@@ -75,6 +75,7 @@ MLX_MODEL_ALIAS: dict[str, str] = {
     "command-r:latest": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
     "command-r": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
     "qwen2.5:14b": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
+    "qwen3:30b-a3b": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
     # Experimental (A/B vs the 3B helper, NOT default until eval CIs OK)
     "qwen3:4b": "mlx-community/Qwen3-4B-Instruct-2507-4bit",
 }
@@ -564,15 +565,15 @@ _BACKEND_SINGLETON: LLMBackend | None = None
 def get_backend() -> LLMBackend:
     """Return the active LLM backend (singleton).
 
-    Selection: env var `RAG_LLM_BACKEND` ∈ {ollama, mlx}. Default
-    `ollama` during the migration window; flips to `mlx` post-cutover
-    (Ola 5).
+    Selection: env var `RAG_LLM_BACKEND` ∈ {ollama, mlx}. Default flipped
+    to `mlx` post-cutover 2026-05-05 (Ola 4); rollback explícito a `ollama`
+    via env var si MLX regresiona.
     """
     global _BACKEND_SINGLETON
     if _BACKEND_SINGLETON is not None:
         return _BACKEND_SINGLETON
 
-    choice = os.environ.get("RAG_LLM_BACKEND", "ollama").lower()
+    choice = os.environ.get("RAG_LLM_BACKEND", "mlx").lower()
     if choice == "mlx":
         _BACKEND_SINGLETON = MLXBackend()
     elif choice == "ollama":

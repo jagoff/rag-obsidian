@@ -3356,7 +3356,7 @@ def resolve_chat_model() -> str:
     global _CHAT_MODEL_RESOLVED
     if _CHAT_MODEL_RESOLVED is not None:
         return _CHAT_MODEL_RESOLVED
-    backend = os.environ.get("RAG_LLM_BACKEND", "ollama").lower()
+    backend = os.environ.get("RAG_LLM_BACKEND", "mlx").lower()
     if backend == "mlx":
         try:
             from rag.llm_backend import MLX_MODEL_ALIAS, MLXBackend  # local import
@@ -3881,7 +3881,7 @@ class _TimedOllamaProxy:
         # format and `chat()` here doesn't yield. Streaming sites must
         # use `_chat_stream_dispatch()` instead of this proxy.
         if (
-            os.environ.get("RAG_LLM_BACKEND", "ollama").lower() == "mlx"
+            os.environ.get("RAG_LLM_BACKEND", "mlx").lower() == "mlx"
             and not kwargs.get("tools")
             and not kwargs.get("stream")
         ):
@@ -3939,7 +3939,7 @@ def _mlx_or_ollama_chat(**kwargs):
     if ollama.chat is not _ORIGINAL_OLLAMA_CHAT:
         return ollama.chat(**kwargs)
     if (
-        os.environ.get("RAG_LLM_BACKEND", "ollama").lower() == "mlx"
+        os.environ.get("RAG_LLM_BACKEND", "mlx").lower() == "mlx"
         and not kwargs.get("tools")
         and not kwargs.get("stream")
     ):
@@ -3966,7 +3966,7 @@ def _chat_stream_dispatch(**kwargs):
         # Monkey-patched (test): use module symbol so mock intercepts.
         return ollama.chat(stream=True, **kwargs)
     if (
-        os.environ.get("RAG_LLM_BACKEND", "ollama").lower() == "mlx"
+        os.environ.get("RAG_LLM_BACKEND", "mlx").lower() == "mlx"
         and not kwargs.get("tools")
     ):
         from rag.llm_backend import ChatOptions, get_backend

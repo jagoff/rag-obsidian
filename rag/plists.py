@@ -157,6 +157,7 @@ def _serve_plist(rag_bin: str) -> str:
     <key>TRANSFORMERS_OFFLINE</key><string>1</string>
     <key>FASTEMBED_CACHE_PATH</key><string>{Path.home()}/.cache/fastembed</string>
     <key>RAG_MEMORY_PRESSURE_INTERVAL</key><string>20</string>
+    <key>RAG_LLM_BACKEND</key><string>mlx</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -258,6 +259,7 @@ def _web_plist(rag_bin: str) -> str:
     <key>RAG_MEMORY_PRESSURE_THRESHOLD</key><string>80</string>
     <key>RAG_AUTO_FIX_WORKER</key><string>1</string>
     <key>RAG_AUTO_FIX_HOURLY_CAP</key><string>12</string>
+    <key>RAG_LLM_BACKEND</key><string>mlx</string>
 {yt_line}  </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -297,6 +299,7 @@ def _digest_plist(rag_bin: str, hour: int = 22, minute: int = 0) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
+    <key>RAG_LLM_BACKEND</key><string>mlx</string>
   </dict>
   <key>StartCalendarInterval</key>
   <dict>
@@ -349,6 +352,7 @@ def _morning_plist(rag_bin: str, hour: int = 7, minute: int = 0) -> str:
     <key>TERM</key><string>dumb</string>
     <key>RAG_EXPLORE</key><string>1</string>
     <key>RAG_MORNING_VOICE</key><string></string>
+    <key>RAG_LLM_BACKEND</key><string>mlx</string>
   </dict>
   <key>StartCalendarInterval</key>
   <array>
@@ -393,6 +397,7 @@ def _today_plist(rag_bin: str, hour: int = 22, minute: int = 0) -> str:
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
     <key>RAG_EXPLORE</key><string>1</string>
+    <key>RAG_LLM_BACKEND</key><string>mlx</string>
   </dict>
   <key>StartCalendarInterval</key>
   <array>
@@ -447,6 +452,7 @@ def _wa_fast_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
+    <key>RAG_LLM_BACKEND</key><string>mlx</string>
   </dict>
   <key>StartInterval</key><integer>300</integer>
   <key>RunAtLoad</key><false/>
@@ -479,6 +485,7 @@ def _emergent_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
+    <key>RAG_LLM_BACKEND</key><string>mlx</string>
   </dict>
   <key>StartCalendarInterval</key>
   <dict>
@@ -518,6 +525,7 @@ def _patterns_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
+    <key>RAG_LLM_BACKEND</key><string>mlx</string>
   </dict>
   <key>StartCalendarInterval</key>
   <dict>
@@ -556,6 +564,7 @@ def _archive_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
+    <key>RAG_LLM_BACKEND</key><string>mlx</string>
   </dict>
   <key>StartCalendarInterval</key>
   <dict>
@@ -638,6 +647,7 @@ def _consolidate_plist(rag_bin: str) -> str:
     <key>TERM</key><string>dumb</string>
     <key>OLLAMA_KEEP_ALIVE</key><string>20m</string>
     <key>RAG_STATE_SQL</key><string>1</string>
+    <key>RAG_LLM_BACKEND</key><string>mlx</string>
   </dict>
   <key>StartCalendarInterval</key>
   <dict>
@@ -739,6 +749,7 @@ def _anticipate_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
+    <key>RAG_LLM_BACKEND</key><string>mlx</string>
   </dict>
   <key>StartInterval</key><integer>600</integer>
   <key>RunAtLoad</key><false/>
@@ -897,6 +908,7 @@ def _auto_harvest_plist(rag_bin: str) -> str:
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
     <key>RAG_STATE_SQL</key><string>1</string>
+    <key>RAG_LLM_BACKEND</key><string>mlx</string>
   </dict>
   <key>StartCalendarInterval</key>
   <dict>
@@ -944,6 +956,7 @@ def _active_learning_nudge_plist(rag_bin: str) -> str:
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
     <key>RAG_STATE_SQL</key><string>1</string>
+    <key>RAG_LLM_BACKEND</key><string>mlx</string>
   </dict>
   <key>StartCalendarInterval</key>
   <dict>
@@ -1001,6 +1014,7 @@ def _online_tune_plist(rag_bin: str) -> str:
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
     <key>RAG_EVAL_GATE_TIMEOUT_S</key><string>2400</string>
+    <key>RAG_LLM_BACKEND</key><string>mlx</string>
   </dict>
   <key>StartCalendarInterval</key>
   <dict>
@@ -1787,6 +1801,7 @@ def _brief_auto_tune_plist(rag_bin: str) -> str:
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
     <key>RAG_STATE_SQL</key><string>1</string>
+    <key>RAG_LLM_BACKEND</key><string>mlx</string>
   </dict>
   <key>StartCalendarInterval</key>
   <dict>

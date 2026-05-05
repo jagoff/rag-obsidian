@@ -2,7 +2,7 @@
 
 > Doc técnica de referencia. PM doc + estado vivo en el vault: [`99-AI/system/mlx-migration/dispatch.md`](obsidian://open?vault=Notes&file=04-Archive%2F99-obsidian-system%2F99-AI%2Fsystem%2Fmlx-migration%2Fdispatch).
 > Código de la abstracción: [`rag/llm_backend.py`](../rag/llm_backend.py).
-> Iniciado: **2026-05-05**. Estado: **Ola 1 (foundation) cerrada, Ola 2 en curso**.
+> Iniciado: **2026-05-05**. Estado: **Ola 2 (en curso) — `MLXBackend` funcional, 4 modelos smoke-testeados OK, streaming implementado, dispatch de raw call sites en progreso**.
 
 ## Resumen ejecutivo
 
@@ -13,14 +13,14 @@
 ### Gates de éxito
 
 - **Ola 1 (cerrada)**: scaffold mergeable a master en compatibility mode. Backend abstraction + extra opcional `[mlx]` + docs base. ✅
-- **Ola 2**: 28 call sites de `ollama.chat` / `ollama.generate` pasan por `get_backend()`. Sub-pytest verde por sub-zona.
+- **Ola 2 (en curso)**: `MLXBackend.chat()` + `chat_stream()` funcionales. 4 modelos smoke-testeados OK. ~29 call sites que pasan por `_TimedOllamaProxy.chat()` ya ruteados via `_mlx_chat_via_backend()`. 14 raw `ollama.chat(stream=True, ...)` sites siendo patcheados. Ver sección [Dispatch Ola 2](#dispatch-ola-2) abajo.
 - **Ola 3**: `keep_alive` emulado con resident-process + LRU. Plists actualizados. Métricas MLX expuestas.
-- **Ola 4**: `rag eval` con bootstrap CIs **no-overlapping bajo floor** = ROLLBACK automático. Floor (2026-04-17): singles `hit@5 88.10% [76.19, 97.62] · MRR 0.772 [0.651, 0.873]`, chains `hit@5 78.79% [63.64, 90.91] · chain_success 50.00% [25.00, 75.00]`. Determinismo: dos corridas consecutivas → números idénticos.
+- **Ola 4**: `rag eval` con bootstrap CIs **no-overlapping bajo floor** = ROLLBACK automático. Floor actual (2026-04-27, post-golden-remap): singles `hit@5 53.70% [40.74, 66.67] · MRR 0.528 [0.407, 0.657]`, chains `hit@5 72.00% [52.00, 88.00] · chain_success 33.33% [11.11, 66.67]`. Determinismo: dos corridas consecutivas → números idénticos. Backends Ollama y MLX deben compararse con CIs; si MLX cae bajo floor de Ollama con CIs no-overlapping → ROLLBACK.
 - **Ola 5 (cutover)**: `import ollama` desaparece del repo (`rag/`, `tests/`). `ollama>=0.6.1` sale de [`pyproject.toml`](../pyproject.toml). `OllamaBackend` se retira (o se conserva en `legacy/` por insurance de rollback histórico).
 
 ## Arquitectura del backend
 
-Toda la abstracción vive en [`rag/llm_backend.py`](../rag/llm_backend.py) (~334 LOC). Nada de runtime tocó el código de los call sites en Ola 1: el backend default sigue siendo `ollama` y todo pasa por passthrough.
+Toda la abstracción vive en [`rag/llm_backend.py`](../rag/llm_backend.py) (~555 LOC). En Ola 2 `MLXBackend` está funcional (no-stub) y los ~29 call sites que pasan por `_TimedOllamaProxy` ya rutean a MLX cuando `RAG_LLM_BACKEND=mlx`. El backend default sigue siendo `ollama`.
 
 ### Diagrama
 
@@ -38,7 +38,7 @@ Toda la abstracción vive en [`rag/llm_backend.py`](../rag/llm_backend.py) (~334
                 ▼                         ▼
         ┌──────────────────┐      ┌──────────────────┐
         │  OllamaBackend   │      │   MLXBackend     │
-        │  (default hoy)   │      │  (Ola 2 pending) │
+        │  (default hoy)   │      │  (Ola 2 ✅)      │
         ├──────────────────┤      ├──────────────────┤
         │ ollama.chat      │      │ mlx_lm.generate  │
         │ ollama.generate  │      │ + chat template  │
@@ -91,18 +91,33 @@ Call sites que necesitan chat-tier sampling pasan overrides (en general `CHAT_OP
 
 Wrappea el client `ollama`. Identity passthrough: traduce `ChatOptions` → `options` dict, llama a `ollama.chat` / `ollama.generate` / `ollama.list`, y resuelve nombres MLX-style → Ollama-style con `to_ollama()` (por si un call site ya migró a HF ID antes de Ola 5).
 
-### `MLXBackend` (stub Ola 1, implementación Ola 2)
+### `MLXBackend` (funcional desde Ola 2)
 
-Hoy `chat()` y `generate()` raisean `NotImplementedError("Ola 2 work — see dispatch.md")`. El `__init__` valida que `mlx_lm` esté importable; si no está → `RuntimeError("mlx-lm not installed. Run \`uv add mlx-lm\` or set RAG_LLM_BACKEND=ollama.")`. `list_available()` ya funciona: scanea `~/.cache/huggingface/hub/` por carpetas `models--mlx-community--*`.
+`chat()`, `chat_stream()` y `generate()` están implementados. El `__init__` valida que `mlx_lm` esté importable; si no está → `RuntimeError("mlx-lm not installed. Run \`uv pip install '.[mlx]'\` or set RAG_LLM_BACKEND=ollama.")`. `list_available()` scanea `~/.cache/huggingface/hub/` por carpetas `models--mlx-community--*`.
 
-Ola 2 cablea:
+Lo que Ola 2 cableó:
 
-- `mlx_lm.load(model_id)` con caché de modelos cargados (`self._loaded`).
-- Chat template via `tokenizer.apply_chat_template(messages, add_generation_prompt=True)`.
-- `mlx_lm.generate(model, tokenizer, prompt, max_tokens=num_predict, temp=temperature, ...)`.
-- LRU eviction + idle-unload thread (ver sección VRAM más abajo).
-- JSON mode parity con el `format="json"` de Ollama (parser + repair sobre adversarial inputs).
-- Tool-calling adapter (command-r format ≠ Qwen3 format — parser nuevo, no migración 1:1).
+- `mlx_lm.load(model_id)` con caché de modelos cargados (`self._loaded`, `OrderedDict` LRU).
+- Chat template via `tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)`.
+- `mlx_lm.generate(model, tokenizer, prompt, max_tokens=num_predict, sampler=make_sampler(temp, top_p), ...)`.
+- LRU eviction: modelos `_BIG_MODELS` (Qwen3-30B-A3B) son single-tenant (evictan todo); pequeños LRU-cap a `_MAX_SMALL_LOADED=3`.
+- JSON mode: `_apply_chat_template` agrega instrucción de sistema; `_extract_json` hace strip de fences y aísla el primer bloque `{...}`. Sin grammar-constrained decode nativo (MLX no lo tiene aún) — el parser en `rag/__init__.py` hace el repair final.
+- `chat_stream()`: `mlx_lm.stream_generate` generator, retorna objetos `ChatResponse(done=False)` con `.message.content` incremental + terminal `done=True, done_reason='stop'`. Mismo `_apply_chat_template` que `chat()`.
+
+Lo que Ola 2 **no** implementa (sin soporte bajo MLX, ver sección abajo):
+
+- `tools=[...]` — no hay tool-calling nativo MLX. Las llamadas con `tools=` bypasean al path Ollama o se stripean.
+- `ollama.generate(prompt='', keep_alive=0)` — trick de unload de Ollama. En MLX es no-op silencioso.
+
+### Dispatch Ola 2: `_TimedOllamaProxy` + raw call sites
+
+El mecanismo de dispatch tiene dos capas:
+
+**Capa 1 — `_TimedOllamaProxy.chat()`** (línea ~3848 de `rag/__init__.py`): cuando `RAG_LLM_BACKEND=mlx`, cada `proxy.chat(...)` detecta el env var y llama a `_mlx_chat_via_backend(**kwargs)` en lugar de `ollama.Client.chat()`. Esta capa cubre todos los call sites que usan `_helper_client`, `_chat_client`, `_summary_client`, etc. — ~29 sitios en total.
+
+`_mlx_chat_via_backend()` traduce el `options` dict Ollama → `ChatOptions`, droppea kwargs Ollama-only (`tools`, `think`, `logprobs`, `stream=True` — collapsa a no-streaming en esta capa).
+
+**Capa 2 — raw `ollama.chat(stream=True, ...)`**: 14 call sites que llaman `ollama.chat` directamente (no via proxy), usados para SSE streaming en `rag query` y `rag chat`. Estos se están migrando en la sesión actual para usar `get_backend().chat_stream(...)` con fallback al path Ollama cuando el backend es `ollama`.
 
 ### `get_backend()` singleton
 
@@ -114,12 +129,12 @@ Singleton process-wide. Reset via `reset_backend()` (sólo tests). Valores váli
 
 ## Mapping de modelos
 
-| MLX HF ID | Tamaño | Reemplaza Ollama | Tier | Use-cases |
-|---|---|---|---|---|
-| [`mlx-community/Qwen2.5-3B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-3B-Instruct-4bit) | ~1.9 GB | `qwen2.5:3b` | **HELPER** (det.) | `_reformulate_query`, contextual summary, lookup, postprocess, followup judge, tag suggester, typo correction, history summarisation, datetime fallback. `temp=0, seed=42`. |
-| [`mlx-community/Qwen2.5-7B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-7B-Instruct-4bit) | ~4.3 GB | `qwen2.5:7b` | **CHAT default** | `rag query`, narrative brief fallback, read summary, prep brief, inbox triage, whisper LLM correct. |
-| [`mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit`](https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit) | ~17 GB | `command-r:latest`, `qwen2.5:14b` | **HQ tier** | Contradiction detector, `_render_morning_structured_prompt` (brief JSON), `rag do` tool-loop, **re-test HyDE**. |
-| [`mlx-community/Qwen3-4B-Instruct-2507-4bit`](https://huggingface.co/mlx-community/Qwen3-4B-Instruct-2507-4bit) | ~2.5 GB | — | Experimental | A/B vs el 3B helper. **NO default** hasta CIs no-overlapping arriba del floor en `rag eval`. |
+| MLX HF ID | Tamaño | Reemplaza Ollama | Tier | Smoke test | Use-cases |
+|---|---|---|---|---|---|
+| [`mlx-community/Qwen2.5-3B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-3B-Instruct-4bit) | ~1.9 GB | `qwen2.5:3b` | **HELPER** (det.) | ✅ 2026-05-05 | `_reformulate_query`, contextual summary, lookup, postprocess, followup judge, tag suggester, typo correction, history summarisation, datetime fallback. `temp=0, seed=42`. |
+| [`mlx-community/Qwen2.5-7B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-7B-Instruct-4bit) | ~4.3 GB | `qwen2.5:7b` | **CHAT default** | ✅ 2026-05-05 | `rag query`, narrative brief fallback, read summary, prep brief, inbox triage, whisper LLM correct. |
+| [`mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit`](https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit) | ~17 GB | `command-r:latest`, `qwen2.5:14b` | **HQ tier** | ✅ 2026-05-05 (chat + JSON mode) | Contradiction detector, `_render_morning_structured_prompt` (brief JSON), `rag do` tool-loop, **re-test HyDE**. |
+| [`mlx-community/Qwen3-4B-Instruct-2507-4bit`](https://huggingface.co/mlx-community/Qwen3-4B-Instruct-2507-4bit) | ~2.5 GB | — | Experimental | ✅ 2026-05-05 | A/B vs el 3B helper. **NO default** hasta CIs no-overlapping arriba del floor en `rag eval`. |
 
 ### Justificación
 
@@ -187,40 +202,158 @@ Todo lo que estaba garantizado con Ollama tiene que seguir garantizado con MLX. 
 7. **Local-first**. Memoria `feedback_local_free_stack`: jamás OpenAI/Anthropic/Google/ElevenLabs APIs. MLX corre 100% local en Apple Silicon, así que esta invariante refuerza (no rompe).
 8. **No caches stale por rename**. Contextual summary cache por **file hash**, no path. (Esto es del runtime, no del backend, pero queda acá porque MLX no debe alterarlo.)
 
+## Streaming (`chat_stream`)
+
+`MLXBackend.chat_stream()` usa `mlx_lm.stream_generate` y retorna un generator de objetos `ChatResponse` con la misma interfaz que `OllamaBackend.chat_stream()`:
+
+```python
+for chunk in backend.chat_stream(model="qwen2.5:7b", messages=[...]):
+    piece = chunk.message.content   # token incremental (puede ser sub-word)
+    if chunk.done:
+        break                       # done=True, done_reason='stop', content=''
+```
+
+Diferencias vs Ollama streaming:
+
+- **Granularidad de tokens**: MLX puede flushear sub-words o varios tokens por yield dependiendo del tokenizer; Ollama suele flushear un token por SSE event. El texto final es equivalente.
+- **Primer token latency**: MLX no tiene daemon HTTP overhead → primer token más rápido en cold (no hay round-trip HTTP), pero el primer yield puede tardar más si el modelo no estaba en `_loaded` (load time ~3-8s para modelos pequeños, ~30-90s para el 30B).
+- `stream=True` pasado via `_mlx_chat_via_backend` es stripeado (no hay flag `stream` en MLX). La diferencia es que `_TimedOllamaProxy.chat()` **no** usa `chat_stream()` — colapsa streaming a non-streaming. Los call sites que hacen SSE real (`for chunk in ollama.chat(stream=True, ...)`) necesitan migrar explícitamente a `get_backend().chat_stream(...)` (trabajo de la capa 2 de Ola 2).
+
+## Limitaciones bajo MLX (sin soporte actualmente)
+
+| Feature | Comportamiento bajo MLX |
+|---|---|
+| `tools=[...]` (tool-calling nativo) | `_mlx_chat_via_backend` droppea el kwarg. Las llamadas que requieren tool-calling JSON schema siguen yendo por Ollama o necesitan un parser custom Qwen3. El `rag do` tool-loop necesita este parser — coordinado en Ola 2. |
+| `ollama.generate(prompt='', keep_alive=0)` | Trick de Ollama para descargar un modelo de VRAM. MLX no tiene ese mecanismo. En `MLXBackend.generate()` el `keep_alive=0` es ignorado (no-op silencioso). Para forzar eviction: `backend._loaded.clear()` manual. |
+| JSON mode con constrained decode | MLX no tiene grammar-constrained decode nativo (a diferencia del `format="json"` de Ollama que fuerza tokens válidos). El `MLXBackend` usa la heurística de inyectar instrucción en el system prompt + `_extract_json()` post-gen. Funciona para HQ tier (Qwen3-30B es bueno en JSON); puede fallar con el helper 3B en outputs complejos. Si falla: downstream repair en `rag/__init__.py` completa el fix. |
+| Multi-process model sharing | Ollama es daemon compartido; cada proceso MLX carga su propia copia. Ver gotcha en sección "Multi-process". |
+| `keep_alive="5m"` (TTL custom) | Parseado pero no enforced todavía. Ola 3 implementa el watchdog thread. |
+
+## Cómo flipear al backend MLX
+
+El backend por default sigue siendo `ollama` durante la ventana de migración. Para probar MLX:
+
+### Ad-hoc (shell / desarrollo)
+
+```bash
+export RAG_LLM_BACKEND=mlx
+rag query "qué notas tengo sobre X" --plain
+# o directo sin exportar:
+RAG_LLM_BACKEND=mlx rag query "qué notas tengo sobre X" --plain
+```
+
+Para verificar que el backend está activo:
+
+```python
+from rag.llm_backend import get_backend, reset_backend
+reset_backend()  # fuerza re-resolución con el env actual
+b = get_backend()
+print(b.name)           # → "mlx"
+print(b.list_available())  # lista modelos MLX en ~/.cache/huggingface/hub/
+```
+
+### Daemons launchd (post-Ola 4)
+
+Agregar al `EnvironmentVariables` dict de cada plist:
+
+```xml
+<key>RAG_LLM_BACKEND</key>
+<string>mlx</string>
+```
+
+Luego recargar:
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.fer.obsidian-rag-web.plist
+launchctl load   ~/Library/LaunchAgents/com.fer.obsidian-rag-web.plist
+```
+
+O via `rag setup` si el factory `_services_spec()` ya incluye la variable.
+
+**No hacer esto antes de Ola 4** (eval gate) salvo para testing puntual con `rag stop` previo.
+
+### Tests
+
+```python
+def test_algo(monkeypatch):
+    monkeypatch.setenv("RAG_LLM_BACKEND", "mlx")
+    from rag.llm_backend import reset_backend
+    reset_backend()
+    # ... tu test
+```
+
+### Smoke test rápido
+
+```bash
+PYTHONPATH=. RAG_LLM_BACKEND=mlx .venv/bin/python scripts/smoke_mlx_models.py
+# saltear el 30B (~17 GB) si querés correr rápido:
+PYTHONPATH=. RAG_LLM_BACKEND=mlx .venv/bin/python scripts/smoke_mlx_models.py --skip-big
+# probar un solo modelo:
+PYTHONPATH=. RAG_LLM_BACKEND=mlx .venv/bin/python scripts/smoke_mlx_models.py --only qwen2.5:3b
+```
+
+## Rollback a Ollama
+
+No requiere ningún cambio de código. Basta con dessetear o poner `ollama`:
+
+```bash
+# opción 1: dessetear (default ya es ollama)
+unset RAG_LLM_BACKEND
+
+# opción 2: explícito
+export RAG_LLM_BACKEND=ollama
+
+# reiniciar daemons si estaban con mlx seteado en plists:
+launchctl unload ~/Library/LaunchAgents/com.fer.obsidian-rag-*.plist
+# editar plists: sacar RAG_LLM_BACKEND o ponerlo en "ollama"
+launchctl load   ~/Library/LaunchAgents/com.fer.obsidian-rag-*.plist
+```
+
+Pre-requisito: `ollama serve` corriendo + modelos pulled:
+
+```bash
+ollama pull qwen2.5:3b
+ollama pull qwen2.5:7b
+ollama pull command-r:latest
+```
+
+El floor de eval asegura que rollback siempre es viable mientras `OllamaBackend` esté en el repo (hasta Ola 5).
+
 ## VRAM management
 
 Apple Silicon usa **unified memory**: GPU + CPU comparten RAM. Cargar 4 modelos = ~26 GB en peak. En Macs 16 GB → imposible. En 32 GB → viable con LRU. En 64 GB+ → todos pueden quedar resident.
 
-### Estrategia LRU (Ola 3)
+### Estrategia LRU (implementada en Ola 2)
 
 ```
-slot 0: helper (~1.9 GB)         siempre resident (eviction key=never)
-slot 1: chat-default (~4.3 GB)   resident con TTL
-slot 2: HQ tier (~17 GB)         resident con TTL, MUTEX vs slot 1 si RAM<32 GB
-slot 3: experimental (~2.5 GB)   on-demand only, no resident
+slot 0: helper (~1.9 GB)         LRU cap=3 small, puede coexistir con cualquiera
+slot 1: chat-default (~4.3 GB)   LRU cap=3 small
+slot 2: HQ tier (~17 GB)         BIG_MODELS → single-tenant, evicta todo lo demás
+slot 3: experimental (~2.5 GB)   LRU cap=3 small, on-demand
 ```
 
-`_BIG_MODELS` en `MLXBackend` lleva el set de los modelos "grandes" (hoy sólo Qwen3-30B-A3B). Eviction policy:
+`_BIG_MODELS` en `MLXBackend` lleva el set de los modelos "grandes" (hoy sólo Qwen3-30B-A3B). Eviction policy (implementada en `_evict_for()`):
 
 ```
 on load(M):
-    if M in BIG_MODELS and "qwen2.5-7b" in self._loaded and total_ram < 32GB:
-        unload("qwen2.5-7b")
-    if "qwen2.5-7b" requested and any(big in self._loaded) and total_ram < 32GB:
-        unload(big)
-    self._loaded[M] = mlx_lm.load(M)
+    if M in BIG_MODELS:
+        evict ALL other models  # pure single-tenant
+    else:
+        evict any big first
+        LRU-trim while len(loaded) >= MAX_SMALL_LOADED (=3)
+    self._loaded[M] = mlx_lm.load(M)  # OrderedDict LRU, newest=last
 ```
 
 ### Idle unload
 
-Env var `RAG_MLX_IDLE_TTL` (default `1800` segundos = 30 min). Thread separado en `MLXBackend.__init__` watchea `last_used_ts` por modelo y descarga cuando excede el TTL. Excepciones: helper Qwen2.5-3B nunca se descarga (es tan chico que no vale la pena el cold-load penalty).
+Env var `RAG_MLX_IDLE_TTL` (default `1800` segundos = 30 min). El valor se guarda en `self._idle_ttl` pero el watchdog thread todavía no está implementado (Ola 3). Eviction hoy es puramente capacity-driven. Excepciones planificadas para Ola 3: helper Qwen2.5-3B nunca se descarga por idle (cold-load penalty no vale la pena).
 
 Equivalencia con Ollama:
 
 | Ollama | MLX |
 |---|---|
-| `keep_alive=-1` (resident hasta que daemon muera) | resident + LRU + idle TTL |
-| `keep_alive=0` (descarga después del request) | no implementado — passthrough con warning |
+| `keep_alive=-1` (resident hasta que daemon muera) | resident + LRU (capacity-driven, Ola 2). Idle TTL watchdog: Ola 3. |
+| `keep_alive=0` (descarga después del request) | no implementado — no-op silencioso |
 | `keep_alive="5m"` | TTL custom por request (Ola 3) |
 
 ## Plan de cutover (5 olas)
@@ -231,7 +364,7 @@ Detalle vivo en [`dispatch.md`](obsidian://open?vault=Notes&file=04-Archive%2F99
 |---|---|---|---|---|
 | **0** | PM bootstrap (dispatch.md, worktrees, claude-peers announce) | `pm` | — | ✅ |
 | **1** | Foundation: `rag/llm_backend.py`, benchmark harness, `pyproject.toml`, docs base | `developer-1`, `developer-2`, `developer-3`, `rag-doc-curator` | `foundation` | ✅ |
-| **2** | Migración de los 28 call sites de `ollama.chat` / `ollama.generate` → `get_backend()`. Sub-zonas: constants/resolver, retrieval helpers, lookup/contextual, brief, ingestion, vault-health, tool-calling, postprocess. Tool-calling parser command-r→Qwen3 nuevo. | `rag-llm` (5 slots), `rag-brief-curator`, `rag-ingestion`, `rag-vault-health` | `mlx-call-sites` | en curso |
+| **2** | `MLXBackend` funcional + streaming. ~29 call sites via `_TimedOllamaProxy` ya ruteados. 14 raw `ollama.chat(stream=True)` sites siendo patcheados. Smoke tests 4 modelos OK. | `developer-3` (esta sesión), `rag-llm` | `experimental/mlx-migration-foundation` | **en curso** |
 | **3** | Runtime: launchd plists sin deps Ollama, `keep_alive` LRU eviction, métricas MLX (`/api/metrics/mlx`) | `rag-infra` (2 slots), `rag-telemetry` | `mlx-infra` | pending |
 | **4** | Tests + eval. `rag eval` con bootstrap CIs vs floor. Determinismo x2 corridas. | `developer-{1,2,3}`, `rag-eval` | `mlx-tests` | pending |
 | **5** | Cutover: sacar `import ollama` del repo, sacar `ollama` de `pyproject.toml`, mem-vault `reference_ollama.md` → `reference_mlx.md`. Verificar plists post-flip. | `pm` + 1-2 specialists | master | pending |
@@ -252,30 +385,9 @@ uv pip install 'mlx-lm>=0.18'
 
 `mlx-lm` sólo está en el extra `mlx`, marker `sys_platform == 'darwin' and platform_machine == 'arm64'`. En Linux/Intel el extra no se resuelve y los tests con marker `requires_mlx` se auto-skipean en CI.
 
-### "El backend sigue siendo Ollama después del cutover"
+### "El backend sigue siendo Ollama"
 
-Default de `get_backend()` es `ollama`. Para flippear:
-
-1. **Desarrollo / shell**: `export RAG_LLM_BACKEND=mlx` antes de correr `rag` / `pytest`.
-2. **Plists (post-Ola 4)**: agregar al `EnvironmentVariables` dict de cada plist en `~/Library/LaunchAgents/com.fer.obsidian-rag-*.plist`:
-   ```xml
-   <key>RAG_LLM_BACKEND</key>
-   <string>mlx</string>
-   ```
-   Después: `launchctl unload ... && launchctl load ...` o `rag setup` que re-instala todo.
-3. **Tests**: usar `monkeypatch.setenv("RAG_LLM_BACKEND", "mlx")` + `from rag.llm_backend import reset_backend; reset_backend()` para forzar re-resolución.
-
-### Rollback rápido a Ollama
-
-Mientras `OllamaBackend` esté en el repo (hasta Ola 5):
-
-```bash
-launchctl unload ~/Library/LaunchAgents/com.fer.obsidian-rag-*.plist
-# editar plists: RAG_LLM_BACKEND=ollama (o sacar la entry, default ya es ollama)
-launchctl load ~/Library/LaunchAgents/com.fer.obsidian-rag-*.plist
-```
-
-`ollama serve` tiene que estar corriendo + los modelos `qwen2.5:3b`, `qwen2.5:7b`, `command-r:latest` pulled (`ollama pull <name>`). Floor de no-regresión asegura que rollback siempre es viable mientras dura la ventana de migración.
+Ver sección [Cómo flipear al backend MLX](#cómo-flipear-al-backend-mlx) y [Rollback a Ollama](#rollback-a-ollama) arriba — instrucciones completas con comandos concretos.
 
 ### Modelo MLX no descargado
 

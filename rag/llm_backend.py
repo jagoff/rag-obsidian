@@ -2,7 +2,7 @@
 
 Created 2026-05-05 as part of `99-AI/system/mlx-migration/dispatch.md`.
 
-## Status: Ola 1 scaffold (compatibility-mode default Ollama)
+## Status: Ola 2 (en curso) — MLXBackend functional
 
 This module defines a thin interface (`LLMBackend`) over the LLM call
 contract used across `rag/__init__.py`. Two concrete backends:
@@ -10,8 +10,9 @@ contract used across `rag/__init__.py`. Two concrete backends:
 - `OllamaBackend` — wraps the existing `ollama` Python client. **Default
   during the migration window** so master stays green even if MLX models
   haven't finished downloading.
-- `MLXBackend` — uses `mlx-lm` (Apple MLX). **Default once the four MLX
-  models are local + Ola 4 eval gate passes**.
+- `MLXBackend` — uses `mlx-lm` (Apple MLX). Functional as of Ola 2:
+  `chat()`, `chat_stream()`, `generate()` all implemented + smoke-tested
+  OK for all 4 models (2026-05-05). **Default once Ola 4 eval gate passes**.
 
 Switch via env var `RAG_LLM_BACKEND={ollama,mlx}` (default `ollama`
 during the migration window, `mlx` post-cutover).
@@ -28,25 +29,30 @@ for the parallel embedding migration.
 - CHAT_OPTIONS (num_ctx=4096, num_predict=768) — VRAM-budgeted.
 - `keep_alive=-1` semantics → emulated via resident-process + LRU on
   the MLX side (MLX has no native keep_alive). Eviction policy:
-  Qwen3-30B (~17 GB) NEVER coexists with qwen2.5:7b (~4.3 GB) when
-  unified RAM <32 GB.
+  Qwen3-30B (~17 GB) is single-tenant (_BIG_MODELS), evicts everything
+  else on load. Small models LRU-capped at _MAX_SMALL_LOADED=3.
 
 ## Model name aliasing
 
-To avoid touching 28 call sites in Ola 1, the backend accepts both
-Ollama-style names (`qwen2.5:3b`) and MLX-style names
-(`mlx-community/Qwen2.5-3B-Instruct-4bit`). `_resolve_alias()` maps
-between them based on `MLX_MODEL_ALIAS` table. Call sites get migrated
-to canonical MLX names in Ola 2.
+The backend accepts both Ollama-style names (`qwen2.5:3b`) and MLX HF
+IDs (`mlx-community/Qwen2.5-3B-Instruct-4bit`). `to_mlx()` / `to_ollama()`
+resolve between them via `MLX_MODEL_ALIAS` table.
 
-## TODO (Ola 2+)
+## What MLX does NOT support (vs Ollama)
 
-- [ ] Implement `MLXBackend.chat()` with mlx_lm.generate + chat template
-- [ ] Implement `MLXBackend.generate()` (raw, no chat template)
-- [ ] LRU eviction for resident MLX processes
-- [ ] JSON-mode robustness (parse + repair) parity with Ollama
-- [ ] Tool-calling format adapter (command-r → Qwen3 schema)
-- [ ] Bench harness wiring (benchmarks/mlx_vs_ollama.py)
+- `tools=[...]` (tool-calling): kwarg is dropped by `_mlx_chat_via_backend`.
+  Call sites that need tool-calling JSON schema still go via Ollama or need
+  a custom Qwen3 parser (Ola 2 work).
+- `keep_alive=0` (model unload trick): ignored silently — no-op.
+- Grammar-constrained JSON decode: `format='json'` uses system-prompt nudge
+  + `_extract_json()` post-gen instead.
+
+## TODO (Ola 2 remaining + Ola 3+)
+
+- [ ] Migrate 14 raw `ollama.chat(stream=True, ...)` call sites to `get_backend().chat_stream(...)`
+- [ ] Tool-calling format adapter (Qwen3 `<tool_call>` JSON schema)
+- [ ] Idle-unload watchdog thread (RAG_MLX_IDLE_TTL enforcement)
+- [ ] Bench harness wiring (benchmarks/bench_mlx_vs_ollama.py)
 """
 
 from __future__ import annotations

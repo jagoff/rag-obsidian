@@ -3346,18 +3346,39 @@ def resolve_chat_model() -> str:
 
     Cached per-process so the Ollama `list` call runs at most once. If none
     are installed, raise a clear error pointing at `ollama pull`.
+
+    MLX backend (`RAG_LLM_BACKEND=mlx`): consult the MLX cache via
+    `MLXBackend.list_available()` instead of `ollama.list()`. Match by
+    Ollama-style alias (e.g. `qwen2.5:7b`) — `MLX_MODEL_ALIAS` translates
+    both directions, so a candidate is "available" iff its mapped HF id
+    is present in `~/.cache/huggingface/hub/`.
     """
     global _CHAT_MODEL_RESOLVED
     if _CHAT_MODEL_RESOLVED is not None:
         return _CHAT_MODEL_RESOLVED
-    try:
-        available = {m.model for m in ollama.list().models}
-    except Exception:
-        available = set()
+    backend = os.environ.get("RAG_LLM_BACKEND", "ollama").lower()
+    if backend == "mlx":
+        try:
+            from rag.llm_backend import MLX_MODEL_ALIAS, MLXBackend  # local import
+            mlx_ids = set(MLXBackend().list_available())
+            available = {alias for alias, hf_id in MLX_MODEL_ALIAS.items() if hf_id in mlx_ids}
+        except Exception:
+            available = set()
+    else:
+        try:
+            available = {m.model for m in ollama.list().models}
+        except Exception:
+            available = set()
     for candidate in CHAT_MODEL_PREFERENCE:
         if candidate in available:
             _CHAT_MODEL_RESOLVED = candidate
             return candidate
+    if backend == "mlx":
+        raise RuntimeError(
+            f"Ningún modelo MLX disponible para CHAT_MODEL_PREFERENCE={CHAT_MODEL_PREFERENCE}. "
+            f"Descargá los snapshots con `huggingface-cli download mlx-community/Qwen2.5-7B-Instruct-4bit` "
+            f"(ver MLX_MODEL_ALIAS en rag/llm_backend.py)."
+        )
     raise RuntimeError(
         f"Ningún modelo de CHAT_MODEL_PREFERENCE instalado: {CHAT_MODEL_PREFERENCE}. "
         f"Instalá uno con: ollama pull {CHAT_MODEL_PREFERENCE[0].split(':')[0]}"
@@ -3855,7 +3876,15 @@ class _TimedOllamaProxy:
         # semantics still apply (timeout is moot for MLX in-process,
         # but the helper semaphore still throttles concurrent calls).
         # Ollama default keeps the original Client(timeout=...) path.
-        if os.environ.get("RAG_LLM_BACKEND", "ollama").lower() == "mlx":
+        # NOTE: tool-calling (`tools=[...]`) and stream=True bypass MLX
+        # and fall through to Ollama — MLX backend has no native tool
+        # format and `chat()` here doesn't yield. Streaming sites must
+        # use `_chat_stream_dispatch()` instead of this proxy.
+        if (
+            os.environ.get("RAG_LLM_BACKEND", "ollama").lower() == "mlx"
+            and not kwargs.get("tools")
+            and not kwargs.get("stream")
+        ):
             if self._semaphore is not None:
                 with self._semaphore:
                     return _mlx_chat_via_backend(**kwargs)
@@ -3898,6 +3927,71 @@ def _mlx_chat_via_backend(**kwargs):
         keep_alive=kwargs.get("keep_alive", -1),
         format=kwargs.get("format"),
     )
+
+
+def _mlx_or_ollama_chat(**kwargs):
+    """Non-streaming chat dispatcher. Same routing logic as `_TimedOllamaProxy.chat()`
+    but exported for callers fuera de `rag/__init__.py` (ej. `web/server.py`)
+    que necesitan rutear via MLXBackend cuando `RAG_LLM_BACKEND=mlx`.
+
+    Bajo `tools=[...]` o `stream=True` cae a Ollama (MLX no los soporta).
+    """
+    if ollama.chat is not _ORIGINAL_OLLAMA_CHAT:
+        return ollama.chat(**kwargs)
+    if (
+        os.environ.get("RAG_LLM_BACKEND", "ollama").lower() == "mlx"
+        and not kwargs.get("tools")
+        and not kwargs.get("stream")
+    ):
+        return _mlx_chat_via_backend(**kwargs)
+    return ollama.chat(**kwargs)
+
+
+def _chat_stream_dispatch(**kwargs):
+    """Streaming dispatcher for raw `for chunk in ollama.chat(stream=True, ...)` sites.
+
+    Centraliza la decisión Ollama vs MLX para call sites de streaming.
+    Bajo `RAG_LLM_BACKEND=mlx` rutea a `MLXBackend.chat_stream(...)`
+    (yields `ChatResponse(done=False, message.content=piece)` por token,
+    terminal `done=True`). Default Ollama: passthrough a `ollama.chat(stream=True)`.
+
+    Tools-using sites no deben llamar acá — caen al fallback Ollama
+    transparente porque MLX no soporta tool-calling nativo. Si pasás
+    `tools=[...]`, este helper también delega a Ollama (silent fallback).
+
+    Tests que monkeypatchean `rag.ollama.chat` siguen interceptando
+    porque la branch Ollama llama al símbolo módulo (no al Client).
+    """
+    if ollama.chat is not _ORIGINAL_OLLAMA_CHAT:
+        # Monkey-patched (test): use module symbol so mock intercepts.
+        return ollama.chat(stream=True, **kwargs)
+    if (
+        os.environ.get("RAG_LLM_BACKEND", "ollama").lower() == "mlx"
+        and not kwargs.get("tools")
+    ):
+        from rag.llm_backend import ChatOptions, get_backend
+
+        options_dict = kwargs.get("options") or {}
+        if hasattr(options_dict, "model_dump"):
+            options_dict = options_dict.model_dump(exclude_none=True)
+        elif not isinstance(options_dict, dict):
+            options_dict = dict(options_dict)
+        opts = ChatOptions(
+            temperature=float(options_dict.get("temperature", 0.0)),
+            seed=int(options_dict.get("seed", 42)),
+            num_ctx=int(options_dict.get("num_ctx", 4096)),
+            num_predict=int(options_dict.get("num_predict", 768)),
+            top_p=float(options_dict.get("top_p", 1.0)),
+            stop=tuple(options_dict.get("stop", ()) or ()),
+        )
+        return get_backend().chat_stream(
+            model=kwargs["model"],
+            messages=kwargs.get("messages") or [],
+            options=opts,
+            keep_alive=kwargs.get("keep_alive", -1),
+            format=kwargs.get("format"),
+        )
+    return ollama.chat(stream=True, **kwargs)
 
 
 def _index_chat_client() -> ollama.Client:
@@ -21113,11 +21207,10 @@ def run_chat_turn(req: ChatTurnRequest) -> ChatTurnResult:
     t_gen_start = time.perf_counter()
     parts: list[str] = []
     try:
-        for chunk in ollama.chat(
+        for chunk in _chat_stream_dispatch(
             model=gen_model,
             messages=messages,
             options=gen_options,
-            stream=True,
             keep_alive=chat_keep_alive(gen_model),
         ):
             parts.append(chunk.message.content or "")
@@ -29544,11 +29637,10 @@ def query(
             # Buffer the stream; do NOT emit here. Citation-repair and critique may
             # mutate `full` after generation. The single `click.echo` for plain mode
             # fires after both passes complete (see below, after critique block).
-            for chunk in ollama.chat(
+            for chunk in _chat_stream_dispatch(
                 model=_gen_model,
                 messages=messages,
                 options=_gen_options,
-                stream=True,
                 keep_alive=chat_keep_alive(),
             ):
                 parts.append(chunk.message.content)
@@ -29559,11 +29651,10 @@ def query(
             # with link/ext styling at the end.
             from rich.live import Live
             with Live("", console=console, refresh_per_second=12, transient=True) as live:
-                for chunk in ollama.chat(
+                for chunk in _chat_stream_dispatch(
                     model=_gen_model,
                     messages=messages,
                     options=_gen_options,
-                    stream=True,
                     keep_alive=chat_keep_alive(),
                 ):
                     parts.append(chunk.message.content)
@@ -30995,11 +31086,10 @@ def chat(
         _t_llm_start = time.perf_counter()
         _t_first_token: float | None = None
         with Live(placeholder, console=console, refresh_per_second=12, transient=True) as live:
-            for chunk in ollama.chat(
+            for chunk in _chat_stream_dispatch(
                 model=_chat_model,
                 messages=messages,
                 options=_CLI_CHAT_OPTIONS,
-                stream=True,
                 keep_alive=chat_keep_alive(),
             ):
                 if _t_first_token is None and chunk.message.content:
@@ -39228,11 +39318,10 @@ def prep(topic: str, k: int, folder: str | None, save: bool,
     t_start = time.perf_counter()
     parts: list[str] = []
     if plain:
-        for chunk in ollama.chat(
+        for chunk in _chat_stream_dispatch(
             model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
             options=CHAT_OPTIONS,
-            stream=True,
             keep_alive=chat_keep_alive(),
         ):
             parts.append(chunk.message.content)
@@ -39245,11 +39334,10 @@ def prep(topic: str, k: int, folder: str | None, save: bool,
     else:
         with console.status("[dim]armando brief…[/dim]", spinner="dots"):
             # Drain the stream silently first, then redraw with link styling.
-            for chunk in ollama.chat(
+            for chunk in _chat_stream_dispatch(
                 model=resolve_chat_model(),
                 messages=[{"role": "user", "content": prompt}],
                 options=CHAT_OPTIONS,
-                stream=True,
                 keep_alive=chat_keep_alive(),
             ):
                 parts.append(chunk.message.content)
@@ -52851,11 +52939,10 @@ def serve(host: str, port: int):
     # query real paga el cold-start del LLM (command-r ~20-30s extra).
     console.print("[dim]Warming up chat model…[/dim]")
     try:
-        for _ in ollama.chat(
+        for _ in _chat_stream_dispatch(
             model=chat_model,
             messages=[{"role": "user", "content": "hi"}],
             options={**CHAT_OPTIONS, "num_predict": 1},
-            stream=True,
             keep_alive=chat_keep_alive(chat_model),
         ):
             pass
@@ -53674,10 +53761,10 @@ def serve(host: str, port: int):
 
         t_gen0 = time.perf_counter()
         parts: list[str] = []
-        for chunk in ollama.chat(
+        for chunk in _chat_stream_dispatch(
             model=_serve_gen_model, messages=messages,
             options=_serve_gen_options,
-            stream=True, keep_alive=chat_keep_alive(_serve_gen_model),
+            keep_alive=chat_keep_alive(_serve_gen_model),
         ):
             parts.append(chunk.message.content)
         t_gen = time.perf_counter() - t_gen0
@@ -53884,10 +53971,10 @@ def serve(host: str, port: int):
         t0 = time.perf_counter()
         parts: list[str] = []
         try:
-            for chunk in ollama.chat(
+            for chunk in _chat_stream_dispatch(
                 model=resolve_chat_model(), messages=messages,
                 options={**CHAT_OPTIONS, "num_predict": predict_cap},
-                stream=True, keep_alive=chat_keep_alive(),
+                keep_alive=chat_keep_alive(),
             ):
                 parts.append(chunk.message.content)
         except Exception as exc:

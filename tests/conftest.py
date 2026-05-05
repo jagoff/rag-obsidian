@@ -52,6 +52,24 @@ _HAS_CHAT_MODEL: bool = _has_chat_model()
 
 
 @pytest.fixture(autouse=True)
+def _force_ollama_backend_for_tests(monkeypatch):
+    """Aislar tests del env var `RAG_LLM_BACKEND=mlx` que pueda tener seteado
+    el dev en su shell. La suite asume Ollama (mockeado) por default. Si MLX
+    se activara accidentalmente, los mocks de `ollama.chat` no interceptan,
+    los modelos MLX tratan de cargarse desde `~/.cache/huggingface/`, y los
+    tests devuelven inferencia real (lenta + no-determinística). Forzar
+    `RAG_LLM_BACKEND=ollama` por test garantiza isolation. También resetea
+    el singleton del backend para que la próxima `get_backend()` re-resuelva.
+    """
+    monkeypatch.setenv("RAG_LLM_BACKEND", "ollama")
+    try:
+        from rag.llm_backend import reset_backend
+        reset_backend()
+    except Exception:
+        pass
+
+
+@pytest.fixture(autouse=True)
 def _skip_if_no_ollama(request):
     """Skip tests decorated with `@pytest.mark.requires_ollama` when
     no ollama chat model is available (CI on ubuntu-latest, machines

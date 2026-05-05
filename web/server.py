@@ -4225,6 +4225,19 @@ def ollama_unload() -> dict:
     pays 3-8s cold reload but the host stays responsive until then.
     """
     freed = []
+    # MLX backend: el truco `prompt='' keep_alive=0` no aplica — los
+    # modelos MLX viven en `MLXBackend._loaded` (OrderedDict). Limpiamos
+    # ese cache directo. Si el daemon ollama tampoco está corriendo, el
+    # ps() abajo falla limpio y devolvemos lo que dropeamos.
+    if os.environ.get("RAG_LLM_BACKEND", "ollama").lower() == "mlx":
+        try:
+            from rag.llm_backend import get_backend
+            mlx_backend = get_backend()
+            mlx_loaded = list(getattr(mlx_backend, "_loaded", {}).keys())
+            getattr(mlx_backend, "_loaded", {}).clear()
+            freed.extend(mlx_loaded)
+        except Exception as exc:
+            freed.append(f"mlx_clear (fail: {exc})")
     try:
         ps = ollama.ps()
         for m in getattr(ps, "models", []) or []:
@@ -5795,7 +5808,8 @@ def followups(req: FollowupsRequest) -> dict:
     from rag import load_prompt as _lp
     prompt = _lp("followups", version="v1") + f"\n\n{ctx}\n\nJSON:"
     try:
-        resp = ollama.chat(
+        from rag import _mlx_or_ollama_chat as _moc
+        resp = _moc(
             model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
             options={"temperature": 0.3, "seed": 42, "num_predict": 220, "num_ctx": 2048},
@@ -11580,9 +11594,10 @@ async def api_query(req: QueryRequest, request: Request) -> dict:
             {"role": "user", "content": user_msg},
         ]
         _keep_alive = chat_keep_alive(web_model)
+        from rag import _mlx_or_ollama_chat as _moc
         resp = await asyncio.wait_for(
             asyncio.to_thread(
-                ollama.chat,
+                _moc,
                 model=web_model,
                 messages=_messages,
                 options=_opts,
@@ -19420,13 +19435,13 @@ def diagnose_error(req: _DiagnoseErrorRequest, request: Request) -> StreamingRes
     def _stream():
         try:
             yield f"data: {json.dumps({'type': 'model', 'name': model})}\n\n"
-            stream = ollama.chat(
+            from rag import _chat_stream_dispatch as _csd
+            stream = _csd(
                 model=model,
                 messages=[
                     {"role": "system", "content": _DIAGNOSE_ERROR_SYSTEM_PROMPT},
                     {"role": "user", "content": user_prompt},
                 ],
-                stream=True,
                 options={
                     "temperature": 0.3,
                     "seed": 42,
@@ -20023,7 +20038,8 @@ def auto_fix(req: _AutoFixRequest, request: Request) -> StreamingResponse:
         for turn_n in range(1, _AUTO_FIX_MAX_TURNS + 1):
             yield f"data: {json.dumps({'type': 'turn', 'n': turn_n})}\n\n"
             try:
-                resp = ollama.chat(
+                from rag import _mlx_or_ollama_chat as _moc
+                resp = _moc(
                     model=model,
                     messages=messages,
                     format="json",

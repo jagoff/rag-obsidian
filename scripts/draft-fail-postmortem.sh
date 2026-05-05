@@ -97,11 +97,11 @@ log show --last 5m --predicate 'eventMessage CONTAINS "ollama" OR eventMessage C
 
 # 10) Latencia probe — cuánto tarda /api/embed AHORA
 {
-  echo "=== probe embed bge-m3 (timeout 30s) ==="
+  echo "=== probe embed qwen3-embedding:0.6b (timeout 30s) ==="
   time curl -s -m 30 -o /dev/null -w 'http=%{http_code} t=%{time_total}\n' \
     -X POST http://127.0.0.1:11434/api/embed \
     -H "Content-Type: application/json" \
-    -d '{"model":"bge-m3","input":"postmortem"}' 2>&1
+    -d '{"model":"qwen3-embedding:0.6b","input":"postmortem"}' 2>&1
   echo
   echo "=== probe generate qwen2.5:7b (timeout 30s, num_predict=1) ==="
   time curl -s -m 30 -o /dev/null -w 'http=%{http_code} t=%{time_total}\n' \

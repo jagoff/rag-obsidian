@@ -13,7 +13,7 @@ Un buscador inteligente para tu vault de Obsidian. En vez de buscar por palabras
 1. **Ollama** corriendo en tu Mac. Instalalo desde [ollama.com](https://ollama.com) y arrancá el servicio.
 2. **Los modelos** que usa el sistema. Bajalos con:
    ```bash
-   ollama pull bge-m3           # embeddings
+   ollama pull qwen3-embedding:0.6b           # embeddings
    ollama pull qwen2.5:3b       # helper (chico y rápido)
    ollama pull qwen2.5:7b       # chat principal (recomendado)
    ```

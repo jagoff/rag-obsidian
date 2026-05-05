@@ -194,7 +194,7 @@ Error típico: `model "qwen2.5:7b" not found`.
 
 ```bash
 ollama pull qwen2.5:7b
-ollama pull bge-m3
+ollama pull qwen3-embedding:0.6b
 ollama pull qwen2.5:3b
 ```
 

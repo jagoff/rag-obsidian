@@ -1453,6 +1453,98 @@ def _audit_corpus_coverage_gaps(conn, days: int) -> dict:
     return out
 
 
+
+def _audit_draft_decision_health(conn: sqlite3.Connection, days: int = 30) -> dict:
+    """Health check del loop de aprendizaje del bot WA (drafts).
+
+    Pregunta accionable: ¿el loop está acumulando pares gold (approved_editar)
+    a buen ritmo para alimentar el DPO fine-tune del modelo de drafts?
+
+    Gate DPO: requiere >=100 pares gold all-time. Un par gold es una row con
+    decision='approved_editar' AND sent_text IS NOT NULL AND sent_text != bot_draft.
+
+    Alerta cuando approved_editar_pct < 10% con muestra >=10 en la ventana.
+    """
+    DPO_GATE_THRESHOLD = 100
+    out: dict = {
+        "window_days": days,
+        "total": 0,
+        "by_decision": {
+            "approved_si": 0,
+            "approved_editar": 0,
+            "rejected": 0,
+            "expired": 0,
+        },
+        "approved_editar_pct": 0.0,
+        "gold_pairs_total": 0,
+        "dpo_gate_threshold": DPO_GATE_THRESHOLD,
+        "dpo_gate_open": False,
+        "alert": False,
+        "suggestion": None,
+    }
+
+    try:
+        exists = conn.execute(
+            "SELECT name FROM sqlite_master"
+            " WHERE type='table' AND name='rag_draft_decisions'"
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        out["error"] = repr(exc)
+        return out
+    if exists is None:
+        out["error"] = "table missing: rag_draft_decisions"
+        return out
+
+    cutoff_iso = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+
+    rows = conn.execute(
+        "SELECT decision, COUNT(*) AS n"
+        " FROM rag_draft_decisions"
+        " WHERE ts >= ?"
+        " GROUP BY decision"
+        " ORDER BY n DESC",
+        (cutoff_iso,),
+    ).fetchall()
+
+    total = 0
+    by_decision: dict = {"approved_si": 0, "approved_editar": 0, "rejected": 0, "expired": 0}
+    for r in rows:
+        decision = r[0] or "unknown"
+        n = int(r[1] or 0)
+        total += n
+        if decision in by_decision:
+            by_decision[decision] = n
+
+    out["total"] = total
+    out["by_decision"] = by_decision
+
+    approved_editar_pct = (
+        round(by_decision["approved_editar"] / total * 100, 1) if total > 0 else 0.0
+    )
+    out["approved_editar_pct"] = approved_editar_pct
+
+    gold_pairs_total = conn.execute(
+        "SELECT COUNT(*) FROM rag_draft_decisions"
+        " WHERE decision = 'approved_editar'"
+        "   AND sent_text IS NOT NULL"
+        "   AND sent_text != bot_draft"
+    ).fetchone()[0]
+    out["gold_pairs_total"] = int(gold_pairs_total or 0)
+    out["dpo_gate_open"] = out["gold_pairs_total"] >= DPO_GATE_THRESHOLD
+
+    if total >= 10 and approved_editar_pct < 10.0:
+        out["alert"] = True
+        out["suggestion"] = (
+            f"Solo {by_decision['approved_editar']} de {total} drafts fueron editados"
+            f" ({approved_editar_pct:.1f}%) en los ultimos {days}d."
+            " El modelo DPO no acumula pares gold."
+            " Si los drafts son mediocres y el user los aprueba igual,"
+            " el loop de aprendizaje esta roto."
+        )
+
+    return out
+
+
 def _audit_db_size() -> dict:
     """Tamaño físico de las DBs + WAL files. Detección temprana de bloat."""
     out = {}

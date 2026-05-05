@@ -559,6 +559,92 @@ def test_qual_quais_y_serie_basic():
     assert replace_iberian_leaks("las coisas") == "las cosas"
 
 
+def test_bug_2026_05_05_fantastical_api():
+    """Regresión del bug del 2026-05-05 con query "buscame la api de
+    fantastical". El LLM devolvió:
+
+      "Vos tenés una nota sobre a API Key del fantastical que se refere
+      a la data 09-08-2024. Acredito que eso seja o que vos está
+      procurando referindo-se a la API Fantastical."
+
+    5 leaks pt nuevos: `Acredito`, `seja o que`, `está procurando`,
+    `referindo-se`, `se refere`, `a la data`, `sobre a API`. Todos
+    cubiertos en `wave9-2026-05-05`.
+    """
+    from rag.iberian_leak_filter import replace_iberian_leaks
+    bug = (
+        "Vos tenés una nota sobre a API Key del fantastical que se "
+        "refere a la data 09-08-2024. Acredito que eso seja o que vos "
+        "está procurando referindo-se a la API Fantastical."
+    )
+    out = replace_iberian_leaks(bug)
+    # Verificar que todos los leaks pt desaparecieron.
+    assert "Acredito" not in out
+    assert "acredito" not in out
+    assert "seja" not in out
+    assert "refere" not in out and "refiere" in out
+    assert "referindo" not in out and "refiriéndose" in out
+    assert "a la data" not in out and "a la fecha" in out
+    assert "sobre a API" not in out and "sobre la API" in out
+    assert "está procurando" not in out and "está buscando" in out
+    # Idempotencia
+    assert replace_iberian_leaks(out) == out
+
+
+def test_acredito_que_solo_match_construccion_pt():
+    """`Acredito que` (pt: "Creo que") es leak. Pero `acredito` solo
+    como verbo bancario en es ("acredito el monto en tu cuenta") es
+    válido. Sólo matcheamos cuando va seguido de `que`.
+    """
+    from rag.iberian_leak_filter import replace_iberian_leaks
+    # Leak pt: "Acredito que..."
+    assert "creo que" in replace_iberian_leaks("Acredito que esto es así").lower()
+    # Es válido (sin "que" después): "El banco acredita el monto"
+    out = replace_iberian_leaks("Te acredito el monto.")
+    assert "creo" not in out  # NO matchea sin "que"
+
+
+def test_seja_subjuntivo_pt():
+    """`seja` (pt subjuntivo de "ser") → `sea` (es)."""
+    from rag.iberian_leak_filter import replace_iberian_leaks
+    assert replace_iberian_leaks("aunque seja tarde") == "aunque sea tarde"
+    assert replace_iberian_leaks("quando sejam listas") == "quando sean listas"
+
+
+def test_referindo_y_refere_pt():
+    """Conjugaciones pt de `referir`."""
+    from rag.iberian_leak_filter import replace_iberian_leaks
+    assert "se refiere" in replace_iberian_leaks("la nota se refere al tema")
+    assert "refiriéndose" in replace_iberian_leaks("estaba referindo-se al evento")
+    assert "refiriendo" in replace_iberian_leaks("estaba referindo el tema")
+
+
+def test_a_la_data_pt():
+    """`a la data <fecha>` es leak pt para `a la fecha`. Sólo matchea
+    cuando viene seguido de número (fecha real); standalone "data" no
+    se toca para no romper "data point" / "la data" técnica.
+    """
+    from rag.iberian_leak_filter import replace_iberian_leaks
+    out = replace_iberian_leaks("revisado a la data 2026-05-05")
+    assert "a la fecha" in out
+    # Sin número: NO matchea (la regla `\ba\s+la\s+data\b` también es
+    # explícita, así que verificamos que ambas cumplen)
+    assert replace_iberian_leaks("a la data 09-08-2024") == "a la fecha 09-08-2024"
+
+
+def test_sobre_a_proper_noun_pt():
+    """`sobre a <Mayúscula>` (pt: "sobre la <noun>") → es: "sobre la".
+    Restringido a sustantivo propio (mayúscula inicial) para no chocar
+    con la prep es "ir a", "voy a", etc.
+    """
+    from rag.iberian_leak_filter import replace_iberian_leaks
+    assert "sobre la API" in replace_iberian_leaks("una nota sobre a API Key")
+    assert "sobre la React" in replace_iberian_leaks("doc sobre a React")
+    # Caso negativo: "sobre a" + minúscula NO se toca
+    out = replace_iberian_leaks("voy a hablar sobre a media tarde")
+    assert "sobre a media" in out  # preserva — minúscula
+
+
 def test_starters_auto_derivados_estan_completos():
     """Validación de la auto-derivación: para cada compound multi-palabra
     en `_IBERIAN_LEAK_REPLACEMENTS`, la primera palabra debe estar en

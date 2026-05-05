@@ -483,6 +483,59 @@ _IBERIAN_LEAK_REPLACEMENTS: tuple[tuple[str, str], ...] = (
     # que el system prompt + el filter de palabras pt-only (mencionou,
     # projeto, lá, ou, em, tá) cubra el grueso. Si vuelve a aparecer,
     # repensar como semantic-aware filter (mini-LLM o detector pt).
+
+    # 2026-05-05 (bug "buscame la api de fantastical"): output literal:
+    # "Vos tenés una nota sobre a API Key del fantastical que se refere
+    # a la data 09-08-2024. Acredito que eso seja o que vos está
+    # procurando referindo-se a la API Fantastical."
+    # 5 leaks pt nuevos no cubiertos por el filter. Los agrego acá:
+    #
+    # `Acredito` / `acredito` (pt: "creo"). En es la 1sg de "acreditar"
+    # existe pero significa "doy credibilidad", uso técnico/financiero.
+    # En contexto conversacional ("Acredito que X"), 99% es leak pt.
+    (r"\bacredito\s+que\b", "creo que"),
+    (r"\bacreditás\s+que\b", "creés que"),
+    # `seja` (pt: subjuntivo de "ser" 3sg). En es es "sea". La grafía
+    # con `j` antes de `a` para forma verbal NO existe en es.
+    (r"\bseja\b", "sea"),
+    (r"\bsejam\b", "sean"),
+    # `refere` (pt: 3sg pres de "referir"). En es es "refiere" con `i`.
+    # La grafía sin la `i` no existe en español. Idem `referindo` (pt
+    # gerundio) → `refiriendo` (es) y la forma reflexiva pronominal
+    # `referindo-se` (pt) → `refiriéndose` (es). El guión + clítico
+    # "-se" pegado es construcción pt; en es rioplatense iría como
+    # "refiriéndose" (sin guión, con tilde).
+    (r"\bse\s+refere\b", "se refiere"),
+    (r"\brefere\b", "refiere"),
+    (r"\breferindo-se\b", "refiriéndose"),
+    (r"\breferindo\b", "refiriendo"),
+    # `a la data` (pt: "a la fecha"). En pt "data" = "fecha"; en es
+    # "data" existe pero no en este contexto (en es sería "fecha" o
+    # "data" como tecnicismo de DB). El compound "a la data" + número
+    # de fecha es leak pt seguro.
+    (r"\ba\s+la\s+data\b", "a la fecha"),
+    (r"\bla\s+data\s+(?=\d)", "la fecha "),
+    # `o que` cuando aparece después de `seja` / verbo es construcción
+    # pt ("lo que"). Estricto: solo después de `sea\s+` o al inicio
+    # tras coma/punto seguido por sujeto pronombre. Mantenemos el más
+    # frecuente: `sea o que` (post `seja → sea` arriba) → `sea lo que`.
+    (r"\bsea\s+o\s+que\b", "sea lo que"),
+    # `está procurando` — pt "estar buscando". Conservador: solo el
+    # compound exacto (procurar existe en es como "intentar", pero
+    # "está procurando" pegado es construcción pt-Brasil para
+    # "está buscando"). Idem `estoy procurando` / `estás procurando`.
+    (r"\bestá\s+procurando\b", "está buscando"),
+    (r"\bestoy\s+procurando\b", "estoy buscando"),
+    (r"\bestás\s+procurando\b", "estás buscando"),
+    # `sobre a` (pt: "sobre la"; "a" pt = "la" en es femenino). Antes
+    # de sustantivo femenino claramente leak pt. Restringido a
+    # "sobre a <consonante mayús>" (proper noun / API / siglas) para
+    # no chocar con el verbo "ir a" en es. La heurística: `\bsobre\s+
+    # a\s+[A-Z]` (mayúscula = nombre propio o sigla).
+    # NOTA: `(?-i:...)` desactiva IGNORECASE inline para el lookahead,
+    # de lo contrario `[A-Z]` matchea minúsculas también por la flag
+    # global del compile loop.
+    (r"\bsobre\s+a\s+(?=(?-i:[A-Z]))", "sobre la "),
 )
 
 

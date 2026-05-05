@@ -6011,7 +6011,7 @@ _CORPUS_HASH_BUCKET: int = int(os.environ.get("RAG_CORPUS_HASH_BUCKET", "500"))
 # (PII redaction, raw tool call stripper, iberian leaks, REGLA 1.b/1.c, etc.).
 # Forzando que las entries del semantic cache pre-fix sean "diferente
 # corpus" → no se sirvan más.
-_FILTER_VERSION = "wave8-2026-04-28"
+_FILTER_VERSION = "wave9-2026-05-05"
 
 
 def _hash_chunk_count(chunk_count: int) -> str:

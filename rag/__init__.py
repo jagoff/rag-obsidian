@@ -20094,6 +20094,12 @@ class ChatTurnResult:
             "llm_judge_n_candidates": int(
                 rr.get("llm_judge_n_candidates", 0) or 0,
             ),
+            # filters_applied: filtros inferidos por retrieve() (source,
+            # folder, tag, date_range). Faltaba en to_log_event() → el
+            # mapper _map_queries_row nunca encontraba el key "filters" en
+            # los eventos generados por run_chat_turn (web + chat CLI),
+            # dejando filters_json siempre {} en la DB. Fix 2026-05-04.
+            "filters": rr.filters_applied or {},
         }
 
 
@@ -52118,6 +52124,50 @@ def serve(host: str, port: int):
             # rationale extendido. Audit 2026-04-25.
             "deep_retrieve_iterations": result.get("deep_retrieve_iterations"),
             "deep_retrieve_exit_reason": result.get("deep_retrieve_exit_reason"),
+            # MMR diversification counter (mismo patrón que to_log_event).
+            # 0 = MMR apagado o ningún slot reordenado.
+            "mmr_applied": int(result.get("mmr_applied", 0) or 0),
+            # Contradiction penalty counter — chunks demoted post-rerank.
+            "contradiction_penalty_applied": int(
+                result.get("contradiction_penalty_applied", 0) or 0,
+            ),
+            # Anaphora resolver (Quick Win #1, 2026-05-04).
+            "anaphora_resolved": bool(
+                (result.get("extras") or {}).get("anaphora_resolved", False),
+            ),
+            "anaphora_original": str(
+                (result.get("extras") or {}).get("anaphora_original", "") or "",
+            ),
+            "anaphora_rewritten": str(
+                (result.get("extras") or {}).get("anaphora_rewritten", "") or "",
+            ),
+            # Intent temporal (Quick Win #3, 2026-05-04).
+            "temporal_intent": result.get("temporal_intent", "neutral") or "neutral",
+            # LLM-as-judge rerank (2026-05-04, default OFF).
+            "llm_judge_fired": bool(result.get("llm_judge_fired", False)),
+            "llm_judge_ms": int(result.get("llm_judge_ms", 0) or 0),
+            "llm_judge_top_score_before": float(
+                result.get("llm_judge_top_score_before", 0.0) or 0.0,
+            ),
+            "llm_judge_top_score_after": float(
+                result.get("llm_judge_top_score_after", 0.0) or 0.0,
+            ),
+            "llm_judge_parse_failed": bool(
+                result.get("llm_judge_parse_failed", False),
+            ),
+            "llm_judge_n_candidates": int(
+                result.get("llm_judge_n_candidates", 0) or 0,
+            ),
+            # Query decomposition (2026-05-04, opt-in via RAG_QUERY_DECOMPOSE=1).
+            "decomposed": bool(
+                (result.get("filters_applied") or {}).get("decomposed", False),
+            ),
+            "n_sub_queries": int(
+                (result.get("filters_applied") or {}).get("n_sub_queries", 0) or 0,
+            ),
+            "decompose_ms": int(
+                (result.get("timing") or {}).get("decompose_ms", 0) or 0,
+            ),
         })
 
         payload = {

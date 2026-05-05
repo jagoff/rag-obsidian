@@ -82,6 +82,44 @@ def test_serve_logs_fast_path_and_gen_model():
     )
 
 
+def test_serve_logs_telemetry_keys_parity():
+    """log_query_event en serve debe emitir las mismas keys de telemetría
+    que to_log_event: mmr_applied, contradiction_penalty_applied,
+    anaphora_*, temporal_intent, llm_judge_* y decompose_*.
+
+    Verificación source-level: si el dict pierde una key en un refactor
+    futuro, este test falla antes de que llegue a producción.
+    """
+    src = (ROOT / "rag" / "__init__.py").read_text(encoding="utf-8")
+    idx = src.find('"cmd": "serve", "q": question')
+    assert idx >= 0, "serve log_query_event anchor missing"
+    # El bloque del dict ocupa ~3150 chars con las nuevas keys.
+    block = src[idx : idx + 3300]
+
+    expected_keys = [
+        '"mmr_applied"',
+        '"contradiction_penalty_applied"',
+        '"anaphora_resolved"',
+        '"anaphora_original"',
+        '"anaphora_rewritten"',
+        '"temporal_intent"',
+        '"llm_judge_fired"',
+        '"llm_judge_ms"',
+        '"llm_judge_top_score_before"',
+        '"llm_judge_top_score_after"',
+        '"llm_judge_parse_failed"',
+        '"llm_judge_n_candidates"',
+        '"decomposed"',
+        '"n_sub_queries"',
+        '"decompose_ms"',
+    ]
+    missing = [k for k in expected_keys if k not in block]
+    assert not missing, (
+        f"serve log_query_event falta(n) {len(missing)} keys de telemetría: "
+        f"{missing}"
+    )
+
+
 # ── Shared infra: _LOOKUP_MODEL + _LOOKUP_NUM_CTX exist with sane values ────
 
 

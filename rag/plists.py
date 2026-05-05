@@ -1695,6 +1695,7 @@ def _wake_up_plist(rag_bin: str) -> str:
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
     <key>OLLAMA_KEEP_ALIVE</key><string>20m</string>
+    <key>RAG_LLM_BACKEND</key><string>mlx</string>
   </dict>
   <key>StartCalendarInterval</key>
   <dict>

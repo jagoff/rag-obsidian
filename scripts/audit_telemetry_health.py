@@ -1201,6 +1201,258 @@ def _audit_abandon_high_score(conn, days: int) -> dict:
     return out
 
 
+def _audit_cache_hit_by_intent(conn, days: int) -> dict:
+    """Cache hit rate por intent — detecta intents con eligible>=20 y hit_rate<5%."""
+    import sqlite3 as _sqlite3
+    ALERT_MIN_ELIGIBLE = 20
+    ALERT_MAX_HIT_RATE = 5.0
+    from datetime import datetime, timedelta
+    cutoff_iso = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+    try:
+        rows = conn.execute("""
+            SELECT
+              COALESCE(json_extract(extra_json, '$.intent'), 'unknown') AS intent,
+              COUNT(*) AS eligible,
+              SUM(CASE WHEN json_extract(extra_json, '$.cache_probe.result') = 'hit'
+                       THEN 1 ELSE 0 END) AS hits,
+              SUM(CASE WHEN json_extract(extra_json, '$.cache_probe.result') = 'miss'
+                       THEN 1 ELSE 0 END) AS misses,
+              ROUND(100.0 * SUM(CASE WHEN json_extract(extra_json, '$.cache_probe.result') = 'hit'
+                               THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 2) AS hit_rate_pct
+            FROM rag_queries
+            WHERE ts >= ?
+              AND cmd IN ('web', 'query', 'serve.chat')
+              AND json_extract(extra_json, '$.cache_probe.result') IN ('hit', 'miss')
+            GROUP BY intent
+            HAVING eligible >= 5
+            ORDER BY eligible DESC
+        """, (cutoff_iso,)).fetchall()
+    except _sqlite3.OperationalError as exc:
+        return {"window_days": days, "by_intent": [], "alerts_count": 0,
+                "global_hit_rate_pct": None, "suggestion": None, "error": repr(exc)}
+    by_intent = []; total_eligible = 0; total_hits = 0; alerts_count = 0
+    for r in rows:
+        eligible = int(r[1] or 0); hits = int(r[2] or 0)
+        hit_rate_pct = float(r[4] or 0.0)
+        is_alert = eligible >= ALERT_MIN_ELIGIBLE and hit_rate_pct < ALERT_MAX_HIT_RATE
+        if is_alert:
+            alerts_count += 1
+        by_intent.append({"intent": r[0], "eligible": eligible, "hits": hits,
+                           "misses": int(r[3] or 0), "hit_rate_pct": hit_rate_pct, "alert": is_alert})
+        total_eligible += eligible; total_hits += hits
+    global_hit_rate_pct = round(100.0 * total_hits / total_eligible, 2) if total_eligible > 0 else None
+    suggestion = (
+        "Cache cosine threshold alto (RAG_CACHE_COSINE=0.93) o corpus_hash bucket "
+        "muy chico — el cache nunca pega en los intents con alerta. "
+        "Prob\u00e1 bajar RAG_CACHE_COSINE a 0.90."
+    ) if alerts_count > 0 else None
+    return {"window_days": days, "by_intent": by_intent, "alerts_count": alerts_count,
+            "global_hit_rate_pct": global_hit_rate_pct, "suggestion": suggestion}
+
+
+def _audit_ranker_blind_spots(conn: sqlite3.Connection, days: int = 30) -> dict:
+    """Paths que el user marcó como `corrective_path` pero el ranker NUNCA trae como top-1.
+
+    Pregunta accionable: ¿qué notas el user tuvo que corregir manualmente
+    (porque el ranker se equivocó de top-1) que el ranker NUNCA pone en
+    posición 1 dentro de la ventana? Esos son blind spots concretos —
+    el `feedback_pos` weight del scoring formula está mal calibrado para
+    esos paths.
+
+    Cualquier hit es señal de blind spot real: el user ya dijo "esta es
+    la nota correcta" y el ranker la sigue ignorando. Cualquier
+    `count > 0` dispara `alert=True`.
+
+    Acción sugerida cuando dispara: subir `feedback_pos` weight en
+    `ranker.json` o re-correr `rag tune --apply` para que esos paths
+    pesen más en el scoring formula post-rerank.
+
+    Defensivo contra `paths_json` con JSON malformado (rows viejos)
+    usando `json_valid()`. Top-1 = `j.key = 0` sobre el array — el shape
+    de `paths_json` es lista de strings, no de objetos (verificado
+    contra telemetry.db real al implementar).
+
+    Returns:
+        {
+          "window_days": 30,
+          "blind_spots": [{"path": "...", "times_corrected": N}, ...],
+          "count": N,
+          "alert": bool,
+          "suggestion": "..." (sólo presente cuando alert=True),
+        }
+    """
+    out: dict = {
+        "window_days": days,
+        "blind_spots": [],
+        "count": 0,
+        "alert": False,
+    }
+
+    try:
+        exists = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='rag_feedback'"
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        out["error"] = repr(exc)
+        return out
+    if exists is None:
+        out["error"] = "table missing: rag_feedback"
+        return out
+
+    cutoff_iso = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+
+    try:
+        rows = conn.execute(
+            """
+            WITH cp AS (
+              SELECT json_extract(extra_json, '$.corrective_path') AS path,
+                     COUNT(*) AS times
+              FROM rag_feedback
+              WHERE rating < 0
+                AND json_extract(extra_json, '$.corrective_path') IS NOT NULL
+                AND json_extract(extra_json, '$.corrective_path') <> ''
+              GROUP BY path
+            ),
+            top1_paths AS (
+              SELECT DISTINCT j.value AS path
+              FROM rag_queries, json_each(rag_queries.paths_json) j
+              WHERE j.key = 0
+                AND rag_queries.ts >= ?
+                AND json_valid(rag_queries.paths_json)
+            )
+            SELECT cp.path, cp.times
+            FROM cp
+            LEFT JOIN top1_paths ON cp.path = top1_paths.path
+            WHERE top1_paths.path IS NULL
+            ORDER BY cp.times DESC
+            LIMIT 20
+            """,
+            (cutoff_iso,),
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        out["error"] = repr(exc)
+        return out
+
+    blind_spots = [
+        {"path": r[0], "times_corrected": int(r[1] or 0)} for r in rows
+    ]
+    out["blind_spots"] = blind_spots
+    out["count"] = len(blind_spots)
+    out["alert"] = out["count"] > 0
+    if out["alert"]:
+        out["suggestion"] = (
+            "Subir feedback_pos weight en ranker.json o re-correr "
+            "`rag tune --apply` con estos paths como signal"
+        )
+    return out
+
+
+def _audit_corpus_coverage_gaps(conn, days: int) -> dict:
+    """Temas que el user busca repetidamente y el corpus no cubre bien.
+
+    Pregunta accionable: ¿qué debería indexar o agregar al vault?
+
+    Identifica queries que:
+    - Aparecen ≥2 veces en la ventana (no es un one-off accidental).
+    - Tienen top_score entre 0.015 y 0.3 — el pipeline encontró algo pero
+      con muy baja confianza. Scores < 0.015 son refusals directos (la
+      query ni merece intentarlo); scores > 0.3 son cobertura aceptable.
+    - Vienen de los canales principales (chat, query, web, serve.chat).
+
+    Output ordenado por recurrencia DESC, avg_top_score ASC — las más
+    buscadas y peor servidas al frente.
+
+    Thresholds calibrados con distribución real de producción
+    (commit 2026-05-04, SQL validado en DB real → 129 queries únicas
+    con ≥2 ocurrencias en 30 días):
+    - top_score < 0.3: rango donde el reranker no tiene señal semántica
+      suficiente — respuestas vagas, citas poco relevantes.
+    - unique_queries_repeated ≥ 5: alerta conservadora; menos de 5 tiene
+      demasiado falso positivo (tema nicho de una semana atípica).
+    """
+    import sqlite3 as _sqlite3
+    from datetime import datetime, timedelta
+    cutoff_iso = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+    out: dict = {
+        "window_days": days,
+        "total_low_score_queries": 0,
+        "unique_queries_repeated": 0,
+        "top_candidates": [],
+        "alert": False,
+    }
+
+    try:
+        exists = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='rag_queries'"
+        ).fetchone()
+    except _sqlite3.OperationalError as exc:
+        out["error"] = repr(exc)
+        return out
+    if exists is None:
+        out["error"] = "table missing: rag_queries"
+        return out
+
+    total_row = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM rag_queries
+        WHERE ts >= ?
+          AND top_score < 0.3
+          AND top_score > 0.015
+          AND cmd IN ('chat', 'query', 'web', 'serve.chat')
+          AND q != ''
+        """,
+        (cutoff_iso,),
+    ).fetchone()
+    out["total_low_score_queries"] = int(total_row[0] or 0)
+
+    unique_row = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM (
+          SELECT lower(q) AS q_normalized
+          FROM rag_queries
+          WHERE ts >= ?
+            AND top_score < 0.3
+            AND top_score > 0.015
+            AND cmd IN ('chat', 'query', 'web', 'serve.chat')
+            AND q != ''
+          GROUP BY q_normalized
+          HAVING COUNT(*) >= 2
+        )
+        """,
+        (cutoff_iso,),
+    ).fetchone()
+    out["unique_queries_repeated"] = int(unique_row[0] or 0)
+
+    rows = conn.execute(
+        """
+        SELECT
+          lower(q) AS q_normalized,
+          COUNT(*) AS occurrences,
+          ROUND(AVG(top_score), 3) AS avg_top_score,
+          MIN(ts) AS first_seen,
+          MAX(ts) AS last_seen
+        FROM rag_queries
+        WHERE ts >= ?
+          AND top_score < 0.3
+          AND top_score > 0.015
+          AND cmd IN ('chat', 'query', 'web', 'serve.chat')
+          AND q != ''
+        GROUP BY q_normalized
+        HAVING COUNT(*) >= 2
+        ORDER BY occurrences DESC, avg_top_score ASC
+        LIMIT 20
+        """,
+        (cutoff_iso,),
+    ).fetchall()
+    out["top_candidates"] = [dict(r) for r in rows]
+    out["alert"] = out["unique_queries_repeated"] >= 5
+    return out
+
+
 def _audit_db_size() -> dict:
     """Tamaño físico de las DBs + WAL files. Detección temprana de bloat."""
     out = {}
@@ -1443,6 +1695,29 @@ def _render_text(report: dict) -> str:
                 out.append(f"   Sugerencia: {css['suggestion'][:90]}...")
         out.append("")
 
+    # Cache hit por intent
+    chi = report.get("cache_hit_by_intent")
+    if chi is not None:
+        if chi.get("error"):
+            out.append(f"🔍 Cache hit por intent: ERROR — {chi['error']}")
+        else:
+            ghr = chi.get("global_hit_rate_pct")
+            ghr_str = f"{ghr:.1f}%" if ghr is not None else "n/d"
+            out.append(f"🔍 Cache hit por intent ({chi['window_days']}d) — global: {ghr_str}")
+            if chi["by_intent"]:
+                out.append(f"   {'intent':<18} {'eligible':>8} {'hits':>6} {'misses':>7} {'hit_rate':>9}  alerta")
+                out.append("   " + "-" * 58)
+                for row in chi["by_intent"]:
+                    alert_str = "⚠️ " if row["alert"] else "  "
+                    out.append(
+                        f"   {alert_str}{row['intent']:<16} "
+                        f"{row['eligible']:>8} {row['hits']:>6} {row['misses']:>7} "
+                        f"{row['hit_rate_pct']:>8.1f}%"
+                    )
+            if chi.get("alerts_count", 0) > 0 and chi.get("suggestion"):
+                out.append(f"   → {chi['suggestion']}")
+        out.append("")
+
     # Harvest candidates
     hc = report.get("harvest_candidates")
     if hc is not None:
@@ -1475,6 +1750,29 @@ def _render_text(report: dict) -> str:
                         f"          ... y {remaining} más — "
                         "corré el comando de arriba para labelear todos."
                     )
+        out.append("")
+
+    # Ranker blind spots — paths con corrective_path que NUNCA fueron top-1
+    rbs = report.get("ranker_blind_spots")
+    if rbs is not None:
+        if rbs.get("error"):
+            out.append(f"🎯 Ranker blind spots: ERROR — {rbs['error']}")
+        else:
+            count = rbs["count"]
+            days_w = rbs["window_days"]
+            alert_icon = "⚠️ " if rbs["alert"] else "✓ "
+            out.append(
+                f"{alert_icon}Ranker blind spots (paths con CP "
+                f"que nunca fueron top-1, últimos {days_w}d): {count}"
+            )
+            if count > 0:
+                out.append("   El user marcó estos paths como correctos pero el ranker los ignora:")
+                for bs in rbs["blind_spots"][:10]:
+                    out.append(
+                        f"     • {bs['times_corrected']}× corregido → {bs['path']}"
+                    )
+                if rbs.get("suggestion"):
+                    out.append(f"   Sugerencia: {rbs['suggestion']}")
         out.append("")
 
     # DB size
@@ -1570,6 +1868,13 @@ def _render_text(report: dict) -> str:
             f"disponibles (faltan {rows_left}). Corré `rag feedback backfill` o "
             "`rag feedback infer-implicit --window-seconds 600` para destrabar el gate."
         )
+    ahs_hints = report.get("abandon_high_score")
+    if ahs_hints is not None and ahs_hints.get("alert") and not ahs_hints.get("error"):
+        out.append(
+            f"  • Content gap detectado: {ahs_hints['count']} queries con "
+            "top_score \u2265 0.4 donde el user se fue igual. "
+            "Revisar respuestas del LLM (vacias / alucinaciones)."
+        )
     if (
         not err.get("total_errors")
         and not (lat and lat.get("outliers"))
@@ -1577,6 +1882,7 @@ def _render_text(report: dict) -> str:
         and (ret is None or ret.get("status") == "healthy")
         and (chat is None or chat.get("status") == "healthy")
         and (fcg is None or fcg.get("gate_open") or fcg.get("error"))
+        and (ahs_hints is None or not ahs_hints.get("alert"))
     ):
         out.append("  • ✅ Sistema sano. No se requiere acción inmediata.")
     out.append("=" * 72)
@@ -1616,6 +1922,9 @@ def main() -> int:
         report["feedback_corrective_gap"] = None
         report["harvest_candidates"] = None
         report["cross_source_single_source"] = None
+        report["cache_hit_by_intent"] = None
+        report["abandon_high_score"] = None
+        report["ranker_blind_spots"] = None
         report["db_unavailable"] = str(TELEMETRY_DB)
     else:
         try:
@@ -1638,6 +1947,9 @@ def main() -> int:
                 )
             else:
                 report["cross_source_single_source"] = None
+            report["cache_hit_by_intent"] = _audit_cache_hit_by_intent(conn, args.days)
+            report["abandon_high_score"] = _audit_abandon_high_score(conn, args.days)
+            report["ranker_blind_spots"] = _audit_ranker_blind_spots(conn, days=30)
         except sqlite3.OperationalError as exc:
             report["query_latency"] = None
             report["cache_health"] = None
@@ -1647,6 +1959,9 @@ def main() -> int:
             report["feedback_corrective_gap"] = None
             report["harvest_candidates"] = None
             report["cross_source_single_source"] = None
+            report["cache_hit_by_intent"] = None
+            report["abandon_high_score"] = None
+            report["ranker_blind_spots"] = None
             report["db_error"] = repr(exc)
         finally:
             conn.close()

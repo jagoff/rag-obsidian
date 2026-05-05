@@ -259,7 +259,7 @@ def _web_plist(rag_bin: str) -> str:
     <key>RAG_MEMORY_PRESSURE_THRESHOLD</key><string>80</string>
     <key>RAG_AUTO_FIX_WORKER</key><string>1</string>
     <key>RAG_AUTO_FIX_HOURLY_CAP</key><string>12</string>
-    <key>RAG_LLM_BACKEND</key><string>mlx</string>
+    <key>RAG_LLM_BACKEND</key><string>ollama</string>
 {yt_line}  </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>

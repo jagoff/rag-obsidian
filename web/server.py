@@ -3918,35 +3918,6 @@ def _ollama_alive(timeout: float = 2.0) -> bool:
         return False
 
 
-# Dedicated streaming client with a per-chunk read timeout. httpx applies
-# `read` to each chunk of a streaming response: if no bytes arrive within
-# the budget, ReadTimeout fires and our `except Exception` surfaces an
-# error SSE to the frontend. Without this, a stuck-load ollama daemon
-# silently wedges the /api/chat stream forever (spinner never clears).
-#
-# Budget rationale (2026-04-28 update — was 45.0):
-# La streaming call es la fase MÁS pesada del turno: prefill sobre el
-# contexto post-tools (típico 25-30k chars cuando hay whatsapp_pending /
-# reminders_due / calendar_ahead) + decode de la respuesta. Empíricamente
-# `[chat-timing]` registra ttft hasta 38.5s en queries con tool_rounds=1,
-# lo cual está peligrosamente cerca de 45s — un cold-load del modelo
-# (~5-10s extra de KV reinit cuando num_ctx adaptive cambia respecto del
-# value loaded) y/o memory pressure en MPS lo empuja >45s y dispara
-# "LLM falló: timed out" en el frontend. Repro autónomo Playwright
-# 2026-04-28: 3 de 5 queries (whatsapp/RAG/pendientes) cayeron en
-# 59-62s wall time → el stream client cortaba a los 45s del primer
-# read, antes de que llegara el primer token de la synthesis call.
-#
-# Subimos a 90s para alinear con `_OLLAMA_TOOL_TIMEOUT` (que ya estaba
-# en 90s tras commit b0d140e). Argumento: el tool decision call mide el
-# 1er-y-único chunk no-streaming, mientras que el stream final mide
-# per-chunk; ambos pueden saturar el mismo budget cuando el modelo cold-
-# loads o el contexto explota. Si realmente hay un wedge del daemon,
-# `_ollama_chat_probe` lo detecta antes con 6s — el budget de 90s no
-# expone al user a colgues largos por daemon stuck.
-_OLLAMA_STREAM_TIMEOUT = 90.0
-_OLLAMA_STREAM_CLIENT = ollama.Client(timeout=_OLLAMA_STREAM_TIMEOUT)
-
 # Tool-decision call (non-streaming, ~once per turn, with `tools=` schema
 # of all 13 chat tools). Observed 2026-04-24 (Fer F. "LLM falló: timed
 # out"): long queries (~50 palabras + 2KB de _WEB_TOOL_ADDENDUM + JSON

@@ -176,18 +176,25 @@ from rag import (  # noqa: E402
 #         → cosine medio, paráfrasis real, necesitaba reform.
 #   0.887 ("listame los gastos en pesos de la visa") → autocontenido.
 #
-# Trade-off del cambio 0.70 → 0.50:
+# Trade-off del cambio 0.70 → 0.50 → 0.40 (defense-in-depth):
 #   - Antes: cualquier cosine [0.32, 0.70] reformulaba. Capturaba
 #     paráfrasis tipo 0.585 PERO también queries no-relacionadas con
 #     overlap léxico ruidoso (caso del DNI).
-#   - Ahora: cosine [0.32, 0.50] reformula. Cosine [0.50, 1.00] usa
+#   - 2026-05-01: cosine [0.32, 0.50] reformula. Cosine [0.50, 1.00] usa
 #     query raw. Paráfrasis reales suelen estar arriba de 0.55-0.60 →
 #     query raw funciona igual de bien (el contexto de history sigue
 #     en el prompt del LLM final). Queries weak-related en banda alta
 #     ya no se contaminan.
+#   - 2026-05-04: bug recurrente — cosine 0.32-0.50 entre "DNI tramite"
+#     y "ideas de tech app" siguió mezclando temas en el final synthesis.
+#     Bajamos a 0.40 + en la banda residual [0.32, 0.40) se DROPEA
+#     history (igual que sub-0.32 topic shift), no se reformula. El
+#     LLM final tampoco ve los turnos previos → bleed eliminado en
+#     retrieve Y en synthesis.
 #   - Si volvemos a ver "queries cortas perdiendo contexto": subir a
-#     0.55. Si vemos contaminación: bajar a 0.45.
-REFORM_COSINE_HIGH = 0.50
+#     0.45 (sigue dropeando agresivo). Si vemos contaminación: bajar
+#     a 0.35 (banda casi cerrada, raro).
+REFORM_COSINE_HIGH = 0.40
 
 from web.conversation_writer import write_turn, TurnData  # noqa: E402
 from web.tools import (  # noqa: E402
@@ -10083,33 +10090,6 @@ _OLLAMA_STUCK_THRESHOLD = int(os.environ.get("RAG_OLLAMA_STUCK_THRESHOLD", "2"))
 _OLLAMA_STUCK_COOLDOWN_S = int(os.environ.get("RAG_OLLAMA_STUCK_COOLDOWN_S", "180"))
 
 
-def _ollama_kill_runners() -> tuple[int, str]:
-    """Force-kill ollama `runner` subprocesses (NOT `ollama serve`).
-
-    El parent `ollama serve` los respawnea al próximo request — esto da
-    un "soft restart" que recupera de un stuck-load sin requerir que el
-    usuario reinicie Ollama.app manualmente. Requiere `pkill` (parte de
-    procps en macOS, ship con base system).
-
-    Retorna (count_killed, error_msg). count=0 + error="" si no había
-    runners (ollama idle, sin modelos cargados).
-    """
-    try:
-        out = subprocess.run(
-            ["pgrep", "-f", "Ollama.app/Contents/Resources/ollama runner"],
-            capture_output=True, text=True, timeout=3, check=False,
-        ).stdout.strip()
-        if not out:
-            return (0, "")
-        pids = [p for p in out.split("\n") if p.strip().isdigit()]
-        if not pids:
-            return (0, "")
-        subprocess.run(["kill", "-9", *pids], capture_output=True, timeout=3, check=False)
-        return (len(pids), "")
-    except Exception as exc:
-        return (0, str(exc))
-
-
 def _maybe_restart_ollama_on_stuck() -> bool:
     """Si el contador de fallos consecutivos cruzó el threshold y pasó
     el cooldown desde el último restart, kill runners. Retorna True si
@@ -10126,11 +10106,16 @@ def _maybe_restart_ollama_on_stuck() -> bool:
     now = time.time()
     if now - _OLLAMA_STUCK_LAST_RESTART_TS < _OLLAMA_STUCK_COOLDOWN_S:
         return False
-    killed, err = _ollama_kill_runners()
+    try:
+        from rag import _kill_ollama_runners as _rag_kill
+        killed = _rag_kill()
+    except Exception as exc:
+        killed = 0
+        print(f"[ollama-stuck-restart] kill error: {exc}", flush=True)
     _OLLAMA_STUCK_LAST_RESTART_TS = now
     _OLLAMA_STUCK_FAIL_COUNT = 0
     print(
-        f"[ollama-stuck-restart] killed={killed} err={err!r} "
+        f"[ollama-stuck-restart] killed={killed} "
         f"cooldown={_OLLAMA_STUCK_COOLDOWN_S}s",
         flush=True,
     )
@@ -12847,6 +12832,30 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 )
             )
             if _topic_shifted:
+                history = []
+            elif (
+                _topic_shift_cosine is not None
+                and TOPIC_SHIFT_COSINE <= _topic_shift_cosine < REFORM_COSINE_HIGH
+                and not _looks_like_followup(question)
+            ):
+                # 2026-05-04 borderline-band drop: cosine residual entre el
+                # threshold duro de topic-shift (0.32) y REFORM_COSINE_HIGH
+                # (0.40) NO es un follow-up obvio (no matchea regex
+                # `_looks_like_followup`) → tratamos como topic shift débil
+                # y dropeamos history. Antes esta banda iba a `reformulate_
+                # query(question, history)` y el helper LLM mezclaba topics
+                # (ver caso DNI ↔ tech app del 2026-05-04). Con history
+                # vacía: (1) no hay reform LLM, (2) el retrieve usa raw
+                # query, (3) el synthesis prompt downstream tampoco ve los
+                # turnos previos → bleed eliminado en retrieve Y synthesis.
+                # Cost: queries con paráfrasis débil cosine 0.32-0.40
+                # pierden el rewrite — pero esa banda históricamente tenía
+                # más falsos positivos que reales (ver comentario sobre
+                # REFORM_COSINE_HIGH arriba).
+                _topic_shifted = True
+                _topic_shift_reason = (
+                    f"borderline-drop cosine={_topic_shift_cosine:.3f}"
+                )
                 history = []
 
         search_question = question

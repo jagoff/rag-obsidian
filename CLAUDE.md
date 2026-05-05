@@ -330,7 +330,7 @@ Catálogo completo (47+ vars adicionales): [`docs/env-vars-catalog.md`](docs/env
 **Misc**:
 - `OBSIDIAN_RAG_NO_APPLE=1` — desactiva integraciones Apple (Calendar/Reminders/Mail/ScreenTime).
 - `RAG_TIMEZONE` — IANA tz para `_parse_natural_datetime` con tzinfo (default `America/Argentina/Buenos_Aires`).
-- `OBSIDIAN_RAG_WATCH_EXCLUDE_FOLDERS` — comma-separated folders ignorados por `rag watch` (default `"03-Resources/WhatsApp"`).
+- `OBSIDIAN_RAG_WATCH_EXCLUDE_FOLDERS` — comma-separated folders ignorados por `rag watch` (default `"04-Archive/99-obsidian-system/99-AI/external-ingest/WhatsApp"`).
 
 **Dev/debug** (NO en producción): `RAG_DEBUG=1`, `RAG_RETRIEVE_TIMING=1`, `RAG_NO_WARMUP=1`, `OBSIDIAN_RAG_SKIP_CONTEXT_SUMMARY=1`, `OBSIDIAN_RAG_SKIP_SYNTHETIC_Q=1`.
 

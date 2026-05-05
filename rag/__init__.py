@@ -3427,7 +3427,7 @@ def is_excluded(rel_path: str) -> bool:
         or _conversations_indexable(rel_path)
     ):
         return True
-    claude_prefix = "03-Resources/Claude/"
+    claude_prefix = "04-Archive/99-obsidian-system/99-AI/external-ingest/Claude/"
     if rel_path.startswith(claude_prefix) and "/" in rel_path[len(claude_prefix):]:
         return True
     # Legacy episodic-memory inbox (pre-2026-04-25). Las conversaciones
@@ -3473,7 +3473,7 @@ def is_excluded(rel_path: str) -> bool:
     # conversational context well enough and the bigger roll-up chunks
     # help. Not expected in practice because `scripts/ingest_whatsapp.py`
     # already chunks at natural conversation breaks.
-    if rel_path.startswith("03-Resources/WhatsApp/"):
+    if rel_path.startswith("04-Archive/99-obsidian-system/99-AI/external-ingest/WhatsApp/"):
         _wa_override = os.environ.get(
             "OBSIDIAN_RAG_INDEX_WA_MONTHLY", ""
         ).strip().lower()
@@ -3495,7 +3495,7 @@ def is_excluded(rel_path: str) -> bool:
     # vault indexing of any markdown left under 03-Resources/GoogleDrive/.
     # Only needed if `rag index --source drive` is broken and you need
     # to fall back to the old write-to-vault approach.
-    if rel_path.startswith("03-Resources/GoogleDrive/"):
+    if rel_path.startswith("04-Archive/99-obsidian-system/99-AI/external-ingest/GoogleDrive/"):
         _gd_override = os.environ.get(
             "OBSIDIAN_RAG_INDEX_GDRIVE_VAULT", ""
         ).strip().lower()
@@ -7855,6 +7855,21 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             " ON rag_chunk_contexts(doc_id)",
         ),
     ),
+    (
+        # YouTube transcript circuit-breaker cooldown.
+        # Cuando YouTube bloquea la IP (IpBlocked), seteamos cooldown de
+        # 4-24h para evitar retry-storm que prolonga el bloqueo.
+        # backoff exponencial: 1ero 4h, 2do 8h, 3ero 16h, 4to+ 24h.
+        "rag_yt_transcript_cooldown",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_yt_transcript_cooldown ("
+            " id INTEGER PRIMARY KEY CHECK (id = 0),"
+            " blocked_until_ts REAL NOT NULL,"
+            " retry_count INTEGER DEFAULT 0,"
+            " last_blocked_at REAL NOT NULL"
+            ")",
+        ),
+    ),
 )
 
 
@@ -9415,12 +9430,28 @@ class SqliteVecCollection:
     def id(self) -> str:
         """Monotonic schema version bumped on every destructive write.
         Used by _load_corpus() to detect stale BM25 cache — a new `id`
-        signals the collection was destructively rewritten."""
-        row = self._db.execute(
-            "SELECT version FROM rag_schema_version WHERE table_name = ?",
-            (self.name,),
-        ).fetchone()
-        return f"{self.name}:{row[0] if row else 0}"
+        signals the collection was destructively rewritten.
+
+        Mismo guard defensivo que `count()`: bajo race / concurrent shared
+        connection, `execute` puede tirar `InterfaceError: bad parameter
+        or other API misuse` (silent_errors.jsonl 2026-05-01) o la tabla
+        puede no existir todavía. Devolvemos un fallback determinístico
+        (`<name>:0`) en vez de propagar — `_load_corpus` lo trata como
+        cache hit del primer rebuild, peor caso un rebuild extra.
+        """
+        import sqlite3 as _sqlite3
+        try:
+            row = self._db.execute(
+                "SELECT version FROM rag_schema_version WHERE table_name = ?",
+                (self.name,),
+            ).fetchone()
+        except (_sqlite3.InterfaceError, _sqlite3.OperationalError):
+            return f"{self.name}:0"
+        try:
+            v = row[0] if row else 0
+        except (IndexError, TypeError):
+            v = 0
+        return f"{self.name}:{v}"
 
     def _bump_version(self):
         self._db.execute(
@@ -9430,9 +9461,31 @@ class SqliteVecCollection:
         )
 
     def count(self) -> int:
-        return self._db.execute(
-            f"SELECT COUNT(*) FROM {self._meta}"
-        ).fetchone()[0]
+        # Defensive: bajo race con `index --reset` / `delete_collection` la
+        # `meta_*` table puede estar mid-recreate; `fetchone()` puede devolver
+        # None o `()`. Y bajo concurrent thread access al shared sqlite3
+        # connection (`check_same_thread=False`), el statement state puede
+        # corromperse → `InterfaceError: bad parameter or other API misuse`.
+        # En ambos casos devolvemos 0 — el caller (`_load_corpus`) interpreta
+        # un count delta como invalidación de cache, lo peor que pasa es un
+        # rebuild extra en el siguiente call. Mejor que tirar la query entera
+        # vía graph_expand.outer (silent_errors.jsonl 2026-05-01: 23 hits con
+        # tracebacks pegando acá).
+        import sqlite3 as _sqlite3
+        try:
+            row = self._db.execute(
+                f"SELECT COUNT(*) FROM {self._meta}"
+            ).fetchone()
+        except (_sqlite3.InterfaceError, _sqlite3.OperationalError):
+            # InterfaceError → connection state corrupto; OperationalError →
+            # tabla no existe (drop/create race). Ambos: degrade graceful.
+            return 0
+        if not row:
+            return 0
+        try:
+            return int(row[0])
+        except (IndexError, TypeError, ValueError):
+            return 0
 
     @staticmethod
     def _build_where(where: dict | None) -> tuple[str, list]:
@@ -14052,6 +14105,11 @@ DRAFTS_FT_BASE_MODEL = os.environ.get(
 _drafts_ft_model = None
 _drafts_ft_tokenizer = None
 _drafts_ft_lock = threading.Lock()
+# Sentinel: True cuando el load falló en runtime (state_dict mismatch,
+# base model actualizado, etc.). Evita reintentos per-request que
+# generan el mismo RuntimeError 2 events por call. Se resetea solo
+# reiniciando el proceso (o seteando a False en tests con monkeypatch).
+_drafts_ft_load_failed = False
 
 
 def _drafts_ft_enabled() -> bool:
@@ -14094,11 +14152,18 @@ def _load_drafts_ft_model():
     Conservative: NUNCA raisea. Loguea a `silent_errors.jsonl` y
     devuelve (None, None) — el caller (preview endpoint) interpreta
     eso como "fallback a echo del baseline".
+
+    Cuando el load falla por RuntimeError (state_dict mismatch entre
+    el adapter LoRA y el base model), setea `_drafts_ft_load_failed`
+    a True para evitar reintentos per-request con el mismo error.
+    Reiniciar el proceso resetea el sentinel.
     """
-    global _drafts_ft_model, _drafts_ft_tokenizer
+    global _drafts_ft_model, _drafts_ft_tokenizer, _drafts_ft_load_failed
     with _drafts_ft_lock:
         if _drafts_ft_model is not None:
             return _drafts_ft_model, _drafts_ft_tokenizer
+        if _drafts_ft_load_failed:
+            return None, None
         if not _drafts_ft_adapter_available():
             _silent_log(
                 "drafts_ft_adapter_missing",
@@ -14132,7 +14197,16 @@ def _load_drafts_ft_model():
             _drafts_ft_tokenizer = tokenizer
             return _drafts_ft_model, _drafts_ft_tokenizer
         except Exception as exc:
-            _silent_log("drafts_ft_load_failed", exc)
+            import traceback as _tb
+            detail = _tb.format_exc()
+            _silent_log(
+                "drafts_ft_load_failed",
+                f"{exc!r}\n\nTraceback completo:\n{detail}\n"
+                f"Adapter: {DRAFTS_FT_ADAPTER_DIR}\n"
+                f"Base model: {DRAFTS_FT_BASE_MODEL}\n"
+                "RAG_DRAFTS_FT desactivado en runtime — reiniciar proceso para reintentar.",
+            )
+            _drafts_ft_load_failed = True
             return None, None
 
 
@@ -22031,17 +22105,39 @@ def retrieve(
             # "first chunk = most representative") y preservamos el orden de
             # `sorted_neighbors` (closer hops + higher PageRank primero) iterando
             # sobre `top_neighbors` post-fetch.
-            top_neighbors = [nb for nb, _ in sorted_neighbors[:2]]
+            # Sanitizar antes de bindear a sqlite3: filtrar `None`, vacíos y
+            # no-strings. Si algún path se coló como None desde corpus
+            # corrupto / metadata vieja, el `col.get(where={"$in": [...,
+            # None, ...]})` cae con `InterfaceError: bad parameter or other
+            # API misuse` (silent_errors.jsonl 2026-05-01: 23 hits) porque
+            # sqlite3 no sabe bindear None en un IN list contra una columna
+            # TEXT — el row se serializa como NULL y pierde el match, pero
+            # encima rompe la prepared statement state si la connection es
+            # shared. Mejor filtrar de raíz acá.
+            top_neighbors = [
+                nb for nb, _ in sorted_neighbors[:2]
+                if isinstance(nb, str) and nb
+            ]
             if top_neighbors:
                 try:
                     nb_chunks = col.get(
                         where={"file": {"$in": top_neighbors}},
                         include=["documents", "metadatas"],
                     )
+                    # Defensa contra col.get devolviendo None bajo race con
+                    # delete_collection / index --reset (no debería pasar
+                    # con el adapter actual, que siempre devuelve dict, pero
+                    # hubo `'NoneType' object is not subscriptable` upstream
+                    # — guard es barato).
+                    if not isinstance(nb_chunks, dict):
+                        raise RuntimeError(
+                            f"col.get devolvió {type(nb_chunks).__name__} "
+                            "(esperado dict) — race con index --reset?"
+                        )
                     per_path: dict[str, tuple[str, dict]] = {}
                     for doc, meta in zip(
-                        nb_chunks.get("documents", []) or [],
-                        nb_chunks.get("metadatas", []) or [],
+                        nb_chunks.get("documents") or [],
+                        nb_chunks.get("metadatas") or [],
                     ):
                         if not isinstance(meta, dict):
                             continue
@@ -22054,6 +22150,12 @@ def retrieve(
                         if item is None:
                             continue
                         best_doc_raw, best_meta = item
+                        # `best_doc_raw` puede ser None si la row tiene
+                        # `document IS NULL` (raro pero posible). Skip
+                        # temprano: graph_docs.append(None) contamina la
+                        # lista y rompe downstream en build_progressive_context.
+                        if best_doc_raw is None:
+                            continue
                         best_doc = expand_to_parent(best_doc_raw, best_meta)
                         graph_docs.append(best_doc)
                         graph_metas.append(best_meta)
@@ -28095,7 +28197,7 @@ def watch(debounce: float, all_vaults: bool):
     # OBSIDIAN_RAG_WATCH_EXCLUDE_FOLDERS="a,b,c" (relative to vault root).
     _exclude_env = os.environ.get(
         "OBSIDIAN_RAG_WATCH_EXCLUDE_FOLDERS",
-        "03-Resources/WhatsApp",
+        "04-Archive/99-obsidian-system/99-AI/external-ingest/WhatsApp",
     )
     exclude_folders = tuple(
         f.strip().rstrip("/") for f in _exclude_env.split(",") if f.strip()
@@ -40277,15 +40379,17 @@ MORNING_FOLDER = "04-Archive/99-obsidian-system/99-AI/reviews"
 # intacto (los daemons siguen siendo retrievable) y aplicamos esta lista
 # solo en `_collect_morning_evidence` y `_fetch_vault_activity`.
 _DAEMON_GENERATED_PREFIXES = (
-    "03-Resources/Calendar/",
-    "03-Resources/Chrome/",
-    "03-Resources/GitHub/",
-    "03-Resources/Gmail/",
-    "03-Resources/Reminders/",
-    "03-Resources/Screentime/",
-    "03-Resources/WhatsApp/",
-    "03-Resources/YouTube/",
-    "03-Resources/GoogleDrive/",
+    "04-Archive/99-obsidian-system/99-AI/external-ingest/Calendar/",
+    "04-Archive/99-obsidian-system/99-AI/external-ingest/Chrome/",
+    "04-Archive/99-obsidian-system/99-AI/external-ingest/GitHub/",
+    "04-Archive/99-obsidian-system/99-AI/external-ingest/Gmail/",
+    "04-Archive/99-obsidian-system/99-AI/external-ingest/Reminders/",
+    "04-Archive/99-obsidian-system/99-AI/external-ingest/Screentime/",
+    "04-Archive/99-obsidian-system/99-AI/external-ingest/WhatsApp/",
+    "04-Archive/99-obsidian-system/99-AI/external-ingest/YouTube/",
+    "04-Archive/99-obsidian-system/99-AI/external-ingest/GoogleDrive/",
+    "04-Archive/99-obsidian-system/99-AI/external-ingest/Spotify/",
+    "04-Archive/99-obsidian-system/99-AI/external-ingest/Claude/",
     "00-Inbox/WA-",  # 00-Inbox/WA-YYYY-MM-DD.md (whatsapp listener daily)
     # mem-vault auto-saves: el agente escribe estas notas al cerrar tareas
     # no-triviales (decisions, bug patterns, gotchas). Se indexan para
@@ -45998,7 +46102,7 @@ def _render_today_prompt(
         "bloques de contexto. Si un dato no está, no lo menciones.",
         "",
         "4. **Dedupe ingester vs TODAY**. Cuando un dato aparezca tanto "
-        "en una nota `03-Resources/Gmail/<fecha>.md` como en un bucket "
+        "en una nota `04-Archive/99-obsidian-system/99-AI/external-ingest/Gmail/<fecha>.md` como en un bucket "
         "TODAY (`## Gmail — recibido HOY`), priorizá el bucket TODAY "
         "(tiene subject + remitente + snippet). NO cites las notas "
         "ingester como 'tocaste una nota'.",
@@ -57521,7 +57625,7 @@ def _classify_source_from_path(path: str) -> str:
         if scheme in _CALIBRATION_SOURCES:
             return scheme
         return "vault"
-    if path.startswith("03-Resources/WhatsApp/"):
+    if path.startswith("04-Archive/99-obsidian-system/99-AI/external-ingest/WhatsApp/"):
         return "whatsapp"
     return "vault"
 

@@ -65,6 +65,7 @@ __all__ = [
     "_WHATSAPP_ETL_RE",
     "_sync_whatsapp_notes",
     # External-source ETL constants
+    "_EXTERNAL_INGEST_BASE",
     "_REMINDERS_VAULT_SUBPATH",
     "_CALENDAR_VAULT_SUBPATH",
     "_CHROME_VAULT_SUBPATH",
@@ -119,6 +120,9 @@ __all__ = [
     "_YT_TRANSCRIPT_LANG_PRIORITY",
     "_YT_TRANSCRIPT_BATCH",
     "_YT_VIDEO_ID_RE",
+    "_YT_IP_BLOCKED_COOLDOWNS_SECONDS",
+    "_check_yt_ip_cooldown",
+    "_set_yt_ip_cooldown",
     "_collect_youtube_video_ids",
     "_fetch_yt_transcript_for_index",
     "_sync_youtube_transcripts",
@@ -990,7 +994,7 @@ def _sync_whatsapp_notes(vault_root: Path) -> dict:
     """Trigger the WhatsApp → vault ETL script and parse its summary line.
 
     Mirrors the MOZE pre-index pattern: produces `.md` files in
-    `<vault>/03-Resources/WhatsApp/<chat>/YYYY-MM.md` so the regular rglob
+    `<vault>/04-Archive/99-obsidian-system/99-AI/external-ingest/WhatsApp/<chat>/YYYY-MM.md` so the regular rglob
     picks them up. Subprocess to keep it as a single source of truth — the
     same script that the `com.fer.whatsapp-vault-sync` launchd plist runs
     every 15 min. Silent-fail when the script is missing (other machines).
@@ -1017,7 +1021,7 @@ def _sync_whatsapp_notes(vault_root: Path) -> dict:
         "files_unchanged": int(m.group(2)),
         "buckets": int(m.group(3)),
         "chats": int(m.group(4)),
-        "target": "03-Resources/WhatsApp",
+        "target": f"{_EXTERNAL_INGEST_BASE}/WhatsApp",
     }
 
 
@@ -1027,16 +1031,17 @@ def _sync_whatsapp_notes(vault_root: Path) -> dict:
 # returns a stats dict for logging. Triggered from `_run_index` after the
 # WhatsApp sync, before the vault scan.
 
-_REMINDERS_VAULT_SUBPATH = "03-Resources/Reminders"
-_CALENDAR_VAULT_SUBPATH = "03-Resources/Calendar"
-_CHROME_VAULT_SUBPATH = "03-Resources/Chrome"
-_YOUTUBE_VAULT_SUBPATH = "03-Resources/YouTube"
-_GMAIL_VAULT_SUBPATH = "03-Resources/Gmail"
-_GDRIVE_VAULT_SUBPATH = "03-Resources/GoogleDrive"
-_GITHUB_VAULT_SUBPATH = "03-Resources/GitHub"
-_CLAUDE_VAULT_SUBPATH = "03-Resources/Claude"
-_YOUTUBE_TRANSCRIPTS_SUBPATH = "03-Resources/YouTube/transcripts"
-_SPOTIFY_VAULT_SUBPATH = "03-Resources/Spotify"
+_EXTERNAL_INGEST_BASE = "04-Archive/99-obsidian-system/99-AI/external-ingest"
+_REMINDERS_VAULT_SUBPATH = f"{_EXTERNAL_INGEST_BASE}/Reminders"
+_CALENDAR_VAULT_SUBPATH = f"{_EXTERNAL_INGEST_BASE}/Calendar"
+_CHROME_VAULT_SUBPATH = f"{_EXTERNAL_INGEST_BASE}/Chrome"
+_YOUTUBE_VAULT_SUBPATH = f"{_EXTERNAL_INGEST_BASE}/YouTube"
+_GMAIL_VAULT_SUBPATH = f"{_EXTERNAL_INGEST_BASE}/Gmail"
+_GDRIVE_VAULT_SUBPATH = f"{_EXTERNAL_INGEST_BASE}/GoogleDrive"
+_GITHUB_VAULT_SUBPATH = f"{_EXTERNAL_INGEST_BASE}/GitHub"
+_CLAUDE_VAULT_SUBPATH = f"{_EXTERNAL_INGEST_BASE}/Claude"
+_YOUTUBE_TRANSCRIPTS_SUBPATH = f"{_EXTERNAL_INGEST_BASE}/YouTube/transcripts"
+_SPOTIFY_VAULT_SUBPATH = f"{_EXTERNAL_INGEST_BASE}/Spotify"
 _SPOTIFY_CREDS_PATH = Path.home() / ".config/obsidian-rag/spotify_client.json"
 _SPOTIFY_TOKEN_PATH = Path.home() / ".config/obsidian-rag/spotify_token.json"
 _SPOTIFY_SCOPES = "user-read-recently-played user-top-read"
@@ -1979,10 +1984,94 @@ _YT_TRANSCRIPT_LANG_PRIORITY = ("es", "es-419", "en", "en-US")
 _YT_TRANSCRIPT_BATCH = 10
 _YT_VIDEO_ID_RE = re.compile(r"youtube\.com/watch\?v=([\w\-]{6,})")
 
+# Circuit-breaker backoff schedule (exponencial): 4h → 8h → 16h → 24h
+_YT_IP_BLOCKED_COOLDOWNS_SECONDS = (4 * 3600, 8 * 3600, 16 * 3600, 24 * 3600)
+
+
+def _check_yt_ip_cooldown() -> bool | dict:
+    """Retorna True si cooldown está activo (skipar fetch), dict de status si no.
+    Retorna `{"active": False}` si no hay cooldown o expiró."""
+    try:
+        from rag import _ragvec_state_conn
+    except ImportError:
+        return False  # Sin DB disponible, asumir cooldown inactivo (laxo)
+
+    try:
+        with _ragvec_state_conn() as conn:
+            # Crear tabla si no existe (idempotent)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS rag_yt_transcript_cooldown ("
+                " id INTEGER PRIMARY KEY CHECK (id = 0),"
+                " blocked_until_ts REAL NOT NULL,"
+                " retry_count INTEGER DEFAULT 0,"
+                " last_blocked_at REAL NOT NULL"
+                ")"
+            )
+            row = conn.execute(
+                "SELECT blocked_until_ts, retry_count FROM rag_yt_transcript_cooldown WHERE id = 0"
+            ).fetchone()
+
+            if not row:
+                return {"active": False}
+
+            blocked_until_ts, retry_count = row
+            now = time.time()
+            if now < blocked_until_ts:
+                return {"active": True, "blocked_until_ts": blocked_until_ts, "retry_count": retry_count}
+            return {"active": False}
+    except Exception:  # pragma: no cover
+        # Error al leer DB → asumir cooldown inactivo (laxo, mejor fail-open)
+        return False
+
+
+def _set_yt_ip_cooldown() -> None:
+    """Registra un bloqueo IpBlocked y aumenta el cooldown exponencialmente."""
+    try:
+        from rag import _ragvec_state_conn
+    except ImportError:
+        return  # Sin DB, nada que registrar
+
+    try:
+        with _ragvec_state_conn() as conn:
+            # Crear tabla si no existe (idempotent)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS rag_yt_transcript_cooldown ("
+                " id INTEGER PRIMARY KEY CHECK (id = 0),"
+                " blocked_until_ts REAL NOT NULL,"
+                " retry_count INTEGER DEFAULT 0,"
+                " last_blocked_at REAL NOT NULL"
+                ")"
+            )
+            now = time.time()
+            row = conn.execute(
+                "SELECT retry_count FROM rag_yt_transcript_cooldown WHERE id = 0"
+            ).fetchone()
+
+            if row:
+                retry_count = row[0] + 1
+            else:
+                retry_count = 0
+
+            # Clamp a max cooldown (24h)
+            cooldown_idx = min(retry_count, len(_YT_IP_BLOCKED_COOLDOWNS_SECONDS) - 1)
+            cooldown_seconds = _YT_IP_BLOCKED_COOLDOWNS_SECONDS[cooldown_idx]
+            blocked_until_ts = now + cooldown_seconds
+
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO rag_yt_transcript_cooldown (id, blocked_until_ts, retry_count, last_blocked_at)
+                VALUES (0, ?, ?, ?)
+                """,
+                (blocked_until_ts, retry_count, now),
+            )
+            conn.commit()
+    except Exception:  # pragma: no cover
+        pass
+
 
 def _collect_youtube_video_ids(vault_root: Path) -> list[tuple[str, str]]:
     """Read recent YouTube daily notes, pull (video_id, title) pairs."""
-    yt_dir = vault_root / "03-Resources/YouTube"
+    yt_dir = vault_root / _YOUTUBE_VAULT_SUBPATH
     if not yt_dir.is_dir():
         return []
     seen: set[str] = set()
@@ -2007,14 +2096,23 @@ def _collect_youtube_video_ids(vault_root: Path) -> list[tuple[str, str]]:
 
 
 def _fetch_yt_transcript_for_index(video_id: str) -> tuple[str, str] | None:
-    """Returns (lang, transcript_text) or None on miss."""
+    """Returns (lang, transcript_text) or None on miss.
+
+    Si detecta IpBlocked, registra el cooldown y retorna None.
+    """
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
+        from youtube_transcript_api._errors import IpBlocked
     except ImportError:
         return None
     try:
         api = YouTubeTranscriptApi()
         listing = api.list(video_id)
+    except IpBlocked as exc:
+        # Circuit-breaker: YouTube está bloqueando esta IP
+        _set_yt_ip_cooldown()
+        _etl_log_swallow("yt_transcript_list_ip_blocked", exc)
+        return None
     except Exception as exc:
         _etl_log_swallow("yt_transcript_list", exc)
         return None
@@ -2052,7 +2150,23 @@ def _fetch_yt_transcript_for_index(video_id: str) -> tuple[str, str] | None:
 def _sync_youtube_transcripts(vault_root: Path, batch: int = _YT_TRANSCRIPT_BATCH) -> dict:
     """For each video referenced in recent YouTube daily notes, fetch its
     transcript once. Caps at `batch` per run.
+
+    Si YouTube está bloqueando la IP (circuit-breaker activo), retorna early
+    sin tocar la red.
     """
+    # Check circuit-breaker antes de hacer fetch
+    cooldown_status = _check_yt_ip_cooldown()
+    if cooldown_status is True or (isinstance(cooldown_status, dict) and cooldown_status.get("active")):
+        return {
+            "ok": True,
+            "files_written": 0,
+            "fetched_this_run": 0,
+            "failed_this_run": 0,
+            "videos_known": 0,
+            "reason": "yt_ip_cooldown_active",
+            "cooldown_status": cooldown_status if isinstance(cooldown_status, dict) else None,
+        }
+
     import sys as _sys
     _yt_fetch = getattr(_sys.modules.get("rag"), "_fetch_yt_transcript_for_index", _fetch_yt_transcript_for_index)
     videos = _collect_youtube_video_ids(vault_root)
@@ -2256,7 +2370,7 @@ def _sync_spotify_notes(vault_root: Path, max_recent: int = 50) -> dict:
 
 # ── Screen Time persistence (daily + monthly) ─────────────────────────────────
 
-SCREENTIME_VAULT_SUBPATH = "03-Resources/Screentime"
+SCREENTIME_VAULT_SUBPATH = f"{_EXTERNAL_INGEST_BASE}/Screentime"
 _SCREENTIME_BACKFILL_DAYS = 30
 _SCREENTIME_DAILY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.md$")
 _SCREENTIME_MONTHLY_RE = re.compile(r"^\d{4}-\d{2}\.md$")

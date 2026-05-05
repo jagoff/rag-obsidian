@@ -414,7 +414,7 @@ def _c_queries_existential(start: str, end: str) -> dict[str, float]:
 def _c_gmail_received(start: str, end: str) -> dict[str, float]:
     """Count de mensajes gmail recibidos por día.
 
-    Source: notas en `<vault>/03-Resources/Gmail/<YYYY-MM-DD>.md` que
+    Source: notas en `<vault>/04-Archive/99-obsidian-system/99-AI/external-ingest/Gmail/<YYYY-MM-DD>.md` que
     el ingester de gmail genera 1×/día con un dump de las últimas 48h.
     El frontmatter trae `message_count: N` que es el count exacto.
     Más confiable que parsear el body buscando subjects (formato puede
@@ -430,7 +430,7 @@ def _c_gmail_received(start: str, end: str) -> dict[str, float]:
         from rag import VAULT_PATH  # noqa: PLC0415
     except Exception:
         return {}
-    folder = VAULT_PATH / "03-Resources" / "Gmail"
+    folder = VAULT_PATH / "04-Archive" / "99-obsidian-system" / "99-AI" / "external-ingest" / "Gmail"
     if not folder.exists() or not folder.is_dir():
         return {}
     out: dict[str, float] = {}

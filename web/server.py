@@ -602,7 +602,7 @@ def _detect_tool_intent(q: str) -> list[tuple[str, dict]]:
 #                   `_format_forced_tool_output` (p.ej. "### Mails").
 #   digest_hint   — dónde más buscar items indexados en el CONTEXTO si la
 #                   live section está vacía. Para mails: las notas de
-#                   03-Resources/Gmail/YYYY-MM-DD.md usan un `## <asunto>`
+#                   04-Archive/99-obsidian-system/99-AI/external-ingest/Gmail/YYYY-MM-DD.md usan un `## <asunto>`
 #                   por mail con From/Date/Snippet debajo — extraer esos
 #                   H2 da un listado crudo de "mis últimos mails" que el
 #                   user espera. Otros sources tienen su propio formato.
@@ -620,7 +620,7 @@ _SOURCE_INTENT_META: dict[str, dict[str, str]] = {
         "live_section": "### Mails",
         "digest_hint": (
             "Si en el CONTEXTO hay notas del vault del tipo "
-            "`03-Resources/Gmail/YYYY-MM-DD.md` (cada `## <asunto>` "
+            "`04-Archive/99-obsidian-system/99-AI/external-ingest/Gmail/YYYY-MM-DD.md` (cada `## <asunto>` "
             "dentro es UN mail, con su **From:**, **Date:** y **Snippet:**), "
             "extraé esos asuntos y listálos uno por línea — son LITERALMENTE "
             "los últimos mails del usuario. NO digas 'en tu nota' ni "
@@ -667,7 +667,7 @@ _SOURCE_INTENT_META: dict[str, dict[str, str]] = {
         "digest_hint": (
             "La sección live trae los chats donde el user debe el próximo "
             "mensaje (último inbound sin reply). Si en el CONTEXTO hay "
-            "notas de `03-Resources/WhatsApp/<contacto>/YYYY-MM.md` con "
+            "notas de `04-Archive/99-obsidian-system/99-AI/external-ingest/WhatsApp/<contacto>/YYYY-MM.md` con "
             "más contexto de esos chats, podés complementar. NUNCA "
             "inventes conversaciones de WhatsApp — si la sección live "
             "está vacía decilo explícitamente en vez de citar otras "
@@ -712,7 +712,7 @@ def _build_source_intent_hint(forced_tool_names: list[str]) -> str | None:
 
     1. Dónde buscar primero (la sección live del tool: "### Mails").
     2. Dónde buscar si la live está vacía (notas indexadas del vault con
-       formato conocido — p.ej. 03-Resources/Gmail/YYYY-MM-DD.md tiene
+       formato conocido — p.ej. 04-Archive/99-obsidian-system/99-AI/external-ingest/Gmail/YYYY-MM-DD.md tiene
        un H2 por mail, listar esos H2 == listar los últimos mails).
     3. Formato de respuesta esperado (viñetas, shape por item).
     4. Qué PROHIBIR explícitamente (decir "tus notas" / "otras fuentes" /
@@ -728,7 +728,7 @@ def _build_source_intent_hint(forced_tool_names: list[str]) -> str | None:
     - Iter 2: con el tool disparando pero vacío, el CONTEXTO se reemplazaba
       → LLM sin material para fallback → "te dejo otras fuentes" abstracto.
     - Iter 3 (este): con el CONTEXTO preservado, el LLM tiene notas de
-      `03-Resources/Gmail/*.md` disponibles, PERO hablaba de "tu nota
+      `04-Archive/99-obsidian-system/99-AI/external-ingest/Gmail/*.md` disponibles, PERO hablaba de "tu nota
       del 22 de abril" y "fuentes" en lugar de extraer los asuntos de
       los mails. User feedback textual: "en vez de fuentes (que no tiene
       sentido porque son notas de obsidian) trae los titulos de los
@@ -794,7 +794,7 @@ def _build_source_intent_hint(forced_tool_names: list[str]) -> str | None:
 # reconocimiento de intent, pero GENÉRICO en el fallback. Causa: el pre-
 # router reemplazó el CONTEXTO entero con el output de gmail_recent
 # (que vino vacío → sólo "_Sin mails pendientes._"), descartando la
-# retrieve del vault que había devuelto `03-Resources/Gmail/2026-04-22.md`
+# retrieve del vault que había devuelto `04-Archive/99-obsidian-system/99-AI/external-ingest/Gmail/2026-04-22.md`
 # (el digest de mails indexado). Sin material en CONTEXTO, el LLM
 # resolvió el fallback con una frase abstracta. Este helper permite
 # detectar empty-state y preservar el vault retrieve en ese caso.
@@ -13880,7 +13880,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 # vault y agregamos el tool output como sección explícita
                 # "CONSULTAS EN VIVO (todas vacías)". Racional: si el user
                 # preguntó por "últimos mails" y `gmail_recent` vino vacío,
-                # pero el retrieve pulló `03-Resources/Gmail/2026-04-22.md`
+                # pero el retrieve pulló `04-Archive/99-obsidian-system/99-AI/external-ingest/Gmail/2026-04-22.md`
                 # (digest indexado de mails), queremos que el LLM pueda
                 # usar ese digest como fallback concreto en vez de
                 # contestar "te dejo otras fuentes" en abstracto. Con el

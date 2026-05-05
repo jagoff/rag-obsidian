@@ -2274,7 +2274,7 @@ def _wa_chat_month_link(jid: str, label: str, ts_iso: str) -> str:
 
     Falls back to just the label if the month can't be parsed. The link
     target mirrors `whatsapp-to-vault`'s layout:
-    `03-Resources/WhatsApp/<slug>/YYYY-MM.md`.
+    `04-Archive/99-obsidian-system/99-AI/external-ingest/WhatsApp/<slug>/YYYY-MM.md`.
     """
     slug_src = label if any(ch.isalpha() for ch in label) else (jid.split("@")[0] or "sin-nombre")
     # Same slug rule as vault-sync: strip non-word/dash/dot/space.
@@ -2285,7 +2285,7 @@ def _wa_chat_month_link(jid: str, label: str, ts_iso: str) -> str:
         ym = dt.strftime("%Y-%m")
     except Exception:
         return f"[[{label}]]"
-    return f"[[03-Resources/WhatsApp/{slug}/{ym}|{label}]]"
+    return f"[[04-Archive/99-obsidian-system/99-AI/external-ingest/WhatsApp/{slug}/{ym}|{label}]]"
 
 
 def _wa_tasks_write_note(

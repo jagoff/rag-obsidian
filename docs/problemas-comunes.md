@@ -133,7 +133,7 @@ tail -n 50 ~/.local/share/obsidian-rag/watch.error.log
 launchctl kickstart -k gui/$(id -u)/com.fer.obsidian-rag-watch
 ```
 
-**Fix 4**: revisar que el folder no esté excluido. Algunos folders tipo `03-Resources/WhatsApp` se saltean porque generan ruido. La lista está en la env var:
+**Fix 4**: revisar que el folder no esté excluido. Algunos folders tipo `04-Archive/99-obsidian-system/99-AI/external-ingest/WhatsApp` se saltean porque generan ruido. La lista está en la env var:
 
 ```bash
 echo $OBSIDIAN_RAG_WATCH_EXCLUDE_FOLDERS

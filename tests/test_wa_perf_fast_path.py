@@ -1,7 +1,7 @@
 """Tests para las 3 optimizaciones de latencia en queries sobre WhatsApp
 (2026-04-22). Target: reducir P50/P95 ~50% de queries que resuelven a WA.
 
-Track 1 — `is_excluded("03-Resources/WhatsApp/...")` devuelve True por
+Track 1 — `is_excluded("04-Archive/99-obsidian-system/99-AI/external-ingest/WhatsApp/...")` devuelve True por
 default para que el vault indexer no duplique los chunks ya creados por
 `scripts/ingest_whatsapp.py` como `source="whatsapp"`. Rollback:
 `OBSIDIAN_RAG_INDEX_WA_MONTHLY=1`.
@@ -30,21 +30,21 @@ import rag
 
 def test_is_excluded_wa_monthly_default_skipped():
     """Default: los monthly rollups de WhatsApp se excluyen del indexer."""
-    assert rag.is_excluded("03-Resources/WhatsApp/Maria/2026-03.md") is True
-    assert rag.is_excluded("03-Resources/WhatsApp/Juli/2026-04.md") is True
+    assert rag.is_excluded("04-Archive/99-obsidian-system/99-AI/external-ingest/WhatsApp/Maria/2026-03.md") is True
+    assert rag.is_excluded("04-Archive/99-obsidian-system/99-AI/external-ingest/WhatsApp/Juli/2026-04.md") is True
     assert rag.is_excluded(
-        "03-Resources/WhatsApp/Grecias group/2026-01.md"
+        "04-Archive/99-obsidian-system/99-AI/external-ingest/WhatsApp/Grecias group/2026-01.md"
     ) is True
 
 
 def test_is_excluded_wa_override_respected(monkeypatch):
     """OBSIDIAN_RAG_INDEX_WA_MONTHLY=1 re-habilita el indexing como vault."""
     monkeypatch.setenv("OBSIDIAN_RAG_INDEX_WA_MONTHLY", "1")
-    assert rag.is_excluded("03-Resources/WhatsApp/Maria/2026-03.md") is False
+    assert rag.is_excluded("04-Archive/99-obsidian-system/99-AI/external-ingest/WhatsApp/Maria/2026-03.md") is False
     monkeypatch.setenv("OBSIDIAN_RAG_INDEX_WA_MONTHLY", "true")
-    assert rag.is_excluded("03-Resources/WhatsApp/Maria/2026-03.md") is False
+    assert rag.is_excluded("04-Archive/99-obsidian-system/99-AI/external-ingest/WhatsApp/Maria/2026-03.md") is False
     monkeypatch.setenv("OBSIDIAN_RAG_INDEX_WA_MONTHLY", "yes")
-    assert rag.is_excluded("03-Resources/WhatsApp/Maria/2026-03.md") is False
+    assert rag.is_excluded("04-Archive/99-obsidian-system/99-AI/external-ingest/WhatsApp/Maria/2026-03.md") is False
 
 
 def test_is_excluded_wa_override_rejects_false_values(monkeypatch):
@@ -52,7 +52,7 @@ def test_is_excluded_wa_override_rejects_false_values(monkeypatch):
     for val in ("", "0", "false", "no"):
         monkeypatch.setenv("OBSIDIAN_RAG_INDEX_WA_MONTHLY", val)
         assert rag.is_excluded(
-            "03-Resources/WhatsApp/Maria/2026-03.md"
+            "04-Archive/99-obsidian-system/99-AI/external-ingest/WhatsApp/Maria/2026-03.md"
         ) is True, f"val={val!r}"
 
 

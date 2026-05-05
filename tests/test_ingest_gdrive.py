@@ -3,7 +3,7 @@
 
 After the 2026-04-24 rewrite the ingester upserts chunks directly to
 the vector collection instead of writing markdown files to the vault
-(user's Obsidian workflow was moving `03-Resources/GoogleDrive/` to
+(user's Obsidian workflow was moving `04-Archive/99-obsidian-system/99-AI/external-ingest/GoogleDrive/` to
 `.trash/` periodically, making the file-based approach unusable).
 
 Tests cover:
@@ -23,7 +23,7 @@ Tests cover:
   9. `run()` end-to-end with a `FakeCollection` + `FakeService`:
      bootstrap vs incremental, dry-run, cursor advance, reset, errors
      don't tank the run, ``is_excluded`` already skips
-     ``03-Resources/GoogleDrive/`` so vault-side leftovers can't leak
+     ``04-Archive/99-obsidian-system/99-AI/external-ingest/GoogleDrive/`` so vault-side leftovers can't leak
      back into the corpus.
 """
 from __future__ import annotations
@@ -592,16 +592,16 @@ def test_run_export_failures_dont_tank_run():
     assert not any(m["drive_id"] == "docBAD" for _, m in col.rows.values())
 
 
-# ── 10. invariant: is_excluded skips 03-Resources/GoogleDrive/ ─────────────
+# ── 10. invariant: is_excluded skips 04-Archive/99-obsidian-system/99-AI/external-ingest/GoogleDrive/ ─────────────
 
 
 def test_is_excluded_blocks_leftover_gdrive_folder_by_default():
     """Post-rewrite, the file-based path is obsolete. `is_excluded()` must
-    skip `03-Resources/GoogleDrive/` so any stale markdown (daily snapshot,
+    skip `04-Archive/99-obsidian-system/99-AI/external-ingest/GoogleDrive/` so any stale markdown (daily snapshot,
     legacy backfill) never gets vault-side double-indexed alongside the
     real `source="drive"` chunks."""
-    assert rag.is_excluded("03-Resources/GoogleDrive/archive/foo.md") is True
-    assert rag.is_excluded("03-Resources/GoogleDrive/2026-04-24.md") is True
+    assert rag.is_excluded("04-Archive/99-obsidian-system/99-AI/external-ingest/GoogleDrive/archive/foo.md") is True
+    assert rag.is_excluded("04-Archive/99-obsidian-system/99-AI/external-ingest/GoogleDrive/2026-04-24.md") is True
     # Escape hatch (env override) is tested implicitly by reading the env var;
     # we don't exercise the override here to keep the default path deterministic.
 

@@ -220,20 +220,43 @@ class OllamaBackend(LLMBackend):
 
 
 class MLXBackend(LLMBackend):
-    """Apple MLX backend via `mlx-lm`. Resident-process + LRU eviction.
+    """Apple MLX backend via `mlx-lm`. Resident-models + LRU eviction.
 
-    Ola 2 work — scaffold only. Raises NotImplementedError until the
-    Ola 2 agents wire `mlx_lm.generate` + chat template + JSON mode.
+    Returns ollama-shape responses (`ChatResponse` / `GenerateResponse`)
+    so call sites that read `r["message"]["content"]` or `r.message.content`
+    keep working without changes.
+
+    ## Determinism
+
+    `temperature=0` → greedy decoding (argmax) → bit-exact reproducible
+    on the same hardware. `seed` is honored via `mx.random.seed()` when
+    `temperature > 0` (sampling path).
+
+    ## VRAM management
+
+    `_loaded` holds resident `(model, tokenizer)` tuples keyed by HF repo
+    id. Eviction policy:
+
+    - When loading a `_BIG_MODELS` member (Qwen3-30B-A3B ~17 GB):
+      evict ALL other models first (pure single-tenant on big-tier).
+    - Otherwise: LRU cap at `_MAX_LOADED` (default 3 small models OR
+      1 big + 0 small).
+
+    `_idle_ttl` (env `RAG_MLX_IDLE_TTL`, default 1800s) is a hint for
+    a future watchdog thread; not yet enforced. Eviction today is
+    purely capacity-driven.
     """
 
     name = "mlx"
 
-    # Models that NEVER coexist in unified RAM <32 GB (LRU eviction key)
+    # Models that NEVER coexist with anything else (pure single-tenant)
     _BIG_MODELS = frozenset(
         {
             "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
         }
     )
+
+    _MAX_SMALL_LOADED = 3
 
     def __init__(self) -> None:
         # Lazy import to avoid hard dep when backend is `ollama`
@@ -241,12 +264,50 @@ class MLXBackend(LLMBackend):
             import mlx_lm  # type: ignore[import-not-found]  # noqa: F401
         except ImportError as e:
             raise RuntimeError(
-                "mlx-lm not installed. Run `uv add mlx-lm` or set "
-                "RAG_LLM_BACKEND=ollama."
+                "mlx-lm not installed. Run `uv pip install '.[mlx]'` or "
+                "set RAG_LLM_BACKEND=ollama."
             ) from e
 
-        self._loaded: dict[str, Any] = {}  # model_id → (model, tokenizer)
+        # OrderedDict to preserve LRU order: oldest first, newest last
+        from collections import OrderedDict
+
+        self._loaded: OrderedDict[str, tuple[Any, Any]] = OrderedDict()
         self._idle_ttl = int(os.environ.get("RAG_MLX_IDLE_TTL", "1800"))
+
+    def _load(self, model_id: str) -> tuple[Any, Any]:
+        """Get or load (model, tokenizer) for `model_id`. LRU bump on hit."""
+        canonical = to_mlx(model_id)
+        if canonical in self._loaded:
+            self._loaded.move_to_end(canonical)
+            return self._loaded[canonical]
+
+        # Eviction BEFORE load (free RAM first)
+        self._evict_for(canonical)
+
+        from mlx_lm import load  # type: ignore[import-not-found]
+
+        model, tokenizer = load(canonical)
+        self._loaded[canonical] = (model, tokenizer)
+        return (model, tokenizer)
+
+    def _evict_for(self, incoming: str) -> None:
+        """Evict resident models to make room for `incoming`."""
+        is_big = incoming in self._BIG_MODELS
+
+        if is_big:
+            # Big models are single-tenant: evict everything else.
+            for k in list(self._loaded.keys()):
+                if k != incoming:
+                    self._loaded.pop(k, None)
+            return
+
+        # Incoming is small: evict any big, then LRU-trim small ones.
+        for k in list(self._loaded.keys()):
+            if k in self._BIG_MODELS:
+                self._loaded.pop(k, None)
+
+        while len(self._loaded) >= self._MAX_SMALL_LOADED:
+            self._loaded.popitem(last=False)  # evict LRU (oldest)
 
     def chat(
         self,
@@ -256,8 +317,21 @@ class MLXBackend(LLMBackend):
         keep_alive: str | int = -1,
         format: str | None = None,
         **kwargs: Any,
-    ) -> dict[str, Any]:
-        raise NotImplementedError("Ola 2 work — see dispatch.md")
+    ) -> Any:
+        from ollama._types import ChatResponse, Message  # type: ignore[import-not-found]
+
+        opts = options or ChatOptions()
+        mlx_model, tokenizer = self._load(model)
+        prompt = self._apply_chat_template(tokenizer, messages, format=format)
+        text = self._mlx_generate(mlx_model, tokenizer, prompt, opts)
+        if format == "json":
+            text = self._extract_json(text)
+        return ChatResponse(
+            model=to_ollama(model),
+            message=Message(role="assistant", content=text),
+            done=True,
+            done_reason="stop",
+        )
 
     def generate(
         self,
@@ -266,8 +340,90 @@ class MLXBackend(LLMBackend):
         options: ChatOptions | None = None,
         keep_alive: str | int = -1,
         **kwargs: Any,
-    ) -> dict[str, Any]:
-        raise NotImplementedError("Ola 2 work — see dispatch.md")
+    ) -> Any:
+        from ollama._types import GenerateResponse  # type: ignore[import-not-found]
+
+        opts = options or ChatOptions()
+        mlx_model, tokenizer = self._load(model)
+        text = self._mlx_generate(mlx_model, tokenizer, prompt, opts)
+        return GenerateResponse(
+            model=to_ollama(model),
+            response=text,
+            done=True,
+            done_reason="stop",
+        )
+
+    @staticmethod
+    def _apply_chat_template(
+        tokenizer: Any,
+        messages: list[dict[str, str]],
+        format: str | None = None,
+    ) -> str:
+        """Apply tokenizer's chat template; nudge JSON mode in system msg."""
+        msgs = list(messages)
+        if format == "json":
+            # Best-effort JSON mode for models without native grammar.
+            # Prepend a strong instruction; parser does repair downstream.
+            extra = (
+                "Respond with ONLY a single valid JSON object. "
+                "No prose, no markdown fences, no commentary."
+            )
+            if msgs and msgs[0].get("role") == "system":
+                msgs[0] = {
+                    **msgs[0],
+                    "content": msgs[0]["content"] + "\n\n" + extra,
+                }
+            else:
+                msgs = [{"role": "system", "content": extra}, *msgs]
+
+        return tokenizer.apply_chat_template(
+            msgs, add_generation_prompt=True, tokenize=False
+        )
+
+    @staticmethod
+    def _mlx_generate(model: Any, tokenizer: Any, prompt: str, opts: ChatOptions) -> str:
+        from mlx_lm import generate  # type: ignore[import-not-found]
+        from mlx_lm.sample_utils import make_sampler  # type: ignore[import-not-found]
+
+        sampler = make_sampler(temp=opts.temperature, top_p=opts.top_p)
+        # Seed for reproducibility when sampling (temp>0). Greedy (temp=0)
+        # is bit-exact deterministic on same hardware regardless of seed.
+        if opts.temperature > 0:
+            import mlx.core as mx  # type: ignore[import-not-found]
+
+            mx.random.seed(opts.seed)
+
+        return generate(
+            model,
+            tokenizer,
+            prompt,
+            max_tokens=opts.num_predict,
+            sampler=sampler,
+            verbose=False,
+        )
+
+    @staticmethod
+    def _extract_json(text: str) -> str:
+        """Best-effort: strip markdown fences + isolate first {...} block.
+
+        Models without native grammar mode often wrap JSON in ```json ... ```
+        or prepend prose. The downstream parser in `rag/__init__.py` already
+        handles malformed JSON via repair; this just gives it a cleaner
+        starting point.
+        """
+        s = text.strip()
+        # Strip ```json ... ``` fences
+        if s.startswith("```"):
+            s = s.split("\n", 1)[-1] if "\n" in s else s
+            if s.endswith("```"):
+                s = s[:-3]
+            s = s.strip()
+        # Isolate first balanced {...} (naive, parser does the heavy lifting)
+        first = s.find("{")
+        last = s.rfind("}")
+        if first >= 0 and last > first:
+            return s[first : last + 1]
+        return s
 
     def list_available(self) -> list[str]:
         # Scan ~/.cache/huggingface/hub/ for mlx-community models
@@ -276,11 +432,20 @@ class MLXBackend(LLMBackend):
         hub = Path.home() / ".cache" / "huggingface" / "hub"
         if not hub.exists():
             return []
-        return [
-            d.name.replace("models--", "").replace("--", "/")
-            for d in hub.iterdir()
-            if d.is_dir() and "mlx-community" in d.name
-        ]
+        out: list[str] = []
+        for d in hub.iterdir():
+            if not d.is_dir():
+                continue
+            name = d.name
+            if "mlx-community" not in name:
+                continue
+            # `models--mlx-community--Qwen2.5-3B-Instruct-4bit` →
+            # `mlx-community/Qwen2.5-3B-Instruct-4bit`
+            stripped = name.removeprefix("models--")
+            parts = stripped.split("--")
+            if len(parts) >= 2:
+                out.append(f"{parts[0]}/{'-'.join(parts[1:])}")
+        return out
 
 
 # ---------------------------------------------------------------------------

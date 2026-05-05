@@ -1201,6 +1201,230 @@ def _audit_abandon_high_score(conn, days: int) -> dict:
     return out
 
 
+def _audit_intent_latency_drift(conn: sqlite3.Connection) -> dict:
+    """Detecta drift de latencia (>30%) por intent: últimos 7d vs baseline 30d.
+
+    Compara `avg_retrieve_ms` y `avg_gen_ms` de cada intent entre dos
+    ventanas: reciente (7d) y baseline (30d). Un drift >30% en cualquiera
+    de las dos métricas marca `alert=True` para ese intent.
+
+    Útil para detectar regresiones silenciosas post-cambio de pipeline
+    (nuevo modelo, cambio de BM25, reindex masivo, etc.) antes de que el
+    user las experimente en producción.
+
+    Solo considera intents con n_7d >= 5 (muestra mínima para distinguir
+    drift real de ruido estadístico). Cmds: `web`, `query`, `serve.chat`.
+
+    Shape de retorno:
+        {
+            "intents": [
+                {
+                    "intent": str,
+                    "n_7d": int, "n_30d": int,
+                    "avg_retrieve_ms_7d": float, "avg_retrieve_ms_30d": float,
+                    "drift_retrieve_pct": float | None,
+                    "avg_gen_ms_7d": float | None, "avg_gen_ms_30d": float | None,
+                    "drift_gen_pct": float | None,
+                    "alert": bool,
+                },
+                ...
+            ],
+            "alerts_count": int,
+        }
+    """
+    _SQL = """
+        SELECT
+            COALESCE(json_extract(extra_json, '$.intent'), 'unknown') AS intent,
+            COUNT(*) AS n,
+            ROUND(AVG(t_retrieve) * 1000, 0) AS avg_retrieve_ms,
+            ROUND(AVG(t_gen) * 1000, 0) AS avg_gen_ms
+        FROM rag_queries
+        WHERE ts >= datetime('now', ?)
+          AND cmd IN ('web', 'query', 'serve.chat')
+          AND t_retrieve IS NOT NULL
+        GROUP BY intent
+        HAVING COUNT(*) >= 5
+    """
+    DRIFT_THRESHOLD = 30.0  # % de aumento sobre el baseline para marcar alert
+
+    def _fetch(window: str) -> dict[str, dict]:
+        rows = conn.execute(_SQL, (window,)).fetchall()
+        return {
+            r["intent"]: {
+                "n": int(r["n"]),
+                "avg_retrieve_ms": float(r["avg_retrieve_ms"] or 0.0),
+                "avg_gen_ms": (
+                    float(r["avg_gen_ms"]) if r["avg_gen_ms"] is not None else None
+                ),
+            }
+            for r in rows
+        }
+
+    def _drift_pct(new_val: float | None, base_val: float | None) -> float | None:
+        if new_val is None or base_val is None or base_val == 0:
+            return None
+        return round((new_val - base_val) / base_val * 100.0, 2)
+
+    try:
+        data_7d = _fetch("-7 days")
+        data_30d = _fetch("-30 days")
+    except sqlite3.OperationalError as exc:
+        return {"intents": [], "alerts_count": 0, "error": repr(exc)}
+
+    intents_out = []
+    for intent, d7 in data_7d.items():
+        d30 = data_30d.get(intent, {})
+        avg_retr_30 = d30.get("avg_retrieve_ms")
+        avg_gen_30 = d30.get("avg_gen_ms")
+        drift_retr = _drift_pct(d7["avg_retrieve_ms"], avg_retr_30)
+        drift_gen = _drift_pct(d7["avg_gen_ms"], avg_gen_30)
+        alert = (drift_retr is not None and drift_retr > DRIFT_THRESHOLD) or (
+            drift_gen is not None and drift_gen > DRIFT_THRESHOLD
+        )
+        intents_out.append({
+            "intent": intent,
+            "n_7d": d7["n"],
+            "n_30d": d30.get("n", 0),
+            "avg_retrieve_ms_7d": d7["avg_retrieve_ms"],
+            "avg_retrieve_ms_30d": avg_retr_30 if avg_retr_30 is not None else 0.0,
+            "drift_retrieve_pct": drift_retr,
+            "avg_gen_ms_7d": d7["avg_gen_ms"],
+            "avg_gen_ms_30d": avg_gen_30,
+            "drift_gen_pct": drift_gen,
+            "alert": alert,
+        })
+
+    # Alerts primero, luego descendente por drift_retrieve_pct
+    intents_out.sort(
+        key=lambda x: (not x["alert"], -(x["drift_retrieve_pct"] or 0.0))
+    )
+    alerts_count = sum(1 for i in intents_out if i["alert"])
+    return {"intents": intents_out, "alerts_count": alerts_count}
+
+
+def _audit_draft_decision_health(conn: sqlite3.Connection, days: int = 30) -> dict:
+    """Health check del loop de aprendizaje del bot WA (drafts).
+
+    Pregunta accionable: ¿el loop está acumulando pares gold (`approved_editar`)
+    a buen ritmo para alimentar el DPO fine-tune del modelo de drafts?
+
+    El gate del DPO (sección "Fine-tune del modelo de drafts WA — DPO + LoRA"
+    en CLAUDE.md) requiere ≥100 pares gold all-time. Un par gold es una row
+    con `decision='approved_editar'` + `sent_text IS NOT NULL` +
+    `sent_text != bot_draft` (el user efectivamente editó el draft).
+
+    Detecta una patología importante: si el user aprueba todos los drafts sin
+    editar (`approved_si=100%`), no se generan pares gold. El modelo nunca
+    aprende el estilo real del user — sigue generando el mismo tono genérico.
+    Alerta cuando `approved_editar_pct < 10%` con muestra ≥10 decisiones en
+    la ventana.
+
+    Columnas del output:
+
+    - window_days: ventana de análisis
+    - total: rows en la ventana
+    - by_decision: {approved_si, approved_editar, rejected, expired}
+    - approved_editar_pct: % de approved_editar sobre el total de la ventana
+    - gold_pairs_total: pares gold all-time (not windowed) — lo que el DPO ve
+    - dpo_gate_threshold: 100 (hardcoded, igual que scripts/finetune_drafts.py)
+    - dpo_gate_open: gold_pairs_total >= 100
+    - alert: True si approved_editar_pct < 10% con muestra suficiente
+    - suggestion: texto accionable cuando alert=True
+    """
+    DPO_GATE_THRESHOLD = 100
+    out: dict = {
+        "window_days": days,
+        "total": 0,
+        "by_decision": {
+            "approved_si": 0,
+            "approved_editar": 0,
+            "rejected": 0,
+            "expired": 0,
+        },
+        "approved_editar_pct": 0.0,
+        "gold_pairs_total": 0,
+        "dpo_gate_threshold": DPO_GATE_THRESHOLD,
+        "dpo_gate_open": False,
+        "alert": False,
+        "suggestion": None,
+    }
+
+    try:
+        exists = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='rag_draft_decisions'"
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        out["error"] = repr(exc)
+        return out
+    if exists is None:
+        out["error"] = "table missing: rag_draft_decisions"
+        return out
+
+    cutoff_iso = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+
+    # 1) Distribución de decisiones en la ventana
+    rows = conn.execute(
+        """
+        SELECT decision, COUNT(*) AS n
+        FROM rag_draft_decisions
+        WHERE ts >= ?
+        GROUP BY decision
+        ORDER BY n DESC
+        """,
+        (cutoff_iso,),
+    ).fetchall()
+
+    total = 0
+    by_decision: dict[str, int] = {
+        "approved_si": 0,
+        "approved_editar": 0,
+        "rejected": 0,
+        "expired": 0,
+    }
+    for r in rows:
+        decision = r[0] or "unknown"
+        n = int(r[1] or 0)
+        total += n
+        if decision in by_decision:
+            by_decision[decision] = n
+
+    out["total"] = total
+    out["by_decision"] = by_decision
+
+    approved_editar_pct = (
+        round(by_decision["approved_editar"] / total * 100, 1) if total > 0 else 0.0
+    )
+    out["approved_editar_pct"] = approved_editar_pct
+
+    # 2) Gold pairs all-time (no windowed) — lo que el script de DPO ve
+    gold_pairs_total = conn.execute(
+        """
+        SELECT COUNT(*) FROM rag_draft_decisions
+        WHERE decision = 'approved_editar'
+          AND sent_text IS NOT NULL
+          AND sent_text != bot_draft
+        """
+    ).fetchone()[0]
+    out["gold_pairs_total"] = int(gold_pairs_total or 0)
+    out["dpo_gate_open"] = out["gold_pairs_total"] >= DPO_GATE_THRESHOLD
+
+    # 3) Alerta si casi no hay pares gold en la ventana — el user aprueba
+    # sin editar y el modelo no aprende su estilo real.
+    if total >= 10 and approved_editar_pct < 10.0:
+        out["alert"] = True
+        out["suggestion"] = (
+            f"Solo {by_decision['approved_editar']} de {total} drafts fueron editados "
+            f"({approved_editar_pct:.1f}%) en los últimos {days}d. "
+            "El modelo DPO no acumula pares gold. "
+            "Si los drafts son buenos sin editar, OK. "
+            "Si los drafts son mediocres y el user los aprueba igual, "
+            "el loop de aprendizaje está roto — el modelo nunca va a mejorar."
+        )
+
+    return out
+
+
 def _audit_db_size() -> dict:
     """Tamaño físico de las DBs + WAL files. Detección temprana de bloat."""
     out = {}
@@ -1477,6 +1701,101 @@ def _render_text(report: dict) -> str:
                     )
         out.append("")
 
+
+    # Content gap detector: abandon_high_score
+    ahs = report.get("abandon_high_score")
+    if ahs is not None:
+        if ahs.get("error"):
+            out.append(f"\u2653\ufe0f  Content gap: ERROR -- {ahs['error']}")
+        else:
+            count = ahs["count"]
+            days_w = ahs["window_days"]
+            alert_icon = "\u26a0\ufe0f " if ahs["alert"] else "\u2713 "
+            out.append(
+                f"{alert_icon}Content gap (abandon + top_score >= 0.4, "
+                f"ultimos {days_w}d): {count}"
+            )
+            if count >= 5:
+                out.append(f"   \u26a0\ufe0f  {ahs['suggestion']}")
+            if ahs["samples"]:
+                out.append(f"   {'score':>6}  {'ts':<22}  query")
+                for s in ahs["samples"][:10]:
+                    q_raw = s["q"] or ""
+                    q_truncated = (q_raw[:55] + "...") if len(q_raw) > 55 else q_raw
+                    out.append(
+                        f"   {s['top_score']:>6.3f}  {s['ts']:<22}  {q_truncated!r}"
+                    )
+        out.append("")
+
+    # Cache hit rate por intent — signal de tuning del cache
+    chi = report.get("cache_hit_by_intent")
+    if chi is not None:
+        if chi.get("error"):
+            out.append(f"🔍 Cache por intent: ERROR — {chi['error']}")
+        else:
+            global_rate = chi.get("global_hit_rate_pct")
+            alerts = chi.get("alerts_count", 0)
+            n_intents = len(chi.get("by_intent") or [])
+            rate_str = f"{global_rate:.1f}%" if global_rate is not None else "—"
+            alert_icon = "⚠️ " if alerts > 0 else "✓"
+            out.append(
+                f"{alert_icon} Cache hit por intent: global {rate_str} "
+                f"({n_intents} intents con ≥5 queries elegibles)"
+            )
+            if chi.get("by_intent"):
+                out.append(
+                    f"   {'intent':<16}  {'eligible':>8}  {'hits':>5}  {'misses':>6}  {'hit_rate':>8}  alerta"
+                )
+                for row in chi["by_intent"]:
+                    alert_mark = "⚠️ " if row["alert"] else "   "
+                    out.append(
+                        f"   {row['intent']:<16}  {row['eligible']:>8}  "
+                        f"{row['hits']:>5}  {row['misses']:>6}  "
+                        f"{row['hit_rate_pct']:>7.1f}%  {alert_mark}"
+                    )
+            if alerts > 0 and chi.get("suggestion"):
+                out.append(f"   → {chi['suggestion']}")
+        out.append("")
+
+    # Intent latency drift — regresiones silenciosas post-cambio de pipeline
+    ild = report.get("intent_latency_drift")
+    if ild is not None:
+        if ild.get("error"):
+            out.append(f"⏱️  Drift latencia por intent: ERROR — {ild['error']}")
+        else:
+            alerts = ild.get("alerts_count", 0)
+            n_intents = len(ild.get("intents") or [])
+            alert_icon = "⚠️ " if alerts > 0 else "✓"
+            out.append(
+                f"{alert_icon} Drift latencia por intent (7d vs 30d): "
+                f"{alerts} alert(s) en {n_intents} intents con ≥5 queries"
+            )
+            if ild.get("intents"):
+                out.append(
+                    f"   {'intent':<16}  {'n_7d':>5}  {'n_30d':>5}  "
+                    f"{'retr_7d':>7}  {'retr_30d':>8}  {'drift_r%':>8}  "
+                    f"{'gen_7d':>6}  {'drift_g%':>8}  alerta"
+                )
+                for row in ild["intents"]:
+                    alert_mark = "⚠️ " if row["alert"] else "   "
+                    drift_r = (
+                        f"{row['drift_retrieve_pct']:>+.1f}%"
+                        if row["drift_retrieve_pct"] is not None
+                        else "    —"
+                    )
+                    drift_g = (
+                        f"{row['drift_gen_pct']:>+.1f}%"
+                        if row["drift_gen_pct"] is not None
+                        else "    —"
+                    )
+                    out.append(
+                        f"   {row['intent']:<16}  {row['n_7d']:>5}  {row['n_30d']:>5}  "
+                        f"{row['avg_retrieve_ms_7d']:>7.0f}  {row['avg_retrieve_ms_30d']:>8.0f}  "
+                        f"{drift_r:>8}  "
+                        f"{(row['avg_gen_ms_7d'] or 0):>6.0f}  {drift_g:>8}  {alert_mark}"
+                    )
+        out.append("")
+
     # DB size
     db = report.get("db_size", {})
     out.append("💽 DB sizes:")
@@ -1570,6 +1889,22 @@ def _render_text(report: dict) -> str:
             f"disponibles (faltan {rows_left}). Corré `rag feedback backfill` o "
             "`rag feedback infer-implicit --window-seconds 600` para destrabar el gate."
         )
+    ahs_hints = report.get("abandon_high_score")
+    if ahs_hints is not None and ahs_hints.get("alert") and not ahs_hints.get("error"):
+        out.append(
+            f"  \u2022 Content gap detectado: {ahs_hints['count']} queries con "
+            "top_score >= 0.4 donde el user se fue igual. "
+            "Revisar respuestas del LLM (vacias / alucinaciones)."
+        )
+    chi_d = report.get("cache_hit_by_intent")
+    if chi_d is not None and not chi_d.get("error") and chi_d.get("alerts_count", 0) > 0:
+        alerts_n = chi_d["alerts_count"]
+        out.append(
+            f"  • Cache hit rate <5% en {alerts_n} intent(s) con ≥20 queries elegibles — "
+            "revisar RAG_CACHE_COSINE (bajar de 0.93 a 0.90) "
+            "o _CORPUS_HASH_BUCKET (ampliar de 100 a 200). "
+            "Ver tabla 🔍 Cache hit por intent arriba para el detalle por intent."
+        )
     if (
         not err.get("total_errors")
         and not (lat and lat.get("outliers"))
@@ -1577,6 +1912,8 @@ def _render_text(report: dict) -> str:
         and (ret is None or ret.get("status") == "healthy")
         and (chat is None or chat.get("status") == "healthy")
         and (fcg is None or fcg.get("gate_open") or fcg.get("error"))
+        and (ahs_hints is None or not ahs_hints.get("alert"))
+        and (chi is None or chi.get("alerts_count", 0) == 0 or chi.get("error"))
     ):
         out.append("  • ✅ Sistema sano. No se requiere acción inmediata.")
     out.append("=" * 72)
@@ -1616,6 +1953,9 @@ def main() -> int:
         report["feedback_corrective_gap"] = None
         report["harvest_candidates"] = None
         report["cross_source_single_source"] = None
+        report["cache_hit_by_intent"] = None
+        report["abandon_high_score"] = None
+        report["intent_latency_drift"] = None
         report["db_unavailable"] = str(TELEMETRY_DB)
     else:
         try:
@@ -1638,6 +1978,9 @@ def main() -> int:
                 )
             else:
                 report["cross_source_single_source"] = None
+            report["cache_hit_by_intent"] = _audit_cache_hit_by_intent(conn, args.days)
+            report["abandon_high_score"] = _audit_abandon_high_score(conn, args.days)
+            report["intent_latency_drift"] = _audit_intent_latency_drift(conn)
         except sqlite3.OperationalError as exc:
             report["query_latency"] = None
             report["cache_health"] = None
@@ -1647,6 +1990,9 @@ def main() -> int:
             report["feedback_corrective_gap"] = None
             report["harvest_candidates"] = None
             report["cross_source_single_source"] = None
+            report["cache_hit_by_intent"] = None
+            report["abandon_high_score"] = None
+            report["intent_latency_drift"] = None
             report["db_error"] = repr(exc)
         finally:
             conn.close()

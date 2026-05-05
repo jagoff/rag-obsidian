@@ -1439,6 +1439,139 @@ def _log_surface_event_background_default() -> bool:
     return val not in ("0", "false", "no")
 
 
+# ── Replay payload helpers (Sprint 3-A, 2026-05-04) ─────────────────────────
+# Persisten en extra_json de rag_queries los campos necesarios para replay
+# determinístico de queries: hashes siempre (minimal overhead), payloads raw
+# sólo cuando RAG_LOG_REPLAY_PAYLOAD=1 (privacy-gated, default OFF).
+#
+# Por qué separar hash de payload:
+#   - Los hashes (16 chars c/u) son inertes para la privacidad y habilitan
+#     dedup de queries idénticas en análisis downstream.
+#   - Los payloads raw (response_text, history_snapshot) pueden contener PII
+#     del vault — se gatean con opt-in explícito.
+#
+# Storage cost estimado:
+#   - Flags OFF (default): ~30 KB/sem (3x16-char hashes por row).
+#   - Flags ON: ~3.5 MB/sem (~50 queries/dia x 2.3 KB/row promedio).
+#
+# Env vars:
+#   RAG_LOG_REPLAY_PAYLOAD=1  — activa response_text + history_snapshot
+#   RAG_LOG_RERANK_RAW=1      — activa rerank_logits_raw (list[float])
+
+_REPLAY_RESPONSE_MAX_BYTES: int = 8_192   # 8 KB cap para response_text
+_REPLAY_HISTORY_MAX_BYTES: int = 4_096    # 4 KB cap para history_snapshot
+
+
+def _replay_payload_enabled() -> bool:
+    """True cuando RAG_LOG_REPLAY_PAYLOAD=1 -- activa storage de
+    response_text + history_snapshot en extra_json.
+
+    Default OFF -- los payloads pueden contener PII del vault.
+    """
+    val = os.environ.get("RAG_LOG_REPLAY_PAYLOAD", "").strip().lower()
+    return val in ("1", "true", "yes")
+
+
+def _rerank_raw_enabled() -> bool:
+    """True cuando RAG_LOG_RERANK_RAW=1 -- activa storage de
+    rerank_logits_raw (list[float]) en extra_json.
+
+    Default OFF -- util solo para debugging de regresiones del ranker.
+    """
+    val = os.environ.get("RAG_LOG_RERANK_RAW", "").strip().lower()
+    return val in ("1", "true", "yes")
+
+
+def _truncate_for_replay(text: str, max_bytes: int) -> "tuple[str, bool]":
+    """Trunca text a max_bytes (UTF-8) si supera el limite.
+
+    Retorna (texto_truncado, fue_truncado). La truncacion preserva
+    codepoints UTF-8 completos (no corta en medio de un multibyte).
+    """
+    if not text:
+        return ("", False)
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return (text, False)
+    truncated_text = encoded[:max_bytes].decode("utf-8", errors="ignore")
+    return (truncated_text, True)
+
+
+def _replay_hash(text: str) -> str:
+    """sha256[:16] de text (UTF-8). Retorna '' si text esta vacio."""
+    if not text:
+        return ""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _build_replay_fields(
+    *,
+    response: str | None = None,
+    history: list | None = None,
+    prompt: str | None = None,
+    corpus_hash: str = "",
+    rerank_logits: list | None = None,
+) -> dict:
+    """Construye el subset de campos de replay payload para extra_json.
+
+    Campos ALWAYS ON (hashes, ~48 chars total):
+      corpus_hash        -- hash del corpus snapshot
+      prompt_hash        -- sha256[:16] del system+user prompt final
+      response_hash      -- sha256[:16] del response del LLM
+
+    Campos OPT-IN (RAG_LOG_REPLAY_PAYLOAD=1):
+      response_text      -- raw response capped 8 KB
+      response_truncated -- bool, True si excedio 8 KB
+      history_snapshot   -- turns previos capped 4 KB
+      history_truncated  -- bool, True si excedio 4 KB
+
+    Campos OPT-IN (RAG_LOG_RERANK_RAW=1):
+      rerank_logits_raw  -- list[float]
+
+    Siempre retorna un dict (puede estar vacio si todos los inputs son
+    None/vacios).
+    """
+    out: dict = {}
+
+    if corpus_hash:
+        out["corpus_hash"] = corpus_hash
+
+    if prompt:
+        out["prompt_hash"] = _replay_hash(prompt)
+
+    response_str = response or ""
+    if response_str:
+        out["response_hash"] = _replay_hash(response_str)
+        if _replay_payload_enabled():
+            text_capped, truncated = _truncate_for_replay(
+                response_str, _REPLAY_RESPONSE_MAX_BYTES,
+            )
+            out["response_text"] = text_capped
+            out["response_truncated"] = truncated
+
+    if history:
+        try:
+            history_json = json.dumps(history, ensure_ascii=False)
+        except Exception:
+            history_json = ""
+        if history_json:
+            out["history_hash"] = _replay_hash(history_json)
+            if _replay_payload_enabled():
+                snapshot_capped, hist_truncated = _truncate_for_replay(
+                    history_json, _REPLAY_HISTORY_MAX_BYTES,
+                )
+                try:
+                    out["history_snapshot"] = json.loads(snapshot_capped)
+                except Exception:
+                    out["history_snapshot"] = snapshot_capped
+                out["history_truncated"] = hist_truncated
+
+    if rerank_logits is not None and _rerank_raw_enabled():
+        out["rerank_logits_raw"] = [round(float(x), 6) for x in rerank_logits]
+
+    return out
+
+
 def log_query_event(event: dict) -> None:
     """Insert a query event into rag_queries.
 
@@ -19653,6 +19786,71 @@ class RetrieveResult:
         return cls(**kwargs)
 
 
+def retrieve_result_to_log_extras(rr: "RetrieveResult") -> dict:
+    """Extrae del RetrieveResult las keys que deben ir en extra_json del
+    log de queries, en el mismo shape que produce ChatTurnResult.to_log_event.
+
+    Por qué existe esta función (2026-05-04):
+
+    El endpoint /api/chat de web/server.py llama a multi_retrieve() directamente
+    y construye su propio dict para log_query_event. Con cada feature nueva
+    (anaphora, temporal_intent, MMR, query decomposition, LLM judge) el dev
+    tiene que acordarse de agregar la key al dict manual del gen() — y por lo
+    general no lo hace. Resultado: 6 features no aparecen en
+    rag_queries.extra_json para el path web aunque el pipeline las computa.
+
+    Esta función actúa de puente: callers que tienen un RetrieveResult pero NO
+    un ChatTurnResult (i.e., gen() en server.py) pueden hacer
+    {**base_dict, **retrieve_result_to_log_extras(result)} y obtener todas las
+    keys automáticamente. Agregar un campo nuevo = solo agregar al dataclass +
+    mapear en to_log_event — esta función propaga sin cambios adicionales.
+
+    Args:
+        rr: RetrieveResult devuelto por retrieve() / multi_retrieve().
+
+    Returns:
+        dict con las keys {anaphora_*, contradiction_penalty_applied,
+        mmr_applied, temporal_intent, decomposed, n_sub_queries, decompose_ms,
+        llm_judge_*}. Nunca lanza excepción — defaults seguros en error path.
+    """
+    try:
+        _extras = rr.extras or {}
+        _filters = rr.filters_applied or {}
+        _timing = rr.timing or {}
+        return {
+            # Anaphora resolver (Quick Win #1, 2026-05-04)
+            "anaphora_resolved": bool(_extras.get("anaphora_resolved", False)),
+            "anaphora_original": str(_extras.get("anaphora_original", "") or ""),
+            "anaphora_rewritten": str(_extras.get("anaphora_rewritten", "") or ""),
+            # Contradiction penalty counter (2026-04-29)
+            "contradiction_penalty_applied": int(
+                rr.get("contradiction_penalty_applied", 0) or 0
+            ),
+            # MMR diversification counter (2026-04-29)
+            "mmr_applied": int(rr.get("mmr_applied", 0) or 0),
+            # Quick Win #3: intent temporal (2026-05-04)
+            "temporal_intent": rr.get("temporal_intent", "neutral") or "neutral",
+            # Query decomposition (2026-05-04, opt-in RAG_QUERY_DECOMPOSE=1)
+            "decomposed": bool(_filters.get("decomposed", False)),
+            "n_sub_queries": int(_filters.get("n_sub_queries", 0) or 0),
+            "decompose_ms": int(_timing.get("decompose_ms", 0) or 0),
+            # LLM-as-judge rerank (2026-05-04, opt-in RAG_LLM_JUDGE=1)
+            "llm_judge_fired": bool(rr.get("llm_judge_fired", False)),
+            "llm_judge_ms": int(rr.get("llm_judge_ms", 0) or 0),
+            "llm_judge_top_score_before": float(
+                rr.get("llm_judge_top_score_before", 0.0) or 0.0
+            ),
+            "llm_judge_top_score_after": float(
+                rr.get("llm_judge_top_score_after", 0.0) or 0.0
+            ),
+            "llm_judge_parse_failed": bool(rr.get("llm_judge_parse_failed", False)),
+            "llm_judge_n_candidates": int(rr.get("llm_judge_n_candidates", 0) or 0),
+        }
+    except Exception:
+        # Nunca levantar excepción desde un helper de telemetría.
+        return {}
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Unified chat turn pipeline (2026-04-22, #1 de los 4 refactors estructurales)
 #
@@ -20523,6 +20721,14 @@ def retrieve(
     # reformulación posterior — la signal vive en cómo el user escribió la
     # query, no en cómo el helper la parafraseó). Determinístico.
     _temporal_intent = _query_temporal_intent(question)
+    # Quick Win #4 — typo correction telemetry (2026-05-04, refactor
+    # 2026-05-04 evening): reset el ContextVar antes de que `expand_queries`
+    # / `_correct_typos_llm` lo populen. Cosechamos en `_collect_typo_telemetry`
+    # justo antes de cada return para que el `RetrieveResult.llm_typo_*`
+    # refleje SOLO esta query (no una corrida anterior dentro del mismo
+    # thread/coroutine). Reemplaza el reset legacy a globals que tenía data
+    # race en el web multi-threaded.
+    _typo_telemetry_reset()
     if _col_count == 0:
         return RetrieveResult(
             docs=[], metas=[], scores=[], confidence=float("-inf"),
@@ -28788,6 +28994,15 @@ def query(
             result.get("contradiction_penalty_applied", 0) or 0,
         ),
         "mmr_applied": int(result.get("mmr_applied", 0) or 0),
+        # Sprint 3-A (2026-05-04): replay payload fields.
+        # corpus_hash + prompt_hash + response_hash SIEMPRE presentes
+        # (16 chars c/u, negligible storage). response_text +
+        # history_snapshot sólo con RAG_LOG_REPLAY_PAYLOAD=1 (opt-in).
+        **_build_replay_fields(
+            response=full,
+            history=history,
+            corpus_hash=_cache_hash,
+        ),
     })
 
     if sess is not None:

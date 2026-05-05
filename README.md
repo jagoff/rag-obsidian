@@ -87,7 +87,7 @@ Quickstart end-to-end (asumiendo macOS + Homebrew + `uv` ya instalado):
 # 1. Verificar que Ollama está corriendo y tiene los modelos
 ollama list   # debe incluir bge-m3, qwen2.5:3b, command-r (o qwen2.5:14b / phi4 como fallbacks)
 # Si falta alguno:
-ollama pull bge-m3
+ollama pull qwen3-embedding:0.6b
 ollama pull qwen2.5:3b
 ollama pull command-r
 

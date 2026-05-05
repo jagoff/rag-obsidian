@@ -2315,7 +2315,7 @@ def cleanup_sessions(ttl_days: int = SESSION_TTL_DAYS) -> int:
     return removed
 
 
-EMBED_MODEL = "bge-m3"  # multilingual (ES/EN), 1024-dim
+EMBED_MODEL = "qwen3-embedding:0.6b"  # multilingual (ES/EN), 1024-dim
 # Chat model preference: first available wins.
 # Orden tras bench 2026-04-18 (ver scripts/bench_chat.py, 5 queries × 2 runs
 # warm sobre vault work, rerank_pool default, num_ctx=4096):
@@ -12005,11 +12005,12 @@ def _get_local_embedder():
                 _dev = "cuda"
             else:
                 _dev = "cpu"
-            # NOTE: EMBED_MODEL is the ollama short name ("bge-m3"); the
-            # HuggingFace repo id is "BAAI/bge-m3". Passing the ollama name
-            # makes sentence_transformers hit the hub HEAD endpoint and fail
+            # NOTE: EMBED_MODEL is the ollama short name
+            # ("qwen3-embedding:0.6b"); the HuggingFace repo id is
+            # "Qwen/Qwen3-Embedding-0.6B". Passing the ollama name makes
+            # sentence_transformers hit the hub HEAD endpoint and fail
             # offline.
-            _local_embedder = SentenceTransformer("BAAI/bge-m3", device=_dev)
+            _local_embedder = SentenceTransformer("Qwen/Qwen3-Embedding-0.6B", device=_dev)
             # MPS cache cleanup wrapper — mismo patrón que get_reranker()
             # / get_nli_model(). El bge-m3 local hace `encode()` (no
             # `predict()`), pero el comportamiento de MPS es idéntico:

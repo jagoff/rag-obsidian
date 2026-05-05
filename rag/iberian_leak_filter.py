@@ -387,6 +387,60 @@ _IBERIAN_LEAK_REPLACEMENTS: tuple[tuple[str, str], ...] = (
     # "Voulu" observado al inicio de respuesta — claramente falso.
     (r"\bVoulu,?\s+", ""),
     (r"\bvoilà\b", "acá"),
+    # 2026-05-04 (smoke test E2E): leaks observados en `rag query
+    # "qué proyectos tengo activos"` con qwen2.5:7b. Output literal:
+    # "Vos podés fijate en la nota X que tá no folder Y. acá tiene
+    # todo lo que se mencionou sobre los tus projetos actívos, como
+    # milestones e horas vendidas em diferentes tipos de contratos
+    # ou proyectos. Vos podés ver más detalhes lá."
+    #
+    # Estas palabras NO existían en el filter y no chocan con español
+    # rioplatense (grafías pt-only).
+    #
+    # `mencionou` (pt 3sg pretérito de mencionar; sufijo -ou pt only).
+    (r"\bmencionou\b", "mencionó"),
+    # `projetos` / `projeto` — pt no usa la "y" que está en español
+    # ("proyectos"). El digram `pj` sin `y` es pt-only.
+    (r"\bprojeto\b", "proyecto"),
+    (r"\bprojetos\b", "proyectos"),
+    # `detalhes` / `detalhe` — el digrama `lh` (palatal lateral) sólo
+    # existe en pt; en español es `ll` o sin nasal.
+    (r"\bdetalhes\b", "detalles"),
+    (r"\bdetalhe\b", "detalle"),
+    # `lá` (pt: "allá"). En español rioplatense "la" es artículo
+    # femenino o pronombre. Con tilde aguda y sin contexto de
+    # interrogación sólo aparece como leak pt.
+    (r"\blá\b", "allá"),
+    # `ou` (pt: conjunción "o"). En español "ou" no existe como
+    # palabra suelta. Restringido a contextos con espacio antes y
+    # después para no romper "tour", "soup", etc. con substring.
+    (r"\bou\b", "o"),
+    # `em` suelto (pt preposición "en"). Las compounds `em março`,
+    # `em sua`, etc. ya están arriba; este es el catch-all para
+    # "em diferentes", "em esta", "em algún". Lookahead exige letra
+    # minúscula después para no tocar siglas (EM-1, EMI, etc.).
+    (r"\bem\s+(?=[a-záéíóúñ])", "en "),
+    # `tá` (pt coloquial para "está"; sufijo verbal -ta sin acento
+    # circunflejo no-existe en es; con tilde aguda sólo aparece como
+    # forma reducida pt). Convertir a "está".
+    (r"\btá\b", "está"),
+    # 2026-05-04: "los tus" / "la tua" patterns — el LLM mezcla
+    # artículo + posesivo (combinación pt). En español rioplatense
+    # se dice "tus X" o "tu X", nunca "los tus X" / "la tua X".
+    # `tua` ya se reemplaza arriba; este captura el redundante "los".
+    (r"\blos\s+tus\b", "tus"),
+    (r"\blas\s+tus\b", "tus"),
+    (r"\bel\s+tu\b", "tu"),
+    (r"\bla\s+tu\b", "tu"),
+    # NOTA: `\bno\b` solo NO se reemplaza (clash con negación en es). El
+    # compound "<verbo> no <sust>" estilo "está no folder" es leak pt
+    # común ("vive no barrio" / "queda no archivo"), pero la lista de
+    # verbos en español que pueden seguir a "no" es enorme ("no
+    # funciona", "no rueda", "no llega") — cualquier regla mecánica
+    # falsifica negación genuina. Aceptamos el leak residual y dejamos
+    # que el system prompt + el filter de palabras pt-only (mencionou,
+    # projeto, lá, ou, em, tá) cubra el grueso. Si vuelve a aparecer,
+    # repensar como semantic-aware filter (mini-LLM o detector pt).
 )
 
 

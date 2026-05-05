@@ -395,6 +395,69 @@ def test_idempotencia_corpus_completo():
         assert once == twice, f"no idempotente: {s!r} → {once!r} → {twice!r}"
 
 
+def test_leaks_2026_05_04_proyectos_query():
+    """Smoke E2E del 2026-05-04: `rag query "qué proyectos tengo activos"`
+    devolvió respuesta con `tá no folder`, `mencionou`, `los tus projetos`,
+    `em diferentes`, `ou proyectos`, `detalhes lá`. Locked acá para que
+    el filter no regrese a tener gaps en estas palabras.
+    """
+    replace, _ = _import_helpers()
+    src = (
+        'la nota tá no archivo. mencionou los tus projetos en em '
+        "diferentes tipos ou proyectos. más detalhes lá."
+    )
+    out = replace(src)
+    # Palabras pt que NO deben quedar en el output (con word boundary
+    # para no caer en substrings como "tá" dentro de "está").
+    import re
+    for forbidden in ("tá", "mencionou", "projetos", "ou", "detalhes",
+                      "lá"):
+        assert not re.search(rf"\b{re.escape(forbidden)}\b", out), (
+            f"{forbidden!r} no se filtró: {out!r}"
+        )
+    assert "los tus" not in out, f"'los tus' no se filtró: {out!r}"
+    # Reemplazos correctos esperados:
+    for expected in ("está", "mencionó", "proyectos", "detalles",
+                     "allá"):
+        assert expected in out, f"falta {expected!r} en {out!r}"
+
+
+def test_negacion_genuina_no_se_corrompe():
+    """Crítico: el `\\bno\\b` solo NO se reemplaza para no romper la
+    negación española genuina ("no quiero", "el código no funciona").
+    El leak residual `está no <noun>` se acepta — el riesgo de
+    falsificar negación supera al beneficio.
+    """
+    replace, _ = _import_helpers()
+    casos = (
+        "No quiero ir, no me gusta esa idea.",
+        "El código no funciona y no compila tampoco.",
+        "Está, no sé qué decirte.",
+        "la pelota no rueda — está, no funciona el motor",
+    )
+    for s in casos:
+        out = replace(s)
+        # `no` como palabra debe sobrevivir tal cual al menos una vez
+        assert " no " in f" {out} " or out.startswith("No "), (
+            f"negación genuina rota: {s!r} → {out!r}"
+        )
+
+
+def test_em_compound_no_pisa_em_substring():
+    """Sanity: el regex `\\bem\\s+(?=[a-z])` NO debe tocar substrings
+    como "tema", "iemma", "BMC-EM-1". Sólo `em` como palabra suelta
+    seguida de letra minúscula.
+    """
+    replace, _ = _import_helpers()
+    safe = (
+        "el tema central del proyecto BMC-EM-1 es claro",
+        "Sistema EMI tiene 3 módulos",
+        "EM-2 es la versión actualizada",
+    )
+    for s in safe:
+        assert replace(s) == s, f"`em` substring rompió: {s!r} → {replace(s)!r}"
+
+
 def test_stream_corpus_expandido_2026_04_29():
     """Misma invariante que `test_stream_total_output_matches_replace_over_concat`
     pero usando el corpus extendido con las palabras nuevas. Cubre los

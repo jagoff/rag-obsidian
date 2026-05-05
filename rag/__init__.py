@@ -28015,8 +28015,16 @@ def query(
                 _cached_response = hit["response"]
                 _cached_paths = hit["paths"]
                 _cached_top = hit["top_score"]
+                # 2026-05-04: aplicar `replace_iberian_leaks` al cache
+                # hit. El non-plain path va por `render_response()` que
+                # ya filtra; el `--plain` echaba directo. Si el cache
+                # fue populado antes del fix de filter (o con un leak
+                # residual), el output queda contaminado para siempre
+                # hasta que se invalide el cache. Aplicar acá es defense-
+                # in-depth + idempotente.
                 if plain:
-                    click.echo(convert_obsidian_links(_cached_response))
+                    from rag.iberian_leak_filter import replace_iberian_leaks as _rilk
+                    click.echo(convert_obsidian_links(_rilk(_cached_response)))
                 else:
                     console.print(render_response(_cached_response))
                     if _cached_paths:
@@ -28594,8 +28602,18 @@ def query(
     # critique have already mutated `full`. Ordering: stream → repair → critique
     # → THIS echo → counter-evidence (if --counter). Non-plain path uses Live +
     # console.print reprints above and does not reach this branch.
+    #
+    # 2026-05-04: aplicar `replace_iberian_leaks` también acá. El path
+    # non-plain pasa por `render_response()` que ya lo aplica internamente
+    # (línea ~487), pero `--plain` echaba `full` directo sin filter — se
+    # detectó haciendo `rag query "qué proyectos tengo activos" --plain`
+    # y la respuesta tenía "tá", "mencionou", "projetos", "em", "ou",
+    # "lá". El listener WhatsApp y otros consumidores programáticos usan
+    # `--plain`, así que sin el filter acá los leaks llegan al usuario.
+    # El filter es idempotente; aplicarlo no duplica si ya está limpio.
     if plain:
-        click.echo(convert_obsidian_links(full))
+        from rag.iberian_leak_filter import replace_iberian_leaks
+        click.echo(convert_obsidian_links(replace_iberian_leaks(full)))
 
     contrad: list[dict] = []
     if counter:

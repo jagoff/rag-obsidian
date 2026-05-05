@@ -23,6 +23,22 @@ from pathlib import Path
 
 from rag._constants import _GOOGLE_TOKEN_PATH
 
+
+def _etl_log_swallow(scope: str, exc: BaseException) -> None:
+    """Wrapper local sobre `rag._silent_log` con lazy-import para evitar
+    circular import. Cualquier fallo del logger se traga.
+
+    Audit 2026-05-04: pre-fix había 35/59 except silent en este archivo
+    con SOLO 1 logueado. Cuando un ETL fallaba (Gmail OAuth caducó, Drive
+    API rate-limit, MOZE CSV mal formado, Spotify token expired), no
+    quedaba traza en silent_errors.jsonl → debugging a ciegas.
+    """
+    try:
+        from rag import _silent_log  # noqa: PLC0415 — lazy
+        _silent_log(scope, exc)
+    except Exception:  # pragma: no cover — never re-raise
+        pass
+
 __all__ = [
     # MOZE helpers
     "MOZE_BACKUP_DIR",
@@ -183,8 +199,8 @@ def _moze_parse_latest() -> tuple[Path, list[tuple[datetime, dict]]] | None:
     try:
         from rag.integrations import tally4_realm
         tally4_realm.ensure_moze_csv(MOZE_BACKUP_DIR)
-    except Exception:
-        pass
+    except Exception as exc:
+        _etl_log_swallow("moze_tally4_ensure_csv", exc)
 
     try:
         csvs: list[Path] = []
@@ -192,7 +208,8 @@ def _moze_parse_latest() -> tuple[Path, list[tuple[datetime, dict]]] | None:
             if d and d.exists():
                 csvs.extend(d.glob("MOZE_*.csv"))
         csvs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    except Exception:
+    except Exception as exc:
+        _etl_log_swallow("moze_csv_listing", exc)
         return None
     if not csvs:
         return None
@@ -210,7 +227,8 @@ def _moze_parse_latest() -> tuple[Path, list[tuple[datetime, dict]]] | None:
                 except ValueError:
                     continue
                 rows.append((d, r))
-    except Exception:
+    except Exception as exc:
+        _etl_log_swallow("moze_csv_parse", exc)
         return None
     return (src, rows) if rows else None
 
@@ -390,8 +408,8 @@ def _sync_moze_notes(vault_root: Path) -> dict:
         if p.name not in current_set:
             try:
                 p.unlink()
-            except Exception:
-                pass
+            except Exception as exc:
+                _etl_log_swallow("moze_prune_stale_month", exc)
 
     # Roll-up index note — gives chat queries like "cuánto gasté este año"
     # a single surface to land on instead of 12 per-month notes.
@@ -531,7 +549,8 @@ def _parse_credit_card_xlsx(path: Path) -> dict | None:
         return None
     try:
         wb = load_workbook(path, data_only=True, read_only=True)
-    except Exception:
+    except Exception as exc:
+        _etl_log_swallow("credit_card_xlsx_load", exc)
         return None
 
     rows: list[tuple] = []
@@ -543,7 +562,8 @@ def _parse_credit_card_xlsx(path: Path) -> dict | None:
         # streaming, sin riesgo de memoria.
         for row in ws.iter_rows(values_only=True):
             rows.append(row)
-    except Exception:
+    except Exception as exc:
+        _etl_log_swallow("credit_card_xlsx_iter_rows", exc)
         return None
     finally:
         try:
@@ -942,8 +962,8 @@ def _sync_credit_cards_notes(vault_root: Path) -> dict:
         if p.name not in current_set:
             try:
                 p.unlink()
-            except Exception:
-                pass
+            except Exception as exc:
+                _etl_log_swallow("credit_card_prune_stale", exc)
 
     if not current_set and parse_failed:
         return {"ok": False, "reason": "no_parsed"}
@@ -1041,14 +1061,14 @@ def _harden_oauth_cache_perms() -> None:
     if cfg_dir.is_dir():
         try:
             cfg_dir.chmod(0o700)
-        except OSError:
-            pass
+        except OSError as exc:
+            _etl_log_swallow("oauth_cache_chmod_dir", exc)
     for tok in (_GOOGLE_TOKEN_PATH, _SPOTIFY_TOKEN_PATH):
         if tok.is_file():
             try:
                 os.chmod(tok, 0o600)
-            except OSError:
-                pass
+            except OSError as exc:
+                _etl_log_swallow("oauth_cache_chmod_token", exc)
 
 
 _harden_oauth_cache_perms()
@@ -1238,8 +1258,8 @@ def _read_chrome_visits(history_db: Path, hours: int = 48) -> list[dict]:
     finally:
         try:
             tmp.unlink()
-        except OSError:
-            pass
+        except OSError as exc:
+            _etl_log_swallow("chrome_history_tmp_unlink", exc)
 
     out: list[dict] = []
     seen: set[str] = set()
@@ -1397,7 +1417,8 @@ def _load_google_credentials(allow_interactive: bool = True) -> "google.oauth2.c
     try:
         flow = InstalledAppFlow.from_client_secrets_file(str(keys), list(_GOOGLE_SCOPES))
         creds = flow.run_local_server(port=0, open_browser=True)
-    except Exception:
+    except Exception as exc:
+        _etl_log_swallow("google_oauth_flow_failed", exc)
         return None
     _write_secret_file(_GOOGLE_TOKEN_PATH, creds.to_json())
     return creds
@@ -1468,7 +1489,8 @@ def _sync_gmail_notes(vault_root: Path, hours: int = 48, max_messages: int = 30,
             msg = gm.users().messages().get(
                 userId="me", id=mid, format="full",
             ).execute()
-        except Exception:
+        except Exception as exc:
+            _etl_log_swallow("gmail_message_fetch", exc)
             continue
         headers = {h["name"].lower(): h["value"] for h in (msg.get("payload", {}).get("headers") or [])}
         body = _decode_gmail_body(msg.get("payload") or {})
@@ -1993,7 +2015,8 @@ def _fetch_yt_transcript_for_index(video_id: str) -> tuple[str, str] | None:
     try:
         api = YouTubeTranscriptApi()
         listing = api.list(video_id)
-    except Exception:
+    except Exception as exc:
+        _etl_log_swallow("yt_transcript_list", exc)
         return None
     transcript = None
     chosen_lang = None
@@ -2003,16 +2026,20 @@ def _fetch_yt_transcript_for_index(video_id: str) -> tuple[str, str] | None:
             chosen_lang = lang
             break
         except Exception:
+            # Per-lang miss esperado — el video no tiene ese idioma. NO
+            # loggear (sino se llena el log con noise por cada lang miss).
             continue
     if transcript is None:
         try:
             transcript = next(iter(listing))
             chosen_lang = transcript.language_code
-        except Exception:
+        except Exception as exc:
+            _etl_log_swallow("yt_transcript_iter_fallback", exc)
             return None
     try:
         fetched = transcript.fetch()
-    except Exception:
+    except Exception as exc:
+        _etl_log_swallow("yt_transcript_fetch", exc)
         return None
     snippets = getattr(fetched, "snippets", None) or fetched
     parts = [getattr(s, "text", None) or s.get("text", "") for s in snippets]
@@ -2116,10 +2143,11 @@ def _spotify_client(allow_interactive: bool = True) -> "spotipy.Spotify | None":
         try:
             if _token_path.is_file():
                 os.chmod(_token_path, 0o600)
-        except OSError:
-            pass
+        except OSError as exc:
+            _etl_log_swallow("spotify_token_chmod", exc)
         return spotipy.Spotify(auth=token["access_token"])
-    except Exception:
+    except Exception as exc:
+        _etl_log_swallow("spotify_oauth_token", exc)
         return None
 
 

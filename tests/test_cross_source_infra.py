@@ -22,21 +22,26 @@ import rag
 def test_valid_sources_contains_expected():
     # Phase 1 registered 6 sources + Phase 1e/f added contacts + calls
     # + Phase 2 added safari + drive (Google Docs/Sheets/Slides corpus,
-    # commit de03db1 2026-04-23). Anchor test so future additions don't
-    # silently grow the surface.
+    # commit de03db1 2026-04-23) + 2026-05-05 added `memory` (mem-vault
+    # carve-out from `source=vault`, see `_infer_vault_source`). Anchor
+    # test so future additions don't silently grow the surface.
     assert rag.VALID_SOURCES == frozenset(
-        {"vault", "calendar", "gmail", "whatsapp", "reminders", "messages",
-         "contacts", "calls", "safari", "drive"}
+        {"vault", "memory", "calendar", "gmail", "whatsapp", "reminders",
+         "messages", "contacts", "calls", "safari", "drive"}
     )
 
 
 def test_source_weights_dict_covers_every_valid_source():
-    # Hierarchy: vault > contacts ≈ calendar > reminders > gmail ≈ drive
-    #          > safari ≈ calls > whatsapp = messages.
+    # Hierarchy: vault > contacts ≈ calendar > memory ≈ reminders
+    #          > gmail ≈ drive > safari ≈ calls > whatsapp = messages.
     assert set(rag.SOURCE_WEIGHTS) == rag.VALID_SOURCES
     assert rag.SOURCE_WEIGHTS["vault"] == 1.00
     assert rag.SOURCE_WEIGHTS["contacts"] == 0.95
     assert rag.SOURCE_WEIGHTS["calendar"] == 0.95
+    # memory: agent-curated mem-vault, softly down-weighted so user-authored
+    # vault notes win ties. See `_infer_vault_source` for the path-prefix
+    # carve-out (2026-05-05).
+    assert rag.SOURCE_WEIGHTS["memory"] == 0.90
     assert rag.SOURCE_WEIGHTS["reminders"] == 0.90
     assert rag.SOURCE_WEIGHTS["gmail"] == 0.85
     # drive: Docs/Sheets/Slides son user-authored + high trust, mismo band que email.

@@ -2351,7 +2351,7 @@ _COLLECTION_BASE = "obsidian_notes_v11"  # v11: removed temporal tokens (A/B 202
 # the "no cloud calls" invariant declared at the top of CLAUDE.md. Tracked
 # in docs/design-cross-source-corpus.md §10.6.
 VALID_SOURCES: frozenset[str] = frozenset(
-    {"vault", "calendar", "gmail", "whatsapp", "reminders", "messages",
+    {"vault", "memory", "calendar", "gmail", "whatsapp", "reminders", "messages",
      "contacts", "calls", "safari", "drive"}
 )
 # `pillow` (iOS sleep tracker) tiene un ingester propio en
@@ -2368,6 +2368,10 @@ SOURCE_WEIGHTS: dict[str, float] = {
     "vault":     1.00,
     "contacts":  0.95,   # editorial trust — user-curated metadata
     "calendar":  0.95,
+    "memory":    0.90,   # mem-vault facts/decisions/gotchas — curated by the agent,
+                         # softly down-weighted so user-authored vault notes win ties
+                         # on queries that match both. See feedback-loop guard in
+                         # `is_excluded()` rationale.
     "reminders": 0.90,
     "gmail":     0.85,
     "drive":     0.85,   # Docs/Sheets/Slides: user-authored, high trust like email
@@ -2387,6 +2391,7 @@ SOURCE_WEIGHTS: dict[str, float] = {
 #   - whatsapp / messages / calls: conversational — a 2-month-old trace rarely matters
 SOURCE_RECENCY_HALFLIFE_DAYS: dict[str, float | None] = {
     "vault":     None,
+    "memory":    None,   # curated knowledge — no temporal decay
     "contacts":  None,
     "calendar":  None,
     "reminders":   90.0,
@@ -2411,6 +2416,7 @@ SOURCE_RECENCY_HALFLIFE_DAYS: dict[str, float | None] = {
 # (vault retention is manual).
 SOURCE_RETENTION_DAYS: dict[str, int | None] = {
     "vault":     None,
+    "memory":    None,   # never auto-purge mem-vault entries
     "contacts":  None,
     "calendar":  None,
     "reminders": None,
@@ -2430,6 +2436,24 @@ def normalize_source(value: object, *, default: str = "vault") -> str:
     if isinstance(value, str) and value in VALID_SOURCES:
         return value
     return default
+
+
+# Path-prefix discriminator: chunks whose vault-relative path starts with
+# `04-Archive/99-obsidian-system/99-AI/memory/` belong to the agent-curated
+# mem-vault. They get `source="memory"` (weight=0.90) instead of
+# `source="vault"` (weight=1.00), so user-authored notes win ties on
+# overlapping queries. The carve-out exists because mem-vault entries
+# describe THE SYSTEM ITSELF (bug patterns, decisions, gotchas) and were
+# previously dominating retrieval at >50% of top-k for technical queries.
+# See `is_excluded()` for why memories stay indexed at all.
+_MEMORY_PATH_PREFIX = "04-Archive/99-obsidian-system/99-AI/memory/"
+
+
+def _infer_vault_source(rel_path: str) -> str:
+    """`memory` for mem-vault entries, `vault` otherwise. Called from the
+    indexer (`_index_single_file` + the rglob path in `_run_index`) so the
+    discriminator is set at write time. Cheap path-prefix check."""
+    return "memory" if (rel_path or "").startswith(_MEMORY_PATH_PREFIX) else "vault"
 
 
 def source_weight(source: str) -> float:
@@ -3628,6 +3652,8 @@ CONFIDENCE_RERANK_MIN = 0.015
 # baseline 0.015 (no regression intended for the dominant source).
 CONFIDENCE_RERANK_MIN_PER_SOURCE: dict[str, float] = {
     "vault":     0.015,   # baseline (vault-prose calibrated)
+    "memory":    0.015,   # mem-vault prose: structured Contexto/Problema/Solución,
+                          # similar body length to vault → reuse vault threshold
     "whatsapp":  0.008,   # bodies ~143 chars, scores 0.02-0.10 normales
     "calendar":  0.008,   # eventos cortos, mismo problema que WA
     "reminders": 0.008,   # ítems estructurados pero cortos
@@ -27326,7 +27352,9 @@ def _index_single_file(
         # Cross-source discriminator (Phase 1). Old rows without this field
         # default to "vault" via `normalize_source` at read time, so this is
         # pure forward-compat — no re-embed required on upgrade.
-        "source": "vault",
+        # `_infer_vault_source` carves out `99-AI/memory/` → source="memory"
+        # so mem-vault entries don't dominate top-k via vault's weight=1.00.
+        "source": _infer_vault_source(doc_id_prefix),
     }
     # Aliases → `extra_json` (list form preserved). Downstream readers
     # merge `extra_json` into the meta dict via `_row_to_meta`, so
@@ -27911,7 +27939,7 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
                 "outlinks": ",".join(outlinks),
                 # Cross-source discriminator (Phase 1). See `_index_single_file`
                 # for the same field on the incremental path.
-                "source": "vault",
+                "source": _infer_vault_source(doc_id_prefix),
             }
             for fm_key in FM_SEARCHABLE_FIELDS:
                 v = fm.get(fm_key)

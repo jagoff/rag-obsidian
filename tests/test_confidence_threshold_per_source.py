@@ -45,6 +45,7 @@ def test_threshold_calibrated_values_w3_9():
     doc update — fail loud otherwise."""
     expected = {
         "vault":     0.015,   # baseline (vault-prose calibrated)
+        "memory":    0.015,   # mem-vault prose, reuse vault threshold
         "whatsapp":  0.008,   # bodies cortos ~143 chars
         "calendar":  0.008,   # eventos cortos
         "reminders": 0.008,   # ítems cortos

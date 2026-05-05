@@ -86,11 +86,13 @@ def test_queries_yaml_cross_source_prefixes_cover_all_valid_sources():
                              "reminders://", "messages://",
                              "contacts://", "calls://", "safari://",
                              "drive://"}
-    # vault is file-backed → not a prefix
-    expected_whitelisted = rag.VALID_SOURCES - {"vault"}
+    # vault + memory are file-backed (memory lives at
+    # 04-Archive/99-obsidian-system/99-AI/memory/<slug>.md inside the vault) →
+    # neither uses a `<source>://` prefix.
+    expected_whitelisted = rag.VALID_SOURCES - {"vault", "memory"}
     prefix_sources = {p.rstrip("://") for p in CROSS_SOURCE_PREFIXES}
     assert prefix_sources == expected_whitelisted, (
-        f"Whitelist drift: prefixes {prefix_sources} vs VALID_SOURCES-vault "
+        f"Whitelist drift: prefixes {prefix_sources} vs VALID_SOURCES-{{vault,memory}} "
         f"{expected_whitelisted}. Update test_queries_yaml_all_paths_exist_or_placeholder."
     )
 

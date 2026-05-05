@@ -1571,58 +1571,6 @@ def _audit_corpus_coverage_gaps(conn, days: int) -> dict:
     out["top_candidates"] = [dict(r) for r in rows]
     out["alert"] = out["unique_queries_repeated"] >= 5
     return out
-
-
-
-def _audit_impression_to_open_ratio(conn, days: int = 7) -> dict:
-    """CTR: proporción de queries con al menos un 'open' de behavior.
-
-    Detecta si el user está usando los resultados (abriendo notas) o
-    ignorándolos. Un CTR < 0.5% con alto volumen indica resultados
-    poco relevantes o mala UX de apertura.
-    """
-    from datetime import datetime, timedelta
-    cutoff_iso = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
-    out: dict = {
-        "window_days": days,
-        "total_queries": 0,
-        "queries_with_open": 0,
-        "ctr_pct": 0.0,
-        "alert": False,
-    }
-    try:
-        exists = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='rag_behavior'"
-        ).fetchone()
-        if exists is None:
-            out["error"] = "table missing: rag_behavior"
-            return out
-
-        queries_row = conn.execute(
-            "SELECT COUNT(*) FROM rag_queries WHERE ts >= ? AND q != ''",
-            (cutoff_iso,),
-        ).fetchone()
-        out["total_queries"] = int(queries_row[0] or 0)
-
-        opens_row = conn.execute(
-            """
-            SELECT COUNT(DISTINCT session) FROM rag_behavior
-            WHERE ts >= ? AND event = 'open'
-            """,
-            (cutoff_iso,),
-        ).fetchone()
-        out["queries_with_open"] = int(opens_row[0] or 0)
-
-        total = out["total_queries"]
-        if total > 0:
-            out["ctr_pct"] = round(out["queries_with_open"] / total * 100, 4)
-
-        out["alert"] = total >= 50 and out["ctr_pct"] < 0.5
-    except Exception as exc:
-        out["error"] = repr(exc)
-    return out
-
-
 def _audit_draft_decision_health(conn: sqlite3.Connection, days: int = 30) -> dict:
     """Health check del loop de aprendizaje del bot WA (drafts).
 
@@ -1712,6 +1660,82 @@ def _audit_draft_decision_health(conn: sqlite3.Connection, days: int = 30) -> di
         )
 
     return out
+
+
+def _audit_intent_latency_drift(conn: sqlite3.Connection) -> dict:
+    """Detecta drift de latencia por intent — 7d vs 30d baseline.
+
+    Pregunta accionable: algun intent tardo >30% mas en t_retrieve o t_gen
+    esta semana vs el baseline del ultimo mes? Signal temprana de regresion
+    silenciosa antes de que el eval gate la capture.
+    """
+    _SQL = """
+        SELECT
+            COALESCE(json_extract(extra_json, '$.intent'), 'unknown') AS intent,
+            COUNT(*) AS n,
+            ROUND(AVG(t_retrieve) * 1000, 0) AS avg_retrieve_ms,
+            ROUND(AVG(t_gen) * 1000, 0) AS avg_gen_ms
+        FROM rag_queries
+        WHERE ts >= datetime('now', ?)
+          AND cmd IN ('web', 'query', 'serve.chat')
+          AND t_retrieve IS NOT NULL
+        GROUP BY intent
+        HAVING COUNT(*) >= 5
+    """
+    DRIFT_THRESHOLD = 30.0
+
+    def _fetch(window: str) -> dict:
+        rows = conn.execute(_SQL, (window,)).fetchall()
+        return {
+            r["intent"]: {
+                "n": int(r["n"]),
+                "avg_retrieve_ms": float(r["avg_retrieve_ms"] or 0.0),
+                "avg_gen_ms": (
+                    float(r["avg_gen_ms"]) if r["avg_gen_ms"] is not None else None
+                ),
+            }
+            for r in rows
+        }
+
+    def _drift_pct(new_val, base_val):
+        if new_val is None or base_val is None or base_val == 0:
+            return None
+        return round((new_val - base_val) / base_val * 100.0, 2)
+
+    try:
+        data_7d = _fetch("-7 days")
+        data_30d = _fetch("-30 days")
+    except sqlite3.OperationalError as exc:
+        return {"intents": [], "alerts_count": 0, "error": repr(exc)}
+
+    intents_out = []
+    for intent, d7 in data_7d.items():
+        d30 = data_30d.get(intent, {})
+        avg_retr_30 = d30.get("avg_retrieve_ms")
+        avg_gen_30 = d30.get("avg_gen_ms")
+        drift_retr = _drift_pct(d7["avg_retrieve_ms"], avg_retr_30)
+        drift_gen = _drift_pct(d7["avg_gen_ms"], avg_gen_30)
+        alert = (drift_retr is not None and drift_retr > DRIFT_THRESHOLD) or (
+            drift_gen is not None and drift_gen > DRIFT_THRESHOLD
+        )
+        intents_out.append({
+            "intent": intent,
+            "n_7d": d7["n"],
+            "n_30d": d30.get("n", 0),
+            "avg_retrieve_ms_7d": d7["avg_retrieve_ms"],
+            "avg_retrieve_ms_30d": avg_retr_30 if avg_retr_30 is not None else 0.0,
+            "drift_retrieve_pct": drift_retr,
+            "avg_gen_ms_7d": d7["avg_gen_ms"],
+            "avg_gen_ms_30d": avg_gen_30,
+            "drift_gen_pct": drift_gen,
+            "alert": alert,
+        })
+
+    intents_out.sort(
+        key=lambda x: (not x["alert"], -(x["drift_retrieve_pct"] or 0.0))
+    )
+    alerts_count = sum(1 for i in intents_out if i["alert"])
+    return {"intents": intents_out, "alerts_count": alerts_count}
 
 
 def _audit_db_size() -> dict:
@@ -2133,6 +2157,45 @@ def _render_text(report: dict) -> str:
             out.append(f"   Sugerencia: {itor['suggestion']}")
         out.append("")
 
+    # Drift latencia por intent (7d vs 30d)
+    ild = report.get("intent_latency_drift")
+    if ild is not None:
+        if ild.get("error"):
+            out.append(f"⏱️  Drift latencia por intent: ERROR — {ild['error']}")
+        else:
+            alerts = ild.get("alerts_count", 0)
+            n_intents = len(ild.get("intents") or [])
+            alert_icon = "⚠️ " if alerts > 0 else "✓"
+            out.append(
+                f"{alert_icon} Drift latencia por intent (7d vs 30d): "
+                f"{alerts} alert(s) en {n_intents} intents con >=5 queries"
+            )
+            if ild.get("intents"):
+                out.append(
+                    f"   {'intent':<16}  {'n_7d':>5}  {'n_30d':>5}  "
+                    f"{'retr_7d':>7}  {'retr_30d':>8}  {'drift_r%':>8}  "
+                    f"{'gen_7d':>6}  {'drift_g%':>8}  alerta"
+                )
+                for row in ild["intents"]:
+                    alert_mark = "⚠️ " if row["alert"] else "   "
+                    drift_r = (
+                        f"{row['drift_retrieve_pct']:>+.1f}%"
+                        if row["drift_retrieve_pct"] is not None
+                        else "    —"
+                    )
+                    drift_g = (
+                        f"{row['drift_gen_pct']:>+.1f}%"
+                        if row["drift_gen_pct"] is not None
+                        else "    —"
+                    )
+                    out.append(
+                        f"   {row['intent']:<16}  {row['n_7d']:>5}  {row['n_30d']:>5}  "
+                        f"{row['avg_retrieve_ms_7d']:>7.0f}  {row['avg_retrieve_ms_30d']:>8.0f}  "
+                        f"{drift_r:>8}  "
+                        f"{(row['avg_gen_ms_7d'] or 0):>6.0f}  {drift_g:>8}  {alert_mark}"
+                    )
+        out.append("")
+
     # DB size
     db = report.get("db_size", {})
     out.append("💽 DB sizes:")
@@ -2315,6 +2378,7 @@ def main() -> int:
         report["draft_decision_health"] = None
         report["impression_to_open_ratio"] = None
         report["corpus_coverage_gaps"] = None
+        report["intent_latency_drift"] = None
         report["db_unavailable"] = str(TELEMETRY_DB)
     else:
         try:
@@ -2343,6 +2407,7 @@ def main() -> int:
             report["draft_decision_health"] = _audit_draft_decision_health(conn, args.days)
             report["impression_to_open_ratio"] = _audit_impression_to_open_ratio(conn, args.days)
             report["corpus_coverage_gaps"] = _audit_corpus_coverage_gaps(conn, args.days)
+            report["intent_latency_drift"] = _audit_intent_latency_drift(conn)
         except sqlite3.OperationalError as exc:
             report["query_latency"] = None
             report["cache_health"] = None
@@ -2358,6 +2423,7 @@ def main() -> int:
             report["draft_decision_health"] = None
             report["impression_to_open_ratio"] = None
             report["corpus_coverage_gaps"] = None
+            report["intent_latency_drift"] = None
             report["db_error"] = repr(exc)
         finally:
             conn.close()

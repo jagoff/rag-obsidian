@@ -3412,9 +3412,14 @@ def submit_draft_preview(req: DraftPreviewPayload, request: Request) -> dict:
             original_conversation=req.original_conversation,
             bot_draft_baseline=req.bot_draft_baseline,
         )
-    except Exception:  # pragma: no cover — el helper ya hace silent-fail
+    except Exception as exc:  # pragma: no cover — el helper ya hace silent-fail
         preview = req.bot_draft_baseline
         ft_active = False
+        try:
+            import rag as _rag_mod  # noqa: PLC0415
+            _rag_mod._silent_log("drafts_ft_generate_failed", exc)
+        except Exception:
+            pass
     return {"ok": True, "preview": preview, "ft_active": ft_active}
 
 
@@ -4292,8 +4297,12 @@ def create_reminder(req: ReminderCreateRequest) -> dict:
     # panel on next load without waiting for SWR.
     try:
         _HOME_STATE["ts"] = 0.0
-    except Exception:
-        pass
+    except Exception as _exc_home_bust:
+        try:
+            import rag as _rag_mod  # noqa: PLC0415
+            _rag_mod._silent_log("home_cache_bust", _exc_home_bust)
+        except Exception:
+            pass
     return {"ok": True, "id": res}
 
 
@@ -4373,8 +4382,12 @@ def complete_reminder(req: ReminderCompleteRequest) -> dict:
     # waiting for the 60s SWR cycle.
     try:
         _HOME_STATE["ts"] = 0.0
-    except Exception:
-        pass
+    except Exception as _exc_home_bust:
+        try:
+            import rag as _rag_mod  # noqa: PLC0415
+            _rag_mod._silent_log("home_cache_bust", _exc_home_bust)
+        except Exception:
+            pass
     return {"ok": True, "message": msg}
 
 
@@ -4397,8 +4410,12 @@ def delete_reminder(req: ReminderDeleteRequest) -> dict:
         raise HTTPException(status_code=400, detail=msg)
     try:
         _HOME_STATE["ts"] = 0.0
-    except Exception:
-        pass
+    except Exception as _exc_home_bust:
+        try:
+            import rag as _rag_mod  # noqa: PLC0415
+            _rag_mod._silent_log("home_cache_bust", _exc_home_bust)
+        except Exception:
+            pass
     return {"ok": True, "message": msg}
 
 
@@ -5173,8 +5190,12 @@ def whatsapp_send(req: WhatsAppSendRequest) -> dict:
             "reply_to_id": reply_to_id,
             "sent": True,
         })
-    except Exception:
-        pass
+    except Exception as exc:
+        try:
+            import rag as _rag_mod  # noqa: PLC0415
+            _rag_mod._silent_log("whatsapp_send_audit_log", exc)
+        except Exception:
+            pass
     return {"ok": True, "jid": jid}
 
 
@@ -11416,8 +11437,12 @@ async def api_query(req: QueryRequest, request: Request) -> dict:
             hint = stale_source_hint(question)
             if hint:
                 canned = canned + "\n\n" + hint
-        except Exception:
-            pass
+        except Exception as exc:
+            try:
+                import rag as _rag_mod  # noqa: PLC0415
+                _rag_mod._silent_log("api_query_stale_hint", exc)
+            except Exception:
+                pass
         return {
             "answer": canned,
             "sources": [],
@@ -11557,8 +11582,13 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         _client_device = _rag_mod._classify_device(
             request.headers.get("User-Agent", "")
         )
-    except Exception:
+    except Exception as exc:
         _client_device = "other"
+        try:
+            import rag as _rag_mod_log  # noqa: PLC0415
+            _rag_mod_log._silent_log("chat_device_classification", exc)
+        except Exception:
+            pass
 
     # ── /redo path ───────────────────────────────────────────────────────
     # If the client sent redo_turn_id, resolve the original question from
@@ -11618,10 +11648,15 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             _last_t = _prev_turns_state[-1]
             _last_turn_tools = list(_last_t.get("tools_fired") or [])
             _last_turn_weather_location = _last_t.get("weather_location") or None
-    except Exception:
+    except Exception as exc:
         # Defense in depth — el state lookup no debe romper la chat call.
         _last_turn_tools = []
         _last_turn_weather_location = None
+        try:
+            import rag as _rag_mod  # noqa: PLC0415
+            _rag_mod._silent_log("chat_session_state_lookup", exc)
+        except Exception:
+            pass
 
     # Spotify control short-circuit — comandos directos de playback
     # ("pausa", "siguiente", "anterior", "pone Bohemian Rhapsody", etc.).

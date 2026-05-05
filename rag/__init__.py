@@ -867,8 +867,19 @@ def _log_writer_loop() -> None:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 with path.open("a", encoding="utf-8") as f:
                     f.write(line)
-            except Exception:
-                pass
+            except Exception as _exc_log_write:
+                # Si el writer mismo falla, NO podemos llamar a
+                # _silent_log() (recursión infinita). Fallback: stderr,
+                # que en launchd va al StandardErrorPath del plist
+                # (~/.local/share/obsidian-rag/*.log).
+                try:
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"[rag-log-writer] write to {path} failed: "
+                        f"{type(_exc_log_write).__name__}: {_exc_log_write}\n"
+                    )
+                except Exception:
+                    pass
         finally:
             _LOG_QUEUE.task_done()
 
@@ -13730,7 +13741,15 @@ _TOPIC_SHIFT_FOLLOWUP_RE = re.compile(
     # 0.40 actual) porque las palabras vacías ("otros", "cuál", "dame") no
     # cargan signal. Whitelist explícita.
     r"qu[eé]\s+otros?|qu[eé]\s+otras?|"        # "qué otros materiales"
-    r"cu[aá]l\s+(?:era|fue|es|ser[ií]a|ser[ií]an)\s+(?:el|la|los|las)?|"  # "cuál era el primer punto"
+    # 2026-05-04: sacamos `es` del verb-set. Era falso-positivo masivo —
+    # "cuál es el/la X" es el patrón estándar de pregunta factual en
+    # español ("cuál es la capital de Francia", "cuál es el nro serial
+    # de la guitarra fender") y matcheaba como anáfora arrastrando la
+    # history del turno anterior. Past/conditional (era/fue/sería/serían)
+    # SÍ son señal fuerte de referencia hacia atrás. Las anáforas legítimas
+    # con presente ("cuál es el último que dijiste") las atrapa la rule
+    # de ordinales abajo.
+    r"cu[aá]l\s+(?:era|fue|ser[ií]a|ser[ií]an)\s+(?:el|la|los|las)?|"  # "cuál era el primer punto"
     r"dame\s+(?:un|el|los|otro)|"               # "dame un ejemplo"
     r"un\s+ejemplo|otro\s+ejemplo|"             # "un ejemplo más"
     r"explic[aá]me\s+(?:mejor|bien|m[aá]s|otra\s+vez)|"
@@ -23080,8 +23099,8 @@ def multi_retrieve(
                 _r_extras = {}
                 r["extras"] = _r_extras
             _r_extras.update(_anaphora_telemetry)
-        except Exception:
-            pass
+        except Exception as exc:
+            _silent_log("multi_retrieve_anaphora_telemetry", exc)
         return r
 
     all_items: list[tuple[float, str, dict]] = []
@@ -27240,8 +27259,8 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
     # runs en daemons long-lived → tras 500 captions el budget agotaba.
     try:
         _vlm_caption_budget_reset()
-    except Exception:
-        pass
+    except Exception as exc:
+        _silent_log("vlm_caption_budget_reset", exc)
     # Contradiction check only runs in incremental mode and when not opted out.
     check_contradictions = not reset and not no_contradict
 
@@ -27264,8 +27283,8 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
                 try:
                     _log_collection_op("delete", cname, {"reason": "index --reset"})
                     client.delete_collection(cname)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _silent_log("index_reset_delete_collection", exc)
             col = client.get_or_create_collection(
                 COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
             )
@@ -28289,8 +28308,8 @@ def query(
                     "propose_intent_short_circuit": True,
                     "intent": "create",
                 })
-            except Exception:
-                pass
+            except Exception as exc:
+                _silent_log("query_create_intent_log", exc)
             return
 
     # ── Spotify control short-circuit ───────────────────────────────────────
@@ -28316,8 +28335,8 @@ def query(
                     "spotify_ok": bool(spotify_res.get("ok")),
                     "intent": "spotify_control",
                 })
-            except Exception:
-                pass
+            except Exception as exc:
+                _silent_log("query_spotify_log", exc)
             return
 
     # Explicit --since wins over auto-detect; both are pushed through retrieve().

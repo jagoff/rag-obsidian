@@ -135,7 +135,16 @@ from rank_bm25 import BM25Okapi
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
-from rich.progress import track
+from rich.progress import (
+    track,
+    Progress,
+    SpinnerColumn,
+    BarColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+    MofNCompleteColumn,
+)
 from rich.rule import Rule
 from rich.syntax import Syntax
 from rich.table import Table
@@ -8619,6 +8628,13 @@ def _ragvec_state_conn():
         if (row[0] if row else "").lower() != "wal":
             conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
+        # cache_size + mmap_size — ver SqliteVecClient.__init__ para el rationale.
+        # telemetry.db crece ~5 MB/día; 64 MB cache mantiene los índices
+        # hot (rag_behavior tiene 5 indexes ~92 MB) y el mmap permite que
+        # las queries agregadas (path agg 7d) saquen ventaja del page cache
+        # del OS sin syscalls.
+        conn.execute("PRAGMA cache_size=-65536")
+        conn.execute("PRAGMA mmap_size=268435456")
         conn.execute(
             "CREATE TABLE IF NOT EXISTS rag_schema_version ("
             " table_name TEXT PRIMARY KEY, version INTEGER NOT NULL DEFAULT 0)"
@@ -9927,6 +9943,15 @@ class SqliteVecClient:
         # error hasta el próximo schedule. 60s es el mismo orden que
         # telemetry.db y suficiente para cualquier contención normal.
         self._db.execute("PRAGMA busy_timeout=60000")
+        # cache_size + mmap_size — audit 2026-05-04: ragvec.db default 8 MB
+        # cache (cache_size=2000 pages × 4096 bytes) era ridículo para una
+        # DB de ~250 MB; bajos hit rates en page cache + cero memory-mapping
+        # multiplicaban IO. 64 MB de cache cubre todo el footprint vivo
+        # típico (~50-100 MB) y el mmap de 256 MB le permite al kernel
+        # servir lecturas hot directamente desde page cache sin syscalls.
+        # Negativo = KB. Idempotente — PRAGMA noop si ya está seteado.
+        self._db.execute("PRAGMA cache_size=-65536")
+        self._db.execute("PRAGMA mmap_size=268435456")
         self._db.execute(
             "CREATE TABLE IF NOT EXISTS rag_schema_version ("
             " table_name TEXT PRIMARY KEY, "
@@ -14576,13 +14601,33 @@ def _system_memory_used_pct() -> float | None:
     if sys.platform != "darwin":
         return None
     try:
-        vm_out = subprocess.run(
-            ["vm_stat"], capture_output=True, text=True, timeout=2, check=False,
-        ).stdout
-        total_out = subprocess.run(
-            ["sysctl", "-n", "hw.memsize"],
-            capture_output=True, text=True, timeout=2, check=False,
-        ).stdout
+        vm_out = ""
+        total_out = ""
+        for vm_bin in ("/usr/bin/vm_stat", "/bin/vm_stat", "vm_stat"):
+            try:
+                vm_out = subprocess.run(
+                    [vm_bin], capture_output=True, text=True, timeout=2, check=False,
+                ).stdout
+                if vm_out:
+                    break
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                continue
+        for sct_bin in ("/usr/sbin/sysctl", "/sbin/sysctl", "sysctl"):
+            try:
+                total_out = subprocess.run(
+                    [sct_bin, "-n", "hw.memsize"],
+                    capture_output=True, text=True, timeout=2, check=False,
+                ).stdout
+                if total_out:
+                    break
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                continue
+        if not vm_out or not total_out:
+            _silent_log(
+                "system_memory_used_pct_no_output",
+                Exception(f"vm_stat={bool(vm_out)} sysctl={bool(total_out)}"),
+            )
+            return None
         total_bytes = int(total_out.strip())
         if total_bytes <= 0:
             return None
@@ -14620,14 +14665,30 @@ def _system_swap_used_gb() -> float | None:
     Early-warning del thrashing antes de que el pct comprometido llegue
     al threshold: si swap > 1-2 GB el kernel ya está paginando activo
     y cualquier cold-load de modelo (ollama, MPS) toma >>30s.
+
+    Path absoluto a `/usr/sbin/sysctl` por si el daemon launchd tiene
+    un PATH minimalista que no incluye sbin.
     """
     if sys.platform != "darwin":
         return None
+    sysctl_paths = ("/usr/sbin/sysctl", "/sbin/sysctl", "sysctl")
+    out = ""
+    for p in sysctl_paths:
+        try:
+            out = subprocess.run(
+                [p, "-n", "vm.swapusage"],
+                capture_output=True, text=True, timeout=2, check=False,
+            ).stdout.strip()
+            if out:
+                break
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+        except Exception as exc:
+            _silent_log("system_swap_used_gb_subprocess", exc)
+            continue
+    if not out:
+        return None
     try:
-        out = subprocess.run(
-            ["sysctl", "-n", "vm.swapusage"],
-            capture_output=True, text=True, timeout=2, check=False,
-        ).stdout.strip()
         m = re.search(r"used\s*=\s*([0-9.]+)([KMGT])", out, re.IGNORECASE)
         if not m:
             return None
@@ -14635,8 +14696,38 @@ def _system_swap_used_gb() -> float | None:
         unit = m.group(2).upper()
         mult = {"K": 1.0/1024/1024, "M": 1.0/1024, "G": 1.0, "T": 1024.0}.get(unit, 0.0)
         return val * mult
-    except Exception:
+    except Exception as exc:
+        _silent_log("system_swap_used_gb_parse", exc)
         return None
+
+
+def _kill_ollama_runners() -> int:
+    """Force-kill ollama `runner` subprocesses (NOT `ollama serve` parent).
+
+    Recovery rápido para stuck-load: el daemon `ollama serve` respawnea
+    los runners on-demand al próximo /api/generate. Esto resetea la KV
+    cache y libera RAM/VRAM bajo presión sin requerir reinicio manual
+    de Ollama.app.
+
+    Retorna el count de PIDs killed. Silent-fail si no hay runners.
+    """
+    try:
+        out = subprocess.run(
+            ["/usr/bin/pgrep", "-f", "Ollama.app/Contents/Resources/ollama runner"],
+            capture_output=True, text=True, timeout=3, check=False,
+        ).stdout.strip()
+        if not out:
+            return 0
+        pids = [p for p in out.split("\n") if p.strip().isdigit()]
+        if not pids:
+            return 0
+        subprocess.run(["/bin/kill", "-9", *pids],
+                       capture_output=True, timeout=3, check=False)
+        print(f"[ollama-kill-runners] killed pids={pids}", flush=True)
+        return len(pids)
+    except Exception as exc:
+        _silent_log("kill_ollama_runners", exc)
+        return 0
 
 
 def _handle_memory_pressure(pct_before: float, threshold: float) -> dict:
@@ -14666,9 +14757,15 @@ def _handle_memory_pressure(pct_before: float, threshold: float) -> dict:
         chat_model = None
     actions["chat_model"] = chat_model
     if chat_model:
+        # CRITICO: usar Client con timeout corto. Si ollama está stuck
+        # (su usual modo de fallo bajo swap thrash), el call default sin
+        # timeout cuelga el thread del watchdog 60s+, justo cuando lo
+        # necesitamos rapidísimo. Si timea → se cae al fallback de kill
+        # de runners abajo (ver actions["chat_unload_timeout"]).
         try:
             import ollama as _ollama
-            _ollama.chat(
+            _client = _ollama.Client(timeout=10)
+            _client.chat(
                 model=chat_model,
                 messages=[{"role": "user", "content": "."}],
                 options={"num_predict": 1},
@@ -14676,7 +14773,14 @@ def _handle_memory_pressure(pct_before: float, threshold: float) -> dict:
             )
             actions["chat_unloaded"] = True
         except Exception as exc:
+            actions["chat_unload_timeout"] = True
             _silent_log("memory_watchdog_unload_chat", exc)
+            # NO matar runners acá. Mezclar las señales (presión alta vs
+            # stuck-load) lleva a un loop: bajamos pressure → next request
+            # recarga modelo → pressure sube → watchdog mata otra vez.
+            # El kill agresivo es responsabilidad de
+            # `_maybe_restart_ollama_on_stuck` que tiene cooldown propio
+            # y dispara solo cuando ollama efectivamente no responde.
 
     # Paso 2: re-medir y decidir reranker
     pct_after = _system_memory_used_pct()
@@ -14737,15 +14841,34 @@ def _memory_pressure_watchdog_loop(threshold: float, interval: int) -> None:
         timeouts de ollama (60s helper, 90s chat) golpean en cadena.
     """
     try:
-        swap_gb_threshold = float(os.environ.get("RAG_MEMORY_PRESSURE_SWAP_GB", "1.5"))
+        swap_gb_threshold = float(os.environ.get("RAG_MEMORY_PRESSURE_SWAP_GB", "4.0"))
     except ValueError:
-        swap_gb_threshold = 1.5
+        swap_gb_threshold = 4.0
+    try:
+        cooldown_s = float(os.environ.get("RAG_MEMORY_PRESSURE_COOLDOWN_S", "300"))
+    except ValueError:
+        cooldown_s = 300.0
+    print(
+        f"[memory-watchdog] loop start swap_threshold={swap_gb_threshold}GB "
+        f"cooldown={cooldown_s}s",
+        flush=True,
+    )
+    _tick_count = 0
+    _last_action_ts = 0.0
     while True:
         try:
             if _daemon_shutdown_event.wait(timeout=interval):
                 return
             pct = _system_memory_used_pct()
             swap_gb = _system_swap_used_gb()
+            _tick_count += 1
+            if _tick_count % 4 == 1:
+                # Heartbeat cada ~minuto para confirmar que el thread tickea
+                print(
+                    f"[memory-watchdog] tick={_tick_count} pct={pct} "
+                    f"swap_gb={swap_gb}",
+                    flush=True,
+                )
             if pct is None and swap_gb is None:
                 continue
             trigger_pct = pct is not None and pct >= threshold
@@ -14754,7 +14877,17 @@ def _memory_pressure_watchdog_loop(threshold: float, interval: int) -> None:
                 and swap_gb_threshold > 0
                 and swap_gb >= swap_gb_threshold
             )
+            # Cooldown: tras una acción, no volver a actuar hasta que pase
+            # cooldown_s. Evita el thrash loop unload→reload→unload→...
+            # cada `interval` segundos cuando el sistema está bajo presión
+            # crónica (el unload libera memoria pero el siguiente request
+            # vuelve a cargar el modelo, sube la pressure otra vez).
+            now = time.time()
+            in_cooldown = (now - _last_action_ts) < cooldown_s
+            if (trigger_pct or trigger_swap) and in_cooldown:
+                continue
             if trigger_pct or trigger_swap:
+                _last_action_ts = now
                 actions = _handle_memory_pressure(pct if pct is not None else 0.0, threshold)
                 if swap_gb is not None:
                     actions["swap_gb"] = round(swap_gb, 2)
@@ -27504,127 +27637,168 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
     indexed_files = set()
     added_chunks = 0
     updated_files = 0
-    # Explicit console=console so the bar also renders from inside `rag chat`
-    # (`/reindex`), where rich's default Console missed TTY detection.
-    for path in track(
-        md_files, description="Procesando...",
-        console=console, transient=False,
-    ):
-        doc_id_prefix = str(path.relative_to(VAULT_PATH))
-        folder = str(path.relative_to(VAULT_PATH).parent)
-        raw = path.read_text(encoding="utf-8", errors="ignore")
-        # Hash con mtimes de imágenes embebidas — paridad con
-        # `_index_single_file`: una screenshot updateada (sin cambio en el
-        # .md) fuerza reindex para picar el OCR nuevo.
-        h = _file_hash_with_images(raw, path, VAULT_PATH)
+    skipped_files = 0
+    # Progress bar explícito — antes usábamos `rich.progress.track`, pero
+    # rich detecta `is_terminal=False` en algunos wrappers (Ghostty + pipes,
+    # Devin terminal, `rag chat /reindex` desde un Live group) y silencia
+    # la barra. `force_terminal=True` + columnas explícitas garantizan
+    # render en stderr aunque la heurística falle. Con `--reset` el loop
+    # tarda minutos; sin barra, parece colgado. Aprendido el 2026-05-04.
+    _bar_console = Console(force_terminal=True, stderr=True)
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[cyan]Indexando[/cyan]"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TextColumn("•"),
+        TimeElapsedColumn(),
+        TextColumn("•"),
+        TimeRemainingColumn(),
+        TextColumn("• [dim]+{task.fields[chunks]} chunks · "
+                   "~{task.fields[updated]} upd · "
+                   "={task.fields[skipped]} skip[/dim]"),
+        console=_bar_console,
+        transient=False,
+    )
+    task_id = progress.add_task(
+        "indexing", total=len(md_files),
+        chunks=0, updated=0, skipped=0,
+    )
+    progress.start()
+    try:
+        for path in md_files:
+            progress.advance(task_id)
+            progress.update(
+                task_id,
+                chunks=added_chunks,
+                updated=updated_files,
+                skipped=skipped_files,
+            )
+            doc_id_prefix = str(path.relative_to(VAULT_PATH))
+            folder = str(path.relative_to(VAULT_PATH).parent)
+            raw = path.read_text(encoding="utf-8", errors="ignore")
+            # Hash con mtimes de imágenes embebidas — paridad con
+            # `_index_single_file`: una screenshot updateada (sin cambio en el
+            # .md) fuerza reindex para picar el OCR nuevo.
+            h = _file_hash_with_images(raw, path, VAULT_PATH)
 
-        # Skip unchanged files (hash matches what's stored)
-        existing = file_to_chunks.get(doc_id_prefix, [])
-        if existing and all(eh == h for _, eh in existing):
+            # Skip unchanged files (hash matches what's stored)
+            existing = file_to_chunks.get(doc_id_prefix, [])
+            if existing and all(eh == h for _, eh in existing):
+                indexed_files.add(doc_id_prefix)
+                skipped_files += 1
+                continue
+
+            fm = parse_frontmatter(raw)
+            tags = _normalize_fm_tags(fm)
+            outlinks = extract_wikilinks(raw)
+            text = clean_md(raw)
+            # OCR enrichment: concat el texto de imágenes embebidas al body
+            # antes del chunking. `images_source=raw` porque clean_md() strippea
+            # los `![[img.png]]`. Gated por cache + ocrmac availability.
+            text = _enrich_body_with_ocr(text, path, VAULT_PATH, images_source=raw)
+
+            # Before touching the collection for this file, check whether the
+            # incoming content contradicts anything already in the vault. When
+            # it does, the note's frontmatter is rewritten in place and we pick
+            # up the new raw/hash here.
+            #
+            # Uses `_dispatch_contradiction_check` so bulk `rag index` doesn't
+            # block on a 5-10s chat-model call per file — the daemon thread
+            # writes `contradicts:` in the background and the next incremental
+            # pass picks it up (idempotent if unchanged).
+            if check_contradictions:
+                updated = _dispatch_contradiction_check(col, path, text, doc_id_prefix)
+                if updated:
+                    raw, h = updated
+                    fm = parse_frontmatter(raw)
+                    tags = _normalize_fm_tags(fm)
+                    outlinks = extract_wikilinks(raw)
+
+            # File changed (or new) — remove any stale chunks first
+            if existing:
+                col.delete(ids=[eid for eid, _ in existing])
+                updated_files += 1
+
+            # Contextual embedding: generate or retrieve cached document-level summary
+            ctx_summary = get_context_summary(text, h, path.stem, folder)
+            synth_qs = get_synthetic_questions(text, h, path.stem, folder)
+
+            chunks = semantic_chunks(
+                text, path.stem, folder, tags, fm,
+                context_summary=ctx_summary,
+                synthetic_questions=synth_qs,
+            )
+            if not chunks:
+                indexed_files.add(doc_id_prefix)
+                continue
+
+            ids = [f"{doc_id_prefix}::{i}" for i in range(len(chunks))]
+            embed_texts = [c[0] for c in chunks]
+            display_texts = [c[1] for c in chunks]
+            parent_texts = [c[2] for c in chunks]
+            # Contextual Retrieval (Anthropic, Sept 2024) — mismo wrap que
+            # `_index_single_file`. Gated por `RAG_CONTEXTUAL_RETRIEVAL=1`.
+            # Display_texts/parent_texts no se mutan — el contexto vive
+            # sólo en el embedding.
+            embed_texts = _contextual_retrieval.contextualize_chunks(
+                embed_texts=embed_texts,
+                display_texts=display_texts,
+                doc_id=doc_id_prefix,
+                parent_doc_text=text,
+                doc_metadata={"title": path.stem, "folder": folder, "note": path.stem},
+            )
+            embeddings = embed(embed_texts)
+
+            # Metadata carries hash + searchable frontmatter fields for filtering.
+            base_meta = {
+                "file": doc_id_prefix,
+                "note": path.stem,
+                "folder": folder,
+                "tags": ",".join(tags),
+                "hash": h,
+                "outlinks": ",".join(outlinks),
+                # Cross-source discriminator (Phase 1). See `_index_single_file`
+                # for the same field on the incremental path.
+                "source": "vault",
+            }
+            for fm_key in FM_SEARCHABLE_FIELDS:
+                v = fm.get(fm_key)
+                if v not in (None, ""):
+                    base_meta[fm_key] = str(v)
+
+            metadatas = []
+            for p in parent_texts:
+                meta = dict(base_meta)
+                meta["parent"] = p
+                metadatas.append(meta)
+
+            col.add(
+                ids=ids,
+                embeddings=embeddings,
+                documents=display_texts,
+                metadatas=metadatas,
+            )
+            added_chunks += len(ids)
+            # Entity extraction — see `_index_single_file` for the same hook
+            # on the incremental path; same invariants (gated by
+            # `_entity_extraction_enabled`, silent-fail if gliner absent).
+            _extract_and_index_entities_for_chunks(display_texts, ids, metadatas, "vault")
+            # URL sub-index, same hash gate as the chunk index above.
+            try:
+                urls_indexed += _index_urls(col_urls, doc_id_prefix, raw, path.stem, folder, tags)
+            except Exception:
+                pass
             indexed_files.add(doc_id_prefix)
-            continue
-
-        fm = parse_frontmatter(raw)
-        tags = _normalize_fm_tags(fm)
-        outlinks = extract_wikilinks(raw)
-        text = clean_md(raw)
-        # OCR enrichment: concat el texto de imágenes embebidas al body
-        # antes del chunking. `images_source=raw` porque clean_md() strippea
-        # los `![[img.png]]`. Gated por cache + ocrmac availability.
-        text = _enrich_body_with_ocr(text, path, VAULT_PATH, images_source=raw)
-
-        # Before touching the collection for this file, check whether the
-        # incoming content contradicts anything already in the vault. When
-        # it does, the note's frontmatter is rewritten in place and we pick
-        # up the new raw/hash here.
-        #
-        # Uses `_dispatch_contradiction_check` so bulk `rag index` doesn't
-        # block on a 5-10s chat-model call per file — the daemon thread
-        # writes `contradicts:` in the background and the next incremental
-        # pass picks it up (idempotent if unchanged).
-        if check_contradictions:
-            updated = _dispatch_contradiction_check(col, path, text, doc_id_prefix)
-            if updated:
-                raw, h = updated
-                fm = parse_frontmatter(raw)
-                tags = _normalize_fm_tags(fm)
-                outlinks = extract_wikilinks(raw)
-
-        # File changed (or new) — remove any stale chunks first
-        if existing:
-            col.delete(ids=[eid for eid, _ in existing])
-            updated_files += 1
-
-        # Contextual embedding: generate or retrieve cached document-level summary
-        ctx_summary = get_context_summary(text, h, path.stem, folder)
-        synth_qs = get_synthetic_questions(text, h, path.stem, folder)
-
-        chunks = semantic_chunks(
-            text, path.stem, folder, tags, fm,
-            context_summary=ctx_summary,
-            synthetic_questions=synth_qs,
+        # Final flush of postfix counters antes de stop().
+        progress.update(
+            task_id,
+            chunks=added_chunks,
+            updated=updated_files,
+            skipped=skipped_files,
         )
-        if not chunks:
-            indexed_files.add(doc_id_prefix)
-            continue
-
-        ids = [f"{doc_id_prefix}::{i}" for i in range(len(chunks))]
-        embed_texts = [c[0] for c in chunks]
-        display_texts = [c[1] for c in chunks]
-        parent_texts = [c[2] for c in chunks]
-        # Contextual Retrieval (Anthropic, Sept 2024) — mismo wrap que
-        # `_index_single_file`. Gated por `RAG_CONTEXTUAL_RETRIEVAL=1`.
-        # Display_texts/parent_texts no se mutan — el contexto vive
-        # sólo en el embedding.
-        embed_texts = _contextual_retrieval.contextualize_chunks(
-            embed_texts=embed_texts,
-            display_texts=display_texts,
-            doc_id=doc_id_prefix,
-            parent_doc_text=text,
-            doc_metadata={"title": path.stem, "folder": folder, "note": path.stem},
-        )
-        embeddings = embed(embed_texts)
-
-        # Metadata carries hash + searchable frontmatter fields for filtering.
-        base_meta = {
-            "file": doc_id_prefix,
-            "note": path.stem,
-            "folder": folder,
-            "tags": ",".join(tags),
-            "hash": h,
-            "outlinks": ",".join(outlinks),
-            # Cross-source discriminator (Phase 1). See `_index_single_file`
-            # for the same field on the incremental path.
-            "source": "vault",
-        }
-        for fm_key in FM_SEARCHABLE_FIELDS:
-            v = fm.get(fm_key)
-            if v not in (None, ""):
-                base_meta[fm_key] = str(v)
-
-        metadatas = []
-        for p in parent_texts:
-            meta = dict(base_meta)
-            meta["parent"] = p
-            metadatas.append(meta)
-
-        col.add(
-            ids=ids,
-            embeddings=embeddings,
-            documents=display_texts,
-            metadatas=metadatas,
-        )
-        added_chunks += len(ids)
-        # Entity extraction — see `_index_single_file` for the same hook
-        # on the incremental path; same invariants (gated by
-        # `_entity_extraction_enabled`, silent-fail if gliner absent).
-        _extract_and_index_entities_for_chunks(display_texts, ids, metadatas, "vault")
-        # URL sub-index, same hash gate as the chunk index above.
-        try:
-            urls_indexed += _index_urls(col_urls, doc_id_prefix, raw, path.stem, folder, tags)
-        except Exception:
-            pass
-        indexed_files.add(doc_id_prefix)
+    finally:
+        progress.stop()
 
     # Orphan cleanup: files in DB that no longer exist on disk
     # 2026-04-30 BUG FIX: cross-source chunks (whatsapp://X, calendar://Y, etc.)
@@ -55079,11 +55253,83 @@ _SQL_KEEP_ALL_TABLES: tuple[str, ...] = (
 # the whole DB and should only run weekly at most.
 _VACUUM_DELTA_BYTES = 500 * 1024 * 1024
 
+# Secondary VACUUM gate: trigger on freelist fragmentation regardless of
+# delta. Audit 2026-05-04: ragvec.db acumuló 73.8% freelist (181 MB de
+# pages muertas en una DB de 246 MB) sin nunca disparar el gate de delta
+# — el corpus se reembedea/reindexa de a poco y el delta neto siempre fue
+# bajo. Estos thresholds garantizan que VACUUM corre cuando la fragmentación
+# es real, no cuando la DB se duplicó.
+_VACUUM_FRAG_PCT = 0.25  # ≥ 25% del page_count en freelist
+_VACUUM_FRAG_MIN_WASTED_BYTES = 50 * 1024 * 1024  # AND ≥ 50 MB desperdiciados
+
 # Key in rag_feedback_golden_meta for the last-vacuum sentinel. Reuses the
 # existing meta table to avoid schema churn during the cutover; the key
 # namespace ("vacuum_*") is disjoint from the feedback-golden keys.
 _VACUUM_META_KEY_BYTES = "vacuum_last_bytes"
 _VACUUM_META_KEY_TS = "vacuum_last_ts"
+
+
+def _vacuum_if_fragmented(sqlite_path: Path, *, dry_run: bool = False,
+                           pct: float = _VACUUM_FRAG_PCT,
+                           min_wasted: int = _VACUUM_FRAG_MIN_WASTED_BYTES) -> dict:
+    """VACUUM `sqlite_path` if freelist fragmentation exceeds threshold.
+
+    Standalone — no rotation, no sentinel, no meta table dependency.
+    Runs against any sqlite file (ragvec.db, telemetry.db, …). Returns a
+    dict with `ran`, `before_bytes`, `after_bytes`, `freelist_pct`,
+    `wasted_bytes`. On any error returns `{"ran": False, "error": ...}`.
+
+    Audit 2026-05-04: añadido para reclamar las 181 MB de freelist en
+    ragvec.db que `_sql_rotate_log_tables` no tocaba (esa función está
+    hardcodeada a telemetry.db).
+    """
+    import sqlite3 as _sqlite
+    out: dict = {"ran": False, "path": str(sqlite_path)}
+    if not sqlite_path.is_file():
+        out["skipped"] = "no sqlite file"
+        return out
+    try:
+        conn = _sqlite.connect(str(sqlite_path), timeout=60.0)
+        conn.execute("PRAGMA busy_timeout=60000")
+    except _sqlite.Error as e:
+        out["error"] = f"connect failed: {e}"
+        return out
+    try:
+        page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+        page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+        freelist = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+        wasted = freelist * page_size
+        frag_pct = (freelist / page_count) if page_count else 0.0
+        out["freelist_pct"] = round(frag_pct, 4)
+        out["wasted_bytes"] = wasted
+        out["before_bytes"] = page_count * page_size
+        should = (frag_pct >= pct) and (wasted >= min_wasted)
+        if not should:
+            out["skipped"] = "below threshold"
+            return out
+        if dry_run:
+            out["would_run"] = True
+            return out
+        # VACUUM no puede correr dentro de una transacción.
+        conn.isolation_level = None
+        conn.execute("VACUUM")
+        # Truncate WAL after VACUUM — VACUUM rewrites all pages and pumps
+        # the WAL temporarily; checkpoint reclaims the disk inmediately.
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except _sqlite.Error:
+            pass
+        new_pc = int(conn.execute("PRAGMA page_count").fetchone()[0])
+        out["after_bytes"] = new_pc * page_size
+        out["ran"] = True
+    except _sqlite.Error as e:
+        out["error"] = str(e)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return out
 
 
 def _sql_rotate_log_tables(*, dry_run: bool = False,
@@ -55204,7 +55450,25 @@ def _sql_rotate_log_tables(*, dry_run: bool = False,
             ).fetchone()
         last_bytes = int(last_bytes_row[0]) if last_bytes_row and last_bytes_row[0] else 0
         delta = current_bytes - last_bytes
-        should_vacuum = delta >= _VACUUM_DELTA_BYTES
+        # Dos gates en OR — delta absoluto (DB creció ≥ 500 MB desde último
+        # VACUUM) o fragmentación (freelist ≥ 25% AND ≥ 50 MB wasted). El
+        # segundo cubre el caso típico de telemetry: pocos GB totales pero
+        # mucho churn de DELETE de logs viejos que dejan freelist sin recuperar.
+        freelist_count = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+        wasted_bytes = freelist_count * page_size
+        frag_pct = (freelist_count / page_count) if page_count else 0.0
+        out["freelist_pct"] = round(frag_pct, 4)
+        out["wasted_bytes"] = wasted_bytes
+        should_vacuum_delta = delta >= _VACUUM_DELTA_BYTES
+        should_vacuum_frag = (
+            frag_pct >= _VACUUM_FRAG_PCT
+            and wasted_bytes >= _VACUUM_FRAG_MIN_WASTED_BYTES
+        )
+        should_vacuum = should_vacuum_delta or should_vacuum_frag
+        out["vacuum_reason"] = (
+            "delta" if should_vacuum_delta else
+            ("frag" if should_vacuum_frag else None)
+        )
 
         if should_vacuum and not dry_run:
             out["vacuum_before_bytes"] = current_bytes
@@ -55856,6 +56120,16 @@ def run_maintenance(
         results["wal_checkpoint_telemetry"] = _telemetry_wal_checkpoint(dry_run=dry_run)
     except Exception as e:
         results["wal_checkpoint_telemetry_error"] = str(e)
+
+    # 3d. VACUUM oportunístico de ragvec.db si la fragmentación supera el
+    # threshold. _sql_rotate_log_tables sólo cubre telemetry.db; ragvec.db
+    # acumula freelist por reembedding/reindex y nada lo recuperaba antes.
+    try:
+        results["ragvec_vacuum"] = _vacuum_if_fragmented(
+            DB_PATH / "ragvec.db", dry_run=dry_run,
+        )
+    except Exception as e:
+        results["ragvec_vacuum_error"] = str(e)
 
     # 4. Context cache pruning
     try:
@@ -56519,13 +56793,37 @@ def maintenance(dry_run: bool, skip_reindex: bool, skip_logs: bool, verbose: boo
         if sql_rot.get("vacuum_ran"):
             bv = (sql_rot.get("vacuum_before_bytes") or 0) / (1024 * 1024)
             av = (sql_rot.get("vacuum_after_bytes") or 0) / (1024 * 1024)
-            console.print(f"  [bold]VACUUM:[/bold] ran {bv:.1f} → {av:.1f} MB")
+            reason = sql_rot.get("vacuum_reason") or ""
+            tag = f" [{reason}]" if reason else ""
+            console.print(f"  [bold]VACUUM telemetry:[/bold] ran {bv:.1f} → {av:.1f} MB{tag}")
         elif sql_rot.get("vacuum_would_run"):
-            console.print("  [bold]VACUUM:[/bold] [yellow]would run (delta ≥ 500 MB)[/yellow]")
+            console.print("  [bold]VACUUM telemetry:[/bold] [yellow]would run[/yellow]")
         else:
-            console.print("  [bold]VACUUM:[/bold] [dim]skipped (delta < 500 MB)[/dim]")
+            pct = sql_rot.get("freelist_pct", 0) * 100
+            console.print(
+                f"  [bold]VACUUM telemetry:[/bold] [dim]skipped (frag {pct:.1f}%)[/dim]"
+            )
     elif "sql_rotation_error" in results:
         console.print(f"  [bold]SQL rotation:[/bold] [red]error: {results['sql_rotation_error']}[/red]")
+
+    # ── ragvec.db VACUUM oportunístico ──
+    rv = results.get("ragvec_vacuum") or {}
+    if rv:
+        if rv.get("ran"):
+            bv = (rv.get("before_bytes") or 0) / (1024 * 1024)
+            av = (rv.get("after_bytes") or 0) / (1024 * 1024)
+            console.print(
+                f"  [bold]VACUUM ragvec:[/bold] ran {bv:.1f} → {av:.1f} MB [frag]"
+            )
+        elif rv.get("would_run"):
+            console.print("  [bold]VACUUM ragvec:[/bold] [yellow]would run[/yellow]")
+        elif rv.get("error"):
+            console.print(f"  [bold]VACUUM ragvec:[/bold] [red]{rv['error']}[/red]")
+        else:
+            pct = rv.get("freelist_pct", 0) * 100
+            console.print(
+                f"  [bold]VACUUM ragvec:[/bold] [dim]skipped (frag {pct:.1f}%)[/dim]"
+            )
 
     # ── Migration .bak cleanup ──
     bak = results.get("bak_cleanup") or {}

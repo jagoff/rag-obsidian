@@ -170,6 +170,8 @@ class _DummyCol:
 
 def test_rotation_vacuum_gated_by_delta(sql_env, monkeypatch):
     """Small page_count * page_size delta → no VACUUM. Large delta → VACUUM runs."""
+    # Disable the freelist gate so this test only exercises the delta path.
+    monkeypatch.setattr(rag, "_VACUUM_FRAG_PCT", 1.01)
     # Small-delta run: patch the threshold so even a tiny DB triggers VACUUM
     # conditionally. First, verify the UNTOUCHED path with a high threshold.
     monkeypatch.setattr(rag, "_VACUUM_DELTA_BYTES", 10**12)  # 1 TB
@@ -180,6 +182,7 @@ def test_rotation_vacuum_gated_by_delta(sql_env, monkeypatch):
     monkeypatch.setattr(rag, "_VACUUM_DELTA_BYTES", 0)
     out = rag._sql_rotate_log_tables(dry_run=False)
     assert out["vacuum_ran"] is True
+    assert out["vacuum_reason"] == "delta"
     assert out["vacuum_before_bytes"] is not None
     assert out["vacuum_after_bytes"] is not None
 
@@ -187,6 +190,104 @@ def test_rotation_vacuum_gated_by_delta(sql_env, monkeypatch):
     monkeypatch.setattr(rag, "_VACUUM_DELTA_BYTES", 1)
     out2 = rag._sql_rotate_log_tables(dry_run=False)
     assert out2["vacuum_ran"] is False
+
+
+def test_rotation_vacuum_gated_by_freelist_fragmentation(sql_env, monkeypatch):
+    """Freelist gate fires VACUUM independientemente del delta size.
+
+    Audit 2026-05-04: ragvec.db acumuló 73.8% freelist sin nunca disparar
+    el gate de delta. El gate secundario (freelist% + wasted bytes) tiene
+    que cubrir ese caso.
+    """
+    db_path = sql_env["db_path"]
+    # Inflar la DB y luego DELETE para crear freelist real.
+    import sqlite3 as _s
+    conn = _s.connect(str(db_path))
+    conn.execute("CREATE TABLE _frag (id INTEGER PRIMARY KEY, blob BLOB)")
+    blob = b"x" * 4096
+    conn.executemany(
+        "INSERT INTO _frag (blob) VALUES (?)", [(blob,) for _ in range(2000)]
+    )
+    conn.commit()
+    conn.execute("DELETE FROM _frag")
+    conn.commit()
+    free_before = conn.execute("PRAGMA freelist_count").fetchone()[0]
+    total_before = conn.execute("PRAGMA page_count").fetchone()[0]
+    conn.close()
+    assert free_before / total_before >= 0.5, (
+        f"setup: expected ≥50% freelist, got {free_before}/{total_before}"
+    )
+
+    # Delta gate altísimo — sólo el frag gate puede disparar.
+    monkeypatch.setattr(rag, "_VACUUM_DELTA_BYTES", 10**12)
+    # Threshold de wasted bajo para que la DB chiquita del test califique.
+    monkeypatch.setattr(rag, "_VACUUM_FRAG_MIN_WASTED_BYTES", 1024)
+    monkeypatch.setattr(rag, "_VACUUM_FRAG_PCT", 0.25)
+
+    out = rag._sql_rotate_log_tables(dry_run=False)
+    assert out["vacuum_ran"] is True
+    assert out["vacuum_reason"] == "frag"
+    assert out["freelist_pct"] >= 0.25
+    assert out["wasted_bytes"] >= 1024
+
+
+def test_vacuum_if_fragmented_standalone(tmp_path):
+    """`_vacuum_if_fragmented` corre VACUUM en cualquier sqlite cuando el
+    freelist supera el threshold; skipea en otro caso. No depende de
+    sentinel ni meta tables."""
+    import sqlite3 as _s
+    db_path = tmp_path / "frag.db"
+    conn = _s.connect(str(db_path))
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, blob BLOB)")
+    conn.executemany(
+        "INSERT INTO t (blob) VALUES (?)",
+        [(b"y" * 4096,) for _ in range(1500)],
+    )
+    conn.commit()
+    conn.execute("DELETE FROM t")
+    conn.commit()
+    conn.close()
+
+    out = rag._vacuum_if_fragmented(db_path, pct=0.25, min_wasted=1024)
+    assert out["ran"] is True
+    assert out["after_bytes"] < out["before_bytes"]
+
+    # Re-run: freelist should be ~0, gate skips.
+    out2 = rag._vacuum_if_fragmented(db_path, pct=0.25, min_wasted=1024)
+    assert out2["ran"] is False
+    assert out2.get("skipped") == "below threshold"
+
+
+def test_vacuum_if_fragmented_dry_run(tmp_path):
+    """dry_run no muta — devuelve `would_run=True` cuando supera threshold."""
+    import sqlite3 as _s
+    db_path = tmp_path / "frag.db"
+    conn = _s.connect(str(db_path))
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, blob BLOB)")
+    conn.executemany(
+        "INSERT INTO t (blob) VALUES (?)",
+        [(b"z" * 4096,) for _ in range(1500)],
+    )
+    conn.commit()
+    conn.execute("DELETE FROM t")
+    conn.commit()
+    conn.close()
+
+    size_before = db_path.stat().st_size
+    out = rag._vacuum_if_fragmented(
+        db_path, dry_run=True, pct=0.25, min_wasted=1024,
+    )
+    assert out.get("would_run") is True
+    assert out["ran"] is False
+    # Archivo intocado.
+    assert db_path.stat().st_size == size_before
+
+
+def test_vacuum_if_fragmented_missing_file(tmp_path):
+    """Archivo inexistente → skipped sin crash."""
+    out = rag._vacuum_if_fragmented(tmp_path / "nope.db")
+    assert out["ran"] is False
+    assert out.get("skipped") == "no sqlite file"
 
 
 def test_rotation_whatsapp_scheduled_uses_created_at(sql_env):

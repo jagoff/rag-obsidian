@@ -7112,19 +7112,6 @@ _RAW_TOOL_CALL_RE = re.compile(
 )
 
 
-def _detect_raw_tool_call(text: str) -> str | None:
-    """Returns the matched tool name if `text` starts with a raw tool-call
-    syntax. None otherwise. Used to short-circuit synthesis output that
-    leaked tool-call markup instead of executing it.
-    """
-    if not text:
-        return None
-    m = _RAW_TOOL_CALL_RE.match(text)
-    if not m:
-        return None
-    return (m.group("name") or "").lower()
-
-
 class _RawToolCallStripper:
     """Streaming filter que detecta raw tool-call syntax al inicio del
     stream y la reemplaza con una clarificación amigable. Buffer first

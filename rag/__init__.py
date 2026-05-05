@@ -15369,7 +15369,7 @@ def warmup_async() -> None:
         # alinear el warmup al num_ctx de runtime, no al ping mínimo.
         try:
             _chat_model = resolve_chat_model()
-            ollama.chat(
+            _mlx_or_ollama_chat(
                 model=_chat_model,
                 messages=[{"role": "user", "content": "ok"}],
                 options={"num_predict": 1,
@@ -15380,7 +15380,7 @@ def warmup_async() -> None:
         except Exception:
             pass
         try:
-            ollama.chat(
+            _mlx_or_ollama_chat(
                 model=HELPER_MODEL,
                 messages=[{"role": "user", "content": "ok"}],
                 options={"num_predict": 1,
@@ -35120,7 +35120,7 @@ def _replay_query_row(
                     {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": f"{q}\n\n{context_str}"},
                 ]
-                response = ollama.chat(
+                response = _mlx_or_ollama_chat(
                     model=resolve_chat_model(),
                     messages=msgs,
                     options=CHAT_OPTIONS,
@@ -48820,7 +48820,7 @@ def wake_up(ctx, dry_run: bool, skip_index: bool, skip_bookmarks: bool,
                 # queda en RAM hasta que ollama lo desaloje por presión
                 # de memoria o restart. El primer `rag chat` post-wake-up
                 # no paga el cold-start (~400ms de prefill vs. 5s cold).
-                ollama.chat(
+                _mlx_or_ollama_chat(
                     model=model,
                     messages=[{"role": "user", "content": "."}],
                     options=CHAT_OPTIONS,
@@ -52352,7 +52352,7 @@ def extract_enrich_entities(question: str, answer: str) -> dict:
     # that blew the enrich budget repeatedly. JSON-mode + 160 tokens lands
     # at ~600-900ms warm, well inside the wall ceiling.
     try:
-        rsp = ollama.chat(
+        rsp = _mlx_or_ollama_chat(
             model=resolve_chat_model(),
             messages=[
                 {"role": "system", "content": _ENRICH_HELPER_PROMPT},

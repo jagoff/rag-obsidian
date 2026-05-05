@@ -10,21 +10,40 @@ Local-first sobre VAULT + corpus locales (sqlite-vec + Ollama + sentence-transfo
 
 Python 3.13, `uv`. Runtime venv: `.venv/bin/python`. Global tool: `~/.local/share/uv/tools/obsidian-rag/`.
 
-## MLX migration (en curso, 2026-05-05)
+## MLX migration (Ola 2 completa — 2026-05-05)
 
-Migración Ollama → MLX para los 4 LLMs locales. Dispatch + estado en [vault](obsidian://open?vault=Notes&file=04-Archive%2F99-obsidian-system%2F99-AI%2Fsystem%2Fmlx-migration%2Fdispatch).
+Migración Ollama → MLX para los 4 LLMs locales. **Estado**: Olas 0+1+2 completas. Pendiente: Ola 3 (cutover plists al nuevo default) y Ola 4 (eval gate + rollback automático). Dispatch + estado en [vault](obsidian://open?vault=Notes&file=04-Archive%2F99-obsidian-system%2F99-AI%2Fsystem%2Fmlx-migration%2Fdispatch).
 
-**Mapping**:
+**Mapping** (todos smoke-tested OK en Apple Silicon, 2026-05-05):
 - `qwen2.5:3b` (HELPER) → [`mlx-community/Qwen2.5-3B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-3B-Instruct-4bit)
 - `qwen2.5:7b` (CHAT default) → [`mlx-community/Qwen2.5-7B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-7B-Instruct-4bit)
-- `command-r` / `qwen2.5:14b` (HQ tier) → [`mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit`](https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit) — para contradiction detector, brief JSON, `rag do`, re-test HyDE
+- `command-r` / `qwen2.5:14b` (HQ tier) → [`mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit`](https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit) — contradiction detector, brief JSON, `rag do`, HyDE
 - experimental → [`mlx-community/Qwen3-4B-Instruct-2507-4bit`](https://huggingface.co/mlx-community/Qwen3-4B-Instruct-2507-4bit) — A/B vs el 3B helper
 
-**Switch runtime**: env var `RAG_LLM_BACKEND={ollama,mlx}`. Default `ollama` durante la migración. Backend abstraction en [`rag/llm_backend.py`](rag/llm_backend.py) con `OllamaBackend` (legacy passthrough) + `MLXBackend` (Ola 2 pendiente). Extra opcional `mlx` en `pyproject.toml` (Apple Silicon only, marker `requires_mlx`).
+**Switch runtime**: env var `RAG_LLM_BACKEND={ollama,mlx}`. Default `ollama` hasta que Ola 4 apruebe. Ad-hoc: `RAG_LLM_BACKEND=mlx rag query "..."` funciona end-to-end ahora mismo. Rollback: desunsettear la var; sin cambios de código.
+
+**Backend abstraction** en [`rag/llm_backend.py`](rag/llm_backend.py): `OllamaBackend` (legacy passthrough) + `MLXBackend` con `chat()`, `chat_stream()`, `generate()`, `list_available()` — todos funcionales. Extra opcional `mlx` en `pyproject.toml` (Apple Silicon only, marker `requires_mlx`).
+
+**4 dispatch points en `rag/__init__.py`** (Ola 2):
+
+| Punto | Función | Rol |
+|---|---|---|
+| `_TimedOllamaProxy.chat()` | proxy-wrapper | ~29 call sites (helper/summary/chat-capped); rutea a MLXBackend cuando `RAG_LLM_BACKEND=mlx`, fallback Ollama si `tools=` o `stream=` |
+| `_mlx_chat_via_backend()` | adapter | Traduce kwargs shape ollama → MLXBackend |
+| `_mlx_or_ollama_chat()` | dispatcher no-streaming | Exportada para call sites raw de `web/server.py` |
+| `_chat_stream_dispatch()` | dispatcher streaming | Para `for chunk in ollama.chat(stream=True, ...)` — usa `MLXBackend.chat_stream()` bajo MLX |
+
+`resolve_chat_model()` es backend-aware: consulta `MLXBackend.list_available()` cuando `RAG_LLM_BACKEND=mlx`.
+
+**Fallbacks silenciosos bajo MLX**:
+- Tool-calling (`_handle_chat_create_intent` ~línea 30140, `do()` ~37486) — MLX no tiene formato nativo de tools; fallback a Ollama automático.
+- `ollama.generate(prompt='', keep_alive=0)` — unload calls; fallback a Ollama.
+
+**Tests**: `tests/conftest.py` tiene autouse fixture `_force_ollama_backend_for_tests` que fuerza `RAG_LLM_BACKEND=ollama` por test (evita leak de shell env). Marker `requires_mlx` registrado en `pyproject.toml`.
 
 **Embeddings (bge-m3) NO entran en este scope** — migración separada en [`99-AI/system/embedding-swap-qwen3-8b/`](obsidian://open?vault=Notes&file=04-Archive%2F99-obsidian-system%2F99-AI%2Fsystem%2Fembedding-swap-qwen3-8b%2Fplan).
 
-**Gate de no-regresión** (Ola 4): `rag eval` con bootstrap CIs vs floor (singles `hit@5 88.10% [76.19, 97.62]`, chains `chain_success 50.00% [25.00, 75.00]`). CIs no-overlapping abajo del floor → ROLLBACK automático (mantener Ollama default).
+**Gate de no-regresión** (Ola 4): `rag eval` con bootstrap CIs vs floor actual (singles `hit@5 53.70% [40.74, 66.67]`, chains `hit@5 72.00% [52.00, 88.00]`). Correr con ambos backends antes de flipear default en plists. CIs no-overlapping abajo del floor → NO flipear.
 
 Doc técnica completa en [`docs/mlx-migration.md`](docs/mlx-migration.md).
 

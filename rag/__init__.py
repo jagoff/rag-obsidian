@@ -23732,28 +23732,39 @@ _CLI_WARMUP_SUBCOMMANDS = frozenset({
 })
 
 
-@click.group(cls=_HighlightGroup)
+@click.group(cls=_HighlightGroup, invoke_without_command=True)
 @click.pass_context
 def cli(ctx: click.Context) -> None:
     """RAG local para notas de Obsidian."""
+    # Default subcommand: si no se invoca ningún subcomando, redirigir a `chat`.
+    # `rag` solo (sin args ni flags) → `rag chat` con defaults. `--help`,
+    # `--version`, etc. los maneja Click antes de llegar acá. Tratamos el caso
+    # None como si fuera "chat" para warmup + auto-embed, sin tocar el atributo
+    # interno de Click (evita doble dispatch).
+    _default_to_chat = ctx.invoked_subcommand is None
+    _effective_subcommand = "chat" if _default_to_chat else ctx.invoked_subcommand
+
     # Auto-enable RAG_LOCAL_EMBED=1 for query-like subcommands (query, chat,
     # do, pendientes, prep, links, dupes) unless the user has explicitly set
     # it. Saves ~100-130ms per query by using the in-process SentenceTransformer
     # instead of the ollama HTTP round-trip. See rag.py:6970
     # (`_maybe_auto_enable_local_embed`) + CLAUDE.md §Env vars.
-    _maybe_auto_enable_local_embed(ctx.invoked_subcommand)
+    _maybe_auto_enable_local_embed(_effective_subcommand)
 
     # Eager warmup para subcomandos que retrievan — no bloquea (fire-and-forget
     # + daemon threads). RAG_NO_WARMUP=1 skippea adentro de warmup_async() si
     # el usuario quiere zero-overhead absoluto (útil para scripts en serie).
-    # ctx.invoked_subcommand es None cuando `rag --help` / `rag` sin args →
-    # skip trivial (no hay retrieve en el horizonte).
-    if ctx.invoked_subcommand in _CLI_WARMUP_SUBCOMMANDS:
+    if _effective_subcommand in _CLI_WARMUP_SUBCOMMANDS:
         try:
             warmup_async()
         except Exception:
             # Silent-fail: warmup es best-effort, no debe crashear el CLI.
             pass
+
+    # Si entramos por `rag` solo (sin subcomando), invocamos `chat` con defaults
+    # ahora — después de warmup + auto-embed para que el chat arranque caliente.
+    if _default_to_chat:
+        ctx.invoke(chat)
 
 
 def file_hash(raw: str) -> str:

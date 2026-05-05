@@ -157,6 +157,7 @@ from rag import (  # noqa: E402
     _summarize_conversation_history,
     TOPIC_SHIFT_COSINE,
     retrieve_result_to_log_extras,
+    _build_replay_fields,
 )
 
 # Cosine band for the borderline reform-LLM gate. The lower bound matches
@@ -14807,6 +14808,15 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             # bloque. Campos cubiertos: anaphora_resolved/original/rewritten,
             # contradiction_penalty_applied, mmr_applied, temporal_intent,
             # decomposed/n_sub_queries/decompose_ms, llm_judge_*. (2026-05-04)
+            # Sprint 3-A (2026-05-04): replay payload fields.
+            # corpus_hash + prompt_hash + response_hash SIEMPRE presentes
+            # (16 chars c/u, negligible storage). response_text +
+            # history_snapshot sólo con RAG_LOG_REPLAY_PAYLOAD=1 (opt-in).
+            **_build_replay_fields(
+                response=full,
+                history=history,
+                corpus_hash=_semantic_cache_hash,
+            ),
             **retrieve_result_to_log_extras(result),
         })
 

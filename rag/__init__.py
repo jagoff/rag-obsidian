@@ -15168,13 +15168,15 @@ def _record_learned_paraphrase(
         return False
 
 
-# Thread-local state que expand_queries() muta para exponer al caller
-# (query()) el delta de typo correction. Se usa lista de 1 elemento para
-# mutabilidad desde una inner function sin `nonlocal`. El GIL garantiza
-# que expand_queries runs serially dentro de cada retrieve() — no hace
-# falta lock. Reset a [None] en cada llamada a expand_queries().
-_expand_last_llm_typo_original: list[str | None] = [None]
-_expand_last_llm_typo_corrected: list[str | None] = [None]
+# NOTE (refactor 2026-05-04 evening): las globals legacy
+# `_expand_last_llm_typo_original` / `_expand_last_llm_typo_corrected`
+# fueron eliminadas — tenían data race en el web multi-threaded
+# (request A leía el state escrito por request B entre `expand_queries`
+# y el log_query_event). Reemplazo: `_LLM_TYPO_LAST: ContextVar` populado
+# por `_correct_typos_llm` y cosechado por `_apply_typo_telemetry(rr)`
+# desde `retrieve()` / `multi_retrieve()` para escribir
+# `RetrieveResult.llm_typo_*`. Los callers (CLI `query()`, `serve()`,
+# web `gen()`) leen del `result` en vez de las globals — sin races.
 
 
 def expand_queries(question: str) -> list[str]:
@@ -15203,21 +15205,17 @@ def expand_queries(question: str) -> list[str]:
     # del pipeline trabaje sobre la query corregida. El corrector tiene su
     # propio LRU cache de 256 entries (en _llm_typo_cache) así que queries
     # repetidas no pagan el costo del LLM. Si la corrección cambia la query,
-    # se expone como `_llm_typo_original` en la variable de módulo para que
-    # query() lo registre en extra_json.
+    # `_correct_typos_llm` lo expone via `_LLM_TYPO_LAST` ContextVar
+    # (thread-safe — reemplazo del legacy `_expand_last_llm_typo_*[0]` que
+    # tenía data race en el web multi-threaded). El caller
+    # (`retrieve()` / `multi_retrieve()`) cosecha el CV via
+    # `_apply_typo_telemetry(rr)` y lo aplica al `RetrieveResult`.
     # Coexistencia: maybe_normalize_typos sigue corriendo post-retrieve en
     # query() para borderline-confidence results — ambos caminos son
     # complementarios.
-    _llm_typo_original_for_log: str | None = None
     corrected_question = _correct_typos_llm(question)
     if corrected_question != question:
-        _llm_typo_original_for_log = question
         question = corrected_question
-    # Exponer el delta al caller (query()) via thread-local para logging.
-    # Usamos una variable de módulo protegida por el GIL — expand_queries
-    # corre single-threaded dentro de cada retrieve() call.
-    _expand_last_llm_typo_original[0] = _llm_typo_original_for_log
-    _expand_last_llm_typo_corrected[0] = corrected_question if _llm_typo_original_for_log else None
 
     tokens = question.strip().split()
     # Audit 2026-04-26 (L1): consultar cache ANTES del gate de tokens.
@@ -19936,6 +19934,14 @@ def retrieve_result_to_log_extras(rr: "RetrieveResult") -> dict:
             ),
             "llm_judge_parse_failed": bool(rr.get("llm_judge_parse_failed", False)),
             "llm_judge_n_candidates": int(rr.get("llm_judge_n_candidates", 0) or 0),
+            # filters_applied: filtros inferidos por retrieve() (source, folder,
+            # tag, date_range). Incluido acá para que web/server.py lo propague
+            # via **retrieve_result_to_log_extras(result) sin acordarse de
+            # agregarlo en gen(). Fix 2026-05-04 — estaba siempre {} porque
+            # ningún call site del path web incluía "filters" en el dict de
+            # log_query_event. _map_queries_row busca key "filters" → col
+            # "filters_json". _filters computado arriba como rr.filters_applied.
+            "filters": _filters,
         }
     except Exception:
         # Nunca levantar excepción desde un helper de telemetría.
@@ -28559,10 +28565,11 @@ def query(
         counter=counter,
     )
 
-    # Resetear el estado de LLM typo correction antes de retrieve() para
-    # que el logging al final refleje ESTA query, no una anterior.
-    _expand_last_llm_typo_original[0] = None
-    _expand_last_llm_typo_corrected[0] = None
+    # Refactor 2026-05-04 evening: el reset legacy a las globals
+    # `_expand_last_llm_typo_*[0] = None` ya no hace falta — el ContextVar
+    # `_LLM_TYPO_LAST` se resetea dentro de `retrieve()` antes de
+    # `expand_queries()` y se cosecha al `RetrieveResult`. Los campos
+    # `result.llm_typo_*` reflejan ESTA query (no una anterior).
 
     def _do_retrieve():
         result = retrieve(**_retrieve_kwargs)
@@ -29064,10 +29071,13 @@ def query(
         # `llm_typo_corrected` es True si expand_queries() corrigió la query
         # via qwen2.5:3b antes del embed. `llm_typo_original` guarda la query
         # antes de la corrección para análisis posterior. Ambos son None si
-        # la feature no disparó (query ya correcta o gate OFF).
-        "llm_typo_corrected": _expand_last_llm_typo_original[0] is not None,
-        "llm_typo_original": _expand_last_llm_typo_original[0],
-        "llm_typo_corrected_text": _expand_last_llm_typo_corrected[0],
+        # la feature no disparó (query ya correcta o gate OFF). Refactor
+        # 2026-05-04 evening: leemos de `result` (RetrieveResult) en vez de
+        # las globals legacy `_expand_last_llm_typo_*[0]` que tenían data
+        # race en el web multi-threaded.
+        "llm_typo_corrected": bool(result.get("llm_typo_corrected", False)),
+        "llm_typo_original": result.get("llm_typo_original"),
+        "llm_typo_corrected_text": result.get("llm_typo_corrected_text"),
         # GC#2.A telemetry fix 2026-04-22 — intent lived only in top-level
         # query() state pre-fix; extra_json logging made 97% of rag_queries
         # rows show `intent=NULL`, breaking any analytics on intent share.
@@ -30405,6 +30415,14 @@ def chat(
             # rationale extendido. Audit 2026-04-25.
             "deep_retrieve_iterations": result.get("deep_retrieve_iterations"),
             "deep_retrieve_exit_reason": result.get("deep_retrieve_exit_reason"),
+            # Sprint 3-A (2026-05-04): replay payload fields.
+            # history[:-2] = turns ANTES de este turn (user+assistant ya
+            # fueron appendeados arriba). corpus_hash via col (write DB).
+            **_build_replay_fields(
+                response=full,
+                history=history[:-2] if len(history) >= 2 else [],
+                corpus_hash=_corpus_hash_cached(col),
+            ),
         })
 
         last_turn_id = turn_id
@@ -52474,6 +52492,12 @@ def serve(host: str, port: int):
             ),
             "decompose_ms": int(
                 (result.get("timing") or {}).get("decompose_ms", 0) or 0,
+            ),
+            # Sprint 3-A (2026-05-04): replay payload fields.
+            **_build_replay_fields(
+                response=answer,
+                history=history,
+                corpus_hash=_serve_sem_hash,
             ),
         })
 

@@ -4045,8 +4045,9 @@ def _ollama_chat_probe(timeout_s: float = 6.0) -> bool:
     subsequent call since the system cache already exists.
     """
     try:
+        from rag import _mlx_or_ollama_chat
         _probe_model = _resolve_web_chat_model()
-        _OLLAMA_STREAM_CLIENT.chat(
+        _mlx_or_ollama_chat(
             model=_probe_model,
             messages=[
                 {"role": "system", "content": _WEB_SYSTEM_PROMPT},
@@ -4055,8 +4056,7 @@ def _ollama_chat_probe(timeout_s: float = 6.0) -> bool:
             options={"num_predict": 1, "num_ctx": _WEB_CHAT_NUM_CTX,
                      "temperature": 0, "seed": 42},
             stream=False,
-            think=False,   # thinking-capable models would otherwise emit
-                           # <think> blocks as "tokens" with empty content
+            think=False,
             keep_alive=chat_keep_alive(_probe_model),
         )
         return True
@@ -7912,11 +7912,11 @@ def _gen_tasks_response(sess: dict, question: str, history: list[dict]):
     # full brief lands even with both vaults' loops expanded.
     tasks_options = {**CHAT_OPTIONS, "num_predict": 800}
     try:
-        for chunk in _OLLAMA_STREAM_CLIENT.chat(
+        from rag import _chat_stream_dispatch
+        for chunk in _chat_stream_dispatch(
             model=resolve_chat_model(),
             messages=messages,
             options=tasks_options,
-            stream=True,
             keep_alive=chat_keep_alive(),
         ):
             delta = chunk.message.content or ""
@@ -10214,10 +10214,11 @@ def _run_chat_prewarm_cycle() -> None:
     this thread forever and mask the next real request.
     """
     global _OLLAMA_STUCK_FAIL_COUNT
+    from rag import _mlx_or_ollama_chat
     cycle_failed = False
     for model, num_ctx in _chat_prewarm_targets():
         try:
-            _OLLAMA_STREAM_CLIENT.chat(
+            _mlx_or_ollama_chat(
                 model=model,
                 messages=[
                     {"role": "system", "content": _WEB_SYSTEM_PROMPT},
@@ -10226,7 +10227,7 @@ def _run_chat_prewarm_cycle() -> None:
                 options={"num_predict": 1, "num_ctx": num_ctx,
                          "temperature": 0, "seed": 42},
                 stream=False,
-                think=False,   # match the probe + main chat path
+                think=False,
                 keep_alive=chat_keep_alive(model),
             )
             print(f"[chat-prewarm] {model} pinned (num_ctx={num_ctx})", flush=True)
@@ -14275,6 +14276,27 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 and _vault_retrieve_weak
                 and not _has_mention_hit
             )
+            # MLX backend bypass (2026-05-05, post-Ola-3 cutover): bajo
+            # `RAG_LLM_BACKEND=mlx`, el tool-decide round NO soporta tools
+            # nativamente y el dispatcher cae a Ollama. Si Ollama no tiene
+            # `qwen2.5:7b` warm (escenario default post-cutover MLX),
+            # pagamos cold-load ~30s solo para que el LLM diga "no hay
+            # tool". Skippeamos salvo opt-in explícito o propose-intent
+            # (donde el LLM SÍ tiene que extraer args).
+            # Override: `RAG_MLX_KEEP_FALLBACK=1` mantiene el round.
+            _mlx_active = os.environ.get(
+                "RAG_LLM_BACKEND", "mlx"
+            ).strip().lower() == "mlx"
+            _mlx_keep_fallback = os.environ.get(
+                "RAG_MLX_KEEP_FALLBACK", ""
+            ).strip() not in ("", "0", "false", "no")
+            if (
+                _mlx_active
+                and not _mlx_keep_fallback
+                and not _llm_tool_decide
+                and not _propose_intent
+            ):
+                _llm_fallback_needed = False
             _skip_llm_tool_round = (
                 not _llm_tool_decide
                 and not _propose_intent
@@ -14290,6 +14312,19 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     f"{float(result.get('confidence') or 0.0):.3f} "
                     f"< {_CONF_DEEP_THRESHOLD} — running LLM tool-decide "
                     f"as safety net",
+                    flush=True,
+                )
+            elif (
+                _mlx_active
+                and not _mlx_keep_fallback
+                and _pre_router_missed
+                and _vault_retrieve_weak
+                and not _has_mention_hit
+                and not _propose_intent
+            ):
+                print(
+                    f"[chat-llm-fallback] skipped (mlx backend) conf="
+                    f"{float(result.get('confidence') or 0.0):.3f}",
                     flush=True,
                 )
 
@@ -14582,11 +14617,11 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         _t_llm_start = time.perf_counter()
         _first_token_logged = False
         try:
-            for chunk in _OLLAMA_STREAM_CLIENT.chat(
+            from rag import _chat_stream_dispatch
+            for chunk in _chat_stream_dispatch(
                 model=_web_model,
                 messages=final_messages,
                 options=_stream_options,
-                stream=True,
                 think=False,   # the user-facing stream never includes a
                                # <think> preamble. Thinking-capable models
                                # (qwen3+, deepseek-r1, qwq) otherwise emit

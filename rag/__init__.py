@@ -24019,7 +24019,7 @@ def find_contradictions_for_note(
     # other models) can't hang the rglob — fail-skip instead.
     helper_raw = ""
     try:
-        resp = _index_chat_client().chat(
+        resp = _mlx_or_ollama_chat(
             model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
             options=CHAT_OPTIONS,

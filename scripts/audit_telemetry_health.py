@@ -1867,6 +1867,35 @@ def _render_text(report: dict) -> str:
                     out.append(f"   Sugerencia: {rbs['suggestion']}")
         out.append("")
 
+    # Draft decision health (DPO fine-tune gate del bot WA)
+    ddh = report.get("draft_decision_health")
+    if ddh is not None:
+        if ddh.get("error"):
+            out.append(f"📝 Drafts WA: ERROR — {ddh['error']}")
+        else:
+            total_w = ddh["total"]
+            ae_pct = ddh["approved_editar_pct"]
+            gold = ddh["gold_pairs_total"]
+            gate_open = ddh["dpo_gate_open"]
+            threshold = ddh["dpo_gate_threshold"]
+            gate_icon = "✅" if gate_open else "🔒"
+            by_d = ddh["by_decision"]
+            out.append(
+                f"📝 Drafts WA (últimos {ddh['window_days']}d): "
+                f"{total_w} decisiones | "
+                f"aprobado={by_d['approved_si']} "
+                f"editado={by_d['approved_editar']} ({ae_pct:.1f}%) "
+                f"rechazado={by_d['rejected']} expirado={by_d['expired']}"
+            )
+            out.append(
+                f"   Gold pairs all-time: {gold} "
+                f"— gate DPO {gate_icon} {'ABIERTO' if gate_open else 'CERRADO'} "
+                f"(threshold: {threshold})"
+            )
+            if ddh["alert"] and ddh["suggestion"]:
+                out.append(f"   ⚠️  {ddh['suggestion']}")
+        out.append("")
+
     # DB size
     db = report.get("db_size", {})
     out.append("💽 DB sizes:")
@@ -2017,6 +2046,7 @@ def main() -> int:
         report["cache_hit_by_intent"] = None
         report["abandon_high_score"] = None
         report["ranker_blind_spots"] = None
+        report["draft_decision_health"] = None
         report["db_unavailable"] = str(TELEMETRY_DB)
     else:
         try:
@@ -2042,6 +2072,7 @@ def main() -> int:
             report["cache_hit_by_intent"] = _audit_cache_hit_by_intent(conn, args.days)
             report["abandon_high_score"] = _audit_abandon_high_score(conn, args.days)
             report["ranker_blind_spots"] = _audit_ranker_blind_spots(conn, days=30)
+            report["draft_decision_health"] = _audit_draft_decision_health(conn, args.days)
         except sqlite3.OperationalError as exc:
             report["query_latency"] = None
             report["cache_health"] = None
@@ -2054,6 +2085,7 @@ def main() -> int:
             report["cache_hit_by_intent"] = None
             report["abandon_high_score"] = None
             report["ranker_blind_spots"] = None
+            report["draft_decision_health"] = None
             report["db_error"] = repr(exc)
         finally:
             conn.close()

@@ -19833,6 +19833,23 @@ class RetrieveResult:
     llm_judge_top_score_after: float = 0.0
     llm_judge_parse_failed: bool = False
     llm_judge_n_candidates: int = 0
+    # Quick Win #4 — LLM typo correction telemetry (2026-05-04, refactor
+    # 2026-05-04 evening): pre-refactor estos campos vivían en variables
+    # de módulo (`_expand_last_llm_typo_original[0]` /
+    # `_expand_last_llm_typo_corrected[0]`) que el web server multi-thread
+    # podía pisar entre requests concurrentes (data race silencioso). El
+    # síntoma medible: 0 rows con `llm_typo_corrected` para `cmd=web` en
+    # 30 días aunque el feature corre por default.
+    #
+    # El fix mueve el state al `RetrieveResult`: `_correct_typos_llm`
+    # escribe a un `ContextVar` (thread-safe + asyncio-safe), `retrieve()`
+    # / `multi_retrieve()` lo cosechan después de `expand_queries()` y
+    # poblan estos campos via `_apply_typo_telemetry(rr)`. `to_log_event`
+    # los exporta al dict del log. Los callers (CLI `query()`, `serve()`,
+    # web `gen()`) leen del `result` en vez de las globals — sin races.
+    llm_typo_corrected: bool = False
+    llm_typo_original: str | None = None
+    llm_typo_corrected_text: str | None = None
 
     # ── Retrocompat dict access ─────────────────────────────────────────
 

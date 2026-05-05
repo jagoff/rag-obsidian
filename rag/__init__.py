@@ -694,7 +694,7 @@ def _is_cross_source_target(vault_path: Path) -> bool:
     Chrome, Drive, GitHub, Claude, YouTube, Spotify).
 
     Motivación del guard: los ETLs escriben `.md` files a
-    `vault_path/<folder>/` (ej MOZE → `02-Areas/Personal/Finanzas/MOZE/`)
+    `vault_path/<folder>/` (ej MOZE → `04-Archive/99-obsidian-system/99-AI/external-ingest/Finanzas/MOZE/`)
     para que el rglob post-sync los absorba. Pre-fix, cualquier invocación
     con `OBSIDIAN_RAG_VAULT=.../otro-vault rag index` (o post-fix con
     `rag index --vault otro`) disparaba los 12 syncs contra `otro-vault`,
@@ -14610,6 +14610,34 @@ def _system_memory_used_pct() -> float | None:
         return None
 
 
+def _system_swap_used_gb() -> float | None:
+    """Return macOS swap usage in GB, or None si no se puede medir.
+
+    Sample `sysctl vm.swapusage`:
+        vm.swapusage: total = 4096.00M  used = 2907.06M  free = 1188.94M
+
+    Early-warning del thrashing antes de que el pct comprometido llegue
+    al threshold: si swap > 1-2 GB el kernel ya está paginando activo
+    y cualquier cold-load de modelo (ollama, MPS) toma >>30s.
+    """
+    if sys.platform != "darwin":
+        return None
+    try:
+        out = subprocess.run(
+            ["sysctl", "-n", "vm.swapusage"],
+            capture_output=True, text=True, timeout=2, check=False,
+        ).stdout.strip()
+        m = re.search(r"used\s*=\s*([0-9.]+)([KMGT])", out, re.IGNORECASE)
+        if not m:
+            return None
+        val = float(m.group(1))
+        unit = m.group(2).upper()
+        mult = {"K": 1.0/1024/1024, "M": 1.0/1024, "G": 1.0, "T": 1024.0}.get(unit, 0.0)
+        return val * mult
+    except Exception:
+        return None
+
+
 def _handle_memory_pressure(pct_before: float, threshold: float) -> dict:
     """Respuesta escalonada a un evento de memory pressure.
 
@@ -14696,19 +14724,45 @@ def _handle_memory_pressure(pct_before: float, threshold: float) -> dict:
 
 
 def _memory_pressure_watchdog_loop(threshold: float, interval: int) -> None:
-    """Loop del thread daemon. Corre hasta que el proceso termina."""
+    """Loop del thread daemon. Corre hasta que el proceso termina.
+
+    Trigger condicional dual:
+      - `pct >= threshold`: memory comprometida (wired+active+compressed) cruzó
+        el umbral porcentual.
+      - `swap_gb >= RAG_MEMORY_PRESSURE_SWAP_GB` (default 1.5 GB): el kernel ya
+        está paginando activo. Esta condición se chequea ANTES de que el pct
+        cruce el threshold porque el thrashing arranca en cuanto hay swap I/O
+        sostenido — la latencia de cualquier cold-load se dispara, y los
+        timeouts de ollama (60s helper, 90s chat) golpean en cadena.
+    """
+    try:
+        swap_gb_threshold = float(os.environ.get("RAG_MEMORY_PRESSURE_SWAP_GB", "1.5"))
+    except ValueError:
+        swap_gb_threshold = 1.5
     while True:
         try:
             if _daemon_shutdown_event.wait(timeout=interval):
                 return
             pct = _system_memory_used_pct()
-            if pct is None:
+            swap_gb = _system_swap_used_gb()
+            if pct is None and swap_gb is None:
                 continue
-            if pct >= threshold:
-                actions = _handle_memory_pressure(pct, threshold)
+            trigger_pct = pct is not None and pct >= threshold
+            trigger_swap = (
+                swap_gb is not None
+                and swap_gb_threshold > 0
+                and swap_gb >= swap_gb_threshold
+            )
+            if trigger_pct or trigger_swap:
+                actions = _handle_memory_pressure(pct if pct is not None else 0.0, threshold)
+                if swap_gb is not None:
+                    actions["swap_gb"] = round(swap_gb, 2)
+                actions["trigger_pct"] = trigger_pct
+                actions["trigger_swap"] = trigger_swap
                 print(
                     f"[memory-watchdog] pressure={actions['pct_before']}% "
-                    f"threshold={threshold}% "
+                    f"threshold={threshold}% swap={actions.get('swap_gb')}GB "
+                    f"trigger_pct={trigger_pct} trigger_swap={trigger_swap} "
                     f"chat_unloaded={actions['chat_unloaded']} "
                     f"reranker_unloaded={actions['reranker_unloaded']} "
                     f"pct_after={actions.get('pct_after_chat')}%",
@@ -19899,6 +19953,11 @@ class RetrieveResult:
     graph_docs: list[str] = field(default_factory=list)
     graph_metas: list[dict] = field(default_factory=list)
     extras: dict = field(default_factory=dict)
+    # Candidatos más allá del top-k, ya rerankeados. Usado por
+    # `build_progressive_context` para evitar un segundo sem.query — son
+    # de mayor calidad que un fresh search porque ya pasaron por BM25+sem
+    # merge + cross-encoder. NO confundir con `extras: dict` (telemetría).
+    extra_candidates: list[tuple[str, dict]] = field(default_factory=list)
     intent: str | None = None
     vault_scope: list[str] = field(default_factory=list)
     # Audit 2026-04-25 (commit e81251f2): trackeamos las iteraciones del
@@ -20766,7 +20825,7 @@ def run_chat_turn(req: ChatTurnRequest) -> ChatTurnResult:
         _col = get_db_for(_col_path)
         context = build_progressive_context(
             _col, retrieve_result.docs, retrieve_result.metas, req.question,
-            extras=retrieve_result.extras,
+            extras=retrieve_result.extra_candidates,
         )
     if retrieve_result.graph_docs:
         graph_section = "\n\n---\n\n".join(
@@ -22367,7 +22426,7 @@ def retrieve(
         query_variants=variants,
         graph_docs=graph_docs,
         graph_metas=graph_metas,
-        extras=extras,
+        extra_candidates=extras,
         timing=dict(_timing),
         fast_path=_fast_path,
         intent=intent,
@@ -34422,9 +34481,14 @@ def _replay_query_row(
     """
     import hashlib
 
+    _raw_ts = row.get("ts")
+    if isinstance(_raw_ts, float):
+        _raw_ts = datetime.fromtimestamp(_raw_ts, tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%S"
+        )
     result: dict = {
         "query_id": row.get("id"),
-        "ts": row.get("ts"),
+        "ts": _raw_ts,
         "q": row.get("q", ""),
         "cmd": row.get("cmd", ""),
         "verdict": "equivalent",
@@ -40403,7 +40467,7 @@ _DAEMON_GENERATED_PREFIXES = (
     # en su propio bucket (`💸 Finanzas`) con totales calculados — meterlas
     # también como "notas tocadas" duplica la señal y empuja al LLM a
     # mezclar nombres de categorías ("House", "Consumibles") en el recap.
-    "02-Areas/Personal/Finanzas/",
+    "04-Archive/99-obsidian-system/99-AI/external-ingest/Finanzas/",
 )
 
 

@@ -1,7 +1,7 @@
 """Unit tests for `rag._sync_credit_cards_notes`.
 
 Mirrors the MOZE pattern: produce 1 markdown note per (card, cycle) under
-`{vault}/02-Areas/Personal/Finanzas/Tarjetas/`, hash-skip if content
+`{vault}/04-Archive/99-obsidian-system/99-AI/external-ingest/Finanzas/Tarjetas/`, hash-skip if content
 unchanged, prune notes whose source xlsx no longer exists.
 
 Tests use real openpyxl-built xlsx fixtures (same builder used by
@@ -58,7 +58,7 @@ def isolated_finances(tmp_path, monkeypatch):
 
 
 def test_sync_writes_one_note_per_card_cycle(isolated_finances):
-    """Single xlsx → 1 .md under `02-Areas/Personal/Finanzas/Tarjetas/`."""
+    """Single xlsx → 1 .md under `04-Archive/99-obsidian-system/99-AI/external-ingest/Finanzas/Tarjetas/`."""
     import rag
 
     finance_dir, vault_root = isolated_finances
@@ -71,9 +71,9 @@ def test_sync_writes_one_note_per_card_cycle(isolated_finances):
     assert stats["files_written"] == 1
     assert stats["files_skipped"] == 0
     assert stats["files_parse_failed"] == 0
-    assert stats["target"] == "02-Areas/Personal/Finanzas/Tarjetas"
+    assert stats["target"] == "04-Archive/99-obsidian-system/99-AI/external-ingest/Finanzas/Tarjetas"
 
-    target_dir = vault_root / "02-Areas/Personal/Finanzas/Tarjetas"
+    target_dir = vault_root / "04-Archive/99-obsidian-system/99-AI/external-ingest/Finanzas/Tarjetas"
     notes = list(target_dir.glob("*.md"))
     assert len(notes) == 1
     assert notes[0].name == "Tarjeta-Visa-1059-2026-03.md"
@@ -90,7 +90,7 @@ def test_sync_note_has_structured_frontmatter(isolated_finances):
     _make_card_xlsx(finance_dir / "Último resumen - Visa 1059.xlsx")
     rag._sync_credit_cards_notes(vault_root)
 
-    note = (vault_root / "02-Areas/Personal/Finanzas/Tarjetas/"
+    note = (vault_root / "04-Archive/99-obsidian-system/99-AI/external-ingest/Finanzas/Tarjetas/"
             "Tarjeta-Visa-1059-2026-03.md")
     body = note.read_text(encoding="utf-8")
 
@@ -127,7 +127,7 @@ def test_sync_note_body_contains_purchases(isolated_finances):
     _make_card_xlsx(finance_dir / "Último resumen - Visa 1059.xlsx")
     rag._sync_credit_cards_notes(vault_root)
 
-    note = (vault_root / "02-Areas/Personal/Finanzas/Tarjetas/"
+    note = (vault_root / "04-Archive/99-obsidian-system/99-AI/external-ingest/Finanzas/Tarjetas/"
             "Tarjeta-Visa-1059-2026-03.md")
     body = note.read_text(encoding="utf-8")
 
@@ -182,7 +182,7 @@ def test_sync_handles_multiple_cards_separate_notes(isolated_finances):
     assert stats["files_total"] == 2
     assert stats["files_written"] == 2
 
-    target_dir = vault_root / "02-Areas/Personal/Finanzas/Tarjetas"
+    target_dir = vault_root / "04-Archive/99-obsidian-system/99-AI/external-ingest/Finanzas/Tarjetas"
     names = sorted(p.name for p in target_dir.glob("*.md"))
     assert names == [
         "Tarjeta-Mastercard-5234-2026-03.md",
@@ -207,7 +207,7 @@ def test_sync_different_cycles_create_different_notes(isolated_finances):
     )
 
     stats = rag._sync_credit_cards_notes(vault_root)
-    target_dir = vault_root / "02-Areas/Personal/Finanzas/Tarjetas"
+    target_dir = vault_root / "04-Archive/99-obsidian-system/99-AI/external-ingest/Finanzas/Tarjetas"
     names = sorted(p.name for p in target_dir.glob("*.md"))
 
     assert stats["files_written"] == 2
@@ -227,7 +227,7 @@ def test_sync_prunes_orphan_notes(isolated_finances):
     xlsx = _make_card_xlsx(finance_dir / "Último resumen - Visa 1059.xlsx")
     rag._sync_credit_cards_notes(vault_root)
 
-    target_dir = vault_root / "02-Areas/Personal/Finanzas/Tarjetas"
+    target_dir = vault_root / "04-Archive/99-obsidian-system/99-AI/external-ingest/Finanzas/Tarjetas"
     note = target_dir / "Tarjeta-Visa-1059-2026-03.md"
     assert note.is_file()
 
@@ -299,6 +299,6 @@ def test_sync_skips_xlsx_with_missing_brand_or_last4(isolated_finances):
     # The xlsx was found and parsed, but `_card_note_filename` returned
     # None (no brand/last4) → counted as parse_failed.
     assert stats["ok"] is True or stats["reason"] == "no_parsed"
-    target_dir = vault_root / "02-Areas/Personal/Finanzas/Tarjetas"
+    target_dir = vault_root / "04-Archive/99-obsidian-system/99-AI/external-ingest/Finanzas/Tarjetas"
     if target_dir.is_dir():
         assert list(target_dir.glob("*.md")) == []

@@ -282,7 +282,7 @@ Máximo de filas a escanear por lookup. Default 2000 (lineal — cheap hasta una
 ## Paths / folders
 
 ### `OBSIDIAN_RAG_MOZE_FOLDER`
-Dónde cae la ingesta MOZE dentro del vault. Default: `02-Areas/Personal/Finanzas/MOZE`.
+Dónde cae la ingesta MOZE dentro del vault. Default: `04-Archive/99-obsidian-system/99-AI/external-ingest/Finanzas/MOZE`.
 
 ```bash
 export OBSIDIAN_RAG_MOZE_FOLDER="02-Areas/Finanzas/MOZE"

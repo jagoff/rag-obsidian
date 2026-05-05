@@ -156,8 +156,15 @@ TARJETAS_BACKUP_DIR = Path(
     os.environ.get("OBSIDIAN_RAG_FINANCE_DIR", "")
     or (Path.home() / "Library/Mobile Documents/com~apple~CloudDocs/Finances")
 )
+# Base path for AI-generated / system-generated content in the vault.
+# Regla user (CLAUDE.md global): "todo lo que se genere por fuera de
+# Obsidian y se genere por medio de AI o con fines de AI tiene que ir
+# a 99-AI". Definido temprano (antes de MOZE/Tarjetas/etc subpaths) para
+# que las constantes de módulo lo puedan referenciar.
+_EXTERNAL_INGEST_BASE = "04-Archive/99-obsidian-system/99-AI/external-ingest"
 MOZE_VAULT_SUBPATH = os.environ.get(
-    "OBSIDIAN_RAG_MOZE_FOLDER", "02-Areas/Personal/Finanzas/MOZE"
+    "OBSIDIAN_RAG_MOZE_FOLDER",
+    f"{_EXTERNAL_INGEST_BASE}/Finanzas/MOZE",
 )
 MOZE_MONTH_ES = [
     "", "enero", "febrero", "marzo", "abril", "mayo", "junio",
@@ -471,7 +478,8 @@ def _sync_moze_notes(vault_root: Path) -> dict:
 # ── Resúmenes de tarjeta de crédito → notas mensuales ────────────────────────
 
 TARJETAS_VAULT_SUBPATH = os.environ.get(
-    "OBSIDIAN_RAG_TARJETAS_FOLDER", "02-Areas/Personal/Finanzas/Tarjetas"
+    "OBSIDIAN_RAG_TARJETAS_FOLDER",
+    f"{_EXTERNAL_INGEST_BASE}/Finanzas/Tarjetas",
 )
 
 # Regex para extraer marca + últimos 4 del nombre de archivo o sheet name.
@@ -1031,7 +1039,6 @@ def _sync_whatsapp_notes(vault_root: Path) -> dict:
 # returns a stats dict for logging. Triggered from `_run_index` after the
 # WhatsApp sync, before the vault scan.
 
-_EXTERNAL_INGEST_BASE = "04-Archive/99-obsidian-system/99-AI/external-ingest"
 _REMINDERS_VAULT_SUBPATH = f"{_EXTERNAL_INGEST_BASE}/Reminders"
 _CALENDAR_VAULT_SUBPATH = f"{_EXTERNAL_INGEST_BASE}/Calendar"
 _CHROME_VAULT_SUBPATH = f"{_EXTERNAL_INGEST_BASE}/Chrome"
@@ -2025,7 +2032,12 @@ def _check_yt_ip_cooldown() -> bool | dict:
 
 
 def _set_yt_ip_cooldown() -> None:
-    """Registra un bloqueo IpBlocked y aumenta el cooldown exponencialmente."""
+    """Registra un bloqueo IpBlocked y aumenta el cooldown exponencialmente.
+
+    Idempotente dentro de un mismo cooldown window: si el cooldown ya está
+    activo, NO bumpear retry_count ni reescribir blocked_until_ts.
+    Solo bumpear cuando el cooldown anterior expiró y se entra a uno nuevo.
+    """
     try:
         from rag import _ragvec_state_conn
     except ImportError:
@@ -2044,11 +2056,17 @@ def _set_yt_ip_cooldown() -> None:
             )
             now = time.time()
             row = conn.execute(
-                "SELECT retry_count FROM rag_yt_transcript_cooldown WHERE id = 0"
+                "SELECT blocked_until_ts, retry_count FROM rag_yt_transcript_cooldown WHERE id = 0"
             ).fetchone()
 
+            # Si el cooldown anterior sigue activo, NO bumpear counter
             if row:
-                retry_count = row[0] + 1
+                blocked_until_ts, retry_count = row
+                if now < blocked_until_ts:
+                    # Cooldown activo — retornar sin cambios (idempotente)
+                    return
+                # Cooldown expiró — bumpear para el próximo nivel
+                retry_count = retry_count + 1
             else:
                 retry_count = 0
 
@@ -2187,6 +2205,11 @@ def _sync_youtube_transcripts(vault_root: Path, batch: int = _YT_TRANSCRIPT_BATC
         fetched += 1
         if not result:
             failed += 1
+            # Chequear si el circuit-breaker se activó tras el fetch fallido
+            # (IpBlocked activaría el cooldown). Si está activo, romper el loop.
+            cooldown_status = _check_yt_ip_cooldown()
+            if cooldown_status is True or (isinstance(cooldown_status, dict) and cooldown_status.get("active")):
+                break
             continue
         lang, text = result
         url = f"https://www.youtube.com/watch?v={vid}"

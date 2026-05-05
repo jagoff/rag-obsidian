@@ -5,6 +5,31 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# ── OpenMP/libomp ABI clash workaround (macOS Apple Silicon) ───────────
+# En macOS Apple Silicon hay un bug conocido: cuando dos librerías nativas
+# linkean cada una su propia `libomp.dylib` (torch trae una embedded,
+# lightgbm trae otra; sentence-transformers carga la de torch), la
+# primera llamada que ejerce el OpenMP runtime después del segundo
+# `dlopen` segfaultea con `Fatal Python error: Segmentation fault`
+# adentro de `__init_from_np2d` (lightgbm) o `_C._mps_emptyCache` (torch).
+#
+# Reproducible 100% con:
+#     >>> import torch; torch.backends.mps.is_available()
+#     >>> import lightgbm as lgb; lgb.Dataset(np.zeros((10, 2)))   # SEGV
+# y al revés también si después tocás torch.
+#
+# Esto rompía el suite entero: tests que importan torch en module-scope
+# (e.g. `tests/test_reranker_fp32_mps_invariant.py`) en collection-time
+# contaminaban procesos donde después `tests/test_ranker_lgbm.py` corría
+# `Booster.predict()` → ~16 fails clusterizados al 60% y luego SEGV al 62%.
+#
+# Fix: forzar `OMP_NUM_THREADS=1` antes de cualquier import. Eso hace que
+# las dos librerías skipeen el thread-pool init de OpenMP y nunca peleen
+# por el runtime. Verificado con repros de los dos lados (torch→lightgbm
+# y lightgbm→torch) corriendo limpio. El overhead es despreciable en tests
+# (lo que importa es throughput de la suite, no de un train individual).
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
 import pytest
 
 

@@ -1439,6 +1439,136 @@ def _log_surface_event_background_default() -> bool:
     return val not in ("0", "false", "no")
 
 
+# ── Replay payload helpers (Sprint 3-A, 2026-05-04) ─────────────────────────
+# Persisten en extra_json de rag_queries los campos necesarios para replay
+# determinístico de queries: hashes siempre (minimal overhead), payloads raw
+# sólo cuando RAG_LOG_REPLAY_PAYLOAD=1 (privacy-gated, default OFF).
+#
+# Por qué separar hash de payload:
+#   - El hash (16 chars) es inerte para la privacidad y habilita dedup de
+#     queries idénticas en el análisis downstream.
+#   - El payload raw (response_text, history_snapshot) puede contener PII
+#     del vault — se gate con opt-in explícito.
+#
+# Storage cost estimado:
+#   - Flags OFF (default): ~30 KB/sem (3×16-char hashes por row).
+#   - Flags ON: ~3.5 MB/sem (~50 queries/día × 2.3 KB/row promedio).
+#
+# Env vars:
+#   RAG_LOG_REPLAY_PAYLOAD=1  -- activa response_text + history_snapshot
+#   RAG_LOG_RERANK_RAW=1      -- activa rerank_logits_raw (list[float])
+
+_REPLAY_RESPONSE_MAX_BYTES: int = 8_192   # 8 KB cap para response_text
+_REPLAY_HISTORY_MAX_BYTES: int = 4_096    # 4 KB cap para history_snapshot
+
+
+def _replay_payload_enabled() -> bool:
+    """True cuando ``RAG_LOG_REPLAY_PAYLOAD=1`` -- activa storage de
+    response_text + history_snapshot en extra_json.
+
+    Default OFF -- los payloads pueden contener PII del vault.
+    """
+    val = os.environ.get("RAG_LOG_REPLAY_PAYLOAD", "").strip().lower()
+    return val in ("1", "true", "yes")
+
+
+def _rerank_raw_enabled() -> bool:
+    """True cuando ``RAG_LOG_RERANK_RAW=1`` -- activa storage de
+    rerank_logits_raw (list[float]) en extra_json.
+
+    Default OFF -- útil sólo para debugging de regresiones del ranker.
+    """
+    val = os.environ.get("RAG_LOG_RERANK_RAW", "").strip().lower()
+    return val in ("1", "true", "yes")
+
+
+def _truncate_for_replay(text: str, max_bytes: int) -> tuple[str, bool]:
+    """Trunca ``text`` a ``max_bytes`` (UTF-8) si supera el límite.
+
+    Retorna ``(texto_truncado, fue_truncado)``. La truncación preserva
+    codepoints UTF-8 completos (no corta en medio de un multibyte).
+    """
+    if not text:
+        return ("", False)
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return (text, False)
+    truncated_text = encoded[:max_bytes].decode("utf-8", errors="ignore")
+    return (truncated_text, True)
+
+
+def _replay_hash(text: str) -> str:
+    """sha256[:16] de ``text`` (UTF-8). Retorna '' si text está vacío."""
+    if not text:
+        return ""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _build_replay_fields(
+    *,
+    response: str | None = None,
+    history: list | None = None,
+    prompt: str | None = None,
+    corpus_hash: str = "",
+    rerank_logits: list[float] | None = None,
+) -> dict:
+    """Construye el subset de campos de replay payload para extra_json.
+
+    Campos ALWAYS ON (hashes, ~48 chars total):
+      corpus_hash        -- hash del corpus snapshot
+      prompt_hash        -- sha256[:16] del system+user prompt final
+      response_hash      -- sha256[:16] del response del LLM
+
+    Campos OPT-IN (RAG_LOG_REPLAY_PAYLOAD=1):
+      response_text      -- raw response capped 8 KB
+      response_truncated -- bool, True si excedió 8 KB
+      history_snapshot   -- turns previos capped 4 KB
+      history_truncated  -- bool, True si excedió 4 KB
+
+    Campos OPT-IN (RAG_LOG_RERANK_RAW=1):
+      rerank_logits_raw  -- list[float]
+    """
+    out: dict = {}
+
+    if corpus_hash:
+        out["corpus_hash"] = corpus_hash
+
+    if prompt:
+        out["prompt_hash"] = _replay_hash(prompt)
+
+    response_str = response or ""
+    if response_str:
+        out["response_hash"] = _replay_hash(response_str)
+        if _replay_payload_enabled():
+            text_capped, truncated = _truncate_for_replay(
+                response_str, _REPLAY_RESPONSE_MAX_BYTES,
+            )
+            out["response_text"] = text_capped
+            out["response_truncated"] = truncated
+
+    if history:
+        try:
+            history_json = json.dumps(history, ensure_ascii=False)
+        except Exception:
+            history_json = ""
+        if history_json:
+            out["history_hash"] = _replay_hash(history_json)
+            if _replay_payload_enabled():
+                snapshot_capped, hist_truncated = _truncate_for_replay(
+                    history_json, _REPLAY_HISTORY_MAX_BYTES,
+                )
+                try:
+                    out["history_snapshot"] = json.loads(snapshot_capped)
+                except Exception:
+                    out["history_snapshot"] = snapshot_capped
+                out["history_truncated"] = hist_truncated
+
+    if rerank_logits is not None and _rerank_raw_enabled():
+        out["rerank_logits_raw"] = [round(float(x), 6) for x in rerank_logits]
+
+    return out
+
+
 def log_query_event(event: dict) -> None:
     """Insert a query event into rag_queries.
 
@@ -12273,6 +12403,18 @@ def _correct_typos_llm(query: str) -> str:
         hit = _llm_typo_cache.get(query)
         if hit is not None:
             _llm_typo_cache.move_to_end(query)
+            # Cache hit: surface el delta al ContextVar igual que el path
+            # full así el caller cosecha telemetría aunque el LLM no haya
+            # corrido. Sin esto, queries repetidas saldrían como "no
+            # corregida" en el log aunque hubiesen pagado el LLM antes.
+            if hit != query:
+                _LLM_TYPO_LAST.set({
+                    "original": query,
+                    "corrected": hit,
+                    "was_corrected": True,
+                })
+            else:
+                _LLM_TYPO_LAST.set(None)
             return hit
 
     prompt = (
@@ -12305,6 +12447,18 @@ def _correct_typos_llm(query: str) -> str:
         _llm_typo_cache.move_to_end(query)
         while len(_llm_typo_cache) > _LLM_TYPO_CACHE_MAX:
             _llm_typo_cache.popitem(last=False)
+
+    # Surface el delta al ContextVar (thread-safe). El caller (`retrieve()`
+    # / `multi_retrieve()` via `_typo_telemetry_get()`) lo cosechará
+    # post-`expand_queries()` y lo metera al `RetrieveResult`.
+    if corrected != query:
+        _LLM_TYPO_LAST.set({
+            "original": query,
+            "corrected": corrected,
+            "was_corrected": True,
+        })
+    else:
+        _LLM_TYPO_LAST.set(None)
 
     return corrected
 
@@ -14944,15 +15098,6 @@ def _record_learned_paraphrase(
         return False
 
 
-# Thread-local state que expand_queries() muta para exponer al caller
-# (query()) el delta de typo correction. Se usa lista de 1 elemento para
-# mutabilidad desde una inner function sin `nonlocal`. El GIL garantiza
-# que expand_queries runs serially dentro de cada retrieve() — no hace
-# falta lock. Reset a [None] en cada llamada a expand_queries().
-_expand_last_llm_typo_original: list[str | None] = [None]
-_expand_last_llm_typo_corrected: list[str | None] = [None]
-
-
 def expand_queries(question: str) -> list[str]:
     """Generate 2 paraphrases for multi-query retrieval. Returns [original, p1, p2].
 
@@ -14979,21 +15124,14 @@ def expand_queries(question: str) -> list[str]:
     # del pipeline trabaje sobre la query corregida. El corrector tiene su
     # propio LRU cache de 256 entries (en _llm_typo_cache) así que queries
     # repetidas no pagan el costo del LLM. Si la corrección cambia la query,
-    # se expone como `_llm_typo_original` en la variable de módulo para que
-    # query() lo registre en extra_json.
-    # Coexistencia: maybe_normalize_typos sigue corriendo post-retrieve en
-    # query() para borderline-confidence results — ambos caminos son
-    # complementarios.
-    _llm_typo_original_for_log: str | None = None
+    # `_correct_typos_llm` lo expone via `_LLM_TYPO_LAST` ContextVar
+    # (thread-safe — reemplazo del legacy `_expand_last_llm_typo_*[0]` que
+    # tenía data race en el web multi-threaded). Coexistencia:
+    # maybe_normalize_typos sigue corriendo post-retrieve en query() para
+    # borderline-confidence results — ambos caminos son complementarios.
     corrected_question = _correct_typos_llm(question)
     if corrected_question != question:
-        _llm_typo_original_for_log = question
         question = corrected_question
-    # Exponer el delta al caller (query()) via thread-local para logging.
-    # Usamos una variable de módulo protegida por el GIL — expand_queries
-    # corre single-threaded dentro de cada retrieve() call.
-    _expand_last_llm_typo_original[0] = _llm_typo_original_for_log
-    _expand_last_llm_typo_corrected[0] = corrected_question if _llm_typo_original_for_log else None
 
     tokens = question.strip().split()
     # Audit 2026-04-26 (L1): consultar cache ANTES del gate de tokens.
@@ -28262,10 +28400,11 @@ def query(
         counter=counter,
     )
 
-    # Resetear el estado de LLM typo correction antes de retrieve() para
-    # que el logging al final refleje ESTA query, no una anterior.
-    _expand_last_llm_typo_original[0] = None
-    _expand_last_llm_typo_corrected[0] = None
+    # Refactor 2026-05-04 evening: el reset legacy a las globals
+    # `_expand_last_llm_typo_*[0] = None` ya no hace falta — el ContextVar
+    # `_LLM_TYPO_LAST` se resetea dentro de `retrieve()` antes de
+    # `expand_queries()` y se cosecha al `RetrieveResult`. Los campos
+    # `result.llm_typo_*` reflejan ESTA query (no una anterior).
 
     def _do_retrieve():
         result = retrieve(**_retrieve_kwargs)
@@ -28767,10 +28906,13 @@ def query(
         # `llm_typo_corrected` es True si expand_queries() corrigió la query
         # via qwen2.5:3b antes del embed. `llm_typo_original` guarda la query
         # antes de la corrección para análisis posterior. Ambos son None si
-        # la feature no disparó (query ya correcta o gate OFF).
-        "llm_typo_corrected": _expand_last_llm_typo_original[0] is not None,
-        "llm_typo_original": _expand_last_llm_typo_original[0],
-        "llm_typo_corrected_text": _expand_last_llm_typo_corrected[0],
+        # la feature no disparó (query ya correcta o gate OFF). Refactor
+        # 2026-05-04 evening: leemos de `result` (RetrieveResult) en vez de
+        # las globals legacy `_expand_last_llm_typo_*[0]` que tenían data
+        # race en el web multi-threaded.
+        "llm_typo_corrected": bool(result.get("llm_typo_corrected", False)),
+        "llm_typo_original": result.get("llm_typo_original"),
+        "llm_typo_corrected_text": result.get("llm_typo_corrected_text"),
         # GC#2.A telemetry fix 2026-04-22 — intent lived only in top-level
         # query() state pre-fix; extra_json logging made 97% of rag_queries
         # rows show `intent=NULL`, breaking any analytics on intent share.

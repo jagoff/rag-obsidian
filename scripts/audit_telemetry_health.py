@@ -749,6 +749,157 @@ def check_chat_health(conn: sqlite3.Connection, days: int = 7) -> dict:
     return out
 
 
+def _audit_impression_to_open_ratio(conn, days: int = 7) -> dict:
+    """CTR global del retrieval: chunks mostrados -> clicks (opens).
+
+    Metrica accionable mas directa de calidad de ranking: si el usuario
+    ve un chunk en los resultados y NO lo abre, o es irrelevante o esta
+    tan bajo en el ranking que nunca llega al user. Un CTR cayendo semana
+    a semana es senal temprana de degradacion del ranker ANTES de que se
+    note en el eval hit@5.
+
+    CTR actual medido 2026-05-04: 0.065% (180 opens / 275.970 impressions
+    en 7d). Muy bajo porque `impression` se loguea por chunk x query (varios
+    chunks por retrieve) y `open` es un acto explicito del user. El valor
+    absoluto importa menos que el trend.
+
+    Reglas de alerta:
+    - `alert=True` cuando CTR 7d cae >20% vs CTR 30d baseline
+      (trend_pct < -20%) con al menos 100 impressions en 7d.
+    - Tambien `alert=True` cuando CTR 7d < 0.02% con >= 100 impressions
+      (senal de que casi nadie clickea nada -- ranking probablemente roto).
+
+    Returns dict JSON-serializable.
+    """
+    import sqlite3 as _sqlite3
+    out: dict = {
+        "window_days": days,
+        "impressions_7d": 0,
+        "opens_7d": 0,
+        "ctr_pct_7d": 0.0,
+        "impressions_30d": 0,
+        "opens_30d": 0,
+        "ctr_pct_30d": None,
+        "trend_pct": None,
+        "alert": False,
+        "alert_reasons": [],
+        "suggestion": "",
+        "weekly_breakdown": [],
+    }
+
+    try:
+        exists = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='rag_behavior'"
+        ).fetchone()
+    except _sqlite3.OperationalError as exc:
+        out["error"] = repr(exc)
+        return out
+    if exists is None:
+        out["error"] = "table missing: rag_behavior"
+        return out
+
+    # Ventana N dias (configurable, default 7)
+    row_nd = conn.execute(
+        """
+        SELECT
+          COUNT(DISTINCT CASE WHEN event = 'impression' THEN id END),
+          COUNT(DISTINCT CASE WHEN event = 'open' THEN id END)
+        FROM rag_behavior
+        WHERE ts >= datetime('now', ?)
+        """,
+        (f"-{days} days",),
+    ).fetchone()
+    impressions_7d = int(row_nd[0] or 0)
+    opens_7d = int(row_nd[1] or 0)
+    ctr_7d = round(100.0 * opens_7d / impressions_7d, 4) if impressions_7d else 0.0
+
+    out["impressions_7d"] = impressions_7d
+    out["opens_7d"] = opens_7d
+    out["ctr_pct_7d"] = ctr_7d
+
+    # Baseline 30d (siempre, independientemente del days arg -- anchor de trend)
+    row_30d = conn.execute(
+        """
+        SELECT
+          COUNT(DISTINCT CASE WHEN event = 'impression' THEN id END),
+          COUNT(DISTINCT CASE WHEN event = 'open' THEN id END)
+        FROM rag_behavior
+        WHERE ts >= datetime('now', '-30 days')
+        """
+    ).fetchone()
+    impressions_30d = int(row_30d[0] or 0)
+    opens_30d = int(row_30d[1] or 0)
+    ctr_30d = None
+    if impressions_30d > 0:
+        ctr_30d = round(100.0 * opens_30d / impressions_30d, 4)
+    out["impressions_30d"] = impressions_30d
+    out["opens_30d"] = opens_30d
+    out["ctr_pct_30d"] = ctr_30d
+
+    # Trend: (ctr_nd - ctr_30d) / ctr_30d * 100
+    trend_pct = None
+    if ctr_30d is not None and ctr_30d > 0:
+        trend_pct = round((ctr_7d - ctr_30d) / ctr_30d * 100.0, 1)
+    out["trend_pct"] = trend_pct
+
+    # Breakdown semanal ultimas 4 semanas (curva visible en --json)
+    weekly_rows = conn.execute(
+        """
+        SELECT
+          strftime('%Y-W%W', ts) AS week,
+          COUNT(DISTINCT CASE WHEN event = 'impression' THEN id END) AS imp,
+          COUNT(DISTINCT CASE WHEN event = 'open' THEN id END) AS op
+        FROM rag_behavior
+        WHERE ts >= datetime('now', '-28 days')
+        GROUP BY week
+        ORDER BY week ASC
+        """
+    ).fetchall()
+    breakdown = []
+    for r in weekly_rows:
+        imp = int(r[1] or 0)
+        op = int(r[2] or 0)
+        ctr = round(100.0 * op / imp, 4) if imp else 0.0
+        breakdown.append({"week": r[0], "impressions": imp, "opens": op, "ctr_pct": ctr})
+    out["weekly_breakdown"] = breakdown
+
+    # Reglas de alerta
+    alert_reasons = []
+    if impressions_7d >= 100:
+        if trend_pct is not None and trend_pct < -20.0:
+            alert_reasons.append(
+                f"CTR cayo {abs(trend_pct):.1f}% vs baseline 30d "
+                f"({ctr_7d:.4f}% -> desde {ctr_30d:.4f}%)"
+            )
+        if ctr_7d < 0.02:
+            alert_reasons.append(
+                f"CTR absoluto muy bajo: {ctr_7d:.4f}% con {impressions_7d:,} impressions "
+                f"(umbral: <0.02%)"
+            )
+    out["alert"] = bool(alert_reasons)
+    out["alert_reasons"] = alert_reasons
+
+    if alert_reasons:
+        out["suggestion"] = (
+            "CTR en caida -- el ranking puede estar mostrando chunks irrelevantes. "
+            "Revisar `rag tune --online --days 14` y logs de `rag_behavior` para "
+            "ver que paths se imprimen vs cuales se abren."
+        )
+    elif impressions_7d < 100:
+        out["suggestion"] = (
+            f"Muestra insuficiente ({impressions_7d} impressions en {days}d) "
+            "para detectar tendencia. Esperar mas actividad."
+        )
+    else:
+        out["suggestion"] = (
+            f"CTR estable: {ctr_7d:.4f}% en {days}d. "
+            "El valor absoluto es bajo por diseno -- lo que importa es el trend."
+        )
+
+    return out
+
+
 def _audit_feedback_corrective_gap(conn: sqlite3.Connection) -> dict:
     """Gap de corrective_path en feedbacks negativos — gate del LoRA fine-tune.
 
@@ -1201,6 +1352,255 @@ def _audit_abandon_high_score(conn, days: int) -> dict:
     return out
 
 
+def _audit_cache_hit_by_intent(conn: sqlite3.Connection, days: int) -> dict:
+    """Breakdown de cache hit rate por intent — signal de tuning del cache.
+
+    El cache semántico (`rag_response_cache`) usa un único cosine threshold
+    (`RAG_CACHE_COSINE`, default 0.93) y un bucket de corpus_hash
+    (`_CORPUS_HASH_BUCKET`, default 100). Si el threshold es demasiado alto
+    o el bucket demasiado chico, queries que parecen similares no pegan y el
+    hit rate se va a cero. Este detector segmenta por intent para que el
+    operador vea exactamente qué intents tienen volumen real pero re-uso cero.
+
+    **Pregunta accionable**: ¿algún intent tiene ≥20 queries elegibles pero
+    hit rate <5%? → candidato a bajar `RAG_CACHE_COSINE` o ampliar el bucket.
+
+    Solo considera queries con `cmd IN ('web', 'query', 'serve.chat')` y
+    que registraron `cache_probe.result` en ('hit', 'miss') — las que tienen
+    `skipped` o NULL no son elegibles para cache y no aportan señal.
+
+    Alert threshold: eligible ≥ 20 AND hit_rate_pct < 5.0.
+    Informativo (sin alert): eligible ∈ [5, 20).
+
+    Returns dict JSON-serializable con shape::
+
+        {
+            "window_days": 7,
+            "by_intent": [
+                {
+                    "intent": "semantic",
+                    "eligible": 53,
+                    "hits": 0,
+                    "misses": 53,
+                    "hit_rate_pct": 0.0,
+                    "alert": True,  # eligible>=20 y hit_rate<5%
+                },
+                ...
+            ],
+            "alerts_count": 1,           # intents que cumplen el threshold de alerta
+            "global_hit_rate_pct": 0.0,  # hit rate global sobre todos los intents
+            "suggestion": "...",         # sugerencia accionable (solo si alerts_count > 0)
+        }
+    """
+    ALERT_MIN_ELIGIBLE = 20
+    ALERT_MAX_HIT_RATE = 5.0
+
+    cutoff_iso = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+              COALESCE(json_extract(extra_json, '$.intent'), 'unknown') AS intent,
+              COUNT(*) AS eligible,
+              SUM(CASE WHEN json_extract(extra_json, '$.cache_probe.result') = 'hit'
+                       THEN 1 ELSE 0 END) AS hits,
+              SUM(CASE WHEN json_extract(extra_json, '$.cache_probe.result') = 'miss'
+                       THEN 1 ELSE 0 END) AS misses,
+              ROUND(
+                100.0 * SUM(CASE WHEN json_extract(extra_json, '$.cache_probe.result') = 'hit'
+                                 THEN 1 ELSE 0 END)
+                / NULLIF(COUNT(*), 0),
+              2) AS hit_rate_pct
+            FROM rag_queries
+            WHERE ts >= ?
+              AND cmd IN ('web', 'query', 'serve.chat')
+              AND json_extract(extra_json, '$.cache_probe.result') IN ('hit', 'miss')
+            GROUP BY intent
+            HAVING eligible >= 5
+            ORDER BY eligible DESC
+            """,
+            (cutoff_iso,),
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        return {
+            "window_days": days,
+            "by_intent": [],
+            "alerts_count": 0,
+            "global_hit_rate_pct": None,
+            "suggestion": None,
+            "error": repr(exc),
+        }
+
+    by_intent = []
+    total_eligible = 0
+    total_hits = 0
+    alerts_count = 0
+    for r in rows:
+        intent = r[0]
+        eligible = int(r[1] or 0)
+        hits = int(r[2] or 0)
+        misses = int(r[3] or 0)
+        hit_rate_pct = float(r[4] or 0.0)
+        is_alert = eligible >= ALERT_MIN_ELIGIBLE and hit_rate_pct < ALERT_MAX_HIT_RATE
+        if is_alert:
+            alerts_count += 1
+        by_intent.append({
+            "intent": intent,
+            "eligible": eligible,
+            "hits": hits,
+            "misses": misses,
+            "hit_rate_pct": hit_rate_pct,
+            "alert": is_alert,
+        })
+        total_eligible += eligible
+        total_hits += hits
+
+    global_hit_rate_pct: float | None = None
+    if total_eligible > 0:
+        global_hit_rate_pct = round(100.0 * total_hits / total_eligible, 2)
+
+    suggestion: str | None = None
+    if alerts_count > 0:
+        suggestion = (
+            "Cache cosine threshold alto (RAG_CACHE_COSINE=0.93) o "
+            "corpus_hash bucket muy chico (_CORPUS_HASH_BUCKET) — "
+            "el cache nunca pega en los intents con alerta. "
+            "Probá bajar RAG_CACHE_COSINE a 0.90 o revisar que el "
+            "corpus_hash no esté cambiando entre queries consecutivas."
+        )
+
+    return {
+        "window_days": days,
+        "by_intent": by_intent,
+        "alerts_count": alerts_count,
+        "global_hit_rate_pct": global_hit_rate_pct,
+        "suggestion": suggestion,
+    }
+
+
+def _audit_draft_decision_health(conn: sqlite3.Connection, days: int = 30) -> dict:
+    """Health check del loop de aprendizaje del bot WA (drafts).
+
+    Pregunta accionable: ¿el loop está acumulando pares gold (`approved_editar`)
+    a buen ritmo para alimentar el DPO fine-tune del modelo de drafts?
+
+    El gate del DPO (sección "Fine-tune del modelo de drafts WA — DPO + LoRA"
+    en CLAUDE.md) requiere ≥100 pares gold all-time. Un par gold es una row
+    con `decision='approved_editar'` + `sent_text IS NOT NULL` +
+    `sent_text != bot_draft` (el user efectivamente editó el draft).
+
+    Detecta una patología importante: si el user aprueba todos los drafts sin
+    editar (`approved_si=100%`), no se generan pares gold. El modelo nunca
+    aprende el estilo real del user — sigue generando el mismo tono genérico.
+    Alerta cuando `approved_editar_pct < 10%` con muestra ≥10 decisiones en
+    la ventana.
+
+    Columnas del output:
+
+    - window_days: ventana de análisis
+    - total: rows en la ventana
+    - by_decision: {approved_si, approved_editar, rejected, expired}
+    - approved_editar_pct: % de approved_editar sobre el total de la ventana
+    - gold_pairs_total: pares gold all-time (not windowed) — lo que el DPO ve
+    - dpo_gate_threshold: 100 (hardcoded, igual que scripts/finetune_drafts.py)
+    - dpo_gate_open: gold_pairs_total >= 100
+    - alert: True si approved_editar_pct < 10% con muestra suficiente
+    - suggestion: texto accionable cuando alert=True
+    """
+    DPO_GATE_THRESHOLD = 100
+    out: dict = {
+        "window_days": days,
+        "total": 0,
+        "by_decision": {
+            "approved_si": 0,
+            "approved_editar": 0,
+            "rejected": 0,
+            "expired": 0,
+        },
+        "approved_editar_pct": 0.0,
+        "gold_pairs_total": 0,
+        "dpo_gate_threshold": DPO_GATE_THRESHOLD,
+        "dpo_gate_open": False,
+        "alert": False,
+        "suggestion": None,
+    }
+
+    try:
+        exists = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type=\'table\' AND name=\'rag_draft_decisions\'"
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        out["error"] = repr(exc)
+        return out
+    if exists is None:
+        out["error"] = "table missing: rag_draft_decisions"
+        return out
+
+    cutoff_iso = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+
+    # 1) Distribución de decisiones en la ventana
+    rows = conn.execute(
+        """
+        SELECT decision, COUNT(*) AS n
+        FROM rag_draft_decisions
+        WHERE ts >= ?
+        GROUP BY decision
+        ORDER BY n DESC
+        """,
+        (cutoff_iso,),
+    ).fetchall()
+
+    total = 0
+    by_decision: dict[str, int] = {
+        "approved_si": 0,
+        "approved_editar": 0,
+        "rejected": 0,
+        "expired": 0,
+    }
+    for r in rows:
+        decision = r[0] or "unknown"
+        n = int(r[1] or 0)
+        total += n
+        if decision in by_decision:
+            by_decision[decision] = n
+
+    out["total"] = total
+    out["by_decision"] = by_decision
+
+    approved_editar_pct = (
+        round(by_decision["approved_editar"] / total * 100, 1) if total > 0 else 0.0
+    )
+    out["approved_editar_pct"] = approved_editar_pct
+
+    # 2) Gold pairs all-time (no windowed) — lo que el script de DPO ve
+    gold_pairs_total = conn.execute(
+        """
+        SELECT COUNT(*) FROM rag_draft_decisions
+        WHERE decision = \'approved_editar\'
+          AND sent_text IS NOT NULL
+          AND sent_text != bot_draft
+        """
+    ).fetchone()[0]
+    out["gold_pairs_total"] = int(gold_pairs_total or 0)
+    out["dpo_gate_open"] = out["gold_pairs_total"] >= DPO_GATE_THRESHOLD
+
+    # 3) Alerta si casi no hay pares gold en la ventana — el user aprueba
+    # sin editar y el modelo no aprende su estilo real.
+    if total >= 10 and approved_editar_pct < 10.0:
+        out["alert"] = True
+        out["suggestion"] = (
+            f"Solo {by_decision[\'approved_editar\']} de {total} drafts fueron editados "
+            f"({approved_editar_pct:.1f}%) en los últimos {days}d. "
+            "El modelo DPO no acumula pares gold. "
+            "Si los drafts son buenos sin editar, OK. "
+            "Si los drafts son mediocres y el user los aprueba igual, "
+            "el loop de aprendizaje está roto — el modelo nunca va a mejorar."
+        )
+
+    return out
+
+
 def _audit_db_size() -> dict:
     """Tamaño físico de las DBs + WAL files. Detección temprana de bloat."""
     out = {}
@@ -1477,6 +1877,97 @@ def _render_text(report: dict) -> str:
                     )
         out.append("")
 
+
+    # Content gap detector — abandon_high_score
+    ahs = report.get("abandon_high_score")
+    if ahs is not None:
+        if ahs.get("error"):
+            out.append(f"🕳️  Content gap: ERROR — {ahs['error']}")
+        else:
+            count = ahs["count"]
+            days_w = ahs["window_days"]
+            alert_icon = "⚠️ " if ahs["alert"] else "✓ "
+            out.append(
+                f"{alert_icon}Content gap (abandon + top_score >= 0.4, "
+                f"últimos {days_w}d): {count}"
+            )
+            if count >= 5:
+                out.append(f"   ⚠️  {ahs['suggestion']}")
+            if ahs["samples"]:
+                out.append(f"   {'score':>6}  {'ts':<22}  query")
+                for s in ahs["samples"][:10]:
+                    q_truncated = (
+                        (s["q"][:55] + "\u2026") if len(s["q"] or "") > 55
+                        else (s["q"] or "")
+                    )
+                    out.append(
+                        f"   {s['top_score']:>6.3f}  {s['ts']:<22}  {q_truncated!r}"
+                    )
+        out.append("")
+
+    # Cache hit rate por intent — signal de tuning del cache
+    chi = report.get("cache_hit_by_intent")
+    if chi is not None:
+        if chi.get("error"):
+            out.append(f"🔍 Cache por intent: ERROR — {chi['error']}")
+        else:
+            global_rate = chi.get("global_hit_rate_pct")
+            alerts = chi.get("alerts_count", 0)
+            n_intents = len(chi.get("by_intent") or [])
+            rate_str = f"{global_rate:.1f}%" if global_rate is not None else "—"
+            alert_icon = "⚠️ " if alerts > 0 else "✓"
+            out.append(
+                f"{alert_icon} Cache hit por intent: global {rate_str} "
+                f"({n_intents} intents con ≥5 queries elegibles)"
+            )
+            if chi.get("by_intent"):
+                out.append(
+                    f"   {'intent':<16}  {'eligible':>8}  {'hits':>5}  {'misses':>6}  {'hit_rate':>8}  alerta"
+                )
+                for row in chi["by_intent"]:
+                    alert_mark = "⚠️ " if row["alert"] else "   "
+                    out.append(
+                        f"   {row['intent']:<16}  {row['eligible']:>8}  "
+                        f"{row['hits']:>5}  {row['misses']:>6}  "
+                        f"{row['hit_rate_pct']:>7.1f}%  {alert_mark}"
+                    )
+            if alerts > 0 and chi.get("suggestion"):
+                out.append(f"   → {chi['suggestion']}")
+        out.append("")
+
+    # CTR retrieval — impression_to_open_ratio
+    ctr_data = report.get("impression_to_open_ratio")
+    if ctr_data is not None and not ctr_data.get("error"):
+        ctr_7 = ctr_data.get("ctr_pct_7d", 0.0)
+        ctr_30 = ctr_data.get("ctr_pct_30d")
+        imp_7 = ctr_data.get("impressions_7d", 0)
+        op_7 = ctr_data.get("opens_7d", 0)
+        trend = ctr_data.get("trend_pct")
+        alert = ctr_data.get("alert", False)
+        alert_prefix = "⚠️  " if alert else "   "
+        trend_str = f" (trend {trend:+.1f}% vs 30d)" if trend is not None else ""
+        ctr_30_str = f" | baseline 30d: {ctr_30:.4f}%" if ctr_30 is not None else ""
+        out.append(
+            f"{alert_prefix}👆 CTR retrieval ({report['days']}d): "
+            f"{ctr_7:.4f}% "
+            f"({op_7:,} opens / {imp_7:,} impressions)"
+            f"{ctr_30_str}"
+            f"{trend_str}"
+        )
+        if ctr_data.get("weekly_breakdown"):
+            out.append("   Breakdown semanal (últimas 4 semanas):")
+            for wb in ctr_data["weekly_breakdown"]:
+                bar = "█" * min(20, max(1, int(wb["ctr_pct"] * 200)))
+                out.append(
+                    f"     {wb['week']}  {wb['opens']:>5} opens / "
+                    f"{wb['impressions']:>8,} imp  "
+                    f"CTR {wb['ctr_pct']:.4f}%  {bar}"
+                )
+        if alert:
+            for reason in ctr_data.get("alert_reasons", []):
+                out.append(f"   ⚠️  {reason}")
+        out.append("")
+
     # DB size
     db = report.get("db_size", {})
     out.append("💽 DB sizes:")
@@ -1570,6 +2061,20 @@ def _render_text(report: dict) -> str:
             f"disponibles (faltan {rows_left}). Corré `rag feedback backfill` o "
             "`rag feedback infer-implicit --window-seconds 600` para destrabar el gate."
         )
+    ahs = report.get("abandon_high_score")
+    if ahs is not None and ahs.get("alert") and not ahs.get("error"):
+        out.append(
+            f"  • Content gap detectado: {ahs['count']} queries con top_score "
+            ">= 0.4 donde el user se fue igual — revisá respuestas del LLM "
+            "(alucinaciones / respuestas vacías). Mirá la sección 🕳️ arriba."
+        )
+    if ctr_data is not None and ctr_data.get("alert"):
+        trend = ctr_data.get("trend_pct")
+        trend_str = f" (caída {abs(trend):.1f}% vs 30d)" if trend is not None else ""
+        out.append(
+            f"  • CTR retrieval en alerta{trend_str} — ranking puede estar "
+            "degradando. Revisar `rag tune --online --days 14`."
+        )
     if (
         not err.get("total_errors")
         and not (lat and lat.get("outliers"))
@@ -1577,6 +2082,7 @@ def _render_text(report: dict) -> str:
         and (ret is None or ret.get("status") == "healthy")
         and (chat is None or chat.get("status") == "healthy")
         and (fcg is None or fcg.get("gate_open") or fcg.get("error"))
+        and (ahs is None or not ahs.get("alert"))
     ):
         out.append("  • ✅ Sistema sano. No se requiere acción inmediata.")
     out.append("=" * 72)
@@ -1616,6 +2122,8 @@ def main() -> int:
         report["feedback_corrective_gap"] = None
         report["harvest_candidates"] = None
         report["cross_source_single_source"] = None
+        report["impression_to_open_ratio"] = None
+        report["abandon_high_score"] = None
         report["db_unavailable"] = str(TELEMETRY_DB)
     else:
         try:
@@ -1638,6 +2146,8 @@ def main() -> int:
                 )
             else:
                 report["cross_source_single_source"] = None
+            report["impression_to_open_ratio"] = _audit_impression_to_open_ratio(conn, args.days)
+            report["abandon_high_score"] = _audit_abandon_high_score(conn, args.days)
         except sqlite3.OperationalError as exc:
             report["query_latency"] = None
             report["cache_health"] = None
@@ -1647,6 +2157,8 @@ def main() -> int:
             report["feedback_corrective_gap"] = None
             report["harvest_candidates"] = None
             report["cross_source_single_source"] = None
+            report["impression_to_open_ratio"] = None
+            report["abandon_high_score"] = None
             report["db_error"] = repr(exc)
         finally:
             conn.close()

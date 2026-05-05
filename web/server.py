@@ -156,6 +156,7 @@ from rag import (  # noqa: E402
     session_history,
     _summarize_conversation_history,
     TOPIC_SHIFT_COSINE,
+    retrieve_result_to_log_extras,
 )
 
 # Cosine band for the borderline reform-LLM gate. The lower bound matches
@@ -14798,6 +14799,15 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             "nli_verified_count": _nli_verified_count,
             "nli_unverified_count": _nli_unverified_count,
             "nli_unverified_sentences": _nli_unverified_sentences[:5],  # cap 5 para no inflar el log
+            # Campos derivados del RetrieveResult que antes quedaban fuera del
+            # log web porque gen() construye su dict manualmente en lugar de
+            # delegar a ChatTurnResult.to_log_event. Con este spread, cualquier
+            # campo nuevo que se agregue al dataclass + to_log_event aparece
+            # automáticamente en rag_queries.extra_json sin modificar este
+            # bloque. Campos cubiertos: anaphora_resolved/original/rewritten,
+            # contradiction_penalty_applied, mmr_applied, temporal_intent,
+            # decomposed/n_sub_queries/decompose_ms, llm_judge_*. (2026-05-04)
+            **retrieve_result_to_log_extras(result),
         })
 
         yield _sse("done", {

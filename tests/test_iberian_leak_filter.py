@@ -525,6 +525,40 @@ def test_stream_starters_adyacentes_arreglado():
     )
 
 
+def test_bug_serie_favorita_2026_05_05():
+    """Regresión: respuesta del chat web sobre '¿cuál es mi serie favorita?'
+    emitió portugués denso pese al system prompt. El filter tiene que
+    limpiar todos los tokens pt del output observado.
+    """
+    from rag.iberian_leak_filter import replace_iberian_leaks
+
+    leaked = (
+        "Para saber qual es a tu série favorita, te sugiero que reflitás "
+        "sobre las coisas que más gostás o las que más te identifican "
+        "para poder definir una série favorita."
+    )
+    cleaned = replace_iberian_leaks(leaked)
+    # Ninguno de estos tokens pt debería sobrevivir.
+    for pt_token in ("qual", "série", "reflitás", "coisas", "gostás"):
+        assert pt_token not in cleaned, (
+            f"token pt {pt_token!r} sobrevive en output: {cleaned!r}"
+        )
+    # Idempotencia — aplicar 2× da el mismo resultado.
+    assert replace_iberian_leaks(cleaned) == cleaned
+
+
+def test_qual_quais_y_serie_basic():
+    """Pares nuevos agregados el 2026-05-05."""
+    from rag.iberian_leak_filter import replace_iberian_leaks
+
+    assert replace_iberian_leaks("qual es") == "cuál es"
+    assert replace_iberian_leaks("quais son") == "cuáles son"
+    assert replace_iberian_leaks("série A") == "serie A"
+    assert replace_iberian_leaks("las séries") == "las series"
+    assert replace_iberian_leaks("esa coisa") == "esa cosa"
+    assert replace_iberian_leaks("las coisas") == "las cosas"
+
+
 def test_starters_auto_derivados_estan_completos():
     """Validación de la auto-derivación: para cada compound multi-palabra
     en `_IBERIAN_LEAK_REPLACEMENTS`, la primera palabra debe estar en

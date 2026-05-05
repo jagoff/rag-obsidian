@@ -432,6 +432,48 @@ _IBERIAN_LEAK_REPLACEMENTS: tuple[tuple[str, str], ...] = (
     (r"\blas\s+tus\b", "tus"),
     (r"\bel\s+tu\b", "tu"),
     (r"\bla\s+tu\b", "tu"),
+    # 2026-05-05 (bug "serie favorita"): qwen2.5:7b respondió con portugués
+    # denso sobre "¿cuál es mi serie favorita?" — output literal: "Para
+    # saber qual es a tu série favorita, te sugiero que reflitás sobre
+    # las coisas que más gostás o las que más te identifican". Todos
+    # estos tokens NO existían en el filter y no chocan con español
+    # rioplatense (grafías pt-only o conjugaciones pt-only).
+    #
+    # `qual` — pronombre interrogativo pt. En es es "cuál" (con tilde).
+    # La grafía "qual" sin tilde no existe en español ninguna variante.
+    (r"\bqual\b", "cuál"),
+    (r"\bquais\b", "cuáles"),
+    # `série` — la grafía con acento agudo en `é` SOLO existe en pt.
+    # En español es "serie" plana (sin tilde). Singular + plural.
+    (r"\bsérie\b", "serie"),
+    (r"\bséries\b", "series"),
+    # `coisa` / `coisas` — pt "cosa/cosas". La grafía con `oi` en
+    # español existe pero no en esta palabra (en es es "cosa").
+    (r"\bcoisa\b", "cosa"),
+    (r"\bcoisas\b", "cosas"),
+    # `reflitás` — conjugación pt-voseo falsa (el LLM confunde la
+    # morfología rioplatense + pt). En es rioplatense sería
+    # "reflexionés" o mejor "pensés" (más natural). Idem `reflitás` /
+    # `reflitas` / `reflitás` / `reflitires`. La raíz `reflit-` NO existe
+    # en español — el verbo es "reflexionar" con `x`.
+    (r"\brefli[tz][aá]?s?\b", "pensés"),
+    (r"\breflitires\b", "pienses"),
+    # `gostás` / `gostas` / `gosta` / `gostam` — verbo pt "gostar" (=
+    # "gustar" en es). La raíz `gost-` sin `u` no existe en español
+    # (el verbo es "gustar" con `u`). Convertir a la forma impersonal
+    # rioplatense más natural.
+    (r"\bgostás\b", "te gustan"),
+    (r"\bgostas\b", "te gustan"),
+    (r"\bgosta\b", "te gusta"),
+    (r"\bgostam\b", "les gustan"),
+    # `identificás` con grafía pt en el pronombre cliclítico — en
+    # rioplatense "identificás" es conjugación válida voseo, NO ES LEAK.
+    # NO agregar regla para esta palabra.
+    #
+    # `sugiero que + subjuntivo` — el LLM mezcló "te sugiero que
+    # reflitás" (pt voseo-ish). La corrección de `reflitás` arriba
+    # ya basta; no hace falta regla estructural.
+
     # NOTA: `\bno\b` solo NO se reemplaza (clash con negación en es). El
     # compound "<verbo> no <sust>" estilo "está no folder" es leak pt
     # común ("vive no barrio" / "queda no archivo"), pero la lista de

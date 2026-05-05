@@ -37633,8 +37633,12 @@ def prep(topic: str, k: int, folder: str | None, save: bool,
             keep_alive=chat_keep_alive(),
         ):
             parts.append(chunk.message.content)
-        # Same WA/TG-friendly link rewrite as `query --plain`.
-        click.echo(convert_obsidian_links("".join(parts)))
+        # Same WA/TG-friendly link rewrite as `query --plain`. Aplicar
+        # `replace_iberian_leaks` también acá — el non-plain path va
+        # por `render_response()` que ya filtra; el `--plain` echaba
+        # directo. Mismo patrón que `query` (audit 2026-05-04).
+        from rag.iberian_leak_filter import replace_iberian_leaks as _rilk
+        click.echo(convert_obsidian_links(_rilk("".join(parts))))
     else:
         with console.status("[dim]armando brief…[/dim]", spinner="dots"):
             # Drain the stream silently first, then redraw with link styling.
@@ -51699,7 +51703,11 @@ def serve(host: str, port: int):
                         parts.append(content)
             except Exception as exc:
                 return {"error": f"LLM falló: {exc}"}
-            answer = "".join(parts).strip()
+            # 2026-05-04: aplicar filter pt→es al output del LLM antes
+            # de cachear / persistir / devolver. `serve.tasks` no pasa
+            # por `run_parallel_post_process` (path corto sin retrieve).
+            from rag.iberian_leak_filter import replace_iberian_leaks as _rilk
+            answer = _rilk("".join(parts).strip())
             t_gen = time.perf_counter() - t_gen0
 
             query_turn_id = new_turn_id()
@@ -52226,7 +52234,12 @@ def serve(host: str, port: int):
         except Exception as exc:
             return {"error": f"llm failed: {exc}"}
         t_gen = time.perf_counter() - t0
-        answer = "".join(parts).strip()
+        # 2026-05-04: aplicar filter pt→es al output del LLM antes de
+        # persistir/devolver. `serve.chat` (chitchat path corto sin
+        # RAG retrieve) no pasaba por filter — leaks pt llegaban al
+        # cliente WhatsApp/CLI.
+        from rag.iberian_leak_filter import replace_iberian_leaks as _rilk
+        answer = _rilk("".join(parts).strip())
 
         chat_turn_id = new_turn_id()
         if sess:

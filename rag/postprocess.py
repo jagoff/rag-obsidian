@@ -653,6 +653,20 @@ def run_parallel_post_process(
     import rag as _rag
 
     wall_start = time.perf_counter()
+
+    # 2026-05-04: aplicar `replace_iberian_leaks` al `full_orig` ANTES
+    # de cualquier merge logic. Pre-fix: el filter sólo se aplicaba
+    # dentro de `_pp_task_repair`/`_pp_task_critique` cuando esos
+    # task ejecutaban; si ambos eran skipped (fast_path + no critique +
+    # citations OK) → `result.full` quedaba con el output RAW del LLM
+    # (con leaks pt potenciales). El bug era visible en `serve.tasks`
+    # / `serve.chat` (web/server.py /api/chat-tasks) y cualquier
+    # consumer de `pp.full` que asume "ya pasó por filter".
+    # Idempotente: si ya está limpio el filter no muta. La única
+    # razón para tenerlo en cada task individual es que repair/critique
+    # GENERAN texto nuevo (que también puede leak). Acá lo aplicamos
+    # al baseline antes de mergear cualquier outcome.
+    full_orig = replace_iberian_leaks(full_orig)
     bad = _rag.verify_citations(full_orig, metas)
 
     # Figure out which tasks to run

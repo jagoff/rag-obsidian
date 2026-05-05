@@ -70,7 +70,7 @@ def test_skip_low_confidence(tmp_vault):
 def test_skip_already_distilled(tmp_vault):
     _conv(
         tmp_vault, "done", ["00-Inbox/x.md"],
-        extra_fm="distilled_to: 03-Resources/runbooks/from-conversations/done.md\n",
+        extra_fm="distilled_to: 04-Archive/99-obsidian-system/99-AI/runbooks/from-conversations/done.md\n",
     )
     out = cd.find_orphaned_conversations(tmp_vault)
     assert not any("done" in c["conv_path"] for c in out)
@@ -81,7 +81,7 @@ def test_distill_writes_runbook_with_bot_answer(tmp_vault):
     res = cd.run_distillation(tmp_vault, apply=True, min_confidence=0.5)
     assert len(res["distilled"]) == 1
     runbook_rel = res["distilled"][0]["runbook"]
-    assert runbook_rel.startswith("03-Resources/runbooks/from-conversations/")
+    assert runbook_rel.startswith("04-Archive/99-obsidian-system/99-AI/runbooks/from-conversations/")
     rb = (tmp_vault / runbook_rel).read_text(encoding="utf-8")
     assert "type: runbook" in rb
     assert "AFT-new-account" in rb  # bot answer preserved

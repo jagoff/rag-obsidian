@@ -40,11 +40,14 @@ __all__ = [
     "run_distillation",
 ]
 
-# Donde aterrizan las notas destiladas. Subcarpeta dedicada para que el
-# user pueda inspeccionar / borrar / promover sin afectar otros runbooks
-# escritos a mano. Bajo `03-Resources/` para que el indexer las agarre
-# (no quedan excluidas por `is_excluded`).
-RUNBOOKS_DIR = "03-Resources/runbooks/from-conversations"
+# Donde aterrizan las notas destiladas. Bajo
+# `04-Archive/99-obsidian-system/99-AI/runbooks/from-conversations/`
+# para cumplir la regla CLAUDE.md global del user: "todo lo que se
+# genere por fuera de Obsidian y se genere por medio de AI o con fines
+# de AI tiene que ir a 99-AI". `is_excluded()` whitelistea
+# `99-AI/runbooks/` (subcarpeta agregada al lado de `99-AI/memory/`,
+# `99-AI/external-ingest/`).
+RUNBOOKS_DIR = "04-Archive/99-obsidian-system/99-AI/runbooks/from-conversations"
 
 # Floor de confianza para considerar destilable. Las conversations con
 # confidence_avg < threshold tienen respuestas dudosas y no las queremos

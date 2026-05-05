@@ -17,7 +17,7 @@ def tmp_vault(tmp_path):
     vault = tmp_path / "vault"
     for d in (
         "00-Inbox",
-        "03-Resources/runbooks/from-conversations",
+        "04-Archive/99-obsidian-system/99-AI/runbooks/from-conversations",
         "04-Archive/99-obsidian-system/99-AI/conversations",
     ):
         (vault / d).mkdir(parents=True)
@@ -100,7 +100,7 @@ def test_skip_when_no_overlap(tmp_vault):
 
 
 def test_hint_prefers_distilled_runbook(tmp_vault):
-    runbook_path = "03-Resources/runbooks/from-conversations/aws-cuenta.md"
+    runbook_path = "04-Archive/99-obsidian-system/99-AI/runbooks/from-conversations/aws-cuenta.md"
     _conv(
         tmp_vault, "aws-distilled",
         "como crear cuenta global aws",

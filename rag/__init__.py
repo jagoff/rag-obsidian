@@ -3424,6 +3424,7 @@ def is_excluded(rel_path: str) -> bool:
         rel_path.startswith(system_prefix + "99-Mentions/")
         or rel_path.startswith(system_prefix + "99-AI/memory/")
         or rel_path.startswith(system_prefix + "99-AI/external-ingest/")
+        or rel_path.startswith(system_prefix + "99-AI/runbooks/")
         or _conversations_indexable(rel_path)
     ):
         return True

@@ -173,6 +173,19 @@ def test_replay_query_row_empty_q_returns_regression():
     assert result["error"] == "empty_q"
 
 
+def test_replay_query_row_ts_float_normalized_to_str():
+    """ts como epoch float (SQLite REAL) debe normalizarse a ISO string en result."""
+    epoch = 1746432000.0  # 2025-05-05T08:00:00Z aprox
+    row = {"id": 100, "ts": epoch, "q": "test query", "cmd": "cli",
+           "paths_json": [], "extra_json": {}, "filters_json": {}}
+    result = _replay_query_row(row, skip_gen=True)
+    # ts debe ser str, no float
+    assert isinstance(result["ts"], str), f"expected str, got {type(result['ts'])}"
+    # debe poder slice sin TypeError
+    ts_slice = (result["ts"] or "")[:16]
+    assert len(ts_slice) == 16
+
+
 def test_replay_query_row_corpus_drift_without_force_returns_exit(sample_row: dict):
     """When corpus_hash mismatches and --force is False, return corpus_drift error."""
     sample_row["extra_json"]["corpus_hash"] = "deadbeef00000000"  # wrong hash

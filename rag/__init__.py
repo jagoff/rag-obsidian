@@ -52,6 +52,7 @@ import contextlib
 import fcntl
 import functools
 import hashlib
+import contextvars
 import heapq
 import json
 import queue

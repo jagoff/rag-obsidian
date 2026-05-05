@@ -1093,6 +1093,114 @@ def _audit_cross_source_single_source(
     return out
 
 
+def _audit_abandon_high_score(conn, days: int) -> dict:
+    """Queries donde el ranker estaba seguro pero el user se fue igual.
+
+    Detecta el patrón "content gap, no ranking gap": ``top_score >= 0.4``
+    (el pipeline encontró algo relevante) pero el outcome fue
+    ``session_outcome_weak_negative`` (el user abandonó sin interactuar).
+    Esto señala que el problema está en la **respuesta del LLM** —
+    vacía, alucinada, o que no responde la pregunta — y NO en el ranking.
+
+    Diferencia vs ranking gap: un ranking gap tiene ``top_score < 0.4``
+    — el pipeline no encontró nada relevante desde el vamos. Un content
+    gap tiene score alto pero el usuario igual se fue.
+
+    El JOIN usa ``turn_id`` de ``rag_feedback`` que tiene formato
+    ``<session_id>:<query_id>`` — se extrae el id numérico con substr
+    y se cruza contra ``rag_queries.id``.
+
+    Returns dict con shape::
+
+        {
+            "window_days": 14,
+            "count": 7,
+            "samples": [{"q": "...", "top_score": 0.55, "ts": "...", "session": "..."}, ...],
+            "alert": True,
+            "suggestion": "...",
+        }
+
+    ``alert=True`` cuando ``count >= 5``. Devuelve ``count=0, alert=False``
+    cuando no hay datos (no explota).
+    """
+    ALERT_THRESHOLD = 5
+    out: dict = {
+        "window_days": days,
+        "count": 0,
+        "samples": [],
+        "alert": False,
+        "suggestion": (
+            "Top queries donde el ranker acertó (top_score >= 0.4) "
+            "pero el user se fue igual (weak_negative). Revisar la "
+            "respuesta del LLM — ¿era vacía, alucinada, o no respondía "
+            "la pregunta? El problema está en generation, no en retrieval."
+        ),
+    }
+
+    try:
+        exists = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type=\'table\' AND name=\'rag_feedback\'"
+        ).fetchone()
+    except Exception as exc:
+        out["error"] = repr(exc)
+        return out
+    if exists is None:
+        out["error"] = "table missing: rag_feedback"
+        return out
+
+    cutoff_param = f"-{days} days"
+
+    count_row = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM rag_feedback rf
+        JOIN rag_queries rq
+          ON rq.id = CAST(substr(rf.turn_id, instr(rf.turn_id, ':') + 1) AS INTEGER)
+        WHERE json_extract(rf.extra_json, '$.implicit_loss_source')
+              = 'session_outcome_weak_negative'
+          AND rq.top_score >= 0.4
+          AND rq.ts >= datetime('now', ?)
+        """,
+        (cutoff_param,),
+    ).fetchone()
+    count = int(count_row[0] or 0)
+    out["count"] = count
+    out["alert"] = count >= ALERT_THRESHOLD
+
+    if count > 0:
+        sample_rows = conn.execute(
+            """
+            SELECT
+              substr(rq.q, 1, 80)  AS q_short,
+              rq.top_score,
+              rq.ts,
+              rq.session
+            FROM rag_feedback rf
+            JOIN rag_queries rq
+              ON rq.id = CAST(substr(rf.turn_id, instr(rf.turn_id, ':') + 1) AS INTEGER)
+            WHERE json_extract(rf.extra_json, '$.implicit_loss_source')
+                  = 'session_outcome_weak_negative'
+              AND rq.top_score >= 0.4
+              AND rq.ts >= datetime('now', ?)
+            ORDER BY rq.ts DESC
+            LIMIT 20
+            """,
+            (cutoff_param,),
+        ).fetchall()
+        out["samples"] = [
+            {
+                "q": r[0],
+                "top_score": round(float(r[1] or 0.0), 3),
+                "ts": r[2],
+                "session": r[3],
+            }
+            for r in sample_rows
+        ]
+
+    return out
+
+
 def _audit_db_size() -> dict:
     """Tamaño físico de las DBs + WAL files. Detección temprana de bloat."""
     out = {}

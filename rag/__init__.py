@@ -3850,12 +3850,54 @@ class _TimedOllamaProxy:
             # Monkey-patched (test): delegate to the module symbol so the
             # mock intercepts. Timeout is ignored — tests don't need it.
             return ollama.chat(**kwargs)
+        # MLX migration (2026-05-05): when RAG_LLM_BACKEND=mlx is set,
+        # route through the abstraction backend. Semaphore + timeout
+        # semantics still apply (timeout is moot for MLX in-process,
+        # but the helper semaphore still throttles concurrent calls).
+        # Ollama default keeps the original Client(timeout=...) path.
+        if os.environ.get("RAG_LLM_BACKEND", "ollama").lower() == "mlx":
+            if self._semaphore is not None:
+                with self._semaphore:
+                    return _mlx_chat_via_backend(**kwargs)
+            return _mlx_chat_via_backend(**kwargs)
         if self._client is None:
             self._client = ollama.Client(timeout=self._timeout)
         if self._semaphore is not None:
             with self._semaphore:
                 return self._client.chat(**kwargs)
         return self._client.chat(**kwargs)
+
+
+def _mlx_chat_via_backend(**kwargs):
+    """Route an ollama-shape `chat(**kwargs)` call through the MLX backend.
+
+    Translates ollama's `options` dict into `ChatOptions`, drops
+    ollama-only kwargs (`tools`, `think`, `logprobs`, `top_logprobs`,
+    `stream` — for MLX `stream=True` collapses to non-streaming).
+    Preserves `keep_alive` and `format` semantics.
+    """
+    from rag.llm_backend import ChatOptions, get_backend
+
+    options_dict = kwargs.get("options") or {}
+    if hasattr(options_dict, "model_dump"):
+        options_dict = options_dict.model_dump(exclude_none=True)
+    elif not isinstance(options_dict, dict):
+        options_dict = dict(options_dict)
+    opts = ChatOptions(
+        temperature=float(options_dict.get("temperature", 0.0)),
+        seed=int(options_dict.get("seed", 42)),
+        num_ctx=int(options_dict.get("num_ctx", 4096)),
+        num_predict=int(options_dict.get("num_predict", 768)),
+        top_p=float(options_dict.get("top_p", 1.0)),
+        stop=tuple(options_dict.get("stop", ()) or ()),
+    )
+    return get_backend().chat(
+        model=kwargs["model"],
+        messages=kwargs.get("messages") or [],
+        options=opts,
+        keep_alive=kwargs.get("keep_alive", -1),
+        format=kwargs.get("format"),
+    )
 
 
 def _index_chat_client() -> ollama.Client:

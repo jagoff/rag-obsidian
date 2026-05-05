@@ -956,7 +956,9 @@ def _audit_harvest_candidates(conn: sqlite3.Connection, days: int = 7) -> dict:
 
 
 def _audit_cross_source_single_source(
-    ragvec_conn: sqlite3.Connection, days: int = 7
+    telemetry_conn: sqlite3.Connection,
+    ragvec_conn: sqlite3.Connection,
+    days: int = 7,
 ) -> dict:
     """Detector: queries con múltiples sources DISTINTOS en top-k pero dominio de uno.
 
@@ -1021,7 +1023,7 @@ def _audit_cross_source_single_source(
 
     # Queries con paths_json no-null y >1 path (top-k > 1).
     try:
-        queries = ragvec_conn.execute(
+        queries = telemetry_conn.execute(
             """
             SELECT ts, q, paths_json
             FROM rag_queries
@@ -1333,6 +1335,40 @@ def _render_text(report: dict) -> str:
                 out.append(f"   Sugerencia: {css['suggestion'][:90]}...")
         out.append("")
 
+    # Harvest candidates
+    hc = report.get("harvest_candidates")
+    if hc is not None:
+        if hc.get("error"):
+            out.append(f"🌾 Harvest candidates: ERROR — {hc['error']}")
+        else:
+            count = hc["count"]
+            days_w = hc["window_days"]
+            alert_icon = "⚠️ " if hc["alert"] else "✓ "
+            out.append(
+                f"{alert_icon}Harvest candidates (últimos {days_w}d, "
+                f"score 0.015–0.35, sin thumbs): {count}"
+            )
+            if count > 0:
+                out.append("   Comando copy-pasteable:")
+                out.append(f"     {hc['harvest_command']}")
+                out.append("")
+                out.append(f"   {'#':>5}  {'score':>6}  {'cmd':<12}  query")
+                for i, c in enumerate(hc["top_candidates"][:10], 1):
+                    q_truncated = (
+                        (c["q"][:55] + "…") if len(c["q"]) > 55 else c["q"]
+                    )
+                    out.append(
+                        f"   {i:>5}. {c['top_score']:>6.4f}  "
+                        f"{c['cmd']:<12}  {q_truncated!r}"
+                    )
+                if count > len(hc["top_candidates"]):
+                    remaining = count - len(hc["top_candidates"])
+                    out.append(
+                        f"          ... y {remaining} más — "
+                        "corré el comando de arriba para labelear todos."
+                    )
+        out.append("")
+
     # DB size
     db = report.get("db_size", {})
     out.append("💽 DB sizes:")
@@ -1488,9 +1524,9 @@ def main() -> int:
             report["feedback_corrective_gap"] = _audit_feedback_corrective_gap(conn)
             report["harvest_candidates"] = _audit_harvest_candidates(conn, args.days)
             # Cross-source single-source detector (requiere ragvec_conn)
-            if ragvec_conn is not None:
+            if ragvec_conn is not None and conn is not None:
                 report["cross_source_single_source"] = _audit_cross_source_single_source(
-                    ragvec_conn, args.days
+                    conn, ragvec_conn, args.days
                 )
             else:
                 report["cross_source_single_source"] = None

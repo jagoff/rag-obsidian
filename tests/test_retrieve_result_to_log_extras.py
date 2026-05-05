@@ -39,6 +39,13 @@ def test_empty_rr_returns_all_keys():
         "llm_judge_fired", "llm_judge_ms",
         "llm_judge_top_score_before", "llm_judge_top_score_after",
         "llm_judge_parse_failed", "llm_judge_n_candidates",
+        # Quick Win #4 — typo correction telemetry surfaced via el bridge
+        # (refactor 2026-05-04 evening). Reemplaza las globals legacy
+        # `_expand_last_llm_typo_*[0]` que tenían data race en el web.
+        "llm_typo_corrected", "llm_typo_original", "llm_typo_corrected_text",
+        # filters_applied surfacing (2026-05-04, agregado para que el web
+        # log_query_event reciba `filters_json` con los filtros inferidos).
+        "filters",
     }
     assert expected_keys == set(extras.keys())
 

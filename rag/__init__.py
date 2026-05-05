@@ -24833,7 +24833,7 @@ _REMIND_INTENT_RE = re.compile(
     # Triggers (rioplatense + neutro + EN). El (?:de\s+|que\s+)? acepta
     # "recordame DE llamar a Juan" / "recordame QUE llame" sin afectar
     # el resto.
-    r"^\s*(?:recordame|recuerd[aáé]me|recu[eé]rdame|acordate|hac[eé]me\s+acordar|"
+    r"^\s*(?:record[aáé]me|recuerd[aáé]me|recu[eé]rdame|acordate|hac[eé]me\s+acordar|"
     r"reminder|remember\s+me|remind\s+me|remindme)\s+"
     r"(?:de\s+|que\s+)?(?P<rest>.+)$",
     re.IGNORECASE,

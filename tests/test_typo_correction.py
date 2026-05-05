@@ -8,8 +8,14 @@ Valida:
 5. Silent fail: ollama timeout / excepción → devuelve original sin crashear.
 6. Feature gate: RAG_TYPO_CORRECTION=0 → _correct_typos_llm devuelve original sin LLM call.
 7. Integration: expand_queries("psicologa") usa la query corregida downstream.
-8. Wire-up: _expand_last_llm_typo_original queda seteado cuando hay corrección.
-9. Wire-up: _expand_last_llm_typo_original es None cuando no hay corrección.
+8. Wire-up: el ContextVar `_LLM_TYPO_LAST` queda seteado cuando hay corrección.
+9. Wire-up: el ContextVar `_LLM_TYPO_LAST` es None cuando no hay corrección.
+
+Refactor 2026-05-04 evening: las globals legacy
+`_expand_last_llm_typo_*[0]` fueron eliminadas porque tenían data race en
+el web multi-threaded. Reemplazo: `_LLM_TYPO_LAST: ContextVar` populado
+por `_correct_typos_llm` y cosechado por `_apply_typo_telemetry(rr)`
+desde `retrieve()` / `multi_retrieve()`.
 """
 from __future__ import annotations
 
@@ -151,21 +157,24 @@ class TestCorrectTyposLlm:
 # ── Tests: expand_queries integration ─────────────────────────────────────────
 
 class TestExpandQueriesTypoIntegration:
-    """Verifica que expand_queries() usa la query corregida downstream."""
+    """Verifica que expand_queries() usa la query corregida downstream.
+
+    Post-refactor 2026-05-04: el wire-up se valida via el ContextVar
+    `_LLM_TYPO_LAST` (thread-safe) en lugar de las globals legacy.
+    """
 
     def setup_method(self):
         _clear_llm_typo_cache()
         self._orig_enabled = rag._TYPO_CORRECTION_ENABLED
         rag._TYPO_CORRECTION_ENABLED = True
-        # Resetear state de logging
-        rag._expand_last_llm_typo_original[0] = None
-        rag._expand_last_llm_typo_corrected[0] = None
+        # Resetear el ContextVar antes de cada test (igual que `retrieve()`
+        # hace al inicio para garantizar state limpio).
+        rag._typo_telemetry_reset()
 
     def teardown_method(self):
         _clear_llm_typo_cache()
         rag._TYPO_CORRECTION_ENABLED = self._orig_enabled
-        rag._expand_last_llm_typo_original[0] = None
-        rag._expand_last_llm_typo_corrected[0] = None
+        rag._typo_telemetry_reset()
 
     def test_expand_queries_usa_query_corregida(self):
         """expand_queries("psicologa") → la lista resultante arranca con "psicóloga"."""
@@ -185,8 +194,9 @@ class TestExpandQueriesTypoIntegration:
             f"El primer elemento debería ser la query corregida, got {result[0]!r}"
         )
 
-    def test_expand_queries_sets_llm_typo_original_when_corrected(self):
-        """Cuando hay corrección, _expand_last_llm_typo_original[0] queda seteado."""
+    def test_expand_queries_sets_typo_ctx_when_corrected(self):
+        """Cuando hay corrección, el ContextVar `_LLM_TYPO_LAST` queda seteado
+        con el delta {original, corrected, was_corrected: True}."""
         def _fake_chat(**kwargs):
             messages = kwargs.get("messages", [])
             content = messages[0]["content"] if messages else ""
@@ -197,13 +207,14 @@ class TestExpandQueriesTypoIntegration:
         with patch.object(rag._helper_client(), "chat", side_effect=_fake_chat):
             rag.expand_queries("asor")
 
-        assert rag._expand_last_llm_typo_original[0] == "asor", (
-            "El original debería quedar en _expand_last_llm_typo_original"
-        )
-        assert rag._expand_last_llm_typo_corrected[0] == "Astor"
+        delta = rag._typo_telemetry_get()
+        assert delta is not None, "El ContextVar debería tener el delta de la corrección"
+        assert delta["original"] == "asor"
+        assert delta["corrected"] == "Astor"
+        assert delta["was_corrected"] is True
 
-    def test_expand_queries_llm_typo_original_none_when_no_correction(self):
-        """Cuando no hay corrección, _expand_last_llm_typo_original[0] es None."""
+    def test_expand_queries_typo_ctx_none_when_no_correction(self):
+        """Cuando no hay corrección, el ContextVar `_LLM_TYPO_LAST` es None."""
         def _fake_chat(**kwargs):
             messages = kwargs.get("messages", [])
             content = messages[0]["content"] if messages else ""
@@ -214,6 +225,73 @@ class TestExpandQueriesTypoIntegration:
         with patch.object(rag._helper_client(), "chat", side_effect=_fake_chat):
             rag.expand_queries("qué hago mañana")
 
-        assert rag._expand_last_llm_typo_original[0] is None, (
-            "No debería haber corrección para una query ya correcta"
+        assert rag._typo_telemetry_get() is None, (
+            "No debería haber delta para una query ya correcta"
         )
+
+    def test_apply_typo_telemetry_writes_to_retrieve_result(self):
+        """`_apply_typo_telemetry(rr)` cosecha el ContextVar y escribe los 3
+        fields (`llm_typo_corrected`, `llm_typo_original`,
+        `llm_typo_corrected_text`) al `RetrieveResult`."""
+        # Setear el CV manualmente como lo haría `_correct_typos_llm`
+        rag._LLM_TYPO_LAST.set({
+            "original": "asor",
+            "corrected": "Astor",
+            "was_corrected": True,
+        })
+        rr = rag.RetrieveResult(
+            docs=[], metas=[], scores=[], confidence=0.0,
+            search_query="Astor",
+        )
+        assert rr.llm_typo_corrected is False  # default
+        rag._apply_typo_telemetry(rr)
+        assert rr.llm_typo_corrected is True
+        assert rr.llm_typo_original == "asor"
+        assert rr.llm_typo_corrected_text == "Astor"
+
+    def test_apply_typo_telemetry_noop_when_ctx_empty(self):
+        """`_apply_typo_telemetry(rr)` no toca el RetrieveResult cuando el
+        ContextVar está en su default (None)."""
+        rag._typo_telemetry_reset()
+        rr = rag.RetrieveResult(
+            docs=[], metas=[], scores=[], confidence=0.0,
+            search_query="qué hago mañana",
+        )
+        rag._apply_typo_telemetry(rr)
+        assert rr.llm_typo_corrected is False
+        assert rr.llm_typo_original is None
+        assert rr.llm_typo_corrected_text is None
+
+    def test_thread_safe_isolation_via_contextvar(self):
+        """Dos threads concurrentes setean el ContextVar con valores
+        distintos — cada uno lee SU valor sin interferencia (data race
+        que el refactor 2026-05-04 evening eliminó)."""
+        import threading
+        import contextvars
+
+        results: dict[str, dict | None] = {}
+        barrier = threading.Barrier(2)
+
+        def _worker(name: str, original: str, corrected: str):
+            ctx = contextvars.copy_context()
+            def _set_and_read():
+                rag._LLM_TYPO_LAST.set({
+                    "original": original,
+                    "corrected": corrected,
+                    "was_corrected": True,
+                })
+                barrier.wait()  # asegurar interleaving
+                results[name] = rag._typo_telemetry_get()
+            ctx.run(_set_and_read)
+
+        t1 = threading.Thread(target=_worker, args=("A", "asor", "Astor"))
+        t2 = threading.Thread(target=_worker, args=("B", "biba", "BICA"))
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+
+        assert results["A"] == {
+            "original": "asor", "corrected": "Astor", "was_corrected": True,
+        }
+        assert results["B"] == {
+            "original": "biba", "corrected": "BICA", "was_corrected": True,
+        }

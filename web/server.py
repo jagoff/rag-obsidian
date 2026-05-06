@@ -7882,6 +7882,11 @@ def _gen_tasks_response(sess: dict, question: str, history: list[dict]):
     # 384 num_predict cap — LLM stops mid-"Vault loops". Bump to 800 so the
     # full brief lands even with both vaults' loops expanded.
     tasks_options = {**CHAT_OPTIONS, "num_predict": 800}
+    # 2026-05-05 (audit gap fix): aplicar `_IberianLeakFilter` también acá.
+    # `/api/chat` ya tenía el filter cableado (línea 14580), pero
+    # `/api/tasks` streamea delta directo sin filter — leak pt llegaba
+    # crudo al user. Mismo patrón buffered (compound across chunks).
+    iberian = _IberianLeakFilter()
     try:
         from rag import _chat_stream_dispatch
         for chunk in _chat_stream_dispatch(
@@ -7892,8 +7897,15 @@ def _gen_tasks_response(sess: dict, question: str, history: list[dict]):
         ):
             delta = chunk.message.content or ""
             if delta:
-                parts.append(delta)
-                yield _sse("token", {"delta": delta})
+                cleaned = iberian.feed(delta)
+                if cleaned:
+                    parts.append(cleaned)
+                    yield _sse("token", {"delta": cleaned})
+        # Flush residual del buffer del filter (compound que no vio boundary).
+        tail = iberian.flush()
+        if tail:
+            parts.append(tail)
+            yield _sse("token", {"delta": tail})
     except Exception as exc:
         # Ver `[chat-stream-error] phase=synthesis` en /api/chat para
         # rationale — mismo bug de observabilidad acá. Este es el brief
@@ -12548,6 +12560,24 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                                 f"stripped {_sem_strip_n} foreign char(s) "
                                 f"from cached response — filter_version "
                                 f"bump should invalidate stale entries",
+                                flush=True,
+                            )
+                        # 2026-05-05 wave-9 (audit gap fix): aplicar
+                        # `replace_iberian_leaks` también al cache hit. El
+                        # bump de `_FILTER_VERSION` invalida entries pre-fix
+                        # vía corpus_hash, pero defense-in-depth: si una
+                        # entry quedó cacheada con el viejo set de reglas
+                        # (Acredito/seja/refere/voseo grammar) la limpiamos
+                        # acá antes de yield.
+                        _sem_text_pre_iberian_len = len(_sem_text)
+                        _sem_text = _replace_iberian_leaks(_sem_text)
+                        _sem_iberian_diff = abs(_sem_text_pre_iberian_len - len(_sem_text))
+                        if _sem_iberian_diff > 0:
+                            print(
+                                f"[chat-iberian-replace] phase=cache_hit "
+                                f"diff={_sem_iberian_diff} chars in cached "
+                                f"response — filter_version bump should "
+                                f"invalidate stale entries",
                                 flush=True,
                             )
                         _sem_sources = [

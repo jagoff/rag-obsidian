@@ -150,6 +150,15 @@ def test_pre_router_false_positives_guarded():
         "eventualmente",       # evento + "...almente" → no match
         "citadino",            # cita + "dino" → no match
         "semanal",             # semana + "l" → no match
+        # Regression 2026-05-06 (user report): query opinión/conocimiento
+        # general disparaba reminders_due (`to.?do` matcheaba "todos") y
+        # weather (`\btiempos?\b` matcheaba "tiempos"). Fix: `to-do` con
+        # hyphen literal + `\btiempo\b` solo singular.
+        "cual es la mejor serie de todos los tiempos?",
+        "cual es el mejor libro de todos los tiempos",
+        "los tiempos cambian",
+        "tiempos modernos pelicula",
+        "todos los presidentes de argentina",
     ]
     for q in false_positive_queries:
         matched = _detect_tool_intent(q)

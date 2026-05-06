@@ -26,7 +26,7 @@ for the parallel embedding migration.
 ## Invariants preserved
 
 - HELPER_OPTIONS (temperature=0, seed=42) — eval reproducibility floor.
-- CHAT_OPTIONS (num_ctx=4096, num_predict=768) — VRAM-budgeted.
+- CHAT_OPTIONS (num_ctx=4096, num_predict=384) — VRAM-budgeted.
 - `keep_alive=-1` semantics → emulated via resident-process + LRU on
   the MLX side (MLX has no native keep_alive). Eviction policy:
   Qwen3-30B (~17 GB) is single-tenant (_BIG_MODELS), evicts everything
@@ -58,12 +58,38 @@ resolve between them via `MLX_MODEL_ALIAS` table.
 from __future__ import annotations
 
 import os
+import re
 import threading
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
 
 # ---------------------------------------------------------------------------
+# Qwen3 <think> block stripping
+# ---------------------------------------------------------------------------
+
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", flags=re.DOTALL | re.IGNORECASE)
+
+
+def strip_think_blocks(text: str) -> str:
+    """Remove Qwen3-style <think>...</think> reasoning blocks before JSON parse.
+
+    Qwen3-30B (HQ tier MLX) can emit thinking blocks before the actual
+    response when greedy decoding falls into a thinking-mode pattern.
+    These blocks contain prose AND brace characters that confuse JSON
+    extractors and structured-output parsers downstream.
+
+    Safe for Ollama output (passthrough when no <think> tag is present).
+    Does NOT strip unclosed tags -- incomplete output is left as-is.
+    """
+    if not text or "<think>" not in text.lower():
+        return text
+    return _THINK_BLOCK_RE.sub("", text).strip()
+
+
+# ---------------------------------------------------------------------------
+# Model aliases: Ollama name <-> MLX HuggingFace ID----------------------------------------------------------------
 # Model aliases: Ollama name ↔ MLX HuggingFace ID
 # ---------------------------------------------------------------------------
 
@@ -112,7 +138,11 @@ class ChatOptions:
     temperature: float = 0.0
     seed: int = 42
     num_ctx: int = 4096
-    num_predict: int = 768
+    # 384 matches CHAT_OPTIONS["num_predict"] in rag/__init__.py (median
+    # answer_len=38 chars, p90 approx 200 tokens). A default of 768 caused
+    # callers passing options={} without num_predict to generate 2x more
+    # tokens under MLX than under Ollama (latency + quality regression).
+    num_predict: int = 384
     top_p: float = 1.0
     stop: tuple[str, ...] = ()
 
@@ -402,7 +432,57 @@ class MLXBackend(LLMBackend):
         self._last_used: dict[str, float] = {}
         self._watchdog_thread: threading.Thread | None = None
         self._watchdog_stop = threading.Event()
+        # Fix #4: sampler cache — same (temp, top_p) reuses the same sampler object
+        self._sampler_cache: dict[tuple[float, float], Any] = {}
         self._start_watchdog()
+
+    def _start_watchdog(self) -> None:
+        """Daemon thread: evict idle MLX models cada _idle_ttl/4 segundos.
+
+        Idempotente: chequea `_watchdog_thread` para no spawnear múltiples
+        threads. Daemon=True → muere al exit del proceso. Errores en el
+        loop se swallowean — el watchdog NUNCA debe matar el proceso si
+        la eviction falla.
+
+        Disable: `RAG_MLX_IDLE_TTL=0` (chequea antes de spawnear).
+        """
+        if self._idle_ttl <= 0:
+            return
+        if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
+            return
+        # Check 4× per TTL window. Min 60s para no consumir CPU.
+        interval = max(60, self._idle_ttl // 4)
+
+        def _loop() -> None:
+            while not self._watchdog_stop.wait(interval):
+                try:
+                    self._evict_idle()
+                except Exception:
+                    # Watchdog NUNCA raises. Silent-fail mantiene proceso vivo.
+                    pass
+
+        self._watchdog_thread = threading.Thread(
+            target=_loop, name="mlx-idle-watchdog", daemon=True,
+        )
+        self._watchdog_thread.start()
+
+    def _evict_idle(self) -> None:
+        """Evict resident models cuyo last_used > _idle_ttl segundos ago.
+
+        Llamado por el watchdog daemon. Mantiene `_loaded` y `_last_used`
+        en sync. No-op si TTL <= 0.
+        """
+        if self._idle_ttl <= 0:
+            return
+        now = time.monotonic()
+        with self._loaded_lock:
+            stale = [
+                mid for mid, ts in self._last_used.items()
+                if (now - ts) > self._idle_ttl and mid in self._loaded
+            ]
+            for mid in stale:
+                self._loaded.pop(mid, None)
+                self._last_used.pop(mid, None)
 
     def _load(self, model_id: str) -> tuple[Any, Any]:
         """Get or load (model, tokenizer) for `model_id`. LRU bump on hit.
@@ -427,6 +507,7 @@ class MLXBackend(LLMBackend):
         with self._loaded_lock:
             if canonical in self._loaded:
                 self._loaded.move_to_end(canonical)
+                self._last_used[canonical] = time.monotonic()
                 return self._loaded[canonical]
             # Eviction BEFORE load (free RAM first); reentrant via RLock.
             self._evict_for(canonical)
@@ -443,8 +524,10 @@ class MLXBackend(LLMBackend):
         with self._loaded_lock:
             if canonical in self._loaded:
                 self._loaded.move_to_end(canonical)
+                self._last_used[canonical] = time.monotonic()
                 return self._loaded[canonical]
             self._loaded[canonical] = (model, tokenizer)
+            self._last_used[canonical] = time.monotonic()
             return (model, tokenizer)
 
     def _evict_for(self, incoming: str) -> None:
@@ -461,15 +544,18 @@ class MLXBackend(LLMBackend):
                 for k in list(self._loaded.keys()):
                     if k != incoming:
                         self._loaded.pop(k, None)
+                        self._last_used.pop(k, None)
                 return
 
             # Incoming is small: evict any big, then LRU-trim small ones.
             for k in list(self._loaded.keys()):
                 if k in self._BIG_MODELS:
                     self._loaded.pop(k, None)
+                    self._last_used.pop(k, None)
 
             while len(self._loaded) >= self._MAX_SMALL_LOADED:
-                self._loaded.popitem(last=False)  # evict LRU (oldest)
+                k, _ = self._loaded.popitem(last=False)  # evict LRU (oldest)
+                self._last_used.pop(k, None)
 
     def chat(
         self,
@@ -486,6 +572,7 @@ class MLXBackend(LLMBackend):
         mlx_model, tokenizer = self._load(model)
         prompt = self._apply_chat_template(tokenizer, messages, format=format)
         text = self._mlx_generate(mlx_model, tokenizer, prompt, opts)
+        self._bump_last_used(model)
         if format == "json":
             text = self._extract_json(text)
         return ChatResponse(
@@ -532,6 +619,7 @@ class MLXBackend(LLMBackend):
                 done=False,
             )
 
+        self._bump_last_used(model)
         yield ChatResponse(
             model=ollama_model,
             message=Message(role="assistant", content=""),
@@ -586,12 +674,11 @@ class MLXBackend(LLMBackend):
             msgs, add_generation_prompt=True, tokenize=False
         )
 
-    @staticmethod
-    def _mlx_generate(model: Any, tokenizer: Any, prompt: str, opts: ChatOptions) -> str:
+    def _mlx_generate(self, model: Any, tokenizer: Any, prompt: str, opts: ChatOptions) -> str:
+        """Run MLX generate with a cached sampler (Fix #4)."""
         from mlx_lm import generate  # type: ignore[import-not-found]
-        from mlx_lm.sample_utils import make_sampler  # type: ignore[import-not-found]
 
-        sampler = make_sampler(temp=opts.temperature, top_p=opts.top_p)
+        sampler = self._get_sampler(opts.temperature, opts.top_p)
         # Seed for reproducibility when sampling (temp>0). Greedy (temp=0)
         # is bit-exact deterministic on same hardware regardless of seed.
         if opts.temperature > 0:
@@ -610,14 +697,15 @@ class MLXBackend(LLMBackend):
 
     @staticmethod
     def _extract_json(text: str) -> str:
-        """Best-effort: strip markdown fences + isolate first {...} block.
+        """Best-effort: strip think blocks + fences + isolate first {...} block.
 
-        Models without native grammar mode often wrap JSON in ```json ... ```
-        or prepend prose. The downstream parser in `rag/__init__.py` already
-        handles malformed JSON via repair; this just gives it a cleaner
-        starting point.
+        Qwen3-30B (HQ tier) can emit <think>...</think> blocks before the JSON
+        -- strip those first since they may contain brace characters that confuse
+        the naive {{ ... }} slicer. Then strips markdown fences.
+        The downstream parser in `rag/__init__.py` handles malformed JSON via
+        repair; this just gives it a cleaner starting point.
         """
-        s = text.strip()
+        s = strip_think_blocks(text.strip())
         # Strip ```json ... ``` fences
         if s.startswith("```"):
             s = s.split("\n", 1)[-1] if "\n" in s else s
@@ -700,6 +788,50 @@ class MLXBackend(LLMBackend):
         except Exception:
             return False
 
+    def _get_sampler(self, temperature: float, top_p: float) -> Any:
+        """Return a cached make_sampler() result for (temperature, top_p).
+
+        The HELPER path always calls with temp=0, top_p=1.0 — the same
+        sampler object is reused across requests (Fix #4). Thread-safe via
+        a dedicated lock separate from `_loaded_lock`.
+        """
+        key = (float(temperature), float(top_p))
+        try:
+            # Fast path: already cached
+            cached = self._sampler_cache.get(key)
+            if cached is not None:
+                return cached
+        except AttributeError:
+            # First call before _sampler_cache is set (shouldn't happen,
+            # but defensively fall through to create)
+            pass
+        from mlx_lm.sample_utils import make_sampler  # type: ignore[import-not-found]
+
+        sampler = make_sampler(temp=temperature, top_p=top_p)
+        try:
+            self._sampler_cache[key] = sampler
+        except AttributeError:
+            pass
+        return sampler
+
+    def _bump_last_used(self, model: str) -> None:
+        """Update `_last_used` timestamp for `model` post-generation.
+
+        Called at the end of `chat()` and `chat_stream()` so the idle-unload
+        TTL restarts from the *end* of inference, not the start.
+        """
+        canonical = to_mlx(model)
+        with self._loaded_lock:
+            if canonical in self._loaded:
+                self._last_used[canonical] = time.monotonic()
+
+    def shutdown_watchdog(self) -> None:
+        """Signal the watchdog thread to stop. Call from reset_backend() in tests."""
+        self._watchdog_stop.set()
+        if self._watchdog_thread is not None:
+            self._watchdog_thread.join(timeout=2)
+            self._watchdog_thread = None
+
 
 # ---------------------------------------------------------------------------
 # Backend resolver
@@ -735,6 +867,8 @@ def get_backend() -> LLMBackend:
 def reset_backend() -> None:
     """Force re-resolution on next get_backend() call. Tests only."""
     global _BACKEND_SINGLETON
+    if isinstance(_BACKEND_SINGLETON, MLXBackend):
+        _BACKEND_SINGLETON.shutdown_watchdog()
     _BACKEND_SINGLETON = None
 
 
@@ -747,6 +881,7 @@ __all__ = [
     "OllamaBackend",
     "get_backend",
     "reset_backend",
+    "strip_think_blocks",
     "to_mlx",
     "to_ollama",
 ]

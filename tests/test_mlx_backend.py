@@ -137,7 +137,8 @@ def test_chat_options_defaults():
     assert opts.temperature == 0.0
     assert opts.seed == 42
     assert opts.num_ctx == 4096
-    assert opts.num_predict == 768
+    # 384 matches CHAT_OPTIONS["num_predict"] in rag/__init__.py — was 768 (mismatch bug)
+    assert opts.num_predict == 384
 
 
 # ---------------------------------------------------------------------------

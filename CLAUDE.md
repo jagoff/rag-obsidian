@@ -45,7 +45,7 @@ Migración Ollama → MLX para los 4 LLMs locales. **Estado**: Olas 0+1+2+3 comp
 
 **Embeddings (bge-m3) NO entran en este scope** — migración separada en [`99-AI/system/embedding-swap-qwen3-8b/`](obsidian://open?vault=Notes&file=04-Archive%2F99-obsidian-system%2F99-AI%2Fsystem%2Fembedding-swap-qwen3-8b%2Fplan).
 
-**Gate de no-regresión** (Ola 4): `rag eval` con bootstrap CIs vs floor actual (singles `hit@5 53.70% [40.74, 66.67]`, chains `hit@5 72.00% [52.00, 88.00]`). Correr con ambos backends antes de flipear default en plists. CIs no-overlapping abajo del floor → NO flipear.
+**Gate de no-regresión** (Ola 4 cerrado 2026-05-05): MLX `singles 56.60% [43.40, 69.81] · chains 72.00% [56.00, 88.00]` SOBRE el floor PRE-MLX. Cutover firme. Para futuras migraciones: `rag eval --latency` con bootstrap CIs vs floor actual; CIs no-overlapping abajo del floor → rollback.
 
 Doc técnica completa en [`docs/mlx-migration.md`](docs/mlx-migration.md).
 
@@ -547,13 +547,17 @@ Promote checklist: (1) `RAG_CONTEXTUAL_RETRIEVAL=1 rag index --reset --contextua
 
 ## Eval baselines
 
-**Floor actual PRE-MLX (2026-04-27, pre-cutover 2026-05-05, post-golden-remap vault reorg, commit `6f8994f`)**:
+**Floor actual MLX (2026-05-05, post-Ola 3 cutover, post-typo-corrector-fix `48ababf`)**:
 
-- Singles: `hit@5 53.70% [40.74, 66.67] · MRR 0.528 [0.407, 0.657] · n=54`
-- Chains: `hit@5 72.00% [52.00, 88.00] · MRR 0.633-0.653 · chain_success 33.33% [11.11, 66.67] · turns=25 chains=9`
-- **Lower-CI-bound gate** (nightly online-tune auto-rollback): singles < 40.74% OR chains < 52.00%
+- Singles: `hit@5 56.60% [43.40, 69.81] · MRR 0.535 [0.403, 0.667] · n=53`
+- Chains: `hit@5 72.00% [56.00, 88.00] · MRR 0.617 [0.447, 0.773]`
+- **Lower-CI-bound gate** (nightly online-tune auto-rollback): singles < 43.40% OR chains < 56.00%
 
-La caída vs floor previo (singles 71.67% → 53.70%, chains 86.67% → 72.00%) NO es regresión del pipeline — es reducción del n + remoción de goldens fáciles que ya no existen post-vault-reorg.
+**Floor PRE-MLX (2026-04-27, archivado)**: singles `53.70% [40.74, 66.67]`, chains `72.00% [52.00, 88.00]`. Post-cutover MLX supera ambos (+2.9pp singles, chains match con CI más estrecho).
+
+**Bug encontrado durante Ola 4 cutover (2026-05-05)**: el typo corrector `_correct_typos_llm` (qwen2.5:3b) parafrasea agresivamente bajo MLX backend (`charla→chatea`, `fantastical→fantastic`, introduce typos). Drop singles 54.72% Ollama → 5.66% MLX cuando typo corrector ON. Fix: `_resolve_typo_correction_default()` selecciona default según `RAG_LLM_BACKEND` — OFF para mlx, ON para ollama. Override `RAG_TYPO_CORRECTION=1` siempre gana.
+
+La caída vs floor histórico (singles 71.67% → 53.70%, chains 86.67% → 72.00%) NO es regresión del pipeline — es reducción del n + remoción de goldens fáciles que ya no existen post-vault-reorg.
 
 `rag eval --latency --max-p95-ms N` agrega P50/P95/P99 + CI gate. Bootstrap: 1000 resamples, seed=42.
 

@@ -27,8 +27,10 @@ install:  ## Re-install the editable uv tool (after Python code changes)
 	# `dep gliner not available` cada corrida y la feature de entity-aware
 	# retrieval queda silentemente desactivada — bug operativo encontrado
 	# en producción 2026-04-25, ahora bake-eado al install default.
+	# `mlx` agrega los wheels de mlx-lm (LLM backend activo desde Ola 5
+	# hard-cutover 2026-05-06; sin esto el backend no levanta).
 	# `spotify` queda como opt-in puro porque requiere config OAuth manual.
-	uv tool install --reinstall --editable '.[entities,stt]'
+	uv tool install --reinstall --editable '.[entities,stt,mlx]'
 
 test:  ## Fast suite: pytest -q skipping @pytest.mark.slow
 	.venv/bin/python -m pytest tests/ -q -m "not slow" --tb=short

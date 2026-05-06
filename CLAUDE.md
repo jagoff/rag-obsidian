@@ -2,9 +2,11 @@
 
 Local RAG sobre vault Obsidian. Layout post-split (2026-05-04): `rag/` paquete (`__init__.py` 60.2k LOC core + sub-modules `plists.py`, `cross_source_etls.py`, `postprocess.py`, `archive.py`, `anticipatory.py`, `brief_schedule.py`, `contradictions_penalty.py`, `voice_brief.py`, `whisper.py`, `wa_scheduled.py`, `wa_tasks.py`, `mmr_diversification.py`, `today_correlator.py`, `vault_health.py`, etc) + `mcp_server.py` (thin wrapper) + `web/` (FastAPI server.py 20.6k LOC + static) + `tests/` (6,031 tests, 395 archivos). Re-export pattern: `__init__.py` hace `from rag.X import *  # noqa: F401, F403` con `__all__` explícito en cada sub-módulo (preserva 100% compat).
 
-Entry points (instalados via `uv tool install --reinstall --editable '.[entities,stt,spotify,mlx]'`):
+Entry points (instalados via `uv tool install --reinstall --editable '.[entities,stt,mlx]'`):
 - `rag` — CLI indexing/querying/chat/productivity/automation
 - `obsidian-rag-mcp` — MCP server (`rag_query`, `rag_read_note`, `rag_list_notes`, `rag_links`, `rag_stats`)
+
+Extras default: `entities` (gliner NER), `stt` (faster-whisper), `mlx` (LLM backend activo). `spotify` queda opt-in puro — agregarlo solo si OAuth está configurado: `'.[entities,stt,mlx,spotify]'`.
 
 Local-first sobre VAULT + corpus locales (sqlite-vec + Ollama/MLX + sentence-transformers). Cross-source ingesters cloud (Gmail/Calendar/Drive) requieren creds OAuth en `~/.{gmail,calendar,gdrive}-mcp/`; sin esas creds silent-fail y corpus local sigue funcionando. WhatsApp + Reminders stay local.
 
@@ -118,10 +120,59 @@ PWA instalable iOS Safari → home screen. Wiring: [`web/static/manifest.webmani
 
 **Seguridad**: server NO tiene auth. Solo activar en WiFi privado.
 
+## Make targets (dev loop)
+
+| Target | Comando | Cuándo |
+|---|---|---|
+| `make install` | `uv tool install --reinstall --editable '.[entities,stt,mlx]'` | Después de cambios en código Python |
+| `make test` | `pytest -q -m "not slow" --tb=short` | Default loop iteración |
+| `make test-fast` | xdist `-n auto`, skip slow | Suite paralela cuando importan minutos |
+| `make test-all` | suite completa incluido `slow` | Pre-push, sequential (slow tests share state) |
+| `make lint` | `uvx ruff check` (paridad CI) | Antes de commit |
+| `make format` | `ruff --fix` + `ruff format` | Auto-fix safe + estilo |
+| `make eval` | `rag eval --latency --max-p95-ms 2500` | Validar floor + perf gate (~24min warm) |
+| `make eval-fast` | `rag eval` sin latency | Solo hit@k + MRR (más rápido) |
+| `make tune` | dry-run `rag tune --samples 500` | Ver ranker.json winner sin persistir |
+| `make tune-apply` | `rag tune --apply --yes` | Persiste winner + backup |
+| `make silent-errors` | tail últimos 20 silent errors | Diagnóstico rápido `silent_errors.jsonl` |
+| `make silent-summary` | agrega por `(where, exc_type)` | Audit telemetry |
+| `make drift-watcher` | corre `scripts/drift_watcher.py` manual | Alerta si singles_hit5 cae >5pp run-over-run |
+| `make coverage` | report term + HTML en `htmlcov/` | Audit cobertura |
+
+`.venv/bin/python` es el intérprete autoritativo para tests + eval; `uv tool install` solo afecta los entry points globales (`rag`, `obsidian-rag-mcp`).
+
+### Web server dev loop
+
+Para iterar sobre [`web/server.py`](web/server.py) sin tocar el plist:
+
+```bash
+launchctl bootout gui/$(id -u)/com.fer.obsidian-rag-web      # parar el daemon
+.venv/bin/python -m uvicorn web.server:app --reload --port 8765
+# al terminar:
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fer.obsidian-rag-web.plist
+```
+
+### Tests — single file / marker / debug
+
+```bash
+.venv/bin/python -m pytest tests/test_foo.py -q                    # un archivo
+.venv/bin/python -m pytest tests/test_foo.py::test_bar -q          # un test
+.venv/bin/python -m pytest tests/test_foo.py -k "name_substring" -x -vv   # primer fail, verbose
+.venv/bin/python -m pytest -m "requires_mlx"                       # por marker
+.venv/bin/python -m pytest tests/test_foo.py -q --pdb              # drop a pdb on fail
+```
+
+Conftest autouse fixture `_force_ollama_backend_for_tests` fuerza `RAG_LLM_BACKEND=ollama` por test — los tests que necesitan el mock fake-Ollama deben monkeypatchear `ollama.chat` directamente.
+
 ## Commands (canonical subset)
 
 ```bash
-uv tool install --reinstall --editable '.[entities,stt,spotify,mlx]'
+uv tool install --reinstall --editable '.[entities,stt,mlx]'
+
+# Bootstrap (idempotente)
+rag start                                                        # levanta todos los daemons + RagNet + catch-up
+rag stop                                                         # frena todo
+rag health                                                       # snapshot unificado: corpus, latencia, feedback, calibration
 
 # Core
 rag index [--reset] [--no-contradict] [--vault NAME]
@@ -152,7 +203,7 @@ rag brief stats, rag brief schedule [status|reset|auto-tune]
 rag voice-brief generate, rag whisper {stats|vocab|patterns|export|import}
 
 # Maintenance
-rag maintenance, rag free, rag setup, rag stop
+rag maintenance, rag free, rag setup
 rag daemons {status|reconcile|doctor|retry|kickstart-overdue}
 python scripts/audit_telemetry_health.py --days 7  # PRIMER comando antes de "auditá el sistema"
 
@@ -178,7 +229,7 @@ Catálogo completo (47+ vars adicionales) en [`docs/env-vars-catalog.md`](docs/e
 - `RAG_MLX_IDLE_TTL` (default 1800s), `RAG_MLX_IDLE_DISABLE=1`.
 
 **Performance + memoria**:
-- `OLLAMA_KEEP_ALIVE=-1` (default forever). Auto-clamp a `_LARGE_KEEP_ALIVE="20m"` para `_LARGE_CHAT_MODELS` (command-r, qwen3:30b-a3b). Override: `RAG_KEEP_ALIVE_LARGE_MODEL`.
+- `OLLAMA_KEEP_ALIVE=-1` (default forever). Auto-clamp a `_LARGE_KEEP_ALIVE="20m"` para `_LARGE_CHAT_MODELS` (command-r, qwen3:30b-a3b). Override: `RAG_KEEP_ALIVE_LARGE_MODEL`. **Nota post-MLX cutover (2026-05-06)**: estos modelos están purgados del disco — el clamp es código defensivo que solo dispara si alguien hace re-pull para rollback. En estado actual (default `RAG_LLM_BACKEND=mlx`) nunca se ejecuta.
 - `RAG_MEMORY_PRESSURE_DISABLE=1` — desactiva watchdog (default ON, threshold 85%, interval 60s). Bajo pressure: unload chat + force-unload reranker (bypassa `RAG_RERANKER_NEVER_UNLOAD`).
 - `RAG_RERANKER_NEVER_UNLOAD=1` — pina reranker en MPS VRAM. Cost ~2-3 GB.
 - `RAG_RERANKER_IDLE_TTL=900` — segundos idle-unload.
@@ -248,7 +299,7 @@ Detalle completo del pipeline en [`docs/retrieval-internals.md`](docs/retrieval-
 ```
 query → typo correct → anaphora resolve → classify_intent → infer_filters
       → adaptive routing → decomposition gate → expand_queries (qwen2.5:3b)
-      → embed bge-m3 → sqlite-vec sem + BM25 → RRF + dedup → expand to parent
+      → embed qwen3-embedding:0.6b (1024d, vía Ollama) → sqlite-vec sem + BM25 → RRF + dedup → expand to parent
       → rerank (bge-reranker-v2-m3, MPS+fp32) → LLM judge gate
       → score loop (recency/intent/behavior/contradiction/feedback)
       → MMR diversification → contradiction penalty → seen_titles soft penalty (-0.1)
@@ -258,7 +309,7 @@ query → typo correct → anaphora resolve → classify_intent → infer_filter
 
 **Generation prompts**: `SYSTEM_RULES_STRICT` (default semantic), `SYSTEM_RULES` (`--loose`), `SYSTEM_RULES_LOOKUP` (count/list/recent/agenda), `SYSTEM_RULES_SYNTHESIS`, `SYSTEM_RULES_COMPARISON`. Routed via `system_prompt_for_intent(intent, loose)`. `_CHUNK_AS_DATA_RULE` (REGLA 0) + `_NAME_PRESERVATION_RULE` previenen prompt injection + name corruption.
 
-**`_FILTER_VERSION`** ([`rag/__init__.py:6017`](rag/__init__.py)): bumpear cuando cambia regex que afecta tools_fired, `_WEB_SYSTEM_PROMPT`/REGLA N, traducción descriptions inyectada. Naming: `wave<N>-<YYYY-MM-DD>`. Detalle en [`docs/wave-8-gotchas.md`](docs/wave-8-gotchas.md).
+**`_FILTER_VERSION`** ([`rag/__init__.py`](rag/__init__.py) — `grep -n '_FILTER_VERSION\s*=' rag/__init__.py` para ubicar; valor actual `wave9-2026-05-05`): bumpear cuando cambia regex que afecta tools_fired, `_WEB_SYSTEM_PROMPT`/REGLA N, traducción descriptions inyectada. Naming: `wave<N>-<YYYY-MM-DD>`. Detalle en [`docs/wave-8-gotchas.md`](docs/wave-8-gotchas.md).
 
 ## Eval baselines (floor MLX 2026-05-05)
 

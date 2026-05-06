@@ -206,6 +206,8 @@ def test_calendar_signal_score_inversely_proportional(monkeypatch, state_db):
 # ── Echo signal ──────────────────────────────────────────────────────────────
 
 def test_echo_no_recent_notes(monkeypatch, tmp_path):
+    # Mock memory gate (2026-05-05 fix)
+    monkeypatch.setattr(rag, "_system_memory_used_pct", lambda: 50.0)
     monkeypatch.setattr(rag, "_resolve_vault_path", lambda: tmp_path)
     out = rag._anticipate_signal_echo(datetime.now())
     assert out == []
@@ -218,6 +220,8 @@ def test_echo_emits_when_old_match(monkeypatch, tmp_path, state_db):
     body = "x" * 600  # ≥500 chars
     today_note.write_text(body, encoding="utf-8")
 
+    # Mock memory gate (2026-05-05 fix)
+    monkeypatch.setattr(rag, "_system_memory_used_pct", lambda: 50.0)
     monkeypatch.setattr(rag, "_resolve_vault_path", lambda: vault)
     monkeypatch.setattr(rag, "get_db", lambda: state_db)
     # Mock retrieve to return an old note
@@ -249,6 +253,8 @@ def test_echo_below_cosine_threshold_skipped(monkeypatch, tmp_path, state_db):
     today_note = vault / "today.md"
     today_note.write_text("x" * 600, encoding="utf-8")
 
+    # Mock memory gate (2026-05-05 fix)
+    monkeypatch.setattr(rag, "_system_memory_used_pct", lambda: 50.0)
     monkeypatch.setattr(rag, "_resolve_vault_path", lambda: vault)
     monkeypatch.setattr(rag, "get_db", lambda: state_db)
     monkeypatch.setattr(
@@ -270,6 +276,8 @@ def test_echo_skips_same_file(monkeypatch, tmp_path, state_db):
     today_note = vault / "today.md"
     today_note.write_text("x" * 600, encoding="utf-8")
 
+    # Mock memory gate (2026-05-05 fix)
+    monkeypatch.setattr(rag, "_system_memory_used_pct", lambda: 50.0)
     monkeypatch.setattr(rag, "_resolve_vault_path", lambda: vault)
     monkeypatch.setattr(rag, "get_db", lambda: state_db)
     monkeypatch.setattr(

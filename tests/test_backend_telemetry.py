@@ -1,13 +1,11 @@
 """Tests para el campo `backend` en rag_queries.extra_json.
 
-Verifica que los 4 dispatch points (TimedOllamaProxy.chat,
-_mlx_chat_via_backend, _mlx_or_ollama_chat, _chat_stream_dispatch)
-setean el ContextVar `_ACTIVE_BACKEND_CTX`, y que `log_query_event`
-lo lee y lo agrega a extra_json antes de encolar la write.
-
-Todos los tests usan RAG_LLM_BACKEND=ollama (via autouse fixture del
-conftest) para no cargar modelos MLX reales. Hay tests explícitos que
-simulan backend=mlx cambiando el env var en el scope del test.
+Post-Ola 7 (2026-05-06): `OllamaBackend` retirado. Los dispatch points
+activos son `_mlx_chat`, `_mlx_chat_via_backend`, `_chat_stream_dispatch`
+— todos setean el ContextVar `_ACTIVE_BACKEND_CTX` a "mlx". Los tests
+de fallback ollama->mlx siguen midiendo el ContextVar manualmente
+(via `_mark_backend`) porque `fallback_reason` sigue siendo parte del
+schema operativo (telemetría histórica + futuras versiones de backend).
 """
 import json
 import os
@@ -214,55 +212,34 @@ class TestLogQueryEventBackendField:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.no_auto_mlx_stub
 class TestDispatchPointsMarkBackend:
     """Verifica que los dispatch points setean el CV correctamente.
 
-    No se invoca LLM real — solo verifica el CV via _get_backend_telemetry().
-    Se usa el patch de ollama.chat = lambda para que no haga request real.
+    No se invoca LLM real — solo verifica el CV via _get_backend_telemetry()
+    despues de mockear `_mlx_chat_via_backend` para que no toque MLX.
+
+    `no_auto_mlx_stub` marker: la fixture autouse del conftest stubea
+    `_mlx_chat` para tests indirectos. Acá necesitamos ejercitar el
+    `_mlx_chat` real (con su `_mark_backend` side-effect), así que
+    optamos out.
     """
 
-    def test_timed_proxy_ollama_marks_ollama(self, monkeypatch, _reset_backend_cv):
-        """TimedOllamaProxy.chat con backend Ollama marca backend=ollama.
-
-        _helper_client() es una funcion, no una instancia. El proxy usa
-        ollama.chat cuando esta mockeado (branch test), por lo que el mark
-        se bypasea. El test verifica que la llamada no crashea y que el
-        comportamiento del mock (CV en None) es el esperado.
-        """
-        monkeypatch.setenv("RAG_LLM_BACKEND", "ollama")
-
-        # Parchear ollama.chat para que el proxy use el mock (no el Client)
+    def test_mlx_chat_marks_backend(self, monkeypatch, _reset_backend_cv):
+        """`_mlx_chat` setea backend=mlx en el ContextVar."""
+        monkeypatch.setenv("RAG_LLM_BACKEND", "mlx")
         mock_resp = type("R", (), {"message": type("M", (), {"content": "ok"})()})()
-        monkeypatch.setattr(rag.ollama, "chat", lambda **kw: mock_resp)
+        # Bypass MLX backend real — mockear el via_backend directamente.
+        monkeypatch.setattr(rag, "_mlx_chat_via_backend", lambda **kw: mock_resp)
 
-        # _helper_client() retorna un _TimedOllamaProxy
-        proxy = rag._helper_client()
-        proxy.chat(model="qwen2.5:3b", messages=[])
-
+        rag._mlx_chat(model="qwen2.5:3b", messages=[])
         bk = rag._get_backend_telemetry()
-        # Con mock activo (ollama.chat != _ORIGINAL_OLLAMA_CHAT), el branch
-        # test del proxy bypasea el mark. El CV queda en None — comportamiento
-        # correcto en modo test (mock intercepta antes del dispatch mark).
-        assert bk is None  # mock intercepta antes del dispatch mark
-
-    def test_mlx_or_ollama_chat_ollama_env_marks_ollama(
-        self, monkeypatch, _reset_backend_cv
-    ):
-        """_mlx_or_ollama_chat con RAG_LLM_BACKEND=ollama -> no es mlx path -> mark ollama."""
-        monkeypatch.setenv("RAG_LLM_BACKEND", "ollama")
-        mock_resp = type("R", (), {"message": type("M", (), {"content": "ok"})()})()
-        monkeypatch.setattr(rag.ollama, "chat", lambda **kw: mock_resp)
-
-        rag._mlx_or_ollama_chat(model="qwen2.5:3b", messages=[])
-        # Con mock, el branch test intercepta antes del mark
-        bk = rag._get_backend_telemetry()
-        assert bk is None  # mock intercepta
+        assert bk is not None
+        assert bk["backend"] == "mlx"
 
     def test_mark_backend_called_directly_in_mlx_path(self, monkeypatch, _reset_backend_cv):
-        """Simula el path MLX en _mlx_or_ollama_chat sin llamar al backend real."""
+        """Simula el dispatch MLX llamando `_mark_backend` directo."""
         monkeypatch.setenv("RAG_LLM_BACKEND", "mlx")
-        # NO mockear ollama.chat (que triggerea el branch test y bypasea el mark)
-        # Llamar _mark_backend directamente como lo haria el dispatch si llegara al if mlx:
         rag._mark_backend("mlx")
         bk = rag._get_backend_telemetry()
         assert bk is not None

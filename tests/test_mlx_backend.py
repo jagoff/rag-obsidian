@@ -1,15 +1,11 @@
 """Tests for rag/llm_backend.py — LLMBackend abstraction.
 
-All tests run without MLX or a live Ollama daemon via mocks.
+Post-Ola 7 (2026-05-06): `OllamaBackend` retirado. Solo MLX vivo.
 `test_get_backend_mlx_when_env_set` uses pytest.importorskip because
 it exercises MLXBackend.__init__ which does `import mlx_lm` eagerly.
 """
 
 from __future__ import annotations
-
-import sys
-import types
-import unittest.mock as mock
 
 import pytest
 
@@ -18,7 +14,6 @@ from rag.llm_backend import (
     OLLAMA_MODEL_ALIAS,
     ChatOptions,
     MLXBackend,
-    OllamaBackend,
     get_backend,
     reset_backend,
     to_mlx,
@@ -35,20 +30,6 @@ def _reset(monkeypatch):
     reset_backend()
     yield
     reset_backend()
-
-
-# ---------------------------------------------------------------------------
-# Helper: fake ollama module so OllamaBackend.__init__ never hits the daemon
-# ---------------------------------------------------------------------------
-
-
-def _make_fake_ollama() -> types.ModuleType:
-    """Return a minimal fake `ollama` module stub."""
-    m = types.ModuleType("ollama")
-    m.chat = mock.MagicMock(return_value={})
-    m.generate = mock.MagicMock(return_value={})
-    m.list = mock.MagicMock(return_value=mock.MagicMock(models=[]))
-    return m
 
 
 # ---------------------------------------------------------------------------
@@ -116,15 +97,19 @@ def test_get_backend_mlx_when_env_set(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 5. invalid backend env → ValueError
+# 5. invalid backend env → fallback a MLX con warning (post-Ola 7)
 # ---------------------------------------------------------------------------
 
 
-def test_get_backend_invalid_raises(monkeypatch):
+def test_get_backend_invalid_falls_back_to_mlx(monkeypatch, caplog):
+    """Post-Ola 7: cualquier valor distinto de 'mlx' (incluyendo 'ollama'
+    y 'invalid') loguea warning y vuelve a MLX. Antes esto raisearía
+    ValueError; ahora MLX es el único backend vivo."""
+    pytest.importorskip("mlx_lm")
     monkeypatch.setenv("RAG_LLM_BACKEND", "invalid")
 
-    with pytest.raises(ValueError, match="RAG_LLM_BACKEND must be"):
-        get_backend()
+    backend = get_backend()
+    assert isinstance(backend, MLXBackend)
 
 
 # ---------------------------------------------------------------------------
@@ -186,21 +171,17 @@ def test_mlx_alias_table_complete():
 
 
 def test_reset_backend_clears_singleton(monkeypatch):
-    fake_ollama = _make_fake_ollama()
+    """Post-Ola 7: solo MLX vivo. El test verifica que reset_backend()
+    fuerza re-resolver el singleton (instancias distintas pre/post reset)."""
+    pytest.importorskip("mlx_lm")
+    monkeypatch.setenv("RAG_LLM_BACKEND", "mlx")
 
-    # First call: explicitly ollama (default is mlx post-cutover, but
-    # this test focuses on the singleton-reset semantics not the default)
-    monkeypatch.setenv("RAG_LLM_BACKEND", "ollama")
-    with mock.patch.dict(sys.modules, {"ollama": fake_ollama}):
-        b1 = get_backend()
-    assert isinstance(b1, OllamaBackend)
+    b1 = get_backend()
+    assert isinstance(b1, MLXBackend)
 
-    # Reset + change env → should resolve a fresh instance
     reset_backend()
-    monkeypatch.setenv("RAG_LLM_BACKEND", "ollama")
-    with mock.patch.dict(sys.modules, {"ollama": fake_ollama}):
-        b2 = get_backend()
 
-    assert isinstance(b2, OllamaBackend)
+    b2 = get_backend()
+    assert isinstance(b2, MLXBackend)
     # They're different objects because reset_backend cleared the singleton
     assert b1 is not b2

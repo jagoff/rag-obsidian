@@ -58,7 +58,7 @@ def fake_ollama(monkeypatch):
     def fake_chat(**kwargs):
         return FakeResponse(state["next_response"])
 
-    monkeypatch.setattr(rag.ollama, "chat", fake_chat)
+    monkeypatch.setattr(rag, "_mlx_chat", fake_chat)
     return state
 
 
@@ -104,7 +104,7 @@ def test_query_without_proper_nouns_keeps_all_paraphrases(fake_ollama):
 def test_ollama_failure_returns_just_original(fake_ollama, monkeypatch):
     def boom(**kwargs):
         raise RuntimeError("ollama down")
-    monkeypatch.setattr(rag.ollama, "chat", boom)
+    monkeypatch.setattr(rag, "_mlx_chat", boom)
     variants = rag.expand_queries("qué usa Adam Jones?")
     assert variants == ["qué usa Adam Jones?"]
 
@@ -149,7 +149,7 @@ def test_skips_expansion_for_short_queries(short_query, fake_ollama):
     fake_ollama["next_response"] = "dummy\nresponse"
     # Override fake_chat for this test to count calls
     import rag as _rag
-    _rag.ollama.chat = counting_chat
+    _rag._mlx_chat = counting_chat
 
     variants = rag.expand_queries(short_query)
     assert variants == [short_query]

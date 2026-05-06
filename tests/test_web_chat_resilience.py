@@ -149,7 +149,6 @@ def test_grounding_hang_does_not_block_sse_done(chat_env, monkeypatch):
             ] + [SimpleNamespace(message=SimpleNamespace(content="mundo"))])
         return SimpleNamespace(message=SimpleNamespace(content="", tool_calls=None))
 
-    monkeypatch.setattr(server_mod.ollama, "chat", _mock_chat)
     monkeypatch.setattr(_rag, "_mlx_chat_via_backend", _mock_chat)
 
     t0 = time.perf_counter()
@@ -195,18 +194,22 @@ def test_pre_router_detect_exception_emits_error_and_done(chat_env, monkeypatch)
     # Also stub the LLM so if the test ever falls through past the early
     # branch, we don't make a real network call.
     from types import SimpleNamespace
-    monkeypatch.setattr(
-        server_mod.ollama, "chat",
-        lambda *a, **kw: SimpleNamespace(
-            message=SimpleNamespace(content="", tool_calls=None)
-        ) if not kw.get("stream") else iter([]),
-    )
     import rag as _rag2
     monkeypatch.setattr(
         _rag2, "_mlx_chat_via_backend",
         lambda *a, **kw: SimpleNamespace(
             message=SimpleNamespace(content="", tool_calls=None)
         ),
+    )
+    monkeypatch.setattr(
+        _rag2, "_mlx_chat",
+        lambda *a, **kw: SimpleNamespace(
+            message=SimpleNamespace(content="", tool_calls=None)
+        ),
+    )
+    monkeypatch.setattr(
+        _rag2, "_chat_stream_dispatch",
+        lambda *a, **kw: iter([]),
     )
 
     events, body = _post_chat("qué tengo para hacer hoy")

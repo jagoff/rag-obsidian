@@ -69,7 +69,7 @@ def test_log_event_includes_intent_in_happy_path(monkeypatch):
             yield _FakeResponse("respuesta")
         return gen()
 
-    monkeypatch.setattr(rag.ollama, "chat", fake_chat)
+    monkeypatch.setattr(rag, "_mlx_chat", fake_chat)
     logged: dict = {}
     monkeypatch.setattr(rag, "log_query_event", lambda ev: logged.update(ev))
 

@@ -2380,14 +2380,13 @@ _COLLECTION_BASE = "obsidian_notes_v12_q4b"  # A/B 2026-05-06: paralelo a v11, e
 # in docs/design-cross-source-corpus.md §10.6.
 VALID_SOURCES: frozenset[str] = frozenset(
     {"vault", "memory", "calendar", "gmail", "whatsapp", "reminders", "messages",
-     "contacts", "calls", "safari", "drive"}
+     "contacts", "calls", "safari", "drive", "pillow"}
 )
 # `pillow` (iOS sleep tracker) tiene un ingester propio en
-# `rag index --source pillow` pero NO entra al corpus vectorial — datos
-# viven en `rag_sleep_sessions` y se consumen vía home + brief. Por eso
-# NO está en VALID_SOURCES (que filtra qué sources son indexables al
-# corpus). El handler CLI lo despacha antes de la validación, ver más
-# abajo "if src == 'pillow'".
+# `rag index --source pillow`. Sus datos viven en `rag_sleep_sessions`
+# (no en el corpus vectorial), pero la source figura en VALID_SOURCES
+# para mantener paridad con `CONFIDENCE_RERANK_MIN_PER_SOURCE` (audit
+# de invariantes, ver `test_threshold_helper_all_sources_covered`).
 
 # Per-source weight applied multiplicatively to the final rerank+feature
 # score. Vault stays at 1.00 so the default path is a no-op; anything
@@ -3712,7 +3711,7 @@ CONFIDENCE_RERANK_MIN_PER_SOURCE: dict[str, float] = {
     "contacts":  0.012,   # bodies medianos, signal alto
     "safari":    0.012,   # title + body de bookmark/history
     "drive":     0.010,   # docs cortos en la fase actual del ingester
-    "pillow":    0.015,   # sleep tracker; corpus local-only pero source registrada en VALID_SOURCES
+    "pillow":    0.015,   # sleep tracker, baseline (no eval data yet)
 }
 
 
@@ -3840,105 +3839,24 @@ def _save_context_cache() -> None:
     CONTEXT_CACHE_PATH.write_text(payload)
 
 
-_SUMMARY_CLIENT: "_TimedOllamaProxy | None" = None
 _INDEX_CHAT_CLIENT: ollama.Client | None = None
-_HELPER_CLIENT: "_TimedOllamaProxy | None" = None
-_CHAT_CAPPED_CLIENT: "_TimedOllamaProxy | None" = None
-
-# Capture the original `ollama.chat` at import time so _TimedOllamaProxy
-# can detect monkey-patches (tests replace `rag.ollama.chat` with mocks).
-_ORIGINAL_OLLAMA_CHAT = ollama.chat
-# `_ORIGINAL_OLLAMA_EMBED` y `_INDEX_EMBED_CLIENT` removidos en Ola 6 cero-Ollama
-# (2026-05-06): `embed()` corre 100% in-process via SentenceTransformer
-# (Qwen3-Embedding-0.6B). No hay paths Ollama de embed en runtime.
 
 # Semaphore that caps concurrent qwen2.5:3b (HELPER_MODEL) calls.
-# Ollama serialises at the GPU level but each blocked Python thread holds
-# an open httpx connection that eventually times out (measured: 277
-# ReadTimeout errors in 7d from morning + anticipate + followup running
-# concurrently). Capping to 2 lets a second request queue in Python
-# instead of timing out against Ollama's internal queue.
-# Override: RAG_HELPER_CONCURRENCY=N (default 2).
+# MLX corre in-process pero el semaphore sigue siendo útil: throttlea
+# llamadas concurrentes al GPU (morning + anticipate + followup) para
+# evitar contención MPS. Override: RAG_HELPER_CONCURRENCY=N (default 2).
 _HELPER_SEM: threading.Semaphore = threading.Semaphore(
     int(os.environ.get("RAG_HELPER_CONCURRENCY", "2"))
 )
 
 
-class _TimedOllamaProxy:
-    """Thin proxy over `ollama.chat` with a production-time timeout.
-
-    Tests that monkeypatch `rag.ollama.chat` expect the wrapped callers to
-    hit the module-level symbol directly — if we always went through
-    `ollama.Client(timeout=...).chat`, the mock would never run because
-    Client has its own httpx session. So: when `ollama.chat` is the
-    original function (no monkeypatch), route through a cached Client
-    with a real timeout. Otherwise, route through `ollama.chat` so test
-    mocks intercept correctly.
-
-    The timeout is a safety ceiling, not a performance knob. In production
-    a wedged ollama daemon raises httpx.ReadTimeout and the caller's
-    existing `except Exception` path handles it. In tests, the proxy is
-    transparent.
-
-    When `semaphore` is provided (set by _helper_client and _summary_client
-    for all qwen2.5:3b call sites), concurrent calls block on acquire()
-    rather than piling up inside Ollama and timing out.
-    """
-
-    def __init__(self, timeout: float, semaphore: "threading.Semaphore | None" = None):
-        self._timeout = timeout
-        self._client: ollama.Client | None = None
-        self._semaphore = semaphore
-
-    def chat(self, **kwargs):
-        if ollama.chat is not _ORIGINAL_OLLAMA_CHAT:
-            # Monkey-patched (test): delegate to the module symbol so the
-            # mock intercepts. Timeout is ignored — tests don't need it.
-            return ollama.chat(**kwargs)
-        # MLX migration (2026-05-05): when RAG_LLM_BACKEND=mlx is set,
-        # route through the abstraction backend. Semaphore + timeout
-        # semantics still apply (timeout is moot for MLX in-process,
-        # but the helper semaphore still throttles concurrent calls).
-        # Ollama default keeps the original Client(timeout=...) path.
-        # NOTE: stream=True bypasses MLX here and falls through to Ollama
-        # — `chat()` does not yield. Streaming sites must use
-        # `_chat_stream_dispatch()` instead of this proxy.
-        # Tool-calling (`tools=[...]`) is now native via Qwen `<tool_call>`
-        # parser in `rag.mlx_tool_calls` (Ola 5, 2026-05-06).
-        from rag.llm_backend import get_backend
-        _be_name = get_backend().name  # singleton — no env lookup per-call
-        if (
-            _be_name == "mlx"
-            and not kwargs.get("stream")
-        ):
-            _mark_backend("mlx")
-            if self._semaphore is not None:
-                with self._semaphore:
-                    return _mlx_chat_via_backend(**kwargs)
-            return _mlx_chat_via_backend(**kwargs)
-        # Ollama path: fallback stream bajo MLX, o backend nativo Ollama
-        _fallback = "stream" if _be_name == "mlx" else None
-        _mark_backend("ollama", fallback_reason=_fallback)
-        if self._client is None:
-            self._client = ollama.Client(timeout=self._timeout)
-        if self._semaphore is not None:
-            with self._semaphore:
-                return self._client.chat(**kwargs)
-        return self._client.chat(**kwargs)
-
-
 def _mlx_chat_via_backend(**kwargs):
-    """Route an ollama-shape `chat(**kwargs)` call through the MLX backend.
+    """Traduce un call ollama-shape `chat(**kwargs)` al MLX backend.
 
-    Translates ollama's `options` dict into `ChatOptions`, propagates
-    `tools=[...]` to the Qwen chat template (Ola 5), drops other
-    ollama-only kwargs (`think`, `logprobs`, `top_logprobs`, `stream`
-    — for MLX `stream=True` collapses to non-streaming).
-    Preserves `keep_alive` and `format` semantics.
+    Convierte el dict `options` en `ChatOptions`, propaga `tools=[...]`
+    al Qwen chat template (Ola 5). Descarta kwargs ollama-only (`think`,
+    `logprobs`, `top_logprobs`, `stream`).
     """
-    # Telemetry: marca el backend efectivo. Cuando se llega desde
-    # _TimedOllamaProxy o _mlx_or_ollama_chat el mark ya fue seteado;
-    # esta llamada es idempotente para call sites directos futuros.
     _mark_backend("mlx")
     from rag.llm_backend import ChatOptions, get_backend
 
@@ -3965,79 +3883,51 @@ def _mlx_chat_via_backend(**kwargs):
     )
 
 
-def _mlx_or_ollama_chat(**kwargs):
-    """Non-streaming chat dispatcher. Same routing logic as `_TimedOllamaProxy.chat()`
-    but exported for callers fuera de `rag/__init__.py` (ej. `web/server.py`)
-    que necesitan rutear via MLXBackend cuando `RAG_LLM_BACKEND=mlx`.
+def _mlx_chat(**kwargs):
+    """Non-streaming chat dispatcher — rutas directamente a MLXBackend.
 
-    Bajo `stream=True` cae a Ollama (MLX no soporta non-streaming yield).
     Tool-calling (`tools=[...]`) es nativo via `rag.mlx_tool_calls` (Ola 5).
     """
-    if ollama.chat is not _ORIGINAL_OLLAMA_CHAT:
-        return ollama.chat(**kwargs)
-    from rag.llm_backend import get_backend
-    _be_name = get_backend().name  # singleton
-    if (
-        _be_name == "mlx"
-        and not kwargs.get("stream")
-    ):
-        _mark_backend("mlx")
-        return _mlx_chat_via_backend(**kwargs)
-    _fallback = "stream" if _be_name == "mlx" else None
-    _mark_backend("ollama", fallback_reason=_fallback)
-    return ollama.chat(**kwargs)
+    _mark_backend("mlx")
+    return _mlx_chat_via_backend(**kwargs)
+
+
+# Alias retrocompat post-Ola 7: web/server.py + scripts importan
+# `_mlx_or_ollama_chat`. Tras la purga del branch Ollama, ambos paths
+# ruta a MLX. El alias evita tocar 5 callsites en web/server.py + 1 en
+# scripts/ — todos pueden seguir usando el nombre histórico.
+_mlx_or_ollama_chat = _mlx_chat
 
 
 def _chat_stream_dispatch(**kwargs):
-    """Streaming dispatcher for raw `for chunk in ollama.chat(stream=True, ...)` sites.
+    """Streaming dispatcher — rutea a `MLXBackend.chat_stream()`.
 
-    Centraliza la decisión Ollama vs MLX para call sites de streaming.
-    Bajo `RAG_LLM_BACKEND=mlx` rutea a `MLXBackend.chat_stream(...)`
-    (yields `ChatResponse(done=False, message.content=piece)` por token,
-    terminal `done=True`). Default Ollama: passthrough a `ollama.chat(stream=True)`.
-
-    Tools-using sites no deben llamar acá — caen al fallback Ollama
-    transparente porque MLX no soporta tool-calling nativo. Si pasás
-    `tools=[...]`, este helper también delega a Ollama (silent fallback).
-
-    Tests que monkeypatchean `rag.ollama.chat` siguen interceptando
-    porque la branch Ollama llama al símbolo módulo (no al Client).
+    Yields `ChatResponse(done=False, message.content=piece)` por token,
+    terminal `done=True`. Tool-calling no soportado en streaming.
     """
-    if ollama.chat is not _ORIGINAL_OLLAMA_CHAT:
-        # Monkey-patched (test): use module symbol so mock intercepts.
-        return ollama.chat(stream=True, **kwargs)
+    _mark_backend("mlx")
     from rag.llm_backend import ChatOptions, get_backend
-    _be_name = get_backend().name  # singleton
-    if (
-        _be_name == "mlx"
-        and not kwargs.get("tools")
-    ):
-        _mark_backend("mlx")
 
-        options_dict = kwargs.get("options") or {}
-        if hasattr(options_dict, "model_dump"):
-            options_dict = options_dict.model_dump(exclude_none=True)
-        elif not isinstance(options_dict, dict):
-            options_dict = dict(options_dict)
-        opts = ChatOptions(
-            temperature=float(options_dict.get("temperature", 0.0)),
-            seed=int(options_dict.get("seed", 42)),
-            num_ctx=int(options_dict.get("num_ctx", 4096)),
-            num_predict=int(options_dict.get("num_predict", 384)),
-            top_p=float(options_dict.get("top_p", 1.0)),
-            stop=tuple(options_dict.get("stop", ()) or ()),
-        )
-        return get_backend().chat_stream(
-            model=kwargs["model"],
-            messages=kwargs.get("messages") or [],
-            options=opts,
-            keep_alive=kwargs.get("keep_alive", -1),
-            format=kwargs.get("format"),
-        )
-    # Fallback Ollama: tools= con MLX activo, o backend Ollama nativo
-    _fallback = "tools" if (_be_name == "mlx" and kwargs.get("tools")) else None
-    _mark_backend("ollama", fallback_reason=_fallback)
-    return ollama.chat(stream=True, **kwargs)
+    options_dict = kwargs.get("options") or {}
+    if hasattr(options_dict, "model_dump"):
+        options_dict = options_dict.model_dump(exclude_none=True)
+    elif not isinstance(options_dict, dict):
+        options_dict = dict(options_dict)
+    opts = ChatOptions(
+        temperature=float(options_dict.get("temperature", 0.0)),
+        seed=int(options_dict.get("seed", 42)),
+        num_ctx=int(options_dict.get("num_ctx", 4096)),
+        num_predict=int(options_dict.get("num_predict", 384)),
+        top_p=float(options_dict.get("top_p", 1.0)),
+        stop=tuple(options_dict.get("stop", ()) or ()),
+    )
+    return get_backend().chat_stream(
+        model=kwargs["model"],
+        messages=kwargs.get("messages") or [],
+        options=opts,
+        keep_alive=kwargs.get("keep_alive", -1),
+        format=kwargs.get("format"),
+    )
 
 
 def _index_chat_client() -> ollama.Client:
@@ -4053,56 +3943,63 @@ def _index_chat_client() -> ollama.Client:
     return _INDEX_CHAT_CLIENT
 
 
-def _summary_client() -> "_TimedOllamaProxy":
-    """Dedicated proxy with a hard timeout for context-summary calls.
+class _SemaphoredChatClient:
+    """Wrapper mínimo sobre `_mlx_chat_via_backend` con semaphore opcional.
 
-    The module-level `ollama.chat` uses the default httpx client which
-    has no read timeout — a stuck runner (seen in the wild when indexing
-    large vaults: one degenerate note hangs the runner for ~an hour) will
-    block the whole indexing batch on `recvfrom`. A 45s ceiling is well
-    above the p99 call time (~1s on qwen2.5:3b for a 2k-char prompt) but
-    bounds the worst case so indexing keeps moving.
+    Reemplaza `_TimedOllamaProxy` post-purga Ollama (Ola 7). MLX corre
+    in-process — los timeouts HTTP ya no aplican. El semaphore sigue
+    siendo útil para throttlear llamadas concurrentes al GPU.
+    """
 
-    Uses _HELPER_SEM (shared with _helper_client) so index-time context
-    summary calls are rate-limited alongside query-time helper calls.
+    def __init__(self, semaphore: "threading.Semaphore | None" = None):
+        self._semaphore = semaphore
+
+    def chat(self, **kwargs):
+        # Route via `_mlx_chat` (not `_mlx_chat_via_backend` directly) so
+        # tests that monkeypatch `rag._mlx_chat` intercept the call. Same
+        # functional behaviour — `_mlx_chat` is a thin marker over
+        # `_mlx_chat_via_backend`.
+        if self._semaphore is not None:
+            with self._semaphore:
+                return _mlx_chat(**kwargs)
+        return _mlx_chat(**kwargs)
+
+
+_SUMMARY_CLIENT: "_SemaphoredChatClient | None" = None
+_HELPER_CLIENT: "_SemaphoredChatClient | None" = None
+_CHAT_CAPPED_CLIENT: "_SemaphoredChatClient | None" = None
+
+
+def _summary_client() -> "_SemaphoredChatClient":
+    """Cliente dedicado para context-summary calls (index-time).
+
+    Usa _HELPER_SEM para rate-limitear junto con query-time helper calls.
     """
     global _SUMMARY_CLIENT
     if _SUMMARY_CLIENT is None:
-        _SUMMARY_CLIENT = _TimedOllamaProxy(timeout=45.0, semaphore=_HELPER_SEM)
+        _SUMMARY_CLIENT = _SemaphoredChatClient(semaphore=_HELPER_SEM)
     return _SUMMARY_CLIENT
 
 
-def _helper_client() -> "_TimedOllamaProxy":
-    """Cached proxy with a 60s timeout for quick helper-model calls
-    (reformulate_query, expand_queries, _judge_sufficiency,
-    _generate_synthetic_questions, HyDE). Monkey-patch-compatible — see
-    _TimedOllamaProxy docstring.
+def _helper_client() -> "_SemaphoredChatClient":
+    """Cliente para helper-model calls rápidos (reformulate_query,
+    expand_queries, _judge_sufficiency, HyDE).
 
-    Uses _HELPER_SEM to cap concurrent qwen2.5:3b calls and prevent
-    ReadTimeout errors when multiple daemons (morning, anticipate,
-    followup, chat) hit the helper simultaneously.
-
-    Bumped 30s → 60s tras audit 2026-04-30: con qwen2.5:7b + bge-reranker
-    pineados en MPS y `OLLAMA_MAX_LOADED_MODELS=2`, el helper qwen2.5:3b
-    sufre unload/reload bajo presión y el cold-load tarda 30+s en CPU. El
-    timeout viejo timeaba EN el borde, generando ~85 ReadTimeout/24h aún
-    con el retry de `reformulate_query`. 60s da headroom para cold-load
-    sin enmascarar latencia real (queries normales tardan <500ms).
+    Usa _HELPER_SEM para cap concurrencia qwen2.5:3b.
     """
     global _HELPER_CLIENT
     if _HELPER_CLIENT is None:
-        _HELPER_CLIENT = _TimedOllamaProxy(timeout=60.0, semaphore=_HELPER_SEM)
+        _HELPER_CLIENT = _SemaphoredChatClient(semaphore=_HELPER_SEM)
     return _HELPER_CLIENT
 
 
-def _chat_capped_client() -> "_TimedOllamaProxy":
-    """Cached proxy with a 90s timeout for bounded non-streaming chat
-    calls (citation-repair, critique, digest, morning/today narrative,
-    read summary, contradiction detector). Monkey-patch-compatible.
+def _chat_capped_client() -> "_SemaphoredChatClient":
+    """Cliente para non-streaming chat calls (citation-repair, digest,
+    morning/today narrative, read summary, contradiction detector).
     """
     global _CHAT_CAPPED_CLIENT
     if _CHAT_CAPPED_CLIENT is None:
-        _CHAT_CAPPED_CLIENT = _TimedOllamaProxy(timeout=90.0)
+        _CHAT_CAPPED_CLIENT = _SemaphoredChatClient()
     return _CHAT_CAPPED_CLIENT
 
 
@@ -15495,16 +15392,6 @@ def warmup_async() -> None:
         except Exception:
             pass
 
-    def _wu_ollama_embed() -> None:
-        # bge-m3 warm: fuerza a ollama a cargar + pinear el modelo de embed.
-        # Crítico: si el local embedder falla o timea, el fallback `embed()`
-        # pega contra este ollama. Sin este warmup, el fallback paga el
-        # cold load ollama (5-10s adicionales).
-        try:
-            embed(["warmup"])
-        except Exception:
-            pass
-
     def _wu_local_embed() -> None:
         # In-process bge-m3 SentenceTransformer (~5s cold load on MPS).
         # Self-gates on _local_embed_enabled() — bulk paths que nunca
@@ -15544,7 +15431,7 @@ def warmup_async() -> None:
         # alinear el warmup al num_ctx de runtime, no al ping mínimo.
         try:
             _chat_model = resolve_chat_model()
-            _mlx_or_ollama_chat(
+            _mlx_chat(
                 model=_chat_model,
                 messages=[{"role": "user", "content": "ok"}],
                 options={"num_predict": 1,
@@ -15555,7 +15442,7 @@ def warmup_async() -> None:
         except Exception:
             pass
         try:
-            _mlx_or_ollama_chat(
+            _mlx_chat(
                 model=HELPER_MODEL,
                 messages=[{"role": "user", "content": "ok"}],
                 options={"num_predict": 1,
@@ -15569,7 +15456,6 @@ def warmup_async() -> None:
     def _run() -> None:
         targets = [
             ("reranker", _wu_reranker),
-            ("ollama-embed", _wu_ollama_embed),
             ("local-embed", _wu_local_embed),
             ("corpus", _wu_corpus),
             ("chat-models", _wu_chat_models),
@@ -24196,7 +24082,7 @@ def find_contradictions_for_note(
     # other models) can't hang the rglob — fail-skip instead.
     helper_raw = ""
     try:
-        resp = _mlx_or_ollama_chat(
+        resp = _mlx_chat(
             model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
             options=CHAT_OPTIONS,
@@ -35299,7 +35185,7 @@ def _replay_query_row(
                     {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": f"{q}\n\n{context_str}"},
                 ]
-                response = _mlx_or_ollama_chat(
+                response = _mlx_chat(
                     model=resolve_chat_model(),
                     messages=msgs,
                     options=CHAT_OPTIONS,
@@ -47554,17 +47440,13 @@ TODAY_BRIEF_OPTIONS = {
 }
 
 
-# Cliente dedicado con timeout MÁS ALTO (120s vs 90s del general). Con
-# qwen2.5:7b warm el inference tarda ~10-15s; cold path puede pegar 30-60s
-# si ollama lo descargó por memory pressure. 120s deja margen sin tener
-# que esperar 3 minutos.
-_TODAY_BRIEF_CLIENT = None
+_TODAY_BRIEF_CLIENT: "_SemaphoredChatClient | None" = None
 
 
-def _today_brief_client():
+def _today_brief_client() -> "_SemaphoredChatClient":
     global _TODAY_BRIEF_CLIENT
     if _TODAY_BRIEF_CLIENT is None:
-        _TODAY_BRIEF_CLIENT = _TimedOllamaProxy(timeout=120.0)
+        _TODAY_BRIEF_CLIENT = _SemaphoredChatClient()
     return _TODAY_BRIEF_CLIENT
 
 
@@ -48999,7 +48881,7 @@ def wake_up(ctx, dry_run: bool, skip_index: bool, skip_bookmarks: bool,
                 # queda en RAM hasta que ollama lo desaloje por presión
                 # de memoria o restart. El primer `rag chat` post-wake-up
                 # no paga el cold-start (~400ms de prefill vs. 5s cold).
-                _mlx_or_ollama_chat(
+                _mlx_chat(
                     model=model,
                     messages=[{"role": "user", "content": "."}],
                     options=CHAT_OPTIONS,
@@ -52533,7 +52415,7 @@ def extract_enrich_entities(question: str, answer: str) -> dict:
     # that blew the enrich budget repeatedly. JSON-mode + 160 tokens lands
     # at ~600-900ms warm, well inside the wall ceiling.
     try:
-        rsp = _mlx_or_ollama_chat(
+        rsp = _mlx_chat(
             model=resolve_chat_model(),
             messages=[
                 {"role": "system", "content": _ENRICH_HELPER_PROMPT},

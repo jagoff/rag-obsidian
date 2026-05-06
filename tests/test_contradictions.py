@@ -29,14 +29,20 @@ def fake_reranker(monkeypatch):
 
 @pytest.fixture
 def scripted_ollama(monkeypatch):
-    """Factory: call the returned setter with a string to stub the next ollama.chat."""
+    """Factory: call the returned setter with a string to stub the next chat call.
+
+    Post-Ola 7: parchea `_mlx_chat_via_backend` (call site debajo de
+    `_chat_capped_client().chat()` — el SemaphoredChatClient invoca el
+    via_backend helper directo).
+    """
     state = {"content": '{"contradictions": []}', "calls": 0}
 
-    def _chat(model, messages, options=None, keep_alive=None):
+    def _chat(**kwargs):
         state["calls"] += 1
         return _FakeResponse(state["content"])
 
-    monkeypatch.setattr(rag.ollama, "chat", _chat)
+    monkeypatch.setattr(rag, "_mlx_chat_via_backend", _chat)
+    monkeypatch.setattr(rag, "_mlx_chat", _chat)
 
     def _set(content):
         state["content"] = content
@@ -195,7 +201,8 @@ def test_ollama_exception_returns_empty(col, fake_reranker, fake_embed, monkeypa
     def _raise(**kwargs):
         raise RuntimeError("ollama down")
 
-    monkeypatch.setattr(rag.ollama, "chat", _raise)
+    monkeypatch.setattr(rag, "_mlx_chat_via_backend", _raise)
+    monkeypatch.setattr(rag, "_mlx_chat", _raise)
 
     out = rag.find_contradictions(col, "q", _LONG_ANSWER, set())
     assert out == []

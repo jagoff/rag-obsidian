@@ -35,7 +35,7 @@ def fake_chat(monkeypatch):
         if "VOCABULARIO" in prompt and "TAGS:" in prompt:
             return _FakeResponse("- rag\n- ml")
         return _FakeResponse(_SUMMARY)
-    monkeypatch.setattr(rag.ollama, "chat", _chat)
+    monkeypatch.setattr(rag, "_mlx_chat", _chat)
 
 
 @pytest.fixture
@@ -221,7 +221,7 @@ def test_ingest_empty_summary_raises(tmp_vault, monkeypatch):
             return _FakeResponse("")
         return _FakeResponse("   ")
 
-    monkeypatch.setattr(rag.ollama, "chat", _chat)
+    monkeypatch.setattr(rag, "_mlx_chat", _chat)
     html = _fake_html()
     with pytest.raises(RuntimeError, match="vacío"):
         rag.ingest_read_url(
@@ -247,7 +247,7 @@ def test_ingest_tags_only_from_existing_vocab(tmp_vault, monkeypatch):
             return _FakeResponse("- invented-tag\n- rag\n- madeup")
         return _FakeResponse(_SUMMARY)
 
-    monkeypatch.setattr(rag.ollama, "chat", _chat)
+    monkeypatch.setattr(rag, "_mlx_chat", _chat)
     html = _fake_html()
     result = rag.ingest_read_url(
         col, "https://example.com/post",

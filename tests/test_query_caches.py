@@ -172,7 +172,7 @@ def fake_chat(monkeypatch):
         state["calls"] += 1
         return _FakeChatResp(state["next_response"])
 
-    monkeypatch.setattr(rag.ollama, "chat", fake)
+    monkeypatch.setattr(rag, "_mlx_chat", fake)
     return state
 
 
@@ -201,7 +201,7 @@ def test_expand_failure_does_not_pollute_cache(monkeypatch):
     def boom(**kwargs):
         raise RuntimeError("ollama down")
 
-    monkeypatch.setattr(rag.ollama, "chat", boom)
+    monkeypatch.setattr(rag, "_mlx_chat", boom)
     out = rag.expand_queries("query rota")
     assert out == ["query rota"]
     assert "query rota" not in rag._expand_cache

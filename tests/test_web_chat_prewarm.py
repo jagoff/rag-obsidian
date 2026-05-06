@@ -20,7 +20,7 @@ Tests cubren:
   2. Si el operador setea `OBSIDIAN_RAG_WEB_CHAT_MODEL == _LOOKUP_MODEL`
      (mismo modelo en ambos roles), targets dedupea a uno solo (no
      queremos pingear dos veces el mismo modelo con el mismo num_ctx).
-  3. `_run_chat_prewarm_cycle()` invoca `rag._mlx_or_ollama_chat`
+  3. `_run_chat_prewarm_cycle()` invoca `rag._mlx_chat`
      una vez por target, con el num_ctx correcto.
   4. Si un target falla (modelo no disponible), el OTRO target se sigue
      intentando — guard del fail-mode "skip-cycle entero".
@@ -31,6 +31,17 @@ from __future__ import annotations
 import pytest
 
 from web import server as server_mod
+
+
+@pytest.fixture(autouse=True)
+def _force_prewarm_under_mlx(monkeypatch):
+    """Post-Ola 7 (2026-05-06): `_chat_prewarm_targets()` returns `[]` bajo
+    MLX (default) porque el prewarm `keep_alive` semantics no aplican
+    in-process. Estos tests miden la lógica de targets/dedup/run-cycle, así
+    que forzamos el path Ollama-style con `RAG_MLX_PREWARM=1` para que la
+    función produzca la lista de targets que se está testeando.
+    """
+    monkeypatch.setenv("RAG_MLX_PREWARM", "1")
 
 
 def test_targets_default_pins_main_and_lookup(monkeypatch):
@@ -86,7 +97,7 @@ def test_targets_use_lookup_num_ctx_for_lookup_model(monkeypatch):
 
 
 def test_run_cycle_calls_chat_for_every_target(monkeypatch):
-    """`_run_chat_prewarm_cycle` invoca `rag._mlx_or_ollama_chat` una
+    """`_run_chat_prewarm_cycle` invoca `rag._mlx_chat` una
     vez por target, con el `num_ctx` correcto en `options`."""
     import rag as _rag
     calls: list[dict] = []
@@ -96,7 +107,7 @@ def test_run_cycle_calls_chat_for_every_target(monkeypatch):
         from types import SimpleNamespace
         return SimpleNamespace(message=SimpleNamespace(content="."))
 
-    monkeypatch.setattr(_rag, "_mlx_or_ollama_chat", _fake_chat)
+    monkeypatch.setattr(_rag, "_mlx_chat", _fake_chat)
     monkeypatch.setattr(server_mod, "_resolve_web_chat_model", lambda: "qwen2.5:7b")
     monkeypatch.setattr(server_mod, "_LOOKUP_MODEL", "qwen2.5:3b")
     monkeypatch.setattr(server_mod, "_LOOKUP_NUM_CTX", 4096)
@@ -129,7 +140,7 @@ def test_run_cycle_one_target_failure_does_not_block_other(monkeypatch):
         from types import SimpleNamespace
         return SimpleNamespace(message=SimpleNamespace(content="."))
 
-    monkeypatch.setattr(_rag, "_mlx_or_ollama_chat", _fake_chat)
+    monkeypatch.setattr(_rag, "_mlx_chat", _fake_chat)
     monkeypatch.setattr(server_mod, "_resolve_web_chat_model", lambda: "qwen2.5:7b")
     monkeypatch.setattr(server_mod, "_LOOKUP_MODEL", "qwen2.5:3b")
     monkeypatch.setattr(server_mod, "_LOOKUP_NUM_CTX", 4096)

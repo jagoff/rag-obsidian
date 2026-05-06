@@ -495,8 +495,11 @@ def test_drive_search_emits_sources_sse_with_drive_link(monkeypatch):
             return SimpleNamespace(
                 message=SimpleNamespace(content="", tool_calls=None),
             )
-    import ollama
-    monkeypatch.setattr(ollama, "chat", _Mock())
+    import rag as _rag_mod
+    mock_inst = _Mock()
+    monkeypatch.setattr(_rag_mod, "_mlx_chat", mock_inst)
+    monkeypatch.setattr(_rag_mod, "_mlx_chat_via_backend", mock_inst)
+    monkeypatch.setattr(_rag_mod, "_chat_stream_dispatch", mock_inst)
 
     # Fire the query — pre-router should fire drive_search.
     client = TestClient(app)

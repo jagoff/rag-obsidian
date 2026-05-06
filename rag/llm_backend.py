@@ -1,20 +1,19 @@
-"""LLM backend abstraction — Ollama → MLX migration.
+"""LLM backend abstraction — MLX (Ola 7, 2026-05-06).
 
 Created 2026-05-05 as part of `99-AI/system/mlx-migration/dispatch.md`.
 
-## Status: Ola 6 — cero-Ollama (en curso 2026-05-06)
+## Status: Ola 7 — OllamaBackend retired
 
 This module defines a thin interface (`LLMBackend`) over the LLM call
-contract used across `rag/__init__.py`. Two concrete backends:
+contract used across `rag/__init__.py`. Single concrete backend:
 
-- `MLXBackend` — uses `mlx-lm` (Apple MLX). **Default post-cutover**
-  (Ola 5, 2026-05-06). Cubre chat/generate/embed nativo. Qwen2.5-3B/7B,
-  Qwen3-30B-A3B, granite-vision (VLM), Qwen3-Embedding-0.6B.
-- `OllamaBackend` — wraps the legacy `ollama` Python client. Quedó como
-  rollback path solo. En Ola 6 los modelos chat ya están purgados del
-  disco — re-pull manual requerido para activar este backend.
+- `MLXBackend` — uses `mlx-lm` (Apple MLX). Cubre chat/generate/embed
+  nativo. Qwen2.5-3B/7B, Qwen3-30B-A3B, granite-vision (VLM),
+  Qwen3-Embedding-0.6B.
 
-Switch via env var `RAG_LLM_BACKEND={mlx,ollama}` (default `mlx`).
+`OllamaBackend` was retired in Ola 7. `RAG_LLM_BACKEND=ollama` logs a
+warning and falls back to MLX. Rollback requires re-pull of Ollama chat
+models (~24 GB) before reverting to an older commit.
 
 ## Scope post-Ola-6: chat + generate + embed
 
@@ -108,9 +107,9 @@ MLX_MODEL_ALIAS: dict[str, str] = {
     "qwen3:30b-a3b": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
     # Experimental (A/B vs the 3B helper, NOT default until eval CIs OK)
     "qwen3:4b": "mlx-community/Qwen3-4B-Instruct-2507-4bit",
-    # Embedder — qwen3-embedding stays on Ollama for indexing/query paths;
-    # this alias enables MLXBackend.embed() as an alternative when callers
-    # explicitly route through the backend (Phase 1 scope B).
+    # Embedder — active path is SentenceTransformer in-process via
+    # _get_local_embedder() in rag/__init__.py. This alias exists so
+    # callers routing explicitly through MLXBackend.embed() still resolve.
     "qwen3-embedding:0.6b": "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ",
 }
 
@@ -155,7 +154,7 @@ class ChatOptions:
 
 
 class LLMBackend(ABC):
-    """Common interface for Ollama / MLX backends."""
+    """Common interface for LLM backends."""
 
     name: str = "abstract"
 
@@ -222,163 +221,14 @@ class LLMBackend(ABC):
 
     @abstractmethod
     def unload(self, model: str | None = None) -> bool:
-        """Best-effort: free RAM/VRAM held by `model` (or all loaded models
-        if `model` is None). Returns True if anything was unloaded.
+        """Best-effort: free RAM/VRAM held by `model` (or all if None).
 
-        Watchdog hook for memory pressure response. Implementations:
-
-        - OllamaBackend: `chat(keep_alive=0)` ping with timeout (delegated
-          to caller — see `_handle_memory_pressure`); returning here is a
-          best-effort no-op signal so call sites can still call it.
-        - MLXBackend: pops from `_loaded` + `mx.clear_cache()`.
-
-        Errors swallowed — never raise.
+        Returns True if anything was unloaded. Errors swallowed — never raise.
         """
 
 
 # ---------------------------------------------------------------------------
-# OllamaBackend (legacy — default during migration window)
-# ---------------------------------------------------------------------------
-
-
-class OllamaBackend(LLMBackend):
-    """Wraps `ollama` Python client. Identity passthrough."""
-
-    name = "ollama"
-
-    def __init__(self) -> None:
-        import ollama  # type: ignore[import-not-found]
-
-        self._ollama = ollama
-
-    def chat(
-        self,
-        model: str,
-        messages: list[dict[str, str]],
-        options: ChatOptions | None = None,
-        keep_alive: str | int = -1,
-        format: str | None = None,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        opts = self._opts_to_dict(options)
-        call_kwargs = dict(
-            model=to_ollama(model),
-            messages=messages,
-            options=opts,
-            keep_alive=keep_alive,
-            **kwargs,
-        )
-        if format is not None:
-            call_kwargs["format"] = format
-        return self._ollama.chat(**call_kwargs)
-
-    def chat_stream(
-        self,
-        model: str,
-        messages: list[dict[str, str]],
-        options: ChatOptions | None = None,
-        keep_alive: str | int = -1,
-        format: str | None = None,
-        **kwargs: Any,
-    ) -> Any:
-        opts = self._opts_to_dict(options)
-        call_kwargs = dict(
-            model=to_ollama(model),
-            messages=messages,
-            options=opts,
-            keep_alive=keep_alive,
-            stream=True,
-            **kwargs,
-        )
-        if format is not None:
-            call_kwargs["format"] = format
-        yield from self._ollama.chat(**call_kwargs)
-
-    def generate(
-        self,
-        model: str,
-        prompt: str,
-        options: ChatOptions | None = None,
-        keep_alive: str | int = -1,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        opts = self._opts_to_dict(options)
-        return self._ollama.generate(
-            model=to_ollama(model),
-            prompt=prompt,
-            options=opts,
-            keep_alive=keep_alive,
-            **kwargs,
-        )
-
-    def list_available(self) -> list[str]:
-        return [m.model for m in self._ollama.list().models]
-
-    def embed(
-        self,
-        model: str,
-        inputs: list[str],
-        keep_alive: str | int = -1,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        """Passthrough to ollama.embed — insurance rollback path."""
-        resp = self._ollama.embed(
-            model=to_ollama(model),
-            input=inputs,
-            keep_alive=keep_alive,
-        )
-        return {"embeddings": list(resp.embeddings)}
-
-    def unload(self, model: str | None = None) -> bool:
-        """Ping Ollama with `keep_alive=0` to release the model.
-
-        If `model` is None, unloads every currently-resident model.
-        Bounded to 5s per model — under pressure / stuck-load this can
-        hang otherwise.
-        """
-        try:
-            client = self._ollama.Client(timeout=5)
-            if model is None:
-                try:
-                    targets = [m.model for m in self._ollama.ps().models]
-                except Exception:
-                    targets = []
-            else:
-                targets = [to_ollama(model)]
-            unloaded_any = False
-            for tgt in targets:
-                try:
-                    client.chat(
-                        model=tgt,
-                        messages=[{"role": "user", "content": "."}],
-                        options={"num_predict": 1},
-                        keep_alive=0,
-                    )
-                    unloaded_any = True
-                except Exception:
-                    continue
-            return unloaded_any
-        except Exception:
-            return False
-
-    @staticmethod
-    def _opts_to_dict(options: ChatOptions | None) -> dict[str, Any]:
-        if options is None:
-            options = ChatOptions()
-        d: dict[str, Any] = {
-            "temperature": options.temperature,
-            "seed": options.seed,
-            "num_ctx": options.num_ctx,
-            "num_predict": options.num_predict,
-            "top_p": options.top_p,
-        }
-        if options.stop:
-            d["stop"] = list(options.stop)
-        return d
-
-
-# ---------------------------------------------------------------------------
-# MLXBackend — Ola 2 implementation pending
+# MLXBackend
 # ---------------------------------------------------------------------------
 
 
@@ -1017,25 +867,19 @@ _BACKEND_SINGLETON: LLMBackend | None = None
 
 
 def get_backend() -> LLMBackend:
-    """Return the active LLM backend (singleton).
-
-    Selection: env var `RAG_LLM_BACKEND` ∈ {ollama, mlx}. Default flipped
-    to `mlx` post-cutover 2026-05-05 (Ola 4); rollback explícito a `ollama`
-    via env var si MLX regresiona.
-    """
+    """Return the active LLM backend (singleton). Always MLXBackend (Ola 7)."""
     global _BACKEND_SINGLETON
     if _BACKEND_SINGLETON is not None:
         return _BACKEND_SINGLETON
 
     choice = os.environ.get("RAG_LLM_BACKEND", "mlx").lower()
-    if choice == "mlx":
-        _BACKEND_SINGLETON = MLXBackend()
-    elif choice == "ollama":
-        _BACKEND_SINGLETON = OllamaBackend()
-    else:
-        raise ValueError(
-            f"RAG_LLM_BACKEND must be 'ollama' or 'mlx' (got {choice!r})"
+    if choice == "ollama":
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "OllamaBackend retired in Ola 7; falling back to MLX"
         )
+    _BACKEND_SINGLETON = MLXBackend()
     return _BACKEND_SINGLETON
 
 
@@ -1053,7 +897,6 @@ __all__ = [
     "MLXBackend",
     "MLX_MODEL_ALIAS",
     "OLLAMA_MODEL_ALIAS",
-    "OllamaBackend",
     "get_backend",
     "reset_backend",
     "strip_think_blocks",

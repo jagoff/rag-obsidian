@@ -46,49 +46,51 @@ def _bypass_admin_token():
 
 
 def test_resolve_diagnose_model_prefers_command_r(monkeypatch):
-    """Con command-r:latest instalado lo elige antes que cualquier otro."""
+    """Con command-r:latest disponible (via MLXBackend.list_available)
+    lo elige antes que cualquier otro. Post-Ola 7."""
     _server.__dict__["_DIAGNOSE_MODEL_RESOLVED"] = None  # reset cache
 
-    class FakeModel:
-        def __init__(self, m): self.model = m
-    class FakeList:
-        models = [FakeModel("command-r:latest"), FakeModel("qwen2.5:7b")]
+    from rag.llm_backend import MLX_MODEL_ALIAS
 
-    monkeypatch.setattr(_server.ollama, "list", lambda: FakeList())
+    fake_ids = {MLX_MODEL_ALIAS["command-r:latest"], MLX_MODEL_ALIAS["qwen2.5:7b"]}
+
+    class _FakeBackend:
+        def list_available(self):
+            return list(fake_ids)
+
+    monkeypatch.setattr("rag.llm_backend.MLXBackend", lambda: _FakeBackend())
     assert _server._resolve_diagnose_model() == "command-r:latest"
     _server.__dict__["_DIAGNOSE_MODEL_RESOLVED"] = None
 
 
 def test_resolve_diagnose_model_falls_back_to_chat_model(monkeypatch):
-    """Sin ningún command-r, cae a resolve_chat_model() del rag.py."""
+    """Sin ningún command-r disponible, cae a resolve_chat_model()."""
     _server.__dict__["_DIAGNOSE_MODEL_RESOLVED"] = None
 
-    class FakeModel:
-        def __init__(self, m): self.model = m
-    class FakeList:
-        models = [FakeModel("phi4:latest")]
+    class _FakeBackend:
+        def list_available(self):
+            return []
 
-    monkeypatch.setattr(_server.ollama, "list", lambda: FakeList())
+    monkeypatch.setattr("rag.llm_backend.MLXBackend", lambda: _FakeBackend())
     monkeypatch.setattr(_server, "resolve_chat_model", lambda: "phi4:latest")
     assert _server._resolve_diagnose_model() == "phi4:latest"
     _server.__dict__["_DIAGNOSE_MODEL_RESOLVED"] = None
 
 
 def test_resolve_diagnose_model_caches_per_process(monkeypatch):
-    """Cacheado tras el primer call — `ollama.list()` es ~50ms."""
+    """Cacheado tras el primer call — `MLXBackend().list_available()`
+    requiere disk scan, no queremos hacerlo en cada call."""
     _server.__dict__["_DIAGNOSE_MODEL_RESOLVED"] = None
+    from rag.llm_backend import MLX_MODEL_ALIAS
+
     call_count = {"n": 0}
 
-    class FakeModel:
-        def __init__(self, m): self.model = m
-    class FakeList:
-        models = [FakeModel("command-r:latest")]
+    class _FakeBackend:
+        def list_available(self):
+            call_count["n"] += 1
+            return [MLX_MODEL_ALIAS["command-r:latest"]]
 
-    def fake_list():
-        call_count["n"] += 1
-        return FakeList()
-
-    monkeypatch.setattr(_server.ollama, "list", fake_list)
+    monkeypatch.setattr("rag.llm_backend.MLXBackend", lambda: _FakeBackend())
     _server._resolve_diagnose_model()
     _server._resolve_diagnose_model()
     _server._resolve_diagnose_model()
@@ -118,26 +120,20 @@ def test_diagnose_truncates_long_error_text():
     """error_text > 4000 chars no se rechaza pero se trunca con marker."""
     long_text = "x" * 5000
     # No esperamos 422 — el validator trunca, no rechaza.
-    # Para verificar el truncado tenemos que mockear ollama.chat.
+    # Para verificar el truncado tenemos que mockear `_chat_stream_dispatch`.
     captured = {"prompt": None}
 
-    class FakeChunk:
-        def __init__(self, content, done=False):
-            self.message = {"content": content}
-            self.done = done
-
-    def fake_chat(**kwargs):
+    def fake_stream(**kwargs):
         # Capturar el user prompt para inspeccionar.
         for msg in kwargs.get("messages", []):
             if msg.get("role") == "user":
                 captured["prompt"] = msg["content"]
         return iter([{"message": {"content": "ok"}, "done": True}])
 
-    class FakeList:
-        models = [type("M", (), {"model": "command-r:latest"})()]
-
-    with patch.object(_server.ollama, "list", return_value=FakeList()), \
-         patch.object(_server.ollama, "chat", fake_chat):
+    import rag as _rag
+    with patch.object(_rag, "_chat_stream_dispatch", fake_stream), \
+         patch.object(_server, "_resolve_diagnose_model",
+                      lambda: "command-r:latest"):
         _server.__dict__["_DIAGNOSE_MODEL_RESOLVED"] = None
         with _client.stream(
             "POST", "/api/diagnose-error",
@@ -358,17 +354,15 @@ def test_diagnose_stream_emits_expected_events(monkeypatch):
     class FakeChunk(dict):
         pass
 
-    def fake_chat(**kwargs):
+    def fake_stream(**kwargs):
         return iter([
             {"message": {"content": "hello "}, "done": False},
             {"message": {"content": "world"}, "done": True},
         ])
 
-    class FakeList:
-        models = [type("M", (), {"model": "command-r:latest"})()]
-
-    monkeypatch.setattr(_server.ollama, "list", lambda: FakeList())
-    monkeypatch.setattr(_server.ollama, "chat", fake_chat)
+    import rag as _rag
+    monkeypatch.setattr(_server, "_resolve_diagnose_model", lambda: "command-r:latest")
+    monkeypatch.setattr(_rag, "_chat_stream_dispatch", fake_stream)
     _server.__dict__["_DIAGNOSE_MODEL_RESOLVED"] = None
 
     payload = {"error_text": "boom", "service": "test"}
@@ -385,15 +379,13 @@ def test_diagnose_stream_emits_expected_events(monkeypatch):
 
 
 def test_diagnose_stream_emits_error_event_on_llm_failure(monkeypatch):
-    """ollama.chat tira → stream emite type=error con el detail."""
-    def fake_chat(**kwargs):
+    """LLM call tira → stream emite type=error con el detail."""
+    def fake_stream(**kwargs):
         raise RuntimeError("ollama unreachable")
 
-    class FakeList:
-        models = [type("M", (), {"model": "command-r:latest"})()]
-
-    monkeypatch.setattr(_server.ollama, "list", lambda: FakeList())
-    monkeypatch.setattr(_server.ollama, "chat", fake_chat)
+    import rag as _rag
+    monkeypatch.setattr(_server, "_resolve_diagnose_model", lambda: "command-r:latest")
+    monkeypatch.setattr(_rag, "_chat_stream_dispatch", fake_stream)
     _server.__dict__["_DIAGNOSE_MODEL_RESOLVED"] = None
 
     payload = {"error_text": "boom", "service": "test"}

@@ -109,7 +109,7 @@ def test_resolver_calls_helper_with_history_and_query(monkeypatch):
         captured["prompt"] = messages[0]["content"]
         return _make_fake_resp("clima en Madrid")
 
-    monkeypatch.setattr(rag.ollama, "chat", _fake_chat)
+    monkeypatch.setattr(rag, "_mlx_chat", _fake_chat)
     history = [
         {"role": "user", "content": "qué clima hace en Buenos Aires"},
         {"role": "assistant", "content": "Hoy hay 22°C y sol en Buenos Aires."},
@@ -135,7 +135,7 @@ def test_resolver_caches_repeat_calls(monkeypatch):
         calls["n"] += 1
         return _make_fake_resp("rewrite cacheada")
 
-    monkeypatch.setattr(rag.ollama, "chat", _fake_chat)
+    monkeypatch.setattr(rag, "_mlx_chat", _fake_chat)
     history = [{"role": "user", "content": "qué tengo de astor"}]
     out1 = rag._resolve_anaphora("y de Juli?", history)
     out2 = rag._resolve_anaphora("y de Juli?", history)
@@ -152,7 +152,7 @@ def test_resolver_silent_fail_returns_original(monkeypatch):
     def _fake_chat(model, messages, **kwargs):
         raise Exception("timed out")
 
-    monkeypatch.setattr(rag.ollama, "chat", _fake_chat)
+    monkeypatch.setattr(rag, "_mlx_chat", _fake_chat)
     monkeypatch.setattr(rag, "_silent_log", lambda *a, **k: None)
     history = [{"role": "user", "content": "contexto"}]
     out = rag._resolve_anaphora("y eso?", history)
@@ -170,7 +170,7 @@ def test_resolver_no_history_returns_query_immediate(monkeypatch):
         calls["n"] += 1
         return _make_fake_resp("never reached")
 
-    monkeypatch.setattr(rag.ollama, "chat", _fake_chat)
+    monkeypatch.setattr(rag, "_mlx_chat", _fake_chat)
     out = rag._resolve_anaphora("y en Madrid?", [])
     assert out == "y en Madrid?"
     assert calls["n"] == 0
@@ -188,7 +188,7 @@ def test_resolver_clamps_runaway_output(monkeypatch):
     def _fake_chat(model, messages, **kwargs):
         return _make_fake_resp(big_response)
 
-    monkeypatch.setattr(rag.ollama, "chat", _fake_chat)
+    monkeypatch.setattr(rag, "_mlx_chat", _fake_chat)
     history = [{"role": "user", "content": "x"}]
     out = rag._resolve_anaphora("y eso?", history)
     assert out == "y eso?"  # fallback a la original
@@ -229,7 +229,7 @@ def test_multi_retrieve_resolves_anaphora_before_retrieve(monkeypatch, tmp_path)
     monkeypatch.setenv("RAG_ANAPHORA_RESOLVER", "1")
 
     # Mock helper LLM para que devuelva la rewrite determinística.
-    monkeypatch.setattr(rag.ollama, "chat",
+    monkeypatch.setattr(rag, "_mlx_chat",
                         lambda *a, **k: _make_fake_resp("clima en Madrid hoy"))
 
     captured = {"q_to_retrieve": None}
@@ -283,7 +283,7 @@ def test_multi_retrieve_skips_when_query_self_contained(monkeypatch, tmp_path):
         llm_calls["n"] += 1
         return _make_fake_resp("never reached")
 
-    monkeypatch.setattr(rag.ollama, "chat", _fake_chat)
+    monkeypatch.setattr(rag, "_mlx_chat", _fake_chat)
 
     captured = {"q": None}
 
@@ -326,7 +326,7 @@ def test_multi_retrieve_disabled_by_env(monkeypatch, tmp_path):
         llm_calls["n"] += 1
         return _make_fake_resp("not used")
 
-    monkeypatch.setattr(rag.ollama, "chat", _fake_chat)
+    monkeypatch.setattr(rag, "_mlx_chat", _fake_chat)
 
     captured = {"q": None}
 
@@ -365,7 +365,7 @@ def test_multi_retrieve_unchanged_rewrite_marks_not_resolved(
     rag._cached_anaphora_resolution.cache_clear()
     monkeypatch.setenv("RAG_ANAPHORA_RESOLVER", "1")
 
-    monkeypatch.setattr(rag.ollama, "chat",
+    monkeypatch.setattr(rag, "_mlx_chat",
                         lambda *a, **k: _make_fake_resp("y en Madrid?"))
 
     def _fake_retrieve(col, q, k, *args, **kwargs):

@@ -81,8 +81,8 @@ def _fake_claims(n: int = 3) -> list:
 
 
 def _streaming_fn(answer: str):
-    """Factory: returns a fake ollama.chat that yields one streaming chunk."""
-    def _fake(model, messages, options, stream, keep_alive):
+    """Factory: returns a fake `_chat_stream_dispatch` that yields one chunk."""
+    def _fake(**kwargs):
         yield _FakeChunk(answer)
     return _fake
 
@@ -108,7 +108,7 @@ def _apply_base_patches_query(monkeypatch, retrieve_result=None):
     monkeypatch.setattr(rag, "find_related", lambda col, metas: [])
     monkeypatch.setattr(rag, "render_related", lambda related: None)
     monkeypatch.setattr(rag, "new_turn_id", lambda: "turn-1")
-    monkeypatch.setattr(rag.ollama, "chat", _streaming_fn("Respuesta del vault."))
+    monkeypatch.setattr(rag, "_chat_stream_dispatch", _streaming_fn("Respuesta del vault."))
 
 
 def _apply_base_patches_chat(monkeypatch, tmp_path: Path, retrieve_result=None):
@@ -144,7 +144,7 @@ def _apply_base_patches_chat(monkeypatch, tmp_path: Path, retrieve_result=None):
         lambda vpath: {"indexed": 0, "took_ms": 0, "kind": "incremental"},
     )
     monkeypatch.setattr(rag, "log_query_event", lambda ev: None)
-    monkeypatch.setattr(rag.ollama, "chat", _streaming_fn("Respuesta del vault."))
+    monkeypatch.setattr(rag, "_chat_stream_dispatch", _streaming_fn("Respuesta del vault."))
 
 
 # ── Query integration: 12 cases ────────────────────────────────────────────────
@@ -373,7 +373,7 @@ def test_query_nli_empty_response_no_crash(monkeypatch):
     """Test 10: LLM returns empty string → split_claims("") → [] → ground NOT called."""
     monkeypatch.setenv("RAG_NLI_GROUNDING", "1")
     _apply_base_patches_query(monkeypatch)
-    monkeypatch.setattr(rag.ollama, "chat", _streaming_fn(""))
+    monkeypatch.setattr(rag, "_chat_stream_dispatch", _streaming_fn(""))
 
     ground_calls: list = []
     monkeypatch.setattr(rag, "ground_claims_nli",

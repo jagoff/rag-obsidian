@@ -342,7 +342,7 @@ def test_synthesize_cluster_uses_h1_when_present(tmp_vault: Path, monkeypatch):
     def _fake_chat(**kwargs):
         return {"message": {"content": fake_body}}
 
-    monkeypatch.setattr(cc.rag, "_mlx_or_ollama_chat", _fake_chat)
+    monkeypatch.setattr(cc.rag, "_mlx_chat", _fake_chat)
     monkeypatch.setattr(cc.rag, "resolve_chat_model", lambda: "qwen2.5:7b")
     title, body = cc.synthesize_cluster(items)
     assert title == "Autoridad y coaching"
@@ -370,7 +370,7 @@ def test_synthesize_cluster_rejects_long_prose_first_line(tmp_vault: Path, monke
     def _fake_chat(**kwargs):
         return {"message": {"content": fake_body}}
 
-    monkeypatch.setattr(cc.rag, "_mlx_or_ollama_chat", _fake_chat)
+    monkeypatch.setattr(cc.rag, "_mlx_chat", _fake_chat)
     monkeypatch.setattr(cc.rag, "resolve_chat_model", lambda: "qwen2.5:7b")
     title, _ = cc.synthesize_cluster(items)
     # Title must NOT contain backticks or parens (the prose had them).

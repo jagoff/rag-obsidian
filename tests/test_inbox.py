@@ -95,7 +95,7 @@ def test_suggest_tags_filters_to_vocab(vault_with_corpus, monkeypatch):
     _, col = vault_with_corpus
     # Helper "returns" three candidates: two real, one made-up.
     monkeypatch.setattr(
-        rag.ollama, "chat",
+        rag, "_mlx_chat",
         lambda **kw: _FakeResponse("- coaching\n- liderazgo\n- inventado"),
     )
     picked = rag._suggest_tags_for_note(col, "body about leadership coaching", "Note")
@@ -110,7 +110,7 @@ def test_suggest_tags_empty_body_returns_empty(vault_with_corpus, monkeypatch):
     def _chat(**kw):
         called["n"] += 1
         return _FakeResponse("- coaching")
-    monkeypatch.setattr(rag.ollama, "chat", _chat)
+    monkeypatch.setattr(rag, "_mlx_chat", _chat)
     out = rag._suggest_tags_for_note(col, "", "Note")
     assert out == []
     assert called["n"] == 0  # short-circuits without calling helper
@@ -120,7 +120,7 @@ def test_suggest_tags_handles_helper_exception(vault_with_corpus, monkeypatch):
     _, col = vault_with_corpus
     def _boom(**kw):
         raise RuntimeError("helper down")
-    monkeypatch.setattr(rag.ollama, "chat", _boom)
+    monkeypatch.setattr(rag, "_mlx_chat", _boom)
     assert rag._suggest_tags_for_note(col, "body", "Note") == []
 
 

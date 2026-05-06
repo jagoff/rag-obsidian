@@ -328,7 +328,7 @@ def synthesize_cluster(
     failure; caller decides whether to skip or retry.
     """
     chat_model = model or rag.resolve_chat_model()
-    resp = rag._mlx_or_ollama_chat(
+    resp = rag._mlx_chat(
         model=chat_model,
         messages=[
             {"role": "system", "content": _SYNTH_SYSTEM},

@@ -620,7 +620,7 @@ def test_today_cli_silent_no_op_when_empty(tmp_vault, monkeypatch):
     def _boom(*a, **kw):
         called.append(True)
         return _FakeResponse("must not run")
-    monkeypatch.setattr(rag.ollama, "chat", _boom)
+    monkeypatch.setattr(rag, "_mlx_chat", _boom)
 
     runner = CliRunner()
     result = runner.invoke(rag.cli, ["today", "--plain"])
@@ -638,7 +638,7 @@ def test_today_cli_dry_run_does_not_write(tmp_vault, monkeypatch):
     _set_mtime(p, _FROZEN_NOW - timedelta(minutes=5))
 
     monkeypatch.setattr(rag, "resolve_chat_model", lambda: "stub")
-    monkeypatch.setattr(rag.ollama, "chat", _fake_chat(NARRATIVE_STUB))
+    monkeypatch.setattr(rag, "_mlx_chat", _fake_chat(NARRATIVE_STUB))
 
     runner = CliRunner()
     result = runner.invoke(rag.cli, ["today", "--dry-run", "--plain"])
@@ -661,7 +661,7 @@ def test_today_cli_writes_evening_suffix_and_frontmatter(tmp_vault, monkeypatch)
     _set_mtime(p, _FROZEN_NOW - timedelta(minutes=5))
 
     monkeypatch.setattr(rag, "resolve_chat_model", lambda: "stub")
-    monkeypatch.setattr(rag.ollama, "chat", _fake_chat(NARRATIVE_STUB))
+    monkeypatch.setattr(rag, "_mlx_chat", _fake_chat(NARRATIVE_STUB))
 
     runner = CliRunner()
     result = runner.invoke(rag.cli, ["today", "--plain"])
@@ -690,7 +690,7 @@ def test_today_cli_does_not_collide_with_morning_file(tmp_vault, monkeypatch):
     _set_mtime(p, _FROZEN_NOW - timedelta(minutes=5))
 
     monkeypatch.setattr(rag, "resolve_chat_model", lambda: "stub")
-    monkeypatch.setattr(rag.ollama, "chat", _fake_chat(NARRATIVE_STUB))
+    monkeypatch.setattr(rag, "_mlx_chat", _fake_chat(NARRATIVE_STUB))
 
     runner = CliRunner()
     result = runner.invoke(rag.cli, ["today", "--plain"])

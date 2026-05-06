@@ -9846,76 +9846,6 @@ def _ensure_home_prewarmer() -> None:
 _CHAT_PREWARM_INTERVAL = int(os.environ.get("OBSIDIAN_RAG_CHAT_PREWARM_INTERVAL", "240"))
 _CHAT_PREWARMER_STARTED = False
 
-# ── Ollama stuck-load circuit breaker ─────────────────────────────────────
-# Síntoma observado 2026-05-04: ollama responde a /api/ps en <1ms pero
-# /api/generate de 1 token tarda 30s+ (pegado en KV reinit bajo swap thrash).
-# El prewarmer detecta "Server disconnected" o timeout pero solo loguea —
-# la próxima request del user igual se cuelga 60-120s.
-#
-# Fix: counter de fallos consecutivos del prewarm cycle. Si llega a
-# `_OLLAMA_STUCK_THRESHOLD` (default 2) → matar los runners ollama
-# (NO el `ollama serve` parent). El daemon de Ollama.app respawnea los
-# runners on-demand al próximo request — recovery automático sin manual.
-#
-# Activación: `RAG_OLLAMA_STUCK_RESTART=1` en plist (default OFF para
-# evitar restarts agresivos en entornos con tráfico bajo donde un fallo
-# puntual no significa stuck).
-_OLLAMA_STUCK_FAIL_COUNT = 0
-_OLLAMA_STUCK_LAST_RESTART_TS: float = 0.0
-_OLLAMA_STUCK_THRESHOLD = int(os.environ.get("RAG_OLLAMA_STUCK_THRESHOLD", "2"))
-_OLLAMA_STUCK_COOLDOWN_S = int(os.environ.get("RAG_OLLAMA_STUCK_COOLDOWN_S", "180"))
-
-
-def _maybe_restart_ollama_on_stuck() -> bool:
-    """Si el contador de fallos consecutivos cruzó el threshold y pasó
-    el cooldown desde el último restart, kill runners. Retorna True si
-    se ejecutó kill, False si no.
-
-    Cooldown previene loops infinitos: si el restart no resuelve, no
-    seguimos matando runners cada ciclo del prewarmer.
-    """
-    global _OLLAMA_STUCK_FAIL_COUNT, _OLLAMA_STUCK_LAST_RESTART_TS
-    if os.environ.get("RAG_OLLAMA_STUCK_RESTART", "0") != "1":
-        return False
-    if _OLLAMA_STUCK_FAIL_COUNT < _OLLAMA_STUCK_THRESHOLD:
-        return False
-    now = time.time()
-    if now - _OLLAMA_STUCK_LAST_RESTART_TS < _OLLAMA_STUCK_COOLDOWN_S:
-        return False
-    try:
-        from rag import _kill_ollama_runners as _rag_kill
-        killed = _rag_kill()
-    except Exception as exc:
-        killed = 0
-        print(f"[ollama-stuck-restart] kill error: {exc}", flush=True)
-    _OLLAMA_STUCK_LAST_RESTART_TS = now
-    _OLLAMA_STUCK_FAIL_COUNT = 0
-    print(
-        f"[ollama-stuck-restart] killed={killed} "
-        f"cooldown={_OLLAMA_STUCK_COOLDOWN_S}s",
-        flush=True,
-    )
-    return killed > 0
-
-
-def _ollama_quick_health_probe(timeout_s: float = 1.0) -> bool:
-    """Best-effort: ¿está ollama listo para servir requests?
-
-    GET /api/ps con timeout corto. Si responde 200 en <timeout_s →
-    healthy. Si timea o connection refused → probablemente stuck.
-
-    Esto es complementario al stuck-restart del prewarmer: el chat
-    handler puede chequear ANTES de empezar el flow LLM (que tarda
-    60+ segundos en timear) y bailar fast con error 503 al user.
-    """
-    try:
-        import urllib.request
-        urllib.request.urlopen("http://localhost:11434/api/ps", timeout=timeout_s).read()
-        return True
-    except Exception:
-        return False
-
-
 def _chat_prewarm_targets() -> list[tuple[str, int]]:
     """Resolver the (model, num_ctx) pairs that the prewarm cycle has to pin.
 
@@ -9992,12 +9922,10 @@ def _run_chat_prewarm_cycle() -> None:
     Uses the bounded streaming client so a stuck-load daemon can't wedge
     this thread forever and mask the next real request.
     """
-    global _OLLAMA_STUCK_FAIL_COUNT
-    from rag import _mlx_or_ollama_chat
-    cycle_failed = False
+    from rag import _mlx_chat
     for model, num_ctx in _chat_prewarm_targets():
         try:
-            _mlx_or_ollama_chat(
+            _mlx_chat(
                 model=model,
                 messages=[
                     {"role": "system", "content": _WEB_SYSTEM_PROMPT},
@@ -10014,19 +9942,6 @@ def _run_chat_prewarm_cycle() -> None:
             # Silent fail per-model: ollama down, model not loaded, network
             # blip. Next cycle retries. Never crash the daemon thread.
             print(f"[chat-prewarm] skipped {model}: {exc}", flush=True)
-            cycle_failed = True
-    # Stuck detection: cycles fallidos consecutivos incrementan el counter;
-    # un cycle exitoso lo resetea. El restart se dispara al cruzar threshold.
-    if cycle_failed:
-        _OLLAMA_STUCK_FAIL_COUNT += 1
-        print(
-            f"[chat-prewarm] consecutive_failures={_OLLAMA_STUCK_FAIL_COUNT} "
-            f"threshold={_OLLAMA_STUCK_THRESHOLD}",
-            flush=True,
-        )
-        _maybe_restart_ollama_on_stuck()
-    else:
-        _OLLAMA_STUCK_FAIL_COUNT = 0
 
 
 def _ensure_chat_model_prewarmer() -> None:
@@ -11521,41 +11436,6 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         question = req.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="empty question")
-
-    # ── Pre-flight ollama health probe ───────────────────────────────────
-    # Si ollama está stuck (proceso vivo pero no responde), el flow completo
-    # de chat tarda 60-200s en cascada de timeouts (helper 60s + chat 90s +
-    # citation-repair 60s). Mejor bailar fast con 503 al user y dejar que
-    # el watchdog del prewarmer haga el restart automático en el siguiente
-    # ciclo. Costo del probe: 1ms si healthy, ≤timeout si stuck.
-    #
-    # Gate MLX (2026-05-05): bajo RAG_LLM_BACKEND=mlx Ollama no se usa para
-    # LLM inference — solo como fallback para tool-calling. El probe síncrono
-    # agrega ~20ms overhead por request y puede devolver 503 si el user apagó
-    # el daemon de Ollama (razonable en MLX-only). Se skipea el probe cuando
-    # el backend activo es mlx SALVO que el operador lo force con
-    # RAG_OLLAMA_HEALTH_CHECK=1 explícito.
-    _active_backend = os.environ.get("RAG_LLM_BACKEND", "mlx").strip().lower()
-    _hc_env = os.environ.get("RAG_OLLAMA_HEALTH_CHECK", "")
-    _run_health_probe = (
-        _hc_env == "1"  # forzado explícitamente
-        or (_hc_env != "0" and _active_backend != "mlx")  # ollama default y no desactivado
-    )
-    if _run_health_probe:
-        try:
-            _hc_timeout = float(os.environ.get("RAG_OLLAMA_HEALTH_TIMEOUT_S", "8"))
-        except ValueError:
-            _hc_timeout = 8.0
-        if not _ollama_quick_health_probe(timeout_s=_hc_timeout):
-            # Bumpear stuck counter para acelerar el restart del prewarmer.
-            global _OLLAMA_STUCK_FAIL_COUNT
-            _OLLAMA_STUCK_FAIL_COUNT += 1
-            _maybe_restart_ollama_on_stuck()
-            raise HTTPException(
-                status_code=503,
-                detail=("ollama no responde — el sistema está intentando "
-                        "recuperarse automáticamente, reintenta en 30s"),
-            )
 
     # Detect create-intent EARLY. When true we skip emitting `sources`
     # (vault citations are noise when the user is creating something new,

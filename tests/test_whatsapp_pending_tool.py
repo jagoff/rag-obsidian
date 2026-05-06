@@ -305,15 +305,18 @@ def test_whatsapp_sources_emitted_in_sse_with_wa_me_link(monkeypatch):
     monkeypatch.setitem(server_mod.TOOL_FNS, "reminders_due", lambda **kw: "[]")
     monkeypatch.setitem(server_mod.TOOL_FNS, "calendar_ahead", lambda **kw: "[]")
 
-    # Mock ollama.chat: empty tool_calls (bypass tool-deciding) + one
+    # Mock chat dispatcher: empty tool_calls (bypass tool-deciding) + one
     # streaming token for the final answer.
     class _Mock:
         def __call__(self, *a, **kw):
             if kw.get("stream"):
                 return iter([SimpleNamespace(message=SimpleNamespace(content="ok"))])
             return SimpleNamespace(message=SimpleNamespace(content="", tool_calls=None))
-    import ollama
-    monkeypatch.setattr(ollama, "chat", _Mock())
+    mock_inst = _Mock()
+    import rag as _rag_mod
+    monkeypatch.setattr(_rag_mod, "_mlx_chat", mock_inst)
+    monkeypatch.setattr(_rag_mod, "_mlx_chat_via_backend", mock_inst)
+    monkeypatch.setattr(_rag_mod, "_chat_stream_dispatch", mock_inst)
 
     client = TestClient(app)
     resp = client.post(

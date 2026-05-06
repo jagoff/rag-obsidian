@@ -261,12 +261,20 @@ _TOOL_INTENT_RULES: tuple[tuple[str, dict, str], ...] = (
     # they're CREATE intents now (propose_reminder / propose_calendar_event).
     # Moved to `_PROPOSE_INTENT_RE` below. `recordator` still matches
     # "qué recordatorios tengo" → list.
-    ("reminders_due",   {}, r"pendient|tarea|to.?do|recordator|" + _PLANNING_PAT),
+    # `to-do` requiere hyphen literal — `to.?do` (any-char) matcheaba
+    # "todos" en queries idiomáticas tipo "mejor serie de todos los tiempos"
+    # y disparaba este tool spuriamente. Spanish task vocabulary ya está
+    # cubierto por `tarea|pendient|recordator`.
+    ("reminders_due",   {}, r"pendient|tarea|\bto-do\b|recordator|" + _PLANNING_PAT),
     # "inbox" / "bandeja" alone are too generic — Obsidian PARA uses
     # "00-Inbox" heavily. Require an explicit mail signal.
     ("gmail_recent",    {}, r"\b(mail|correo|e.?mail|gmail)s?\b|bandeja\s+de\s+entrada"),
     ("calendar_ahead",  {}, r"calendari|\beventos?\b|\bcitas?\b|reuni[oó]n|\bagendas?\b|pr[oó]xim[ao]s?\s+d[ií]as|" + _PLANNING_PAT),
-    ("weather",         {}, r"\bclimas?\b|\btiempos?\b|llov|lluvia|temperatur|pron[oó]stico"),
+    # `\btiempo\b` SIN plural: "tiempos" en español es casi siempre idiom
+    # no-weather ("de todos los tiempos", "tiempos modernos", "los tiempos
+    # cambian"). El singular "tiempo" sí es weather común ("qué tiempo
+    # hace").
+    ("weather",         {}, r"\bclimas?\b|\btiempo\b|llov|lluvia|temperatur|pron[oó]stico"),
     # Drive: "drive" alone es ambiguo (también es una palabra EN genérica,
     # "drive-thru", "hard drive"), pero "drive" precedido por
     # google/en/mi/tu/del/al/a/sobre es señal clara de la intent

@@ -3356,7 +3356,8 @@ def resolve_chat_model() -> str:
     global _CHAT_MODEL_RESOLVED
     if _CHAT_MODEL_RESOLVED is not None:
         return _CHAT_MODEL_RESOLVED
-    backend = os.environ.get("RAG_LLM_BACKEND", "mlx").lower()
+    from rag.llm_backend import get_backend
+    backend = get_backend().name  # singleton — 1 lookup al startup, luego cached
     if backend == "mlx":
         try:
             from rag.llm_backend import MLX_MODEL_ALIAS, MLXBackend  # local import
@@ -3880,8 +3881,9 @@ class _TimedOllamaProxy:
         # and fall through to Ollama — MLX backend has no native tool
         # format and `chat()` here doesn't yield. Streaming sites must
         # use `_chat_stream_dispatch()` instead of this proxy.
+        from rag.llm_backend import get_backend
         if (
-            os.environ.get("RAG_LLM_BACKEND", "mlx").lower() == "mlx"
+            get_backend().name == "mlx"
             and not kwargs.get("tools")
             and not kwargs.get("stream")
         ):
@@ -3916,7 +3918,7 @@ def _mlx_chat_via_backend(**kwargs):
         temperature=float(options_dict.get("temperature", 0.0)),
         seed=int(options_dict.get("seed", 42)),
         num_ctx=int(options_dict.get("num_ctx", 4096)),
-        num_predict=int(options_dict.get("num_predict", 768)),
+        num_predict=int(options_dict.get("num_predict", 384)),
         top_p=float(options_dict.get("top_p", 1.0)),
         stop=tuple(options_dict.get("stop", ()) or ()),
     )
@@ -3938,8 +3940,9 @@ def _mlx_or_ollama_chat(**kwargs):
     """
     if ollama.chat is not _ORIGINAL_OLLAMA_CHAT:
         return ollama.chat(**kwargs)
+    from rag.llm_backend import get_backend
     if (
-        os.environ.get("RAG_LLM_BACKEND", "mlx").lower() == "mlx"
+        get_backend().name == "mlx"
         and not kwargs.get("tools")
         and not kwargs.get("stream")
     ):
@@ -3965,11 +3968,11 @@ def _chat_stream_dispatch(**kwargs):
     if ollama.chat is not _ORIGINAL_OLLAMA_CHAT:
         # Monkey-patched (test): use module symbol so mock intercepts.
         return ollama.chat(stream=True, **kwargs)
+    from rag.llm_backend import ChatOptions, get_backend
     if (
-        os.environ.get("RAG_LLM_BACKEND", "mlx").lower() == "mlx"
+        get_backend().name == "mlx"
         and not kwargs.get("tools")
     ):
-        from rag.llm_backend import ChatOptions, get_backend
 
         options_dict = kwargs.get("options") or {}
         if hasattr(options_dict, "model_dump"):
@@ -3980,7 +3983,7 @@ def _chat_stream_dispatch(**kwargs):
             temperature=float(options_dict.get("temperature", 0.0)),
             seed=int(options_dict.get("seed", 42)),
             num_ctx=int(options_dict.get("num_ctx", 4096)),
-            num_predict=int(options_dict.get("num_predict", 768)),
+            num_predict=int(options_dict.get("num_predict", 384)),
             top_p=float(options_dict.get("top_p", 1.0)),
             stop=tuple(options_dict.get("stop", ()) or ()),
         )
@@ -12711,6 +12714,47 @@ _LLM_TYPO_LAST: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "rag_llm_typo_last", default=None,
 )
 
+# -- Backend telemetry ContextVar (2026-05-05) --
+# Registra que backend LLM se uso en la llamada mas reciente del contexto actual.
+# Seteado por los 4 dispatch points (TimedOllamaProxy.chat, _mlx_chat_via_backend,
+# _mlx_or_ollama_chat, _chat_stream_dispatch) y leido por log_query_event para
+# agregar backend, fallback_reason y backend_active al extra_json de rag_queries.
+# Patron identico al de _LLM_TYPO_LAST: CV aislado por task/thread,
+# safe bajo concurrencia web. None cuando no hubo dispatch LLM aun.
+#
+# Shape: {"backend": "mlx"|"ollama", "fallback_reason": str|None, "backend_active": str}
+_ACTIVE_BACKEND_CTX: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "rag_active_backend", default=None,
+)
+
+
+def _mark_backend(backend: str, *, fallback_reason: str | None = None) -> None:
+    """Setea el ContextVar de backend para el request actual.
+
+    backend = "mlx" | "ollama". fallback_reason solo cuando MLX cayo a Ollama
+    ("tools" | "stream" | "mlx_exception"). None para Ollama nativo o MLX limpio.
+    """
+    try:
+        from rag.llm_backend import get_backend
+        backend_active = get_backend().name
+    except Exception:
+        backend_active = os.environ.get("RAG_LLM_BACKEND", "ollama")
+    _ACTIVE_BACKEND_CTX.set({
+        "backend": backend,
+        "fallback_reason": fallback_reason,
+        "backend_active": backend_active,
+    })
+
+
+def _get_backend_telemetry() -> "dict | None":
+    """Lee el ContextVar de backend. Retorna None si no hubo dispatch LLM."""
+    return _ACTIVE_BACKEND_CTX.get()
+
+
+def _reset_backend_telemetry() -> None:
+    """Resetea el ContextVar de backend. Opcional al inicio de un nuevo request."""
+    _ACTIVE_BACKEND_CTX.set(None)
+
 
 def _typo_telemetry_reset() -> None:
     """Reset del ContextVar de typo correction. Llamar antes de
@@ -14979,10 +15023,10 @@ def _handle_memory_pressure(pct_before: float, threshold: float) -> dict:
         # → death spiral). Para MLX, llamamos `MLXBackend.unload()` que
         # pop-ea el modelo de `_loaded` + `mx.clear_cache()`. Bajo Ollama
         # mantenemos el path histórico (cliente con timeout corto).
-        _backend_choice = os.environ.get("RAG_LLM_BACKEND", "mlx").strip().lower()
+        from rag.llm_backend import get_backend
+        _backend_choice = get_backend().name  # singleton — no env lookup en hot path
         if _backend_choice == "mlx":
             try:
-                from rag.llm_backend import get_backend
                 _backend = get_backend()
                 if _backend.unload(chat_model):
                     actions["chat_unloaded"] = True
@@ -53402,11 +53446,10 @@ def serve(host: str, port: int):
             parts: list[str] = []
             ttft_ms: int | None = None
             try:
-                for chunk in _chat_capped_client().chat(
+                for chunk in _chat_stream_dispatch(
                     model=resolve_chat_model(),
                     messages=messages,
                     options={**CHAT_OPTIONS, "num_predict": tasks_predict_cap},
-                    stream=True,
                     keep_alive=chat_keep_alive(),
                 ):
                     content = chunk.message.content
@@ -58984,7 +59027,8 @@ def _behavior_backfill_find_match(
                 rows = conn.execute(
                     f"SELECT id, ts, q, session, paths_json FROM rag_queries"
                     f" WHERE 1=1{_range_where}"
-                    f" ORDER BY ABS(strftime('%s', ts) - strftime('%s', ?)) ASC",
+                    f" ORDER BY ABS(strftime('%s', ts) - strftime('%s', ?)) ASC"
+                    f" LIMIT 50",
                     (*_range_params, orphan_ts),
                 ).fetchall()
                 for r in rows:

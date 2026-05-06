@@ -66,6 +66,7 @@ Para cambiar cualquier default: setear el env var en el shell antes de invocar e
 | `RAG_POSTPROCESS_MODEL` | `""` | `rag.py:135` | Override del model LLM usado en stages de postprocess (critique, NLI repair). Default = chat model. |
 | `RAG_RERANKER_FT_PATH` | `""` (off) | `rag.py:10878` | Path al cross-encoder fine-tuned (gate GC#2.C). Cuando hay model promovido, apunta al symlink `~/.cache/obsidian-rag/reranker-ft-current`. |
 | `RAG_RETRIEVE_TIMING` | `""` (off) | `rag.py` | Debug — dump per-stage timing breakdown de `retrieve()` a stderr. |
+| `RAG_LLM_BACKEND` | `mlx` | `rag/llm_backend.py:728` | Dispatch backend para chat (LLM generation). Valores: `ollama` (legacy Ollama API), `mlx` (Apple Silicon MLX native, default post-2026-05-05). Rollback: `RAG_LLM_BACKEND=ollama` en shell o plist. |
 | `RAG_STATE_SQL` | `1` | `rag.py` | Historicamente activaba el SQL path. Post-T10 es no-op, setear en plists para trail. |
 | `RAG_TRACK_OPENS` | `""` (off) | `rag.py` | Switch del OSC-8 terminal link scheme de `file://` a `x-rag-open://`. Opt-in para trackeo de clicks. |
 | `YOUTUBE_API_KEY` | `""` | `rag.py:36770` | API key opcional para YouTube transcript fetching. Sin esto, el fallback es `yt-dlp --write-auto-sub`. |

@@ -26,7 +26,7 @@ for the parallel embedding migration.
 ## Invariants preserved
 
 - HELPER_OPTIONS (temperature=0, seed=42) — eval reproducibility floor.
-- CHAT_OPTIONS (num_ctx=4096, num_predict=768) — VRAM-budgeted.
+- CHAT_OPTIONS (num_ctx=4096, num_predict=384) — VRAM-budgeted.
 - `keep_alive=-1` semantics → emulated via resident-process + LRU on
   the MLX side (MLX has no native keep_alive). Eviction policy:
   Qwen3-30B (~17 GB) is single-tenant (_BIG_MODELS), evicts everything
@@ -58,6 +58,9 @@ resolve between them via `MLX_MODEL_ALIAS` table.
 from __future__ import annotations
 
 import os
+import sys
+import threading
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
@@ -111,7 +114,11 @@ class ChatOptions:
     temperature: float = 0.0
     seed: int = 42
     num_ctx: int = 4096
-    num_predict: int = 768
+    # 384 matches CHAT_OPTIONS["num_predict"] in rag/__init__.py (median
+    # answer_len=38 chars, p90 approx 200 tokens). A default of 768 caused
+    # callers passing options={} without num_predict to generate 2x more
+    # tokens under MLX than under Ollama (latency + quality regression).
+    num_predict: int = 384
     top_p: float = 1.0
     stop: tuple[str, ...] = ()
 
@@ -383,6 +390,23 @@ class MLXBackend(LLMBackend):
         self._loaded: OrderedDict[str, tuple[Any, Any]] = OrderedDict()
         self._idle_ttl = int(os.environ.get("RAG_MLX_IDLE_TTL", "1800"))
 
+        # Fix #2: lock serializes _load()/_evict_for()/unload() so concurrent
+        # requests don't double-load the same model (OOM risk on big models).
+        self._loaded_lock = threading.Lock()
+
+        # Timestamps for idle-unload watchdog (Fix #5)
+        self._last_used: dict[str, float] = {}
+
+        # Fix #4: sampler cache — same (temp, top_p) reuses the same sampler
+        self._sampler_cache: dict[tuple[float, float], Any] = {}
+        self._sampler_cache_lock = threading.Lock()
+
+        # Watchdog state (Fix #5)
+        self._watchdog_thread: threading.Thread | None = None
+        self._watchdog_stop = threading.Event()
+        if os.environ.get("RAG_MLX_IDLE_TTL_DISABLE", "").lower() not in ("1", "true", "yes"):
+            self._start_watchdog()
+
     def _load(self, model_id: str) -> tuple[Any, Any]:
         """Get or load (model, tokenizer) for `model_id`. LRU bump on hit."""
         canonical = to_mlx(model_id)
@@ -479,6 +503,7 @@ class MLXBackend(LLMBackend):
                 done=False,
             )
 
+        self._bump_last_used(model)
         yield ChatResponse(
             model=ollama_model,
             message=Message(role="assistant", content=""),
@@ -613,18 +638,21 @@ class MLXBackend(LLMBackend):
         Returns True iff anything was unloaded.
         """
         try:
-            if not self._loaded:
-                return False
-            if model is None:
-                self._loaded.clear()
-                unloaded_any = True
-            else:
-                canonical = to_mlx(model)
-                if canonical in self._loaded:
-                    self._loaded.pop(canonical, None)
+            with self._loaded_lock:
+                if not self._loaded:
+                    return False
+                if model is None:
+                    self._loaded.clear()
+                    self._last_used.clear()
                     unloaded_any = True
                 else:
-                    unloaded_any = False
+                    canonical = to_mlx(model)
+                    if canonical in self._loaded:
+                        self._loaded.pop(canonical, None)
+                        self._last_used.pop(canonical, None)
+                        unloaded_any = True
+                    else:
+                        unloaded_any = False
             try:
                 import mlx.core as mx  # type: ignore[import-not-found]
 
@@ -640,6 +668,66 @@ class MLXBackend(LLMBackend):
             return unloaded_any
         except Exception:
             return False
+
+    # -- Idle-unload watchdog ------------------------------------------------
+
+    def _start_watchdog(self) -> None:
+        """Start the idle-unload watchdog daemon thread if TTL is positive."""
+        disabled = os.environ.get("RAG_MLX_IDLE_DISABLE", "").strip() in ("1", "true", "yes")
+        if disabled or self._idle_ttl <= 0:
+            return
+        t = threading.Thread(target=self._watchdog_loop, daemon=True, name="mlx-idle-watchdog")
+        self._watchdog_thread = t
+        t.start()
+
+    def _watchdog_loop(self) -> None:
+        """Daemon loop: evict models idle longer than `_idle_ttl` seconds."""
+        while not self._watchdog_stop.wait(timeout=60):
+            try:
+                self._evict_idle()
+            except Exception:
+                pass
+
+    def _evict_idle(self) -> None:
+        """Evict any loaded model whose last-use timestamp is stale."""
+        now = time.monotonic()
+        to_evict: list[tuple[str, float]] = []
+        with self._loaded_lock:
+            for canonical, last in list(self._last_used.items()):
+                idle_s = now - last
+                if idle_s > self._idle_ttl and canonical in self._loaded:
+                    to_evict.append((canonical, idle_s))
+        for canonical, idle_s in to_evict:
+            with self._loaded_lock:
+                if canonical not in self._loaded:
+                    continue  # already gone (concurrent unload)
+                self._loaded.pop(canonical, None)
+                self._last_used.pop(canonical, None)
+            print(
+                f"[mlx-watchdog] evicting {canonical} idle={idle_s:.0f}s",
+                file=sys.stderr,
+                flush=True,
+            )
+        if to_evict:
+            try:
+                import mlx.core as mx  # type: ignore[import-not-found]
+
+                mx.clear_cache()
+            except Exception:
+                pass
+            try:
+                import gc
+
+                gc.collect()
+            except Exception:
+                pass
+
+    def shutdown_watchdog(self) -> None:
+        """Signal the watchdog thread to stop. Call from reset_backend() in tests."""
+        self._watchdog_stop.set()
+        if self._watchdog_thread is not None:
+            self._watchdog_thread.join(timeout=2)
+            self._watchdog_thread = None
 
 
 # ---------------------------------------------------------------------------
@@ -676,6 +764,8 @@ def get_backend() -> LLMBackend:
 def reset_backend() -> None:
     """Force re-resolution on next get_backend() call. Tests only."""
     global _BACKEND_SINGLETON
+    if isinstance(_BACKEND_SINGLETON, MLXBackend):
+        _BACKEND_SINGLETON.shutdown_watchdog()
     _BACKEND_SINGLETON = None
 
 
@@ -691,3 +781,7 @@ __all__ = [
     "to_mlx",
     "to_ollama",
 ]
+
+# Expose shutdown_watchdog at module level for callers that hold a reference
+# to the backend directly (e.g. memory-pressure handler in rag/__init__.py).
+# It's a method on MLXBackend; listed here for IDE discoverability only.

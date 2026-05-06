@@ -114,8 +114,6 @@ def chat_env(monkeypatch):
     network / ollama / vault. Caller picks what retrieve's fast_path
     flag is by re-applying `multi_retrieve` per-test.
     """
-    monkeypatch.setattr(server_mod, "_ollama_alive", lambda timeout=2.0: True)
-    monkeypatch.setattr(server_mod, "_ollama_chat_probe", lambda timeout_s=6.0: True)
     monkeypatch.setattr(server_mod, "_fetch_whatsapp_unread", lambda *a, **kw: [])
     import rag as _rag
     monkeypatch.setattr(_rag, "build_person_context", lambda q: None)
@@ -173,7 +171,7 @@ def test_mode_fast_forces_small_model(chat_env):
     chat_env.setattr(server_mod, "log_query_event", log)
 
     mock = _OllamaMock([_mk_stream(["ok"])])
-    chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+    chat_env.setattr(server_mod.ollama, "chat", mock)
 
     client = TestClient(app)
     resp = client.post(
@@ -224,7 +222,7 @@ def test_mode_deep_forces_full_model(chat_env):
     chat_env.setattr(server_mod, "log_query_event", log)
 
     mock = _OllamaMock([_mk_stream(["ok"])])
-    chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+    chat_env.setattr(server_mod.ollama, "chat", mock)
 
     client = TestClient(app)
     resp = client.post(
@@ -274,7 +272,7 @@ def test_mode_auto_delegates_to_retrieve(chat_env):
     chat_env.setattr(server_mod, "log_query_event", log)
 
     mock = _OllamaMock([_mk_stream(["ok"])])
-    chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+    chat_env.setattr(server_mod.ollama, "chat", mock)
 
     client = TestClient(app)
     resp = client.post(
@@ -320,7 +318,7 @@ def test_missing_mode_defaults_to_auto(chat_env):
     chat_env.setattr(server_mod, "log_query_event", log)
 
     mock = _OllamaMock([_mk_stream(["ok"])])
-    chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+    chat_env.setattr(server_mod.ollama, "chat", mock)
 
     client = TestClient(app)
     resp = client.post(
@@ -357,7 +355,7 @@ def test_invalid_mode_silent_fallback(chat_env, bad_mode):
     chat_env.setattr(server_mod, "log_query_event", log)
 
     mock = _OllamaMock([_mk_stream(["ok"])])
-    chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+    chat_env.setattr(server_mod.ollama, "chat", mock)
 
     client = TestClient(app)
     resp = client.post(
@@ -399,7 +397,7 @@ def test_mode_case_insensitive(chat_env):
     chat_env.setattr(server_mod, "log_query_event", log)
 
     mock = _OllamaMock([_mk_stream(["ok"])])
-    chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+    chat_env.setattr(server_mod.ollama, "chat", mock)
 
     client = TestClient(app)
     resp = client.post(
@@ -458,7 +456,7 @@ def test_mode_deep_still_downgrades_when_preroute_fires(chat_env):
     )
 
     mock = _OllamaMock([_mk_stream(["ok"])])
-    chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+    chat_env.setattr(server_mod.ollama, "chat", mock)
 
     client = TestClient(app)
     resp = client.post(

@@ -110,10 +110,6 @@ def chat_env(monkeypatch):
         server_mod, "multi_retrieve",
         lambda *a, **kw: _canned_retrieve(confidence=0.5),
     )
-    monkeypatch.setattr(server_mod, "_ollama_alive", lambda timeout=2.0: True)
-    monkeypatch.setattr(
-        server_mod, "_ollama_chat_probe", lambda timeout_s=6.0: True,
-    )
     monkeypatch.setattr(
         server_mod, "_fetch_whatsapp_unread", lambda *a, **kw: [],
     )
@@ -176,7 +172,6 @@ def chat_env(monkeypatch):
         responses=[[SimpleNamespace(message=SimpleNamespace(content="respuesta generada"))]],
     )
     monkeypatch.setattr(server_mod.ollama, "chat", _ollama_mock)
-    monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", _ollama_mock)
     monkeypatch.ollama_mock = _ollama_mock  # type: ignore[attr-defined]
     return monkeypatch
 

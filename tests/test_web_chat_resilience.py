@@ -82,8 +82,6 @@ def chat_env(monkeypatch):
         server_mod, "multi_retrieve",
         lambda *a, **kw: _canned_retrieve_result(a[1] if len(a) >= 2 else "x"),
     )
-    monkeypatch.setattr(server_mod, "_ollama_alive", lambda timeout=2.0: True)
-    monkeypatch.setattr(server_mod, "_ollama_chat_probe", lambda timeout_s=6.0: True)
     monkeypatch.setattr(server_mod, "_fetch_whatsapp_unread", lambda *a, **kw: [])
     import rag as _rag
     monkeypatch.setattr(_rag, "build_person_context", lambda q: None)
@@ -152,8 +150,7 @@ def test_grounding_hang_does_not_block_sse_done(chat_env, monkeypatch):
         return SimpleNamespace(message=SimpleNamespace(content="", tool_calls=None))
 
     monkeypatch.setattr(server_mod.ollama, "chat", _mock_chat)
-    monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", _mock_chat)
-    monkeypatch.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", _mock_chat)
+    monkeypatch.setattr(_rag, "_mlx_chat_via_backend", _mock_chat)
 
     t0 = time.perf_counter()
     events, _ = _post_chat()
@@ -204,16 +201,9 @@ def test_pre_router_detect_exception_emits_error_and_done(chat_env, monkeypatch)
             message=SimpleNamespace(content="", tool_calls=None)
         ) if not kw.get("stream") else iter([]),
     )
+    import rag as _rag2
     monkeypatch.setattr(
-        server_mod._OLLAMA_STREAM_CLIENT, "chat",
-        lambda *a, **kw: iter([SimpleNamespace(
-            message=SimpleNamespace(content="x")
-        )]) if kw.get("stream") else SimpleNamespace(
-            message=SimpleNamespace(content="", tool_calls=None)
-        ),
-    )
-    monkeypatch.setattr(
-        server_mod._OLLAMA_TOOL_CLIENT, "chat",
+        _rag2, "_mlx_chat_via_backend",
         lambda *a, **kw: SimpleNamespace(
             message=SimpleNamespace(content="", tool_calls=None)
         ),

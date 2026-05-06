@@ -179,33 +179,6 @@ class TestT12ReadNotePriority:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# T-infra — Ollama health watchdog
-# ─────────────────────────────────────────────────────────────────────
-
-
-class TestOllamaHealthWatchdog:
-    def test_watchdog_module_importable(self):
-        from rag._ollama_health import start_latency_degradation_watchdog
-        assert callable(start_latency_degradation_watchdog)
-
-    def test_watchdog_disabled_via_env(self, monkeypatch):
-        from rag import _ollama_health
-        monkeypatch.setenv("RAG_LATENCY_WATCHDOG_DISABLE", "1")
-        monkeypatch.setattr(_ollama_health, "_started", False)
-        result = _ollama_health.start_latency_degradation_watchdog()
-        assert result is False
-
-    def test_watchdog_idempotent(self, monkeypatch):
-        from rag import _ollama_health
-        monkeypatch.setattr(_ollama_health, "_watchdog_loop", lambda *a, **kw: None)
-        monkeypatch.setattr(_ollama_health, "_started", False)
-        monkeypatch.delenv("RAG_LATENCY_WATCHDOG_DISABLE", raising=False)
-        first = _ollama_health.start_latency_degradation_watchdog()
-        second = _ollama_health.start_latency_degradation_watchdog()
-        assert first is True and second is True
-
-
-# ─────────────────────────────────────────────────────────────────────
 # Wave 2 (eval QA del 2026-04-28 evening) — bugs adicionales
 # ─────────────────────────────────────────────────────────────────────
 

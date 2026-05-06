@@ -54,12 +54,10 @@ objects. If the tokenizer template doesn't accept `tools=` (older format),
 the call falls through to a no-tools template — caller can detect the
 absence of `tool_calls` in the response and Ollama-fallback.
 
-## TODO
+## Ola 5 cerrada 2026-05-06
 
-- [ ] Migrate 14 raw `ollama.chat(stream=True, ...)` call sites to `get_backend().chat_stream(...)`
-- [x] Tool-calling format adapter (Qwen `<tool_call>` JSON schema) — done 2026-05-06
-- [x] Idle-unload watchdog thread (RAG_MLX_IDLE_TTL enforcement) — done 2026-05-05
-- [ ] Bench harness wiring (benchmarks/bench_mlx_vs_ollama.py)
+Tool-calling nativo MLX via `rag.mlx_tool_calls`, idle-unload watchdog,
+watchdog ollama-chat-daemon retirado (chat 100% in-process MLX).
 """
 
 from __future__ import annotations

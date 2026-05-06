@@ -4071,10 +4071,7 @@ def _index_embed_client() -> ollama.Client:
 
     Empirical foot-gun observed 2026-05-01: a zombie `rag index --no-contradict`
     spawned by a parallel devin session sat in `__recvfrom` for 1.5h
-    (verified with `sample <pid> 1`). The watchdog (`_ollama_health.py`)
-    correctly refused to restart Ollama because `in_flight=2` (chat + the
-    zombie), preserving stream integrity at the cost of letting the chat
-    starve. With this 120s ceiling, the zombie raises `httpx.ReadTimeout`
+    (verified with `sample <pid> 1`). With this 120s ceiling, the zombie raises `httpx.ReadTimeout`
     after 2 minutes, releases the connection, and the existing 4-attempt
     retry in `embed()` either recovers or surfaces the failure — instead
     of the index hanging forever and dragging the chat down with it.
@@ -55553,18 +55550,19 @@ def _cleanup_chat_uploads(*, ttl_days: int | None = None) -> dict:
 
 
 def _check_ollama_health() -> dict:
-    """Verify required Ollama models are available. Returns {model: ok/missing}."""
-    required = [EMBED_MODEL, HELPER_MODEL] + list(CHAT_MODEL_PREFERENCE)
+    """Verify required Ollama models are available. Post-MLX cutover only
+    `EMBED_MODEL` (qwen3-embedding:0.6b) sigue viniendo de ollama; chat
+    pasó a MLX in-process. OCR vision-language model también via ollama
+    si está pulled."""
+    required = [EMBED_MODEL]
     status: dict[str, str] = {}
     try:
         available = {m.model for m in ollama.list().models}
     except Exception as e:
         return {"error": str(e)}
     for model in required:
-        # ollama.list() returns full names; match with and without :latest
         found = model in available or f"{model}:latest" in available
         if not found:
-            # Try prefix match (e.g. "command-r" matches "command-r:latest")
             found = any(a.startswith(model.split(":")[0] + ":") for a in available)
         status[model] = "ok" if found else "missing"
     return status

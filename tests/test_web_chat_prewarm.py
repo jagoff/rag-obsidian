@@ -20,7 +20,7 @@ Tests cubren:
   2. Si el operador setea `OBSIDIAN_RAG_WEB_CHAT_MODEL == _LOOKUP_MODEL`
      (mismo modelo en ambos roles), targets dedupea a uno solo (no
      queremos pingear dos veces el mismo modelo con el mismo num_ctx).
-  3. `_run_chat_prewarm_cycle()` invoca `_OLLAMA_STREAM_CLIENT.chat`
+  3. `_run_chat_prewarm_cycle()` invoca `rag._mlx_or_ollama_chat`
      una vez por target, con el num_ctx correcto.
   4. Si un target falla (modelo no disponible), el OTRO target se sigue
      intentando — guard del fail-mode "skip-cycle entero".
@@ -86,16 +86,17 @@ def test_targets_use_lookup_num_ctx_for_lookup_model(monkeypatch):
 
 
 def test_run_cycle_calls_chat_for_every_target(monkeypatch):
-    """`_run_chat_prewarm_cycle` invoca `_OLLAMA_STREAM_CLIENT.chat` una
+    """`_run_chat_prewarm_cycle` invoca `rag._mlx_or_ollama_chat` una
     vez por target, con el `num_ctx` correcto en `options`."""
+    import rag as _rag
     calls: list[dict] = []
 
-    class FakeStreamClient:
-        def chat(self, **kwargs):
-            calls.append(kwargs)
-            return {"message": {"content": "."}}
+    def _fake_chat(**kwargs):
+        calls.append(kwargs)
+        from types import SimpleNamespace
+        return SimpleNamespace(message=SimpleNamespace(content="."))
 
-    monkeypatch.setattr(server_mod, "_OLLAMA_STREAM_CLIENT", FakeStreamClient())
+    monkeypatch.setattr(_rag, "_mlx_or_ollama_chat", _fake_chat)
     monkeypatch.setattr(server_mod, "_resolve_web_chat_model", lambda: "qwen2.5:7b")
     monkeypatch.setattr(server_mod, "_LOOKUP_MODEL", "qwen2.5:3b")
     monkeypatch.setattr(server_mod, "_LOOKUP_NUM_CTX", 4096)
@@ -118,16 +119,17 @@ def test_run_cycle_one_target_failure_does_not_block_other(monkeypatch):
     blip), el segundo target SE SIGUE INTENTANDO. Pre-fix con un solo
     try/except externo, una falla en el primer modelo cancelaba el
     segundo del mismo cycle."""
+    import rag as _rag
     calls: list[dict] = []
 
-    class FakeStreamClient:
-        def chat(self, **kwargs):
-            calls.append(kwargs)
-            if kwargs["model"] == "qwen2.5:7b":
-                raise RuntimeError("simulated ollama 503")
-            return {"message": {"content": "."}}
+    def _fake_chat(**kwargs):
+        calls.append(kwargs)
+        if kwargs["model"] == "qwen2.5:7b":
+            raise RuntimeError("simulated ollama 503")
+        from types import SimpleNamespace
+        return SimpleNamespace(message=SimpleNamespace(content="."))
 
-    monkeypatch.setattr(server_mod, "_OLLAMA_STREAM_CLIENT", FakeStreamClient())
+    monkeypatch.setattr(_rag, "_mlx_or_ollama_chat", _fake_chat)
     monkeypatch.setattr(server_mod, "_resolve_web_chat_model", lambda: "qwen2.5:7b")
     monkeypatch.setattr(server_mod, "_LOOKUP_MODEL", "qwen2.5:3b")
     monkeypatch.setattr(server_mod, "_LOOKUP_NUM_CTX", 4096)

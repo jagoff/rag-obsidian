@@ -266,8 +266,6 @@ def test_whatsapp_sources_emitted_in_sse_with_wa_me_link(monkeypatch):
     prepended cuando whatsapp_pending encuentra chats. Verifica el mismo
     patrón que drive_search pero para WA."""
     server_mod._CHAT_BUCKETS.clear()
-    monkeypatch.setattr(server_mod, "_ollama_alive", lambda timeout=2.0: True)
-    monkeypatch.setattr(server_mod, "_ollama_chat_probe", lambda timeout_s=6.0: True)
     monkeypatch.setattr(server_mod, "_fetch_whatsapp_unread", lambda *a, **kw: [])
     monkeypatch.setattr(server_mod, "_persist_conversation_turn", lambda *a, **kw: None)
     monkeypatch.setattr(server_mod, "save_session", lambda sess: None)

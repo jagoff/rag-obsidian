@@ -38,6 +38,7 @@ from fastapi.testclient import TestClient
 
 # ── Import targets under test ──────────────────────────────────────────────
 
+import rag as _rag_mod
 from web import server as server_mod
 from web.server import app
 
@@ -146,10 +147,6 @@ def chat_env(monkeypatch):
             a[1] if len(a) >= 2 else "x"
         ),
     )
-    monkeypatch.setattr(server_mod, "_ollama_alive", lambda timeout=2.0: True)
-    monkeypatch.setattr(
-        server_mod, "_ollama_chat_probe", lambda timeout_s=6.0: True,
-    )
     monkeypatch.setattr(
         server_mod, "_fetch_whatsapp_unread", lambda *a, **kw: [],
     )
@@ -197,8 +194,8 @@ def test_bypass_skips_ollama_chat(chat_env):
     """
     mock = _OllamaMock(responses=[])  # zero scripted responses
     chat_env.setattr(server_mod.ollama, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
+
+    chat_env.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
 
     events, _ = _post_chat("qué sabés de Bizarrap")
 
@@ -221,8 +218,8 @@ def test_bypass_template_contains_question_verbatim(chat_env):
     """
     mock = _OllamaMock(responses=[])
     chat_env.setattr(server_mod.ollama, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
+
+    chat_env.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
 
     q = "qué sabés de Bizarrap"
     events, _ = _post_chat(q)
@@ -244,8 +241,8 @@ def test_bypass_done_event_payload(chat_env):
     """
     mock = _OllamaMock(responses=[])
     chat_env.setattr(server_mod.ollama, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
+
+    chat_env.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
 
     events, _ = _post_chat("query sin match en vault")
 
@@ -286,8 +283,8 @@ def test_mention_hit_blocks_bypass(chat_env):
         _mk_stream(["respuesta ", "real"]),
     ])
     chat_env.setattr(server_mod.ollama, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
+
+    chat_env.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
 
     events, _ = _post_chat("qué sabés de Bizarrap")
 
@@ -318,8 +315,8 @@ def test_propose_intent_blocks_bypass(chat_env):
         _mk_stream(["ok"]),
     ])
     chat_env.setattr(server_mod.ollama, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
+
+    chat_env.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
 
     # 2026-04-29 (Feature K): cambiamos "recordame comprar pan mañana"
     # → "anotame comprar pan para mañana" porque el primer string ahora
@@ -353,8 +350,8 @@ def test_high_confidence_no_bypass(chat_env):
         _mk_stream(["hola ", "mundo"]),
     ])
     chat_env.setattr(server_mod.ollama, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
+
+    chat_env.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
 
     events, _ = _post_chat("qué hay sobre docker en mis notas")
 
@@ -390,8 +387,8 @@ def test_confidence_exactly_at_threshold_no_bypass(chat_env):
         _mk_stream(["resp"]),     # streaming final
     ])
     chat_env.setattr(server_mod.ollama, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
+
+    chat_env.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
 
     events, _ = _post_chat("query en el borde")
 
@@ -424,8 +421,8 @@ def test_bypass_preserves_special_chars(chat_env, question, expected_snippet):
     """
     mock = _OllamaMock(responses=[])
     chat_env.setattr(server_mod.ollama, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
+
+    chat_env.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
 
     events, _ = _post_chat(question)
 
@@ -448,8 +445,8 @@ def test_bypass_emits_log_line(chat_env, capsys):
     """
     mock = _OllamaMock(responses=[])
     chat_env.setattr(server_mod.ollama, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
+
+    chat_env.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
 
     _post_chat("query sin match")
 
@@ -475,8 +472,8 @@ def test_bypass_log_query_event_payload(chat_env):
     """
     mock = _OllamaMock(responses=[])
     chat_env.setattr(server_mod.ollama, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
+
+    chat_env.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
 
     _post_chat("otra query sin match")
 
@@ -500,8 +497,8 @@ def test_bypass_emits_chat_timing_line(chat_env, capsys):
     """
     mock = _OllamaMock(responses=[])
     chat_env.setattr(server_mod.ollama, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
+
+    chat_env.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
 
     _post_chat("una query cualquiera")
 

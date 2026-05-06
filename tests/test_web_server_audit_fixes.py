@@ -2,11 +2,9 @@
 
 Cubre cuatro findings cerrados en el mismo commit:
 
-- **R1 #9 + iter** — `_OLLAMA_TOOL_TIMEOUT` y `_OLLAMA_STREAM_TIMEOUT`
-  alineados a 90s. R1 #9 original bajó tool 120 → 45s; eval autónomo
-  del 2026-04-28 lo subió 45 → 90s al ver que la 2da ronda timeouteaba
-  con outputs grandes; repro Playwright el mismo día subió stream 45 →
-  90s al ver el mismo problema en la synthesis call post-tools.
+- **R1 #9 + iter (Ola 5 update)** — `_OLLAMA_STREAM_TIMEOUT` a 90s. Post-MLX
+  cutover el tool-decision call usa `rag._mlx_chat_via_backend` in-process
+  (sin HTTP timeout). El streaming synthesis client sigue en httpx con 90s.
 - **R2-Performance #1** — `_CHAT_BUCKETS` / `_BEHAVIOR_BUCKETS` ahora
   son `_LRURateBucket` con cap 5000 IPs (antes `defaultdict(deque)`
   crecía sin bound y permitía memory exhaustion bajo rotación de
@@ -111,36 +109,13 @@ def _png_bytes() -> bytes:
 # ══════════════════════════════════════════════════════════════════════
 
 
-def test_ollama_tool_timeout_is_90_seconds():
-    """El tool-decision client necesita budget de ~90s: la 2da ronda con
-    `tools=` schema + tool outputs grandes (whatsapp_search, gmail_recent,
-    drive_search) puede tardar 60-80s en MPS warm. Si bajamos a 45s
-    volvemos a ver `LLM falló: timed out` en queries multi-tool."""
-    assert _server._OLLAMA_TOOL_TIMEOUT == 90.0, (
-        f"Esperado _OLLAMA_TOOL_TIMEOUT=90.0 (eval autónomo 2026-04-28, "
-        f"commit b0d140e), got {_server._OLLAMA_TOOL_TIMEOUT}"
-    )
-
-
-def test_ollama_stream_timeout_aligned_with_tool_timeout():
-    """El stream-final client (synthesis post-tools) puede tardar tanto
-    como el tool-decision call: prefill sobre 25-30k chars de contexto +
-    decode de la respuesta + cold-load eventual cuando num_ctx adaptive
-    cambia respecto del loaded value. Pre-fix (2026-04-28) el stream
-    estaba en 45s y disparaba timeouts en ~60s wall time mientras el
-    tool client tenía 90s y holgaba — divergencia que invalidaba el
-    sentido del fix anterior."""
-    assert _server._OLLAMA_STREAM_TIMEOUT == 90.0, (
-        f"Esperado _OLLAMA_STREAM_TIMEOUT=90.0 alineado con _OLLAMA_TOOL_"
-        f"TIMEOUT (repro Playwright 2026-04-28), "
-        f"got {_server._OLLAMA_STREAM_TIMEOUT}"
-    )
-    # Belt-and-suspenders: si alguien sube uno de los dos sin actualizar
-    # el otro, fallamos antes de que llegue al server.
-    assert _server._OLLAMA_STREAM_TIMEOUT == _server._OLLAMA_TOOL_TIMEOUT, (
-        f"Invariant: stream y tool timeouts deben coincidir. "
-        f"stream={_server._OLLAMA_STREAM_TIMEOUT} "
-        f"tool={_server._OLLAMA_TOOL_TIMEOUT}"
+def test_mlx_chat_via_backend_is_callable():
+    """Post-MLX cutover (Ola 5): el tool-decision call ya no usa un httpx
+    client separado — corre in-process via `rag._mlx_chat_via_backend`.
+    Sin HTTP timeout porque es una llamada in-process a Metal/MPS."""
+    import rag as _rag
+    assert callable(getattr(_rag, "_mlx_chat_via_backend", None)), (
+        "rag._mlx_chat_via_backend debe existir y ser callable (tool-decision post-MLX)"
     )
 
 

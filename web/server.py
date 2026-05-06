@@ -2614,17 +2614,6 @@ def _warmup() -> None:
     except Exception as _exc:
         print(f"[warmup] memory-pressure watchdog skipped: {_exc}", flush=True)
 
-    # Latency degradation watchdog — detecta wedge del daemon ollama
-    # tras queries tool-heavy consecutivas y reinicia automáticamente.
-    # Eval 2026-04-28: tras 5-7 queries con tools, p95 sube de ~30s a
-    # ~70s. El watchdog detecta y bouncea el daemon. Lazy import para
-    # no romper si el módulo no existe (deploy parcial OK).
-    try:
-        from rag._ollama_health import start_latency_degradation_watchdog
-        start_latency_degradation_watchdog()
-    except Exception as _exc:
-        print(f"[warmup] ollama-health-watchdog skipped: {_exc}", flush=True)
-
     # WAL checkpointer — libera páginas del WAL cada 30s para que los
     # writers concurrentes (queries, behavior, cache) no peguen contra el
     # busy_timeout bajo carga sostenida. Audit 2026-04-24.
@@ -3946,51 +3935,6 @@ def submit_behavior(req: BehaviorRequest, request: Request) -> dict:
     return {"ok": True}
 
 
-def _ollama_alive(timeout: float = 2.0) -> bool:
-    """Fast probe: does the ollama daemon answer `/api/tags` within `timeout`s?
-    When the daemon hits its stuck-load state the HTTP listener accepts but
-    never replies — /api/chat then hangs forever. A short /api/tags probe
-    catches that state without waiting for a model load.
-    """
-    import urllib.request
-    import urllib.error
-    try:
-        with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=timeout) as r:
-            return r.status == 200
-    except Exception:
-        return False
-
-
-# Tool-decision call (non-streaming, ~once per turn, with `tools=` schema
-# of all 13 chat tools). Observed 2026-04-24 (Fer F. "LLM falló: timed
-# out"): long queries (~50 palabras + 2KB de _WEB_TOOL_ADDENDUM + JSON
-# schemas de 13 tools) hacen que qwen2.5:7b en MPS tarde >45s en
-# samplear la decisión — se disparaba el timeout del cliente streaming
-# compartido y el turno fallaba antes de llegar a generar output.
-# Cliente separado con budget más amplio: tool-decision es una call
-# NO-streaming (no hay UX de tokens flowing) y low-frequency (1 vez por
-# turn, máx 3 rounds), así que podemos permitirnos más budget sin
-# degradar la percepción de "chat congelado". Si realmente hay un hang
-# del daemon, `_ollama_chat_probe` lo detecta antes con 6s.
-#
-# Audit 2026-04-25 finding R1 #9: bajamos el budget de 120s → 45s. El
-# valor previo era demasiado amplio: si qwen2.5:7b se cuelga (OOM,
-# memory pressure, daemon wedge), el chat queda freeze 2 minutos enteros
-# desde la perspectiva del user antes de fallar. qwen2.5 con
-# num_ctx=4096 tarda 1-3s warm + 8-10s cold-load; 45s cubre cold-load +
-# 1-2 retries internos del cliente sin colgar el chat 2 min entero.
-#
-# Eval autónomo 2026-04-28 (12 queries vía Playwright): 45s no
-# alcanzaba para queries post-tool con outputs grandes. Concretamente
-# gmail_recent + whatsapp_search + drive_search consistentemente
-# timeouteaban en la 2da ronda (donde el LLM sintetiza el output del
-# tool en prosa) — observado 60-80s de wall time. Sube a 90s para
-# cubrir el caso. Si en el futuro queremos cap más agresivo, mejor
-# truncar el tool output ANTES de mandarlo al LLM (no tiene sentido
-# pasarle 30+ items con full body — pasarle un summary y los top-N).
-_OLLAMA_TOOL_TIMEOUT = 90.0
-_OLLAMA_TOOL_CLIENT = ollama.Client(timeout=_OLLAMA_TOOL_TIMEOUT)
-
 # Shared num_ctx for every call to the chat model from this server — the
 # real /api/chat, the preflight probe, and the background prewarmer must
 # all pass the same value. ollama re-initialises the KV cache when a
@@ -4033,240 +3977,22 @@ _CRITIQUE_ENABLED = (
 )
 
 
-def _ollama_chat_probe(timeout_s: float = 6.0) -> bool:
-    """Deep probe: does `/api/chat` actually stream a token within `timeout_s`?
-
-    The shallow `/api/tags` probe is insufficient — we've seen the daemon
-    accept /api/tags while /api/chat hangs indefinitely (stuck-load mid-run).
-    This probe sends a 1-token chat against the pinned chat model; if the
-    daemon is wedged, httpx raises within the budget. Reuses the streaming
-    client so the budget applies uniformly.
-
-    CRITICAL: MUST pass num_ctx=_WEB_CHAT_NUM_CTX. Without it, ollama uses
-    its default (2048 for qwen2.5:7b) which differs from the real /api/chat
-    call (4096), forcing ollama to reinit the KV cache on the next user
-    request. Measured impact: prefill 1.5s → 4.9s (3x slower). See
-    `num_ctx mismatch` comment in the main chat path for the same trap.
-
-    Also MUST include _WEB_SYSTEM_PROMPT as the system message. The probe
-    runs before every /api/chat via _ollama_restart_if_stuck, and if it
-    sends a different prompt (even just [user:"."]) ollama overwrites the
-    slot's KV cache with that short prompt. The next real request then
-    cold-prefills the 1300-token system prompt from scratch. Measured
-    2026-04-20: probe w/o system → prefill 4.9s; probe WITH system →
-    prefill 3.4s (−1.5s per request). The probe itself pays the cold
-    prefill once at startup (~2.5s) and then ~80-100ms on every
-    subsequent call since the system cache already exists.
-    """
-    try:
-        from rag import _mlx_or_ollama_chat
-        _probe_model = _resolve_web_chat_model()
-        _mlx_or_ollama_chat(
-            model=_probe_model,
-            messages=[
-                {"role": "system", "content": _WEB_SYSTEM_PROMPT},
-                {"role": "user", "content": "."},
-            ],
-            options={"num_predict": 1, "num_ctx": _WEB_CHAT_NUM_CTX,
-                     "temperature": 0, "seed": 42},
-            stream=False,
-            think=False,
-            keep_alive=chat_keep_alive(_probe_model),
-        )
-        return True
-    except Exception:
-        return False
-
-
-def _ollama_restart_if_stuck() -> bool:
-    """Heal the ollama daemon. Returns True on successful restart. Blocks
-    3-10s for the bounce.
-
-    Detect which deployment is running:
-      1. If `homebrew.mxcl.ollama` is loaded in launchd → use `brew services restart`
-      2. Else if Ollama.app is running → quit + reopen the app
-      3. Else → try kickstart of homebrew first (in case it just bootstrapped),
-         fallback to `open -a Ollama`.
-
-    Pre-2026-04-28 hardcoded `brew services restart`, falló silenciosamente
-    cuando el user usaba la .app version (sin homebrew daemon). Repro
-    Playwright detectó hangs recurrentes que no se auto-curaban porque el
-    restart no aplicaba al daemon real.
-
-    SPLIT-BRAIN FIX (2026-05-01): Un re-spawn ciego del daemon homebrew dejaba
-    al .app daemon original corriendo en paralelo. Ambos hacen `bind(SO_
-    REUSEPORT)` a `:11434` → el kernel load-balancea connections entre los
-    dos arbitrariamente. Resultado: requests del web server iban a un daemon
-    o al otro al azar; el "otro" tenía un set distinto de modelos cargados
-    (el .app no respeta `OLLAMA_MAX_LOADED_MODELS`/`KEEP_ALIVE` del
-    `launchctl setenv`). Cold-load del modelo no presente + KV cache reinit
-    → 90s timeout → "synthesis falló: timed out". Sucedía 1 de cada 2-3
-    chats post-recovery.
-
-    Forensics 2026-05-01 (user report DNI trámite):
-        $ pgrep -lf "ollama serve"
-        1887 /Applications/Ollama.app/Contents/Resources/ollama serve
-        53600 /opt/homebrew/opt/ollama/bin/ollama serve
-        $ lsof -nP -iTCP:11434 -sTCP:LISTEN
-        ollama 1887 ... TCP *:11434
-        ollama 53600 ... TCP 127.0.0.1:11434
-
-    Fix: KILL .app primero (siempre, aunque vayamos a usar homebrew). Si
-    homebrew estaba loaded, solo nos quedamos con homebrew. Si no, abrimos
-    .app desde cero. NUNCA dejamos los dos corriendo.
-    """
-    # Step 1: kill all runners forcefully (the .app's serve will respawn them
-    # on next request). This handles the case where the runner is wedged but
-    # the serve itself is healthy.
-    try:
-        subprocess.run(
-            ["pkill", "-9", "-f", "ollama runner"],
-            capture_output=True, timeout=5, check=False,
-        )
-    except Exception:
-        pass
-
-    # Step 2: detect deployment and restart serve.
-    restarted = False
-    # 2a) Homebrew daemon path.
-    homebrew_loaded = False
-    try:
-        result = subprocess.run(
-            ["launchctl", "list"],
-            capture_output=True, text=True, timeout=5, check=False,
-        )
-        homebrew_loaded = (
-            result.returncode == 0 and "homebrew.mxcl.ollama" in result.stdout
-        )
-    except Exception:
-        pass
-
-    if homebrew_loaded:
-        # SPLIT-BRAIN GUARD: si Ollama.app también está corriendo (LaunchServices
-        # no lo apagó cuando arrancamos homebrew), ambos se pelean por :11434.
-        # Mátalo antes de restartear homebrew. `pkill -f Ollama.app` cubre el
-        # GUI parent + el serve hijo + los runners.
-        try:
-            subprocess.run(
-                ["pkill", "-9", "-f", "/Applications/Ollama.app"],
-                capture_output=True, timeout=5, check=False,
-            )
-            # Pequeña espera para que el kernel libere los FDs del :11434.
-            time.sleep(1)
-        except Exception:
-            pass
-        try:
-            subprocess.run(
-                ["/opt/homebrew/bin/brew", "services", "restart", "ollama"],
-                check=True, capture_output=True, timeout=30,
-            )
-            restarted = True
-        except Exception:
-            pass
-
-    # 2b) Ollama.app path — quit + reopen.
-    if not restarted:
-        try:
-            # Kill all ollama processes (.app + serve + runner). Si había
-            # un homebrew daemon huérfano (residuo de un restart fallido),
-            # también lo matamos para evitar split-brain en el reopen.
-            subprocess.run(
-                ["pkill", "-9", "-f", "ollama"],
-                capture_output=True, timeout=5, check=False,
-            )
-            # Brief pause for clean exit.
-            time.sleep(2)
-            # Reopen the .app (background launches the serve daemon).
-            subprocess.run(
-                ["open", "-a", "Ollama"],
-                capture_output=True, timeout=10, check=False,
-            )
-            restarted = True
-        except Exception:
-            pass
-
-    if not restarted:
-        return False
-
-    # Wait up to 12s for the daemon to accept traffic again (Ollama.app
-    # cold start takes 5-8s on Apple Silicon).
-    for _ in range(24):
-        if _ollama_alive(timeout=1.0):
-            # Sanity check: post-restart, should be exactly 1 daemon listening
-            # en :11434. Si el listener detecta 2+ procesos `ollama serve`,
-            # algo del split-brain guard arriba falló — log greppable y sigue
-            # (no abortamos, prefer "degraded mode" a "no chat", pero el log
-            # es la señal para que el operador investigue).
-            try:
-                ps_result = subprocess.run(
-                    ["pgrep", "-f", "ollama serve"],
-                    capture_output=True, text=True, timeout=3, check=False,
-                )
-                pids = [p for p in (ps_result.stdout or "").split() if p.strip()]
-                if len(pids) > 1:
-                    print(
-                        f"[ollama-restart-warn] split-brain detected post-restart: "
-                        f"{len(pids)} `ollama serve` PIDs running ({','.join(pids)}). "
-                        f"Expected 1. May cause request load-balancing across "
-                        f"daemons → intermittent timeouts.",
-                        flush=True,
-                    )
-            except Exception:
-                pass
-            return True
-        time.sleep(0.5)
-    return False
-
-
-@app.post("/api/ollama/restart", dependencies=[Depends(_require_admin_token)])
-def ollama_restart() -> dict:
-    """Panic button #2: brew-services-restart the ollama daemon. Use when
-    /api/chat is hanging forever (stuck-load state: daemon accepts HTTP
-    but never streams a reply). Blocks ~5-10s.
-    """
-    ok = _ollama_restart_if_stuck()
-    return {"ok": ok, "alive": _ollama_alive()}
-
-
 @app.post("/api/ollama/unload", dependencies=[Depends(_require_admin_token)])
 def ollama_unload() -> dict:
-    """Panic button: evict every loaded model from ollama + drop the
-    reranker from MPS. Frees 15-25 GB of wired unified memory in one
-    call when the Mac starts beachballing.
-
-    Drops each loaded model with keep_alive=0 (ollama's immediate-evict
-    sentinel) and clears the process-local reranker. Next chat query
-    pays 3-8s cold reload but the host stays responsive until then.
+    """Panic button: evict MLX chat models + drop reranker from MPS.
+    Frees 15-25 GB of wired unified memory when the Mac starts beachballing.
+    Post-MLX cutover: chat runs in-process via MLXBackend._loaded; the only
+    ollama models still running are the embedder (qwen3-embedding:0.6b).
     """
     freed = []
-    # MLX backend: el truco `prompt='' keep_alive=0` no aplica — los
-    # modelos MLX viven en `MLXBackend._loaded` (OrderedDict). Limpiamos
-    # ese cache directo. Si el daemon ollama tampoco está corriendo, el
-    # ps() abajo falla limpio y devolvemos lo que dropeamos.
-    if os.environ.get("RAG_LLM_BACKEND", "ollama").lower() == "mlx":
-        try:
-            from rag.llm_backend import get_backend
-            mlx_backend = get_backend()
-            mlx_loaded = list(getattr(mlx_backend, "_loaded", {}).keys())
-            getattr(mlx_backend, "_loaded", {}).clear()
-            freed.extend(mlx_loaded)
-        except Exception as exc:
-            freed.append(f"mlx_clear (fail: {exc})")
     try:
-        ps = ollama.ps()
-        for m in getattr(ps, "models", []) or []:
-            name = getattr(m, "model", None) or getattr(m, "name", None)
-            if not name:
-                continue
-            try:
-                # A bare generate with keep_alive=0 tells ollama to unload
-                # immediately after the (empty) prompt returns.
-                ollama.generate(model=name, prompt="", keep_alive=0)
-                freed.append(name)
-            except Exception as exc:
-                freed.append(f"{name} (fail: {exc})")
+        from rag.llm_backend import get_backend
+        mlx_backend = get_backend()
+        mlx_loaded = list(getattr(mlx_backend, "_loaded", {}).keys())
+        getattr(mlx_backend, "_loaded", {}).clear()
+        freed.extend(mlx_loaded)
     except Exception as exc:
-        return {"ok": False, "error": str(exc), "freed": freed}
+        freed.append(f"mlx_clear (fail: {exc})")
     try:
         from rag import maybe_unload_reranker, _reranker_last_use  # noqa: F401
         import rag as _rag
@@ -12752,49 +12478,6 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 _semantic_cache_emb = None
                 _semantic_cache_hash = ""
 
-        # Fail fast if ollama is in the "stuck-load" state — accepts HTTP
-        # but never responds. Two-layer probe: /api/tags is the cheap
-        # "daemon listening?" check; the deep chat probe catches the mode
-        # where tags responds but chat hangs (seen 2026-04-19 — tags OK,
-        # /api/chat never flushed first chunk). On deep-probe failure we
-        # auto-heal via `brew services restart ollama` and re-probe once
-        # before giving up, so the user's next /api/chat request doesn't
-        # need a manual panic-button press.
-        if not _ollama_alive(timeout=2.0) or not _ollama_chat_probe(timeout_s=6.0):
-            print("[ollama-preflight] stuck-load detected — auto-restarting", flush=True)
-            # Post-restart probe needs to cover a real cold-load:
-            # brew/launchd bounce (~3s) + qwen2.5:7b cold-load (5-10s on
-            # M-series) + 1300-token system prefill (~2.5s on first hit)
-            # + 1 token decode (~100ms). 8s no alcanzaba — el restart sí
-            # funcionaba (logs ~2026-05-01 mostraron `recovered via
-            # restart` poco después), pero el probe timeouteaba y emitíamos
-            # "Auto-restart falló" cuando en realidad el daemon estaba
-            # sano. La request siguiente sí completaba (ttft~60-105s)
-            # pero el user veía el banner rojo igual. 25s da margen real
-            # sin ahogar el spinner del frontend más allá de lo razonable
-            # para un cold-load.
-            if not _ollama_restart_if_stuck() or not _ollama_chat_probe(timeout_s=25.0):
-                yield _sse("error", {
-                    "message": "Ollama no responde (stuck-load). Auto-restart falló. "
-                    "Probá: brew services restart ollama",
-                })
-                # Audit 2026-04-26 (BUG #31): emitir `done` siempre tras
-                # `error` para que el cliente cierre el spinner y libere
-                # el input. Pre-fix: error puro dejaba EventSource
-                # esperando indefinidamente.
-                #
-                # Update 2026-04-28 (BUG #31 wave-2): incluir `top_score:
-                # 0.0` además de `error: true`. El frontend usa
-                # `top_score < 0.10` como gate para `appendFallbackCluster`
-                # (los 3 botones Google/YouTube/Wikipedia). Pre-fix sin
-                # ese campo el cliente NO mostraba el cluster cuando había
-                # error → el user veía el banner rojo y nada más, sin
-                # escape hatch. Con top_score=0.0 el frontend SÍ activa
-                # el fallback.
-                yield _sse("done", {"error": True, "top_score": 0.0})
-                return
-            print("[ollama-preflight] recovered via restart", flush=True)
-
         # Kick off WhatsApp fetch in parallel with retrieve so the SQLite
         # round-trip (25-180ms) overlaps with the heavier retrieval work
         # instead of stacking sequentially before the LLM call.
@@ -14427,38 +14110,17 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     _round_tools = [
                         fn for fn in CHAT_TOOLS if fn.__name__ in PROPOSAL_TOOL_NAMES
                     ]
-                # Use the tool-decision client with a wider timeout than
-                # the streaming one: non-streaming + `tools=` schema of
-                # all 12 chat tools can push qwen2.5:7b > 45s on long
-                # inputs. See `_OLLAMA_TOOL_CLIENT` comment above.
-                #
-                # Backend dispatch (Ola 5, 2026-05-06): under MLX we route
-                # via `_mlx_chat_via_backend` which propagates `tools=` to
-                # `tokenizer.apply_chat_template(tools=...)` and parses
-                # `<tool_call>` blocks via `rag.mlx_tool_calls`. The 90s
-                # HTTP timeout doesn't apply (in-process). Ollama branch
-                # keeps the dedicated client so a stuck daemon can't hang
-                # the chat for 2+ min.
-                from rag.llm_backend import get_backend as _get_backend
-                if _get_backend().name == "mlx":
-                    from rag import _mlx_chat_via_backend
-                    _tr = _mlx_chat_via_backend(
-                        model=_web_model,
-                        messages=tool_messages,
-                        tools=_round_tools,
-                        options=CHAT_TOOL_OPTIONS,
-                        keep_alive=chat_keep_alive(_web_model),
-                    )
-                else:
-                    _tr = _OLLAMA_TOOL_CLIENT.chat(
-                        model=_web_model,
-                        messages=tool_messages,
-                        tools=_round_tools,
-                        options=CHAT_TOOL_OPTIONS,
-                        stream=False,
-                        think=False,   # see _ollama_chat_probe for rationale
-                        keep_alive=chat_keep_alive(_web_model),
-                    )
+                # Tool-decision call via MLX in-process: `_mlx_chat_via_backend`
+                # propagates `tools=` to `tokenizer.apply_chat_template(tools=...)`
+                # and parses `<tool_call>` blocks via `rag.mlx_tool_calls`.
+                from rag import _mlx_chat_via_backend
+                _tr = _mlx_chat_via_backend(
+                    model=_web_model,
+                    messages=tool_messages,
+                    tools=_round_tools,
+                    options=CHAT_TOOL_OPTIONS,
+                    keep_alive=chat_keep_alive(_web_model),
+                )
                 _tmsg = _tr.message
                 _tcalls = list(_tmsg.tool_calls or [])
                 if not _tcalls:
@@ -14825,28 +14487,6 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 f"got_first_token={_first_token_logged} parts_so_far={len(parts)}",
                 flush=True,
             )
-            # 2026-04-28 wave-5: auto-recovery on synthesis ReadTimeout.
-            # Si llegamos acá con ttft=90s+ y got_first_token=False, el daemon
-            # está wedged — el preflight `_ollama_chat_probe` pasó pero el
-            # /api/chat real cuelga. Spawn restart en background thread (no
-            # bloqueamos el response al user, que ya se va a ir con error)
-            # para que la PRÓXIMA request no caiga en el mismo wedge.
-            # Threshold 75s+ porque eso es más que cualquier cold-load
-            # legítimo (15s peor caso documentado en chat-timing logs).
-            _exc_type_str = type(exc).__name__
-            if (
-                _exc_type_str in ("ReadTimeout", "RemoteProtocolError")
-                and _err_ttft_ms >= 75000
-                and not _first_token_logged
-            ):
-                def _bg_restart():
-                    try:
-                        print(f"[ollama-auto-recovery] triggering after {_exc_type_str} ttft={_err_ttft_ms}ms", flush=True)
-                        ok = _ollama_restart_if_stuck()
-                        print(f"[ollama-auto-recovery] result ok={ok}", flush=True)
-                    except Exception as _bg_exc:
-                        print(f"[ollama-auto-recovery] error: {_bg_exc!r}", flush=True)
-                threading.Thread(target=_bg_restart, daemon=True, name="ollama-auto-recovery").start()
             yield _sse("error", {"message": _sanitize_error_for_user(exc, phase="synthesis")})
             # BUG #31 wave-2: top_score=0.0 dispara fallback cluster.
             yield _sse("done", {"error": True, "top_score": 0.0})  # BUG #31
@@ -15244,39 +14884,19 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     )
 
     def guarded():
-        """Increment/decrement the global chat-in-flight counter around
-        the real generator. The home-prewarmer loop checks this counter
-        and skips cycles while > 0 so chat gets exclusive ollama time.
-        Decrement runs in `finally`, which executes on normal completion
-        AND when the client disconnects (generator .close()).
-
-        2026-05-01: además del counter local `_CHAT_INFLIGHT` (que usa
-        el home-prewarmer), llamamos `begin_chat()/end_chat()` del
-        módulo `_ollama_health`. El watchdog de latencia consulta ese
-        counter via `in_flight_chats()` y skipea el `pkill -9 -f ollama`
-        mientras hay >=1 request streaming. Pre-fix: el watchdog mataba
-        ollama mid-synthesis y el cliente veía "Server disconnected
-        without sending a response" — exactamente el síntoma que el
-        watchdog dice arreglar. Lazy import para no acoplar el módulo.
+        """Increment/decrement _CHAT_INFLIGHT around the real generator.
+        The home-prewarmer loop checks this counter and skips cycles while
+        > 0 so the MLX backend gets exclusive attention. Decrement runs in
+        `finally`, which executes on normal completion AND on client disconnect.
         """
         global _CHAT_INFLIGHT
         with _CHAT_INFLIGHT_LOCK:
             _CHAT_INFLIGHT += 1
         try:
-            from rag._ollama_health import begin_chat as _hc_begin
-            _hc_begin()
-        except Exception:
-            pass
-        try:
             yield from gen()
         finally:
             with _CHAT_INFLIGHT_LOCK:
                 _CHAT_INFLIGHT = max(0, _CHAT_INFLIGHT - 1)
-            try:
-                from rag._ollama_health import end_chat as _hc_end
-                _hc_end()
-            except Exception:
-                pass
 
     # Bug fix 2026-04-27: add anti-buffering headers so reverse proxies
     # (Caddy, nginx) don't buffer the SSE stream, causing the user to
@@ -16383,13 +16003,19 @@ def _status_probe_self() -> dict:
 
 
 def _status_probe_ollama() -> dict:
+    """Check ollama daemon is reachable — used only for embeddings post-MLX cutover."""
+    import urllib.request
     t0 = time.monotonic()
-    ok = _ollama_alive(timeout=2.0)
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=2.0) as r:
+            ok = r.status == 200
+    except Exception:
+        ok = False
     ms = int((time.monotonic() - t0) * 1000)
     if ok:
-        return {"id": "ollama", "name": "Ollama (LLM runtime)", "kind": "probe",
+        return {"id": "ollama", "name": "Ollama (embedder)", "kind": "probe",
                 "status": "ok", "detail": f"/api/tags {ms}ms"}
-    return {"id": "ollama", "name": "Ollama (LLM runtime)", "kind": "probe",
+    return {"id": "ollama", "name": "Ollama (embedder)", "kind": "probe",
             "status": "down", "detail": f"no responde /api/tags ({ms}ms)"}
 
 

@@ -1104,58 +1104,18 @@ def test_propose_whatsapp_send_is_NOT_parallel_safe():
     assert "propose_whatsapp_send" not in _tools.PARALLEL_SAFE
 
 
-def test_ollama_tool_client_has_separate_wider_timeout():
-    """Regresión 2026-04-24 iter3 (Fer F. "LLM falló: timed out"): el tool-
-    decision call (non-streaming, con `tools=` schema de 12 tools) tardaba
-    >45s en qwen2.5:7b con prompts largos. Fix iter1: cliente separado
-    `_OLLAMA_TOOL_CLIENT`, distinto del `_OLLAMA_STREAM_CLIENT`.
-
-    Historia de los budgets:
-      - 2026-04-24: tool=120s, stream=45s
-      - 2026-04-25 R2 (commit 2b7c0c1): tool 120 → 45s
-      - 2026-04-28 eval autónomo (commit b0d140e): tool 45 → 90s tras
-        ver que la 2da ronda timeouteaba con outputs grandes.
-      - 2026-04-28 repro Playwright: stream 45 → 90s (este fix). El
-        stream final post-tools también necesita budget extendido —
-        comparte el mismo workload conceptual (cold-load + prefill 25-
-        30k chars + decode). Pre-fix vimos 3/5 queries fallar en 59-62s
-        wall time porque el stream client cortaba a los 45s del primer
-        chunk read antes de recibir el 1er token.
-
-    Lo que el test SIGUE garantizando post-iteraciones:
-    1. `_OLLAMA_TOOL_CLIENT` es UN CLIENTE SEPARADO (no aliased al
-       `_STREAM_CLIENT`) — la separación importa para httpx connection
-       pooling: las calls de tool-decision (con `tools=` schema) no
-       comparten el pool de las calls de streaming, evitando que un
-       hang en una bloquee la otra.
-    2. Ambos timeouts existen como constantes (no hardcoded inline),
-       mantienen el invariante de "una sola fuente de verdad".
-    3. Ambos timeouts coinciden — divergencia produce el bug de
-       "el cliente más chico cae primero antes de que el otro termine".
-
-    Si el audit cambia de opinión y se vuelve a separar timeouts (porque
-    el daemon-wedge mata UX más que el stream-final-slow), actualizar
-    los asserts y agregar comentario en `_OLLAMA_*_TIMEOUT` definitions.
+def test_tool_decision_uses_mlx_chat_via_backend():
+    """Post-MLX cutover (Ola 5, 2026-05-06): el tool-decision call ya no usa
+    `_OLLAMA_TOOL_CLIENT` (cliente separado httpx con timeout 90s). En su lugar
+    usa `rag._mlx_chat_via_backend` in-process — sin timeout HTTP porque corre
+    en el mismo proceso via Metal/MPS. Verifica que el símbolo existe en rag
+    y que el streaming client todavía tiene su budget definido.
     """
+    import rag as _rag
     import web.server as srv
-    assert hasattr(srv, "_OLLAMA_TOOL_CLIENT"), (
-        "_OLLAMA_TOOL_CLIENT debe existir (separado del streaming client)"
+    assert callable(getattr(_rag, "_mlx_chat_via_backend", None)), (
+        "rag._mlx_chat_via_backend debe existir y ser callable (tool-decision post-MLX)"
     )
-    assert hasattr(srv, "_OLLAMA_STREAM_CLIENT"), (
-        "_OLLAMA_STREAM_CLIENT debe existir"
-    )
-    # Clientes distintos (no es el mismo objeto) — separación de pool.
-    assert srv._OLLAMA_TOOL_CLIENT is not srv._OLLAMA_STREAM_CLIENT
-    # Stream budget bumped a 90s post-Playwright repro 2026-04-28:
-    # synthesis post-tools timeouteaba en 59-62s con stream client de 45s.
-    assert srv._OLLAMA_STREAM_TIMEOUT == 90.0
-    # Tool-decision budget bumped a 90s post-eval autónomo del 2026-04-28:
-    # gmail/whatsapp_search/drive_search consistentemente timeouteaban en
-    # la 2da ronda con 45s. Si vuelve a bajar, actualizar este assert.
-    assert srv._OLLAMA_TOOL_TIMEOUT == 90.0
-    # Invariante: ambos coinciden — ver test_ollama_stream_timeout_aligned
-    # _with_tool_timeout en test_web_server_audit_fixes.py.
-    assert srv._OLLAMA_STREAM_TIMEOUT == srv._OLLAMA_TOOL_TIMEOUT
 
 
 def test_tool_addendum_mentions_whatsapp_send():

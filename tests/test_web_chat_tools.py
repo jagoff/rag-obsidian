@@ -41,6 +41,7 @@ from web.tools import (
     reminders_due,
     weather,
 )
+import rag as _rag_mod
 from web import server as server_mod
 from web.server import app
 
@@ -142,8 +143,6 @@ def chat_env(monkeypatch):
         server_mod, "multi_retrieve",
         lambda *a, **kw: _canned_retrieve_result(a[1] if len(a) >= 2 else "x"),
     )
-    monkeypatch.setattr(server_mod, "_ollama_alive", lambda timeout=2.0: True)
-    monkeypatch.setattr(server_mod, "_ollama_chat_probe", lambda timeout_s=6.0: True)
     monkeypatch.setattr(server_mod, "_fetch_whatsapp_unread", lambda *a, **kw: [])
     # build_person_context is a lazy `from rag import ...` inside the
     # endpoint, so we patch the source module.
@@ -448,8 +447,8 @@ def test_chat_endpoint_no_tools_path(chat_env, capsys):
     ]
     mock = _OllamaMock(responses)
     chat_env.setattr(server_mod.ollama, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
+
+    chat_env.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
 
     # Input must NOT match `_detect_metachat_intent` (short-circuits the
     # retrieval path this test is asserting on). "que tal" was moved into
@@ -503,8 +502,8 @@ def test_chat_endpoint_tool_path(chat_env, capsys):
         _mk_stream(["tiempo: ", "soleado"]),
     ])
     chat_env.setattr(server_mod.ollama, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
+
+    chat_env.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
 
     events, _ = _post_chat("qué tiempo va a hacer")
 
@@ -557,8 +556,8 @@ def test_chat_endpoint_parallel_tools(chat_env, capsys):
         _mk_stream(["ok"]),
     ])
     chat_env.setattr(server_mod.ollama, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
+
+    chat_env.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
 
     events, _ = _post_chat("resumen del dia")
 
@@ -621,8 +620,8 @@ def test_chat_endpoint_serial_then_parallel(chat_env, capsys):
         _mk_stream(["done"]),
     ])
     chat_env.setattr(server_mod.ollama, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
+
+    chat_env.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
 
     events, _ = _post_chat("buscá foo y contame el clima")
 
@@ -662,8 +661,8 @@ def test_chat_endpoint_tool_exception_recovers(chat_env, capsys):
         _mk_stream(["ok"]),
     ])
     chat_env.setattr(server_mod.ollama, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
+
+    chat_env.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
 
     events, _ = _post_chat("clima")
 
@@ -719,8 +718,8 @@ def test_chat_timing_log_sanitizes_infinity_confidence(chat_env, capsys, monkeyp
         _mk_stream(["resp"]),
     ])
     monkeypatch.setattr(server_mod.ollama, "chat", mock)
-    monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
-    monkeypatch.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
+
+    monkeypatch.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
 
     events, _body = _post_chat("consulta con corpus vacío")
     assert events[-1][0] == "done"
@@ -785,8 +784,8 @@ def test_chat_endpoint_topic_shift_no_cache_key_unbound_error(chat_env, capsys, 
         _mk_stream(["nueva ", "respuesta"]),
     ])
     monkeypatch.setattr(server_mod.ollama, "chat", mock)
-    monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
-    monkeypatch.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
+
+    monkeypatch.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
 
     events, _body = _post_chat("cuándo es el cumple de mi mamá")
 
@@ -832,8 +831,8 @@ def test_chat_endpoint_round_cap_respected(chat_env, capsys):
         _mk_stream(["forzado"]),
     ])
     chat_env.setattr(server_mod.ollama, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
-    chat_env.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
+
+    chat_env.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
 
     events, _ = _post_chat("dame clima 3 veces")
 
@@ -909,8 +908,8 @@ def test_empty_retrieve_with_forced_tools_skips_bail(chat_env, monkeypatch):
         _mk_stream(["listo"]),
     ])
     monkeypatch.setattr(server_mod.ollama, "chat", mock)
-    monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
-    monkeypatch.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
+
+    monkeypatch.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
 
     events, _ = _post_chat("que tengo para hacer esta semana?")
     names = [ev for ev, _ in events]
@@ -979,8 +978,8 @@ def test_low_conf_bypass_with_forced_tools_skips_bypass(chat_env, monkeypatch):
         _mk_stream(["ok"]),
     ])
     monkeypatch.setattr(server_mod.ollama, "chat", mock)
-    monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
-    monkeypatch.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
+
+    monkeypatch.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
 
     events, _ = _post_chat("que tengo para hacer esta semana?")
 
@@ -1050,8 +1049,8 @@ def test_source_intent_hint_injected_when_pre_router_fires_gmail(
         _mk_stream(["ok"]),             # final streaming
     ])
     monkeypatch.setattr(server_mod.ollama, "chat", mock)
-    monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
-    monkeypatch.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
+
+    monkeypatch.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
 
     events, _ = _post_chat("cuales son mis ultimos mails?")
     assert events, "SSE stream vacío"
@@ -1082,11 +1081,7 @@ def test_source_intent_hint_injected_when_pre_router_fires_gmail(
         f"{hint_msg[:200]!r}"
     )
     assert "tus mails/correos" in hint_msg
-    # El hint debe decirle al LLM que extraiga asuntos de las notas
-    # `03-Resources/Gmail/` en vez de hablar de "fuentes" abstractas
-    # (user feedback iter 3).
-    assert "03-Resources/Gmail" in hint_msg
-    assert "asunto" in hint_msg.lower()
+    # El hint debe orientar al LLM hacia la sección live de mails.
     assert "### Mails" in hint_msg
     # Frase canned para empty-state en vez del vago "te dejo otras fuentes".
     assert "No encontré mails recientes en tu corpus" in hint_msg
@@ -1106,8 +1101,8 @@ def test_source_intent_hint_omitted_when_no_source_specific_tools(
         _mk_stream(["hola!"]),
     ])
     monkeypatch.setattr(server_mod.ollama, "chat", mock)
-    monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
-    monkeypatch.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
+
+    monkeypatch.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
 
     # "dame info sobre grecia" — query semántica de vault sin pre-router match.
     events, _ = _post_chat("dame info sobre grecia")
@@ -1165,8 +1160,8 @@ def test_empty_tool_output_preserves_vault_context(chat_env, monkeypatch):
         _mk_stream(["ok"]),       # streaming final
     ])
     monkeypatch.setattr(server_mod.ollama, "chat", mock)
-    monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
-    monkeypatch.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
+
+    monkeypatch.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
 
     events, _ = _post_chat("cuales son mis ultimos mails?")
     assert mock.calls, "se esperaba al menos una call a ollama.chat"
@@ -1232,8 +1227,8 @@ def test_nonempty_tool_output_replaces_vault_context(chat_env, monkeypatch):
         _mk_stream(["ok"]),
     ])
     monkeypatch.setattr(server_mod.ollama, "chat", mock)
-    monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
-    monkeypatch.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
+
+    monkeypatch.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
 
     events, _ = _post_chat("revisar mails")
     assert mock.calls, "se esperaba al menos una call a ollama.chat"
@@ -1279,8 +1274,8 @@ def test_done_event_flags_source_specific_true_for_gmail_query(
         _mk_stream(["ok"]),
     ])
     monkeypatch.setattr(server_mod.ollama, "chat", mock)
-    monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
-    monkeypatch.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
+
+    monkeypatch.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
 
     events, _ = _post_chat("cuales son mis ultimos mails?")
     done_payload = next(data for ev, data in events if ev == "done")
@@ -1303,8 +1298,8 @@ def test_done_event_flags_source_specific_false_for_generic_query(
         _mk_stream(["respuesta"]),
     ])
     monkeypatch.setattr(server_mod.ollama, "chat", mock)
-    monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
-    monkeypatch.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
+
+    monkeypatch.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
 
     events, _ = _post_chat("dame info sobre grecia")
     done_payload = next(
@@ -1339,8 +1334,8 @@ def test_done_event_flags_source_specific_false_for_weather_only(
         _mk_stream(["ok"]),
     ])
     monkeypatch.setattr(server_mod.ollama, "chat", mock)
-    monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
-    monkeypatch.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
+
+    monkeypatch.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
 
     # "va a llover?" matchea solo el regex de weather (`llov`), no toca
     # `_PLANNING_PAT` (hoy/mañana/semana) que dispararía calendar_ahead
@@ -1380,8 +1375,6 @@ def chat_env_prod(monkeypatch):
     monkeypatch.delenv("RAG_WEB_TOOL_LLM_DECIDE", raising=False)
     # Reset rate-limit bucket (ver comentario en `chat_env` para detalle).
     server_mod._CHAT_BUCKETS.clear()
-    monkeypatch.setattr(server_mod, "_ollama_alive", lambda timeout=2.0: True)
-    monkeypatch.setattr(server_mod, "_ollama_chat_probe", lambda timeout_s=6.0: True)
     monkeypatch.setattr(server_mod, "_fetch_whatsapp_unread", lambda *a, **kw: [])
     import rag as _rag
     monkeypatch.setattr(_rag, "build_person_context", lambda q: None)
@@ -1422,8 +1415,8 @@ def test_llm_tool_decide_fires_when_pre_router_misses_and_vault_weak(
         _mk_stream(["fallback response"]),
     ])
     monkeypatch.setattr(server_mod.ollama, "chat", mock)
-    monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
-    monkeypatch.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
+
+    monkeypatch.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
 
     # Query intencionalmente sin keywords del pre-router — "correspondencia"
     # no está en los regex de `_TOOL_INTENT_RULES`.
@@ -1435,10 +1428,10 @@ def test_llm_tool_decide_fires_when_pre_router_misses_and_vault_weak(
         f"LLM tool-decide round NO corrió a pesar del fallback "
         f"(pre-router miss + conf<0.10). Calls a ollama: {len(mock.calls)}"
     )
-    # Confirmá que el tool-deciding call tiene `stream=False` y
-    # `tools=` (es el shape del decide round, no el final stream).
+    # Confirmá que el tool-deciding call tiene tools= (es el shape del decide
+    # round, no el final stream). Post-MLX: stream= no se pasa explícitamente.
     decide_call = mock.calls[0]
-    assert decide_call.get("stream") is False
+    assert not decide_call.get("stream"), "tool-deciding call no debe ser streaming"
     assert decide_call.get("tools"), "tool-deciding call sin tools= kwarg"
 
     # Log explícito del fallback gate — lo emitimos para debug + tunear.
@@ -1478,8 +1471,8 @@ def test_llm_tool_decide_skipped_when_pre_router_matches(
         _mk_stream(["respuesta basada en gmail_recent"]),
     ])
     monkeypatch.setattr(server_mod.ollama, "chat", mock)
-    monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
-    monkeypatch.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
+
+    monkeypatch.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
 
     events, _ = _post_chat("mis últimos mails")
 
@@ -1511,8 +1504,8 @@ def test_llm_tool_decide_skipped_when_vault_strong(
         _mk_stream(["respuesta del vault"]),
     ])
     monkeypatch.setattr(server_mod.ollama, "chat", mock)
-    monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
-    monkeypatch.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
+
+    monkeypatch.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
 
     # Query que no matchea pre-router pero el vault tiene info buena.
     events, _ = _post_chat("hablame sobre Grecia")

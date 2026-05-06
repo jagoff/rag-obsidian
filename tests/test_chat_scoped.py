@@ -75,7 +75,7 @@ def test_chat_path_scope_filters_to_single_note(monkeypatch):
     reducido. Si NO quedan hits → short-circuit con mensaje canned."""
     monkeypatch.setattr(server_mod, "multi_retrieve",
                         lambda *a, **kw: _canned_retrieve_full())
-    monkeypatch.setattr(server_mod, "_ollama_alive", lambda timeout=2.0: True)
+
 
     client = TestClient(app)
     # path matchea SÓLO la primera meta — el filtrado deja 1 chunk.
@@ -117,7 +117,7 @@ def test_chat_path_scope_no_match_short_circuits(monkeypatch):
     en el done event."""
     monkeypatch.setattr(server_mod, "multi_retrieve",
                         lambda *a, **kw: _canned_retrieve_full())
-    monkeypatch.setattr(server_mod, "_ollama_alive", lambda timeout=2.0: True)
+
 
     client = TestClient(app)
     resp = client.post(
@@ -288,7 +288,7 @@ def test_chat_path_inexistent_returns_200_with_clear_message(monkeypatch):
     especial de errores HTTP."""
     monkeypatch.setattr(server_mod, "multi_retrieve",
                         lambda *a, **kw: _canned_retrieve_full())
-    monkeypatch.setattr(server_mod, "_ollama_alive", lambda timeout=2.0: True)
+
 
     client = TestClient(app)
     resp = client.post(
@@ -326,7 +326,7 @@ def test_chat_folder_scope_passes_to_multi_retrieve(monkeypatch):
         return _canned_retrieve_full()
 
     monkeypatch.setattr(server_mod, "multi_retrieve", fake_multi_retrieve)
-    monkeypatch.setattr(server_mod, "_ollama_alive", lambda timeout=2.0: True)
+
 
     client = TestClient(app)
     resp = client.post(

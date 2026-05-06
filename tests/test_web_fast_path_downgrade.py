@@ -221,8 +221,6 @@ def chat_env_fastpath(monkeypatch):
         server_mod, "multi_retrieve",
         lambda *a, **kw: _canned_retrieve(fast_path=True),
     )
-    monkeypatch.setattr(server_mod, "_ollama_alive", lambda timeout=2.0: True)
-    monkeypatch.setattr(server_mod, "_ollama_chat_probe", lambda timeout_s=6.0: True)
     monkeypatch.setattr(server_mod, "_fetch_whatsapp_unread", lambda *a, **kw: [])
     import rag as _rag
     monkeypatch.setattr(_rag, "build_person_context", lambda q: None)
@@ -268,7 +266,7 @@ def test_functional_downgrade_fires_when_preroute_matches(chat_env_fastpath):
         # Streaming final response
         _mk_stream(["ok", " tenés", " pan", " pendiente"]),
     ])
-    chat_env_fastpath.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+    chat_env_fastpath.setattr(server_mod.ollama, "chat", mock)
 
     client = TestClient(app)
     resp = client.post(
@@ -309,7 +307,7 @@ def test_functional_no_downgrade_when_no_preroute_match(chat_env_fastpath):
     mock = _OllamaMock([
         _mk_stream(["resumen", " del", " vault"]),
     ])
-    chat_env_fastpath.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+    chat_env_fastpath.setattr(server_mod.ollama, "chat", mock)
 
     client = TestClient(app)
     # "explicame qué es ikigai" no tiene ningún keyword que el pre-router
@@ -349,7 +347,7 @@ def test_functional_rollback_env_keeps_fast_path_with_tools(chat_env_fastpath, m
     mock = _OllamaMock([
         _mk_stream(["ok"]),
     ])
-    chat_env_fastpath.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+    monkeypatch.setattr(server_mod.ollama, "chat", mock)
 
     client = TestClient(app)
     resp = client.post(

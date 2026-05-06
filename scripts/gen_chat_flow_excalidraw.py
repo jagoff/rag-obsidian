@@ -376,7 +376,7 @@ def build() -> dict:
 
     e, probe_id = make_box(
         hcenter(cx_center, 420), 1080, 420, box_h,
-        "_ollama_chat_probe + _ollama_restart_if_stuck",
+        "_mlx_chat_via_backend (in-process, Ola 5)",
         "process", font_size=14,
     )
     elements += e

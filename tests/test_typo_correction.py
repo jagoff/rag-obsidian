@@ -153,6 +153,114 @@ class TestCorrectTyposLlm:
             result = rag._correct_typos_llm(query)
         assert result == query
 
+    # ── Jaccard guard (bug 2026-05-05 — paraphrasing bajo MLX) ──────────────
+
+    def test_jaccard_rechaza_paraphrase_sustantivo_a_verbo(self):
+        """`charla con juan` → `chatea con juan` debe rechazarse.
+
+        MLX qwen2.5:3b parafrasea (sustantivo→verbo). 2/3 tokens overlap
+        (jaccard=0.5 < 0.7) → reject, devuelve original.
+        """
+        query = "charla con juan"
+        with patch.object(rag._helper_client(), "chat",
+                          return_value=_mock_ollama_response("chatea con juan")):
+            result = rag._correct_typos_llm(query)
+        assert result == query, (
+            f"Jaccard guard debería rechazar el paraphrase: {result!r}"
+        )
+
+    def test_jaccard_rechaza_language_drift_es_a_pt(self):
+        """`whatsapp con mama` → `whatsapp com mama` (PT) debe rechazarse.
+
+        MLX a veces leakea portugués. `con` → `com` deja 2/3 tokens
+        overlap, jaccard=0.5 < 0.7 → reject.
+        """
+        query = "whatsapp con mama"
+        with patch.object(rag._helper_client(), "chat",
+                          return_value=_mock_ollama_response("whatsapp com mama")):
+            result = rag._correct_typos_llm(query)
+        assert result == query
+
+    def test_jaccard_acepta_accent_only_fix(self):
+        """`reunion pendiente martes` → `reunión pendiente martes` debe pasar.
+
+        Accent fix legítimo: tras norm NFD jaccard=1.0, accept.
+        """
+        with patch.object(rag._helper_client(), "chat",
+                          return_value=_mock_ollama_response("reunión pendiente martes")):
+            result = rag._correct_typos_llm("reunion pendiente martes")
+        assert result == "reunión pendiente martes"
+
+    def test_jaccard_acepta_full_match_modulo_case(self):
+        """`finanzas mose` → `finanzas Mose` debe pasar (case-only).
+
+        Tras lowercase + accent norm jaccard=1.0, accept.
+        """
+        with patch.object(rag._helper_client(), "chat",
+                          return_value=_mock_ollama_response("finanzas Mose")):
+            result = rag._correct_typos_llm("finanzas mose")
+        assert result == "finanzas Mose"
+
+    def test_jaccard_skip_para_single_token(self):
+        """`asor` → `Astor` (1 token, jaccard=0) debe pasar via length cap.
+
+        Token-jaccard sería 0 incluso para typo fix válido en queries
+        de 1 token. La guard explícitamente saltea single-token y deja
+        que el length cap (1.5×) sea el único sanity check.
+        """
+        with patch.object(rag._helper_client(), "chat",
+                          return_value=_mock_ollama_response("Astor")):
+            result = rag._correct_typos_llm("asor")
+        assert result == "Astor", (
+            "Jaccard guard NO debe correr en single-token queries — "
+            f"got: {result!r}"
+        )
+
+    def test_jaccard_threshold_env_override(self, monkeypatch):
+        """`RAG_TYPO_JACCARD_MIN=0.4` deja pasar paraphrase de jaccard 0.5."""
+        monkeypatch.setattr(rag, "_TYPO_JACCARD_MIN", 0.4)
+        query = "charla con juan"
+        with patch.object(rag._helper_client(), "chat",
+                          return_value=_mock_ollama_response("chatea con juan")):
+            result = rag._correct_typos_llm(query)
+        # Con threshold 0.4, jaccard 0.5 ≥ 0.4 → accepta el paraphrase
+        assert result == "chatea con juan"
+
+
+# ── Tests: _typo_correction_token_jaccard ────────────────────────────────────
+
+
+class TestTypoCorrectionTokenJaccard:
+    """Unit tests del helper _typo_correction_token_jaccard."""
+
+    def test_identical_strings_return_one(self):
+        assert rag._typo_correction_token_jaccard("foo bar", "foo bar") == 1.0
+
+    def test_accent_normalization(self):
+        """`reunion` y `reunión` deben normalizarse a la misma token."""
+        assert rag._typo_correction_token_jaccard(
+            "reunion pendiente", "reunión pendiente"
+        ) == 1.0
+
+    def test_case_normalization(self):
+        """`Foo BAR` y `foo bar` matchean post-lowercase."""
+        assert rag._typo_correction_token_jaccard("Foo BAR", "foo bar") == 1.0
+
+    def test_paraphrase_drops_below_threshold(self):
+        """`charla con juan` vs `chatea con juan`: 2/4 = 0.5."""
+        score = rag._typo_correction_token_jaccard(
+            "charla con juan", "chatea con juan"
+        )
+        assert 0.49 < score < 0.51
+
+    def test_disjoint_strings_zero(self):
+        assert rag._typo_correction_token_jaccard("foo bar", "baz qux") == 0.0
+
+    def test_empty_returns_one(self):
+        """Empty string en ambos lados → 1.0 (trust upstream sanity)."""
+        assert rag._typo_correction_token_jaccard("", "") == 1.0
+        assert rag._typo_correction_token_jaccard("foo", "") == 1.0
+
 
 # ── Tests: expand_queries integration ─────────────────────────────────────────
 

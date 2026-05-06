@@ -22,6 +22,8 @@ Migración Ollama → MLX para los 4 LLMs locales. **Estado**: Olas 0+1+2+3 comp
 
 **Switch runtime**: env var `RAG_LLM_BACKEND={ollama,mlx}`. **Default `mlx` post-cutover 2026-05-05**. Rollback: `RAG_LLM_BACKEND=ollama` exportado en shell o agregado al plist en cuestión; sin cambios de código.
 
+**Plists**: 15 de 28 plists tienen `RAG_LLM_BACKEND=mlx` explícito (morning, today, digest, web, anticipate, online-tune, emergent, patterns, wake-up, wa-fast, consolidate, brief-auto-tune, auto-harvest, active-learning-nudge, archive). Los 13 restantes (calibrate, daemon-watchdog, distill, implicit-feedback, ingest-whatsapp, ingest-cross-source, maintenance, routing-rules, vault-cleanup, whisper-vocab, wa-tasks, watch, wake-hook) heredan del default del código (mlx). Rationale: daemons que no generan texto (ingesters, maintenance) heredan; briefs + chat + anticipate setean explícito por clarity operativa.
+
 **Backend abstraction** en [`rag/llm_backend.py`](rag/llm_backend.py): `OllamaBackend` (legacy passthrough) + `MLXBackend` con `chat()`, `chat_stream()`, `generate()`, `list_available()` — todos funcionales. Extra opcional `mlx` en `pyproject.toml` (Apple Silicon only, marker `requires_mlx`).
 
 **4 dispatch points en `rag/__init__.py`** (Ola 2):
@@ -545,7 +547,7 @@ Promote checklist: (1) `RAG_CONTEXTUAL_RETRIEVAL=1 rag index --reset --contextua
 
 ## Eval baselines
 
-**Floor actual (2026-04-27, post-golden-remap vault reorg, commit `6f8994f`)**:
+**Floor actual PRE-MLX (2026-04-27, pre-cutover 2026-05-05, post-golden-remap vault reorg, commit `6f8994f`)**:
 
 - Singles: `hit@5 53.70% [40.74, 66.67] · MRR 0.528 [0.407, 0.657] · n=54`
 - Chains: `hit@5 72.00% [52.00, 88.00] · MRR 0.633-0.653 · chain_success 33.33% [11.11, 66.67] · turns=25 chains=9`
@@ -752,7 +754,7 @@ Regla: pre-router corre UNA vez al inicio de `gen()`, todo el resto del flow LEE
 
 Síntoma: arreglaste filtro / system prompt / regex. Validás Playwright. Test reporta bug sigue. La causa: semantic cache sirviendo respuestas pre-fix porque cache key no incluye nada que tu fix haya cambiado.
 
-Mecanismo: `_FILTER_VERSION` (`rag/__init__.py:4656`) está horneado en `_hash_chunk_count` y usado en corpus_hash → cache key. Bumpear la string invalida TODAS las entries pre-fix.
+Mecanismo: `_FILTER_VERSION` (`rag/__init__.py:6017`) está horneado en `_hash_chunk_count` y usado en corpus_hash → cache key. Bumpear la string invalida TODAS las entries pre-fix.
 
 Cuándo bumpear:
 - Cambia regex que afecta tools_fired (PII redact, raw tool stripper, iberian leaks, foreign scripts).

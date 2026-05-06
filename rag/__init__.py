@@ -12117,7 +12117,15 @@ def _get_local_embedder():
             _os.environ["TRANSFORMERS_OFFLINE"] = "1"
             import torch
             from sentence_transformers import SentenceTransformer
-            if torch.backends.mps.is_available():
+            # `OBSIDIAN_RAG_EMBED_DEVICE` lets ops force CPU during long
+            # bulk-embed runs — observed 2026-05-06 the MPS allocator
+            # crashes with `[METAL] Command buffer execution failed:
+            # Discarded (victim of GPU error/recovery)` after ~200 files
+            # under contention with web/watch/anticipate daemons.
+            _force_dev = os.environ.get("OBSIDIAN_RAG_EMBED_DEVICE", "").strip().lower()
+            if _force_dev in ("cpu", "mps", "cuda"):
+                _dev = _force_dev
+            elif torch.backends.mps.is_available():
                 _dev = "mps"
             elif torch.cuda.is_available():
                 _dev = "cuda"

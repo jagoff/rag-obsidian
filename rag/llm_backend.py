@@ -47,10 +47,10 @@ resolve between them via `MLX_MODEL_ALIAS` table.
 `tools=[...]` is propagated to `tokenizer.apply_chat_template(tools=...)`
 which Qwen2.5-Instruct and Qwen3-Instruct templates support natively. The
 model emits `<tool_call>{...}</tool_call>` blocks; `parse_tool_calls()`
-in `rag.mlx_tool_calls` extracts them into ollama-shape `Message.ToolCall`
-objects. If the tokenizer template doesn't accept `tools=` (older format),
-the call falls through to a no-tools template — caller can detect the
-absence of `tool_calls` in the response and Ollama-fallback.
+in `rag.mlx_tool_calls` extracts them into Message.ToolCall objects.
+If the tokenizer template doesn't accept `tools=` (older format), the
+call falls through to a no-tools template — caller can detect the absence
+of `tool_calls` in the response and gracefully degrade.
 
 ## Ola 5 cerrada 2026-05-06
 

@@ -1,7 +1,7 @@
 [project]
 name = "obsidian-rag"
 version = "0.1.0"
-description = "Local RAG over an Obsidian vault — sqlite-vec + Ollama + sentence-transformers, no cloud calls."
+description = "Local RAG over an Obsidian vault — sqlite-vec + MLX + sentence-transformers, no cloud calls."
 requires-python = ">=3.13"
 dependencies = [
     "sqlite-vec>=0.1.6",
@@ -121,13 +121,12 @@ finetune = [
     "trl>=0.11",
 ]
 # Apple MLX backend para LLMs locales — migración Ollama → MLX
-# (2026-05-05, dispatch en 99-AI/system/mlx-migration/).
-#
-# Default-OFF durante la migración: `rag.llm_backend.get_backend()` lee
-# `RAG_LLM_BACKEND` (default `ollama`). Cuando los 4 modelos MLX target
-# (Qwen2.5-3B, Qwen2.5-7B, Qwen3-4B-2507, Qwen3-30B-A3B-2507) estén
-# bajados Y la Ola 4 (eval gate) esté verde → flip a `RAG_LLM_BACKEND=mlx`
-# en los plists. Ola 5 saca `ollama>=0.6.1` del core.
+# completada en Ola 7 (2026-05-06). `RAG_LLM_BACKEND=mlx` es default,
+# OllamaBackend retirada (`get_backend()` siempre devuelve MLXBackend).
+# `ollama>=0.6.1` queda en `dependencies` como compatibility shim mínimo;
+# no hay call sites runtime — se removerá en Ola 8 cuando los tests que
+# todavía importan `ollama` (test_mlx_embed::skipped, test_retrieve_e2e
+# en docstring) se limpien.
 #
 # `mlx-lm` solo corre en Apple Silicon (sys_platform == 'darwin' +
 # platform_machine == 'arm64'). En CI Linux el extra no se instala y los

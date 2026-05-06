@@ -3880,15 +3880,22 @@ class _TimedOllamaProxy:
         # and fall through to Ollama — MLX backend has no native tool
         # format and `chat()` here doesn't yield. Streaming sites must
         # use `_chat_stream_dispatch()` instead of this proxy.
+        _be_name = os.environ.get("RAG_LLM_BACKEND", "mlx").lower()
         if (
-            os.environ.get("RAG_LLM_BACKEND", "mlx").lower() == "mlx"
+            _be_name == "mlx"
             and not kwargs.get("tools")
             and not kwargs.get("stream")
         ):
+            _mark_backend("mlx")
             if self._semaphore is not None:
                 with self._semaphore:
                     return _mlx_chat_via_backend(**kwargs)
             return _mlx_chat_via_backend(**kwargs)
+        # Ollama path: fallback tools/stream bajo MLX, o backend nativo Ollama
+        _fallback = None
+        if _be_name == "mlx":
+            _fallback = "tools" if kwargs.get("tools") else "stream"
+        _mark_backend("ollama", fallback_reason=_fallback)
         if self._client is None:
             self._client = ollama.Client(timeout=self._timeout)
         if self._semaphore is not None:
@@ -3905,6 +3912,10 @@ def _mlx_chat_via_backend(**kwargs):
     `stream` — for MLX `stream=True` collapses to non-streaming).
     Preserves `keep_alive` and `format` semantics.
     """
+    # Telemetry: marca el backend efectivo. Cuando se llega desde
+    # _TimedOllamaProxy o _mlx_or_ollama_chat el mark ya fue seteado;
+    # esta llamada es idempotente para call sites directos futuros.
+    _mark_backend("mlx")
     from rag.llm_backend import ChatOptions, get_backend
 
     options_dict = kwargs.get("options") or {}
@@ -3938,12 +3949,18 @@ def _mlx_or_ollama_chat(**kwargs):
     """
     if ollama.chat is not _ORIGINAL_OLLAMA_CHAT:
         return ollama.chat(**kwargs)
+    _be_name = os.environ.get("RAG_LLM_BACKEND", "mlx").lower()
     if (
-        os.environ.get("RAG_LLM_BACKEND", "mlx").lower() == "mlx"
+        _be_name == "mlx"
         and not kwargs.get("tools")
         and not kwargs.get("stream")
     ):
+        _mark_backend("mlx")
         return _mlx_chat_via_backend(**kwargs)
+    _fallback = None
+    if _be_name == "mlx":
+        _fallback = "tools" if kwargs.get("tools") else "stream"
+    _mark_backend("ollama", fallback_reason=_fallback)
     return ollama.chat(**kwargs)
 
 
@@ -3965,10 +3982,12 @@ def _chat_stream_dispatch(**kwargs):
     if ollama.chat is not _ORIGINAL_OLLAMA_CHAT:
         # Monkey-patched (test): use module symbol so mock intercepts.
         return ollama.chat(stream=True, **kwargs)
+    _be_name = os.environ.get("RAG_LLM_BACKEND", "mlx").lower()
     if (
-        os.environ.get("RAG_LLM_BACKEND", "mlx").lower() == "mlx"
+        _be_name == "mlx"
         and not kwargs.get("tools")
     ):
+        _mark_backend("mlx")
         from rag.llm_backend import ChatOptions, get_backend
 
         options_dict = kwargs.get("options") or {}
@@ -3991,6 +4010,9 @@ def _chat_stream_dispatch(**kwargs):
             keep_alive=kwargs.get("keep_alive", -1),
             format=kwargs.get("format"),
         )
+    # Fallback Ollama: tools= con MLX activo, o backend Ollama nativo
+    _fallback = "tools" if (_be_name == "mlx" and kwargs.get("tools")) else None
+    _mark_backend("ollama", fallback_reason=_fallback)
     return ollama.chat(stream=True, **kwargs)
 
 
@@ -12685,9 +12707,27 @@ _LLM_TYPO_CACHE_MAX = 256
 _llm_typo_cache: OrderedDict[str, str] = OrderedDict()
 _llm_typo_cache_lock = threading.Lock()
 
-_TYPO_CORRECTION_ENABLED = os.environ.get(
-    "RAG_TYPO_CORRECTION", "1"
-).strip().lower() not in ("0", "false", "no")
+def _resolve_typo_correction_default() -> str:
+    """Default OFF bajo MLX backend hasta fixear el prompt.
+
+    Bug 2026-05-05: MLX qwen2.5:3b parafrasea agresivamente:
+      'charla con maria' -> 'chatea con maria' (sustantivo->verbo)
+      'fantastical api'  -> 'fantastic api'    (proper noun->adj)
+      'reunion con max'  -> 'reunioon con max' (introduce typo)
+
+    Drop singles 54.72% (Ollama) -> 5.66% (MLX) cuando typo corrector
+    esta ON. Ollama qwen2.5:3b conserva la query mejor con el mismo
+    prompt - diferencia de sampling MLX vs HTTP API.
+
+    Override explicito (RAG_TYPO_CORRECTION=1) siempre gana.
+    """
+    explicit = os.environ.get("RAG_TYPO_CORRECTION")
+    if explicit is not None:
+        return explicit
+    backend = os.environ.get("RAG_LLM_BACKEND", "mlx").strip().lower()
+    return "0" if backend == "mlx" else "1"
+
+_TYPO_CORRECTION_ENABLED = _resolve_typo_correction_default().strip().lower() not in ("0", "false", "no")
 
 # ContextVar thread-safe que `_correct_typos_llm` populates con el delta de
 # la última corrección para que el caller (`retrieve()` / `multi_retrieve()`)
@@ -12710,6 +12750,39 @@ _TYPO_CORRECTION_ENABLED = os.environ.get(
 _LLM_TYPO_LAST: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "rag_llm_typo_last", default=None,
 )
+
+# -- Backend telemetry ContextVar (2026-05-05) --
+# Registra que backend LLM se uso en la llamada mas reciente del contexto actual.
+# Seteado por los 4 dispatch points y leido por log_query_event para agregar
+# backend, fallback_reason y backend_active al extra_json de rag_queries.
+# Shape: {"backend": "mlx"|"ollama", "fallback_reason": str|None, "backend_active": str}
+_ACTIVE_BACKEND_CTX: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "rag_active_backend", default=None,
+)
+
+
+def _mark_backend(backend: str, *, fallback_reason: str | None = None) -> None:
+    """Setea el ContextVar de backend para el request actual.
+
+    backend = "mlx" | "ollama". fallback_reason solo cuando MLX cayo a Ollama
+    ("tools" | "stream"). None para Ollama nativo o MLX limpio.
+    """
+    _be_env = os.environ.get("RAG_LLM_BACKEND", "ollama")
+    _ACTIVE_BACKEND_CTX.set({
+        "backend": backend,
+        "fallback_reason": fallback_reason,
+        "backend_active": _be_env,
+    })
+
+
+def _get_backend_telemetry() -> "dict | None":
+    """Lee el ContextVar de backend. Retorna None si no hubo dispatch LLM."""
+    return _ACTIVE_BACKEND_CTX.get()
+
+
+def _reset_backend_telemetry() -> None:
+    """Resetea el ContextVar de backend. Llamar al inicio de un nuevo request."""
+    _ACTIVE_BACKEND_CTX.set(None)
 
 
 def _typo_telemetry_reset() -> None:
@@ -53402,11 +53475,10 @@ def serve(host: str, port: int):
             parts: list[str] = []
             ttft_ms: int | None = None
             try:
-                for chunk in _chat_capped_client().chat(
+                for chunk in _chat_stream_dispatch(
                     model=resolve_chat_model(),
                     messages=messages,
                     options={**CHAT_OPTIONS, "num_predict": tasks_predict_cap},
-                    stream=True,
                     keep_alive=chat_keep_alive(),
                 ):
                     content = chunk.message.content
@@ -58984,7 +59056,8 @@ def _behavior_backfill_find_match(
                 rows = conn.execute(
                     f"SELECT id, ts, q, session, paths_json FROM rag_queries"
                     f" WHERE 1=1{_range_where}"
-                    f" ORDER BY ABS(strftime('%s', ts) - strftime('%s', ?)) ASC",
+                    f" ORDER BY ABS(strftime('%s', ts) - strftime('%s', ?)) ASC"
+                    f" LIMIT 50",
                     (*_range_params, orphan_ts),
                 ).fetchall()
                 for r in rows:

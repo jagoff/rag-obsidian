@@ -257,6 +257,7 @@ def _web_plist(rag_bin: str) -> str:
     <key>FASTEMBED_CACHE_PATH</key><string>{Path.home()}/.cache/fastembed</string>
     <key>RAG_MEMORY_PRESSURE_INTERVAL</key><string>20</string>
     <key>RAG_MEMORY_PRESSURE_THRESHOLD</key><string>80</string>
+    <key>RAG_MEMORY_PRESSURE_SWAP_GB</key><string>8.0</string>
     <key>RAG_AUTO_FIX_WORKER</key><string>1</string>
     <key>RAG_AUTO_FIX_HOURLY_CAP</key><string>12</string>
     <key>RAG_LLM_BACKEND</key><string>mlx</string>

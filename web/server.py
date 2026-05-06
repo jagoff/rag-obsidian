@@ -10160,6 +10160,23 @@ def _chat_prewarm_targets() -> list[tuple[str, int]]:
     valor que `_LOOKUP_MODEL` — evita doble ping al mismo (modelo, num_ctx)
     por ciclo.
     """
+    # MLX backend skip (2026-05-05, post-Ola-3 cutover): bajo MLX el
+    # prewarm es waste — `keep_alive` semantics no aplican (MLX no tiene
+    # daemon HTTP separado, los modelos viven en `MLXBackend._loaded`
+    # OrderedDict in-process con LRU propio). Pingear con `num_predict=1`
+    # solo gasta inference + agrega presión a la VRAM compartida (Apple
+    # Silicon unified memory). El KV-cache reinit problem que motivó el
+    # prewarm es un Ollama-only issue (re-init lento bajo num_ctx mismatch
+    # entre helpers @1024 y chat @4096).
+    #
+    # Override: `RAG_MLX_PREWARM=1` mantiene el prewarm bajo MLX
+    # (útil para tests / debug).
+    _backend_choice = os.environ.get("RAG_LLM_BACKEND", "mlx").strip().lower()
+    _mlx_prewarm = os.environ.get(
+        "RAG_MLX_PREWARM", ""
+    ).strip() not in ("", "0", "false", "no")
+    if _backend_choice == "mlx" and not _mlx_prewarm:
+        return []
     main_model = _resolve_web_chat_model()
     targets: list[tuple[str, int]] = [(main_model, _WEB_CHAT_NUM_CTX)]
     if _LOOKUP_MODEL != main_model:

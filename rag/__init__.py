@@ -14972,19 +14972,40 @@ def _handle_memory_pressure(pct_before: float, threshold: float) -> dict:
         # timeout cuelga el thread del watchdog 60s+, justo cuando lo
         # necesitamos rapidísimo. Si timea → se cae al fallback de kill
         # de runners abajo (ver actions["chat_unload_timeout"]).
-        try:
-            import ollama as _ollama
-            _client = _ollama.Client(timeout=10)
-            _client.chat(
-                model=chat_model,
-                messages=[{"role": "user", "content": "."}],
-                options={"num_predict": 1},
-                keep_alive=0,
-            )
-            actions["chat_unloaded"] = True
-        except Exception as exc:
-            actions["chat_unload_timeout"] = True
-            _silent_log("memory_watchdog_unload_chat", exc)
+        #
+        # Backend-aware (2026-05-05, post-Ola-3 cutover): bajo MLX el
+        # modelo está in-process en MPS, no en Ollama. `keep_alive=0`
+        # via Ollama no libera nada (chat_unloaded queda False eternamente
+        # → death spiral). Para MLX, llamamos `MLXBackend.unload()` que
+        # pop-ea el modelo de `_loaded` + `mx.clear_cache()`. Bajo Ollama
+        # mantenemos el path histórico (cliente con timeout corto).
+        _backend_choice = os.environ.get("RAG_LLM_BACKEND", "mlx").strip().lower()
+        if _backend_choice == "mlx":
+            try:
+                from rag.llm_backend import get_backend
+                _backend = get_backend()
+                if _backend.unload(chat_model):
+                    actions["chat_unloaded"] = True
+                else:
+                    # Modelo no estaba en _loaded — no es error
+                    actions["chat_unload_skipped"] = "not_resident"
+            except Exception as exc:
+                actions["chat_unload_timeout"] = True
+                _silent_log("memory_watchdog_unload_chat_mlx", exc)
+        else:
+            try:
+                import ollama as _ollama
+                _client = _ollama.Client(timeout=10)
+                _client.chat(
+                    model=chat_model,
+                    messages=[{"role": "user", "content": "."}],
+                    options={"num_predict": 1},
+                    keep_alive=0,
+                )
+                actions["chat_unloaded"] = True
+            except Exception as exc:
+                actions["chat_unload_timeout"] = True
+                _silent_log("memory_watchdog_unload_chat", exc)
             # NO matar runners acá. Mezclar las señales (presión alta vs
             # stuck-load) lleva a un loop: bajamos pressure → next request
             # recarga modelo → pressure sube → watchdog mata otra vez.

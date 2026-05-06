@@ -169,6 +169,21 @@ class LLMBackend(ABC):
     def list_available(self) -> list[str]:
         """Return list of locally-available model names (canonical)."""
 
+    @abstractmethod
+    def unload(self, model: str | None = None) -> bool:
+        """Best-effort: free RAM/VRAM held by `model` (or all loaded models
+        if `model` is None). Returns True if anything was unloaded.
+
+        Watchdog hook for memory pressure response. Implementations:
+
+        - OllamaBackend: `chat(keep_alive=0)` ping with timeout (delegated
+          to caller — see `_handle_memory_pressure`); returning here is a
+          best-effort no-op signal so call sites can still call it.
+        - MLXBackend: pops from `_loaded` + `mx.clear_cache()`.
+
+        Errors swallowed — never raise.
+        """
+
 
 # ---------------------------------------------------------------------------
 # OllamaBackend (legacy — default during migration window)
@@ -247,6 +262,38 @@ class OllamaBackend(LLMBackend):
 
     def list_available(self) -> list[str]:
         return [m.model for m in self._ollama.list().models]
+
+    def unload(self, model: str | None = None) -> bool:
+        """Ping Ollama with `keep_alive=0` to release the model.
+
+        If `model` is None, unloads every currently-resident model.
+        Bounded to 5s per model — under pressure / stuck-load this can
+        hang otherwise.
+        """
+        try:
+            client = self._ollama.Client(timeout=5)
+            if model is None:
+                try:
+                    targets = [m.model for m in self._ollama.ps().models]
+                except Exception:
+                    targets = []
+            else:
+                targets = [to_ollama(model)]
+            unloaded_any = False
+            for tgt in targets:
+                try:
+                    client.chat(
+                        model=tgt,
+                        messages=[{"role": "user", "content": "."}],
+                        options={"num_predict": 1},
+                        keep_alive=0,
+                    )
+                    unloaded_any = True
+                except Exception:
+                    continue
+            return unloaded_any
+        except Exception:
+            return False
 
     @staticmethod
     def _opts_to_dict(options: ChatOptions | None) -> dict[str, Any]:
@@ -552,6 +599,47 @@ class MLXBackend(LLMBackend):
             if len(parts) >= 2:
                 out.append(f"{parts[0]}/{'-'.join(parts[1:])}")
         return out
+
+    def unload(self, model: str | None = None) -> bool:
+        """Pop `model` (or all) from `_loaded` + clear MLX Metal cache.
+
+        Apple Silicon Metal holds wired pages for resident MLX models. The
+        memory watchdog calls this under pressure to release VRAM. After
+        eviction, `mx.clear_cache()` releases the Metal allocator's
+        reserved pool — without this, popping the OrderedDict only drops
+        the Python references; Metal keeps the pages wired until
+        gc.collect() runs which is non-deterministic.
+
+        Returns True iff anything was unloaded.
+        """
+        try:
+            if not self._loaded:
+                return False
+            if model is None:
+                self._loaded.clear()
+                unloaded_any = True
+            else:
+                canonical = to_mlx(model)
+                if canonical in self._loaded:
+                    self._loaded.pop(canonical, None)
+                    unloaded_any = True
+                else:
+                    unloaded_any = False
+            try:
+                import mlx.core as mx  # type: ignore[import-not-found]
+
+                mx.clear_cache()
+            except Exception:
+                pass
+            try:
+                import gc
+
+                gc.collect()
+            except Exception:
+                pass
+            return unloaded_any
+        except Exception:
+            return False
 
 
 # ---------------------------------------------------------------------------

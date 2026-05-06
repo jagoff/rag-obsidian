@@ -2,26 +2,25 @@
 
 Created 2026-05-05 as part of `99-AI/system/mlx-migration/dispatch.md`.
 
-## Status: Ola 2 (en curso) — MLXBackend functional
+## Status: Ola 6 — cero-Ollama (en curso 2026-05-06)
 
 This module defines a thin interface (`LLMBackend`) over the LLM call
 contract used across `rag/__init__.py`. Two concrete backends:
 
-- `OllamaBackend` — wraps the existing `ollama` Python client. **Default
-  during the migration window** so master stays green even if MLX models
-  haven't finished downloading.
-- `MLXBackend` — uses `mlx-lm` (Apple MLX). Functional as of Ola 2:
-  `chat()`, `chat_stream()`, `generate()` all implemented + smoke-tested
-  OK for all 4 models (2026-05-05). **Default once Ola 4 eval gate passes**.
+- `MLXBackend` — uses `mlx-lm` (Apple MLX). **Default post-cutover**
+  (Ola 5, 2026-05-06). Cubre chat/generate/embed nativo. Qwen2.5-3B/7B,
+  Qwen3-30B-A3B, granite-vision (VLM), Qwen3-Embedding-0.6B.
+- `OllamaBackend` — wraps the legacy `ollama` Python client. Quedó como
+  rollback path solo. En Ola 6 los modelos chat ya están purgados del
+  disco — re-pull manual requerido para activar este backend.
 
-Switch via env var `RAG_LLM_BACKEND={ollama,mlx}` (default `ollama`
-during the migration window, `mlx` post-cutover).
+Switch via env var `RAG_LLM_BACKEND={mlx,ollama}` (default `mlx`).
 
-## Scope (NOT embeddings)
+## Scope post-Ola-6: chat + generate + embed
 
-This backend covers `chat()` + `generate()` only. Embeddings (`bge-m3`
-today) are out of scope — see `99-AI/system/embedding-swap-qwen3-8b/`
-for the parallel embedding migration.
+Embeddings ahora forman parte del contrato (`embed()` agregado en Ola 6).
+SentenceTransformer in-process es el path real del indexer; `MLXBackend.embed()`
+existe como alternativa explícita para callers que ruteen via dispatch.
 
 ## Invariants preserved
 
@@ -109,6 +108,10 @@ MLX_MODEL_ALIAS: dict[str, str] = {
     "qwen3:30b-a3b": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
     # Experimental (A/B vs the 3B helper, NOT default until eval CIs OK)
     "qwen3:4b": "mlx-community/Qwen3-4B-Instruct-2507-4bit",
+    # Embedder — qwen3-embedding stays on Ollama for indexing/query paths;
+    # this alias enables MLXBackend.embed() as an alternative when callers
+    # explicitly route through the backend (Phase 1 scope B).
+    "qwen3-embedding:0.6b": "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ",
 }
 
 OLLAMA_MODEL_ALIAS: dict[str, str] = {v: k for k, v in MLX_MODEL_ALIAS.items()}
@@ -199,6 +202,19 @@ class LLMBackend(ABC):
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Raw generate (no chat template)."""
+
+    @abstractmethod
+    def embed(
+        self,
+        model: str,
+        inputs: list[str],
+        keep_alive: str | int = -1,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Batch embedding. Returns ollama-shape: {"embeddings": [[float, ...], ...]}.
+
+        Each inner list is L2-normalised 1024-dim (qwen3-embedding compatible).
+        """
 
     @abstractmethod
     def list_available(self) -> list[str]:
@@ -297,6 +313,21 @@ class OllamaBackend(LLMBackend):
 
     def list_available(self) -> list[str]:
         return [m.model for m in self._ollama.list().models]
+
+    def embed(
+        self,
+        model: str,
+        inputs: list[str],
+        keep_alive: str | int = -1,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Passthrough to ollama.embed — insurance rollback path."""
+        resp = self._ollama.embed(
+            model=to_ollama(model),
+            input=inputs,
+            keep_alive=keep_alive,
+        )
+        return {"embeddings": list(resp.embeddings)}
 
     def unload(self, model: str | None = None) -> bool:
         """Ping Ollama with `keep_alive=0` to release the model.
@@ -438,6 +469,10 @@ class MLXBackend(LLMBackend):
         self._watchdog_stop = threading.Event()
         # Fix #4: sampler cache — same (temp, top_p) reuses the same sampler object
         self._sampler_cache: dict[tuple[float, float], Any] = {}
+        # Embedder model cache — separate from chat `_loaded` to avoid eviction
+        # interference (embedder is small ~400MB; chat models LRU at _MAX_SMALL_LOADED).
+        # `_last_used` tracks idle time for the same watchdog as chat models.
+        self._loaded_embed: dict[str, tuple[Any, Any]] = {}
         self._start_watchdog()
 
     def _start_watchdog(self) -> None:
@@ -475,8 +510,8 @@ class MLXBackend(LLMBackend):
     def _evict_idle(self) -> None:
         """Evict resident models cuyo last_used > _idle_ttl segundos ago.
 
-        Llamado por el watchdog daemon. Mantiene `_loaded` y `_last_used`
-        en sync. No-op si TTL <= 0.
+        Llamado por el watchdog daemon. Mantiene `_loaded`, `_loaded_embed`
+        y `_last_used` en sync. No-op si TTL <= 0.
         """
         if self._idle_ttl <= 0:
             return
@@ -484,10 +519,12 @@ class MLXBackend(LLMBackend):
         with self._loaded_lock:
             stale = [
                 mid for mid, ts in self._last_used.items()
-                if (now - ts) > self._idle_ttl and mid in self._loaded
+                if (now - ts) > self._idle_ttl
+                and (mid in self._loaded or mid in self._loaded_embed)
             ]
             for mid in stale:
                 self._loaded.pop(mid, None)
+                self._loaded_embed.pop(mid, None)
                 self._last_used.pop(mid, None)
 
     def _load(self, model_id: str) -> tuple[Any, Any]:
@@ -803,20 +840,24 @@ class MLXBackend(LLMBackend):
         """
         try:
             with self._loaded_lock:
-                if not self._loaded:
+                if not self._loaded and not self._loaded_embed:
                     return False
                 if model is None:
                     self._loaded.clear()
+                    self._loaded_embed.clear()
                     self._last_used.clear()
                     unloaded_any = True
                 else:
                     canonical = to_mlx(model)
+                    unloaded_any = False
                     if canonical in self._loaded:
                         self._loaded.pop(canonical, None)
                         self._last_used.pop(canonical, None)
                         unloaded_any = True
-                    else:
-                        unloaded_any = False
+                    if canonical in self._loaded_embed:
+                        self._loaded_embed.pop(canonical, None)
+                        self._last_used.pop(canonical, None)
+                        unloaded_any = True
             # Cache-clear + GC outside the lock: slow ops, no `_loaded` access.
             try:
                 import mlx.core as mx  # type: ignore[import-not-found]
@@ -833,6 +874,94 @@ class MLXBackend(LLMBackend):
             return unloaded_any
         except Exception:
             return False
+
+    def embed(
+        self,
+        model: str,
+        inputs: list[str],
+        keep_alive: str | int = -1,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Batch embedding via MLX Qwen3-Embedding model.
+
+        Returns ollama-shape {"embeddings": [[float, ...], ...]} where each
+        inner list is a L2-normalised 1024-dim vector (compatible with
+        qwen3-embedding:0.6b Q4_K_M Ollama vectors, cosine-sim ~0.97).
+
+        Model is cached in `_loaded_embed` (separate from chat `_loaded` dict)
+        and tracked via `_last_used` for watchdog eviction. Uses last-real-token
+        pooling with attention-mask-derived lengths to handle padded batches
+        correctly — naive last-token pooling on a padded sequence would read the
+        pad token embedding, not the real final token.
+        """
+        import mlx.core as mx  # type: ignore[import-not-found]
+
+        canonical = to_mlx(model)
+
+        # Load (or retrieve cached) embedder model + tokenizer
+        if canonical not in self._loaded_embed:
+            from mlx_lm import load  # type: ignore[import-not-found]
+
+            embed_model, embed_tokenizer = load(canonical)
+            self._loaded_embed[canonical] = (embed_model, embed_tokenizer)
+
+        embed_model, embed_tokenizer = self._loaded_embed[canonical]
+        self._last_used[canonical] = time.monotonic()
+
+        # mlx-lm wraps HF tokenizers in `TokenizerWrapper` (not directly
+        # callable). Reach for the inner `_tokenizer` (a PreTrainedTokenizer)
+        # which supports the standard batch __call__ interface with padding /
+        # truncation / return_tensors.
+        inner_tokenizer = getattr(embed_tokenizer, "_tokenizer", embed_tokenizer)
+
+        # Tokenize the batch. Use padding so all sequences share a length;
+        # `return_tensors="np"` gives numpy arrays that mlx.array accepts.
+        # `padding=True` pads shorter sequences to the longest in the batch;
+        # `truncation=True` caps at model max_length (32768 for qwen3-emb).
+        encoded = inner_tokenizer(
+            inputs,
+            padding=True,
+            truncation=True,
+            return_tensors="np",
+        )
+        input_ids = mx.array(encoded["input_ids"])           # (batch, seq)
+        attention_mask = mx.array(encoded["attention_mask"])  # (batch, seq)
+
+        batch_size = input_ids.shape[0]
+
+        # Forward pass through the embedding body (bypass lm_head)
+        hidden = embed_model.model(input_ids)  # (batch, seq, hidden_dim)
+
+        # Last-real-token pooling. For each row find the index of the last
+        # non-pad token. `attention_mask` is 1 for real tokens, 0 for pads.
+        # sum(axis=1) gives the count of real tokens; subtract 1 for 0-based index.
+        seq_lengths = mx.sum(attention_mask, axis=1) - 1  # shape (batch,)
+
+        # mx.eval needed so seq_lengths is concrete before the index gather
+        mx.eval(seq_lengths)
+        seq_lengths_np = seq_lengths.tolist()
+
+        # Gather pooled[b] = hidden[b, seq_lengths[b], :]
+        pooled_rows: list[Any] = []
+        for b in range(batch_size):
+            pooled_rows.append(hidden[b, int(seq_lengths_np[b]), :])
+        # Stack into (batch, hidden_dim)
+        pooled = mx.stack(pooled_rows, axis=0)
+
+        # L2-normalise each row
+        norms = mx.sqrt(mx.sum(pooled * pooled, axis=-1, keepdims=True))
+        normalised = pooled / norms
+
+        # Validate output dimension (1024 for qwen3-embedding:0.6b)
+        hidden_dim = normalised.shape[-1]
+        if hidden_dim != 1024:
+            raise RuntimeError(
+                f"MLXBackend.embed: expected 1024-dim output, got {hidden_dim}. "
+                f"Model: {canonical}"
+            )
+
+        mx.eval(normalised)
+        return {"embeddings": normalised.tolist()}
 
     def _get_sampler(self, temperature: float, top_p: float) -> Any:
         """Return a cached make_sampler() result for (temperature, top_p).

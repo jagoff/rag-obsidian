@@ -85,6 +85,9 @@ def _watch_plist(rag_bin: str) -> str:
   <dict>
     <key>HOME</key><string>{Path.home()}</string>
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>RAG_INDEX_LOCAL_EMBED</key><string>1</string>
+    <key>HF_HUB_OFFLINE</key><string>1</string>
+    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -111,19 +114,22 @@ def _serve_plist(rag_bin: str) -> str:
     chat model warm in memory so each request skips the ~5-10s subprocess
     cold-start that listener.ts's fallback pays per message.
 
-    Env vars mirror the web plist: OLLAMA_KEEP_ALIVE=-1 (models pinned in
-    VRAM forever), RAG_RERANKER_NEVER_UNLOAD=1 (cross-encoder stays resident,
-    no 9s reload after idle eviction), RAG_LOCAL_EMBED=1 (in-process
-    SentenceTransformer for query embedding, ~10-30ms vs ~140ms via ollama
-    HTTP), RAG_STATE_SQL=1 (deployment symmetry — no-op post-T10),
+    Env vars mirror the web plist: RAG_RERANKER_NEVER_UNLOAD=1 (cross-encoder
+    stays resident, no 9s reload after idle eviction), RAG_LOCAL_EMBED=1
+    (in-process SentenceTransformer for query embedding, ~10-30ms vs ~140ms
+    via HTTP), RAG_STATE_SQL=1 (deployment symmetry — no-op post-T10),
     HF_HUB_OFFLINE=1 + TRANSFORMERS_OFFLINE=1 (close the race where HEAD
     probes to huggingface.co fire BEFORE rag.py's module-init setdefault —
     see test_plist_web_serve.py for rationale; was causing 64× [local-embed]
-    unavailable + fallback-to-ollama in web.error.log pre-2026-04-22),
+    unavailable in web.error.log pre-2026-04-22),
     RAG_MEMORY_PRESSURE_INTERVAL=20 (the default 60s missed the MPS-OOM
     window measured in web.error.log; 20s gives the watchdog 3 samples per
     minute to catch memory pressure before Metal returns
     `kIOGPUCommandBufferCallbackErrorOutOfMemory`).
+
+    Post-2026-05-06 (Ola 6 cero-Ollama): OLLAMA_KEEP_ALIVE y
+    OLLAMA_MAX_LOADED_MODELS removidos — no hay daemon Ollama al que
+    keep-alivear (modelos chat purgados del disco).
 
     KeepAlive + RunAtLoad mean launchd will resurrect it if it crashes or
     the host reboots. ThrottleInterval=30 prevents crash loops from burning
@@ -148,8 +154,6 @@ def _serve_plist(rag_bin: str) -> str:
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
     <key>PYTHONUNBUFFERED</key><string>1</string>
-    <key>OLLAMA_KEEP_ALIVE</key><string>20m</string>
-    <key>OLLAMA_MAX_LOADED_MODELS</key><string>2</string>
     <key>RAG_RERANKER_NEVER_UNLOAD</key><string>1</string>
     <key>RAG_LOCAL_EMBED</key><string>1</string>
     <key>RAG_STATE_SQL</key><string>1</string>
@@ -247,8 +251,6 @@ def _web_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>PYTHONUNBUFFERED</key><string>1</string>
     <key>OBSIDIAN_RAG_WEB_CHAT_MODEL</key><string>{chat_model}</string>
-    <key>OLLAMA_KEEP_ALIVE</key><string>20m</string>
-    <key>OLLAMA_MAX_LOADED_MODELS</key><string>2</string>
     <key>RAG_LOCAL_EMBED</key><string>1</string>
     <key>RAG_RERANKER_NEVER_UNLOAD</key><string>1</string>
     <key>RAG_STATE_SQL</key><string>1</string>
@@ -646,7 +648,6 @@ def _consolidate_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
-    <key>OLLAMA_KEEP_ALIVE</key><string>20m</string>
     <key>RAG_STATE_SQL</key><string>1</string>
     <key>RAG_LLM_BACKEND</key><string>mlx</string>
   </dict>
@@ -1108,9 +1109,9 @@ def _ingest_whatsapp_plist(rag_bin: str) -> str:
     "último mensaje de X" no se sientan stale, y lo suficientemente spaced
     para no competir con watch/serve en CPU.
 
-    `OLLAMA_KEEP_ALIVE=-1` pin's bge-m3 en VRAM para que el embed batch no
-    pague cold-load en cada run. RAG_LOCAL_EMBED NO se setea (el ingester es
-    bulk-embed path → ollama HTTP es el único batching-capable backend).
+    `RAG_INDEX_LOCAL_EMBED=1` (Ola 6, 2026-05-06 cero-Ollama): embedder
+    in-process siempre activo. Reemplaza el bulk-embed path via Ollama HTTP
+    que requería `OLLAMA_KEEP_ALIVE=-1` para pin bge-m3 en VRAM.
 
     `RunAtLoad=true` (2026-04-22): garantiza run inmediato al instalar o
     post-reboot; sin esto el primer refresh se demoraba hasta 15min tras
@@ -1136,7 +1137,9 @@ def _ingest_whatsapp_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
-    <key>OLLAMA_KEEP_ALIVE</key><string>20m</string>
+    <key>RAG_INDEX_LOCAL_EMBED</key><string>1</string>
+    <key>HF_HUB_OFFLINE</key><string>1</string>
+    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
   </dict>
   <key>StartInterval</key><integer>900</integer>
   <key>RunAtLoad</key><true/>
@@ -1185,7 +1188,9 @@ def _ingest_cross_source_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
-    <key>OLLAMA_KEEP_ALIVE</key><string>20m</string>
+    <key>RAG_INDEX_LOCAL_EMBED</key><string>1</string>
+    <key>HF_HUB_OFFLINE</key><string>1</string>
+    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
   </dict>
   <key>StartInterval</key><integer>3600</integer>
   <key>RunAtLoad</key><true/>
@@ -1228,7 +1233,9 @@ def _ingest_gmail_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
-    <key>OLLAMA_KEEP_ALIVE</key><string>20m</string>
+    <key>RAG_INDEX_LOCAL_EMBED</key><string>1</string>
+    <key>HF_HUB_OFFLINE</key><string>1</string>
+    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
   </dict>
   <key>StartInterval</key><integer>3600</integer>
   <key>RunAtLoad</key><true/>
@@ -1272,7 +1279,9 @@ def _ingest_calendar_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
-    <key>OLLAMA_KEEP_ALIVE</key><string>20m</string>
+    <key>RAG_INDEX_LOCAL_EMBED</key><string>1</string>
+    <key>HF_HUB_OFFLINE</key><string>1</string>
+    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
   </dict>
   <key>StartInterval</key><integer>3600</integer>
   <key>RunAtLoad</key><true/>
@@ -1321,7 +1330,9 @@ def _ingest_reminders_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
-    <key>OLLAMA_KEEP_ALIVE</key><string>20m</string>
+    <key>RAG_INDEX_LOCAL_EMBED</key><string>1</string>
+    <key>HF_HUB_OFFLINE</key><string>1</string>
+    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
   </dict>
   <key>StartInterval</key><integer>3600</integer>
   <key>RunAtLoad</key><true/>
@@ -1353,6 +1364,9 @@ def _ingest_calls_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
+    <key>RAG_INDEX_LOCAL_EMBED</key><string>1</string>
+    <key>HF_HUB_OFFLINE</key><string>1</string>
+    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
   </dict>
   <key>StartCalendarInterval</key>
   <array>
@@ -1401,6 +1415,9 @@ def _ingest_safari_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
+    <key>RAG_INDEX_LOCAL_EMBED</key><string>1</string>
+    <key>HF_HUB_OFFLINE</key><string>1</string>
+    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
   </dict>
   <key>StartCalendarInterval</key>
   <array>
@@ -1449,6 +1466,9 @@ def _ingest_drive_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
+    <key>RAG_INDEX_LOCAL_EMBED</key><string>1</string>
+    <key>HF_HUB_OFFLINE</key><string>1</string>
+    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
   </dict>
   <key>StartCalendarInterval</key>
   <array>
@@ -1504,6 +1524,9 @@ def _ingest_pillow_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
+    <key>RAG_INDEX_LOCAL_EMBED</key><string>1</string>
+    <key>HF_HUB_OFFLINE</key><string>1</string>
+    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
   </dict>
   <key>StartCalendarInterval</key>
   <dict>
@@ -1741,7 +1764,6 @@ def _wake_up_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
-    <key>OLLAMA_KEEP_ALIVE</key><string>20m</string>
     <key>RAG_LLM_BACKEND</key><string>mlx</string>
   </dict>
   <key>StartCalendarInterval</key>

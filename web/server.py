@@ -81,7 +81,12 @@ from pydantic import BaseModel, Field, field_validator
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-import ollama  # noqa: E402
+# `ollama` se importa solo para que tests puedan hacer
+# `monkeypatch.setattr(server_mod.ollama, "chat", ...)`. En runtime el path
+# actual es MLX via `_dispatch_chat` (Ola 6 cero-Ollama, 2026-05-06): el server
+# no hace ningún `ollama.X(...)` directo. Quitar este import rompe ~25 tests
+# que parchean ahí — la migración a un mock-helper unificado es scope aparte.
+import ollama  # noqa: E402, F401
 
 from rag import (  # noqa: E402
     CHAT_OPTIONS,
@@ -6319,9 +6324,12 @@ def get_chat_model() -> dict:
     """
     override = _read_chat_model_override()
     try:
+        from rag.llm_backend import MLXBackend, MLX_MODEL_ALIAS
+        mlx_ids = set(MLXBackend().list_available())
         available = sorted(
-            m.model for m in ollama.list().models
-            if not any(m.model.startswith(p) for p in _CHAT_MODEL_FAMILY_DENYLIST)
+            alias for alias, hf_id in MLX_MODEL_ALIAS.items()
+            if hf_id in mlx_ids
+            and not any(alias.startswith(p) for p in _CHAT_MODEL_FAMILY_DENYLIST)
         )
     except Exception:
         available = []
@@ -6354,14 +6362,16 @@ def set_chat_model(req: ChatModelRequest) -> dict:
     requested = (req.model or "").strip() or None
     if requested is not None:
         try:
-            available = {m.model for m in ollama.list().models}
+            from rag.llm_backend import MLXBackend, MLX_MODEL_ALIAS
+            mlx_ids = set(MLXBackend().list_available())
+            available = {alias for alias, hf_id in MLX_MODEL_ALIAS.items() if hf_id in mlx_ids}
         except Exception:
             available = set()
         if requested not in available:
             raise HTTPException(
                 status_code=400,
-                detail=f"model '{requested}' not installed locally "
-                       f"(try: ollama pull {requested.split(':')[0]})",
+                detail=f"model '{requested}' not available in MLX "
+                       f"(descargalo con: huggingface-cli download mlx-community/...)",
             )
     try:
         _write_chat_model_override(requested)
@@ -19132,7 +19142,9 @@ def _resolve_diagnose_model() -> str:
     if _DIAGNOSE_MODEL_RESOLVED is not None:
         return _DIAGNOSE_MODEL_RESOLVED
     try:
-        available = {m.model for m in ollama.list().models}
+        from rag.llm_backend import MLXBackend, MLX_MODEL_ALIAS
+        mlx_ids = set(MLXBackend().list_available())
+        available = {alias for alias, hf_id in MLX_MODEL_ALIAS.items() if hf_id in mlx_ids}
     except Exception:
         available = set()
     for candidate in _DIAGNOSE_MODEL_PREFERENCE:

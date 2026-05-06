@@ -3842,19 +3842,15 @@ def _save_context_cache() -> None:
 
 _SUMMARY_CLIENT: "_TimedOllamaProxy | None" = None
 _INDEX_CHAT_CLIENT: ollama.Client | None = None
-_INDEX_EMBED_CLIENT: ollama.Client | None = None
 _HELPER_CLIENT: "_TimedOllamaProxy | None" = None
 _CHAT_CAPPED_CLIENT: "_TimedOllamaProxy | None" = None
 
 # Capture the original `ollama.chat` at import time so _TimedOllamaProxy
 # can detect monkey-patches (tests replace `rag.ollama.chat` with mocks).
 _ORIGINAL_OLLAMA_CHAT = ollama.chat
-# Same trick for `ollama.embed`. Tests in test_query_caches.py replace
-# `rag.ollama.embed` to count calls and feed deterministic vectors —
-# routing through `Client(timeout=...).embed` bypasses the mock. So in
-# `embed()` we check identity and only force the timeout-bearing client
-# when the symbol is the original (production path).
-_ORIGINAL_OLLAMA_EMBED = ollama.embed
+# `_ORIGINAL_OLLAMA_EMBED` y `_INDEX_EMBED_CLIENT` removidos en Ola 6 cero-Ollama
+# (2026-05-06): `embed()` corre 100% in-process via SentenceTransformer
+# (Qwen3-Embedding-0.6B). No hay paths Ollama de embed en runtime.
 
 # Semaphore that caps concurrent qwen2.5:3b (HELPER_MODEL) calls.
 # Ollama serialises at the GPU level but each blocked Python thread holds
@@ -4055,36 +4051,6 @@ def _index_chat_client() -> ollama.Client:
     if _INDEX_CHAT_CLIENT is None:
         _INDEX_CHAT_CLIENT = ollama.Client(timeout=120.0)
     return _INDEX_CHAT_CLIENT
-
-
-def _index_embed_client() -> ollama.Client:
-    """Cached `ollama.Client(timeout=120)` for index-time embeddings.
-
-    Mirrors `_index_chat_client` but for the per-chunk `ollama.embed(...)`
-    call inside `embed()`. The vanilla `ollama.embed(...)` module helper
-    uses the default httpx client without any read timeout — if Ollama is
-    saturated (another consumer pinning the GPU, model unload/reload mid
-    embed batch, daemon hung) the call sits in `recvfrom` indefinitely
-    and the whole `rag index` rglob freezes. The web/chat handler then
-    queues behind it forever because every chat path eventually calls
-    `embed()` for the query.
-
-    Empirical foot-gun observed 2026-05-01: a zombie `rag index --no-contradict`
-    spawned by a parallel devin session sat in `__recvfrom` for 1.5h
-    (verified with `sample <pid> 1`). With this 120s ceiling, the zombie raises `httpx.ReadTimeout`
-    after 2 minutes, releases the connection, and the existing 4-attempt
-    retry in `embed()` either recovers or surfaces the failure — instead
-    of the index hanging forever and dragging the chat down with it.
-
-    The 120s value matches `_index_chat_client` (and is well above the
-    p99 cold-load for bge-m3 ~6-8s on Apple Silicon). Tests that mock
-    `rag.ollama.embed` continue to bypass this client — see the identity
-    check in `embed()` against `_ORIGINAL_OLLAMA_EMBED`.
-    """
-    global _INDEX_EMBED_CLIENT
-    if _INDEX_EMBED_CLIENT is None:
-        _INDEX_EMBED_CLIENT = ollama.Client(timeout=120.0)
-    return _INDEX_EMBED_CLIENT
 
 
 def _summary_client() -> "_TimedOllamaProxy":
@@ -11946,39 +11912,26 @@ def cache_stats_reset() -> None:
 
 
 def embed(texts: list[str]) -> list[list[float]]:
+    """Embed `texts` con el SentenceTransformer in-process (Qwen/Qwen3-Embedding-0.6B).
+
+    Ola 6 cero-Ollama (2026-05-06): este path NO llama más a Ollama. El branch
+    legacy `ollama.embed(...)` se eliminó. Si `_get_local_embedder()` retorna
+    None (modelo no se carga), levantamos `RuntimeError` — no hay fallback.
+
+    `RAG_INDEX_LOCAL_EMBED` (env var) ya no condiciona nada — el path local es
+    SIEMPRE el default. La var queda como no-op por back-compat (no rompe
+    nada si está seteada en plists viejos, simplemente se ignora).
+    `RAG_INDEX_LOCAL_EMBED_BATCH` sigue gobernando el batch_size.
+
+    Cache (`_embed_cache`) sigue intacto: hit-ratio en multi-query expansion
+    + chains hace que valga la pena, aunque en `rag index --reset` (first-time
+    embeds) la mayoría son misses. Cosine-distance sqlite-vec es scale-invariant
+    así que `normalize_embeddings=True` (igual que `query_embed_local` y el
+    viejo fast-path) no rompe vectores existentes — `_COLLECTION_BASE` NO se
+    bumpea.
+    """
     if not texts:
         return []
-    # Index-time local embedder fast path (RAG_INDEX_LOCAL_EMBED=1).
-    # Reusa el SentenceTransformer (BAAI/bge-m3) que `_get_local_embedder`
-    # ya carga para el query path. Con MPS en Apple Silicon es ~3-5x más
-    # rápido que la ronda RPC a Ollama en batches grandes (medido 2026-05-04
-    # durante el speedup del `rag index --reset`: 18min → ~2min para 6157
-    # chunks). NO afecta el query path: `query_embed_local` sigue usando
-    # su propio entry point (`RAG_LOCAL_EMBED`). Si la carga del modelo
-    # falla (no cache, etc), caemos al path Ollama legacy abajo.
-    #
-    # Cache de embed (`_embed_cache`) se bypassea en este path: durante un
-    # reset full, los embed_texts son first-time y el cache hit-ratio es
-    # casi 0 — no vale la pena el lock contention.
-    if ollama.embed is _ORIGINAL_OLLAMA_EMBED and os.environ.get(
-        "RAG_INDEX_LOCAL_EMBED", ""
-    ).strip().lower() not in ("", "0", "false", "no"):
-        try:
-            _model = _index_embed_local()
-            if _model is not None:
-                arr = _model.encode(
-                    texts,
-                    normalize_embeddings=True,
-                    batch_size=int(os.environ.get("RAG_INDEX_LOCAL_EMBED_BATCH", "64")),
-                    convert_to_numpy=True,
-                    show_progress_bar=False,
-                )
-                return arr.tolist()
-        except Exception as _exc:
-            if os.environ.get("RAG_DEBUG"):
-                print(
-                    f"[index-local-embed] fallback to ollama: {_exc}", flush=True,
-                )
     # Cache invalidation por cambio de modelo (audit 2026-04-25 R2-Embedding #1).
     # Si EMBED_MODEL cambió desde la última vez que populamos el cache,
     # los embeddings cacheados son del modelo viejo (incompatibles
@@ -12007,40 +11960,22 @@ def embed(texts: list[str]) -> list[list[float]]:
     if not missing_idx:
         return cached  # type: ignore[return-value]
     missing_texts = [texts[i] for i in missing_idx]
-    # Retry on transient Ollama hiccups (ConnectionError). The launchd
-    # KeepAlive daemon reboots ollama within 1-3s when it OOMs under
-    # pressure (happens when `rag index` runs against a large vault
-    # while the web server's command-r runner is also resident).
-    # Without retries, a single dropped connection kills the whole
-    # indexing batch — we've seen `rag index` die after ~5 notes.
-    _last_exc: Exception | None = None
-    for attempt in range(4):
-        try:
-            # Production path: use the cached `Client(timeout=120)` so a
-            # stuck Ollama can't wedge the embed call in `recvfrom`
-            # forever (see `_index_embed_client` docstring for the
-            # 2026-05-01 incident that motivated this). Test path:
-            # honour the module-level monkeypatch so test_query_caches
-            # mocks intercept correctly.
-            if ollama.embed is _ORIGINAL_OLLAMA_EMBED:
-                resp = _index_embed_client().embed(
-                    model=EMBED_MODEL, input=missing_texts, keep_alive=OLLAMA_KEEP_ALIVE,
-                )
-            else:
-                resp = ollama.embed(
-                    model=EMBED_MODEL, input=missing_texts, keep_alive=OLLAMA_KEEP_ALIVE,
-                )
-            break
-        except ConnectionError as exc:
-            _last_exc = exc
-            if attempt == 3:
-                raise
-            # 1.5s, 3s, 6s + jitter (0-0.5s) para evitar thundering herd
-            # cuando varios workers retryan en lockstep post ollama-restart.
-            time.sleep(1.5 * (2 ** attempt) + random.random() * 0.5)
-    else:
-        raise _last_exc  # pragma: no cover
-    fresh = resp.embeddings
+    # In-process SentenceTransformer (MPS en Apple Silicon). Sin retry/fallback
+    # — si el modelo no carga, levantamos RuntimeError (Ola 6: no hay path
+    # Ollama de respaldo).
+    _model = _index_embed_local()
+    if _model is None:
+        raise RuntimeError(
+            "local embedder failed to load — Ola 6 cero-ollama no fallback"
+        )
+    arr = _model.encode(
+        missing_texts,
+        normalize_embeddings=True,
+        batch_size=int(os.environ.get("RAG_INDEX_LOCAL_EMBED_BATCH", "64")),
+        convert_to_numpy=True,
+        show_progress_bar=False,
+    )
+    fresh = arr.tolist()
     with _embed_cache_lock:
         for t, v in zip(missing_texts, fresh):
             _embed_cache[t] = v
@@ -55550,22 +55485,22 @@ def _cleanup_chat_uploads(*, ttl_days: int | None = None) -> dict:
 
 
 def _check_ollama_health() -> dict:
-    """Verify required Ollama models are available. Post-MLX cutover only
-    `EMBED_MODEL` (qwen3-embedding:0.6b) sigue viniendo de ollama; chat
-    pasó a MLX in-process. OCR vision-language model también via ollama
-    si está pulled."""
-    required = [EMBED_MODEL]
-    status: dict[str, str] = {}
+    """Verify the in-process embedder loads OK.
+
+    Ola 6 cero-Ollama (2026-05-06): post-cutover NO consultamos más a Ollama
+    (chat pasó a MLX, embed pasó a SentenceTransformer in-process). El nombre
+    de la función queda por back-compat con callers; semánticamente ahora
+    chequea `_get_local_embedder()` — única dependencia del modelo de embed.
+
+    Devuelve `{EMBED_MODEL: "ok"}` si carga, `{EMBED_MODEL: "missing"}` si
+    `_get_local_embedder()` retorna None (HF cache no presente, MPS unavailable,
+    etc), `{"error": ...}` si la carga levanta excepción.
+    """
     try:
-        available = {m.model for m in ollama.list().models}
+        model = _get_local_embedder()
     except Exception as e:
         return {"error": str(e)}
-    for model in required:
-        found = model in available or f"{model}:latest" in available
-        if not found:
-            found = any(a.startswith(model.split(":")[0] + ":") for a in available)
-        status[model] = "ok" if found else "missing"
-    return status
+    return {EMBED_MODEL: "ok" if model is not None else "missing"}
 
 
 def _prune_url_orphans(vault: Path) -> int:
@@ -63735,7 +63670,7 @@ from rag.pendientes import (  # noqa: E402, F401
 # imports a handful of helpers from `rag` at module-load time
 # (HELPER_MODEL, _silent_log, propose_calendar_event, etc. — all defined
 # earlier in this file). Internal callers of monkey-patched names
-# (_ocrmac_module, _ocr_image, _vlm_client, _VLM_CAPTION_MAX_PER_RUN,
+# (_ocrmac_module, _ocr_image, _vlm_describe, _VLM_CAPTION_MAX_PER_RUN,
 # _detect_cita_from_ocr) resolve via `rag.<X>` so test patches propagate.
 #
 # The `_ocrmac_module` and `_ocrmac_import_attempted` globals live on the
@@ -63778,10 +63713,18 @@ from rag.ocr import (  # noqa: E402, F401
     _vlm_caption_budget_reset,
     _vlm_caption_calls_used,
     _vlm_caption_enabled,
-    _VLM_CLIENT,
-    _vlm_client,
-    _vlm_model_missing_warned,
+    _vlm_describe,
+    _vlm_idle_unload,
+    _vlm_load,
+    _VLM_LAST_USED,
+    _VLM_LOCK,
+    _VLM_MODEL_OBJ,
+    _VLM_PROCESSOR,
 )
+# _VLM_CLIENT was removed from rag.ocr when the VLM backend migrated from
+# Ollama (ollama.Client singleton) to MLX-VLM (mlx_vlm.generate calls).
+# The re-export shim above no longer needs to pull it; leaving this comment
+# as a breadcrumb in case older code still references the symbol.
 
 
 # ── Phase 1b: integrations re-export shim (2026-04-25) ───────────────────────

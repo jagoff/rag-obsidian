@@ -205,27 +205,6 @@ def test_wait_seconds_times_out_when_holder_persists(isolated_lock_path):
     t1.join(timeout=5)
 
 
-class TestIndexEmbedClient:
-    """`_index_embed_client()` cachea un `ollama.Client(timeout=120)` para
-    los embeddings del index pipeline. El timeout existe para que un Ollama
-    saturado no cuelgue el `rag index` en `recvfrom` indefinidamente —
-    ver el docstring de la función para el incidente del 2026-05-01.
-    """
-
-    def test_returns_client_with_120s_timeout(self):
-        """El client tiene timeout=120s consistente con `_index_chat_client`."""
-        from rag import _index_embed_client
-        client = _index_embed_client()
-        assert client is not None
-        # ollama.Client expone _client (httpx) con timeout
-        timeout = client._client.timeout
-        # httpx.Timeout puede ser un objeto compuesto. El read timeout es lo
-        # que importa para `recvfrom` infinito.
-        assert timeout.read == 120.0 or float(timeout.read) == 120.0
-
-    def test_caches_singleton(self):
-        """Llamadas sucesivas devuelven el mismo Client (no re-crea)."""
-        from rag import _index_embed_client
-        c1 = _index_embed_client()
-        c2 = _index_embed_client()
-        assert c1 is c2
+# `_index_embed_client` y `_ORIGINAL_OLLAMA_EMBED` removidos en Ola 6 cero-Ollama
+# (2026-05-06): el bulk-embed path del indexer pasó a SentenceTransformer
+# in-process — no más ronda HTTP a Ollama → no hay client que cachear.

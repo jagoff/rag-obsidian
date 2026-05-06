@@ -58,6 +58,9 @@ resolve between them via `MLX_MODEL_ALIAS` table.
 from __future__ import annotations
 
 import os
+import sys
+import threading
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
@@ -111,7 +114,11 @@ class ChatOptions:
     temperature: float = 0.0
     seed: int = 42
     num_ctx: int = 4096
-    num_predict: int = 768
+    # 384 matches CHAT_OPTIONS["num_predict"] in rag/__init__.py (median
+    # answer_len=38 chars, p90 approx 200 tokens). A default of 768 caused
+    # callers passing options={} without num_predict to generate 2x
+    # more tokens under MLX than under Ollama (latency + quality regression).
+    num_predict: int = 384
     top_p: float = 1.0
     stop: tuple[str, ...] = ()
 
@@ -339,9 +346,11 @@ class MLXBackend(LLMBackend):
     - Otherwise: LRU cap at `_MAX_LOADED` (default 3 small models OR
       1 big + 0 small).
 
-    `_idle_ttl` (env `RAG_MLX_IDLE_TTL`, default 1800s) is a hint for
-    a future watchdog thread; not yet enforced. Eviction today is
-    purely capacity-driven.
+    `_idle_ttl` (env `RAG_MLX_IDLE_TTL`, default 1800s) is enforced by
+    a daemon watchdog thread started in `__init__`. Models idle longer
+    than `_idle_ttl` seconds are evicted from `_loaded` + Metal cache
+    cleared. Set `RAG_MLX_IDLE_TTL=0` or `RAG_MLX_IDLE_DISABLE=1` to
+    disable. Eviction is also capacity-driven (LRU).
 
     ## Streaming semantics (`chat_stream`)
 
@@ -381,26 +390,45 @@ class MLXBackend(LLMBackend):
         from collections import OrderedDict
 
         self._loaded: OrderedDict[str, tuple[Any, Any]] = OrderedDict()
+        self._loaded_lock = threading.RLock()
+        self._last_used: dict[str, float] = {}
         self._idle_ttl = int(os.environ.get("RAG_MLX_IDLE_TTL", "1800"))
+        self._watchdog_thread: threading.Thread | None = None
+        self._watchdog_stop = threading.Event()
+        self._start_watchdog()
 
     def _load(self, model_id: str) -> tuple[Any, Any]:
         """Get or load (model, tokenizer) for `model_id`. LRU bump on hit."""
         canonical = to_mlx(model_id)
-        if canonical in self._loaded:
-            self._loaded.move_to_end(canonical)
-            return self._loaded[canonical]
+        with self._loaded_lock:
+            if canonical in self._loaded:
+                self._loaded.move_to_end(canonical)
+                self._last_used[canonical] = time.monotonic()
+                return self._loaded[canonical]
 
-        # Eviction BEFORE load (free RAM first)
-        self._evict_for(canonical)
+            # Eviction BEFORE load (free RAM first)
+            self._evict_for(canonical)
 
         from mlx_lm import load  # type: ignore[import-not-found]
 
         model, tokenizer = load(canonical)
-        self._loaded[canonical] = (model, tokenizer)
+        with self._loaded_lock:
+            self._loaded[canonical] = (model, tokenizer)
+            self._last_used[canonical] = time.monotonic()
         return (model, tokenizer)
 
+    def _bump_last_used(self, model_id: str) -> None:
+        """Refresh last-used timestamp (call after each generation ends)."""
+        canonical = to_mlx(model_id)
+        with self._loaded_lock:
+            if canonical in self._loaded:
+                self._last_used[canonical] = time.monotonic()
+
     def _evict_for(self, incoming: str) -> None:
-        """Evict resident models to make room for `incoming`."""
+        """Evict resident models to make room for `incoming`.
+
+        Caller must hold `_loaded_lock`.
+        """
         is_big = incoming in self._BIG_MODELS
 
         if is_big:
@@ -408,15 +436,18 @@ class MLXBackend(LLMBackend):
             for k in list(self._loaded.keys()):
                 if k != incoming:
                     self._loaded.pop(k, None)
+                    self._last_used.pop(k, None)
             return
 
         # Incoming is small: evict any big, then LRU-trim small ones.
         for k in list(self._loaded.keys()):
             if k in self._BIG_MODELS:
                 self._loaded.pop(k, None)
+                self._last_used.pop(k, None)
 
         while len(self._loaded) >= self._MAX_SMALL_LOADED:
-            self._loaded.popitem(last=False)  # evict LRU (oldest)
+            k, _ = self._loaded.popitem(last=False)  # evict LRU (oldest)
+            self._last_used.pop(k, None)
 
     def chat(
         self,
@@ -425,16 +456,33 @@ class MLXBackend(LLMBackend):
         options: ChatOptions | None = None,
         keep_alive: str | int = -1,
         format: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> Any:
         from ollama._types import ChatResponse, Message  # type: ignore[import-not-found]
 
         opts = options or ChatOptions()
         mlx_model, tokenizer = self._load(model)
-        prompt = self._apply_chat_template(tokenizer, messages, format=format)
+        prompt = self._apply_chat_template(
+            tokenizer, messages, format=format, tools=tools,
+        )
         text = self._mlx_generate(mlx_model, tokenizer, prompt, opts)
+        self._bump_last_used(model)
+        tool_calls = self._parse_tool_calls(text) if tools else None
         if format == "json":
             text = self._extract_json(text)
+        if tool_calls:
+            content = self._strip_tool_call_blocks(text)
+            return ChatResponse(
+                model=to_ollama(model),
+                message=Message(
+                    role="assistant",
+                    content=content,
+                    tool_calls=tool_calls,
+                ),
+                done=True,
+                done_reason="stop",
+            )
         return ChatResponse(
             model=to_ollama(model),
             message=Message(role="assistant", content=text),
@@ -499,6 +547,7 @@ class MLXBackend(LLMBackend):
         opts = options or ChatOptions()
         mlx_model, tokenizer = self._load(model)
         text = self._mlx_generate(mlx_model, tokenizer, prompt, opts)
+        self._bump_last_used(model)
         return GenerateResponse(
             model=to_ollama(model),
             response=text,
@@ -511,8 +560,14 @@ class MLXBackend(LLMBackend):
         tokenizer: Any,
         messages: list[dict[str, str]],
         format: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
     ) -> str:
-        """Apply tokenizer's chat template; nudge JSON mode in system msg."""
+        """Apply tokenizer's chat template; nudge JSON mode in system msg.
+
+        When `tools` is non-empty, passes them to the chat template so
+        Qwen2.5/Qwen3 models inject the `<tools>...</tools>` system block
+        and emit `<tool_call>{...}</tool_call>` for tool invocations.
+        """
         msgs = list(messages)
         if format == "json":
             # Best-effort JSON mode for models without native grammar.
@@ -529,9 +584,79 @@ class MLXBackend(LLMBackend):
             else:
                 msgs = [{"role": "system", "content": extra}, *msgs]
 
-        return tokenizer.apply_chat_template(
-            msgs, add_generation_prompt=True, tokenize=False
+        kwargs: dict[str, Any] = dict(add_generation_prompt=True, tokenize=False)
+        if tools:
+            kwargs["tools"] = tools
+        return tokenizer.apply_chat_template(msgs, **kwargs)
+
+    @staticmethod
+    def _parse_tool_calls(text: str) -> list[Any] | None:
+        """Parse Qwen `<tool_call>{...}</tool_call>` blocks → ollama-shape list.
+
+        Each block contains a JSON object `{"name": "...", "arguments": {...}}`.
+        Returns None when no parseable tool calls are found (caller treats
+        the response as plain text).
+
+        Robust to:
+        - Multiple `<tool_call>` blocks in one response.
+        - Whitespace + newlines around the JSON.
+        - JSON with trailing commas / single quotes (best-effort repair).
+        """
+        import json
+        import re
+
+        from ollama._types import Message  # type: ignore[import-not-found]
+
+        if not text or "<tool_call>" not in text:
+            return None
+
+        pattern = re.compile(
+            r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL,
         )
+        out: list[Any] = []
+        for m in pattern.finditer(text):
+            raw = m.group(1).strip()
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError:
+                # Best-effort: replace single quotes, drop trailing commas
+                cleaned = raw.replace("'", '"')
+                cleaned = re.sub(r",(\s*[}\]])", r"\1", cleaned)
+                try:
+                    obj = json.loads(cleaned)
+                except json.JSONDecodeError:
+                    continue
+            name = obj.get("name")
+            args = obj.get("arguments") or obj.get("args") or {}
+            if not name or not isinstance(name, str):
+                continue
+            if not isinstance(args, dict):
+                # Some models emit JSON-string args; try to parse
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        args = {"_raw": args}
+                else:
+                    args = {"_raw": str(args)}
+            out.append(
+                Message.ToolCall(
+                    function=Message.ToolCall.Function(name=name, arguments=args)
+                )
+            )
+        return out or None
+
+    @staticmethod
+    def _strip_tool_call_blocks(text: str) -> str | None:
+        """Remove `<tool_call>...</tool_call>` markers from `text`. Returns
+        None when only whitespace remains (so the response carries no
+        prose alongside the tool call)."""
+        import re
+
+        stripped = re.sub(
+            r"<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL,
+        ).strip()
+        return stripped or None
 
     @staticmethod
     def _mlx_generate(model: Any, tokenizer: Any, prompt: str, opts: ChatOptions) -> str:

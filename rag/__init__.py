@@ -1704,6 +1704,22 @@ _IMPRESSION_THROTTLE_SECS = 30
 _impression_last_seen: dict[tuple[str, str], float] = {}
 _impression_lock = threading.Lock()
 
+# Bot-initiated retrieves: NO loggear como impressions porque NO son señal
+# de atención humana. Si las contamos en el denominador del CTR Laplace,
+# inflamos el denominador sin clicks correspondientes → deflate CTR de
+# paths legítimos. Audit 2026-05-05: 277.885/297.297 (94%) de las
+# impressions venían de `source=followup` automático cada 30min × top-K
+# candidates. Fix: skip write side. Lectores siguen pudiendo ver el
+# resto del rag_behavior si el daemon hizo open/click real (esos sí
+# loggean events distintos).
+_BOT_INITIATED_SOURCES = frozenset({
+    "followup",
+    "anticipate-echo",
+    "anticipate-calendar",
+    "anticipate-commitment",
+    "eval",
+})
+
 
 def log_impressions(
     query: str,
@@ -1727,6 +1743,10 @@ def log_impressions(
     returns past the top-5 impressions and the rag_behavior row count is the
     scarce resource (nightly tune reads every event since the cache key).
 
+    Bot-initiated sources (`followup`, `anticipate-*`, `eval`) NO loggean —
+    son retrieves automáticos, no impressions del user. Ver
+    ``_BOT_INITIATED_SOURCES``.
+
     Kill-switch: ``RAG_SKIP_BEHAVIOR_LOG=1`` early-returns. Ver
     ``_telemetry_writes_disabled()``. Lo usa ``rag eval`` para no contaminar
     ``rag_behavior`` con queries del eval set.
@@ -1734,6 +1754,8 @@ def log_impressions(
     if not query or not paths:
         return
     if _telemetry_writes_disabled():
+        return
+    if source in _BOT_INITIATED_SOURCES:
         return
     top1 = paths[0]
     key = (query, top1)
@@ -3356,7 +3378,8 @@ def resolve_chat_model() -> str:
     global _CHAT_MODEL_RESOLVED
     if _CHAT_MODEL_RESOLVED is not None:
         return _CHAT_MODEL_RESOLVED
-    backend = os.environ.get("RAG_LLM_BACKEND", "mlx").lower()
+    from rag.llm_backend import get_backend
+    backend = get_backend().name  # singleton — 1 lookup al startup, luego cached
     if backend == "mlx":
         try:
             from rag.llm_backend import MLX_MODEL_ALIAS, MLXBackend  # local import
@@ -3880,8 +3903,9 @@ class _TimedOllamaProxy:
         # and fall through to Ollama — MLX backend has no native tool
         # format and `chat()` here doesn't yield. Streaming sites must
         # use `_chat_stream_dispatch()` instead of this proxy.
+        from rag.llm_backend import get_backend
         if (
-            os.environ.get("RAG_LLM_BACKEND", "mlx").lower() == "mlx"
+            get_backend().name == "mlx"
             and not kwargs.get("tools")
             and not kwargs.get("stream")
         ):
@@ -3926,6 +3950,7 @@ def _mlx_chat_via_backend(**kwargs):
         options=opts,
         keep_alive=kwargs.get("keep_alive", -1),
         format=kwargs.get("format"),
+        tools=kwargs.get("tools"),
     )
 
 
@@ -3938,8 +3963,9 @@ def _mlx_or_ollama_chat(**kwargs):
     """
     if ollama.chat is not _ORIGINAL_OLLAMA_CHAT:
         return ollama.chat(**kwargs)
+    from rag.llm_backend import get_backend
     if (
-        os.environ.get("RAG_LLM_BACKEND", "mlx").lower() == "mlx"
+        get_backend().name == "mlx"
         and not kwargs.get("tools")
         and not kwargs.get("stream")
     ):
@@ -3965,11 +3991,11 @@ def _chat_stream_dispatch(**kwargs):
     if ollama.chat is not _ORIGINAL_OLLAMA_CHAT:
         # Monkey-patched (test): use module symbol so mock intercepts.
         return ollama.chat(stream=True, **kwargs)
+    from rag.llm_backend import ChatOptions, get_backend
     if (
-        os.environ.get("RAG_LLM_BACKEND", "mlx").lower() == "mlx"
+        get_backend().name == "mlx"
         and not kwargs.get("tools")
     ):
-        from rag.llm_backend import ChatOptions, get_backend
 
         options_dict = kwargs.get("options") or {}
         if hasattr(options_dict, "model_dump"):
@@ -12685,8 +12711,29 @@ _LLM_TYPO_CACHE_MAX = 256
 _llm_typo_cache: OrderedDict[str, str] = OrderedDict()
 _llm_typo_cache_lock = threading.Lock()
 
-_TYPO_CORRECTION_ENABLED = os.environ.get(
-    "RAG_TYPO_CORRECTION", "1"
+def _resolve_typo_correction_default() -> str:
+    """Default OFF bajo MLX backend hasta fixear el prompt.
+
+    Bug detectado 2026-05-05: MLX qwen2.5:3b parafrasea agresivamente:
+      'charla con maria' → 'chatea con maría'  (sustantivo → verbo)
+      'fantastical api'  → 'fantastic api'     (proper noun → adjetivo)
+      'reunión con max'  → 'reunióon con max'  (introduce typo)
+
+    Drop de singles retrieval del 54.72% (Ollama) a 5.66% (MLX) cuando
+    typo corrector activo. Ollama qwen2.5:3b conserva la query mucho
+    mejor con el mismo prompt — diferencia de sampling MLX vs HTTP API.
+
+    Hasta que el prompt sea robusto para MLX, default OFF cuando
+    RAG_LLM_BACKEND=mlx. El user puede forzar ON con
+    `RAG_TYPO_CORRECTION=1`.
+    """
+    explicit = os.environ.get("RAG_TYPO_CORRECTION")
+    if explicit is not None:
+        return explicit
+    backend = os.environ.get("RAG_LLM_BACKEND", "mlx").strip().lower()
+    return "0" if backend == "mlx" else "1"
+
+_TYPO_CORRECTION_ENABLED = _resolve_typo_correction_default(
 ).strip().lower() not in ("0", "false", "no")
 
 # ContextVar thread-safe que `_correct_typos_llm` populates con el delta de
@@ -14979,10 +15026,10 @@ def _handle_memory_pressure(pct_before: float, threshold: float) -> dict:
         # → death spiral). Para MLX, llamamos `MLXBackend.unload()` que
         # pop-ea el modelo de `_loaded` + `mx.clear_cache()`. Bajo Ollama
         # mantenemos el path histórico (cliente con timeout corto).
-        _backend_choice = os.environ.get("RAG_LLM_BACKEND", "mlx").strip().lower()
+        from rag.llm_backend import get_backend
+        _backend_choice = get_backend().name  # singleton — no env lookup en hot path
         if _backend_choice == "mlx":
             try:
-                from rag.llm_backend import get_backend
                 _backend = get_backend()
                 if _backend.unload(chat_model):
                     actions["chat_unloaded"] = True

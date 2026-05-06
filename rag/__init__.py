@@ -3904,15 +3904,15 @@ class _TimedOllamaProxy:
         # semantics still apply (timeout is moot for MLX in-process,
         # but the helper semaphore still throttles concurrent calls).
         # Ollama default keeps the original Client(timeout=...) path.
-        # NOTE: tool-calling (`tools=[...]`) and stream=True bypass MLX
-        # and fall through to Ollama — MLX backend has no native tool
-        # format and `chat()` here doesn't yield. Streaming sites must
-        # use `_chat_stream_dispatch()` instead of this proxy.
+        # NOTE: stream=True bypasses MLX here and falls through to Ollama
+        # — `chat()` does not yield. Streaming sites must use
+        # `_chat_stream_dispatch()` instead of this proxy.
+        # Tool-calling (`tools=[...]`) is now native via Qwen `<tool_call>`
+        # parser in `rag.mlx_tool_calls` (Ola 5, 2026-05-06).
         from rag.llm_backend import get_backend
         _be_name = get_backend().name  # singleton — no env lookup per-call
         if (
             _be_name == "mlx"
-            and not kwargs.get("tools")
             and not kwargs.get("stream")
         ):
             _mark_backend("mlx")
@@ -3920,10 +3920,8 @@ class _TimedOllamaProxy:
                 with self._semaphore:
                     return _mlx_chat_via_backend(**kwargs)
             return _mlx_chat_via_backend(**kwargs)
-        # Ollama path: fallback tools/stream bajo MLX, o backend nativo Ollama
-        _fallback = None
-        if _be_name == "mlx":
-            _fallback = "tools" if kwargs.get("tools") else "stream"
+        # Ollama path: fallback stream bajo MLX, o backend nativo Ollama
+        _fallback = "stream" if _be_name == "mlx" else None
         _mark_backend("ollama", fallback_reason=_fallback)
         if self._client is None:
             self._client = ollama.Client(timeout=self._timeout)
@@ -3936,9 +3934,10 @@ class _TimedOllamaProxy:
 def _mlx_chat_via_backend(**kwargs):
     """Route an ollama-shape `chat(**kwargs)` call through the MLX backend.
 
-    Translates ollama's `options` dict into `ChatOptions`, drops
-    ollama-only kwargs (`tools`, `think`, `logprobs`, `top_logprobs`,
-    `stream` — for MLX `stream=True` collapses to non-streaming).
+    Translates ollama's `options` dict into `ChatOptions`, propagates
+    `tools=[...]` to the Qwen chat template (Ola 5), drops other
+    ollama-only kwargs (`think`, `logprobs`, `top_logprobs`, `stream`
+    — for MLX `stream=True` collapses to non-streaming).
     Preserves `keep_alive` and `format` semantics.
     """
     # Telemetry: marca el backend efectivo. Cuando se llega desde
@@ -3966,6 +3965,7 @@ def _mlx_chat_via_backend(**kwargs):
         options=opts,
         keep_alive=kwargs.get("keep_alive", -1),
         format=kwargs.get("format"),
+        tools=kwargs.get("tools"),
     )
 
 
@@ -3974,7 +3974,8 @@ def _mlx_or_ollama_chat(**kwargs):
     but exported for callers fuera de `rag/__init__.py` (ej. `web/server.py`)
     que necesitan rutear via MLXBackend cuando `RAG_LLM_BACKEND=mlx`.
 
-    Bajo `tools=[...]` o `stream=True` cae a Ollama (MLX no los soporta).
+    Bajo `stream=True` cae a Ollama (MLX no soporta non-streaming yield).
+    Tool-calling (`tools=[...]`) es nativo via `rag.mlx_tool_calls` (Ola 5).
     """
     if ollama.chat is not _ORIGINAL_OLLAMA_CHAT:
         return ollama.chat(**kwargs)
@@ -3982,14 +3983,11 @@ def _mlx_or_ollama_chat(**kwargs):
     _be_name = get_backend().name  # singleton
     if (
         _be_name == "mlx"
-        and not kwargs.get("tools")
         and not kwargs.get("stream")
     ):
         _mark_backend("mlx")
         return _mlx_chat_via_backend(**kwargs)
-    _fallback = None
-    if _be_name == "mlx":
-        _fallback = "tools" if kwargs.get("tools") else "stream"
+    _fallback = "stream" if _be_name == "mlx" else None
     _mark_backend("ollama", fallback_reason=_fallback)
     return ollama.chat(**kwargs)
 

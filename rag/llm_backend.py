@@ -40,17 +40,24 @@ resolve between them via `MLX_MODEL_ALIAS` table.
 
 ## What MLX does NOT support (vs Ollama)
 
-- `tools=[...]` (tool-calling): kwarg is dropped by `_mlx_chat_via_backend`.
-  Call sites that need tool-calling JSON schema still go via Ollama or need
-  a custom Qwen3 parser (Ola 2 work).
 - `keep_alive=0` (model unload trick): ignored silently — no-op.
 - Grammar-constrained JSON decode: `format='json'` uses system-prompt nudge
   + `_extract_json()` post-gen instead.
 
-## TODO (Ola 2 remaining + Ola 3+)
+## Tool-calling
+
+`tools=[...]` is propagated to `tokenizer.apply_chat_template(tools=...)`
+which Qwen2.5-Instruct and Qwen3-Instruct templates support natively. The
+model emits `<tool_call>{...}</tool_call>` blocks; `parse_tool_calls()`
+in `rag.mlx_tool_calls` extracts them into ollama-shape `Message.ToolCall`
+objects. If the tokenizer template doesn't accept `tools=` (older format),
+the call falls through to a no-tools template — caller can detect the
+absence of `tool_calls` in the response and Ollama-fallback.
+
+## TODO
 
 - [ ] Migrate 14 raw `ollama.chat(stream=True, ...)` call sites to `get_backend().chat_stream(...)`
-- [ ] Tool-calling format adapter (Qwen3 `<tool_call>` JSON schema)
+- [x] Tool-calling format adapter (Qwen `<tool_call>` JSON schema) — done 2026-05-06
 - [x] Idle-unload watchdog thread (RAG_MLX_IDLE_TTL enforcement) — done 2026-05-05
 - [ ] Bench harness wiring (benchmarks/bench_mlx_vs_ollama.py)
 """
@@ -565,20 +572,37 @@ class MLXBackend(LLMBackend):
         options: ChatOptions | None = None,
         keep_alive: str | int = -1,
         format: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> Any:
         from ollama._types import ChatResponse, Message  # type: ignore[import-not-found]
 
         opts = options or ChatOptions()
         mlx_model, tokenizer = self._load(model)
-        prompt = self._apply_chat_template(tokenizer, messages, format=format)
+        prompt = self._apply_chat_template(
+            tokenizer, messages, format=format, tools=tools,
+        )
         text = self._mlx_generate(mlx_model, tokenizer, prompt, opts)
         self._bump_last_used(model)
-        if format == "json":
-            text = self._extract_json(text)
+
+        tool_calls = None
+        content = text
+        if tools:
+            from rag.mlx_tool_calls import parse_tool_calls, strip_tool_call_blocks
+
+            tool_calls = parse_tool_calls(text)
+            if tool_calls:
+                content = strip_tool_call_blocks(text)
+
+        if format == "json" and not tool_calls:
+            content = self._extract_json(content if content is not None else text)
+
+        msg_kwargs: dict[str, Any] = {"role": "assistant", "content": content or ""}
+        if tool_calls:
+            msg_kwargs["tool_calls"] = tool_calls
         return ChatResponse(
             model=to_ollama(model),
-            message=Message(role="assistant", content=text),
+            message=Message(**msg_kwargs),
             done=True,
             done_reason="stop",
         )
@@ -653,12 +677,19 @@ class MLXBackend(LLMBackend):
         tokenizer: Any,
         messages: list[dict[str, str]],
         format: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
     ) -> str:
-        """Apply tokenizer's chat template; nudge JSON mode in system msg."""
+        """Apply tokenizer's chat template; nudge JSON mode in system msg.
+
+        When `tools` is non-empty, propagated to `apply_chat_template(tools=...)`
+        — Qwen2.5/3 chat templates render the schema and instruct the model to
+        emit `<tool_call>{...}</tool_call>` blocks. If the tokenizer's template
+        rejects the kwarg (older HF tokenizer or stripped chat_template), fall
+        back to the no-tools render — caller will see no `tool_calls` in the
+        response and can route accordingly.
+        """
         msgs = list(messages)
         if format == "json":
-            # Best-effort JSON mode for models without native grammar.
-            # Prepend a strong instruction; parser does repair downstream.
             extra = (
                 "Respond with ONLY a single valid JSON object. "
                 "No prose, no markdown fences, no commentary."
@@ -670,6 +701,20 @@ class MLXBackend(LLMBackend):
                 }
             else:
                 msgs = [{"role": "system", "content": extra}, *msgs]
+
+        if tools:
+            try:
+                return tokenizer.apply_chat_template(
+                    msgs,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                    tools=tools,
+                )
+            except (TypeError, ValueError):
+                # Tokenizer template doesn't accept `tools=` — render without
+                # the schema. The caller's `parse_tool_calls()` will return
+                # None and the response degrades gracefully to plain text.
+                pass
 
         return tokenizer.apply_chat_template(
             msgs, add_generation_prompt=True, tokenize=False

@@ -14423,15 +14423,34 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 # the streaming one: non-streaming + `tools=` schema of
                 # all 12 chat tools can push qwen2.5:7b > 45s on long
                 # inputs. See `_OLLAMA_TOOL_CLIENT` comment above.
-                _tr = _OLLAMA_TOOL_CLIENT.chat(
-                    model=_web_model,
-                    messages=tool_messages,
-                    tools=_round_tools,
-                    options=CHAT_TOOL_OPTIONS,
-                    stream=False,
-                    think=False,   # see _ollama_chat_probe for rationale
-                    keep_alive=chat_keep_alive(_web_model),
-                )
+                #
+                # Backend dispatch (Ola 5, 2026-05-06): under MLX we route
+                # via `_mlx_chat_via_backend` which propagates `tools=` to
+                # `tokenizer.apply_chat_template(tools=...)` and parses
+                # `<tool_call>` blocks via `rag.mlx_tool_calls`. The 90s
+                # HTTP timeout doesn't apply (in-process). Ollama branch
+                # keeps the dedicated client so a stuck daemon can't hang
+                # the chat for 2+ min.
+                from rag.llm_backend import get_backend as _get_backend
+                if _get_backend().name == "mlx":
+                    from rag import _mlx_chat_via_backend
+                    _tr = _mlx_chat_via_backend(
+                        model=_web_model,
+                        messages=tool_messages,
+                        tools=_round_tools,
+                        options=CHAT_TOOL_OPTIONS,
+                        keep_alive=chat_keep_alive(_web_model),
+                    )
+                else:
+                    _tr = _OLLAMA_TOOL_CLIENT.chat(
+                        model=_web_model,
+                        messages=tool_messages,
+                        tools=_round_tools,
+                        options=CHAT_TOOL_OPTIONS,
+                        stream=False,
+                        think=False,   # see _ollama_chat_probe for rationale
+                        keep_alive=chat_keep_alive(_web_model),
+                    )
                 _tmsg = _tr.message
                 _tcalls = list(_tmsg.tool_calls or [])
                 if not _tcalls:

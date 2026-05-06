@@ -787,7 +787,7 @@ def _write_secret_file(path: Path, content: str) -> None:
 
 _STATE_DIR = _ensure_state_dir_secure()
 
-DB_PATH = Path.home() / ".local/share/obsidian-rag/ragvec"
+DB_PATH = Path(os.environ.get("OBSIDIAN_RAG_DB_PATH") or str(Path.home() / ".local/share/obsidian-rag/ragvec"))
 # Telemetry DB file — intentionally separate from ragvec.db (sqlite-vec + meta_*).
 # Pre-2026-04-21 both workloads shared one file + one WAL; bulk writes from the
 # indexer (`rag index`, `watch`, cross-source ingesters) were blocking hot-path
@@ -822,7 +822,7 @@ COLLECTION_RESET_SENTINEL = Path.home() / ".local/share/obsidian-rag/collection_
 # starved for any Ollama-backed call (semantic + LLM both queued behind
 # the indices). With this lock, the second `rag index` aborts in <1s
 # with `Otro rag index activo`, and the chat keeps flowing.
-INDEX_PROCESS_LOCK = Path.home() / ".local/share/obsidian-rag/index.lock"
+INDEX_PROCESS_LOCK = DB_PATH / "index.lock"  # A/B 2026-05-06: per-DB lock
 # Sink for exceptions that used to be `except Exception: pass`. See
 # `_silent_log()` below — only called from sites where a silent failure
 # could mask a real bug (corrupt cache, data-loss adjacent, reranker
@@ -2343,7 +2343,7 @@ def cleanup_sessions(ttl_days: int = SESSION_TTL_DAYS) -> int:
     return removed
 
 
-EMBED_MODEL = "qwen3-embedding:0.6b"  # multilingual (ES/EN), 1024-dim
+EMBED_MODEL = "Qwen/Qwen3-Embedding-4B"  # A/B 2026-05-06: 4B challenger (2560-dim)
 # Chat model preference: first available wins.
 # Orden tras bench 2026-04-18 (ver scripts/bench_chat.py, 5 queries × 2 runs
 # warm sobre vault work, rerank_pool default, num_ctx=4096):
@@ -2361,7 +2361,7 @@ CHAT_MODEL_PREFERENCE = (
 )
 HELPER_MODEL = "qwen2.5:3b"      # fast, for internal rewrites (multi-query, HyDE, reformulate)
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"  # cross-encoder, multilingual, MPS-friendly
-_COLLECTION_BASE = "obsidian_notes_v11"  # v11: removed temporal tokens (A/B 2026-04-20: 0 impact on hit@5 / MRR vs v9, so reverted the 2026-04-20 wire of dead temporal_token())
+_COLLECTION_BASE = "obsidian_notes_v12_q4b"  # A/B 2026-05-06: paralelo a v11, embedder Qwen3-Embedding-4B
 
 # ── Cross-source corpus (Phase 1, 2026-04-20 user decisions §10) ──────────
 # The collection stays at v11 (no rename / no re-embed) — source discrimination
@@ -12128,7 +12128,7 @@ def _get_local_embedder():
             # "Qwen/Qwen3-Embedding-0.6B". Passing the ollama name makes
             # sentence_transformers hit the hub HEAD endpoint and fail
             # offline.
-            _local_embedder = SentenceTransformer("Qwen/Qwen3-Embedding-0.6B", device=_dev)
+            _local_embedder = SentenceTransformer(EMBED_MODEL, device=_dev)
             # MPS cache cleanup wrapper — mismo patrón que get_reranker()
             # / get_nli_model(). El bge-m3 local hace `encode()` (no
             # `predict()`), pero el comportamiento de MPS es idéntico:

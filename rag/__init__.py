@@ -12723,6 +12723,37 @@ _LLM_TYPO_CACHE_MAX = 256
 _llm_typo_cache: OrderedDict[str, str] = OrderedDict()
 _llm_typo_cache_lock = threading.Lock()
 
+# Token-set Jaccard floor para aceptar la corrección. <0.7 = parafraseo
+# (sustantivo→verbo, lengua, sinónimo) en lugar de typo fix. Empíricamente,
+# typo fixes legítimos (acento añadido, letra swap, capitalización) caen
+# cerca de 1.0 tras normalizar accents; paraphrases caen <=0.5. Override:
+# RAG_TYPO_JACCARD_MIN.
+_TYPO_JACCARD_MIN = float(os.environ.get("RAG_TYPO_JACCARD_MIN", "0.7"))
+
+
+def _typo_correction_token_jaccard(a: str, b: str) -> float:
+    """Token-set Jaccard con accents-stripped + lowercase.
+
+    Diseñado para distinguir typo fix (jaccard alto modulo accents) de
+    paraphrase / language drift (jaccard <=0.5). Tokenización por
+    whitespace — suficiente para queries cortas (4-8 tokens) que es
+    donde corre el typo corrector.
+    """
+    def _norm(s: str) -> set[str]:
+        normalised = unicodedata.normalize("NFKD", s.lower())
+        normalised = "".join(c for c in normalised if not unicodedata.combining(c))
+        return {tok for tok in normalised.split() if tok}
+
+    ta = _norm(a)
+    tb = _norm(b)
+    if not ta or not tb:
+        return 1.0
+    union = ta | tb
+    if not union:
+        return 1.0
+    return len(ta & tb) / len(union)
+
+
 def _resolve_typo_correction_default() -> str:
     """Default OFF bajo MLX backend hasta fixear el prompt.
 
@@ -12905,6 +12936,20 @@ def _correct_typos_llm(query: str) -> str:
             corrected = corrected[1:-1].strip()
         # Sanity check: LLM went off-topic if output is > 1.5× original length
         if not corrected or len(corrected) > 1.5 * len(query):
+            corrected = query
+        # Sanity check: token-set Jaccard (solo multi-token). Bug 2026-05-05
+        # MLX qwen2.5:3b parafrasea (sustantivo→verbo, ES→PT, sinónimos):
+        # 'charla con juan'→'chatea con juan', 'whatsapp con mama'→'whatsapp
+        # com mama'. El length cap no las atrapa. Jaccard accent-insensitive
+        # deja pasar accent fixes ('reunion'→'reunión': jaccard=1.0) y
+        # rechaza paraphrases (jaccard<=0.5). 1-token queries ('asor'→
+        # 'Astor') saltan este check porque jaccard sería 0 incluso para
+        # typo fixes válidos — ahí solo rige el length cap (1.5×).
+        if (
+            corrected != query
+            and len(query.split()) >= 2
+            and _typo_correction_token_jaccard(query, corrected) < _TYPO_JACCARD_MIN
+        ):
             corrected = query
     except Exception:
         corrected = query
@@ -19696,6 +19741,8 @@ def find_contradictions(
         raw = resp.message.content.strip()
     except Exception:
         return []
+    from rag.llm_backend import strip_think_blocks
+    raw = strip_think_blocks(raw)
     m = re.search(r"\{.*\}", raw, re.DOTALL)
     if not m:
         return []
@@ -24146,6 +24193,8 @@ def find_contradictions_for_note(
         # unparseable JSON" — the latter is the json.loads branch below.
         _silent_log("contradict_helper_chat", exc)
         return []
+    from rag.llm_backend import strip_think_blocks
+    helper_raw = strip_think_blocks(helper_raw)
     m = re.search(r"\{.*\}", helper_raw, re.DOTALL)
     if not m:
         return []
@@ -49463,6 +49512,8 @@ def _followup_judge(loop_text: str, candidate_snippet: str) -> tuple[bool, str]:
         raw = resp.message.content.strip()
     except Exception:
         return False, ""
+    from rag.llm_backend import strip_think_blocks
+    raw = strip_think_blocks(raw)
     m = re.search(r"\{.*\}", raw, re.DOTALL)
     if not m:
         return False, ""

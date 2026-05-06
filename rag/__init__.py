@@ -1718,6 +1718,18 @@ _IMPRESSION_THROTTLE_SECS = 30
 _impression_last_seen: dict[tuple[str, str], float] = {}
 _impression_lock = threading.Lock()
 
+# Sources de retrieves bot-initiated que NO representan intent del user. Sus
+# impressions inflarían el denominador del CTR Laplace deflactando paths
+# legítimos. Audit 2026-05-06: 277.885/297.297 rows (94%) eran source=followup.
+# El resto (anticipate-*, eval) son retrieves automáticos sin click humano.
+_BOT_INITIATED_SOURCES = frozenset({
+    "followup",
+    "anticipate-echo",
+    "anticipate-calendar",
+    "anticipate-commitment",
+    "eval",
+})
+
 
 def log_impressions(
     query: str,
@@ -1748,6 +1760,8 @@ def log_impressions(
     if not query or not paths:
         return
     if _telemetry_writes_disabled():
+        return
+    if source in _BOT_INITIATED_SOURCES:
         return
     top1 = paths[0]
     key = (query, top1)

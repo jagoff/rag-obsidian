@@ -805,7 +805,7 @@ EVAL_LOG_PATH = Path.home() / ".local/share/obsidian-rag/eval.jsonl"
 BEHAVIOR_LOG_PATH = Path.home() / ".local/share/obsidian-rag/behavior.jsonl"
 BRIEF_WRITTEN_PATH = Path.home() / ".local/share/obsidian-rag/brief_written.jsonl"
 BRIEF_STATE_PATH = Path.home() / ".local/share/obsidian-rag/brief_state.jsonl"
-COLLECTION_WRITE_LOCK = Path.home() / ".local/share/obsidian-rag/collection_write.lock"
+COLLECTION_WRITE_LOCK = DB_PATH / "collection_write.lock"  # A/B 2026-05-06: per-DB
 COLLECTION_OPS_LOG = Path.home() / ".local/share/obsidian-rag/collection_ops.log"
 COLLECTION_RESET_SENTINEL = Path.home() / ".local/share/obsidian-rag/collection_reset_at"
 # Process-level mutex acquired at the top of `rag index` (CLI entry, line
@@ -19325,7 +19325,7 @@ def _personalized_folder_vote(
 # ── FILING apply + undo ──────────────────────────────────────────────────────
 
 FILING_BATCHES_DIR = Path.home() / ".local/share/obsidian-rag/filing_batches"
-VAULT_WRITE_LOCK_PATH = Path.home() / ".local/share/obsidian-rag/.write.lock"
+VAULT_WRITE_LOCK_PATH = DB_PATH / ".write.lock"  # A/B 2026-05-06: per-DB
 
 
 @contextlib.contextmanager

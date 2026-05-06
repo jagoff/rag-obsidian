@@ -28,21 +28,24 @@ Python 3.13, `uv`. Runtime venv: `.venv/bin/python`. Global tool: `~/.local/shar
 | Cómo funciona end-to-end | [`docs/como-funciona.md`](docs/como-funciona.md) |
 | Recovery + problemas | [`docs/recovery.md`](docs/recovery.md), [`docs/problemas-comunes.md`](docs/problemas-comunes.md) |
 
-## MLX migration (Ola 3 cutover — 2026-05-05)
+## MLX migration (Ola 5 hard-cutover — 2026-05-06)
 
-Default `RAG_LLM_BACKEND=mlx`. Detalle completo en [`docs/mlx-migration.md`](docs/mlx-migration.md).
+**Estado actual: 100% MLX, sin fallback Ollama disponible.** Modelos chat Ollama purgados del disco (decisión user 2026-05-06). Default `RAG_LLM_BACKEND=mlx`. Detalle completo en [`docs/mlx-migration.md`](docs/mlx-migration.md).
 
 **Mapping**:
 - `qwen2.5:3b` (HELPER) → [`mlx-community/Qwen2.5-3B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-3B-Instruct-4bit)
 - `qwen2.5:7b` (CHAT default) → [`mlx-community/Qwen2.5-7B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-7B-Instruct-4bit)
 - `command-r` / `qwen2.5:14b` (HQ tier) → [`mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit`](https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit)
-- experimental → [`mlx-community/Qwen3-4B-Instruct-2507-4bit`](https://huggingface.co/mlx-community/Qwen3-4B-Instruct-2507-4bit)
 
-Switch runtime: `RAG_LLM_BACKEND={ollama,mlx}`. Rollback: export `=ollama` o agregar al plist; sin cambios de código. **Idle-unload watchdog** ([`rag/llm_backend.py`](rag/llm_backend.py)): evicta modelos con `now - last_used > RAG_MLX_IDLE_TTL` (default 1800s). Disable: `RAG_MLX_IDLE_TTL=0` o `RAG_MLX_IDLE_DISABLE=1`.
+`qwen3-embedding:0.6b` sigue corriendo via Ollama (embedder activo, NO migrado a MLX). Es el único modelo Ollama que queda en disco.
 
-**Fallbacks silenciosos bajo MLX**: tool-calling (no formato nativo) → fallback Ollama. `ollama.generate(keep_alive=0)` unloads → fallback Ollama.
+**Tool-calling**: nativo MLX via [`rag/mlx_tool_calls.py`](rag/mlx_tool_calls.py) (Ola 5, commit `82d27d5`). Parser Qwen `<tool_call>{...}</tool_call>` → `Message.ToolCall` ollama-shape. Wireado en [`rag/llm_backend.py:591`](rag/llm_backend.py).
 
-**Tests**: `tests/conftest.py` autouse fixture `_force_ollama_backend_for_tests` fuerza `RAG_LLM_BACKEND=ollama` por test. Marker `requires_mlx` registrado.
+**Rollback emergencia**: requiere re-pull de los 3 modelos chat (`ollama pull qwen2.5:3b qwen2.5:7b qwen3:30b-a3b`, ~24 GB) ANTES de exportar `RAG_LLM_BACKEND=ollama`. Sin eso, el rollback falla con `model 'X' not found`.
+
+**Idle-unload watchdog** ([`rag/llm_backend.py`](rag/llm_backend.py)): evicta modelos con `now - last_used > RAG_MLX_IDLE_TTL` (default 1800s). Disable: `RAG_MLX_IDLE_TTL=0` o `RAG_MLX_IDLE_DISABLE=1`.
+
+**Tests**: `tests/conftest.py` autouse fixture `_force_ollama_backend_for_tests` fuerza `RAG_LLM_BACKEND=ollama` por test. Marker `requires_mlx` registrado. Como Ollama-chat no está en disco, los tests que asumen el backend fake-Ollama deben monkeypatchear `ollama.chat` directamente, no apuntar a un daemon real.
 
 **Embeddings (bge-m3) NO entran en este scope**.
 

@@ -536,6 +536,109 @@ _IBERIAN_LEAK_REPLACEMENTS: tuple[tuple[str, str], ...] = (
     # de lo contrario `[A-Z]` matchea minúsculas también por la flag
     # global del compile loop.
     (r"\bsobre\s+a\s+(?=(?-i:[A-Z]))", "sobre la "),
+
+    # ──────────────────────────────────────────────────────────────────
+    # 2026-05-05 — Voseo-grammar normalization (es-grammar, NO pt-leak)
+    # ──────────────────────────────────────────────────────────────────
+    #
+    # El LLM mezcla `vos` (rioplatense) con conjugación 3sg en vez de
+    # voseo. Caso real del bug del 2026-05-05:
+    #
+    #   "...lo que vos está procurando..."   ← debería ser "vos estás"
+    #
+    # Regla del voseo rioplatense (sintetizada):
+    # - 1ª conjugación (-ar): `vos hablás` (NO `vos habla`)
+    # - 2ª conjugación (-er): `vos comés`  (NO `vos come`)
+    # - 3ª conjugación (-ir): `vos vivís`  (NO `vos vive`)
+    # - Irregulares: `vos sos` (ser), `vos vas` (ir), `vos ves` (ver),
+    #   `vos das` (dar), `vos estás` (estar), `vos has` (haber).
+    #
+    # Estrategia: cubrir los verbos de mayor frecuencia uno-a-uno con
+    # regla explícita. Cubrir todos los regulares sería N+ patrones —
+    # innecesario; los regulares NO suelen aparecer en este tipo de
+    # leak porque el LLM los conjuga bien (problema es con irregulares
+    # + algunos high-frequency).
+    #
+    # Caso edge importante: NO matchear `vos estás` ni `vos tenés` etc.
+    # ya correctos. Eso lo asegura el `\b` después del verbo: `vos
+    # está` (sin `s`) matchea, `vos estás` no.
+    #
+    # IRREGULARES (high frequency)
+    (r"\bvos\s+está\b", "vos estás"),                  # estar → estás
+    (r"\bvos\s+es\b(?!\s+que)", "vos sos"),            # ser → sos (excl. "es que" relator)
+    (r"\bvos\s+tiene\b", "vos tenés"),                 # tener → tenés
+    (r"\bvos\s+puede\b", "vos podés"),                 # poder → podés
+    (r"\bvos\s+hace\b", "vos hacés"),                  # hacer → hacés
+    (r"\bvos\s+sabe\b", "vos sabés"),                  # saber → sabés
+    (r"\bvos\s+quiere\b", "vos querés"),               # querer → querés
+    (r"\bvos\s+dice\b", "vos decís"),                  # decir → decís
+    (r"\bvos\s+viene\b", "vos venís"),                 # venir → venís
+    (r"\bvos\s+pone\b", "vos ponés"),                  # poner → ponés
+    (r"\bvos\s+sale\b", "vos salís"),                  # salir → salís
+    (r"\bvos\s+pide\b", "vos pedís"),                  # pedir → pedís
+    (r"\bvos\s+sigue\b", "vos seguís"),                # seguir → seguís
+    (r"\bvos\s+ve\b", "vos ves"),                      # ver → ves
+    # NO `vos da` — choca con `\bda\s+` (pt → "de la"). dar 3sg es muy
+    # rare en este contexto; aceptamos no cubrirlo. Idem `vos ha` vs
+    # potential `\bha\s+` rules.
+    (r"\bvos\s+ha\b(?!\s+(de|que))", "vos has"),       # haber → has (excl. perífrasis)
+    # Subjuntivo + futuro irregular
+    (r"\bvos\s+sea\b", "vos seas"),
+    (r"\bvos\s+vaya\b", "vos vayas"),
+    (r"\bvos\s+haya\b", "vos hayas"),
+    (r"\bvos\s+será\b", "vos serás"),
+    (r"\bvos\s+estará\b", "vos estarás"),
+    (r"\bvos\s+tendrá\b", "vos tendrás"),
+    (r"\bvos\s+podrá\b", "vos podrás"),
+    # Pretérito imperfecto / condicional
+    (r"\bvos\s+era\b", "vos eras"),
+    (r"\bvos\s+tenía\b", "vos tenías"),
+    (r"\bvos\s+podía\b", "vos podías"),
+    (r"\bvos\s+hacía\b", "vos hacías"),
+    (r"\bvos\s+estaba\b", "vos estabas"),
+    (r"\bvos\s+sería\b", "vos serías"),
+    (r"\bvos\s+tendría\b", "vos tendrías"),
+    (r"\bvos\s+podría\b", "vos podrías"),
+    (r"\bvos\s+haría\b", "vos harías"),
+    # REGULARES de muy alta frecuencia (los que aparecen más en el
+    # vault del user). Cubrimos sólo los que veo en logs reales; el
+    # resto es cubierto por la lección del system prompt.
+    (r"\bvos\s+habla\b", "vos hablás"),                # hablar
+    (r"\bvos\s+busca\b", "vos buscás"),                # buscar
+    (r"\bvos\s+anda\b", "vos andás"),                  # andar
+    (r"\bvos\s+pasa\b", "vos pasás"),                  # pasar
+    (r"\bvos\s+toma\b", "vos tomás"),                  # tomar
+    (r"\bvos\s+lleva\b", "vos llevás"),                # llevar
+    (r"\bvos\s+deja\b", "vos dejás"),                  # dejar
+    (r"\bvos\s+espera\b", "vos esperás"),              # esperar
+    (r"\bvos\s+entra\b", "vos entrás"),                # entrar
+    (r"\bvos\s+queda\b", "vos quedás"),                # quedar
+    (r"\bvos\s+come\b", "vos comés"),                  # comer
+    (r"\bvos\s+lee\b", "vos leés"),                    # leer
+    (r"\bvos\s+cree\b", "vos creés"),                  # creer
+    (r"\bvos\s+vive\b", "vos vivís"),                  # vivir
+    (r"\bvos\s+abre\b", "vos abrís"),                  # abrir
+    (r"\bvos\s+escribe\b", "vos escribís"),            # escribir
+    # NEGACIÓN: las reglas arriba matchean `vos\s+<verbo>` directo. Para
+    # "vos no <verbo>" hace falta variante explícita porque `\s+` solo
+    # captura whitespace, no la palabra `no`. Agregamos las negaciones
+    # high-frequency. Mismas conjugaciones, sólo cambia que entre `vos`
+    # y el verbo va el adverbio negativo.
+    (r"\bvos\s+no\s+está\b", "vos no estás"),
+    (r"\bvos\s+no\s+es\b(?!\s+que)", "vos no sos"),
+    (r"\bvos\s+no\s+tiene\b", "vos no tenés"),
+    (r"\bvos\s+no\s+puede\b", "vos no podés"),
+    (r"\bvos\s+no\s+hace\b", "vos no hacés"),
+    (r"\bvos\s+no\s+sabe\b", "vos no sabés"),
+    (r"\bvos\s+no\s+quiere\b", "vos no querés"),
+    (r"\bvos\s+no\s+dice\b", "vos no decís"),
+    (r"\bvos\s+no\s+viene\b", "vos no venís"),
+    (r"\bvos\s+no\s+ve\b", "vos no ves"),
+    (r"\bvos\s+no\s+da\b", "vos no das"),
+    (r"\bvos\s+no\s+ha\b", "vos no has"),
+    (r"\bvos\s+no\s+habla\b", "vos no hablás"),
+    (r"\bvos\s+no\s+come\b", "vos no comés"),
+    (r"\bvos\s+no\s+vive\b", "vos no vivís"),
 )
 
 

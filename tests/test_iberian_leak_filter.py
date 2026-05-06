@@ -586,7 +586,9 @@ def test_bug_2026_05_05_fantastical_api():
     assert "referindo" not in out and "refiriéndose" in out
     assert "a la data" not in out and "a la fecha" in out
     assert "sobre a API" not in out and "sobre la API" in out
-    assert "está procurando" not in out and "está buscando" in out
+    # Cadena: pt `está procurando` → es `está buscando` → voseo `vos estás buscando`.
+    # Después del paso voseo (2026-05-05), el output final tiene `vos estás buscando`.
+    assert "procurando" not in out and "estás buscando" in out
     # Idempotencia
     assert replace_iberian_leaks(out) == out
 
@@ -643,6 +645,83 @@ def test_sobre_a_proper_noun_pt():
     # Caso negativo: "sobre a" + minúscula NO se toca
     out = replace_iberian_leaks("voy a hablar sobre a media tarde")
     assert "sobre a media" in out  # preserva — minúscula
+
+
+def test_voseo_grammar_irregulares():
+    """`vos + 3sg` (sin `s`) debe convertirse a voseo correcto.
+
+    Caso real del bug del 2026-05-05 ("vos está procurando"). El LLM
+    mezcla `vos` rioplatense con conjugación 3sg en vez de voseo
+    (`vos estás`). Cubrimos los irregulares de mayor frecuencia.
+    """
+    from rag.iberian_leak_filter import replace_iberian_leaks
+    assert replace_iberian_leaks("vos está acá") == "vos estás acá"
+    assert replace_iberian_leaks("vos es responsable") == "vos sos responsable"
+    assert replace_iberian_leaks("vos tiene plata") == "vos tenés plata"
+    assert replace_iberian_leaks("vos puede ver") == "vos podés ver"
+    assert replace_iberian_leaks("vos hace lío") == "vos hacés lío"
+    assert replace_iberian_leaks("vos sabe la verdad") == "vos sabés la verdad"
+    assert replace_iberian_leaks("vos quiere irte") == "vos querés irte"
+    assert replace_iberian_leaks("vos dice que sí") == "vos decís que sí"
+    assert replace_iberian_leaks("vos viene mañana") == "vos venís mañana"
+    assert replace_iberian_leaks("vos pone la pava") == "vos ponés la pava"
+    assert replace_iberian_leaks("vos sale temprano") == "vos salís temprano"
+    assert replace_iberian_leaks("vos ve la peli") == "vos ves la peli"
+    # `vos da` no cubierto: choca con regla pt `\bda\s+` → "de la".
+    # `dar` 3sg es rare en este contexto; aceptamos.
+
+
+def test_voseo_grammar_no_toca_voseo_correcto():
+    """Si ya está bien escrito, NO debe modificar nada (idempotente)."""
+    from rag.iberian_leak_filter import replace_iberian_leaks
+    assert replace_iberian_leaks("vos estás bien") == "vos estás bien"
+    assert replace_iberian_leaks("vos sos copado") == "vos sos copado"
+    assert replace_iberian_leaks("vos tenés tres notas") == "vos tenés tres notas"
+    assert replace_iberian_leaks("vos podés hacerlo") == "vos podés hacerlo"
+    assert replace_iberian_leaks("vos sabés que sí") == "vos sabés que sí"
+
+
+def test_voseo_grammar_negacion():
+    """`vos no <verbo>` debe corregir igual que `vos <verbo>`."""
+    from rag.iberian_leak_filter import replace_iberian_leaks
+    assert replace_iberian_leaks("vos no está acá") == "vos no estás acá"
+    assert replace_iberian_leaks("vos no tiene plata") == "vos no tenés plata"
+    assert replace_iberian_leaks("vos no puede ver") == "vos no podés ver"
+    assert replace_iberian_leaks("vos no es responsable") == "vos no sos responsable"
+    assert replace_iberian_leaks("vos no sabe nada") == "vos no sabés nada"
+
+
+def test_voseo_grammar_excluye_es_que():
+    """`vos es` se transforma a `vos sos`, EXCEPTO cuando viene seguido
+    de `que` (relator: "lo que vos es que importa" — preserva).
+    """
+    from rag.iberian_leak_filter import replace_iberian_leaks
+    # NO transforma "vos es que ..."
+    assert "vos es que" in replace_iberian_leaks("lo que vos es que importa")
+    # SÍ transforma "vos es <otra cosa>"
+    assert replace_iberian_leaks("vos es importante") == "vos sos importante"
+
+
+def test_voseo_grammar_subjuntivo_y_futuro():
+    """Subjuntivo `vos sea/vaya/haya` y futuro `vos será/estará/...` con
+    s final voseo.
+    """
+    from rag.iberian_leak_filter import replace_iberian_leaks
+    assert replace_iberian_leaks("ojalá vos sea feliz") == "ojalá vos seas feliz"
+    assert replace_iberian_leaks("cuando vos vaya") == "cuando vos vayas"
+    assert replace_iberian_leaks("vos será el próximo") == "vos serás el próximo"
+    assert replace_iberian_leaks("vos podrá hacerlo") == "vos podrás hacerlo"
+
+
+def test_voseo_grammar_regulares_alta_frecuencia():
+    """Verbos regulares -ar/-er/-ir más comunes."""
+    from rag.iberian_leak_filter import replace_iberian_leaks
+    assert replace_iberian_leaks("vos habla mucho") == "vos hablás mucho"
+    assert replace_iberian_leaks("vos busca la solución") == "vos buscás la solución"
+    assert replace_iberian_leaks("vos come tarde") == "vos comés tarde"
+    assert replace_iberian_leaks("vos lee rápido") == "vos leés rápido"
+    assert replace_iberian_leaks("vos vive feliz") == "vos vivís feliz"
+    assert replace_iberian_leaks("vos abre el archivo") == "vos abrís el archivo"
 
 
 def test_starters_auto_derivados_estan_completos():

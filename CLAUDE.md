@@ -38,7 +38,7 @@ Migración Ollama → MLX para los 4 LLMs locales. **Estado**: Olas 0+1+2+3 comp
 `resolve_chat_model()` es backend-aware: consulta `MLXBackend.list_available()` cuando `RAG_LLM_BACKEND=mlx`.
 
 **Fallbacks silenciosos bajo MLX**:
-- Tool-calling (`_handle_chat_create_intent` ~línea 30140, `do()` ~37486) — MLX no tiene formato nativo de tools; fallback a Ollama automático.
+- Tool-calling (`_handle_chat_create_intent` ~línea 30254, `do()` ~37559) — MLX no tiene formato nativo de tools; fallback a Ollama automático.
 - `ollama.generate(prompt='', keep_alive=0)` — unload calls; fallback a Ollama.
 
 **Tests**: `tests/conftest.py` tiene autouse fixture `_force_ollama_backend_for_tests` que fuerza `RAG_LLM_BACKEND=ollama` por test (evita leak de shell env). Marker `requires_mlx` registrado en `pyproject.toml`.

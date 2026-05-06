@@ -11,17 +11,23 @@ Agents especializados por dominio. Claude Code los detecta automáticamente al b
 | Generalista #2 | `developer-2` | Idéntico a `developer-1`. Existe para que un segundo peer Claude reclame su propio slug sin colisión. |
 | Generalista #3 | `developer-3` | Idéntico a `developer-1`/`developer-2`. Tercer slot paralelo. |
 | Retrieval | `rag-retrieval` | `retrieve()`, HyDE on/off, rerank, BM25, corpus cache, graph expansion, deep retrieve, scoring formula, `ranker.json`, behavior priors, ranker-vivo nightly online-tune + rollback gate. |
-| LLM expert | `rag-llm` | Toda prompt en `rag.py`, model resolution chain, `HELPER_OPTIONS`/`CHAT_OPTIONS`, JSON schema + parsers, citation verifier, contextual summary cache, HyDE prompt body, `rag do` agent loop, STT (whisper-cli) + TTS (`say` Mónica) contracts. Consultivo cross-domain — coordina con quien dispara cada prompt. |
+| LLM expert | `rag-llm` | Toda prompt en `rag/__init__.py`, model resolution chain, `HELPER_OPTIONS`/`CHAT_OPTIONS`, JSON schema + parsers, citation verifier, contextual summary cache, HyDE prompt body, `rag do` agent loop, STT (whisper-cli) + TTS (`say` Mónica) contracts, MLX backend en `rag/llm_backend.py` + `rag/mlx_tool_calls.py`. Consultivo cross-domain — coordina con quien dispara cada prompt. |
 | Briefs | `rag-brief-curator` | `rag morning` / `rag today` / `rag digest` / `rag pendientes`, evidence rendering, secciones determinísticas (Agenda/Gmail/System/Screen Time/Drive), brief diff signal (kept/deleted → behavior.jsonl), WhatsApp push. |
 | Ingestion | `rag-ingestion` | `rag read` (incl. YouTube), `rag capture`, `rag inbox`, `rag prep`, wikilinks densifier, `rag links` semantic URL finder. |
 | Vault health | `rag-vault-health` | `rag archive`, `rag dead`, `rag followup`, `rag dupes`, contradiction radar (Phase 1+2+3), `rag maintenance` (incl. orphan HNSW segment cleanup, WAL checkpoint, log + behavior rotation). |
 | Integraciones | `rag-integrations` | Todos los `_fetch_*` (Apple Mail/Reminders/Calendar, Gmail API, WhatsApp bridge SQLite + listener, weather, Drive activity, screen time `knowledgeC.db`), ambient agent, `wa-tasks` extractor. |
+| Eval harness | `rag-eval` | `rag eval`, `rag tune` (offline sweep), `queries.yaml` golden set, `feedback_golden.json` labelling, `behavior.jsonl` curation as eval input, bootstrap CI methodology, baselines floor, latency gate (`--max-p95-ms`). Owner de `tests/test_eval*.py`. |
+| Infra / launchd | `rag-infra` | Plists en `~/Library/LaunchAgents/com.fer.obsidian-rag-*.plist`, Caddy + `tls internal` para `ra.ai`, Cloudflare Quick Tunnel, Devin permissions (`.devin/config.json`, `~/.config/devin/config.json`), `pyproject.toml` entry points + `uv tool install --reinstall --editable .`, `launchctl bootstrap`/`bootout`/`kickstart`/`print`. |
+| Perf auditor | `rag-perf-auditor` | Read-only auditor de hot paths en `rag/__init__.py` + `web/server.py`: N+1 sobre sqlite-vec, locking redundante en WAL, blocking I/O en handlers async, sentence-transformers sin batch, LRU caches missing/oversized, `fetchall()` en tablas grandes. NO edita — devuelve reporte priorizado. |
+| Doc curator | `rag-doc-curator` | Detecta drift entre `CLAUDE.md` / `AGENTS.md` / `README.md` y el código real (`rag/`, `web/server.py`). Read-only — devuelve diff estructurado (commands no expuestos, surface no documentado, invariantes contradichos). |
+| Telemetry | `rag-telemetry` | SQL state telemetry (`rag_queries` / `rag_behavior` / `rag_feedback` / `system_memory_metrics` y demás tablas de `telemetry.db`), DDL ensure-once, `corpus_hash` bucketing, query layer del `/dashboard`, rotation lifecycle (SQL + `behavior.jsonl`). |
+| Web | `rag-web` | `web/server.py` (FastAPI: chat, dashboard, SSE, `/api/*`), static frontend (`web/static/*.{js,html,css}`), PWA wiring (manifest + service worker + iOS splash), LAN-exposure env vars (`OBSIDIAN_RAG_BIND_HOST`/`OBSIDIAN_RAG_ALLOW_LAN`), Cloudflare Quick Tunnel publishing. |
 
 Para tareas ambiciosas o cross-dominio, arrancar por `pm`: devuelve un plan de dispatch que el caller ejecuta.
 
 ## Por qué hay 3 slots de developer idénticos
 
-`rag.py` es single-file (~21k líneas, 883 tests, 44 archivos de test). Cuando dos sesiones de Claude Code editan el archivo en paralelo, la última `Write` pisa los cambios intermedios. Tres slots `developer-{1,2,3}` con cuerpo idéntico permiten:
+Layout post-split 2026-05-04: `rag/` paquete (`__init__.py` 60.2k LOC core + sub-modules como `plists.py`, `cross_source_etls.py`, `postprocess.py`, `archive.py`, `anticipatory.py`, `brief_schedule.py`, `voice_brief.py`, `whisper.py`, `wa_scheduled.py`, etc.) + `mcp_server.py` thin wrapper + `web/` + `tests/` (6,031 tests, 395 archivos). Las escrituras siguen serializándose sobre `rag/__init__.py` 60.2k LOC (es el core que casi todos los specialists tocan), así que la presión de paralelismo es la misma que con el single-file viejo. Tres slots `developer-{1,2,3}` con cuerpo idéntico permiten:
 
 1. **Claim por slot**: cada peer Claude reclama el slug libre más bajo (`developer-1`, después `-2`, después `-3`). Slugs distintos = no shadowing en el registry de subagents.
 2. **Paralelismo real**: 3 generalistas pueden trabajar en sub-zonas distintas simultáneamente, coordinados por `mcp__claude-peers__set_summary`.
@@ -31,23 +37,23 @@ Si necesitás más de 3 generalistas en paralelo, agregá `developer04.md` con `
 
 ## Por qué los demás existen
 
-1. **Documentan ownership** — cada uno declara su zona y qué NO debe tocar (ver tabla en `developer*.md`).
+1. **Documentan ownership** — cada uno declara su zona y qué NO debe tocar (ver tabla en `developer*.md` y en cada `rag-*.md`).
 2. **Enrutan tareas** — `Agent(subagent_type: rag-retrieval, ...)` para que la sesión principal delegue en contexto fresco sin pisar edits en curso.
-3. **Preservan invariantes** — cada agent lista los contratos que no se pueden romper (eval baselines con CIs, silent-fail, layout del brief, etc.).
+3. **Preservan invariantes** — cada agent lista los contratos que no se pueden romper (eval baselines con CIs, silent-fail, layout del brief, schema version, MLX defaults, etc.).
 
 ## Protocolo cuando hay peers activos
 
 Si `mcp__claude-peers__list_peers(scope: "repo")` devuelve >1 instancia Claude Code en el repo:
 
-1. **Announce**: `mcp__claude-peers__set_summary` declarando dominio + función (ej. `"developer-1: editando _wa_extract_actions en rag.py:18420"`).
-2. **Check peers**: `list_peers(scope: "repo")` antes de cada edit grande en `rag.py`.
+1. **Announce**: `mcp__claude-peers__set_summary` declarando dominio + función (ej. `"developer-1: editando _wa_extract_actions en rag/__init__.py:18420"`).
+2. **Check peers**: `list_peers(scope: "repo")` antes de cada edit grande en `rag/__init__.py`.
 3. **Rebase mental**: si otro peer tiene summary overlapping con tu zona, **pausar y coordinar** vía `send_message` antes de escribir.
 4. **Commit frecuente**: commits chicos por feature → git es el source of truth ante conflictos.
 5. **Trabajo paralelo ambicioso**: usar `EnterWorktree` antes de editar la misma rama en simultáneo.
 
 ## Cuándo NO usar un agent
 
-- Tarea trivial de 1 archivo fuera de `rag.py` (ej. editar un test): trabajar directo.
+- Tarea trivial de 1 archivo fuera de `rag/__init__.py` (ej. editar un test): trabajar directo.
 - Pregunta conversacional: respondé vos.
 - Tareas cross-dominio (ej. "agregá Gmail al morning brief"): arrancar por `pm` para que rutee — típicamente termina en `rag-brief-curator` (que decide layout) coordinando con `rag-integrations` (que aporta el fetcher).
 

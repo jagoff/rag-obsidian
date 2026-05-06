@@ -1773,6 +1773,19 @@ async def _lifespan(_app) -> "AsyncIterator[None]":
     apagar el server. Errores en startup callbacks NO bloquean el
     server (catch + log); errores en shutdown se loguean y siguen.
     """
+    # Bump anyio threadpool: post-cutover MLX (2026-05-05) el LLM corre
+    # in-process; cada SSE streaming request bloquea 1 worker durante el
+    # decode (CPU-bound). Default 40 tokens saturaba bajo carga sostenida.
+    # Override via env RAG_WEB_THREADPOOL_TOKENS si hace falta.
+    try:
+        import anyio.to_thread as _att
+        _tp_target = int(os.environ.get("RAG_WEB_THREADPOOL_TOKENS", "100"))
+        _limiter = await _att.current_default_thread_limiter()
+        _limiter.total_tokens = _tp_target
+        print(f"[lifespan] anyio threadpool → {_tp_target} tokens", flush=True)
+    except Exception as _exc:
+        print(f"[lifespan] threadpool bump skipped: {_exc}", flush=True)
+
     for fn in _startup_callbacks:
         try:
             fn()

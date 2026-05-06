@@ -64,7 +64,7 @@ def parse_tool_calls(text: str | None) -> list[Any] | None:
     if not text or "<tool_call>" not in text:
         return None
 
-    from ollama._types import Message  # type: ignore[import-not-found]
+    from rag.llm_backend import Message
 
     out: list[Any] = []
     for m in _TOOL_CALL_RE.finditer(text):

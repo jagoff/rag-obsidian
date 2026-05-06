@@ -129,7 +129,6 @@ import click
 import difflib
 import sqlite_vec
 import httpx
-import ollama
 import yaml
 from rank_bm25 import BM25Okapi
 from rich.console import Console
@@ -3385,30 +3384,21 @@ def resolve_chat_model() -> str:
         return _CHAT_MODEL_RESOLVED
     from rag.llm_backend import get_backend, MLX_MODEL_ALIAS, MLXBackend  # local import
     backend = get_backend().name  # singleton — 1 env lookup al startup, cached
-    if backend == "mlx":
-        try:
-            mlx_ids = set(MLXBackend().list_available())
-            available = {alias for alias, hf_id in MLX_MODEL_ALIAS.items() if hf_id in mlx_ids}
-        except Exception:
-            available = set()
-    else:
-        try:
-            available = {m.model for m in ollama.list().models}
-        except Exception:
-            available = set()
+    # Post-Ola 7: OllamaBackend retired. `get_backend()` siempre devuelve
+    # `MLXBackend` (RAG_LLM_BACKEND=ollama loguea warning + cae a MLX).
+    try:
+        mlx_ids = set(MLXBackend().list_available())
+        available = {alias for alias, hf_id in MLX_MODEL_ALIAS.items() if hf_id in mlx_ids}
+    except Exception:
+        available = set()
     for candidate in CHAT_MODEL_PREFERENCE:
         if candidate in available:
             _CHAT_MODEL_RESOLVED = candidate
             return candidate
-    if backend == "mlx":
-        raise RuntimeError(
-            f"Ningún modelo MLX disponible para CHAT_MODEL_PREFERENCE={CHAT_MODEL_PREFERENCE}. "
-            f"Descargá los snapshots con `huggingface-cli download mlx-community/Qwen2.5-7B-Instruct-4bit` "
-            f"(ver MLX_MODEL_ALIAS en rag/llm_backend.py)."
-        )
     raise RuntimeError(
-        f"Ningún modelo de CHAT_MODEL_PREFERENCE instalado: {CHAT_MODEL_PREFERENCE}. "
-        f"Instalá uno con: ollama pull {CHAT_MODEL_PREFERENCE[0].split(':')[0]}"
+        f"Ningún modelo MLX disponible para CHAT_MODEL_PREFERENCE={CHAT_MODEL_PREFERENCE}. "
+        f"Descargá los snapshots con `huggingface-cli download mlx-community/Qwen2.5-7B-Instruct-4bit` "
+        f"(ver MLX_MODEL_ALIAS en rag/llm_backend.py)."
     )
 
 MIN_CHUNK = 150    # chars — merge smaller chunks with neighbor
@@ -3839,8 +3829,6 @@ def _save_context_cache() -> None:
     CONTEXT_CACHE_PATH.write_text(payload)
 
 
-_INDEX_CHAT_CLIENT: ollama.Client | None = None
-
 # Semaphore that caps concurrent qwen2.5:3b (HELPER_MODEL) calls.
 # MLX corre in-process pero el semaphore sigue siendo útil: throttlea
 # llamadas concurrentes al GPU (morning + anticipate + followup) para
@@ -3928,19 +3916,6 @@ def _chat_stream_dispatch(**kwargs):
         keep_alive=kwargs.get("keep_alive", -1),
         format=kwargs.get("format"),
     )
-
-
-def _index_chat_client() -> ollama.Client:
-    """Cached `ollama.Client(timeout=120)` for index-time chat calls.
-    Wraps `find_contradictions_for_note`'s LLM call so a stuck Ollama
-    (cold-load contention while watch + web pin other models) can't hang
-    the whole rglob. The 120s ceiling is generous for cold-load (qwen2.5:7b
-    typically <30s) and fails fast on real saturation.
-    """
-    global _INDEX_CHAT_CLIENT
-    if _INDEX_CHAT_CLIENT is None:
-        _INDEX_CHAT_CLIENT = ollama.Client(timeout=120.0)
-    return _INDEX_CHAT_CLIENT
 
 
 class _SemaphoredChatClient:
@@ -15018,51 +14993,23 @@ def _handle_memory_pressure(pct_before: float, threshold: float) -> dict:
         chat_model = None
     actions["chat_model"] = chat_model
     if chat_model:
-        # CRITICO: usar Client con timeout corto. Si ollama está stuck
-        # (su usual modo de fallo bajo swap thrash), el call default sin
-        # timeout cuelga el thread del watchdog 60s+, justo cuando lo
-        # necesitamos rapidísimo. Si timea → se cae al fallback de kill
-        # de runners abajo (ver actions["chat_unload_timeout"]).
-        #
-        # Backend-aware (2026-05-05, post-Ola-3 cutover): bajo MLX el
-        # modelo está in-process en MPS, no en Ollama. `keep_alive=0`
-        # via Ollama no libera nada (chat_unloaded queda False eternamente
-        # → death spiral). Para MLX, llamamos `MLXBackend.unload()` que
-        # pop-ea el modelo de `_loaded` + `mx.clear_cache()`. Bajo Ollama
-        # mantenemos el path histórico (cliente con timeout corto).
+        # Post-Ola 7: MLX-only path. El modelo vive in-process en MPS;
+        # `MLXBackend.unload()` pop-ea de `_loaded` + `mx.clear_cache()`
+        # para liberar VRAM/RAM. Si el unload falla, marcamos timeout y
+        # seguimos al paso 2 (reranker). El watchdog NO mata runners
+        # propios (eso era responsabilidad del legado
+        # `_maybe_restart_ollama_on_stuck`).
         from rag.llm_backend import get_backend
-        _backend_choice = get_backend().name  # singleton — no env lookup en hot path
-        if _backend_choice == "mlx":
-            try:
-                _backend = get_backend()
-                if _backend.unload(chat_model):
-                    actions["chat_unloaded"] = True
-                else:
-                    # Modelo no estaba en _loaded — no es error
-                    actions["chat_unload_skipped"] = "not_resident"
-            except Exception as exc:
-                actions["chat_unload_timeout"] = True
-                _silent_log("memory_watchdog_unload_chat_mlx", exc)
-        else:
-            try:
-                import ollama as _ollama
-                _client = _ollama.Client(timeout=10)
-                _client.chat(
-                    model=chat_model,
-                    messages=[{"role": "user", "content": "."}],
-                    options={"num_predict": 1},
-                    keep_alive=0,
-                )
+        try:
+            _backend = get_backend()
+            if _backend.unload(chat_model):
                 actions["chat_unloaded"] = True
-            except Exception as exc:
-                actions["chat_unload_timeout"] = True
-                _silent_log("memory_watchdog_unload_chat", exc)
-            # NO matar runners acá. Mezclar las señales (presión alta vs
-            # stuck-load) lleva a un loop: bajamos pressure → next request
-            # recarga modelo → pressure sube → watchdog mata otra vez.
-            # El kill agresivo es responsabilidad de
-            # `_maybe_restart_ollama_on_stuck` que tiene cooldown propio
-            # y dispara solo cuando ollama efectivamente no responde.
+            else:
+                # Modelo no estaba en _loaded — no es error
+                actions["chat_unload_skipped"] = "not_resident"
+        except Exception as exc:
+            actions["chat_unload_timeout"] = True
+            _silent_log("memory_watchdog_unload_chat_mlx", exc)
 
     # Paso 2: re-medir y decidir reranker
     pct_after = _system_memory_used_pct()

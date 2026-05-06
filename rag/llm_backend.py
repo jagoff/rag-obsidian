@@ -68,6 +68,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
 
+from pydantic import BaseModel
+
 # ---------------------------------------------------------------------------
 # Qwen3 <think> block stripping
 # ---------------------------------------------------------------------------
@@ -157,24 +159,44 @@ class ChatOptions:
 # Response types (local replacements for ollama._types)
 # ---------------------------------------------------------------------------
 # These mirror the shape that MLXBackend.chat() / generate() / chat_stream()
-# return. Call sites access them via attribute notation (resp.message.content,
-# resp.done, etc.) — dataclasses satisfy that contract.
-# ToolCall objects inside Message.tool_calls still originate from
-# rag.mlx_tool_calls.parse_tool_calls() and carry their own type — we just
-# store them as Any here to avoid a cross-module import cycle.
+# return. Pydantic BaseModel preserva la API que los call sites ya esperan
+# de los tipos ollama-shape:
+#   - attribute access (resp.message.content, resp.done, ...)
+#   - `tc.model_dump()` para serializar tool_calls a JSON
+#   - nested ToolCall + Function dentro de Message para que
+#     `parse_tool_calls()` pueda construir `Message.ToolCall(function=
+#     Message.ToolCall.Function(name=..., arguments=...))`.
 
 
-@dataclass
-class Message:
+class _ToolCallFunction(BaseModel):
+    """Function payload dentro de un tool call (name + arguments)."""
+
+    name: str
+    arguments: dict[str, Any] = {}
+
+
+class _ToolCall(BaseModel):
+    """Tool call emitido por el modelo. Shape compatible con `ollama.Message.ToolCall`."""
+
+    function: _ToolCallFunction
+
+
+class Message(BaseModel):
     """Single chat message (assistant turn). Mirrors ollama.Message shape."""
 
     role: str
     content: str | None = None
-    tool_calls: list[Any] | None = None
+    tool_calls: list[_ToolCall] | None = None
 
 
-@dataclass
-class ChatResponse:
+# Attribute aliases post-class-body (pydantic v2 trata las asignaciones in-body
+# como fields). Esto preserva la sintaxis ollama-shape original que los call
+# sites ya esperan: `Message.ToolCall(function=Message.ToolCall.Function(...))`.
+_ToolCall.Function = _ToolCallFunction  # type: ignore[attr-defined]
+Message.ToolCall = _ToolCall  # type: ignore[attr-defined]
+
+
+class ChatResponse(BaseModel):
     """Non-streaming chat completion response. Mirrors ollama.ChatResponse."""
 
     model: str
@@ -183,8 +205,7 @@ class ChatResponse:
     done_reason: str | None = None
 
 
-@dataclass
-class GenerateResponse:
+class GenerateResponse(BaseModel):
     """Raw generate (no chat template) response. Mirrors ollama.GenerateResponse."""
 
     model: str

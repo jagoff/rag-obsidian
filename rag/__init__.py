@@ -14614,6 +14614,19 @@ def get_reranker():
         _reranker_last_use = time.time()
         if _reranker is not None:
             return _reranker
+        # Phase 2 scope B (2026-05-06) — opt-in MLX reranker via
+        # RAG_RERANKER_BACKEND=mlx. Loads `mlx-community/Qwen3-Reranker-
+        # 0.6B-mxfp8` and exposes a `.predict(pairs)` API compatible with
+        # sentence-transformers' CrossEncoder. **NOT** drop-in for
+        # ranker.json weights or CONFIDENCE_RERANK_MIN — score scale
+        # changes from unbounded logits (bge) to probability 0-1 (Qwen3).
+        # Re-tune via `rag tune --apply` post-cutover.
+        from rag.mlx_reranker import is_mlx_reranker_enabled
+        if is_mlx_reranker_enabled():
+            from rag.mlx_reranker import MLXReranker, resolve_mlx_reranker_path
+            mlx_path = resolve_mlx_reranker_path(_resolve_reranker_model_path())
+            _reranker = MLXReranker(model_path=mlx_path, max_length=512)
+            return _reranker
         import torch
         from sentence_transformers import CrossEncoder
         if torch.backends.mps.is_available():
@@ -14686,6 +14699,15 @@ def maybe_unload_reranker(force: bool = False) -> bool:
             return False
         try:
             import gc
+            # MLX reranker has its own .unload() that clears mlx caches.
+            # The torch.mps.empty_cache() path below is a no-op for MLX
+            # (different framework), so we route based on instance type.
+            try:
+                from rag.mlx_reranker import MLXReranker
+                if isinstance(_reranker, MLXReranker):
+                    _reranker.unload()
+            except Exception:
+                pass
             del _reranker
             _reranker = None
             try:

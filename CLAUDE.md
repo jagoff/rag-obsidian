@@ -30,26 +30,29 @@ Python 3.13, `uv`. Runtime venv: `.venv/bin/python`. Global tool: `~/.local/shar
 | Cómo funciona end-to-end | [`docs/como-funciona.md`](docs/como-funciona.md) |
 | Recovery + problemas | [`docs/recovery.md`](docs/recovery.md), [`docs/problemas-comunes.md`](docs/problemas-comunes.md) |
 
-## MLX migration (Ola 5 hard-cutover — 2026-05-06)
+## MLX migration (Ola 8 — 100% MLX, cero ollama runtime — 2026-05-06)
 
-**Estado actual: 100% MLX, sin fallback Ollama disponible.** Modelos chat Ollama purgados del disco (decisión user 2026-05-06). Default `RAG_LLM_BACKEND=mlx`. Detalle completo en [`docs/mlx-migration.md`](docs/mlx-migration.md).
+**Estado actual: 100% MLX en todos los paths runtime.** Migración completada en 8 olas escalonadas (Ola 1: dispatch + flag, Ola 5: chat hard-cutover, Ola 6: embed in-process, Ola 7: purga `OllamaBackend`, Ola 8: purga branches defensivos + tipos pydantic locales + `import ollama` removido). Default `RAG_LLM_BACKEND=mlx`. Detalle completo en [`docs/mlx-migration.md`](docs/mlx-migration.md).
 
 **Mapping**:
 - `qwen2.5:3b` (HELPER) → [`mlx-community/Qwen2.5-3B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-3B-Instruct-4bit)
 - `qwen2.5:7b` (CHAT default) → [`mlx-community/Qwen2.5-7B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-7B-Instruct-4bit)
 - `command-r` / `qwen2.5:14b` (HQ tier) → [`mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit`](https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit)
+- `qwen3-embedding:0.6b` (embedder) → [`Qwen/Qwen3-Embedding-0.6B`](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) via `SentenceTransformer` in-process (Ola 6).
 
-`qwen3-embedding:0.6b` sigue corriendo via Ollama (embedder activo, NO migrado a MLX). Es el único modelo Ollama que queda en disco.
+**Tipos response** ([`rag/llm_backend.py`](rag/llm_backend.py)): `Message`, `ChatResponse`, `GenerateResponse` son pydantic `BaseModel` locales (ya no `from ollama._types import ...`). `Message.ToolCall.Function` preservado via assignment post-class para compat con `parse_tool_calls()`.
 
-**Tool-calling**: nativo MLX via [`rag/mlx_tool_calls.py`](rag/mlx_tool_calls.py) (Ola 5, commit `82d27d5`). Parser Qwen `<tool_call>{...}</tool_call>` → `Message.ToolCall` ollama-shape. Wireado en [`rag/llm_backend.py:591`](rag/llm_backend.py).
-
-**Rollback emergencia**: requiere re-pull de los 3 modelos chat (`ollama pull qwen2.5:3b qwen2.5:7b qwen3:30b-a3b`, ~24 GB) ANTES de exportar `RAG_LLM_BACKEND=ollama`. Sin eso, el rollback falla con `model 'X' not found`.
+**Tool-calling**: nativo MLX via [`rag/mlx_tool_calls.py`](rag/mlx_tool_calls.py) (Ola 5, commit `82d27d5`). Parser Qwen `<tool_call>{...}</tool_call>` → `Message.ToolCall`. Wireado en [`rag/llm_backend.py`](rag/llm_backend.py).
 
 **Idle-unload watchdog** ([`rag/llm_backend.py`](rag/llm_backend.py)): evicta modelos con `now - last_used > RAG_MLX_IDLE_TTL` (default 1800s). Disable: `RAG_MLX_IDLE_TTL=0` o `RAG_MLX_IDLE_DISABLE=1`.
 
-**Tests**: `tests/conftest.py` autouse fixture `_force_ollama_backend_for_tests` fuerza `RAG_LLM_BACKEND=ollama` por test. Marker `requires_mlx` registrado. Como Ollama-chat no está en disco, los tests que asumen el backend fake-Ollama deben monkeypatchear `ollama.chat` directamente, no apuntar a un daemon real.
+**Memory pressure watchdog** ([`rag/__init__.py`](rag/__init__.py) `_handle_memory_pressure`): MLX-only path. Llama `MLXBackend.unload(model)` (pop `_loaded` + `mx.clear_cache()`) cuando swap pressure ≥ threshold. Branch Ollama defensivo purgado en Ola 8.
 
-**Embeddings (bge-m3) NO entran en este scope**.
+**Rollback emergencia**: requiere `git revert` de Ola 7+ commits + `uv pip install ollama>=0.6.1` + re-pull de modelos chat Ollama. NO se soporta vía env var — `RAG_LLM_BACKEND=ollama` ahora loguea warning + cae a MLX (`OllamaBackend` no existe más).
+
+**Tests**: `tests/conftest.py` fixture autouse `_reset_backend_singleton_per_test` resetea singleton entre tests + auto-stubea `_mlx_chat`/`_chat_stream_dispatch` para tests que NO mockean LLM (evita cargar modelos reales). Tests que MOCKEAN llm_chat hacen `monkeypatch.setattr(rag, "_mlx_chat", _fake)` — su patch gana sobre el auto-stub.
+
+**`ollama>=0.6.1` removido de `pyproject.toml`** (Ola 8). Ningún call site runtime lo usa. El daemon Ollama (`com.ollama.ollama`) puede seguir corriendo para integraciones externas (mem-vault, otros agentes), no para obsidian-rag.
 
 ## Idioma
 
@@ -71,10 +74,6 @@ Roster + ownership en [`.claude/agents/README.md`](.claude/agents/README.md).
 ### Custom agent profiles requieren reload de la sesión
 
 Profiles en `.claude/agents/*.md` se cargan **una sola vez al iniciar la sesión**. Si creás un agent nuevo durante una sesión activa, esa sesión NO lo ve. Workaround: reabrir sesión, o inyectar el system prompt inline en `subagent_explore` / `subagent_general`. Mismo gotcha aplica a skills custom. Hooks en `.devin/config.json` SÍ se refrescan en runtime.
-
-## Auto-save a `mem-vault` al cerrar tarea
-
-Regla universal en [`~/.claude/CLAUDE.md`](file:///Users/fer/.claude/CLAUDE.md). Trigger: bug fix con root cause no obvio, decisión arquitectónica, refactor con invariantes, performance findings con números, workflow operativo nuevo, gotchas reproducibles. Tool: `mcp_call_tool(server_name="mem-vault", tool_name="memory_save", ...)` con markdown enriquecido (Contexto / Problema / Solución / Tests / Aprendido el YYYY-MM-DD + commit SHA).
 
 ## Auto-pull + commit + push rule
 

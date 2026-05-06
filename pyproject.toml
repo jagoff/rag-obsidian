@@ -8,7 +8,11 @@ dependencies = [
     "fastapi>=0.110",
     "uvicorn>=0.27",
     "click>=8.3.2",
-    "ollama>=0.6.1",
+    # `ollama>=0.6.1` removido en Ola 8 (2026-05-06): post-cutover MLX,
+    # ningún call site runtime importa el paquete. Si necesitás rollback
+    # de emergencia (`RAG_LLM_BACKEND=ollama` ya no es soportado, requiere
+    # `git revert` de Ola 7+ commits), instalá manual `uv pip install
+    # ollama>=0.6.1` antes.
     "rank-bm25>=0.2.2",
     "rich>=15.0.0",
     "pyyaml>=6.0",

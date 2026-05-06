@@ -202,20 +202,7 @@ def test_mlx_backend_embed_unload_clears_embed_cache(backend_with_fake_embed):
     assert len(backend._loaded) == 0
 
 
-@pytest.mark.skip(reason="Ola 7: OllamaBackend purgada — no existe más en rag.llm_backend")
-def test_ollama_backend_embed_passthrough(monkeypatch):
-    """OllamaBackend.embed() delegates to ollama.embed and normalises shape."""
-    import ollama  # type: ignore[import-not-found]
-    from rag.llm_backend import OllamaBackend  # noqa: F401
-
-    fake_resp = mock.MagicMock()
-    fake_resp.embeddings = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
-
-    with mock.patch.object(ollama, "embed", return_value=fake_resp):
-        backend = OllamaBackend()
-        resp = backend.embed(
-            model="qwen3-embedding:0.6b",
-            inputs=["texto A", "texto B"],
-        )
-
-    assert resp == {"embeddings": [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]}
+# Ola 7+ (2026-05-06): `test_ollama_backend_embed_passthrough` borrado.
+# Ejercía `OllamaBackend.embed()` que ya no existe — la clase se retiró
+# en Ola 7 y los tipos `Message`/`ChatResponse` ahora son pydantic
+# locales (no `from ollama._types import ...`).

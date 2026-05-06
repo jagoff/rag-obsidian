@@ -2218,14 +2218,14 @@ def _services_spec_manual() -> list[dict]:
         Dejarlos en el registry les asignaba un slot en el dashboard
         que solo decía "missing".
 
-    Los 3 restantes SÍ tienen histórico de ejecución (logs en
-    `~/.local/share/obsidian-rag/{log-rotate,spotify-poll,synth-refresh}.log`
-    de 2026-04/05) — se mantienen mientras el user decida si los usa
-    o los archiva.
+    Limpieza 2026-05-05: `spotify-poll` fue movido a una factory en código
+    (_spotify_poll_plist) después de 196 SIGKILLs por plist missing. Los 2
+    restantes (`log-rotate`, `synth-refresh`) mantienen histórico de ejecución
+    (logs en `~/.local/share/obsidian-rag/{log-rotate,synth-refresh}.log`
+    de 2026-04/05) — se mantienen mientras el user decida si los usa o archiva.
     """
     return [
         {"label": "com.fer.obsidian-rag-synth-refresh", "category": "manual_keep"},
-        {"label": "com.fer.obsidian-rag-spotify-poll", "category": "manual_keep"},
         {"label": "com.fer.obsidian-rag-log-rotate", "category": "manual_keep"},
     ]
 

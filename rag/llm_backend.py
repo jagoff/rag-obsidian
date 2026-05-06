@@ -557,14 +557,16 @@ class MLXBackend(LLMBackend):
 
     @staticmethod
     def _extract_json(text: str) -> str:
-        """Best-effort: strip markdown fences + isolate first {...} block.
+        """Best-effort: strip think blocks + markdown fences + isolate first {...} block.
 
         Models without native grammar mode often wrap JSON in ```json ... ```
-        or prepend prose. The downstream parser in `rag/__init__.py` already
-        handles malformed JSON via repair; this just gives it a cleaner
-        starting point.
+        or prepend prose. Qwen3-30B (HQ tier) can also emit <think>...</think>
+        blocks before the JSON — those are stripped first because they may
+        contain brace characters that confuse the naive { ... } slicer.
+        The downstream parser in `rag/__init__.py` already handles malformed
+        JSON via repair; this just gives it a cleaner starting point.
         """
-        s = text.strip()
+        s = strip_think_blocks(text.strip())
         # Strip ```json ... ``` fences
         if s.startswith("```"):
             s = s.split("\n", 1)[-1] if "\n" in s else s

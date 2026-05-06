@@ -53402,11 +53402,10 @@ def serve(host: str, port: int):
             parts: list[str] = []
             ttft_ms: int | None = None
             try:
-                for chunk in _chat_capped_client().chat(
+                for chunk in _chat_stream_dispatch(
                     model=resolve_chat_model(),
                     messages=messages,
                     options={**CHAT_OPTIONS, "num_predict": tasks_predict_cap},
-                    stream=True,
                     keep_alive=chat_keep_alive(),
                 ):
                     content = chunk.message.content

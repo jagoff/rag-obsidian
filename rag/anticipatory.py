@@ -358,12 +358,30 @@ def _anticipate_format_echo_brief(today_note: Path, old_meta: dict,
 
 def _anticipate_signal_echo(now: datetime) -> list["AnticipatoryCandidate"]:
     """Última nota tocada hoy (≥6h ventana) que resuena con una nota vieja
-    (>60d). Empuja si cosine ≥ 0.70."""
+    (>60d). Empuja si cosine ≥ 0.70.
+
+    Memory pressure gate (2026-05-05): si system memory >70%, skipear este tick
+    para evitar OOM + retrieve timeout cascades. Post-MLX migration, hay contention
+    entre reranker VRAM pinning + echo retrieve que mata el client HTTP."""
     # `_anticipate_note_age_days` is resolved via `rag` (not local) so tests
     # can monkeypatch.setattr(rag, "_anticipate_note_age_days", ...) and
     # have the override take effect inside this signal.
     import rag as _rag
     from rag import _resolve_vault_path, _silent_log, get_db, retrieve
+
+    # Early-exit bajo memory pressure (2026-05-05 fix).
+    try:
+        mem_pct = _rag._system_memory_used_pct()
+        if mem_pct is not None and mem_pct > 70.0:
+            _silent_log(
+                "anticipate_echo_memory_pressure",
+                Exception(f"memory {mem_pct:.1f}% > 70% threshold")
+            )
+            return []
+    except Exception as exc:
+        _silent_log("anticipate_echo_memory_check", exc)
+        # Fallthrough — si el chequeo de memoria falla, continuamos
+
     try:
         vault = _resolve_vault_path()
     except Exception as exc:

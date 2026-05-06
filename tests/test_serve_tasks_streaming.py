@@ -39,17 +39,15 @@ def _tasks_block() -> str:
 
 
 def test_serve_tasks_uses_streaming():
-    """The chat call inside serve.tasks must use `stream=True` instead
-    of the old blocking form."""
+    """The chat call inside serve.tasks must use _chat_stream_dispatch
+    (MLX-aware) instead of _chat_capped_client().chat(stream=True)."""
     block = _tasks_block()
-    # Must invoke stream=True in the chat call
-    assert "stream=True" in block, (
-        "serve.tasks LLM call must use stream=True (found non-streaming"
-        " call or missing)"
+    assert "for chunk in _chat_stream_dispatch(" in block, (
+        "serve.tasks must use `_chat_stream_dispatch(...)` for MLX routing"
     )
-    # Must iterate chunks
-    assert "for chunk in _chat_capped_client().chat(" in block, (
-        "expected `for chunk in _chat_capped_client().chat(...)` to iterate"
+    # The old Ollama-only call pattern must not appear as executable code
+    assert block.count("for chunk in _chat_capped_client().chat(") == 0, (
+        "serve.tasks must not bypass MLX via _chat_capped_client().chat("
     )
 
 
@@ -107,8 +105,8 @@ def test_serve_tasks_answer_still_full_concat():
     assert 'parts: list[str] = []' in block, (
         "expected `parts: list[str] = []` to accumulate streaming content"
     )
-    assert 'answer = "".join(parts).strip()' in block, (
-        "final answer must be `\"\".join(parts).strip()` for back-compat"
+    assert '\"\"\".join(parts).strip()\"' in block or '_rilk("".join(parts).strip())' in block, (
+        "final answer must concatenate parts for back-compat"
     )
 
 
@@ -126,9 +124,9 @@ def test_serve_tasks_exception_handling_preserved():
     guard the LLM call. Otherwise a dropped ollama connection returns 500
     instead of a structured error to the client."""
     block = _tasks_block()
-    # Find the chat() try/except
-    chat_idx = block.find("for chunk in _chat_capped_client().chat(")
-    assert chat_idx >= 0
+    # Find the MLX-aware streaming call
+    chat_idx = block.find("for chunk in _chat_stream_dispatch(")
+    assert chat_idx >= 0, "expected `for chunk in _chat_stream_dispatch(` in tasks block"
     # Look 800 chars forward for the except + error-return
     window = block[chat_idx : chat_idx + 800]
     assert "except Exception as exc:" in window

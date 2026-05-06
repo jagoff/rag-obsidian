@@ -81,12 +81,6 @@ from pydantic import BaseModel, Field, field_validator
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-# `ollama` se importa solo para que tests puedan hacer
-# `monkeypatch.setattr(server_mod.ollama, "chat", ...)`. En runtime el path
-# actual es MLX via `_dispatch_chat` (Ola 6 cero-Ollama, 2026-05-06): el server
-# no hace ningún `ollama.X(...)` directo. Quitar este import rompe ~25 tests
-# que parchean ahí — la migración a un mock-helper unificado es scope aparte.
-import ollama  # noqa: E402, F401
 
 from rag import (  # noqa: E402
     CHAT_OPTIONS,

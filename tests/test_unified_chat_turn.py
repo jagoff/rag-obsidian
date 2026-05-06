@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from unittest.mock import patch
 
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -138,7 +137,7 @@ def test_result_has_reasonable_defaults():
 # ── run_chat_turn: empty vaults → answer graceful ──────────────────────────
 
 
-def test_run_chat_turn_with_empty_vaults():
+def test_run_chat_turn_with_empty_vaults(monkeypatch):
     """Sin vaults, no hay retrieve posible. Debe devolver un
     ChatTurnResult con answer=refusal-template y retrieve_result vacío.
     NO debería invocar al LLM."""
@@ -146,12 +145,18 @@ def test_run_chat_turn_with_empty_vaults():
         question="qué es ikigai",
         vaults=[],
     )
-    with patch("ollama.chat") as mock_chat:
-        result = rag.run_chat_turn(req)
+    called = {"n": 0}
+
+    def _fake_chat(**kwargs):
+        called["n"] += 1
+        raise AssertionError("LLM no debería llamarse sin vaults")
+
+    monkeypatch.setattr(rag, "_mlx_chat", _fake_chat)
+    result = rag.run_chat_turn(req)
     assert isinstance(result, rag.ChatTurnResult)
     assert result.retrieve_result.docs == []
     # Sin LLM call cuando no hay vaults (short-circuit eficiente)
-    assert not mock_chat.called
+    assert called["n"] == 0
     # Answer debe ser non-empty (mensaje amable) + fast turnaround
     assert result.answer
 

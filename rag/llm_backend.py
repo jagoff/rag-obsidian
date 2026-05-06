@@ -153,6 +153,46 @@ class ChatOptions:
     stop: tuple[str, ...] = ()
 
 
+# ---------------------------------------------------------------------------
+# Response types (local replacements for ollama._types)
+# ---------------------------------------------------------------------------
+# These mirror the shape that MLXBackend.chat() / generate() / chat_stream()
+# return. Call sites access them via attribute notation (resp.message.content,
+# resp.done, etc.) — dataclasses satisfy that contract.
+# ToolCall objects inside Message.tool_calls still originate from
+# rag.mlx_tool_calls.parse_tool_calls() and carry their own type — we just
+# store them as Any here to avoid a cross-module import cycle.
+
+
+@dataclass
+class Message:
+    """Single chat message (assistant turn). Mirrors ollama.Message shape."""
+
+    role: str
+    content: str | None = None
+    tool_calls: list[Any] | None = None
+
+
+@dataclass
+class ChatResponse:
+    """Non-streaming chat completion response. Mirrors ollama.ChatResponse."""
+
+    model: str
+    message: Message
+    done: bool
+    done_reason: str | None = None
+
+
+@dataclass
+class GenerateResponse:
+    """Raw generate (no chat template) response. Mirrors ollama.GenerateResponse."""
+
+    model: str
+    response: str
+    done: bool
+    done_reason: str | None = None
+
+
 class LLMBackend(ABC):
     """Common interface for LLM backends."""
 
@@ -460,8 +500,6 @@ class MLXBackend(LLMBackend):
         tools: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> Any:
-        from ollama._types import ChatResponse, Message  # type: ignore[import-not-found]
-
         opts = options or ChatOptions()
         mlx_model, tokenizer = self._load(model)
         prompt = self._apply_chat_template(
@@ -503,7 +541,6 @@ class MLXBackend(LLMBackend):
     ) -> Any:
         from mlx_lm import stream_generate  # type: ignore[import-not-found]
         from mlx_lm.sample_utils import make_sampler  # type: ignore[import-not-found]
-        from ollama._types import ChatResponse, Message  # type: ignore[import-not-found]
 
         opts = options or ChatOptions()
         mlx_model, tokenizer = self._load(model)
@@ -545,8 +582,6 @@ class MLXBackend(LLMBackend):
         keep_alive: str | int = -1,
         **kwargs: Any,
     ) -> Any:
-        from ollama._types import GenerateResponse  # type: ignore[import-not-found]
-
         opts = options or ChatOptions()
         mlx_model, tokenizer = self._load(model)
         text = self._mlx_generate(mlx_model, tokenizer, prompt, opts)
@@ -893,10 +928,12 @@ def reset_backend() -> None:
 
 __all__ = [
     "ChatOptions",
+    "ChatResponse",
+    "GenerateResponse",
     "LLMBackend",
+    "Message",
     "MLXBackend",
     "MLX_MODEL_ALIAS",
-    "OLLAMA_MODEL_ALIAS",
     "get_backend",
     "reset_backend",
     "strip_think_blocks",

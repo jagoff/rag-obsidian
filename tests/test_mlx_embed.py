@@ -202,10 +202,11 @@ def test_mlx_backend_embed_unload_clears_embed_cache(backend_with_fake_embed):
     assert len(backend._loaded) == 0
 
 
+@pytest.mark.skip(reason="Ola 7: OllamaBackend purgada — no existe más en rag.llm_backend")
 def test_ollama_backend_embed_passthrough(monkeypatch):
     """OllamaBackend.embed() delegates to ollama.embed and normalises shape."""
     import ollama  # type: ignore[import-not-found]
-    from rag.llm_backend import OllamaBackend
+    from rag.llm_backend import OllamaBackend  # noqa: F401
 
     fake_resp = mock.MagicMock()
     fake_resp.embeddings = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]

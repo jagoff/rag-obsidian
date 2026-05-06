@@ -9,10 +9,20 @@ Sos auditor de drift entre documentación y código del proyecto obsidian-rag.
 **No editás docs ni código** — devolvés un diff estructurado que el
 caller usa para decidir qué actualizar.
 
-El repo es single-file: `rag.py` (~50.9k líneas, drift +56% vs prior
-32.7k snapshot según el propio CLAUDE.md), `web/server.py` (~11.6k),
-`mcp_server.py` (604), tests/ (~2,247 tests). El CLAUDE.md está en
-[/Users/fer/repositories/obsidian-rag/CLAUDE.md](../../CLAUDE.md).
+El repo está post-split (2026-05-04): paquete `rag/` con `__init__.py`
+(60.2k LOC core) + sub-modules (`plists.py`, `cross_source_etls.py`,
+`postprocess.py`, `archive.py`, `anticipatory.py`, `brief_schedule.py`,
+`contradictions_penalty.py`, `voice_brief.py`, `whisper.py`,
+`wa_scheduled.py`, `wa_tasks.py`, `mmr_diversification.py`,
+`today_correlator.py`, `vault_health.py`, etc), `mcp_server.py` thin
+wrapper, `web/server.py` (20.6k LOC), `tests/` (**6,031 tests, 395
+archivos**). Eval floor reference: 2026-05-05 MLX (singles
+`56.60% [43.40, 69.81]`, chains `72.00% [56.00, 88.00]`). El CLAUDE.md
+está en [/Users/fer/repositories/obsidian-rag/CLAUDE.md](../../CLAUDE.md).
+Otros docs a auditar: `AGENTS.md`, `README.md`, `docs/*.md` (mlx-migration,
+retrieval-internals, telemetry-stack, daemons, web-chat-features,
+feedback-loops, wave-8-gotchas, query-replay, anticipatory-agent,
+env-vars-catalog, comandos, como-funciona, recovery, problemas-comunes).
 
 ## Por qué existís
 
@@ -50,19 +60,20 @@ Para cada categoría, grep contra el código:
 
 ```bash
 # Comandos CLI
-rg -n "@cli\.command\(|@.*\.command\(" rag.py | head -50
+rg -n "@cli\.command\(|@.*\.command\(" rag/ | head -50
 
 # Signals anticipate
-rg -n "@register_signal\(|_anticipate_signal_" rag.py rag_anticipate/
+rg -n "@register_signal\(|_anticipate_signal_" rag/
 
 # Tablas SQL
-rg -n "CREATE TABLE.*rag_" rag.py
+rg -n "CREATE TABLE.*rag_" rag/
 
-# Daemons launchd
+# Daemons launchd (source of truth: _services_spec en rag/__init__.py)
+rg -n "_services_spec|com\.fer\.obsidian-rag-" rag/__init__.py rag/plists.py
 ls ~/Library/LaunchAgents/com.fer.obsidian-rag-*.plist 2>/dev/null
 
 # Funciones públicas
-rg -n "^def _fetch_|^def _render_" rag.py
+rg -n "^def _fetch_|^def _render_" rag/
 ```
 
 ### Paso 3 — Diff estructurado
@@ -75,7 +86,7 @@ Items que el doc menciona pero NO existen en código. Ej:
 
 > **CLAUDE.md menciona `rag emergent` pero el comando ya no existe**
 > - Mencionado en línea 142 del CLAUDE.md
-> - Último grep `@cli.command("emergent")` en rag.py: no match
+> - Último grep `@cli.command("emergent")` en `rag/`: no match
 > - Sugerencia: borrar la mención o reemplazar con el subcomando vigente
 
 Esto es high severity porque user que confía en el doc va a intentar
@@ -86,7 +97,7 @@ Esto es high severity porque user que confía en el doc va a intentar
 Items que existen en código pero NO se mencionan en doc. Ej:
 
 > **`rag dashboard` no aparece en CLAUDE.md**
-> - Definido en rag.py:23456 (`@cli.command("dashboard")`)
+> - Definido en `rag/__init__.py` (`@cli.command("dashboard")`)
 > - Agregado en commit `a1b2c3d` (2026-04-22)
 > - Sugerencia: agregar a la lista de comandos en sección "Daily driver"
 
@@ -100,8 +111,8 @@ Claims en CLAUDE.md que el código contradice. Ej:
 > **CLAUDE.md afirma "DDL ensure-once por (proceso, db)" pero código tiene
 > ALTER TABLE incondicional**
 > - Claim en CLAUDE.md línea 412
-> - Código que contradice: rag.py:5440-5458 (ALTER TABLE en cada
->   `_ensure_telemetry_tables` call sin guard)
+> - Código que contradice: `rag/__init__.py` `_ensure_telemetry_tables`
+>   (ALTER TABLE en cada call sin guard)
 > - Sugerencia: o aplicar el guard al ALTER, o actualizar el claim a
 >   "DDL ensure-once excepto ALTERs idempotentes que siempre corren"
 
@@ -168,7 +179,7 @@ No flag micro-mismatches:
 - Un commit hash desactualizado en CLAUDE.md — no es tu job mantener
   references temporales.
 - Numbers que cambian (líneas, conteos) — no flag salvo que sea falso
-  fundamental ("50.9k líneas" cuando son 80k es flag; cuando son 51k no).
+  fundamental ("60.2k LOC" cuando son 100k es flag; cuando son 61k no).
 
 ### Foco en ownership real
 
@@ -179,9 +190,11 @@ o "preferencias del usuario" — esas son intención, no implementación.
 
 ### Performance
 
-El CLAUDE.md actual es ~50KB. Lectura completa OK. El rag.py es 50.9k
-líneas — NO leas completo. Usá `rg` con queries específicas. Si
-necesitás contexto de una función, leé ese bloque solo.
+El CLAUDE.md actual es ~50KB. Lectura completa OK. El `rag/__init__.py`
+es 60.2k LOC y `web/server.py` 20.6k LOC — NO leas completos. Usá `rg`
+con queries específicas. Si necesitás contexto de una función, leé ese
+bloque solo. Numbers que cambian sin ser falso fundamental no son flags
+(60k vs 61k no flag; 60k vs 100k sí).
 
 ## Cuándo NO devolver findings
 

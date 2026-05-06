@@ -69,7 +69,7 @@ def test_wake_up_dry_run_skips_everything():
          patch.object(rag_module, "feedback_patterns", side_effect=lambda *a, **kw: called.append("patterns")), \
          patch.object(rag_module, "emergent", side_effect=lambda *a, **kw: called.append("emergent")), \
          patch.object(rag_module, "morning", side_effect=lambda *a, **kw: called.append("morning")), \
-         patch.object(rag_module.ollama, "chat", side_effect=lambda *a, **kw: called.append("ollama")):
+         patch.object(rag_module, "_mlx_chat", side_effect=lambda **kw: called.append("warmup")):
         result = runner.invoke(rag_module.cli, ["wake-up", "--dry-run"])
 
     assert result.exit_code == 0
@@ -189,15 +189,15 @@ def test_wake_up_runs_steps_in_declared_order():
          patch.object(rag_module, "feedback_patterns", new=_stub("patterns")), \
          patch.object(rag_module, "emergent", new=_stub("emergent")), \
          patch.object(rag_module, "morning", new=_stub("morning")), \
-         patch.object(rag_module.ollama, "chat",
-                      side_effect=lambda *a, **kw: call_order.append("ollama")), \
+         patch.object(rag_module, "_mlx_chat",
+                      side_effect=lambda **kw: call_order.append("warmup")), \
          patch.object(rag_module, "resolve_chat_model",
                       return_value="qwen2.5:7b"):
         result = runner.invoke(rag_module.cli, ["wake-up"])
 
     assert result.exit_code == 0, result.output
     assert call_order == ["index", "bookmarks", "wa_tasks", "maintenance",
-                          "patterns", "emergent", "morning", "ollama"]
+                          "patterns", "emergent", "morning", "warmup"]
 
 
 def test_wake_up_continues_after_step_failure():
@@ -223,8 +223,8 @@ def test_wake_up_continues_after_step_failure():
          patch.object(rag_module, "feedback_patterns", new=_stub("patterns")), \
          patch.object(rag_module, "emergent", new=_stub("emergent")), \
          patch.object(rag_module, "morning", new=_stub("morning")), \
-         patch.object(rag_module.ollama, "chat",
-                      side_effect=lambda *a, **kw: call_order.append("ollama")), \
+         patch.object(rag_module, "_mlx_chat",
+                      side_effect=lambda **kw: call_order.append("warmup")), \
          patch.object(rag_module, "resolve_chat_model",
                       return_value="qwen2.5:7b"):
         result = runner.invoke(rag_module.cli, ["wake-up"])
@@ -233,7 +233,7 @@ def test_wake_up_continues_after_step_failure():
     assert result.exit_code == 1
     # Todos los pasos siguientes a maintenance igual corrieron.
     assert call_order == ["index", "bookmarks", "wa_tasks", "maintenance-FAIL",
-                          "patterns", "emergent", "morning", "ollama"]
+                          "patterns", "emergent", "morning", "warmup"]
     assert "Fallaron" in result.output
     assert "simulated failure" in result.output
 
@@ -255,7 +255,7 @@ def test_wake_up_ollama_warmup_uses_keep_alive_minus_one():
          patch.object(rag_module, "feedback_patterns", new=lambda *a, **kw: None), \
          patch.object(rag_module, "emergent", new=lambda *a, **kw: None), \
          patch.object(rag_module, "morning", new=lambda *a, **kw: None), \
-         patch.object(rag_module.ollama, "chat", side_effect=_capture), \
+         patch.object(rag_module, "_mlx_chat", side_effect=_capture), \
          patch.object(rag_module, "resolve_chat_model",
                       return_value="qwen2.5:7b"):
         result = runner.invoke(rag_module.cli, ["wake-up"])
@@ -292,20 +292,13 @@ def test_wake_up_plist_runs_at_0400_daily():
     assert sched == {"Hour": 4, "Minute": 0}
 
 
-def test_wake_up_plist_has_ollama_keep_alive_env():
-    """OLLAMA_KEEP_ALIVE=20m mantiene el chat model warm entre el
-    wake-up y el primer chat del user.
-
-    Nota 2026-04-30: rolleamos `-1 → 20m` (commit `4f7e41f`). Con `-1`
-    + `OLLAMA_MAX_LOADED_MODELS=3` los 3 modelos pinned forever
-    saturaban unified memory de 36 GB → MPS swappeaba → tokens/s
-    caían 10×. Con `20m` el secundario se descarga si idle, el
-    principal (qwen2.5:7b chat) se mantiene warm porque siempre se
-    usa. Mejora 4-10× end-to-end.
+def test_wake_up_plist_no_ollama_keep_alive_env():
+    """Ola 6 cero-Ollama (2026-05-06): modelos chat Ollama purgados del disco.
+    El wake-up plist NO debe setear OLLAMA_KEEP_ALIVE — no hay daemon Ollama.
     """
     d = _parse(rag_module._wake_up_plist(RAG_BIN))
     env = d["EnvironmentVariables"]
-    assert env.get("OLLAMA_KEEP_ALIVE") == "20m"
+    assert "OLLAMA_KEEP_ALIVE" not in env
 
 
 def test_wake_up_plist_logs_to_rag_log_dir():

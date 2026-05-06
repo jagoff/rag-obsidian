@@ -110,10 +110,6 @@ def chat_env(monkeypatch):
         server_mod, "multi_retrieve",
         lambda *a, **kw: _canned_retrieve(confidence=0.5),
     )
-    monkeypatch.setattr(server_mod, "_ollama_alive", lambda timeout=2.0: True)
-    monkeypatch.setattr(
-        server_mod, "_ollama_chat_probe", lambda timeout_s=6.0: True,
-    )
     monkeypatch.setattr(
         server_mod, "_fetch_whatsapp_unread", lambda *a, **kw: [],
     )
@@ -171,12 +167,12 @@ def chat_env(monkeypatch):
     monkeypatch.setattr(rag, "semantic_cache_store", _spy_sem_store)
     monkeypatch.log_events = _events  # type: ignore[attr-defined]
     monkeypatch.sem_stores = _sem_stores  # type: ignore[attr-defined]
-    # Ollama stream LLM returns a non-empty body so the PUT path fires.
+    # MLX stream LLM returns a non-empty body so the PUT path fires.
     _ollama_mock = _OllamaMock(
         responses=[[SimpleNamespace(message=SimpleNamespace(content="respuesta generada"))]],
     )
-    monkeypatch.setattr(server_mod.ollama, "chat", _ollama_mock)
-    monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", _ollama_mock)
+    monkeypatch.setattr(rag, "_chat_stream_dispatch", _ollama_mock)
+    monkeypatch.setattr(rag, "_mlx_chat", _ollama_mock)
     monkeypatch.ollama_mock = _ollama_mock  # type: ignore[attr-defined]
     return monkeypatch
 

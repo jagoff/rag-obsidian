@@ -6,10 +6,11 @@ Three concerns bundled into one module because they form a single pipeline:
    for embedded images, run Apple's on-device OCR, cache results in
    `rag_ocr_cache`. Used by the indexer to make image-heavy notes
    (link-hubs, screenshots, whiteboards) searchable.
-2. **VLM caption fallback** (qwen2.5vl:3b via ollama): when OCR returns
-   < `_VLM_FALLBACK_MIN_OCR` chars, run a vision-language model that
-   produces a grep-friendly caption. Cache in `rag_vlm_captions`. Per-run
-   budget cap so a fresh index doesn't burn 5+ min on captions.
+2. **VLM caption fallback** (granite-vision-3.2-2b via mlx-vlm): when OCR
+   returns < `_VLM_FALLBACK_MIN_OCR` chars, run a vision-language model that
+   produces a grep-friendly caption. Backend: mlx-community/granite-vision-3.2-2b-4bit
+   via `mlx_vlm.generate` (Apple Silicon, MPS). Cache in `rag_vlm_captions`.
+   Per-run budget cap so a fresh index doesn't burn time on captions.
 3. **OCR → intent detector**: the OCR/VLM text gets classified by
    qwen2.5:3b into `event` / `reminder` / `note`. Events trigger
    `propose_calendar_event`, reminders trigger `propose_reminder`, notes
@@ -36,7 +37,8 @@ OCR:
 VLM:
 - `VLM_MODEL`, `_VLM_FALLBACK_MIN_OCR`, `_VLM_CAPTION_MAX_CHARS`,
   `_VLM_CAPTION_MAX_PER_RUN`, `_VLM_CAPTION_PROMPT`.
-- `_vlm_caption_enabled()`, `_vlm_client()`,
+- `_vlm_caption_enabled()`, `_vlm_load()`, `_vlm_idle_unload()`,
+  `_vlm_describe(image_path, prompt)`,
   `_vlm_caption_budget_reset/available/consume()`.
 - `_caption_image(image_path)`.
 - `_image_text_or_caption(image_path)` — OCR-or-VLM dispatcher.
@@ -54,7 +56,7 @@ Intent detector:
 ## Tests-friendly: monkey-patch propagation via `rag.<X>`
 
 Tests heavily patch:
-- `rag._ocrmac_module`, `rag._ocr_image`, `rag._vlm_client`,
+- `rag._ocrmac_module`, `rag._ocr_image`, `rag._vlm_describe`,
   `rag._VLM_CAPTION_MAX_PER_RUN`, `rag._detect_cita_from_ocr`.
 
 For each direct internal caller of these names (e.g. `_load_ocrmac_module`
@@ -73,8 +75,8 @@ each call re-resolves `rag.X`, so patches still propagate.
 
 `rag/ocr.py` is loaded by the re-export shim at the bottom of
 `rag/__init__.py`, after every helper it depends on is defined. The
-heavy `ocrmac` / `ollama` imports are still lazy (inside `_load_ocrmac_module`
-and `_vlm_client` respectively) — module load stays fast.
+heavy `ocrmac` import is still lazy (inside `_load_ocrmac_module`);
+mlx-vlm (`_vlm_load`) is also lazy — module load stays fast.
 """
 
 from __future__ import annotations
@@ -83,10 +85,9 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
 from pathlib import Path
-
-import ollama
 
 # NOTE: helpers from `rag.__init__` are imported INSIDE each function body
 # (deferred) — module-level `from rag import _helper_client, propose_*, ...`
@@ -95,7 +96,7 @@ import ollama
 # `from rag import X` inside a function re-resolves `rag.X` on every call.
 #
 # Same for monkey-patched names (`_ocrmac_module`, `_ocr_image`,
-# `_vlm_client`, `_VLM_CAPTION_MAX_PER_RUN`, `_detect_cita_from_ocr`):
+# `_vlm_describe`, `_VLM_CAPTION_MAX_PER_RUN`, `_detect_cita_from_ocr`):
 # resolved through `import rag as _rag` + `_rag.<X>` inside function bodies.
 
 
@@ -361,10 +362,10 @@ def _ocr_image(image_path: Path) -> str:
 # en texto.
 #
 # La solución: cuando OCR devuelve vacío (o menos de `_VLM_FALLBACK_MIN_OCR`
-# chars), corremos un modelo vision-language local (qwen2.5vl:3b vía ollama)
-# con un prompt que pide descripción grep-friendly + transcripción de texto
-# visible. El caption resultante se concatena al body igual que el OCR, pero
-# con un marker distinto (`<!-- VLM-caption: -->`) para que sea grepable.
+# chars), corremos un modelo vision-language local (granite-vision-3.2-2b vía
+# mlx-vlm) con un prompt que pide descripción grep-friendly + transcripción de
+# texto visible. El caption resultante se concatena al body igual que el OCR,
+# pero con un marker distinto (`<!-- VLM-caption: -->`) para que sea grepable.
 #
 # Cache: tabla `rag_vlm_captions` keyed por `(abs_path, mtime)` — misma
 # invariante que `rag_ocr_cache`. El hash del chunk (`_file_hash_with_images`)
@@ -374,19 +375,17 @@ def _ocr_image(image_path: Path) -> str:
 #
 # Silent-fail total:
 #   - `RAG_VLM_CAPTION=0` → feature off, wrapper devuelve lo que dé OCR.
-#   - ollama no responde / timeout → return "" (el OCR text gana si había).
-#   - Modelo no existe (usuario no corrió `ollama pull qwen2.5vl:3b`) →
-#     hint en stderr UNA vez por proceso + return "".
-#   - Budget per-run excedido → return "" sin llamar a ollama (safety net
+#   - mlx-vlm falla al cargar / generar → return "" (el OCR text gana si había).
+#   - Budget per-run excedido → return "" sin llamar al modelo (safety net
 #     contra loops infinitos o primer indexing de vaults gigantes).
 #
-# Costo real a considerar: qwen2.5vl:3b ocupa ~4 GB en RAM, ~2-4s por imagen
-# en MPS. Primera corrida de `rag index --reset` sobre un vault con 500
-# imágenes sin OCR = ~25 min. Por eso `RAG_VLM_CAPTION_MAX_PER_RUN=500`
-# default — el cap previene que un bug o un corpus inesperadamente grande
-# se coma el día. Override con la var env.
+# Costo real a considerar: granite-vision-3.2-2b ocupa ~3 GB en MPS VRAM,
+# ~1-3s por imagen warm. Primera corrida de `rag index --reset` sobre un
+# vault con 500 imágenes sin OCR = ~20 min. Por eso
+# `RAG_VLM_CAPTION_MAX_PER_RUN=500` default — el cap previene que un bug
+# o un corpus inesperadamente grande se coma el día. Override con la var env.
 
-VLM_MODEL = os.environ.get("RAG_VLM_MODEL", "").strip() or "qwen2.5vl:3b"
+VLM_MODEL = os.environ.get("RAG_VLM_MODEL", "").strip() or "mlx-community/granite-vision-3.2-2b-4bit"
 
 # Chars mínimos de OCR para NO hacer fallback al VLM. 20 = threshold sano
 # empíricamente: menos que esto suele ser ruido de OCR ("OK", "x", "•"), más
@@ -404,13 +403,11 @@ _VLM_CAPTION_MAX_CHARS = 500
 _VLM_CAPTION_MAX_PER_RUN = int(os.environ.get("RAG_VLM_CAPTION_MAX_PER_RUN", "500"))
 _vlm_caption_calls_used: int = 0
 
-# Warned-once set por nombre de modelo. Evita spam en stderr cuando el
-# usuario no tiene el VLM pulled y cada imagen falla con "model not found".
-_vlm_model_missing_warned: set[str] = set()
-
-# Cliente ollama dedicado para VLM. Timeout más alto (60s) que helper text
-# porque qwen2.5vl en MPS tarda 2-4s warm / hasta 10s en cold-load.
-_VLM_CLIENT: "ollama.Client | None" = None
+# Singleton mlx-vlm model + processor. Protected by _VLM_LOCK.
+_VLM_MODEL_OBJ: object | None = None
+_VLM_PROCESSOR: object | None = None
+_VLM_LOCK = threading.Lock()
+_VLM_LAST_USED: float = 0.0
 
 
 def _vlm_caption_enabled() -> bool:
@@ -419,13 +416,73 @@ def _vlm_caption_enabled() -> bool:
     return val not in ("0", "false", "no")
 
 
-def _vlm_client() -> "ollama.Client":
-    """Lazy-init singleton. 60s timeout cubre cold-load del modelo (~10s en
-    MPS primera vez) + inference típica (~2-4s)."""
-    global _VLM_CLIENT
-    if _VLM_CLIENT is None:
-        _VLM_CLIENT = ollama.Client(timeout=60.0)
-    return _VLM_CLIENT
+def _vlm_load() -> tuple[object, object]:
+    """Lazy-load granite-vision via mlx-vlm. Singleton guardado en módulo."""
+    global _VLM_MODEL_OBJ, _VLM_PROCESSOR, _VLM_LAST_USED
+    import rag as _rag
+    hf_id = _rag.VLM_MODEL
+    with _VLM_LOCK:
+        if _VLM_MODEL_OBJ is None:
+            from mlx_vlm import load as _mlx_load  # noqa: PLC0415
+            _VLM_MODEL_OBJ, _VLM_PROCESSOR = _mlx_load(hf_id)
+        _VLM_LAST_USED = time.time()
+        return _VLM_MODEL_OBJ, _VLM_PROCESSOR
+
+
+def _vlm_idle_unload(idle_seconds: float = 600) -> bool:
+    """Evicta el modelo si lleva más de `idle_seconds` sin usarse. Libera ~3 GB MPS."""
+    global _VLM_MODEL_OBJ, _VLM_PROCESSOR, _VLM_LAST_USED
+    if _VLM_MODEL_OBJ is None:
+        return False
+    if time.time() - _VLM_LAST_USED < idle_seconds:
+        return False
+    with _VLM_LOCK:
+        _VLM_MODEL_OBJ = None
+        _VLM_PROCESSOR = None
+        try:
+            import mlx.core as mx  # noqa: PLC0415
+            mx.clear_cache()
+        except Exception:
+            pass
+    return True
+
+
+def _vlm_describe(image_path: "str | Path", prompt: str = "") -> str:
+    """Caption via mlx-vlm (granite-vision). Silent-fail → "" en cualquier error.
+
+    NOTA: `mlx_vlm.prompt_utils.apply_chat_template` NO soporta `granite_vision`
+    (lanza `ValueError: Unsupported model: granite_vision` en mlx-vlm 0.4.4).
+    Usamos `processor.tokenizer.apply_chat_template` con la estructura HF
+    multi-content `[{"role": "user", "content": [{"type": "image"}, {"type": "text", ...}]}]`,
+    que el chat template de granite (en `tokenizer_config.json`) renderea
+    como `<|system|>\\n...\\n<|user|>\\n<image>\\n{prompt}\\n<|assistant|>\\n`.
+    """
+    from mlx_vlm import generate as _mlx_generate  # noqa: PLC0415
+    actual_prompt = prompt or _VLM_CAPTION_PROMPT
+    try:
+        model, processor = _vlm_load()
+        messages = [
+            {"role": "user", "content": [
+                {"type": "image"},
+                {"type": "text", "text": actual_prompt},
+            ]},
+        ]
+        formatted = processor.tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, tokenize=False,
+        )
+        out = _mlx_generate(
+            model, processor, formatted,
+            image=[str(image_path)],
+            verbose=False,
+            max_tokens=256,
+        )
+        text = out if isinstance(out, str) else getattr(out, "text", str(out))
+        return (text or "").strip()
+    except Exception as exc:
+        if os.environ.get("RAG_DEBUG"):
+            import sys as _sys
+            _sys.stderr.write(f"[ocr-vlm] caption failed: {exc}\n")
+        return ""
 
 
 def _vlm_caption_budget_reset() -> None:
@@ -472,15 +529,13 @@ def _caption_image(image_path: Path) -> str:
       - `RAG_VLM_CAPTION=0` — feature off.
       - stat falla (imagen no existe o sin permisos).
       - budget per-run excedido.
-      - ollama timeout / unreachable.
-      - modelo no pulled — imprime hint en stderr UNA vez por proceso.
+      - mlx-vlm falla al cargar o generar.
       - response vacío o mal-formed.
 
     Cache: `rag_vlm_captions` con key `(abs_path, mtime)`. Re-correr sobre
     la misma imagen es O(1) SQL lookup — NO vuelve a llamar al modelo.
     """
-    from rag import _silent_log, _ragvec_state_conn, OLLAMA_KEEP_ALIVE
-    # Resolve via `rag` so tests can monkeypatch.setattr(rag, "_vlm_client", stub).
+    from rag import _silent_log, _ragvec_state_conn
     import rag as _rag
     if not _vlm_caption_enabled():
         return ""
@@ -501,67 +556,25 @@ def _caption_image(image_path: Path) -> str:
                 return row[1] or ""
     except Exception as exc:
         _silent_log("vlm_caption_cache_read", exc)
-        # Seguimos — cache roto no bloquea VLM call.
 
     # Budget gate — DESPUÉS del cache read (cache hits no cuentan contra
     # el budget, solo las invocaciones reales al modelo).
     if not _vlm_caption_budget_available():
         return ""
 
-    # VLM call.
-    try:
-        resp = _rag._vlm_client().chat(
-            model=VLM_MODEL,
-            messages=[{
-                "role": "user",
-                "content": _VLM_CAPTION_PROMPT,
-                "images": [abs_key],
-            }],
-            options={
-                "temperature": 0,
-                "seed": 42,
-                "num_predict": 120,
-                # num_ctx dejamos que el servidor elija — imagen + prompt
-                # +  caption caben cómodo en el default de qwen2.5vl.
-            },
-            keep_alive=OLLAMA_KEEP_ALIVE,
-        )
-    except Exception as exc:
-        # Detectamos "model not found" → hint one-shot. Otros errores
-        # (timeout, network) silent-fail normal.
-        msg = str(exc).lower()
-        if ("not found" in msg or "pull" in msg) and VLM_MODEL not in _vlm_model_missing_warned:
-            _vlm_model_missing_warned.add(VLM_MODEL)
-            try:
-                import sys as _sys
-                _sys.stderr.write(
-                    f"\n[obsidian-rag] VLM caption skipped: modelo '{VLM_MODEL}' "
-                    f"no está disponible en ollama. Corré:\n"
-                    f"    ollama pull {VLM_MODEL}\n"
-                    f"Para desactivar el caption fallback: "
-                    f"export RAG_VLM_CAPTION=0\n\n"
-                )
-            except Exception:
-                pass
-        _silent_log(f"vlm_caption:{abs_key}", exc)
-        return ""
+    # VLM call via mlx-vlm. Resolve via `rag` so tests can
+    # monkeypatch.setattr(rag, "_vlm_describe", stub).
+    raw = _rag._vlm_describe(abs_key)
 
-    # Budget se consume SOLO cuando efectivamente llamamos al modelo (éxito
-    # o respuesta vacía — no cuando falló el pull). Evita que un modelo
-    # no-pulled queme budget en el primer intento y deje el resto sin
-    # siquiera intentar.
+    # Budget se consume SOLO cuando efectivamente llamamos al modelo.
     _vlm_caption_budget_consume()
 
     # Normalización del output.
-    try:
-        raw = resp.message.content or ""
-    except Exception:
-        raw = ""
-    caption = raw.strip()
-    # Strip markdown residual + comillas extra si el modelo ignoró el prompt.
+    caption = (raw or "").strip()
     caption = caption.strip("`\"' \n\r\t").replace("\n\n", " ").replace("\n", " ")
     caption = caption[:_VLM_CAPTION_MAX_CHARS]
 
+    model_id = _rag.VLM_MODEL
     # Cache write (también cacheamos captions vacíos — así no re-intentamos
     # en cada index run una imagen que el VLM no supo captionar).
     try:
@@ -570,7 +583,7 @@ def _caption_image(image_path: Path) -> str:
                 "INSERT OR REPLACE INTO rag_vlm_captions "
                 "(image_path, mtime, caption, model, captioned_at) "
                 "VALUES (?, ?, ?, ?, ?)",
-                (abs_key, float(mtime), caption, VLM_MODEL, time.time()),
+                (abs_key, float(mtime), caption, model_id, time.time()),
             )
     except Exception as exc:
         _silent_log(f"vlm_caption_cache_write:{abs_key}", exc)

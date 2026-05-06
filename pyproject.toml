@@ -1,14 +1,18 @@
 [project]
 name = "obsidian-rag"
 version = "0.1.0"
-description = "Local RAG over an Obsidian vault — sqlite-vec + Ollama + sentence-transformers, no cloud calls."
+description = "Local RAG over an Obsidian vault — sqlite-vec + MLX + sentence-transformers, no cloud calls."
 requires-python = ">=3.13"
 dependencies = [
     "sqlite-vec>=0.1.6",
     "fastapi>=0.110",
     "uvicorn>=0.27",
     "click>=8.3.2",
-    "ollama>=0.6.1",
+    # `ollama>=0.6.1` removido en Ola 8 (2026-05-06): post-cutover MLX,
+    # ningún call site runtime importa el paquete. Si necesitás rollback
+    # de emergencia (`RAG_LLM_BACKEND=ollama` ya no es soportado, requiere
+    # `git revert` de Ola 7+ commits), instalá manual `uv pip install
+    # ollama>=0.6.1` antes.
     "rank-bm25>=0.2.2",
     "rich>=15.0.0",
     "pyyaml>=6.0",
@@ -120,6 +124,21 @@ finetune = [
     "accelerate>=0.30",
     "trl>=0.11",
 ]
+# Apple MLX backend para LLMs locales — migración Ollama → MLX
+# completada en Ola 7 (2026-05-06). `RAG_LLM_BACKEND=mlx` es default,
+# OllamaBackend retirada (`get_backend()` siempre devuelve MLXBackend).
+# `ollama>=0.6.1` queda en `dependencies` como compatibility shim mínimo;
+# no hay call sites runtime — se removerá en Ola 8 cuando los tests que
+# todavía importan `ollama` (test_mlx_embed::skipped, test_retrieve_e2e
+# en docstring) se limpien.
+#
+# `mlx-lm` solo corre en Apple Silicon (sys_platform == 'darwin' +
+# platform_machine == 'arm64'). En CI Linux el extra no se instala y los
+# tests con marker `requires_mlx` se auto-skipean.
+mlx = [
+    "mlx-lm>=0.18; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx-vlm>=0.0.15; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 
 [project.scripts]
 rag = "rag:cli"
@@ -183,7 +202,9 @@ markers = [
     "real_vault: test reads the real vault (opt-out of `_isolate_vault_path` autouse). Read-only operations only — writes MUST use monkeypatch.",
     "real_apple: test is allowed to hit the user's real Apple Reminders / Calendar / Contacts (opt-out of `_isolate_apple_integrations` autouse that sets OBSIDIAN_RAG_NO_APPLE=1). Use only for integration smokes; cleanup is the test's responsibility.",
     "requires_ollama: test calls ollama via `resolve_chat_model()` or equivalent. Auto-skipped when no CHAT_MODEL_PREFERENCE model is installed (CI on ubuntu-latest, sandbox environments).",
+    "requires_mlx: test exercises the real `MLXBackend` end-to-end (loads MLX weights, runs `mlx_lm.generate`). Apple Silicon only; auto-skipped if `mlx_lm` is not importable.",
     "live: end-to-end live tests that spawn `rag serve` + hit ollama with real queries. Double opt-in: requires `RAG_E2E_LIVE=1` env var AND `-m live` or default-skips. ~60s warmup; NOT run in default `pytest tests/` sweep.",
+    "no_auto_mlx_stub: opt-out of conftest's autouse `_reset_backend_singleton_per_test` MLX dispatch stub. Use for tests that exercise `_mlx_chat` / `_chat_stream_dispatch` directly (e.g. backend telemetry side-effect verification).",
 ]
 
 [tool.ruff]

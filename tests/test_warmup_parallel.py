@@ -27,11 +27,12 @@ RAG_PY = (ROOT / "rag" / "__init__.py").read_text(encoding="utf-8")
 
 
 def test_warmup_has_parallel_target_helpers():
-    """Each of the 5 warmup targets must be factored into its own helper,
-    proving the parallelization refactor happened."""
+    """Each warmup target must be factored into its own helper, proving the
+    parallelization refactor happened. Post-Ola 6 (embed in-process MLX):
+    4 helpers — `_wu_ollama_embed` removido cuando bge-m3 dejó de pegar al
+    daemon Ollama."""
     for helper in [
         "def _wu_reranker",
-        "def _wu_ollama_embed",
         "def _wu_local_embed",
         "def _wu_corpus",
         "def _wu_chat_models",
@@ -63,14 +64,15 @@ def test_warmup_run_spawns_threads_not_serial_calls():
     # (They're referenced via the `targets` tuple, not as bare calls.)
 
 
-def test_warmup_targets_list_has_all_five():
-    """The `targets` list in `_run` should name all 5 warmup targets."""
+def test_warmup_targets_list_has_all_four():
+    """The `targets` list in `_run` should name all 4 warmup targets.
+    Post-Ola 6 (embed in-process MLX): "ollama-embed" removido."""
     idx = RAG_PY.find("def warmup_async() -> None")
     block = RAG_PY[idx : idx + 12000]
     targets_idx = block.find("targets = [")
     assert targets_idx >= 0
     targets_block = block[targets_idx : targets_idx + 600]
-    for name in ["reranker", "ollama-embed", "local-embed", "corpus", "chat-models"]:
+    for name in ["reranker", "local-embed", "corpus", "chat-models"]:
         assert f'"{name}"' in targets_block, f"missing target name: {name}"
 
 

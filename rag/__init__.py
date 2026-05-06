@@ -129,7 +129,6 @@ import click
 import difflib
 import sqlite_vec
 import httpx
-import ollama
 import yaml
 from rank_bm25 import BM25Okapi
 from rich.console import Console
@@ -787,7 +786,7 @@ def _write_secret_file(path: Path, content: str) -> None:
 
 _STATE_DIR = _ensure_state_dir_secure()
 
-DB_PATH = Path.home() / ".local/share/obsidian-rag/ragvec"
+DB_PATH = Path(os.environ.get("OBSIDIAN_RAG_DB_PATH") or str(Path.home() / ".local/share/obsidian-rag/ragvec"))
 # Telemetry DB file — intentionally separate from ragvec.db (sqlite-vec + meta_*).
 # Pre-2026-04-21 both workloads shared one file + one WAL; bulk writes from the
 # indexer (`rag index`, `watch`, cross-source ingesters) were blocking hot-path
@@ -805,7 +804,7 @@ EVAL_LOG_PATH = Path.home() / ".local/share/obsidian-rag/eval.jsonl"
 BEHAVIOR_LOG_PATH = Path.home() / ".local/share/obsidian-rag/behavior.jsonl"
 BRIEF_WRITTEN_PATH = Path.home() / ".local/share/obsidian-rag/brief_written.jsonl"
 BRIEF_STATE_PATH = Path.home() / ".local/share/obsidian-rag/brief_state.jsonl"
-COLLECTION_WRITE_LOCK = Path.home() / ".local/share/obsidian-rag/collection_write.lock"
+COLLECTION_WRITE_LOCK = DB_PATH / "collection_write.lock"  # A/B 2026-05-06: per-DB
 COLLECTION_OPS_LOG = Path.home() / ".local/share/obsidian-rag/collection_ops.log"
 COLLECTION_RESET_SENTINEL = Path.home() / ".local/share/obsidian-rag/collection_reset_at"
 # Process-level mutex acquired at the top of `rag index` (CLI entry, line
@@ -822,7 +821,7 @@ COLLECTION_RESET_SENTINEL = Path.home() / ".local/share/obsidian-rag/collection_
 # starved for any Ollama-backed call (semantic + LLM both queued behind
 # the indices). With this lock, the second `rag index` aborts in <1s
 # with `Otro rag index activo`, and the chat keeps flowing.
-INDEX_PROCESS_LOCK = Path.home() / ".local/share/obsidian-rag/index.lock"
+INDEX_PROCESS_LOCK = DB_PATH / "index.lock"  # A/B 2026-05-06: per-DB lock
 # Sink for exceptions that used to be `except Exception: pass`. See
 # `_silent_log()` below — only called from sites where a silent failure
 # could mask a real bug (corrupt cache, data-loss adjacent, reranker
@@ -1625,6 +1624,20 @@ def log_query_event(event: dict) -> None:
         event = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
     except Exception:
         return
+    # Leer el ContextVar de backend ANTES de enqueue: captura el valor del
+    # request actual (no del worker thread). None si el request no llego al
+    # dispatch LLM (confidence refuse, create-intent, scope_no_match).
+    _bk = _get_backend_telemetry()
+    if _bk is not None and "backend" not in event:
+        try:
+            event = {
+                **event,
+                "backend": _bk.get("backend"),
+                "fallback_reason": _bk.get("fallback_reason"),
+                "backend_active": _bk.get("backend_active"),
+            }
+        except Exception:
+            pass
 
     def _do() -> None:
         with _ragvec_state_conn() as conn:
@@ -1704,6 +1717,18 @@ _IMPRESSION_THROTTLE_SECS = 30
 _impression_last_seen: dict[tuple[str, str], float] = {}
 _impression_lock = threading.Lock()
 
+# Sources de retrieves bot-initiated que NO representan intent del user. Sus
+# impressions inflarían el denominador del CTR Laplace deflactando paths
+# legítimos. Audit 2026-05-06: 277.885/297.297 rows (94%) eran source=followup.
+# El resto (anticipate-*, eval) son retrieves automáticos sin click humano.
+_BOT_INITIATED_SOURCES = frozenset({
+    "followup",
+    "anticipate-echo",
+    "anticipate-calendar",
+    "anticipate-commitment",
+    "eval",
+})
+
 
 def log_impressions(
     query: str,
@@ -1734,6 +1759,8 @@ def log_impressions(
     if not query or not paths:
         return
     if _telemetry_writes_disabled():
+        return
+    if source in _BOT_INITIATED_SOURCES:
         return
     top1 = paths[0]
     key = (query, top1)
@@ -2315,7 +2342,7 @@ def cleanup_sessions(ttl_days: int = SESSION_TTL_DAYS) -> int:
     return removed
 
 
-EMBED_MODEL = "qwen3-embedding:0.6b"  # multilingual (ES/EN), 1024-dim
+EMBED_MODEL = "Qwen/Qwen3-Embedding-4B"  # A/B 2026-05-06: 4B challenger (2560-dim)
 # Chat model preference: first available wins.
 # Orden tras bench 2026-04-18 (ver scripts/bench_chat.py, 5 queries × 2 runs
 # warm sobre vault work, rerank_pool default, num_ctx=4096):
@@ -2333,7 +2360,7 @@ CHAT_MODEL_PREFERENCE = (
 )
 HELPER_MODEL = "qwen2.5:3b"      # fast, for internal rewrites (multi-query, HyDE, reformulate)
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"  # cross-encoder, multilingual, MPS-friendly
-_COLLECTION_BASE = "obsidian_notes_v11"  # v11: removed temporal tokens (A/B 2026-04-20: 0 impact on hit@5 / MRR vs v9, so reverted the 2026-04-20 wire of dead temporal_token())
+_COLLECTION_BASE = "obsidian_notes_v12_q4b"  # A/B 2026-05-06: paralelo a v11, embedder Qwen3-Embedding-4B
 
 # ── Cross-source corpus (Phase 1, 2026-04-20 user decisions §10) ──────────
 # The collection stays at v11 (no rename / no re-embed) — source discrimination
@@ -2352,14 +2379,13 @@ _COLLECTION_BASE = "obsidian_notes_v11"  # v11: removed temporal tokens (A/B 202
 # in docs/design-cross-source-corpus.md §10.6.
 VALID_SOURCES: frozenset[str] = frozenset(
     {"vault", "memory", "calendar", "gmail", "whatsapp", "reminders", "messages",
-     "contacts", "calls", "safari", "drive"}
+     "contacts", "calls", "safari", "drive", "pillow"}
 )
 # `pillow` (iOS sleep tracker) tiene un ingester propio en
-# `rag index --source pillow` pero NO entra al corpus vectorial — datos
-# viven en `rag_sleep_sessions` y se consumen vía home + brief. Por eso
-# NO está en VALID_SOURCES (que filtra qué sources son indexables al
-# corpus). El handler CLI lo despacha antes de la validación, ver más
-# abajo "if src == 'pillow'".
+# `rag index --source pillow`. Sus datos viven en `rag_sleep_sessions`
+# (no en el corpus vectorial), pero la source figura en VALID_SOURCES
+# para mantener paridad con `CONFIDENCE_RERANK_MIN_PER_SOURCE` (audit
+# de invariantes, ver `test_threshold_helper_all_sources_covered`).
 
 # Per-source weight applied multiplicatively to the final rerank+feature
 # score. Vault stays at 1.00 so the default path is a no-op; anything
@@ -3346,12 +3372,23 @@ def resolve_chat_model() -> str:
 
     Cached per-process so the Ollama `list` call runs at most once. If none
     are installed, raise a clear error pointing at `ollama pull`.
+
+    MLX backend (`RAG_LLM_BACKEND=mlx`): consult the MLX cache via
+    `MLXBackend.list_available()` instead of `ollama.list()`. Match by
+    Ollama-style alias (e.g. `qwen2.5:7b`) — `MLX_MODEL_ALIAS` translates
+    both directions, so a candidate is "available" iff its mapped HF id
+    is present in `~/.cache/huggingface/hub/`.
     """
     global _CHAT_MODEL_RESOLVED
     if _CHAT_MODEL_RESOLVED is not None:
         return _CHAT_MODEL_RESOLVED
+    from rag.llm_backend import get_backend, MLX_MODEL_ALIAS, MLXBackend  # local import
+    backend = get_backend().name  # singleton — 1 env lookup al startup, cached
+    # Post-Ola 7: OllamaBackend retired. `get_backend()` siempre devuelve
+    # `MLXBackend` (RAG_LLM_BACKEND=ollama loguea warning + cae a MLX).
     try:
-        available = {m.model for m in ollama.list().models}
+        mlx_ids = set(MLXBackend().list_available())
+        available = {alias for alias, hf_id in MLX_MODEL_ALIAS.items() if hf_id in mlx_ids}
     except Exception:
         available = set()
     for candidate in CHAT_MODEL_PREFERENCE:
@@ -3359,8 +3396,9 @@ def resolve_chat_model() -> str:
             _CHAT_MODEL_RESOLVED = candidate
             return candidate
     raise RuntimeError(
-        f"Ningún modelo de CHAT_MODEL_PREFERENCE instalado: {CHAT_MODEL_PREFERENCE}. "
-        f"Instalá uno con: ollama pull {CHAT_MODEL_PREFERENCE[0].split(':')[0]}"
+        f"Ningún modelo MLX disponible para CHAT_MODEL_PREFERENCE={CHAT_MODEL_PREFERENCE}. "
+        f"Descargá los snapshots con `huggingface-cli download mlx-community/Qwen2.5-7B-Instruct-4bit` "
+        f"(ver MLX_MODEL_ALIAS en rag/llm_backend.py)."
     )
 
 MIN_CHUNK = 150    # chars — merge smaller chunks with neighbor
@@ -3663,7 +3701,7 @@ CONFIDENCE_RERANK_MIN_PER_SOURCE: dict[str, float] = {
     "contacts":  0.012,   # bodies medianos, signal alto
     "safari":    0.012,   # title + body de bookmark/history
     "drive":     0.010,   # docs cortos en la fase actual del ingester
-    "pillow":    0.015,   # sleep tracker; corpus local-only pero source registrada en VALID_SOURCES
+    "pillow":    0.015,   # sleep tracker, baseline (no eval data yet)
 }
 
 
@@ -3791,169 +3829,152 @@ def _save_context_cache() -> None:
     CONTEXT_CACHE_PATH.write_text(payload)
 
 
-_SUMMARY_CLIENT: "_TimedOllamaProxy | None" = None
-_INDEX_CHAT_CLIENT: ollama.Client | None = None
-_INDEX_EMBED_CLIENT: ollama.Client | None = None
-_HELPER_CLIENT: "_TimedOllamaProxy | None" = None
-_CHAT_CAPPED_CLIENT: "_TimedOllamaProxy | None" = None
-
-# Capture the original `ollama.chat` at import time so _TimedOllamaProxy
-# can detect monkey-patches (tests replace `rag.ollama.chat` with mocks).
-_ORIGINAL_OLLAMA_CHAT = ollama.chat
-# Same trick for `ollama.embed`. Tests in test_query_caches.py replace
-# `rag.ollama.embed` to count calls and feed deterministic vectors —
-# routing through `Client(timeout=...).embed` bypasses the mock. So in
-# `embed()` we check identity and only force the timeout-bearing client
-# when the symbol is the original (production path).
-_ORIGINAL_OLLAMA_EMBED = ollama.embed
-
 # Semaphore that caps concurrent qwen2.5:3b (HELPER_MODEL) calls.
-# Ollama serialises at the GPU level but each blocked Python thread holds
-# an open httpx connection that eventually times out (measured: 277
-# ReadTimeout errors in 7d from morning + anticipate + followup running
-# concurrently). Capping to 2 lets a second request queue in Python
-# instead of timing out against Ollama's internal queue.
-# Override: RAG_HELPER_CONCURRENCY=N (default 2).
+# MLX corre in-process pero el semaphore sigue siendo útil: throttlea
+# llamadas concurrentes al GPU (morning + anticipate + followup) para
+# evitar contención MPS. Override: RAG_HELPER_CONCURRENCY=N (default 2).
 _HELPER_SEM: threading.Semaphore = threading.Semaphore(
     int(os.environ.get("RAG_HELPER_CONCURRENCY", "2"))
 )
 
 
-class _TimedOllamaProxy:
-    """Thin proxy over `ollama.chat` with a production-time timeout.
+def _mlx_chat_via_backend(**kwargs):
+    """Traduce un call ollama-shape `chat(**kwargs)` al MLX backend.
 
-    Tests that monkeypatch `rag.ollama.chat` expect the wrapped callers to
-    hit the module-level symbol directly — if we always went through
-    `ollama.Client(timeout=...).chat`, the mock would never run because
-    Client has its own httpx session. So: when `ollama.chat` is the
-    original function (no monkeypatch), route through a cached Client
-    with a real timeout. Otherwise, route through `ollama.chat` so test
-    mocks intercept correctly.
+    Convierte el dict `options` en `ChatOptions`, propaga `tools=[...]`
+    al Qwen chat template (Ola 5). Descarta kwargs ollama-only (`think`,
+    `logprobs`, `top_logprobs`, `stream`).
+    """
+    _mark_backend("mlx")
+    from rag.llm_backend import ChatOptions, get_backend
 
-    The timeout is a safety ceiling, not a performance knob. In production
-    a wedged ollama daemon raises httpx.ReadTimeout and the caller's
-    existing `except Exception` path handles it. In tests, the proxy is
-    transparent.
+    options_dict = kwargs.get("options") or {}
+    if hasattr(options_dict, "model_dump"):
+        options_dict = options_dict.model_dump(exclude_none=True)
+    elif not isinstance(options_dict, dict):
+        options_dict = dict(options_dict)
+    opts = ChatOptions(
+        temperature=float(options_dict.get("temperature", 0.0)),
+        seed=int(options_dict.get("seed", 42)),
+        num_ctx=int(options_dict.get("num_ctx", 4096)),
+        num_predict=int(options_dict.get("num_predict", 384)),
+        top_p=float(options_dict.get("top_p", 1.0)),
+        stop=tuple(options_dict.get("stop", ()) or ()),
+    )
+    return get_backend().chat(
+        model=kwargs["model"],
+        messages=kwargs.get("messages") or [],
+        options=opts,
+        keep_alive=kwargs.get("keep_alive", -1),
+        format=kwargs.get("format"),
+        tools=kwargs.get("tools"),
+    )
 
-    When `semaphore` is provided (set by _helper_client and _summary_client
-    for all qwen2.5:3b call sites), concurrent calls block on acquire()
-    rather than piling up inside Ollama and timing out.
+
+def _mlx_chat(**kwargs):
+    """Non-streaming chat dispatcher — rutas directamente a MLXBackend.
+
+    Tool-calling (`tools=[...]`) es nativo via `rag.mlx_tool_calls` (Ola 5).
+    """
+    _mark_backend("mlx")
+    return _mlx_chat_via_backend(**kwargs)
+
+
+# Alias retrocompat post-Ola 7: web/server.py + scripts importan
+# `_mlx_or_ollama_chat`. Tras la purga del branch Ollama, ambos paths
+# ruta a MLX. El alias evita tocar 5 callsites en web/server.py + 1 en
+# scripts/ — todos pueden seguir usando el nombre histórico.
+_mlx_or_ollama_chat = _mlx_chat
+
+
+def _chat_stream_dispatch(**kwargs):
+    """Streaming dispatcher — rutea a `MLXBackend.chat_stream()`.
+
+    Yields `ChatResponse(done=False, message.content=piece)` por token,
+    terminal `done=True`. Tool-calling no soportado en streaming.
+    """
+    _mark_backend("mlx")
+    from rag.llm_backend import ChatOptions, get_backend
+
+    options_dict = kwargs.get("options") or {}
+    if hasattr(options_dict, "model_dump"):
+        options_dict = options_dict.model_dump(exclude_none=True)
+    elif not isinstance(options_dict, dict):
+        options_dict = dict(options_dict)
+    opts = ChatOptions(
+        temperature=float(options_dict.get("temperature", 0.0)),
+        seed=int(options_dict.get("seed", 42)),
+        num_ctx=int(options_dict.get("num_ctx", 4096)),
+        num_predict=int(options_dict.get("num_predict", 384)),
+        top_p=float(options_dict.get("top_p", 1.0)),
+        stop=tuple(options_dict.get("stop", ()) or ()),
+    )
+    return get_backend().chat_stream(
+        model=kwargs["model"],
+        messages=kwargs.get("messages") or [],
+        options=opts,
+        keep_alive=kwargs.get("keep_alive", -1),
+        format=kwargs.get("format"),
+    )
+
+
+class _SemaphoredChatClient:
+    """Wrapper mínimo sobre `_mlx_chat_via_backend` con semaphore opcional.
+
+    Reemplaza `_TimedOllamaProxy` post-purga Ollama (Ola 7). MLX corre
+    in-process — los timeouts HTTP ya no aplican. El semaphore sigue
+    siendo útil para throttlear llamadas concurrentes al GPU.
     """
 
-    def __init__(self, timeout: float, semaphore: "threading.Semaphore | None" = None):
-        self._timeout = timeout
-        self._client: ollama.Client | None = None
+    def __init__(self, semaphore: "threading.Semaphore | None" = None):
         self._semaphore = semaphore
 
     def chat(self, **kwargs):
-        if ollama.chat is not _ORIGINAL_OLLAMA_CHAT:
-            # Monkey-patched (test): delegate to the module symbol so the
-            # mock intercepts. Timeout is ignored — tests don't need it.
-            return ollama.chat(**kwargs)
-        if self._client is None:
-            self._client = ollama.Client(timeout=self._timeout)
+        # Route via `_mlx_chat` (not `_mlx_chat_via_backend` directly) so
+        # tests that monkeypatch `rag._mlx_chat` intercept the call. Same
+        # functional behaviour — `_mlx_chat` is a thin marker over
+        # `_mlx_chat_via_backend`.
         if self._semaphore is not None:
             with self._semaphore:
-                return self._client.chat(**kwargs)
-        return self._client.chat(**kwargs)
+                return _mlx_chat(**kwargs)
+        return _mlx_chat(**kwargs)
 
 
-def _index_chat_client() -> ollama.Client:
-    """Cached `ollama.Client(timeout=120)` for index-time chat calls.
-    Wraps `find_contradictions_for_note`'s LLM call so a stuck Ollama
-    (cold-load contention while watch + web pin other models) can't hang
-    the whole rglob. The 120s ceiling is generous for cold-load (qwen2.5:7b
-    typically <30s) and fails fast on real saturation.
-    """
-    global _INDEX_CHAT_CLIENT
-    if _INDEX_CHAT_CLIENT is None:
-        _INDEX_CHAT_CLIENT = ollama.Client(timeout=120.0)
-    return _INDEX_CHAT_CLIENT
+_SUMMARY_CLIENT: "_SemaphoredChatClient | None" = None
+_HELPER_CLIENT: "_SemaphoredChatClient | None" = None
+_CHAT_CAPPED_CLIENT: "_SemaphoredChatClient | None" = None
 
 
-def _index_embed_client() -> ollama.Client:
-    """Cached `ollama.Client(timeout=120)` for index-time embeddings.
+def _summary_client() -> "_SemaphoredChatClient":
+    """Cliente dedicado para context-summary calls (index-time).
 
-    Mirrors `_index_chat_client` but for the per-chunk `ollama.embed(...)`
-    call inside `embed()`. The vanilla `ollama.embed(...)` module helper
-    uses the default httpx client without any read timeout — if Ollama is
-    saturated (another consumer pinning the GPU, model unload/reload mid
-    embed batch, daemon hung) the call sits in `recvfrom` indefinitely
-    and the whole `rag index` rglob freezes. The web/chat handler then
-    queues behind it forever because every chat path eventually calls
-    `embed()` for the query.
-
-    Empirical foot-gun observed 2026-05-01: a zombie `rag index --no-contradict`
-    spawned by a parallel devin session sat in `__recvfrom` for 1.5h
-    (verified with `sample <pid> 1`). The watchdog (`_ollama_health.py`)
-    correctly refused to restart Ollama because `in_flight=2` (chat + the
-    zombie), preserving stream integrity at the cost of letting the chat
-    starve. With this 120s ceiling, the zombie raises `httpx.ReadTimeout`
-    after 2 minutes, releases the connection, and the existing 4-attempt
-    retry in `embed()` either recovers or surfaces the failure — instead
-    of the index hanging forever and dragging the chat down with it.
-
-    The 120s value matches `_index_chat_client` (and is well above the
-    p99 cold-load for bge-m3 ~6-8s on Apple Silicon). Tests that mock
-    `rag.ollama.embed` continue to bypass this client — see the identity
-    check in `embed()` against `_ORIGINAL_OLLAMA_EMBED`.
-    """
-    global _INDEX_EMBED_CLIENT
-    if _INDEX_EMBED_CLIENT is None:
-        _INDEX_EMBED_CLIENT = ollama.Client(timeout=120.0)
-    return _INDEX_EMBED_CLIENT
-
-
-def _summary_client() -> "_TimedOllamaProxy":
-    """Dedicated proxy with a hard timeout for context-summary calls.
-
-    The module-level `ollama.chat` uses the default httpx client which
-    has no read timeout — a stuck runner (seen in the wild when indexing
-    large vaults: one degenerate note hangs the runner for ~an hour) will
-    block the whole indexing batch on `recvfrom`. A 45s ceiling is well
-    above the p99 call time (~1s on qwen2.5:3b for a 2k-char prompt) but
-    bounds the worst case so indexing keeps moving.
-
-    Uses _HELPER_SEM (shared with _helper_client) so index-time context
-    summary calls are rate-limited alongside query-time helper calls.
+    Usa _HELPER_SEM para rate-limitear junto con query-time helper calls.
     """
     global _SUMMARY_CLIENT
     if _SUMMARY_CLIENT is None:
-        _SUMMARY_CLIENT = _TimedOllamaProxy(timeout=45.0, semaphore=_HELPER_SEM)
+        _SUMMARY_CLIENT = _SemaphoredChatClient(semaphore=_HELPER_SEM)
     return _SUMMARY_CLIENT
 
 
-def _helper_client() -> "_TimedOllamaProxy":
-    """Cached proxy with a 60s timeout for quick helper-model calls
-    (reformulate_query, expand_queries, _judge_sufficiency,
-    _generate_synthetic_questions, HyDE). Monkey-patch-compatible — see
-    _TimedOllamaProxy docstring.
+def _helper_client() -> "_SemaphoredChatClient":
+    """Cliente para helper-model calls rápidos (reformulate_query,
+    expand_queries, _judge_sufficiency, HyDE).
 
-    Uses _HELPER_SEM to cap concurrent qwen2.5:3b calls and prevent
-    ReadTimeout errors when multiple daemons (morning, anticipate,
-    followup, chat) hit the helper simultaneously.
-
-    Bumped 30s → 60s tras audit 2026-04-30: con qwen2.5:7b + bge-reranker
-    pineados en MPS y `OLLAMA_MAX_LOADED_MODELS=2`, el helper qwen2.5:3b
-    sufre unload/reload bajo presión y el cold-load tarda 30+s en CPU. El
-    timeout viejo timeaba EN el borde, generando ~85 ReadTimeout/24h aún
-    con el retry de `reformulate_query`. 60s da headroom para cold-load
-    sin enmascarar latencia real (queries normales tardan <500ms).
+    Usa _HELPER_SEM para cap concurrencia qwen2.5:3b.
     """
     global _HELPER_CLIENT
     if _HELPER_CLIENT is None:
-        _HELPER_CLIENT = _TimedOllamaProxy(timeout=60.0, semaphore=_HELPER_SEM)
+        _HELPER_CLIENT = _SemaphoredChatClient(semaphore=_HELPER_SEM)
     return _HELPER_CLIENT
 
 
-def _chat_capped_client() -> "_TimedOllamaProxy":
-    """Cached proxy with a 90s timeout for bounded non-streaming chat
-    calls (citation-repair, critique, digest, morning/today narrative,
-    read summary, contradiction detector). Monkey-patch-compatible.
+def _chat_capped_client() -> "_SemaphoredChatClient":
+    """Cliente para non-streaming chat calls (citation-repair, digest,
+    morning/today narrative, read summary, contradiction detector).
     """
     global _CHAT_CAPPED_CLIENT
     if _CHAT_CAPPED_CLIENT is None:
-        _CHAT_CAPPED_CLIENT = _TimedOllamaProxy(timeout=90.0)
+        _CHAT_CAPPED_CLIENT = _SemaphoredChatClient()
     return _CHAT_CAPPED_CLIENT
 
 
@@ -11763,39 +11784,26 @@ def cache_stats_reset() -> None:
 
 
 def embed(texts: list[str]) -> list[list[float]]:
+    """Embed `texts` con el SentenceTransformer in-process (Qwen/Qwen3-Embedding-0.6B).
+
+    Ola 6 cero-Ollama (2026-05-06): este path NO llama más a Ollama. El branch
+    legacy `ollama.embed(...)` se eliminó. Si `_get_local_embedder()` retorna
+    None (modelo no se carga), levantamos `RuntimeError` — no hay fallback.
+
+    `RAG_INDEX_LOCAL_EMBED` (env var) ya no condiciona nada — el path local es
+    SIEMPRE el default. La var queda como no-op por back-compat (no rompe
+    nada si está seteada en plists viejos, simplemente se ignora).
+    `RAG_INDEX_LOCAL_EMBED_BATCH` sigue gobernando el batch_size.
+
+    Cache (`_embed_cache`) sigue intacto: hit-ratio en multi-query expansion
+    + chains hace que valga la pena, aunque en `rag index --reset` (first-time
+    embeds) la mayoría son misses. Cosine-distance sqlite-vec es scale-invariant
+    así que `normalize_embeddings=True` (igual que `query_embed_local` y el
+    viejo fast-path) no rompe vectores existentes — `_COLLECTION_BASE` NO se
+    bumpea.
+    """
     if not texts:
         return []
-    # Index-time local embedder fast path (RAG_INDEX_LOCAL_EMBED=1).
-    # Reusa el SentenceTransformer (BAAI/bge-m3) que `_get_local_embedder`
-    # ya carga para el query path. Con MPS en Apple Silicon es ~3-5x más
-    # rápido que la ronda RPC a Ollama en batches grandes (medido 2026-05-04
-    # durante el speedup del `rag index --reset`: 18min → ~2min para 6157
-    # chunks). NO afecta el query path: `query_embed_local` sigue usando
-    # su propio entry point (`RAG_LOCAL_EMBED`). Si la carga del modelo
-    # falla (no cache, etc), caemos al path Ollama legacy abajo.
-    #
-    # Cache de embed (`_embed_cache`) se bypassea en este path: durante un
-    # reset full, los embed_texts son first-time y el cache hit-ratio es
-    # casi 0 — no vale la pena el lock contention.
-    if ollama.embed is _ORIGINAL_OLLAMA_EMBED and os.environ.get(
-        "RAG_INDEX_LOCAL_EMBED", ""
-    ).strip().lower() not in ("", "0", "false", "no"):
-        try:
-            _model = _index_embed_local()
-            if _model is not None:
-                arr = _model.encode(
-                    texts,
-                    normalize_embeddings=True,
-                    batch_size=int(os.environ.get("RAG_INDEX_LOCAL_EMBED_BATCH", "64")),
-                    convert_to_numpy=True,
-                    show_progress_bar=False,
-                )
-                return arr.tolist()
-        except Exception as _exc:
-            if os.environ.get("RAG_DEBUG"):
-                print(
-                    f"[index-local-embed] fallback to ollama: {_exc}", flush=True,
-                )
     # Cache invalidation por cambio de modelo (audit 2026-04-25 R2-Embedding #1).
     # Si EMBED_MODEL cambió desde la última vez que populamos el cache,
     # los embeddings cacheados son del modelo viejo (incompatibles
@@ -11824,40 +11832,22 @@ def embed(texts: list[str]) -> list[list[float]]:
     if not missing_idx:
         return cached  # type: ignore[return-value]
     missing_texts = [texts[i] for i in missing_idx]
-    # Retry on transient Ollama hiccups (ConnectionError). The launchd
-    # KeepAlive daemon reboots ollama within 1-3s when it OOMs under
-    # pressure (happens when `rag index` runs against a large vault
-    # while the web server's command-r runner is also resident).
-    # Without retries, a single dropped connection kills the whole
-    # indexing batch — we've seen `rag index` die after ~5 notes.
-    _last_exc: Exception | None = None
-    for attempt in range(4):
-        try:
-            # Production path: use the cached `Client(timeout=120)` so a
-            # stuck Ollama can't wedge the embed call in `recvfrom`
-            # forever (see `_index_embed_client` docstring for the
-            # 2026-05-01 incident that motivated this). Test path:
-            # honour the module-level monkeypatch so test_query_caches
-            # mocks intercept correctly.
-            if ollama.embed is _ORIGINAL_OLLAMA_EMBED:
-                resp = _index_embed_client().embed(
-                    model=EMBED_MODEL, input=missing_texts, keep_alive=OLLAMA_KEEP_ALIVE,
-                )
-            else:
-                resp = ollama.embed(
-                    model=EMBED_MODEL, input=missing_texts, keep_alive=OLLAMA_KEEP_ALIVE,
-                )
-            break
-        except ConnectionError as exc:
-            _last_exc = exc
-            if attempt == 3:
-                raise
-            # 1.5s, 3s, 6s + jitter (0-0.5s) para evitar thundering herd
-            # cuando varios workers retryan en lockstep post ollama-restart.
-            time.sleep(1.5 * (2 ** attempt) + random.random() * 0.5)
-    else:
-        raise _last_exc  # pragma: no cover
-    fresh = resp.embeddings
+    # In-process SentenceTransformer (MPS en Apple Silicon). Sin retry/fallback
+    # — si el modelo no carga, levantamos RuntimeError (Ola 6: no hay path
+    # Ollama de respaldo).
+    _model = _index_embed_local()
+    if _model is None:
+        raise RuntimeError(
+            "local embedder failed to load — Ola 6 cero-ollama no fallback"
+        )
+    arr = _model.encode(
+        missing_texts,
+        normalize_embeddings=True,
+        batch_size=int(os.environ.get("RAG_INDEX_LOCAL_EMBED_BATCH", "64")),
+        convert_to_numpy=True,
+        show_progress_bar=False,
+    )
+    fresh = arr.tolist()
     with _embed_cache_lock:
         for t, v in zip(missing_texts, fresh):
             _embed_cache[t] = v
@@ -11999,7 +11989,15 @@ def _get_local_embedder():
             _os.environ["TRANSFORMERS_OFFLINE"] = "1"
             import torch
             from sentence_transformers import SentenceTransformer
-            if torch.backends.mps.is_available():
+            # `OBSIDIAN_RAG_EMBED_DEVICE` lets ops force CPU during long
+            # bulk-embed runs — observed 2026-05-06 the MPS allocator
+            # crashes with `[METAL] Command buffer execution failed:
+            # Discarded (victim of GPU error/recovery)` after ~200 files
+            # under contention with web/watch/anticipate daemons.
+            _force_dev = os.environ.get("OBSIDIAN_RAG_EMBED_DEVICE", "").strip().lower()
+            if _force_dev in ("cpu", "mps", "cuda"):
+                _dev = _force_dev
+            elif torch.backends.mps.is_available():
                 _dev = "mps"
             elif torch.cuda.is_available():
                 _dev = "cuda"
@@ -12010,7 +12008,7 @@ def _get_local_embedder():
             # "Qwen/Qwen3-Embedding-0.6B". Passing the ollama name makes
             # sentence_transformers hit the hub HEAD endpoint and fail
             # offline.
-            _local_embedder = SentenceTransformer("Qwen/Qwen3-Embedding-0.6B", device=_dev)
+            _local_embedder = SentenceTransformer(EMBED_MODEL, device=_dev)
             # MPS cache cleanup wrapper — mismo patrón que get_reranker()
             # / get_nli_model(). El bge-m3 local hace `encode()` (no
             # `predict()`), pero el comportamiento de MPS es idéntico:
@@ -12549,9 +12547,58 @@ _LLM_TYPO_CACHE_MAX = 256
 _llm_typo_cache: OrderedDict[str, str] = OrderedDict()
 _llm_typo_cache_lock = threading.Lock()
 
-_TYPO_CORRECTION_ENABLED = os.environ.get(
-    "RAG_TYPO_CORRECTION", "1"
-).strip().lower() not in ("0", "false", "no")
+# Token-set Jaccard floor para aceptar la corrección. <0.7 = parafraseo
+# (sustantivo→verbo, lengua, sinónimo) en lugar de typo fix. Empíricamente,
+# typo fixes legítimos (acento añadido, letra swap, capitalización) caen
+# cerca de 1.0 tras normalizar accents; paraphrases caen <=0.5. Override:
+# RAG_TYPO_JACCARD_MIN.
+_TYPO_JACCARD_MIN = float(os.environ.get("RAG_TYPO_JACCARD_MIN", "0.7"))
+
+
+def _typo_correction_token_jaccard(a: str, b: str) -> float:
+    """Token-set Jaccard con accents-stripped + lowercase.
+
+    Diseñado para distinguir typo fix (jaccard alto modulo accents) de
+    paraphrase / language drift (jaccard <=0.5). Tokenización por
+    whitespace — suficiente para queries cortas (4-8 tokens) que es
+    donde corre el typo corrector.
+    """
+    def _norm(s: str) -> set[str]:
+        normalised = unicodedata.normalize("NFKD", s.lower())
+        normalised = "".join(c for c in normalised if not unicodedata.combining(c))
+        return {tok for tok in normalised.split() if tok}
+
+    ta = _norm(a)
+    tb = _norm(b)
+    if not ta or not tb:
+        return 1.0
+    union = ta | tb
+    if not union:
+        return 1.0
+    return len(ta & tb) / len(union)
+
+
+def _resolve_typo_correction_default() -> str:
+    """Default OFF bajo MLX backend hasta fixear el prompt.
+
+    Bug 2026-05-05: MLX qwen2.5:3b parafrasea agresivamente:
+      'charla con maria' -> 'chatea con maria' (sustantivo->verbo)
+      'fantastical api'  -> 'fantastic api'    (proper noun->adj)
+      'reunion con max'  -> 'reunioon con max' (introduce typo)
+
+    Drop singles 54.72% (Ollama) -> 5.66% (MLX) cuando typo corrector
+    esta ON. Ollama qwen2.5:3b conserva la query mejor con el mismo
+    prompt - diferencia de sampling MLX vs HTTP API.
+
+    Override explicito (RAG_TYPO_CORRECTION=1) siempre gana.
+    """
+    explicit = os.environ.get("RAG_TYPO_CORRECTION")
+    if explicit is not None:
+        return explicit
+    backend = os.environ.get("RAG_LLM_BACKEND", "mlx").strip().lower()
+    return "0" if backend == "mlx" else "1"
+
+_TYPO_CORRECTION_ENABLED = _resolve_typo_correction_default().strip().lower() not in ("0", "false", "no")
 
 # ContextVar thread-safe que `_correct_typos_llm` populates con el delta de
 # la última corrección para que el caller (`retrieve()` / `multi_retrieve()`)
@@ -12574,6 +12621,43 @@ _TYPO_CORRECTION_ENABLED = os.environ.get(
 _LLM_TYPO_LAST: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "rag_llm_typo_last", default=None,
 )
+
+# -- Backend telemetry ContextVar (2026-05-05) --
+# Registra que backend LLM se uso en la llamada mas reciente del contexto actual.
+# Seteado por los 4 dispatch points y leido por log_query_event para agregar
+# backend, fallback_reason y backend_active al extra_json de rag_queries.
+# Shape: {"backend": "mlx"|"ollama", "fallback_reason": str|None, "backend_active": str}
+_ACTIVE_BACKEND_CTX: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "rag_active_backend", default=None,
+)
+
+
+def _mark_backend(backend: str, *, fallback_reason: str | None = None) -> None:
+    """Setea el ContextVar de backend para el request actual.
+
+    backend = "mlx" | "ollama". fallback_reason solo cuando MLX cayo a Ollama
+    ("tools" | "stream"). None para Ollama nativo o MLX limpio.
+    """
+    from rag.llm_backend import get_backend
+    try:
+        _be_env = get_backend().name  # singleton — refleja el backend real, no env crudo
+    except Exception:
+        _be_env = os.environ.get("RAG_LLM_BACKEND", "ollama")
+    _ACTIVE_BACKEND_CTX.set({
+        "backend": backend,
+        "fallback_reason": fallback_reason,
+        "backend_active": _be_env,
+    })
+
+
+def _get_backend_telemetry() -> "dict | None":
+    """Lee el ContextVar de backend. Retorna None si no hubo dispatch LLM."""
+    return _ACTIVE_BACKEND_CTX.get()
+
+
+def _reset_backend_telemetry() -> None:
+    """Resetea el ContextVar de backend. Llamar al inicio de un nuevo request."""
+    _ACTIVE_BACKEND_CTX.set(None)
 
 
 def _typo_telemetry_reset() -> None:
@@ -12676,6 +12760,20 @@ def _correct_typos_llm(query: str) -> str:
             corrected = corrected[1:-1].strip()
         # Sanity check: LLM went off-topic if output is > 1.5× original length
         if not corrected or len(corrected) > 1.5 * len(query):
+            corrected = query
+        # Sanity check: token-set Jaccard (solo multi-token). Bug 2026-05-05
+        # MLX qwen2.5:3b parafrasea (sustantivo→verbo, ES→PT, sinónimos):
+        # 'charla con juan'→'chatea con juan', 'whatsapp con mama'→'whatsapp
+        # com mama'. El length cap no las atrapa. Jaccard accent-insensitive
+        # deja pasar accent fixes ('reunion'→'reunión': jaccard=1.0) y
+        # rechaza paraphrases (jaccard<=0.5). 1-token queries ('asor'→
+        # 'Astor') saltan este check porque jaccard sería 0 incluso para
+        # typo fixes válidos — ahí solo rige el length cap (1.5×).
+        if (
+            corrected != query
+            and len(query.split()) >= 2
+            and _typo_correction_token_jaccard(query, corrected) < _TYPO_JACCARD_MIN
+        ):
             corrected = query
     except Exception:
         corrected = query
@@ -14396,6 +14494,19 @@ def get_reranker():
         _reranker_last_use = time.time()
         if _reranker is not None:
             return _reranker
+        # Phase 2 scope B (2026-05-06) — opt-in MLX reranker via
+        # RAG_RERANKER_BACKEND=mlx. Loads `mlx-community/Qwen3-Reranker-
+        # 0.6B-mxfp8` and exposes a `.predict(pairs)` API compatible with
+        # sentence-transformers' CrossEncoder. **NOT** drop-in for
+        # ranker.json weights or CONFIDENCE_RERANK_MIN — score scale
+        # changes from unbounded logits (bge) to probability 0-1 (Qwen3).
+        # Re-tune via `rag tune --apply` post-cutover.
+        from rag.mlx_reranker import is_mlx_reranker_enabled
+        if is_mlx_reranker_enabled():
+            from rag.mlx_reranker import MLXReranker, resolve_mlx_reranker_path
+            mlx_path = resolve_mlx_reranker_path(_resolve_reranker_model_path())
+            _reranker = MLXReranker(model_path=mlx_path, max_length=512)
+            return _reranker
         import torch
         from sentence_transformers import CrossEncoder
         if torch.backends.mps.is_available():
@@ -14468,6 +14579,15 @@ def maybe_unload_reranker(force: bool = False) -> bool:
             return False
         try:
             import gc
+            # MLX reranker has its own .unload() that clears mlx caches.
+            # The torch.mps.empty_cache() path below is a no-op for MLX
+            # (different framework), so we route based on instance type.
+            try:
+                from rag.mlx_reranker import MLXReranker
+                if isinstance(_reranker, MLXReranker):
+                    _reranker.unload()
+            except Exception:
+                pass
             del _reranker
             _reranker = None
             try:
@@ -14657,23 +14777,65 @@ def start_wal_checkpointer() -> bool:
         return True
 
 
-def _system_memory_used_pct() -> float | None:
-    """Return macOS system memory usage as % used, or None si no se puede medir.
+def _system_memory_used_pct_kernel() -> float | None:
+    """Primary probe: parsea ``memory_pressure -Q`` (kernel truth).
 
-    Fórmula: (wired + active + compressed) / total_bytes.
-    Excluye "free" + "inactive" (macOS los cuenta como disponibles para
-    reclaim — inactive es page cache + dirty reusable). Este cálculo mide
-    la memoria REALMENTE comprometida — si sube >85% el kernel empieza
-    a swappear agresivo y dispara beachballs.
+    Output format (estable desde macOS 11+):
+        ``System-wide memory free percentage: N%``
 
-    Zero-dep: shell-outs a `vm_stat` + `sysctl hw.memsize` (ambos ship
-    con macOS). psutil no está en pyproject.toml a propósito (evita
-    agregar dep binaria para un solo uso).
-
-    Linux / otros: fallback a None — el watchdog se desactiva silencioso.
+    Returns 100 - N. None si el binario no existe / output no parsea.
+    Es la signal canónica que usan beachballs / OOM killer; refleja qué
+    cree el kernel sobre cuánta memoria queda reclaimable, no la fórmula
+    Linux-style de páginas comprometidas (que en macOS infla por contar
+    ``active`` como usado cuando es reclaimable bajo presión).
     """
     if sys.platform != "darwin":
         return None
+    try:
+        for mp_bin in ("/usr/bin/memory_pressure", "/sbin/memory_pressure", "memory_pressure"):
+            try:
+                out = subprocess.run(
+                    [mp_bin, "-Q"],
+                    capture_output=True, text=True, timeout=2, check=False,
+                ).stdout
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                continue
+            if not out:
+                continue
+            m = re.search(r"memory free percentage:\s*(\d+)\s*%", out)
+            if m:
+                free_pct = int(m.group(1))
+                used_pct = 100.0 - free_pct
+                return max(0.0, min(100.0, used_pct))
+        return None
+    except Exception:
+        return None
+
+
+def _system_memory_used_pct() -> float | None:
+    """Return macOS system memory usage as % used, or None si no se puede medir.
+
+    Primary: ``memory_pressure -Q`` (kernel truth — refleja la señal canónica
+    que dispara beachballs / OOM). Fallback: fórmula
+    ``(wired + active + compressed) / total_bytes`` via vm_stat + sysctl.
+
+    El fallback es necesario en sandboxes / containers donde el binario
+    ``memory_pressure`` no está accesible. Sobre el watchdog crónico:
+    cuando ambos paths están disponibles, el primary suele dar 10-15pp
+    menos que el fallback en idle (porque ``active`` cuenta como usado
+    pero es reclaimable). Audit 2026-05-06: el formula path falsamente
+    triggereaba unloads → MLX reload → GPU Hang en loop.
+
+    Zero-dep: shell-outs a binarios macOS. psutil no está en
+    pyproject.toml a propósito.
+
+    Linux / otros: None — el watchdog se desactiva silencioso.
+    """
+    if sys.platform != "darwin":
+        return None
+    primary = _system_memory_used_pct_kernel()
+    if primary is not None:
+        return primary
     try:
         vm_out = ""
         total_out = ""
@@ -14831,30 +14993,23 @@ def _handle_memory_pressure(pct_before: float, threshold: float) -> dict:
         chat_model = None
     actions["chat_model"] = chat_model
     if chat_model:
-        # CRITICO: usar Client con timeout corto. Si ollama está stuck
-        # (su usual modo de fallo bajo swap thrash), el call default sin
-        # timeout cuelga el thread del watchdog 60s+, justo cuando lo
-        # necesitamos rapidísimo. Si timea → se cae al fallback de kill
-        # de runners abajo (ver actions["chat_unload_timeout"]).
+        # Post-Ola 7: MLX-only path. El modelo vive in-process en MPS;
+        # `MLXBackend.unload()` pop-ea de `_loaded` + `mx.clear_cache()`
+        # para liberar VRAM/RAM. Si el unload falla, marcamos timeout y
+        # seguimos al paso 2 (reranker). El watchdog NO mata runners
+        # propios (eso era responsabilidad del legado
+        # `_maybe_restart_ollama_on_stuck`).
+        from rag.llm_backend import get_backend
         try:
-            import ollama as _ollama
-            _client = _ollama.Client(timeout=10)
-            _client.chat(
-                model=chat_model,
-                messages=[{"role": "user", "content": "."}],
-                options={"num_predict": 1},
-                keep_alive=0,
-            )
-            actions["chat_unloaded"] = True
+            _backend = get_backend()
+            if _backend.unload(chat_model):
+                actions["chat_unloaded"] = True
+            else:
+                # Modelo no estaba en _loaded — no es error
+                actions["chat_unload_skipped"] = "not_resident"
         except Exception as exc:
             actions["chat_unload_timeout"] = True
-            _silent_log("memory_watchdog_unload_chat", exc)
-            # NO matar runners acá. Mezclar las señales (presión alta vs
-            # stuck-load) lleva a un loop: bajamos pressure → next request
-            # recarga modelo → pressure sube → watchdog mata otra vez.
-            # El kill agresivo es responsabilidad de
-            # `_maybe_restart_ollama_on_stuck` que tiene cooldown propio
-            # y dispara solo cuando ollama efectivamente no responde.
+            _silent_log("memory_watchdog_unload_chat_mlx", exc)
 
     # Paso 2: re-medir y decidir reranker
     pct_after = _system_memory_used_pct()
@@ -15184,16 +15339,6 @@ def warmup_async() -> None:
         except Exception:
             pass
 
-    def _wu_ollama_embed() -> None:
-        # bge-m3 warm: fuerza a ollama a cargar + pinear el modelo de embed.
-        # Crítico: si el local embedder falla o timea, el fallback `embed()`
-        # pega contra este ollama. Sin este warmup, el fallback paga el
-        # cold load ollama (5-10s adicionales).
-        try:
-            embed(["warmup"])
-        except Exception:
-            pass
-
     def _wu_local_embed() -> None:
         # In-process bge-m3 SentenceTransformer (~5s cold load on MPS).
         # Self-gates on _local_embed_enabled() — bulk paths que nunca
@@ -15233,7 +15378,7 @@ def warmup_async() -> None:
         # alinear el warmup al num_ctx de runtime, no al ping mínimo.
         try:
             _chat_model = resolve_chat_model()
-            ollama.chat(
+            _mlx_chat(
                 model=_chat_model,
                 messages=[{"role": "user", "content": "ok"}],
                 options={"num_predict": 1,
@@ -15244,7 +15389,7 @@ def warmup_async() -> None:
         except Exception:
             pass
         try:
-            ollama.chat(
+            _mlx_chat(
                 model=HELPER_MODEL,
                 messages=[{"role": "user", "content": "ok"}],
                 options={"num_predict": 1,
@@ -15258,7 +15403,6 @@ def warmup_async() -> None:
     def _run() -> None:
         targets = [
             ("reranker", _wu_reranker),
-            ("ollama-embed", _wu_ollama_embed),
             ("local-embed", _wu_local_embed),
             ("corpus", _wu_corpus),
             ("chat-models", _wu_chat_models),
@@ -19044,7 +19188,7 @@ def _personalized_folder_vote(
 # ── FILING apply + undo ──────────────────────────────────────────────────────
 
 FILING_BATCHES_DIR = Path.home() / ".local/share/obsidian-rag/filing_batches"
-VAULT_WRITE_LOCK_PATH = Path.home() / ".local/share/obsidian-rag/.write.lock"
+VAULT_WRITE_LOCK_PATH = DB_PATH / ".write.lock"  # A/B 2026-05-06: per-DB
 
 
 @contextlib.contextmanager
@@ -19446,6 +19590,8 @@ def find_contradictions(
         raw = resp.message.content.strip()
     except Exception:
         return []
+    from rag.llm_backend import strip_think_blocks
+    raw = strip_think_blocks(raw)
     m = re.search(r"\{.*\}", raw, re.DOTALL)
     if not m:
         return []
@@ -21071,11 +21217,10 @@ def run_chat_turn(req: ChatTurnRequest) -> ChatTurnResult:
     t_gen_start = time.perf_counter()
     parts: list[str] = []
     try:
-        for chunk in ollama.chat(
+        for chunk in _chat_stream_dispatch(
             model=gen_model,
             messages=messages,
             options=gen_options,
-            stream=True,
             keep_alive=chat_keep_alive(gen_model),
         ):
             parts.append(chunk.message.content or "")
@@ -23884,7 +24029,7 @@ def find_contradictions_for_note(
     # other models) can't hang the rglob — fail-skip instead.
     helper_raw = ""
     try:
-        resp = _index_chat_client().chat(
+        resp = _mlx_chat(
             model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
             options=CHAT_OPTIONS,
@@ -23897,6 +24042,8 @@ def find_contradictions_for_note(
         # unparseable JSON" — the latter is the json.loads branch below.
         _silent_log("contradict_helper_chat", exc)
         return []
+    from rag.llm_backend import strip_think_blocks
+    helper_raw = strip_think_blocks(helper_raw)
     m = re.search(r"\{.*\}", helper_raw, re.DOTALL)
     if not m:
         return []
@@ -29502,11 +29649,10 @@ def query(
             # Buffer the stream; do NOT emit here. Citation-repair and critique may
             # mutate `full` after generation. The single `click.echo` for plain mode
             # fires after both passes complete (see below, after critique block).
-            for chunk in ollama.chat(
+            for chunk in _chat_stream_dispatch(
                 model=_gen_model,
                 messages=messages,
                 options=_gen_options,
-                stream=True,
                 keep_alive=chat_keep_alive(),
             ):
                 parts.append(chunk.message.content)
@@ -29517,11 +29663,10 @@ def query(
             # with link/ext styling at the end.
             from rich.live import Live
             with Live("", console=console, refresh_per_second=12, transient=True) as live:
-                for chunk in ollama.chat(
+                for chunk in _chat_stream_dispatch(
                     model=_gen_model,
                     messages=messages,
                     options=_gen_options,
-                    stream=True,
                     keep_alive=chat_keep_alive(),
                 ):
                     parts.append(chunk.message.content)
@@ -30953,11 +31098,10 @@ def chat(
         _t_llm_start = time.perf_counter()
         _t_first_token: float | None = None
         with Live(placeholder, console=console, refresh_per_second=12, transient=True) as live:
-            for chunk in ollama.chat(
+            for chunk in _chat_stream_dispatch(
                 model=_chat_model,
                 messages=messages,
                 options=_CLI_CHAT_OPTIONS,
-                stream=True,
                 keep_alive=chat_keep_alive(),
             ):
                 if _t_first_token is None and chunk.message.content:
@@ -34988,7 +35132,7 @@ def _replay_query_row(
                     {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": f"{q}\n\n{context_str}"},
                 ]
-                response = ollama.chat(
+                response = _mlx_chat(
                     model=resolve_chat_model(),
                     messages=msgs,
                     options=CHAT_OPTIONS,
@@ -39186,11 +39330,10 @@ def prep(topic: str, k: int, folder: str | None, save: bool,
     t_start = time.perf_counter()
     parts: list[str] = []
     if plain:
-        for chunk in ollama.chat(
+        for chunk in _chat_stream_dispatch(
             model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
             options=CHAT_OPTIONS,
-            stream=True,
             keep_alive=chat_keep_alive(),
         ):
             parts.append(chunk.message.content)
@@ -39203,11 +39346,10 @@ def prep(topic: str, k: int, folder: str | None, save: bool,
     else:
         with console.status("[dim]armando brief…[/dim]", spinner="dots"):
             # Drain the stream silently first, then redraw with link styling.
-            for chunk in ollama.chat(
+            for chunk in _chat_stream_dispatch(
                 model=resolve_chat_model(),
                 messages=[{"role": "user", "content": prompt}],
                 options=CHAT_OPTIONS,
-                stream=True,
                 keep_alive=chat_keep_alive(),
             ):
                 parts.append(chunk.message.content)
@@ -47245,17 +47387,13 @@ TODAY_BRIEF_OPTIONS = {
 }
 
 
-# Cliente dedicado con timeout MÁS ALTO (120s vs 90s del general). Con
-# qwen2.5:7b warm el inference tarda ~10-15s; cold path puede pegar 30-60s
-# si ollama lo descargó por memory pressure. 120s deja margen sin tener
-# que esperar 3 minutos.
-_TODAY_BRIEF_CLIENT = None
+_TODAY_BRIEF_CLIENT: "_SemaphoredChatClient | None" = None
 
 
-def _today_brief_client():
+def _today_brief_client() -> "_SemaphoredChatClient":
     global _TODAY_BRIEF_CLIENT
     if _TODAY_BRIEF_CLIENT is None:
-        _TODAY_BRIEF_CLIENT = _TimedOllamaProxy(timeout=120.0)
+        _TODAY_BRIEF_CLIENT = _SemaphoredChatClient()
     return _TODAY_BRIEF_CLIENT
 
 
@@ -48690,7 +48828,7 @@ def wake_up(ctx, dry_run: bool, skip_index: bool, skip_bookmarks: bool,
                 # queda en RAM hasta que ollama lo desaloje por presión
                 # de memoria o restart. El primer `rag chat` post-wake-up
                 # no paga el cold-start (~400ms de prefill vs. 5s cold).
-                ollama.chat(
+                _mlx_chat(
                     model=model,
                     messages=[{"role": "user", "content": "."}],
                     options=CHAT_OPTIONS,
@@ -49219,6 +49357,8 @@ def _followup_judge(loop_text: str, candidate_snippet: str) -> tuple[bool, str]:
         raw = resp.message.content.strip()
     except Exception:
         return False, ""
+    from rag.llm_backend import strip_think_blocks
+    raw = strip_think_blocks(raw)
     m = re.search(r"\{.*\}", raw, re.DOTALL)
     if not m:
         return False, ""
@@ -52222,7 +52362,7 @@ def extract_enrich_entities(question: str, answer: str) -> dict:
     # that blew the enrich budget repeatedly. JSON-mode + 160 tokens lands
     # at ~600-900ms warm, well inside the wall ceiling.
     try:
-        rsp = ollama.chat(
+        rsp = _mlx_chat(
             model=resolve_chat_model(),
             messages=[
                 {"role": "system", "content": _ENRICH_HELPER_PROMPT},
@@ -52809,11 +52949,10 @@ def serve(host: str, port: int):
     # query real paga el cold-start del LLM (command-r ~20-30s extra).
     console.print("[dim]Warming up chat model…[/dim]")
     try:
-        for _ in ollama.chat(
+        for _ in _chat_stream_dispatch(
             model=chat_model,
             messages=[{"role": "user", "content": "hi"}],
             options={**CHAT_OPTIONS, "num_predict": 1},
-            stream=True,
             keep_alive=chat_keep_alive(chat_model),
         ):
             pass
@@ -53252,11 +53391,10 @@ def serve(host: str, port: int):
             parts: list[str] = []
             ttft_ms: int | None = None
             try:
-                for chunk in _chat_capped_client().chat(
+                for chunk in _chat_stream_dispatch(
                     model=resolve_chat_model(),
                     messages=messages,
                     options={**CHAT_OPTIONS, "num_predict": tasks_predict_cap},
-                    stream=True,
                     keep_alive=chat_keep_alive(),
                 ):
                     content = chunk.message.content
@@ -53632,10 +53770,10 @@ def serve(host: str, port: int):
 
         t_gen0 = time.perf_counter()
         parts: list[str] = []
-        for chunk in ollama.chat(
+        for chunk in _chat_stream_dispatch(
             model=_serve_gen_model, messages=messages,
             options=_serve_gen_options,
-            stream=True, keep_alive=chat_keep_alive(_serve_gen_model),
+            keep_alive=chat_keep_alive(_serve_gen_model),
         ):
             parts.append(chunk.message.content)
         t_gen = time.perf_counter() - t_gen0
@@ -53842,10 +53980,10 @@ def serve(host: str, port: int):
         t0 = time.perf_counter()
         parts: list[str] = []
         try:
-            for chunk in ollama.chat(
+            for chunk in _chat_stream_dispatch(
                 model=resolve_chat_model(), messages=messages,
                 options={**CHAT_OPTIONS, "num_predict": predict_cap},
-                stream=True, keep_alive=chat_keep_alive(),
+                keep_alive=chat_keep_alive(),
             ):
                 parts.append(chunk.message.content)
         except Exception as exc:
@@ -55206,21 +55344,22 @@ def _cleanup_chat_uploads(*, ttl_days: int | None = None) -> dict:
 
 
 def _check_ollama_health() -> dict:
-    """Verify required Ollama models are available. Returns {model: ok/missing}."""
-    required = [EMBED_MODEL, HELPER_MODEL] + list(CHAT_MODEL_PREFERENCE)
-    status: dict[str, str] = {}
+    """Verify the in-process embedder loads OK.
+
+    Ola 6 cero-Ollama (2026-05-06): post-cutover NO consultamos más a Ollama
+    (chat pasó a MLX, embed pasó a SentenceTransformer in-process). El nombre
+    de la función queda por back-compat con callers; semánticamente ahora
+    chequea `_get_local_embedder()` — única dependencia del modelo de embed.
+
+    Devuelve `{EMBED_MODEL: "ok"}` si carga, `{EMBED_MODEL: "missing"}` si
+    `_get_local_embedder()` retorna None (HF cache no presente, MPS unavailable,
+    etc), `{"error": ...}` si la carga levanta excepción.
+    """
     try:
-        available = {m.model for m in ollama.list().models}
+        model = _get_local_embedder()
     except Exception as e:
         return {"error": str(e)}
-    for model in required:
-        # ollama.list() returns full names; match with and without :latest
-        found = model in available or f"{model}:latest" in available
-        if not found:
-            # Try prefix match (e.g. "command-r" matches "command-r:latest")
-            found = any(a.startswith(model.split(":")[0] + ":") for a in available)
-        status[model] = "ok" if found else "missing"
-    return status
+    return {EMBED_MODEL: "ok" if model is not None else "missing"}
 
 
 def _prune_url_orphans(vault: Path) -> int:
@@ -58834,7 +58973,8 @@ def _behavior_backfill_find_match(
                 rows = conn.execute(
                     f"SELECT id, ts, q, session, paths_json FROM rag_queries"
                     f" WHERE 1=1{_range_where}"
-                    f" ORDER BY ABS(strftime('%s', ts) - strftime('%s', ?)) ASC",
+                    f" ORDER BY ABS(strftime('%s', ts) - strftime('%s', ?)) ASC"
+                    f" LIMIT 50",
                     (*_range_params, orphan_ts),
                 ).fetchall()
                 for r in rows:
@@ -63389,7 +63529,7 @@ from rag.pendientes import (  # noqa: E402, F401
 # imports a handful of helpers from `rag` at module-load time
 # (HELPER_MODEL, _silent_log, propose_calendar_event, etc. — all defined
 # earlier in this file). Internal callers of monkey-patched names
-# (_ocrmac_module, _ocr_image, _vlm_client, _VLM_CAPTION_MAX_PER_RUN,
+# (_ocrmac_module, _ocr_image, _vlm_describe, _VLM_CAPTION_MAX_PER_RUN,
 # _detect_cita_from_ocr) resolve via `rag.<X>` so test patches propagate.
 #
 # The `_ocrmac_module` and `_ocrmac_import_attempted` globals live on the
@@ -63432,10 +63572,18 @@ from rag.ocr import (  # noqa: E402, F401
     _vlm_caption_budget_reset,
     _vlm_caption_calls_used,
     _vlm_caption_enabled,
-    _VLM_CLIENT,
-    _vlm_client,
-    _vlm_model_missing_warned,
+    _vlm_describe,
+    _vlm_idle_unload,
+    _vlm_load,
+    _VLM_LAST_USED,
+    _VLM_LOCK,
+    _VLM_MODEL_OBJ,
+    _VLM_PROCESSOR,
 )
+# _VLM_CLIENT was removed from rag.ocr when the VLM backend migrated from
+# Ollama (ollama.Client singleton) to MLX-VLM (mlx_vlm.generate calls).
+# The re-export shim above no longer needs to pull it; leaving this comment
+# as a breadcrumb in case older code still references the symbol.
 
 
 # ── Phase 1b: integrations re-export shim (2026-04-25) ───────────────────────

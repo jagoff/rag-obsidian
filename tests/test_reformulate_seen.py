@@ -48,7 +48,7 @@ def test_reformulate_no_history_no_summary_returns_input(monkeypatch):
         called["n"] += 1
         raise AssertionError("LLM should not be called")
 
-    monkeypatch.setattr(rag.ollama, "chat", _fake_chat)
+    monkeypatch.setattr(rag, "_mlx_chat", _fake_chat)
     out = rag.reformulate_query("qué es X", [], summary=None)
     assert out == "qué es X"
     assert called["n"] == 0
@@ -75,7 +75,7 @@ def test_reformulate_accepts_seen_titles_kwarg(monkeypatch):
         captured["prompt"] = messages[0]["content"]
         return _Resp("out")
 
-    monkeypatch.setattr(rag.ollama, "chat", _fake_chat)
+    monkeypatch.setattr(rag, "_mlx_chat", _fake_chat)
     monkeypatch.setattr(rag, "_postprocess_reformulation",
                         lambda q, raw, hist: raw)
     history = [{"role": "user", "content": "x"}]
@@ -118,7 +118,7 @@ def test_reformulate_no_retry_on_timeout(monkeypatch):
         calls["n"] += 1
         raise Exception("timed out")
 
-    monkeypatch.setattr(rag.ollama, "chat", _fake_chat)
+    monkeypatch.setattr(rag, "_mlx_chat", _fake_chat)
     monkeypatch.setattr(rag, "_postprocess_reformulation",
                         lambda q, raw, hist: raw)
     import unittest.mock as mock
@@ -147,7 +147,7 @@ def test_reformulate_retries_once_on_503(monkeypatch):
             raise Exception("server busy, please try again. maximum pending requests exceeded (status code: 503)")
         return _make_fake_resp("reformulada ok")
 
-    monkeypatch.setattr(rag.ollama, "chat", _fake_chat)
+    monkeypatch.setattr(rag, "_mlx_chat", _fake_chat)
     monkeypatch.setattr(rag, "_postprocess_reformulation",
                         lambda q, raw, hist: raw)
     import unittest.mock as mock
@@ -184,7 +184,7 @@ def test_reformulate_degrades_after_503_failures(monkeypatch):
 
     # _silent_log se invoca como _silent_log(where, exc) — aceptar **kw
     # defensivo. Real signature: _silent_log(where: str, exc: Exception | None).
-    monkeypatch.setattr(rag.ollama, "chat", _fake_chat)
+    monkeypatch.setattr(rag, "_mlx_chat", _fake_chat)
     monkeypatch.setattr(rag, "_silent_log", _fake_silent_log)
     # Hack: el monkeypatch de _silent_log con _fake_silent_log no respeta
     # la signature real (sólo 2 args). El módulo lo invoca con 2 args
@@ -218,7 +218,7 @@ def test_reformulate_no_retry_on_non_503(monkeypatch):
             calls["n"] += 1
             raise Exception(exc_msg)
 
-        monkeypatch.setattr(rag.ollama, "chat", _fake_chat)
+        monkeypatch.setattr(rag, "_mlx_chat", _fake_chat)
         monkeypatch.setattr(rag, "_silent_log", lambda *a, **k: None)
         import unittest.mock as mock
         with mock.patch("time.sleep"):
@@ -246,7 +246,7 @@ def test_reformulate_succeeds_on_third_retry(monkeypatch):
             raise Exception("server busy, please try again. maximum pending requests exceeded (status code: 503)")
         return _make_fake_resp("reformulada ok tras 3 retries")
 
-    monkeypatch.setattr(rag.ollama, "chat", _fake_chat)
+    monkeypatch.setattr(rag, "_mlx_chat", _fake_chat)
     monkeypatch.setattr(rag, "_postprocess_reformulation",
                         lambda q, raw, hist: raw)
     import unittest.mock as mock
@@ -267,7 +267,7 @@ def test_reformulate_no_retry_without_history(monkeypatch):
     def _fake_chat(**kwargs):
         calls["n"] += 1
 
-    monkeypatch.setattr(rag.ollama, "chat", _fake_chat)
+    monkeypatch.setattr(rag, "_mlx_chat", _fake_chat)
     result = rag.reformulate_query("standalone query", [])
     assert result == "standalone query"
     assert calls["n"] == 0

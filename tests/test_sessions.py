@@ -525,7 +525,7 @@ def test_reformulate_query_includes_summary_section(monkeypatch):
         captured["prompt"] = messages[0]["content"]
         return FakeResp("reformulado")
 
-    monkeypatch.setattr(rag.ollama, "chat", fake_chat)
+    monkeypatch.setattr(rag, "_mlx_chat", fake_chat)
     history = [
         {"role": "user", "content": "hola"},
         {"role": "assistant", "content": "que tal"},
@@ -551,7 +551,7 @@ def test_reformulate_query_no_summary_baseline(monkeypatch):
         captured["prompt"] = messages[0]["content"]
         return FakeResp("reformulado")
 
-    monkeypatch.setattr(rag.ollama, "chat", fake_chat)
+    monkeypatch.setattr(rag, "_mlx_chat", fake_chat)
     rag.reformulate_query(
         "y eso?",
         [{"role": "user", "content": "hola"}],
@@ -579,7 +579,7 @@ def test_reformulate_query_works_with_summary_only(monkeypatch):
         captured["prompt"] = messages[0]["content"]
         return FakeResp("ok")
 
-    monkeypatch.setattr(rag.ollama, "chat", fake_chat)
+    monkeypatch.setattr(rag, "_mlx_chat", fake_chat)
     out = rag.reformulate_query("y eso?", [], summary="contexto previo")
     assert out == "ok"
     assert "contexto previo" in captured["prompt"]

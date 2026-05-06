@@ -85,6 +85,9 @@ def _watch_plist(rag_bin: str) -> str:
   <dict>
     <key>HOME</key><string>{Path.home()}</string>
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>RAG_INDEX_LOCAL_EMBED</key><string>1</string>
+    <key>HF_HUB_OFFLINE</key><string>1</string>
+    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -111,19 +114,22 @@ def _serve_plist(rag_bin: str) -> str:
     chat model warm in memory so each request skips the ~5-10s subprocess
     cold-start that listener.ts's fallback pays per message.
 
-    Env vars mirror the web plist: OLLAMA_KEEP_ALIVE=-1 (models pinned in
-    VRAM forever), RAG_RERANKER_NEVER_UNLOAD=1 (cross-encoder stays resident,
-    no 9s reload after idle eviction), RAG_LOCAL_EMBED=1 (in-process
-    SentenceTransformer for query embedding, ~10-30ms vs ~140ms via ollama
-    HTTP), RAG_STATE_SQL=1 (deployment symmetry — no-op post-T10),
+    Env vars mirror the web plist: RAG_RERANKER_NEVER_UNLOAD=1 (cross-encoder
+    stays resident, no 9s reload after idle eviction), RAG_LOCAL_EMBED=1
+    (in-process SentenceTransformer for query embedding, ~10-30ms vs ~140ms
+    via HTTP), RAG_STATE_SQL=1 (deployment symmetry — no-op post-T10),
     HF_HUB_OFFLINE=1 + TRANSFORMERS_OFFLINE=1 (close the race where HEAD
     probes to huggingface.co fire BEFORE rag.py's module-init setdefault —
     see test_plist_web_serve.py for rationale; was causing 64× [local-embed]
-    unavailable + fallback-to-ollama in web.error.log pre-2026-04-22),
+    unavailable in web.error.log pre-2026-04-22),
     RAG_MEMORY_PRESSURE_INTERVAL=20 (the default 60s missed the MPS-OOM
     window measured in web.error.log; 20s gives the watchdog 3 samples per
     minute to catch memory pressure before Metal returns
     `kIOGPUCommandBufferCallbackErrorOutOfMemory`).
+
+    Post-2026-05-06 (Ola 6 cero-Ollama): OLLAMA_KEEP_ALIVE y
+    OLLAMA_MAX_LOADED_MODELS removidos — no hay daemon Ollama al que
+    keep-alivear (modelos chat purgados del disco).
 
     KeepAlive + RunAtLoad mean launchd will resurrect it if it crashes or
     the host reboots. ThrottleInterval=30 prevents crash loops from burning
@@ -148,8 +154,6 @@ def _serve_plist(rag_bin: str) -> str:
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
     <key>PYTHONUNBUFFERED</key><string>1</string>
-    <key>OLLAMA_KEEP_ALIVE</key><string>20m</string>
-    <key>OLLAMA_MAX_LOADED_MODELS</key><string>2</string>
     <key>RAG_RERANKER_NEVER_UNLOAD</key><string>1</string>
     <key>RAG_LOCAL_EMBED</key><string>1</string>
     <key>RAG_STATE_SQL</key><string>1</string>
@@ -157,6 +161,7 @@ def _serve_plist(rag_bin: str) -> str:
     <key>TRANSFORMERS_OFFLINE</key><string>1</string>
     <key>FASTEMBED_CACHE_PATH</key><string>{Path.home()}/.cache/fastembed</string>
     <key>RAG_MEMORY_PRESSURE_INTERVAL</key><string>20</string>
+    <key>RAG_LLM_BACKEND</key><string>mlx</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -246,8 +251,6 @@ def _web_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>PYTHONUNBUFFERED</key><string>1</string>
     <key>OBSIDIAN_RAG_WEB_CHAT_MODEL</key><string>{chat_model}</string>
-    <key>OLLAMA_KEEP_ALIVE</key><string>20m</string>
-    <key>OLLAMA_MAX_LOADED_MODELS</key><string>2</string>
     <key>RAG_LOCAL_EMBED</key><string>1</string>
     <key>RAG_RERANKER_NEVER_UNLOAD</key><string>1</string>
     <key>RAG_STATE_SQL</key><string>1</string>
@@ -256,8 +259,10 @@ def _web_plist(rag_bin: str) -> str:
     <key>FASTEMBED_CACHE_PATH</key><string>{Path.home()}/.cache/fastembed</string>
     <key>RAG_MEMORY_PRESSURE_INTERVAL</key><string>20</string>
     <key>RAG_MEMORY_PRESSURE_THRESHOLD</key><string>80</string>
+    <key>RAG_MEMORY_PRESSURE_SWAP_GB</key><string>8.0</string>
     <key>RAG_AUTO_FIX_WORKER</key><string>1</string>
     <key>RAG_AUTO_FIX_HOURLY_CAP</key><string>12</string>
+    <key>RAG_LLM_BACKEND</key><string>mlx</string>
 {yt_line}  </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -297,6 +302,7 @@ def _digest_plist(rag_bin: str, hour: int = 22, minute: int = 0) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
+    <key>RAG_LLM_BACKEND</key><string>mlx</string>
   </dict>
   <key>StartCalendarInterval</key>
   <dict>
@@ -349,6 +355,7 @@ def _morning_plist(rag_bin: str, hour: int = 7, minute: int = 0) -> str:
     <key>TERM</key><string>dumb</string>
     <key>RAG_EXPLORE</key><string>1</string>
     <key>RAG_MORNING_VOICE</key><string></string>
+    <key>RAG_LLM_BACKEND</key><string>mlx</string>
   </dict>
   <key>StartCalendarInterval</key>
   <array>
@@ -393,6 +400,7 @@ def _today_plist(rag_bin: str, hour: int = 22, minute: int = 0) -> str:
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
     <key>RAG_EXPLORE</key><string>1</string>
+    <key>RAG_LLM_BACKEND</key><string>mlx</string>
   </dict>
   <key>StartCalendarInterval</key>
   <array>
@@ -447,6 +455,7 @@ def _wa_fast_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
+    <key>RAG_LLM_BACKEND</key><string>mlx</string>
   </dict>
   <key>StartInterval</key><integer>300</integer>
   <key>RunAtLoad</key><false/>
@@ -479,6 +488,7 @@ def _emergent_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
+    <key>RAG_LLM_BACKEND</key><string>mlx</string>
   </dict>
   <key>StartCalendarInterval</key>
   <dict>
@@ -518,6 +528,7 @@ def _patterns_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
+    <key>RAG_LLM_BACKEND</key><string>mlx</string>
   </dict>
   <key>StartCalendarInterval</key>
   <dict>
@@ -556,6 +567,7 @@ def _archive_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
+    <key>RAG_LLM_BACKEND</key><string>mlx</string>
   </dict>
   <key>StartCalendarInterval</key>
   <dict>
@@ -636,8 +648,8 @@ def _consolidate_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
-    <key>OLLAMA_KEEP_ALIVE</key><string>20m</string>
     <key>RAG_STATE_SQL</key><string>1</string>
+    <key>RAG_LLM_BACKEND</key><string>mlx</string>
   </dict>
   <key>StartCalendarInterval</key>
   <dict>
@@ -739,6 +751,7 @@ def _anticipate_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
+    <key>RAG_LLM_BACKEND</key><string>mlx</string>
   </dict>
   <key>StartInterval</key><integer>600</integer>
   <key>RunAtLoad</key><false/>
@@ -897,6 +910,7 @@ def _auto_harvest_plist(rag_bin: str) -> str:
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
     <key>RAG_STATE_SQL</key><string>1</string>
+    <key>RAG_LLM_BACKEND</key><string>mlx</string>
   </dict>
   <key>StartCalendarInterval</key>
   <dict>
@@ -944,6 +958,7 @@ def _active_learning_nudge_plist(rag_bin: str) -> str:
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
     <key>RAG_STATE_SQL</key><string>1</string>
+    <key>RAG_LLM_BACKEND</key><string>mlx</string>
   </dict>
   <key>StartCalendarInterval</key>
   <dict>
@@ -1001,6 +1016,7 @@ def _online_tune_plist(rag_bin: str) -> str:
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
     <key>RAG_EVAL_GATE_TIMEOUT_S</key><string>2400</string>
+    <key>RAG_LLM_BACKEND</key><string>mlx</string>
   </dict>
   <key>StartCalendarInterval</key>
   <dict>
@@ -1093,9 +1109,9 @@ def _ingest_whatsapp_plist(rag_bin: str) -> str:
     "último mensaje de X" no se sientan stale, y lo suficientemente spaced
     para no competir con watch/serve en CPU.
 
-    `OLLAMA_KEEP_ALIVE=-1` pin's bge-m3 en VRAM para que el embed batch no
-    pague cold-load en cada run. RAG_LOCAL_EMBED NO se setea (el ingester es
-    bulk-embed path → ollama HTTP es el único batching-capable backend).
+    `RAG_INDEX_LOCAL_EMBED=1` (Ola 6, 2026-05-06 cero-Ollama): embedder
+    in-process siempre activo. Reemplaza el bulk-embed path via Ollama HTTP
+    que requería `OLLAMA_KEEP_ALIVE=-1` para pin bge-m3 en VRAM.
 
     `RunAtLoad=true` (2026-04-22): garantiza run inmediato al instalar o
     post-reboot; sin esto el primer refresh se demoraba hasta 15min tras
@@ -1121,7 +1137,9 @@ def _ingest_whatsapp_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
-    <key>OLLAMA_KEEP_ALIVE</key><string>20m</string>
+    <key>RAG_INDEX_LOCAL_EMBED</key><string>1</string>
+    <key>HF_HUB_OFFLINE</key><string>1</string>
+    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
   </dict>
   <key>StartInterval</key><integer>900</integer>
   <key>RunAtLoad</key><true/>
@@ -1170,7 +1188,9 @@ def _ingest_cross_source_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
-    <key>OLLAMA_KEEP_ALIVE</key><string>20m</string>
+    <key>RAG_INDEX_LOCAL_EMBED</key><string>1</string>
+    <key>HF_HUB_OFFLINE</key><string>1</string>
+    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
   </dict>
   <key>StartInterval</key><integer>3600</integer>
   <key>RunAtLoad</key><true/>
@@ -1213,7 +1233,9 @@ def _ingest_gmail_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
-    <key>OLLAMA_KEEP_ALIVE</key><string>20m</string>
+    <key>RAG_INDEX_LOCAL_EMBED</key><string>1</string>
+    <key>HF_HUB_OFFLINE</key><string>1</string>
+    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
   </dict>
   <key>StartInterval</key><integer>3600</integer>
   <key>RunAtLoad</key><true/>
@@ -1257,7 +1279,9 @@ def _ingest_calendar_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
-    <key>OLLAMA_KEEP_ALIVE</key><string>20m</string>
+    <key>RAG_INDEX_LOCAL_EMBED</key><string>1</string>
+    <key>HF_HUB_OFFLINE</key><string>1</string>
+    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
   </dict>
   <key>StartInterval</key><integer>3600</integer>
   <key>RunAtLoad</key><true/>
@@ -1306,7 +1330,9 @@ def _ingest_reminders_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
-    <key>OLLAMA_KEEP_ALIVE</key><string>20m</string>
+    <key>RAG_INDEX_LOCAL_EMBED</key><string>1</string>
+    <key>HF_HUB_OFFLINE</key><string>1</string>
+    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
   </dict>
   <key>StartInterval</key><integer>3600</integer>
   <key>RunAtLoad</key><true/>
@@ -1338,6 +1364,9 @@ def _ingest_calls_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
+    <key>RAG_INDEX_LOCAL_EMBED</key><string>1</string>
+    <key>HF_HUB_OFFLINE</key><string>1</string>
+    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
   </dict>
   <key>StartCalendarInterval</key>
   <array>
@@ -1386,6 +1415,9 @@ def _ingest_safari_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
+    <key>RAG_INDEX_LOCAL_EMBED</key><string>1</string>
+    <key>HF_HUB_OFFLINE</key><string>1</string>
+    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
   </dict>
   <key>StartCalendarInterval</key>
   <array>
@@ -1434,6 +1466,9 @@ def _ingest_drive_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
+    <key>RAG_INDEX_LOCAL_EMBED</key><string>1</string>
+    <key>HF_HUB_OFFLINE</key><string>1</string>
+    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
   </dict>
   <key>StartCalendarInterval</key>
   <array>
@@ -1489,6 +1524,9 @@ def _ingest_pillow_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
+    <key>RAG_INDEX_LOCAL_EMBED</key><string>1</string>
+    <key>HF_HUB_OFFLINE</key><string>1</string>
+    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
   </dict>
   <key>StartCalendarInterval</key>
   <dict>
@@ -1557,6 +1595,52 @@ def _mood_poll_plist(rag_bin: str) -> str:
   <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/mood-poll.log</string>
   <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/mood-poll.error.log</string>
   <key>ThrottleInterval</key><integer>60</integer>
+</dict>
+</plist>
+"""
+
+
+def _spotify_poll_plist(rag_bin: str) -> str:
+    """Spotify poller — corre `scripts/spotify_poll.py` cada 60s para
+    grabar el track actualmente en reproducción en `rag_spotify_log`.
+
+    Lógica: script llama `record_now_playing()` desde rag.integrations.
+    Comportamiento esperado:
+      - Si Spotify está cerrado o paused → sale silently (exit 0, no log)
+      - Si hay un track en reproducción → graba a DB + stdout JSON
+
+    No hay opt-in — siempre activo si el plist está cargado. Los datos
+    se usan para context en briefs ("escuchabas X ayer") y futuro mood
+    scoring.
+
+    `RunAtLoad=true` para que bootstrap lance inmediatamente sin esperar
+    60s al primer tick.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    poll_script = repo_root / "scripts" / "spotify_poll.py"
+    uv_python = Path.home() / ".local/share/uv/tools/obsidian-rag/bin/python3"
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-spotify-poll</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{uv_python}</string>
+    <string>{poll_script}</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>RAG_STATE_SQL</key><string>1</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+  </dict>
+  <key>StartInterval</key><integer>60</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/spotify-poll.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/spotify-poll.error.log</string>
 </dict>
 </plist>
 """
@@ -1680,7 +1764,7 @@ def _wake_up_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
-    <key>OLLAMA_KEEP_ALIVE</key><string>20m</string>
+    <key>RAG_LLM_BACKEND</key><string>mlx</string>
   </dict>
   <key>StartCalendarInterval</key>
   <dict>
@@ -1787,6 +1871,7 @@ def _brief_auto_tune_plist(rag_bin: str) -> str:
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
     <key>RAG_STATE_SQL</key><string>1</string>
+    <key>RAG_LLM_BACKEND</key><string>mlx</string>
   </dict>
   <key>StartCalendarInterval</key>
   <dict>
@@ -2083,6 +2168,9 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
         ("com.fer.obsidian-rag-whisper-vocab",
          "com.fer.obsidian-rag-whisper-vocab.plist",
          _whisper_vocab_plist(rag_bin)),
+        ("com.fer.obsidian-rag-spotify-poll",
+         "com.fer.obsidian-rag-spotify-poll.plist",
+         _spotify_poll_plist(rag_bin)),
         # ── DEPRECATED 2026-05-01: `com.fer.obsidian-rag-serve-watchdog` ──
         # Servía para healthcheck del `rag serve` (port 7832), removido
         # cuando bajamos `com.fer.obsidian-rag-serve`. Ver doc-block
@@ -2209,7 +2297,6 @@ def _services_spec_manual() -> list[dict]:
     """
     return [
         {"label": "com.fer.obsidian-rag-synth-refresh", "category": "manual_keep"},
-        {"label": "com.fer.obsidian-rag-spotify-poll", "category": "manual_keep"},
         {"label": "com.fer.obsidian-rag-log-rotate", "category": "manual_keep"},
     ]
 

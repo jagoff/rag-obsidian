@@ -54,6 +54,13 @@ Para cambiar cualquier default: setear el env var en el shell antes de invocar e
 | `RAG_VLM_CAPTION` | `1` | `rag.py:19306` | Activa captioning de imágenes embebidas via VLM (qwen2.5-vl). OCR via Apple Vision sigue siendo el path default — VLM es complementario. |
 | `RAG_WIKILINK_EXPANSION` | `1` | `rag.py:9092` | Expande wikilinks en el CONTEXT del retrieve (resolver link targets a body). Experimental. |
 
+## MLX backend
+
+| Variable | Default | Ubicación | Qué hace |
+|---|---|---|---|
+| `RAG_MLX_IDLE_TTL` | `1800` (30min) | `rag/llm_backend.py` | Segundos de inactividad antes de que el watchdog evicte un modelo de `_loaded` + libere Metal cache. Setear `0` para deshabilitar. Análogo a `RAG_RERANKER_IDLE_TTL`. |
+| `RAG_MLX_IDLE_DISABLE` | `""` (off) | `rag/llm_backend.py` | Setear `1` para deshabilitar el watchdog thread sin cambiar el TTL (útil para tests / debug). |
+
 ## Infraestructura / internal
 
 | Variable | Default | Ubicación | Qué hace |
@@ -66,6 +73,7 @@ Para cambiar cualquier default: setear el env var en el shell antes de invocar e
 | `RAG_POSTPROCESS_MODEL` | `""` | `rag.py:135` | Override del model LLM usado en stages de postprocess (critique, NLI repair). Default = chat model. |
 | `RAG_RERANKER_FT_PATH` | `""` (off) | `rag.py:10878` | Path al cross-encoder fine-tuned (gate GC#2.C). Cuando hay model promovido, apunta al symlink `~/.cache/obsidian-rag/reranker-ft-current`. |
 | `RAG_RETRIEVE_TIMING` | `""` (off) | `rag.py` | Debug — dump per-stage timing breakdown de `retrieve()` a stderr. |
+| `RAG_LLM_BACKEND` | `mlx` | `rag/llm_backend.py:728` | Dispatch backend para chat (LLM generation). Valores: `ollama` (legacy Ollama API), `mlx` (Apple Silicon MLX native, default post-2026-05-05). Rollback: `RAG_LLM_BACKEND=ollama` en shell o plist. Cada invocación de dispatch setea el ContextVar `_ACTIVE_BACKEND_CTX` (`rag/__init__.py`); `log_query_event` lo lee y lo persiste en `rag_queries.extra_json` como campos `backend`, `fallback_reason`, `backend_active`. Query de verificación: `SELECT json_extract(extra_json,'$.backend'), COUNT(*) FROM rag_queries WHERE ts > datetime('now','-1 day') GROUP BY 1`. |
 | `RAG_STATE_SQL` | `1` | `rag.py` | Historicamente activaba el SQL path. Post-T10 es no-op, setear en plists para trail. |
 | `RAG_TRACK_OPENS` | `""` (off) | `rag.py` | Switch del OSC-8 terminal link scheme de `file://` a `x-rag-open://`. Opt-in para trackeo de clicks. |
 | `YOUTUBE_API_KEY` | `""` | `rag.py:36770` | API key opcional para YouTube transcript fetching. Sin esto, el fallback es `yt-dlp --write-auto-sub`. |

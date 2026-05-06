@@ -116,7 +116,7 @@ def test_chat_remind_inline_emits_created_sse(monkeypatch):
     create_mock = MagicMock(return_value=(True, "x-apple-reminderkit://ABC-123"))
     monkeypatch.setattr(rag, "_create_reminder", create_mock)
     # Disable rate limit + ollama probe — defensivo.
-    monkeypatch.setattr(server_mod, "_ollama_alive", lambda timeout=2.0: True)
+
 
     client = TestClient(app)
     resp = client.post(
@@ -175,7 +175,7 @@ def test_chat_remind_inline_calls_create_reminder_with_correct_args(monkeypatch)
         return True, f"id-{len(captured)}"
 
     monkeypatch.setattr(rag, "_create_reminder", fake_create)
-    monkeypatch.setattr(server_mod, "_ollama_alive", lambda timeout=2.0: True)
+
 
     client = TestClient(app)
     resp = client.post(
@@ -196,7 +196,7 @@ def test_chat_remind_inline_does_not_fire_for_normal_question(monkeypatch):
     """Una pregunta NO-recordatorio NO debe disparar `_create_reminder`."""
     create_mock = MagicMock()
     monkeypatch.setattr(rag, "_create_reminder", create_mock)
-    monkeypatch.setattr(server_mod, "_ollama_alive", lambda timeout=2.0: True)
+
     # El flow normal va a llamar muchísimas cosas (retrieve, etc.) que
     # no queremos ejercer acá. Stub `multi_retrieve` para que devuelva
     # algo barato.
@@ -208,8 +208,6 @@ def test_chat_remind_inline_does_not_fire_for_normal_question(monkeypatch):
     monkeypatch.setattr(server_mod, "save_session", lambda sess: None)
     monkeypatch.setattr(server_mod, "log_query_event", lambda ev: None)
     # Bypass del LLM call también — ollama.chat puede no estar.
-    monkeypatch.setattr(server_mod, "_ollama_chat_probe", lambda timeout_s=6.0: True)
-
     client = TestClient(app)
     resp = client.post(
         "/api/chat",

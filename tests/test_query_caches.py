@@ -2,7 +2,7 @@
 
 Los caches viven in-process: chat multi-turn y bots persistentes repiten
 paraphrases idénticas (qwen2.5:3b con seed=42 → determinístico) y embeddings
-de las mismas variantes — cachear ahorra llamadas a ollama.
+de las mismas variantes — cachear ahorra llamadas al embedder local.
 
 El conftest.py autouse limpia ambos caches entre tests, así que cada caso
 arranca con dict vacío.
@@ -10,16 +10,12 @@ arranca con dict vacío.
 import json
 import threading
 
+import numpy as np
 import pytest
 import rag
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-
-
-class _FakeEmbedResp:
-    def __init__(self, vectors):
-        self.embeddings = vectors
 
 
 class _FakeMessage:
@@ -42,16 +38,22 @@ def _vec_for(text: str) -> list[float]:
 
 @pytest.fixture
 def fake_embed(monkeypatch):
-    """Mock ollama.embed contando llamadas y los inputs solicitados."""
+    """Mock del embedder local contando llamadas y los inputs solicitados.
+
+    Ola 6 cero-Ollama: embed() ya no llama ollama.embed. Mockeamos
+    _index_embed_local() para que retorne un FakeEmbedder con .encode().
+    """
     state = {"calls": 0, "inputs": []}
 
-    def fake(**kwargs):
-        state["calls"] += 1
-        inputs = list(kwargs.get("input", []))
-        state["inputs"].append(inputs)
-        return _FakeEmbedResp([_vec_for(t) for t in inputs])
+    class _FakeEmbedder:
+        def encode(self, texts, normalize_embeddings=True, batch_size=64,
+                   convert_to_numpy=True, show_progress_bar=False):
+            state["calls"] += 1
+            state["inputs"].append(list(texts))
+            return np.array([_vec_for(t) for t in texts])
 
-    monkeypatch.setattr(rag.ollama, "embed", fake)
+    _instance = _FakeEmbedder()
+    monkeypatch.setattr(rag, "_index_embed_local", lambda: _instance)
     return state
 
 
@@ -60,7 +62,7 @@ def test_empty_input_short_circuits(fake_embed):
     assert fake_embed["calls"] == 0
 
 
-def test_second_call_same_input_does_not_invoke_ollama(fake_embed):
+def test_second_call_same_input_does_not_invoke_embedder(fake_embed):
     out1 = rag.embed(["hola mundo"])
     out2 = rag.embed(["hola mundo"])
     assert out1 == out2
@@ -80,7 +82,7 @@ def test_partial_hit_only_sends_missing(fake_embed):
     assert out == [_vec_for("a"), _vec_for("c"), _vec_for("b"), _vec_for("d")]
 
 
-def test_repeated_string_in_one_call_only_sent_once_to_ollama(fake_embed):
+def test_repeated_string_in_one_call_only_sent_once_to_embedder(fake_embed):
     # Si el caller pasa el mismo texto dos veces, el dict de cache no
     # explota y ambas posiciones reciben el mismo vector.
     out = rag.embed(["x", "x"])
@@ -170,7 +172,7 @@ def fake_chat(monkeypatch):
         state["calls"] += 1
         return _FakeChatResp(state["next_response"])
 
-    monkeypatch.setattr(rag.ollama, "chat", fake)
+    monkeypatch.setattr(rag, "_mlx_chat", fake)
     return state
 
 
@@ -199,7 +201,7 @@ def test_expand_failure_does_not_pollute_cache(monkeypatch):
     def boom(**kwargs):
         raise RuntimeError("ollama down")
 
-    monkeypatch.setattr(rag.ollama, "chat", boom)
+    monkeypatch.setattr(rag, "_mlx_chat", boom)
     out = rag.expand_queries("query rota")
     assert out == ["query rota"]
     assert "query rota" not in rag._expand_cache

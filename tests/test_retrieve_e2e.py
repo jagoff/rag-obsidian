@@ -15,10 +15,10 @@ Run it:
     RAG_RUN_E2E=1 .venv/bin/python -m pytest tests/test_retrieve_e2e.py -q
 
 If the gate is off (default), the whole module skips. We prefer an env flag
-over a `try-import ollama`-style auto-detect because the latter would
-silently run in dev envs that have ollama up but no bge-m3 pulled, and
-fail with confusing `ollama._types.ResponseError`. Explicit opt-in keeps
-the skip signal clean.
+over a `try-import <backend>`-style auto-detect because the latter would
+silently run in dev envs that have the LLM backend up but no models pulled,
+and fail with confusing import-time errors. Explicit opt-in keeps the skip
+signal clean.
 """
 from __future__ import annotations
 
@@ -32,8 +32,9 @@ os.environ.setdefault("RAG_MEMORY_PRESSURE_DISABLE", "1")
 pytestmark = pytest.mark.skipif(
     not os.environ.get("RAG_RUN_E2E"),
     reason=(
-        "End-to-end retrieve test — requires ollama + bge-m3 + "
-        "bge-reranker-v2-m3 + qwen2.5:3b. Opt in with RAG_RUN_E2E=1."
+        "End-to-end retrieve test — requires MLX models + bge-m3 + "
+        "bge-reranker-v2-m3 + Qwen2.5-3B-Instruct-4bit. Opt in with "
+        "RAG_RUN_E2E=1."
     ),
 )
 

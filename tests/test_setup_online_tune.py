@@ -223,21 +223,17 @@ def test_serve_plist_port_7832_and_keepalive():
 
 
 def test_serve_plist_warm_model_env():
-    """Serve exists to keep models warm — without these env vars the
-    whole point of the service evaporates (reranker unloads after 15min
-    idle, bge-m3 pays HTTP round-trip, ollama drops the chat model).
+    """Serve existe para mantener reranker + embedder in-process warm.
 
-    Nota 2026-04-30: rolleamos `OLLAMA_KEEP_ALIVE -1 → 20m` (commit
-    `4f7e41f`). Razón: con `-1` + `OLLAMA_MAX_LOADED_MODELS=3` los 3
-    modelos pinned forever saturaban unified memory de 36 GB, MPS
-    swappeaba y tokens/s caían 10×. Con `20m` el secundario se descarga
-    si idle, el principal se mantiene warm porque siempre se usa.
-    Mejora 4-10× end-to-end (RagNet 41-90s → 14-23s).
+    Ola 6 cero-Ollama (2026-05-06): OLLAMA_KEEP_ALIVE y
+    OLLAMA_MAX_LOADED_MODELS removidos — no hay daemon Ollama que
+    keep-alivear. RAG_LLM_BACKEND=mlx reemplaza la función de calentar
+    chat model.
     """
     d = _parse_plist(rag_module._serve_plist(RAG_BIN))
     env = d.get("EnvironmentVariables", {})
-    assert env.get("OLLAMA_KEEP_ALIVE") == "20m"
-    assert env.get("OLLAMA_MAX_LOADED_MODELS") == "2"
+    assert "OLLAMA_KEEP_ALIVE" not in env
+    assert "OLLAMA_MAX_LOADED_MODELS" not in env
     assert env.get("RAG_RERANKER_NEVER_UNLOAD") == "1"
     assert env.get("RAG_LOCAL_EMBED") == "1"
 
@@ -295,7 +291,9 @@ def test_services_spec_total_count():
     # Net: 35 → 28 services.
     # 2026-05-04 (PM): +1 distill-conversations weekly (semanal Sunday 02:00).
     # Net: 28 → 29.
-    assert len(specs) == 29
+    # 2026-05-06 (Ola 6): +1 spotify-poll.
+    # Net: 29 → 30.
+    assert len(specs) == 30
 
 
 def test_services_spec_includes_maintenance():
@@ -418,14 +416,12 @@ def test_ingester_plist_valid_plist(fn_name, expected_source, expected_interval)
     #    "qué tengo esta semana" con data stale.
     assert d["RunAtLoad"] is True
 
-    # 6. OLLAMA_KEEP_ALIVE=20m en env — el ingester emite un batch de embeds
-    #    con bge-m3; sin un keep-alive, cada corrida paga cold-load.
-    #    Pre-2026-04-30 era `-1` (pin forever) pero saturaba unified
-    #    memory junto con qwen2.5:7b + qwen2.5:3b. Rolleamos a 20m + cap
-    #    `MAX_LOADED_MODELS=2`. Detalle en commit `4f7e41f` y en el
-    #    docstring del módulo de configuración keep-alive.
+    # 6. RAG_INDEX_LOCAL_EMBED=1 en env — Ola 6 cero-Ollama (2026-05-06):
+    #    el ingester embeds se hacen in-process con SentenceTransformer.
+    #    OLLAMA_KEEP_ALIVE ya no aplica — no hay daemon Ollama que keep-alivear.
     env = d.get("EnvironmentVariables", {})
-    assert env.get("OLLAMA_KEEP_ALIVE") == "20m"
+    assert env.get("RAG_INDEX_LOCAL_EMBED") == "1"
+    assert "OLLAMA_KEEP_ALIVE" not in env
 
 
 def test_ingester_plists_log_paths_distinct():

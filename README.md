@@ -31,7 +31,9 @@ RAG local sobre el vault de Obsidian, fully local: sqlite-vec + Ollama + sentenc
 
 ## Qué es y cómo se compone
 
-Una sola CLI (`rag`) sobre `~/repositories/obsidian-rag/rag.py` (~5500 líneas) + un MCP server (`obsidian-rag-mcp`) sobre `mcp_server.py`.
+Una sola CLI (`rag`) sobre el paquete `~/repositories/obsidian-rag/rag/` (`__init__.py` ~64k LOC core + sub-módulos especializados, post-split 2026-05-04) + un MCP server (`obsidian-rag-mcp`) sobre `mcp_server.py`.
+
+> **Nota MLX cutover (2026-05-06)**: el stack chat migró de Ollama a [MLX](https://github.com/ml-explore/mlx-lm). Default `RAG_LLM_BACKEND=mlx`. Solo `qwen3-embedding:0.6b` sigue corriendo en Ollama. Las tablas y diagramas de abajo aún muestran nombres `qwen2.5:Xb` / `command-r` por compatibilidad de helper bindings — bajo MLX se resuelven a sus equivalentes 4bit ([`Qwen2.5-3B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-3B-Instruct-4bit), [`Qwen2.5-7B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-7B-Instruct-4bit), [`Qwen3-30B-A3B-Instruct-2507-4bit`](https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit)). Detalle en [`docs/mlx-migration.md`](./docs/mlx-migration.md) y [CLAUDE.md](./CLAUDE.md).
 
 ```mermaid
 graph TD
@@ -54,10 +56,13 @@ graph TD
         Counter["--counter<br/>(contradiction radar)"]
     end
 
-    subgraph Ollama["Ollama (localhost:11434)"]
-        Embed["bge-m3 (1024d)"]
-        Helper["qwen2.5:3b (helper)"]
-        Chat["command-r (chat + judgment)"]
+    subgraph LLM["LLM backend"]
+        Embed["qwen3-embedding:0.6b (1024d)<br/>Ollama localhost:11434"]
+        subgraph MLX["MLX (Apple Silicon, default)"]
+            Helper["Qwen2.5-3B-Instruct-4bit<br/>(helper)"]
+            Chat["Qwen2.5-7B-Instruct-4bit<br/>(chat default)"]
+            HQ["Qwen3-30B-A3B-Instruct-2507-4bit<br/>(HQ tier)"]
+        end
     end
 
     Reranker["bge-reranker-v2-m3<br/>(MPS+fp16)"]
@@ -84,12 +89,13 @@ graph TD
 Quickstart end-to-end (asumiendo macOS + Homebrew + `uv` ya instalado):
 
 ```bash
-# 1. Verificar que Ollama está corriendo y tiene los modelos
-ollama list   # debe incluir bge-m3, qwen2.5:3b, command-r (o qwen2.5:14b / phi4 como fallbacks)
-# Si falta alguno:
+# 1. Verificar que Ollama está corriendo (sólo embedder post-MLX cutover 2026-05-06)
+ollama list   # debe incluir qwen3-embedding:0.6b
+# Si falta:
 ollama pull qwen3-embedding:0.6b
-ollama pull qwen2.5:3b
-ollama pull command-r
+# Los modelos chat (Qwen2.5-3B/7B-Instruct-4bit, Qwen3-30B-A3B-Instruct-2507-4bit)
+# se descargan automáticamente del Hugging Face Hub al primer uso vía mlx-lm.
+# Para pre-pullear: huggingface-cli download mlx-community/Qwen2.5-7B-Instruct-4bit
 
 # 2. Instalar el CLI (binarios: rag, obsidian-rag-mcp)
 # Los extras `entities` (gliner NER, RAG_ENTITY_LOOKUP=ON default) y `stt`
@@ -169,9 +175,11 @@ launchctl list | grep obsidian-rag    # los 35 servicios deben aparecer
 
 ![System overview](./docs/diagrams/system-overview.svg)
 
-### Interacciones con Ollama
+### Interacciones con el LLM backend
 
-Cada operación del pipeline va a un modelo específico. Ollama es el único daemon con estado (resident VRAM via `keep_alive=-1`); el reranker vive en sentence-transformers aparte (MPS+fp16).
+> **Post-MLX cutover (2026-05-06)**: la tabla de abajo conserva los nombres `qwen2.5:Xb` / `command-r` por valor histórico y porque los helper bindings siguen referenciándolos por nombre. Bajo el default `RAG_LLM_BACKEND=mlx`, [`rag/llm_backend.py`](./rag/llm_backend.py) los resuelve a sus equivalentes MLX 4bit en runtime. Solo `qwen3-embedding:0.6b` corre nativo en Ollama. Detalle: [`docs/mlx-migration.md`](./docs/mlx-migration.md).
+
+Cada operación del pipeline va a un modelo específico. El reranker vive en sentence-transformers aparte (MPS+float32, **no fp16** — colapsó en 2 A/Bs).
 
 ![Ollama interactions](./docs/diagrams/ollama-interactions.svg)
 
@@ -188,7 +196,7 @@ Cada operación del pipeline va a un modelo específico. Ollama es el único dae
 | Weekly digest / morning brief / prep | `command-r:latest` | Ollama `chat` |
 | Surface "por qué este puente" | `command-r:latest` | Ollama `chat` |
 | Agent loop (`rag do`) | `command-r:latest` | Ollama `chat` tool-calling |
-| Cross-encoder rerank | `BAAI/bge-reranker-v2-m3` | sentence-transformers local (MPS+fp16) |
+| Cross-encoder rerank | `BAAI/bge-reranker-v2-m3` | sentence-transformers local (**MPS+fp32**, fp16 falla — ver CLAUDE.md invariant) |
 
 Fallback resolver de `resolve_chat_model()`: `command-r:latest` → `qwen2.5:14b` → `phi4:latest`. El primero instalado gana.
 
@@ -574,14 +582,14 @@ Las **3 más críticas** que casi siempre vas a querer setear:
 | `OLLAMA_KEEP_ALIVE` | `-1` (forever) | Pasado a cada `ollama.chat/embed`. Evita reload de modelos entre queries. Acepta int (segundos) o duration string ("30m"). |
 | `HF_HUB_OFFLINE` / `TRANSFORMERS_OFFLINE` | `1` | Reranker se carga del caché local. |
 
-**Stack de modelos** (definidos al tope de `rag.py`):
+**Stack de modelos** (definidos al tope de `rag/__init__.py` — nombres lógicos; backend MLX los resuelve a equivalentes 4bit en runtime):
 
-| Rol | Modelo | Cuándo se usa |
+| Rol | Modelo lógico | Resuelto a (default `RAG_LLM_BACKEND=mlx`) |
 |---|---|---|
-| Chat (answers + contradiction judgment + prep + digest) | `command-r:latest` (preferido) → `qwen2.5:14b` → `phi4:latest` | `resolve_chat_model()` toma el primero instalado |
-| Helper (paraphrase, HyDE, history reformulation, autotag) | `qwen2.5:3b` | Tareas baratas y rápidas |
-| Embeddings | `bge-m3` (multilingual, 1024d) | Indexing + queries |
-| Reranker | `BAAI/bge-reranker-v2-m3` | Cross-encoder, **forzado a `device=mps`+`fp16`** en Apple Silicon |
+| Chat (answers + contradiction judgment + prep + digest) | `qwen2.5:7b` (default) / `command-r` o `qwen2.5:14b` (HQ tier) | [`Qwen2.5-7B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-7B-Instruct-4bit) / [`Qwen3-30B-A3B-Instruct-2507-4bit`](https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit) |
+| Helper (paraphrase, HyDE, history reformulation, autotag) | `qwen2.5:3b` | [`Qwen2.5-3B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-3B-Instruct-4bit) |
+| Embeddings | `qwen3-embedding:0.6b` (multilingual, 1024d) — Ollama | NO migra a MLX, sigue en Ollama |
+| Reranker | `BAAI/bge-reranker-v2-m3` | sentence-transformers in-process, `device=mps`+`float32` |
 
 **Decoding** (deterministic — esto es retrieval, no creative writing):
 

@@ -52,6 +52,105 @@ _HAS_CHAT_MODEL: bool = _has_chat_model()
 
 
 @pytest.fixture(autouse=True)
+def _reset_backend_singleton_per_test(monkeypatch, request):
+    """Ola 7 (2026-05-06): `OllamaBackend` retired. La fixture previa
+    (`_force_ollama_backend_for_tests`) seteaba `RAG_LLM_BACKEND=ollama`,
+    pero ahora ese valor logueá warning y vuelve a MLX. Mantenemos el
+    reset del singleton + un auto-stub de los dispatchers `_mlx_chat`
+    y `_chat_stream_dispatch` para que tests que NO mockean LLM calls
+    (la mayoría) no carguen MLX models reales (fallarían con
+    LocalEntryNotFoundError bajo HF_HUB_OFFLINE=1).
+
+    Tests que mockean LLM calls hacen `monkeypatch.setattr(rag,
+    "_mlx_chat", _fake)` o `_chat_stream_dispatch` con su propio fake
+    — eso gana sobre este auto-stub porque pytest aplica los
+    monkeypatches en LIFO y el del test corre después.
+    """
+    try:
+        from rag.llm_backend import reset_backend
+        reset_backend()
+    except Exception:
+        pass
+
+    # Auto-stub: cualquier test que llegue al dispatcher real sin
+    # haberlo mockeado recibe una respuesta dummy en vez de cargar el
+    # modelo MLX. Sin esto, tests indirectos (CLI tools, helpers que
+    # invocan citation-repair, critique, etc.) revientan con
+    # `LocalEntryNotFoundError: Cannot find cached snapshot ...
+    # HF_HUB_OFFLINE=1`.
+    #
+    # Opt-out: tests con marker `no_auto_mlx_stub` (ej. backend
+    # telemetry tests que ejercen `_mlx_chat` real para verificar
+    # marker side-effects) NO reciben el stub.
+    if request.node.get_closest_marker("no_auto_mlx_stub"):
+        yield
+        try:
+            from rag.llm_backend import reset_backend
+            reset_backend()
+        except Exception:
+            pass
+        return
+    try:
+        import rag as _rag
+        from types import SimpleNamespace
+
+        def _stub_chat(*args, **kwargs):
+            return SimpleNamespace(
+                message=SimpleNamespace(content="", tool_calls=None),
+            )
+
+        def _stub_stream(*args, **kwargs):
+            # Delegate to whatever `_mlx_chat` is at call time. If a test
+            # monkeypatched `rag._mlx_chat` with its own fake, this stream
+            # stub picks it up and yields the fake's content as a single
+            # chunk. That preserves the test contract from pre-Ola 7
+            # (mock `_mlx_chat` once, both streaming and non-streaming
+            # paths see the mock).
+            try:
+                resp = _rag._mlx_chat(*args, **kwargs)
+                content = ""
+                if hasattr(resp, "message"):
+                    content = (getattr(resp.message, "content", "") or "")
+                elif isinstance(resp, dict):
+                    content = (
+                        resp.get("message", {}).get("content", "") or ""
+                    )
+                return iter([
+                    SimpleNamespace(
+                        done=False, done_reason=None,
+                        message=SimpleNamespace(
+                            content=content, tool_calls=None,
+                        ),
+                    ),
+                    SimpleNamespace(
+                        done=True, done_reason="stop",
+                        message=SimpleNamespace(content="", tool_calls=None),
+                    ),
+                ])
+            except Exception:
+                return iter([
+                    SimpleNamespace(
+                        done=True, done_reason="stop",
+                        message=SimpleNamespace(content="", tool_calls=None),
+                    ),
+                ])
+
+        monkeypatch.setattr(_rag, "_mlx_chat", _stub_chat, raising=False)
+        monkeypatch.setattr(
+            _rag, "_chat_stream_dispatch", _stub_stream, raising=False,
+        )
+    except Exception:
+        pass
+
+    yield
+    try:
+        from rag.llm_backend import reset_backend
+        reset_backend()
+    except Exception:
+        pass
+
+
+@pytest.fixture(autouse=True)
 def _skip_if_no_ollama(request):
     """Skip tests decorated with `@pytest.mark.requires_ollama` when
     no ollama chat model is available (CI on ubuntu-latest, machines

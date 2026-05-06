@@ -438,8 +438,6 @@ def test_drive_search_emits_sources_sse_with_drive_link(monkeypatch):
     # Reset rate-limit bucket + mock el retrieve y las dependencias que
     # el endpoint carga eager.
     server_mod._CHAT_BUCKETS.clear()
-    monkeypatch.setattr(server_mod, "_ollama_alive", lambda timeout=2.0: True)
-    monkeypatch.setattr(server_mod, "_ollama_chat_probe", lambda timeout_s=6.0: True)
     monkeypatch.setattr(server_mod, "_fetch_whatsapp_unread", lambda *a, **kw: [])
     monkeypatch.setattr(server_mod, "_persist_conversation_turn", lambda *a, **kw: None)
     monkeypatch.setattr(server_mod, "save_session", lambda sess: None)
@@ -497,8 +495,11 @@ def test_drive_search_emits_sources_sse_with_drive_link(monkeypatch):
             return SimpleNamespace(
                 message=SimpleNamespace(content="", tool_calls=None),
             )
-    import ollama
-    monkeypatch.setattr(ollama, "chat", _Mock())
+    import rag as _rag_mod
+    mock_inst = _Mock()
+    monkeypatch.setattr(_rag_mod, "_mlx_chat", mock_inst)
+    monkeypatch.setattr(_rag_mod, "_mlx_chat_via_backend", mock_inst)
+    monkeypatch.setattr(_rag_mod, "_chat_stream_dispatch", mock_inst)
 
     # Fire the query — pre-router should fire drive_search.
     client = TestClient(app)

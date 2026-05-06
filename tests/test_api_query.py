@@ -202,8 +202,9 @@ def test_api_query_full_path_calls_llm(monkeypatch):
     class _FakeResp:
         def __init__(self, content): self.message = _FakeMsg(content)
 
+    import rag as _rag_mod
     monkeypatch.setattr(
-        server_mod.ollama, "chat",
+        _rag_mod, "_mlx_chat",
         lambda **kw: _FakeResp("Tus series rankeadas: Breaking Bad, The Office, Black Mirror."),
     )
 
@@ -247,7 +248,8 @@ def test_api_query_full_path_empty_corpus_returns_canned(monkeypatch):
     def _fake_chat(**kw):
         called["n"] += 1
         raise AssertionError("LLM call no debería dispararse con corpus vacío")
-    monkeypatch.setattr(server_mod.ollama, "chat", _fake_chat)
+    import rag as _rag_mod
+    monkeypatch.setattr(_rag_mod, "_mlx_chat", _fake_chat)
 
     client = TestClient(app)
     resp = client.post("/api/query", json={"question": "nada"})

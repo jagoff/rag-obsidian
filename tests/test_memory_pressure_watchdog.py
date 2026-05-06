@@ -122,27 +122,27 @@ def test_memory_pct_zero_total_returns_none(monkeypatch):
 
 
 def test_handle_pressure_unloads_chat_model(monkeypatch):
-    """Paso 1: invoca ollama.chat con keep_alive=0 para evictar el chat model."""
+    """Paso 1 (MLX path): invoca MLXBackend.unload() para evictar el chat model."""
     monkeypatch.setattr(rag, "resolve_chat_model", lambda: "qwen2.5:7b")
     monkeypatch.setattr(rag, "_system_memory_used_pct", lambda: 70.0)
 
-    ollama_calls = []
+    unload_calls = []
 
-    class _FakeOllama:
-        @staticmethod
-        def chat(**kwargs):
-            ollama_calls.append(kwargs)
+    class _FakeMLXBackend:
+        name = "mlx"
+        def unload(self, model):
+            unload_calls.append(model)
+            return True  # model was resident and evicted
 
-    monkeypatch.setitem(sys.modules, "ollama", _FakeOllama)
+    from rag import llm_backend as _lb
+    monkeypatch.setattr(_lb, "get_backend", lambda: _FakeMLXBackend())
 
     actions = rag._handle_memory_pressure(pct_before=90.0, threshold=85.0)
 
     assert actions["chat_unloaded"] is True
     assert actions["chat_model"] == "qwen2.5:7b"
-    assert len(ollama_calls) == 1
-    assert ollama_calls[0]["model"] == "qwen2.5:7b"
-    assert ollama_calls[0]["keep_alive"] == 0
-    assert ollama_calls[0]["options"]["num_predict"] == 1
+    assert len(unload_calls) == 1
+    assert unload_calls[0] == "qwen2.5:7b"
 
 
 def test_handle_pressure_no_chat_model_when_resolve_fails(monkeypatch):
@@ -166,17 +166,18 @@ def test_handle_pressure_skips_reranker_when_chat_unload_enough(monkeypatch):
     monkeypatch.setattr(rag, "resolve_chat_model", lambda: "qwen2.5:7b")
     monkeypatch.setattr(rag, "_system_memory_used_pct", lambda: 70.0)
 
-    class _FakeOllama:
-        @staticmethod
-        def chat(**_kwargs):
-            pass
+    class _FakeMLXBackend:
+        name = "mlx"
+        def unload(self, model):
+            return True
 
-    monkeypatch.setitem(sys.modules, "ollama", _FakeOllama)
+    from rag import llm_backend as _lb
+    monkeypatch.setattr(_lb, "get_backend", lambda: _FakeMLXBackend())
 
-    unload_calls = []
+    reranker_calls = []
 
     def _fake_unload(force=False):
-        unload_calls.append(force)
+        reranker_calls.append(force)
         return True
 
     monkeypatch.setattr(rag, "maybe_unload_reranker", _fake_unload)
@@ -184,7 +185,7 @@ def test_handle_pressure_skips_reranker_when_chat_unload_enough(monkeypatch):
     actions = rag._handle_memory_pressure(pct_before=90.0, threshold=85.0)
 
     assert actions["reranker_unloaded"] is False
-    assert unload_calls == []
+    assert reranker_calls == []
 
 
 def test_handle_pressure_force_unloads_reranker_when_still_high(monkeypatch):
@@ -193,17 +194,18 @@ def test_handle_pressure_force_unloads_reranker_when_still_high(monkeypatch):
     # Simulamos que el unload no alivió la presión — sigue a 88%.
     monkeypatch.setattr(rag, "_system_memory_used_pct", lambda: 88.0)
 
-    class _FakeOllama:
-        @staticmethod
-        def chat(**_kwargs):
-            pass
+    class _FakeMLXBackend:
+        name = "mlx"
+        def unload(self, model):
+            return True
 
-    monkeypatch.setitem(sys.modules, "ollama", _FakeOllama)
+    from rag import llm_backend as _lb
+    monkeypatch.setattr(_lb, "get_backend", lambda: _FakeMLXBackend())
 
-    unload_calls = []
+    reranker_calls = []
 
     def _fake_unload(force=False):
-        unload_calls.append(force)
+        reranker_calls.append(force)
         return True
 
     monkeypatch.setattr(rag, "maybe_unload_reranker", _fake_unload)
@@ -212,21 +214,22 @@ def test_handle_pressure_force_unloads_reranker_when_still_high(monkeypatch):
 
     assert actions["chat_unloaded"] is True
     assert actions["reranker_unloaded"] is True
-    assert unload_calls == [True]  # force=True passed
+    assert reranker_calls == [True]  # force=True passed
 
 
-def test_handle_pressure_ollama_exception_logged(monkeypatch):
-    """Si ollama.chat explota, lo capturamos — la respuesta no puede crashear
-    el watchdog thread."""
+def test_handle_pressure_mlx_exception_logged(monkeypatch):
+    """Si MLXBackend.unload() explota, lo capturamos — la respuesta no puede
+    crashear el watchdog thread."""
     monkeypatch.setattr(rag, "resolve_chat_model", lambda: "qwen2.5:7b")
     monkeypatch.setattr(rag, "_system_memory_used_pct", lambda: 70.0)
 
-    class _FakeOllama:
-        @staticmethod
-        def chat(**_kwargs):
-            raise RuntimeError("ollama daemon stuck")
+    class _FakeMLXBackend:
+        name = "mlx"
+        def unload(self, model):
+            raise RuntimeError("mlx unload exploded")
 
-    monkeypatch.setitem(sys.modules, "ollama", _FakeOllama)
+    from rag import llm_backend as _lb
+    monkeypatch.setattr(_lb, "get_backend", lambda: _FakeMLXBackend())
 
     # Should NOT raise
     actions = rag._handle_memory_pressure(pct_before=90.0, threshold=85.0)

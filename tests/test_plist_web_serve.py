@@ -143,17 +143,42 @@ def test_web_plist_has_rag_reranker_never_unload():
     assert d["EnvironmentVariables"].get("RAG_RERANKER_NEVER_UNLOAD") == "1"
 
 
-def test_web_plist_has_ollama_keep_alive():
-    """Web plist pinns `OLLAMA_KEEP_ALIVE=20m` (post-rollback 2026-04-30,
-    commit `4f7e41f`). Pre-rollback era `-1` (pin forever) pero con 3
-    modelos pinned + 36 GB unified memory MPS swappeaba y tokens/s se
-    caían 10×. `20m` deja warm el principal (qwen2.5:7b se usa todo el
-    rato así que nunca expira) y descarga los secundarios cuando idle.
+def test_web_plist_no_ollama_keep_alive():
+    """Ola 6 cero-Ollama (2026-05-06): modelos chat Ollama purgados del disco.
+    El web plist NO debe setear OLLAMA_KEEP_ALIVE ni OLLAMA_MAX_LOADED_MODELS
+    — no hay daemon Ollama que keep-alivear.
     """
     d = _parse(rag_module._web_plist(RAG_BIN))
-    assert d["EnvironmentVariables"].get("OLLAMA_KEEP_ALIVE") == "20m"
-    # Cap simultáneo de modelos cargados en VRAM (rolleamos de 3 a 2).
-    assert d["EnvironmentVariables"].get("OLLAMA_MAX_LOADED_MODELS") == "2"
+    env = d["EnvironmentVariables"]
+    assert "OLLAMA_KEEP_ALIVE" not in env, \
+        "Ola 6: modelos Ollama purgados — OLLAMA_KEEP_ALIVE no debe estar en web plist"
+    assert "OLLAMA_MAX_LOADED_MODELS" not in env, \
+        "Ola 6: OLLAMA_MAX_LOADED_MODELS no debe estar en web plist"
+
+
+def test_indexers_have_local_embed_and_no_ollama_keepalive():
+    """Ola 6 cero-Ollama: todos los plists indexers tienen RAG_INDEX_LOCAL_EMBED=1
+    y NO tienen OLLAMA_KEEP_ALIVE (embed path es ahora in-process).
+    """
+    indexer_plists = [
+        ("watch", rag_module._watch_plist(RAG_BIN)),
+        ("ingest_whatsapp", rag_module._ingest_whatsapp_plist(RAG_BIN)),
+        ("ingest_cross_source", rag_module._ingest_cross_source_plist(RAG_BIN)),
+        ("ingest_gmail", rag_module._ingest_gmail_plist(RAG_BIN)),
+        ("ingest_calendar", rag_module._ingest_calendar_plist(RAG_BIN)),
+        ("ingest_reminders", rag_module._ingest_reminders_plist(RAG_BIN)),
+        ("ingest_calls", rag_module._ingest_calls_plist(RAG_BIN)),
+        ("ingest_safari", rag_module._ingest_safari_plist(RAG_BIN)),
+        ("ingest_drive", rag_module._ingest_drive_plist(RAG_BIN)),
+        ("ingest_pillow", rag_module._ingest_pillow_plist(RAG_BIN)),
+    ]
+    for name, xml in indexer_plists:
+        d = _parse(xml)
+        env = d["EnvironmentVariables"]
+        assert env.get("RAG_INDEX_LOCAL_EMBED") == "1", \
+            f"{name}: falta RAG_INDEX_LOCAL_EMBED=1 (Ola 6 cero-Ollama)"
+        assert "OLLAMA_KEEP_ALIVE" not in env, \
+            f"{name}: OLLAMA_KEEP_ALIVE no debe estar (Ola 6 cero-Ollama)"
 
 
 def test_web_plist_keepalive_runatload():

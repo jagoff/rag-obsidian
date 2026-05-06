@@ -559,6 +559,171 @@ def test_qual_quais_y_serie_basic():
     assert replace_iberian_leaks("las coisas") == "las cosas"
 
 
+def test_bug_2026_05_05_fantastical_api():
+    """Regresión del bug del 2026-05-05 con query "buscame la api de
+    fantastical". El LLM devolvió:
+
+      "Vos tenés una nota sobre a API Key del fantastical que se refere
+      a la data 09-08-2024. Acredito que eso seja o que vos está
+      procurando referindo-se a la API Fantastical."
+
+    5 leaks pt nuevos: `Acredito`, `seja o que`, `está procurando`,
+    `referindo-se`, `se refere`, `a la data`, `sobre a API`. Todos
+    cubiertos en `wave9-2026-05-05`.
+    """
+    from rag.iberian_leak_filter import replace_iberian_leaks
+    bug = (
+        "Vos tenés una nota sobre a API Key del fantastical que se "
+        "refere a la data 09-08-2024. Acredito que eso seja o que vos "
+        "está procurando referindo-se a la API Fantastical."
+    )
+    out = replace_iberian_leaks(bug)
+    # Verificar que todos los leaks pt desaparecieron.
+    assert "Acredito" not in out
+    assert "acredito" not in out
+    assert "seja" not in out
+    assert "refere" not in out and "refiere" in out
+    assert "referindo" not in out and "refiriéndose" in out
+    assert "a la data" not in out and "a la fecha" in out
+    assert "sobre a API" not in out and "sobre la API" in out
+    # Cadena: pt `está procurando` → es `está buscando` → voseo `vos estás buscando`.
+    # Después del paso voseo (2026-05-05), el output final tiene `vos estás buscando`.
+    assert "procurando" not in out and "estás buscando" in out
+    # Idempotencia
+    assert replace_iberian_leaks(out) == out
+
+
+def test_acredito_que_solo_match_construccion_pt():
+    """`Acredito que` (pt: "Creo que") es leak. Pero `acredito` solo
+    como verbo bancario en es ("acredito el monto en tu cuenta") es
+    válido. Sólo matcheamos cuando va seguido de `que`.
+    """
+    from rag.iberian_leak_filter import replace_iberian_leaks
+    # Leak pt: "Acredito que..."
+    assert "creo que" in replace_iberian_leaks("Acredito que esto es así").lower()
+    # Es válido (sin "que" después): "El banco acredita el monto"
+    out = replace_iberian_leaks("Te acredito el monto.")
+    assert "creo" not in out  # NO matchea sin "que"
+
+
+def test_seja_subjuntivo_pt():
+    """`seja` (pt subjuntivo de "ser") → `sea` (es)."""
+    from rag.iberian_leak_filter import replace_iberian_leaks
+    assert replace_iberian_leaks("aunque seja tarde") == "aunque sea tarde"
+    assert replace_iberian_leaks("quando sejam listas") == "quando sean listas"
+
+
+def test_referindo_y_refere_pt():
+    """Conjugaciones pt de `referir`."""
+    from rag.iberian_leak_filter import replace_iberian_leaks
+    assert "se refiere" in replace_iberian_leaks("la nota se refere al tema")
+    assert "refiriéndose" in replace_iberian_leaks("estaba referindo-se al evento")
+    assert "refiriendo" in replace_iberian_leaks("estaba referindo el tema")
+
+
+def test_a_la_data_pt():
+    """`a la data <fecha>` es leak pt para `a la fecha`. Sólo matchea
+    cuando viene seguido de número (fecha real); standalone "data" no
+    se toca para no romper "data point" / "la data" técnica.
+    """
+    from rag.iberian_leak_filter import replace_iberian_leaks
+    out = replace_iberian_leaks("revisado a la data 2026-05-05")
+    assert "a la fecha" in out
+    # Sin número: NO matchea (la regla `\ba\s+la\s+data\b` también es
+    # explícita, así que verificamos que ambas cumplen)
+    assert replace_iberian_leaks("a la data 09-08-2024") == "a la fecha 09-08-2024"
+
+
+def test_sobre_a_proper_noun_pt():
+    """`sobre a <Mayúscula>` (pt: "sobre la <noun>") → es: "sobre la".
+    Restringido a sustantivo propio (mayúscula inicial) para no chocar
+    con la prep es "ir a", "voy a", etc.
+    """
+    from rag.iberian_leak_filter import replace_iberian_leaks
+    assert "sobre la API" in replace_iberian_leaks("una nota sobre a API Key")
+    assert "sobre la React" in replace_iberian_leaks("doc sobre a React")
+    # Caso negativo: "sobre a" + minúscula NO se toca
+    out = replace_iberian_leaks("voy a hablar sobre a media tarde")
+    assert "sobre a media" in out  # preserva — minúscula
+
+
+def test_voseo_grammar_irregulares():
+    """`vos + 3sg` (sin `s`) debe convertirse a voseo correcto.
+
+    Caso real del bug del 2026-05-05 ("vos está procurando"). El LLM
+    mezcla `vos` rioplatense con conjugación 3sg en vez de voseo
+    (`vos estás`). Cubrimos los irregulares de mayor frecuencia.
+    """
+    from rag.iberian_leak_filter import replace_iberian_leaks
+    assert replace_iberian_leaks("vos está acá") == "vos estás acá"
+    assert replace_iberian_leaks("vos es responsable") == "vos sos responsable"
+    assert replace_iberian_leaks("vos tiene plata") == "vos tenés plata"
+    assert replace_iberian_leaks("vos puede ver") == "vos podés ver"
+    assert replace_iberian_leaks("vos hace lío") == "vos hacés lío"
+    assert replace_iberian_leaks("vos sabe la verdad") == "vos sabés la verdad"
+    assert replace_iberian_leaks("vos quiere irte") == "vos querés irte"
+    assert replace_iberian_leaks("vos dice que sí") == "vos decís que sí"
+    assert replace_iberian_leaks("vos viene mañana") == "vos venís mañana"
+    assert replace_iberian_leaks("vos pone la pava") == "vos ponés la pava"
+    assert replace_iberian_leaks("vos sale temprano") == "vos salís temprano"
+    assert replace_iberian_leaks("vos ve la peli") == "vos ves la peli"
+    # `vos da` no cubierto: choca con regla pt `\bda\s+` → "de la".
+    # `dar` 3sg es rare en este contexto; aceptamos.
+
+
+def test_voseo_grammar_no_toca_voseo_correcto():
+    """Si ya está bien escrito, NO debe modificar nada (idempotente)."""
+    from rag.iberian_leak_filter import replace_iberian_leaks
+    assert replace_iberian_leaks("vos estás bien") == "vos estás bien"
+    assert replace_iberian_leaks("vos sos copado") == "vos sos copado"
+    assert replace_iberian_leaks("vos tenés tres notas") == "vos tenés tres notas"
+    assert replace_iberian_leaks("vos podés hacerlo") == "vos podés hacerlo"
+    assert replace_iberian_leaks("vos sabés que sí") == "vos sabés que sí"
+
+
+def test_voseo_grammar_negacion():
+    """`vos no <verbo>` debe corregir igual que `vos <verbo>`."""
+    from rag.iberian_leak_filter import replace_iberian_leaks
+    assert replace_iberian_leaks("vos no está acá") == "vos no estás acá"
+    assert replace_iberian_leaks("vos no tiene plata") == "vos no tenés plata"
+    assert replace_iberian_leaks("vos no puede ver") == "vos no podés ver"
+    assert replace_iberian_leaks("vos no es responsable") == "vos no sos responsable"
+    assert replace_iberian_leaks("vos no sabe nada") == "vos no sabés nada"
+
+
+def test_voseo_grammar_excluye_es_que():
+    """`vos es` se transforma a `vos sos`, EXCEPTO cuando viene seguido
+    de `que` (relator: "lo que vos es que importa" — preserva).
+    """
+    from rag.iberian_leak_filter import replace_iberian_leaks
+    # NO transforma "vos es que ..."
+    assert "vos es que" in replace_iberian_leaks("lo que vos es que importa")
+    # SÍ transforma "vos es <otra cosa>"
+    assert replace_iberian_leaks("vos es importante") == "vos sos importante"
+
+
+def test_voseo_grammar_subjuntivo_y_futuro():
+    """Subjuntivo `vos sea/vaya/haya` y futuro `vos será/estará/...` con
+    s final voseo.
+    """
+    from rag.iberian_leak_filter import replace_iberian_leaks
+    assert replace_iberian_leaks("ojalá vos sea feliz") == "ojalá vos seas feliz"
+    assert replace_iberian_leaks("cuando vos vaya") == "cuando vos vayas"
+    assert replace_iberian_leaks("vos será el próximo") == "vos serás el próximo"
+    assert replace_iberian_leaks("vos podrá hacerlo") == "vos podrás hacerlo"
+
+
+def test_voseo_grammar_regulares_alta_frecuencia():
+    """Verbos regulares -ar/-er/-ir más comunes."""
+    from rag.iberian_leak_filter import replace_iberian_leaks
+    assert replace_iberian_leaks("vos habla mucho") == "vos hablás mucho"
+    assert replace_iberian_leaks("vos busca la solución") == "vos buscás la solución"
+    assert replace_iberian_leaks("vos come tarde") == "vos comés tarde"
+    assert replace_iberian_leaks("vos lee rápido") == "vos leés rápido"
+    assert replace_iberian_leaks("vos vive feliz") == "vos vivís feliz"
+    assert replace_iberian_leaks("vos abre el archivo") == "vos abrís el archivo"
+
+
 def test_starters_auto_derivados_estan_completos():
     """Validación de la auto-derivación: para cada compound multi-palabra
     en `_IBERIAN_LEAK_REPLACEMENTS`, la primera palabra debe estar en

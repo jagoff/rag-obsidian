@@ -20,8 +20,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import ollama  # noqa: E402
-
 import rag  # noqa: E402
 
 
@@ -44,8 +42,10 @@ def run_query(
     """Ejecuta una query completa (retrieve + LLM streaming) y devuelve timing.
 
     Mirror-ea el flujo de rag.py `chat()` loop: multi_retrieve con no_deep,
-    pool=RERANK_POOL_MAX default, luego ollama.chat con _CLI_CHAT_OPTIONS.
-    No lee stdin.
+    pool=RERANK_POOL_MAX default, luego `_chat_stream_dispatch` con
+    `_CLI_CHAT_OPTIONS`. Bajo `RAG_LLM_BACKEND=mlx` (default post-cutover
+    2026-05-06) rutea a `MLXBackend.chat_stream`; bajo `=ollama` rutea
+    al daemon HTTP. No lee stdin.
     """
     history = history or []
     t_turn = time.perf_counter()
@@ -89,14 +89,13 @@ def run_query(
     t_first_token: float | None = None
     t_llm = time.perf_counter()
     try:
-        for chunk in ollama.chat(
+        for chunk in rag._chat_stream_dispatch(
             model=model or rag.resolve_chat_model(),
             messages=messages,
             options=options,
-            stream=True,
             keep_alive=rag.OLLAMA_KEEP_ALIVE,
         ):
-            c = chunk.message.content or ""
+            c = getattr(chunk.message, "content", None) or ""
             if c and t_first_token is None:
                 t_first_token = time.perf_counter()
             parts.append(c)

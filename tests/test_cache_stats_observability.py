@@ -107,10 +107,14 @@ def test_concurrent_records_no_loss():
 
 def test_embed_records_hits_and_misses(monkeypatch):
     """Primer embed("abc") → miss. Segundo embed("abc") → hit."""
-    # Prime ollama stub
-    class _FakeResp:
-        embeddings = [[1.0, 2.0, 3.0]]
-    monkeypatch.setattr(rag.ollama, "embed", lambda **kw: _FakeResp())
+    import numpy as np
+
+    class _FakeEmbedder:
+        def encode(self, texts, normalize_embeddings=True, batch_size=64,
+                   convert_to_numpy=True, show_progress_bar=False):
+            return np.array([[1.0, 2.0, 3.0] for _ in texts])
+
+    monkeypatch.setattr(rag, "_index_embed_local", lambda: _FakeEmbedder())
 
     # Clear the embed cache (autouse en conftest ya lo hace, pero por si acaso)
     rag._embed_cache.clear()
@@ -130,13 +134,14 @@ def test_embed_records_hits_and_misses(monkeypatch):
 
 def test_embed_batch_mixed(monkeypatch):
     """embed(['a', 'b', 'c']) con 'a' en cache → 1 hit + 2 misses en una call."""
-    class _FakeResp:
-        def __init__(self, embs):
-            self.embeddings = embs
-    monkeypatch.setattr(rag.ollama, "embed",
-                        lambda model, input, keep_alive: _FakeResp(
-                            [[float(ord(t))] for t in input]
-                        ))
+    import numpy as np
+
+    class _FakeEmbedder:
+        def encode(self, texts, normalize_embeddings=True, batch_size=64,
+                   convert_to_numpy=True, show_progress_bar=False):
+            return np.array([[float(ord(t[0]))] for t in texts])
+
+    monkeypatch.setattr(rag, "_index_embed_local", lambda: _FakeEmbedder())
     rag._embed_cache.clear()
     # Pre-populate 'a'
     rag.embed(["a"])

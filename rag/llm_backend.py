@@ -51,7 +51,7 @@ resolve between them via `MLX_MODEL_ALIAS` table.
 
 - [ ] Migrate 14 raw `ollama.chat(stream=True, ...)` call sites to `get_backend().chat_stream(...)`
 - [ ] Tool-calling format adapter (Qwen3 `<tool_call>` JSON schema)
-- [ ] Idle-unload watchdog thread (RAG_MLX_IDLE_TTL enforcement)
+- [x] Idle-unload watchdog thread (RAG_MLX_IDLE_TTL enforcement) — done 2026-05-05
 - [ ] Bench harness wiring (benchmarks/bench_mlx_vs_ollama.py)
 """
 
@@ -89,7 +89,6 @@ def strip_think_blocks(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Model aliases: Ollama name <-> MLX HuggingFace ID----------------------------------------------------------------
 # Model aliases: Ollama name ↔ MLX HuggingFace ID
 # ---------------------------------------------------------------------------
 
@@ -444,8 +443,10 @@ class MLXBackend(LLMBackend):
         loop se swallowean — el watchdog NUNCA debe matar el proceso si
         la eviction falla.
 
-        Disable: `RAG_MLX_IDLE_TTL=0` (chequea antes de spawnear).
+        Disable: `RAG_MLX_IDLE_TTL=0` o `RAG_MLX_IDLE_DISABLE=1`.
         """
+        if os.environ.get("RAG_MLX_IDLE_DISABLE", "").strip() in ("1", "true", "yes"):
+            return
         if self._idle_ttl <= 0:
             return
         if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
@@ -763,11 +764,13 @@ class MLXBackend(LLMBackend):
                     return False
                 if model is None:
                     self._loaded.clear()
+                    self._last_used.clear()
                     unloaded_any = True
                 else:
                     canonical = to_mlx(model)
                     if canonical in self._loaded:
                         self._loaded.pop(canonical, None)
+                        self._last_used.pop(canonical, None)
                         unloaded_any = True
                     else:
                         unloaded_any = False

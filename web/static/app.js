@@ -260,8 +260,14 @@ async function loadVaults() {
     }
 
     const options = Array.from(vaultPicker.options).map((o) => o.value);
-    if (vaultScope && options.includes(vaultScope)) {
-      vaultPicker.value = vaultScope;
+    const storedScope = localStorage.getItem(VAULT_KEY);
+    if (storedScope !== null && options.includes(storedScope)) {
+      vaultPicker.value = storedScope;
+      vaultScope = storedScope;
+    } else if (storedScope === null && options.includes("all")) {
+      vaultPicker.value = "all";
+      vaultScope = "all";
+      localStorage.setItem(VAULT_KEY, "all");
     } else {
       vaultPicker.value = "";
       vaultScope = "";

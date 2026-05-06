@@ -2637,6 +2637,28 @@ def _warmup() -> None:
                     print("[warmup] reranker loaded on MPS", flush=True)
                 except Exception as _exc:
                     print(f"[warmup] reranker skipped: {_exc}", flush=True)
+            # MLX chat-model prewarm (post-Ola-3 cutover, 2026-05-05): bajo
+            # RAG_LLM_BACKEND=mlx el primer /api/chat paga cold-load
+            # (~60-80s qwen2.5:7b 4-bit MPS). Cargar acá mueve la latencia
+            # fuera del path user-facing. Override: RAG_MLX_NO_PREWARM=1.
+            if (
+                os.environ.get("RAG_LLM_BACKEND", "mlx").strip().lower() == "mlx"
+                and os.environ.get("RAG_MLX_NO_PREWARM", "").strip() in ("", "0", "false", "no")
+            ):
+                try:
+                    from rag.llm_backend import get_backend as _get_bk
+                    _bk = _get_bk()
+                    if _bk.name == "mlx":
+                        _chat_model = _resolve_web_chat_model()
+                        _t0 = time.time()
+                        _bk._load(_chat_model)
+                        print(
+                            f"[warmup] mlx chat model {_chat_model} loaded in "
+                            f"{time.time()-_t0:.1f}s",
+                            flush=True,
+                        )
+                except Exception as _exc:
+                    print(f"[warmup] mlx chat prewarm skipped: {_exc}", flush=True)
             if os.environ.get("RAG_LOCAL_EMBED", "").strip() not in ("", "0", "false", "no"):
                 try:
                     # `_warmup_local_embedder()` es el único helper que, además
@@ -11454,7 +11476,14 @@ async def api_query(req: QueryRequest, request: Request) -> dict:
     )
     _t_retrieve_start = time.perf_counter()
     try:
-        result = multi_retrieve(
+        # asyncio.to_thread: multi_retrieve tarda 2-15s (embed + BM25 +
+        # rerank). Correrlo síncrono bloquea el event loop de FastAPI →
+        # heartbeats SSE, dashboard stream y otros handlers async quedan
+        # congelados durante ese window. Los cache locks ya existentes en
+        # rag/__init__.py (_corpus_cache_lock RLock, _embed_cache_lock Lock,
+        # etc.) garantizan thread-safety para concurrent calls.
+        result = await asyncio.to_thread(
+            multi_retrieve,
             vaults, question, req.k, req.folder, None, req.tag, False,
             multi_query=not req.retrieve_only,
             auto_filter=True,
@@ -11742,7 +11771,20 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
     # citation-repair 60s). Mejor bailar fast con 503 al user y dejar que
     # el watchdog del prewarmer haga el restart automático en el siguiente
     # ciclo. Costo del probe: 1ms si healthy, ≤timeout si stuck.
-    if os.environ.get("RAG_OLLAMA_HEALTH_CHECK", "1") == "1":
+    #
+    # Gate MLX (2026-05-05): bajo RAG_LLM_BACKEND=mlx Ollama no se usa para
+    # LLM inference — solo como fallback para tool-calling. El probe síncrono
+    # agrega ~20ms overhead por request y puede devolver 503 si el user apagó
+    # el daemon de Ollama (razonable en MLX-only). Se skipea el probe cuando
+    # el backend activo es mlx SALVO que el operador lo force con
+    # RAG_OLLAMA_HEALTH_CHECK=1 explícito.
+    _active_backend = os.environ.get("RAG_LLM_BACKEND", "mlx").strip().lower()
+    _hc_env = os.environ.get("RAG_OLLAMA_HEALTH_CHECK", "")
+    _run_health_probe = (
+        _hc_env == "1"  # forzado explícitamente
+        or (_hc_env != "0" and _active_backend != "mlx")  # ollama default y no desactivado
+    )
+    if _run_health_probe:
         try:
             _hc_timeout = float(os.environ.get("RAG_OLLAMA_HEALTH_TIMEOUT_S", "8"))
         except ValueError:

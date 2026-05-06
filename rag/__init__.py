@@ -1625,6 +1625,20 @@ def log_query_event(event: dict) -> None:
         event = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
     except Exception:
         return
+    # Leer el ContextVar de backend ANTES de enqueue: captura el valor del
+    # request actual (no del worker thread). None si el request no llego al
+    # dispatch LLM (confidence refuse, create-intent, scope_no_match).
+    _bk = _get_backend_telemetry()
+    if _bk is not None and "backend" not in event:
+        try:
+            event = {
+                **event,
+                "backend": _bk.get("backend"),
+                "fallback_reason": _bk.get("fallback_reason"),
+                "backend_active": _bk.get("backend_active"),
+            }
+        except Exception:
+            pass
 
     def _do() -> None:
         with _ragvec_state_conn() as conn:
@@ -3356,10 +3370,10 @@ def resolve_chat_model() -> str:
     global _CHAT_MODEL_RESOLVED
     if _CHAT_MODEL_RESOLVED is not None:
         return _CHAT_MODEL_RESOLVED
-    backend = os.environ.get("RAG_LLM_BACKEND", "mlx").lower()
+    from rag.llm_backend import get_backend, MLX_MODEL_ALIAS, MLXBackend  # local import
+    backend = get_backend().name  # singleton — 1 env lookup al startup, cached
     if backend == "mlx":
         try:
-            from rag.llm_backend import MLX_MODEL_ALIAS, MLXBackend  # local import
             mlx_ids = set(MLXBackend().list_available())
             available = {alias for alias, hf_id in MLX_MODEL_ALIAS.items() if hf_id in mlx_ids}
         except Exception:
@@ -3880,7 +3894,8 @@ class _TimedOllamaProxy:
         # and fall through to Ollama — MLX backend has no native tool
         # format and `chat()` here doesn't yield. Streaming sites must
         # use `_chat_stream_dispatch()` instead of this proxy.
-        _be_name = os.environ.get("RAG_LLM_BACKEND", "mlx").lower()
+        from rag.llm_backend import get_backend
+        _be_name = get_backend().name  # singleton — no env lookup per-call
         if (
             _be_name == "mlx"
             and not kwargs.get("tools")
@@ -3927,7 +3942,7 @@ def _mlx_chat_via_backend(**kwargs):
         temperature=float(options_dict.get("temperature", 0.0)),
         seed=int(options_dict.get("seed", 42)),
         num_ctx=int(options_dict.get("num_ctx", 4096)),
-        num_predict=int(options_dict.get("num_predict", 768)),
+        num_predict=int(options_dict.get("num_predict", 384)),
         top_p=float(options_dict.get("top_p", 1.0)),
         stop=tuple(options_dict.get("stop", ()) or ()),
     )
@@ -3949,7 +3964,8 @@ def _mlx_or_ollama_chat(**kwargs):
     """
     if ollama.chat is not _ORIGINAL_OLLAMA_CHAT:
         return ollama.chat(**kwargs)
-    _be_name = os.environ.get("RAG_LLM_BACKEND", "mlx").lower()
+    from rag.llm_backend import get_backend
+    _be_name = get_backend().name  # singleton
     if (
         _be_name == "mlx"
         and not kwargs.get("tools")
@@ -3982,13 +3998,13 @@ def _chat_stream_dispatch(**kwargs):
     if ollama.chat is not _ORIGINAL_OLLAMA_CHAT:
         # Monkey-patched (test): use module symbol so mock intercepts.
         return ollama.chat(stream=True, **kwargs)
-    _be_name = os.environ.get("RAG_LLM_BACKEND", "mlx").lower()
+    from rag.llm_backend import ChatOptions, get_backend
+    _be_name = get_backend().name  # singleton
     if (
         _be_name == "mlx"
         and not kwargs.get("tools")
     ):
         _mark_backend("mlx")
-        from rag.llm_backend import ChatOptions, get_backend
 
         options_dict = kwargs.get("options") or {}
         if hasattr(options_dict, "model_dump"):
@@ -3999,7 +4015,7 @@ def _chat_stream_dispatch(**kwargs):
             temperature=float(options_dict.get("temperature", 0.0)),
             seed=int(options_dict.get("seed", 42)),
             num_ctx=int(options_dict.get("num_ctx", 4096)),
-            num_predict=int(options_dict.get("num_predict", 768)),
+            num_predict=int(options_dict.get("num_predict", 384)),
             top_p=float(options_dict.get("top_p", 1.0)),
             stop=tuple(options_dict.get("stop", ()) or ()),
         )
@@ -12767,7 +12783,11 @@ def _mark_backend(backend: str, *, fallback_reason: str | None = None) -> None:
     backend = "mlx" | "ollama". fallback_reason solo cuando MLX cayo a Ollama
     ("tools" | "stream"). None para Ollama nativo o MLX limpio.
     """
-    _be_env = os.environ.get("RAG_LLM_BACKEND", "ollama")
+    from rag.llm_backend import get_backend
+    try:
+        _be_env = get_backend().name  # singleton — refleja el backend real, no env crudo
+    except Exception:
+        _be_env = os.environ.get("RAG_LLM_BACKEND", "ollama")
     _ACTIVE_BACKEND_CTX.set({
         "backend": backend,
         "fallback_reason": fallback_reason,
@@ -15052,10 +15072,10 @@ def _handle_memory_pressure(pct_before: float, threshold: float) -> dict:
         # → death spiral). Para MLX, llamamos `MLXBackend.unload()` que
         # pop-ea el modelo de `_loaded` + `mx.clear_cache()`. Bajo Ollama
         # mantenemos el path histórico (cliente con timeout corto).
-        _backend_choice = os.environ.get("RAG_LLM_BACKEND", "mlx").strip().lower()
+        from rag.llm_backend import get_backend
+        _backend_choice = get_backend().name  # singleton — no env lookup en hot path
         if _backend_choice == "mlx":
             try:
-                from rag.llm_backend import get_backend
                 _backend = get_backend()
                 if _backend.unload(chat_model):
                     actions["chat_unloaded"] = True

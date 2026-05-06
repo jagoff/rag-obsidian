@@ -1576,6 +1576,52 @@ def _mood_poll_plist(rag_bin: str) -> str:
 """
 
 
+def _spotify_poll_plist(rag_bin: str) -> str:
+    """Spotify poller — corre `scripts/spotify_poll.py` cada 60s para
+    grabar el track actualmente en reproducción en `rag_spotify_log`.
+
+    Lógica: script llama `record_now_playing()` desde rag.integrations.
+    Comportamiento esperado:
+      - Si Spotify está cerrado o paused → sale silently (exit 0, no log)
+      - Si hay un track en reproducción → graba a DB + stdout JSON
+
+    No hay opt-in — siempre activo si el plist está cargado. Los datos
+    se usan para context en briefs ("escuchabas X ayer") y futuro mood
+    scoring.
+
+    `RunAtLoad=true` para que bootstrap lance inmediatamente sin esperar
+    60s al primer tick.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    poll_script = repo_root / "scripts" / "spotify_poll.py"
+    uv_python = Path.home() / ".local/share/uv/tools/obsidian-rag/bin/python3"
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-spotify-poll</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{uv_python}</string>
+    <string>{poll_script}</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>RAG_STATE_SQL</key><string>1</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+  </dict>
+  <key>StartInterval</key><integer>60</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/spotify-poll.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/spotify-poll.error.log</string>
+</dict>
+</plist>
+"""
+
+
 def _routing_rules_plist(rag_bin: str) -> str:
     """Detector de patrones de ruteo — cada 5 minutos, analiza
     comportamiento y promueve nuevas rutas de queries automáticamente.
@@ -2099,6 +2145,9 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
         ("com.fer.obsidian-rag-whisper-vocab",
          "com.fer.obsidian-rag-whisper-vocab.plist",
          _whisper_vocab_plist(rag_bin)),
+        ("com.fer.obsidian-rag-spotify-poll",
+         "com.fer.obsidian-rag-spotify-poll.plist",
+         _spotify_poll_plist(rag_bin)),
         # ── DEPRECATED 2026-05-01: `com.fer.obsidian-rag-serve-watchdog` ──
         # Servía para healthcheck del `rag serve` (port 7832), removido
         # cuando bajamos `com.fer.obsidian-rag-serve`. Ver doc-block
@@ -2225,7 +2274,6 @@ def _services_spec_manual() -> list[dict]:
     """
     return [
         {"label": "com.fer.obsidian-rag-synth-refresh", "category": "manual_keep"},
-        {"label": "com.fer.obsidian-rag-spotify-poll", "category": "manual_keep"},
         {"label": "com.fer.obsidian-rag-log-rotate", "category": "manual_keep"},
     ]
 

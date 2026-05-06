@@ -58,6 +58,7 @@ resolve between them via `MLX_MODEL_ALIAS` table.
 from __future__ import annotations
 
 import os
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
@@ -383,40 +384,92 @@ class MLXBackend(LLMBackend):
         self._loaded: OrderedDict[str, tuple[Any, Any]] = OrderedDict()
         self._idle_ttl = int(os.environ.get("RAG_MLX_IDLE_TTL", "1800"))
 
+        # Race-condition guard for `_loaded` mutation (P1 fix 2026-05-05).
+        #
+        # Under the multi-thread web server, `_load()`/`_evict_for()`/`unload()`
+        # can interleave: thread A loading qwen2.5:7b while thread B loads
+        # qwen2.5:3b while the memory watchdog calls `unload()`. The sequence
+        # `check → evict → store` is NOT atomic without a lock — two threads
+        # could each `mlx_lm.load()` the same model duplicating VRAM, or
+        # `unload()` could pop a tuple while another thread is reading it.
+        #
+        # RLock (not Lock) because `_load()` calls `_evict_for()` while holding
+        # the lock — re-entrancy avoids deadlock. Note: the heavy `mlx_lm.load()`
+        # call itself is intentionally OUT of the lock (see `_load()` docstring)
+        # so concurrent `chat()` calls on already-resident models don't block
+        # behind a 3-8s cold load running in another thread.
+        self._loaded_lock = threading.RLock()
+        self._last_used: dict[str, float] = {}
+        self._watchdog_thread: threading.Thread | None = None
+        self._watchdog_stop = threading.Event()
+        self._start_watchdog()
+
     def _load(self, model_id: str) -> tuple[Any, Any]:
-        """Get or load (model, tokenizer) for `model_id`. LRU bump on hit."""
+        """Get or load (model, tokenizer) for `model_id`. LRU bump on hit.
+
+        Concurrency contract (P1 fix 2026-05-05):
+
+        1. The fast-path lookup + LRU bump runs under `_loaded_lock` — atomic.
+        2. Eviction (`_evict_for`) runs under the same lock (re-entrant via RLock).
+        3. The heavy `mlx_lm.load(canonical)` call (3-8s cold load) is OUT of
+           the lock so concurrent `chat()` calls on already-resident models
+           do NOT block behind it.
+        4. After loading, a double-check inside the lock ensures that if a
+           second thread loaded the same model during the unlocked window,
+           we discard the duplicate and return the version stored first.
+           This caps duplicated `mlx_lm.load()` calls to at most N for N
+           racing threads on the same fresh model — but only ONE result
+           wins the `_loaded` slot, no leak.
+        """
         canonical = to_mlx(model_id)
-        if canonical in self._loaded:
-            self._loaded.move_to_end(canonical)
-            return self._loaded[canonical]
 
-        # Eviction BEFORE load (free RAM first)
-        self._evict_for(canonical)
+        # Fast path: already resident → LRU bump + return under lock.
+        with self._loaded_lock:
+            if canonical in self._loaded:
+                self._loaded.move_to_end(canonical)
+                return self._loaded[canonical]
+            # Eviction BEFORE load (free RAM first); reentrant via RLock.
+            self._evict_for(canonical)
 
+        # Heavy I/O OUTSIDE the lock so concurrent chats on resident models
+        # don't block behind a 3-8s cold load.
         from mlx_lm import load  # type: ignore[import-not-found]
 
         model, tokenizer = load(canonical)
-        self._loaded[canonical] = (model, tokenizer)
-        return (model, tokenizer)
+
+        # Double-check under lock: another thread may have loaded the same
+        # model while we were waiting on `mlx_lm.load`. If so, return the
+        # winner and let `(model, tokenizer)` we just loaded get GC'd.
+        with self._loaded_lock:
+            if canonical in self._loaded:
+                self._loaded.move_to_end(canonical)
+                return self._loaded[canonical]
+            self._loaded[canonical] = (model, tokenizer)
+            return (model, tokenizer)
 
     def _evict_for(self, incoming: str) -> None:
-        """Evict resident models to make room for `incoming`."""
-        is_big = incoming in self._BIG_MODELS
+        """Evict resident models to make room for `incoming`.
 
-        if is_big:
-            # Big models are single-tenant: evict everything else.
+        Holds `_loaded_lock` (RLock) — safe to call while already holding it
+        from `_load()`. Direct external callers are also protected.
+        """
+        with self._loaded_lock:
+            is_big = incoming in self._BIG_MODELS
+
+            if is_big:
+                # Big models are single-tenant: evict everything else.
+                for k in list(self._loaded.keys()):
+                    if k != incoming:
+                        self._loaded.pop(k, None)
+                return
+
+            # Incoming is small: evict any big, then LRU-trim small ones.
             for k in list(self._loaded.keys()):
-                if k != incoming:
+                if k in self._BIG_MODELS:
                     self._loaded.pop(k, None)
-            return
 
-        # Incoming is small: evict any big, then LRU-trim small ones.
-        for k in list(self._loaded.keys()):
-            if k in self._BIG_MODELS:
-                self._loaded.pop(k, None)
-
-        while len(self._loaded) >= self._MAX_SMALL_LOADED:
-            self._loaded.popitem(last=False)  # evict LRU (oldest)
+            while len(self._loaded) >= self._MAX_SMALL_LOADED:
+                self._loaded.popitem(last=False)  # evict LRU (oldest)
 
     def chat(
         self,
@@ -610,21 +663,27 @@ class MLXBackend(LLMBackend):
         the Python references; Metal keeps the pages wired until
         gc.collect() runs which is non-deterministic.
 
+        Concurrency: the `_loaded` mutation runs under `_loaded_lock`
+        (P1 fix 2026-05-05). `mx.clear_cache()` and `gc.collect()` run
+        OUTSIDE the lock — they can be slow and don't touch the dict.
+
         Returns True iff anything was unloaded.
         """
         try:
-            if not self._loaded:
-                return False
-            if model is None:
-                self._loaded.clear()
-                unloaded_any = True
-            else:
-                canonical = to_mlx(model)
-                if canonical in self._loaded:
-                    self._loaded.pop(canonical, None)
+            with self._loaded_lock:
+                if not self._loaded:
+                    return False
+                if model is None:
+                    self._loaded.clear()
                     unloaded_any = True
                 else:
-                    unloaded_any = False
+                    canonical = to_mlx(model)
+                    if canonical in self._loaded:
+                        self._loaded.pop(canonical, None)
+                        unloaded_any = True
+                    else:
+                        unloaded_any = False
+            # Cache-clear + GC outside the lock: slow ops, no `_loaded` access.
             try:
                 import mlx.core as mx  # type: ignore[import-not-found]
 

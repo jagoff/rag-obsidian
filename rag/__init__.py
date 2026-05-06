@@ -14945,23 +14945,65 @@ def start_wal_checkpointer() -> bool:
         return True
 
 
-def _system_memory_used_pct() -> float | None:
-    """Return macOS system memory usage as % used, or None si no se puede medir.
+def _system_memory_used_pct_kernel() -> float | None:
+    """Primary probe: parsea ``memory_pressure -Q`` (kernel truth).
 
-    Fórmula: (wired + active + compressed) / total_bytes.
-    Excluye "free" + "inactive" (macOS los cuenta como disponibles para
-    reclaim — inactive es page cache + dirty reusable). Este cálculo mide
-    la memoria REALMENTE comprometida — si sube >85% el kernel empieza
-    a swappear agresivo y dispara beachballs.
+    Output format (estable desde macOS 11+):
+        ``System-wide memory free percentage: N%``
 
-    Zero-dep: shell-outs a `vm_stat` + `sysctl hw.memsize` (ambos ship
-    con macOS). psutil no está en pyproject.toml a propósito (evita
-    agregar dep binaria para un solo uso).
-
-    Linux / otros: fallback a None — el watchdog se desactiva silencioso.
+    Returns 100 - N. None si el binario no existe / output no parsea.
+    Es la signal canónica que usan beachballs / OOM killer; refleja qué
+    cree el kernel sobre cuánta memoria queda reclaimable, no la fórmula
+    Linux-style de páginas comprometidas (que en macOS infla por contar
+    ``active`` como usado cuando es reclaimable bajo presión).
     """
     if sys.platform != "darwin":
         return None
+    try:
+        for mp_bin in ("/usr/bin/memory_pressure", "/sbin/memory_pressure", "memory_pressure"):
+            try:
+                out = subprocess.run(
+                    [mp_bin, "-Q"],
+                    capture_output=True, text=True, timeout=2, check=False,
+                ).stdout
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                continue
+            if not out:
+                continue
+            m = re.search(r"memory free percentage:\s*(\d+)\s*%", out)
+            if m:
+                free_pct = int(m.group(1))
+                used_pct = 100.0 - free_pct
+                return max(0.0, min(100.0, used_pct))
+        return None
+    except Exception:
+        return None
+
+
+def _system_memory_used_pct() -> float | None:
+    """Return macOS system memory usage as % used, or None si no se puede medir.
+
+    Primary: ``memory_pressure -Q`` (kernel truth — refleja la señal canónica
+    que dispara beachballs / OOM). Fallback: fórmula
+    ``(wired + active + compressed) / total_bytes`` via vm_stat + sysctl.
+
+    El fallback es necesario en sandboxes / containers donde el binario
+    ``memory_pressure`` no está accesible. Sobre el watchdog crónico:
+    cuando ambos paths están disponibles, el primary suele dar 10-15pp
+    menos que el fallback en idle (porque ``active`` cuenta como usado
+    pero es reclaimable). Audit 2026-05-06: el formula path falsamente
+    triggereaba unloads → MLX reload → GPU Hang en loop.
+
+    Zero-dep: shell-outs a binarios macOS. psutil no está en
+    pyproject.toml a propósito.
+
+    Linux / otros: None — el watchdog se desactiva silencioso.
+    """
+    if sys.platform != "darwin":
+        return None
+    primary = _system_memory_used_pct_kernel()
+    if primary is not None:
+        return primary
     try:
         vm_out = ""
         total_out = ""

@@ -327,9 +327,8 @@ def synthesize_cluster(
     H1/first-line; body = the full markdown the LLM produced. Raises on LLM
     failure; caller decides whether to skip or retry.
     """
-    import ollama  # imported lazily so unit tests can monkeypatch without network
     chat_model = model or rag.resolve_chat_model()
-    resp = ollama.chat(
+    resp = rag._mlx_or_ollama_chat(
         model=chat_model,
         messages=[
             {"role": "system", "content": _SYNTH_SYSTEM},
@@ -338,7 +337,10 @@ def synthesize_cluster(
         options=rag.CHAT_OPTIONS,
         keep_alive=rag.OLLAMA_KEEP_ALIVE,
     )
-    body = (resp.get("message", {}).get("content") or "").strip()
+    if hasattr(resp, "message"):
+        body = (getattr(resp.message, "content", "") or "").strip()
+    else:
+        body = (resp.get("message", {}).get("content") or "").strip()
     if not body:
         raise RuntimeError("empty synthesis response")
     # Title extraction: prefer the H1 the prompt asks for; fall back to the

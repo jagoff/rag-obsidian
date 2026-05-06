@@ -54,6 +54,13 @@ Para cambiar cualquier default: setear el env var en el shell antes de invocar e
 | `RAG_VLM_CAPTION` | `1` | `rag.py:19306` | Activa captioning de imágenes embebidas via VLM (qwen2.5-vl). OCR via Apple Vision sigue siendo el path default — VLM es complementario. |
 | `RAG_WIKILINK_EXPANSION` | `1` | `rag.py:9092` | Expande wikilinks en el CONTEXT del retrieve (resolver link targets a body). Experimental. |
 
+## MLX backend
+
+| Variable | Default | Ubicación | Qué hace |
+|---|---|---|---|
+| `RAG_MLX_IDLE_TTL` | `1800` (30min) | `rag/llm_backend.py` | Segundos de inactividad antes de que el watchdog evicte un modelo de `_loaded` + libere Metal cache. Setear `0` para deshabilitar. Análogo a `RAG_RERANKER_IDLE_TTL`. |
+| `RAG_MLX_IDLE_DISABLE` | `""` (off) | `rag/llm_backend.py` | Setear `1` para deshabilitar el watchdog thread sin cambiar el TTL (útil para tests / debug). |
+
 ## Infraestructura / internal
 
 | Variable | Default | Ubicación | Qué hace |

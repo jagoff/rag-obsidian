@@ -2396,6 +2396,12 @@ SOURCE_WEIGHTS: dict[str, float] = {
     "calls":     0.80,   # log entries: factual but semantically thin
     "whatsapp":  0.75,
     "messages":  0.75,
+    # `pillow` (iOS sleep tracker, despachado en `rag index --source pillow`):
+    # los datos viven en `rag_sleep_sessions` (no escriben chunks al corpus
+    # vectorial), pero la entry queda acá para mantener paridad con
+    # `VALID_SOURCES` + `CONFIDENCE_RERANK_MIN_PER_SOURCE`. Weight nominal
+    # 0.50 — defensivo si por algún motivo escribiera chunks (no debería).
+    "pillow":    0.50,
 }
 
 # Recency half-life per source, in days. None → no decay applied (chunks
@@ -2425,6 +2431,9 @@ SOURCE_RECENCY_HALFLIFE_DAYS: dict[str, float | None] = {
     "whatsapp":    60.0,
     "messages":    60.0,
     "calls":       60.0,
+    # `pillow`: no aplica recency decay porque no escribe chunks al corpus.
+    # Entry presente para coverage del `set(SOURCE_RECENCY_HALFLIFE_DAYS) == VALID_SOURCES`.
+    "pillow":     None,
 }
 
 # Retention windows per source, in days. None → keep forever. Used at
@@ -2443,6 +2452,9 @@ SOURCE_RETENTION_DAYS: dict[str, int | None] = {
     "whatsapp":   180,
     "messages":   180,
     "calls":      180,
+    # `pillow`: el ingester maneja su propio retention sobre `rag_sleep_sessions`.
+    # Acá None para coverage del set check.
+    "pillow":     None,
 }
 
 

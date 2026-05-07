@@ -23,11 +23,13 @@ def test_valid_sources_contains_expected():
     # Phase 1 registered 6 sources + Phase 1e/f added contacts + calls
     # + Phase 2 added safari + drive (Google Docs/Sheets/Slides corpus,
     # commit de03db1 2026-04-23) + 2026-05-05 added `memory` (mem-vault
-    # carve-out from `source=vault`, see `_infer_vault_source`). Anchor
-    # test so future additions don't silently grow the surface.
+    # carve-out from `source=vault`, see `_infer_vault_source`)
+    # + 2026-05-07 added `pillow` (PIL image OCR ingester, despacho ad-hoc
+    # ANTES del check VALID_SOURCES en `_run_index_inner`). Anchor test
+    # so future additions don't silently grow the surface.
     assert rag.VALID_SOURCES == frozenset(
         {"vault", "memory", "calendar", "gmail", "whatsapp", "reminders",
-         "messages", "contacts", "calls", "safari", "drive"}
+         "messages", "contacts", "calls", "safari", "drive", "pillow"}
     )
 
 

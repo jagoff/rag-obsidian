@@ -5818,7 +5818,7 @@ _CORPUS_HASH_BUCKET: int = int(os.environ.get("RAG_CORPUS_HASH_BUCKET", "500"))
 # (PII redaction, raw tool call stripper, iberian leaks, REGLA 1.b/1.c, etc.).
 # Forzando que las entries del semantic cache pre-fix sean "diferente
 # corpus" → no se sirvan más.
-_FILTER_VERSION = "wave10-2026-05-06"
+_FILTER_VERSION = "wave11-2026-05-06"
 
 
 def _hash_chunk_count(chunk_count: int) -> str:
@@ -27839,6 +27839,40 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
     want to render their own summary.
     """
     col = get_db()
+    # Arrancar memory pressure watchdog (idempotente — si ya corre, no-op).
+    # Sin esto el bulk indexing fragmenta MPS allocator hasta GPU OOM
+    # acumulado a ~14min con `kIOGPUCommandBufferCallbackErrorOutOfMemory`.
+    # El docstring legacy de `start_memory_pressure_watchdog` decía "CLI
+    # one-shot no necesita watchdog" — falso para `rag index --reset` con
+    # 635+ archivos, toma 15-30+ min. Reproducido HOY 2026-05-06 PID 29718
+    # tras ~14min run. Audit completo en
+    # `99-AI/system/embedder-fix-2026-05-06/patch-proposal-watchdog.md`.
+    try:
+        start_memory_pressure_watchdog()
+    except Exception as exc:
+        _silent_log("run_index_watchdog_start", exc)
+    # Override temporal `RAG_RERANKER_NEVER_UNLOAD=0` durante el indexer:
+    # el reranker pinned (~2-3GB VRAM) NO se necesita durante indexing
+    # — solo en query path. Sin este override, `_handle_memory_pressure`
+    # respeta NEVER_UNLOAD=1 y emite "skipping" ante presión, dejando
+    # 2-3GB VRAM ocupados que aceleran el OOM acumulado.
+    _orig_reranker_never_unload = os.environ.get("RAG_RERANKER_NEVER_UNLOAD", "")
+    os.environ["RAG_RERANKER_NEVER_UNLOAD"] = "0"
+    try:
+        return _run_index_inner(reset, no_contradict, col)
+    finally:
+        if _orig_reranker_never_unload:
+            os.environ["RAG_RERANKER_NEVER_UNLOAD"] = _orig_reranker_never_unload
+        else:
+            os.environ.pop("RAG_RERANKER_NEVER_UNLOAD", None)
+
+
+def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
+    """Cuerpo real del indexer. Extraído de `_run_index()` (2026-05-06)
+    para encapsular el body bajo el `try/finally` del override de
+    `RAG_RERANKER_NEVER_UNLOAD` sin re-indentar ~400 líneas. La función
+    receives `col` ya inicializado para no duplicar `get_db()`.
+    """
     _invalidate_corpus_cache()
     # Audit 2026-04-26 (BUG #23): reset VLM caption budget per-run.
     # Pre-fix: counter `_vlm_caption_calls_used` se acumulaba entre
@@ -28035,6 +28069,21 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
             indexed_files.add(f["doc_id_prefix"])
         pending_files.clear()
         pending_chunk_count = 0
+        # Defensivo post-flush: liberar MPS cache después de cada batch.
+        # El wrapper `_encode_with_cleanup` solo libera por encode call,
+        # los embedding tensors retornados quedan vivos en Python list
+        # hasta que el `for f, ...` de arriba los pasa a `col.add()`. Sin
+        # este `empty_cache()` final, MPS allocator fragmenta entre 200+
+        # flushes de un reindex full → GPU OOM acumulado (signature
+        # `kIOGPUCommandBufferCallbackErrorOutOfMemory` reproducido HOY
+        # 2026-05-06 PID 29718). Combinado con
+        # `start_memory_pressure_watchdog()` arriba para defensa en
+        # profundidad.
+        try:
+            import torch as _torch
+            _torch.mps.empty_cache()
+        except Exception:
+            pass
 
     try:
         for path in md_files:

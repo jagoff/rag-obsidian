@@ -84,10 +84,12 @@ MLX_MODEL_ALIAS: dict[str, str] = {
     "qwen3:30b-a3b": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
     # Experimental (A/B vs the 3B helper, NOT default until eval CIs OK)
     "qwen3:4b": "mlx-community/Qwen3-4B-Instruct-2507-4bit",
-    # Embedder — active path is SentenceTransformer in-process via
-    # _get_local_embedder() in rag/__init__.py. This alias exists so
-    # callers routing explicitly through MLXBackend.embed() still resolve.
-    "qwen3-embedding:0.6b": "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ",
+    # Embedder — active path is MLX in-process via MLXEmbedder
+    # (`rag.mlx_embed`). 8-bit quant elegida porque cosine ≥0.9977 vs
+    # PyTorch fp16 reference (~bit-equivalente, NO requiere reindex);
+    # variantes 4bit-DWQ (~0.97) y mxfp8 (~0.98) sí lo requerirían.
+    # Validación en commit que migró el embedder a MLX (2026-05-06).
+    "qwen3-embedding:0.6b": "mlx-community/Qwen3-Embedding-0.6B-8bit",
 }
 
 SHORT_NAME_ALIAS: dict[str, str] = {v: k for k, v in MLX_MODEL_ALIAS.items()}

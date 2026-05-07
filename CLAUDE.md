@@ -32,13 +32,13 @@ Python 3.13, `uv`. Runtime venv: `.venv/bin/python`. Global tool: `~/.local/shar
 
 ## MLX migration (Ola 8 — 100% MLX, cero ollama runtime — 2026-05-06)
 
-**Estado actual: 100% MLX en todos los paths runtime.** Migración completada en 8 olas escalonadas (Ola 1: dispatch + flag, Ola 5: chat hard-cutover, Ola 6: embed in-process, Ola 7: purga `OllamaBackend`, Ola 8: purga branches defensivos + tipos pydantic locales + `import ollama` removido). Default `RAG_LLM_BACKEND=mlx`. Detalle completo en [`docs/mlx-migration.md`](docs/mlx-migration.md).
+**Estado actual: 100% MLX en todos los paths runtime — incluido el embedder.** Migración completada en 9 olas escalonadas (Ola 1: dispatch + flag, Ola 5: chat hard-cutover, Ola 6: embed in-process via SentenceTransformer, Ola 7: purga `OllamaBackend`, Ola 8: purga branches defensivos + tipos pydantic locales + `import ollama` removido, **Ola 9 (2026-05-06): embedder PyTorch → MLX vía `mlx-lm` + `mlx-community/Qwen3-Embedding-0.6B-8bit`**). Default `RAG_LLM_BACKEND=mlx`, `RAG_EMBED_BACKEND=mlx`. Detalle completo en [`docs/mlx-migration.md`](docs/mlx-migration.md).
 
 **Mapping**:
 - `qwen2.5:3b` (HELPER) → [`mlx-community/Qwen2.5-3B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-3B-Instruct-4bit)
 - `qwen2.5:7b` (CHAT default) → [`mlx-community/Qwen2.5-7B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-7B-Instruct-4bit)
 - `command-r` / `qwen2.5:14b` (HQ tier) → [`mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit`](https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit)
-- `qwen3-embedding:0.6b` (embedder) → [`Qwen/Qwen3-Embedding-0.6B`](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) via `SentenceTransformer` in-process (Ola 6).
+- `qwen3-embedding:0.6b` (embedder) → [`mlx-community/Qwen3-Embedding-0.6B-8bit`](https://huggingface.co/mlx-community/Qwen3-Embedding-0.6B-8bit) via [`mlx-lm`](https://github.com/ml-explore/mlx-lm) in-process (`rag/mlx_embed.py`, Ola 9). Cosine ≥0.9977 vs PyTorch fp16 — bit-equivalente funcional, NO requiere reindex (`_COLLECTION_BASE` queda en `obsidian_notes_v12`).
 
 **Tipos response** ([`rag/llm_backend.py`](rag/llm_backend.py)): `Message`, `ChatResponse`, `GenerateResponse` son pydantic `BaseModel` locales (ya no `from ollama._types import ...`). `Message.ToolCall.Function` preservado via assignment post-class para compat con `parse_tool_calls()`.
 
@@ -48,7 +48,7 @@ Python 3.13, `uv`. Runtime venv: `.venv/bin/python`. Global tool: `~/.local/shar
 
 **Memory pressure watchdog** ([`rag/__init__.py`](rag/__init__.py) `_handle_memory_pressure`): MLX-only path. Llama `MLXBackend.unload(model)` (pop `_loaded` + `mx.clear_cache()`) cuando swap pressure ≥ threshold. Branch Ollama defensivo purgado en Ola 8.
 
-**Rollback emergencia**: requiere `git revert` de Ola 7+ commits + `uv pip install ollama>=0.6.1` + re-pull de modelos chat Ollama. NO se soporta vía env var — `RAG_LLM_BACKEND=ollama` ahora loguea warning + cae a MLX (`OllamaBackend` no existe más).
+**Rollback emergencia**: requiere `git revert` de Ola 7+ commits + `uv pip install ollama>=0.6.1` + re-pull de modelos chat Ollama. NO se soporta vía env var — `RAG_LLM_BACKEND=ollama` ahora loguea warning + cae a MLX (`OllamaBackend` no existe más). Para el embedder, rollback al path PyTorch SentenceTransformer está disponible vía `RAG_EMBED_BACKEND=pytorch` (path histórico mantenido como contención mientras MLX se valida en runtime sostenido).
 
 **Tests**: `tests/conftest.py` fixture autouse `_reset_backend_singleton_per_test` resetea singleton entre tests + auto-stubea `_mlx_chat`/`_chat_stream_dispatch` para tests que NO mockean LLM (evita cargar modelos reales). Tests que MOCKEAN llm_chat hacen `monkeypatch.setattr(rag, "_mlx_chat", _fake)` — su patch gana sobre el auto-stub.
 
@@ -232,8 +232,9 @@ Catálogo completo (47+ vars adicionales) en [`docs/env-vars-catalog.md`](docs/e
 - `RAG_MEMORY_PRESSURE_DISABLE=1` — desactiva watchdog (default ON, threshold 85%, interval 60s). Bajo pressure: unload chat + force-unload reranker (bypassa `RAG_RERANKER_NEVER_UNLOAD`).
 - `RAG_RERANKER_NEVER_UNLOAD=1` — pina reranker en MPS VRAM. Cost ~2-3 GB.
 - `RAG_RERANKER_IDLE_TTL=900` — segundos idle-unload.
-- `RAG_LOCAL_EMBED=1` — in-process bge-m3 (set en plists web + serve, auto-set en CLI query-like). NO en indexing/watch.
+- `RAG_LOCAL_EMBED=1` — in-process embedder (set en plists web + serve, auto-set en CLI query-like). NO en indexing/watch.
 - `RAG_LOCAL_EMBED_WAIT_MS=6000` — budget Event ready antes de raise (post-Ola 6: no hay fallback, solo el path local).
+- `RAG_EMBED_BACKEND=mlx` (default, post-Ola 9 2026-05-06) — backend del embedder local. `=pytorch` activa el rollback path SentenceTransformer (`Qwen/Qwen3-Embedding-0.6B` en MPS). MLX usa `mlx-community/Qwen3-Embedding-0.6B-8bit` via [`mlx-lm`](https://github.com/ml-explore/mlx-lm); cosine ≥0.9977 vs PyTorch fp16, sin reindex.
 
 **Async writers** (default ON desde audit 2026-04-24):
 - Set `RAG_LOG_{QUERY,BEHAVIOR,FT_RATING,AMBIENT,CONTRADICTIONS,ARCHIVE,TUNE,SURFACE}_ASYNC=0` + `RAG_METRICS_ASYNC=0` para opt-out.
@@ -282,7 +283,7 @@ Catálogo completo (47+ vars adicionales) en [`docs/env-vars-catalog.md`](docs/e
 
 Detalle completo del pipeline en [`docs/retrieval-internals.md`](docs/retrieval-internals.md). Resumen invariantes críticos:
 
-**Schema collection**: bump `_COLLECTION_BASE` (currently `obsidian_notes_v11`). Per-vault suffix sha256[:8] of resolved path.
+**Schema collection**: bump `_COLLECTION_BASE` (currently `obsidian_notes_v12`). Per-vault suffix sha256[:8] of resolved path.
 
 **Reranker**: `BAAI/bge-reranker-v2-m3` con `device="mps"` + `float32` forced. **NO switch fp16** — 2 A/Bs failed (collapse 2026-04-13, overhead 2x con calidad equivalente 2026-04-22).
 

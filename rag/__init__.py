@@ -11958,14 +11958,43 @@ def _maybe_auto_enable_local_embed(invoked_subcommand: str | None) -> None:
     os.environ["RAG_LOCAL_EMBED"] = "1"
 
 
+def _resolve_embed_backend() -> str:
+    """Resuelve el backend del embedder local.
+
+    `RAG_EMBED_BACKEND=mlx` (default) → `MLXEmbedder` via mlx-lm.
+    `RAG_EMBED_BACKEND=pytorch` → SentenceTransformer (rollback path).
+
+    Cualquier valor no reconocido se trata como `mlx` con un breadcrumb
+    si `RAG_DEBUG=1`.
+    """
+    raw = os.environ.get("RAG_EMBED_BACKEND", "").strip().lower()
+    if raw in ("pytorch", "torch", "st", "sentence-transformers", "sentence_transformers"):
+        return "pytorch"
+    if raw and raw != "mlx" and os.environ.get("RAG_DEBUG"):
+        print(f"[local-embed] RAG_EMBED_BACKEND={raw!r} no reconocido, usando 'mlx'", flush=True)
+    return "mlx"
+
+
 def _get_local_embedder():
-    """Lazy-load BAAI/bge-m3 as a SentenceTransformer for in-process query embeds.
+    """Lazy-load del embedder in-process para query path + index path.
 
-    Returns the model instance, or None if the model is not cached locally
-    (silently falls to in-process in `query_embed_local`).
+    Backends (resueltos via `RAG_EMBED_BACKEND`):
 
-    Uses MPS on Apple Silicon (same device as reranker).  Caches the model
-    globally so subsequent calls are O(1).
+    - **mlx** (default, post-2026-05-06): ``MLXEmbedder`` envuelve
+      ``mlx-community/Qwen3-Embedding-0.6B-8bit`` cargado con
+      ``mlx_lm.load``. Cosine ≥0.9977 vs PyTorch fp16 (validado en
+      `rag/mlx_embed.py`) — bit-equivalente funcional, no requiere
+      reindex (`_COLLECTION_BASE` queda en `obsidian_notes_v11`).
+      Forward 4-5× más rápido que SentenceTransformer en MPS.
+    - **pytorch** (rollback): ``SentenceTransformer('Qwen/Qwen3-Embedding-0.6B')``
+      en MPS/CUDA/CPU. Path histórico, mantenido como contención por
+      si MLX rompe en alguna macOS / mlx-lm bump. Activación:
+      ``RAG_EMBED_BACKEND=pytorch``.
+
+    Returns the model instance, or None si la carga falla (callers
+    raisean — sin fallback path).
+
+    Singleton: subsecuentes calls son O(1).
     """
     global _local_embedder
     if _local_embedder is not None:
@@ -11973,104 +12002,110 @@ def _get_local_embedder():
     with _local_embedder_lock:
         if _local_embedder is not None:
             return _local_embedder
+        backend = _resolve_embed_backend()
         try:
-            import os as _os
-            # Only load from local cache — never trigger a download mid-serve.
-            # Both env vars required: HF_HUB_OFFLINE gates the hub client,
-            # TRANSFORMERS_OFFLINE gates sentence_transformers' HEAD check.
-            # Without the second one, ST tries an HTTP probe and raises on
-            # offline systems even when the snapshot is already cached.
-            _os.environ["HF_HUB_OFFLINE"] = "1"
-            _os.environ["TRANSFORMERS_OFFLINE"] = "1"
-            import torch
-            from sentence_transformers import SentenceTransformer
-            # `OBSIDIAN_RAG_EMBED_DEVICE` lets ops force CPU during long
-            # bulk-embed runs — observed 2026-05-06 the MPS allocator
-            # crashes with `[METAL] Command buffer execution failed:
-            # Discarded (victim of GPU error/recovery)` after ~200 files
-            # under contention with web/watch/anticipate daemons.
-            _force_dev = os.environ.get("OBSIDIAN_RAG_EMBED_DEVICE", "").strip().lower()
-            if _force_dev in ("cpu", "mps", "cuda"):
-                _dev = _force_dev
-            elif torch.backends.mps.is_available():
-                _dev = "mps"
-            elif torch.cuda.is_available():
-                _dev = "cuda"
+            if backend == "mlx":
+                _local_embedder = _load_mlx_embedder()
             else:
-                _dev = "cpu"
-            # NOTE: EMBED_MODEL is the short alias name
-            # ("qwen3-embedding:0.6b"); the HuggingFace repo id is
-            # "Qwen/Qwen3-Embedding-0.6B". Pasar el alias corto haría
-            # que sentence_transformers golpee el HF HEAD endpoint y
-            # falle offline.
-            # NOTE: EMBED_MODEL es el alias corto ("qwen3-embedding:0.6b").
-            # El HF repo id real es "Qwen/Qwen3-Embedding-0.6B". Pasar el
-            # alias corto haría que sentence_transformers golpee el HF HEAD
-            # endpoint y falle offline.
-            _local_embedder = SentenceTransformer("Qwen/Qwen3-Embedding-0.6B", device=_dev)
-            # Cap max_seq_length post-load (2026-05-06 fix root cause):
-            # Qwen3-Embedding default es 8192 tokens; chunks reales casi
-            # nunca pasan de ~500 (chunker token-aware). Sin cap, MPS
-            # aloca attention 8192² × dim para batches grandes →
-            # RuntimeError "Invalid buffer size: 64.00 GiB" en
-            # `index_batch_embed` (reproducido HOY 16:26 con batch=64).
-            # Cap a 512 cubre el 99% de chunks reales sin truncar nada
-            # útil; deja batches grandes seguros. Override:
-            # `RAG_LOCAL_EMBED_MAX_SEQ_LEN`.
-            try:
-                _max_seq = int(os.environ.get("RAG_LOCAL_EMBED_MAX_SEQ_LEN", "512"))
-                if _max_seq > 0:
-                    _local_embedder.max_seq_length = _max_seq
-                    # Cap también el tokenizer subyacente (Opción 1 fix
-                    # 2026-05-06): sin esto el tokenizer Rust de HF procesa
-                    # el input completo antes de truncar al output cap,
-                    # alocando attention buffers proporcional al input
-                    # original. En archivos con líneas >12k chars (~3000
-                    # tokens en un párrafo, e.g., transcripts YouTube,
-                    # Chrome history dumps), MPS pide ~38 GB transitorio
-                    # que satura GPU pool y deja el proceso en `state U`
-                    # (uninterruptible sleep) sin disparar RuntimeError
-                    # visible. El cap del tokenizer trunca el input ANTES
-                    # de pasar al modelo. Defensa en profundidad junto al
-                    # cap del modelo de la línea anterior.
-                    try:
-                        _local_embedder.tokenizer.model_max_length = _max_seq
-                    except Exception:
-                        pass
-            except (TypeError, ValueError):
-                _local_embedder.max_seq_length = 512
-                try:
-                    _local_embedder.tokenizer.model_max_length = 512
-                except Exception:
-                    pass
-            # MPS cache cleanup wrapper — mismo patrón que get_reranker()
-            # / get_nli_model(). El bge-m3 local hace `encode()` (no
-            # `predict()`), pero el comportamiento de MPS es idéntico:
-            # cada call deja tensors fragmentados que solo se liberan
-            # con torch.mps.empty_cache(). Sin esto, en sesiones largas
-            # contribuye al bloat de unified memory junto al reranker
-            # (caso real 2026-05-02: vmmap del web/server.py mostró 8 GB
-            # en "owned unmapped (graphics)").
-            #
-            # Override: RAG_LOCAL_EMBED_NO_CLEANUP=1 para tests que
-            # necesiten determinismo del MPS allocator.
-            if _dev == "mps" and os.environ.get("RAG_LOCAL_EMBED_NO_CLEANUP", "").strip() not in ("1", "true", "yes"):
-                _orig_encode = _local_embedder.encode
-                def _encode_with_cleanup(*args, **kwargs):
-                    try:
-                        return _orig_encode(*args, **kwargs)
-                    finally:
-                        try:
-                            import torch as _torch
-                            _torch.mps.empty_cache()
-                        except Exception:
-                            pass
-                _local_embedder.encode = _encode_with_cleanup
+                _local_embedder = _load_pytorch_embedder()
         except Exception as _exc:
             if os.environ.get("RAG_DEBUG"):
-                print(f"[local-embed] unavailable ({_exc}) — raising (no fallback)", flush=True)
+                print(f"[local-embed:{backend}] unavailable ({_exc}) — raising (no fallback)", flush=True)
             _local_embedder = None  # stays None; callers raise (no fallback)
     return _local_embedder
+
+
+def _load_mlx_embedder():
+    """Carga el embedder MLX (Qwen3-Embedding-0.6B-8bit) via mlx-lm.
+
+    Resuelve el repo id desde ``MLX_MODEL_ALIAS[EMBED_MODEL]`` para que el
+    alias quede single-source-of-truth en `rag/llm_backend.py`.
+
+    Cap `max_seq_length` desde ``RAG_LOCAL_EMBED_MAX_SEQ_LEN`` (default
+    512). Mantiene la convención del path PyTorch — chunks reales casi
+    nunca pasan de ~500 tokens, y el cap evita ataques de attention
+    cuadrática sobre inputs largos (caso real 2026-05-06: lines >12k
+    chars dejaban MPS pidiendo ~38 GB transitorio).
+    """
+    from rag.llm_backend import to_mlx
+    from rag.mlx_embed import MLXEmbedder, is_repo_cached
+
+    repo = to_mlx(EMBED_MODEL)
+    # Defensive: si el snapshot no está en cache local, raise inmediato
+    # en vez de dejar que mlx-lm intente download silencioso mid-serve.
+    # Caller convierte el raise en `None` y los call sites raisean a su
+    # vez sin fallback.
+    if not is_repo_cached(repo):
+        raise RuntimeError(
+            f"snapshot MLX del embedder no cacheado: {repo!r}. "
+            f"Pre-descargar con `huggingface-cli download {repo}`"
+        )
+    try:
+        max_seq = int(os.environ.get("RAG_LOCAL_EMBED_MAX_SEQ_LEN", "512"))
+    except (TypeError, ValueError):
+        max_seq = 512
+    if max_seq <= 0:
+        max_seq = 512
+    return MLXEmbedder(repo, max_seq_length=max_seq)
+
+
+def _load_pytorch_embedder():
+    """Rollback path: SentenceTransformer('Qwen/Qwen3-Embedding-0.6B').
+
+    Mantiene el comportamiento histórico (pre-2026-05-06):
+    - MPS/CUDA/CPU device resolution (con override `OBSIDIAN_RAG_EMBED_DEVICE`).
+    - max_seq_length cap + tokenizer.model_max_length cap.
+    - MPS cache cleanup wrapper post-encode (con override
+      `RAG_LOCAL_EMBED_NO_CLEANUP=1` para tests).
+    - Offline gates HF_HUB_OFFLINE + TRANSFORMERS_OFFLINE.
+
+    Activación: `RAG_EMBED_BACKEND=pytorch`.
+    """
+    import os as _os
+    _os.environ["HF_HUB_OFFLINE"] = "1"
+    _os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    import torch
+    from sentence_transformers import SentenceTransformer
+
+    _force_dev = os.environ.get("OBSIDIAN_RAG_EMBED_DEVICE", "").strip().lower()
+    if _force_dev in ("cpu", "mps", "cuda"):
+        _dev = _force_dev
+    elif torch.backends.mps.is_available():
+        _dev = "mps"
+    elif torch.cuda.is_available():
+        _dev = "cuda"
+    else:
+        _dev = "cpu"
+    model = SentenceTransformer("Qwen/Qwen3-Embedding-0.6B", device=_dev)
+    try:
+        _max_seq = int(os.environ.get("RAG_LOCAL_EMBED_MAX_SEQ_LEN", "512"))
+        if _max_seq > 0:
+            model.max_seq_length = _max_seq
+            try:
+                model.tokenizer.model_max_length = _max_seq
+            except Exception:
+                pass
+    except (TypeError, ValueError):
+        model.max_seq_length = 512
+        try:
+            model.tokenizer.model_max_length = 512
+        except Exception:
+            pass
+    if _dev == "mps" and os.environ.get("RAG_LOCAL_EMBED_NO_CLEANUP", "").strip() not in ("1", "true", "yes"):
+        _orig_encode = model.encode
+
+        def _encode_with_cleanup(*args, **kwargs):
+            try:
+                return _orig_encode(*args, **kwargs)
+            finally:
+                try:
+                    import torch as _torch
+                    _torch.mps.empty_cache()
+                except Exception:
+                    pass
+
+        model.encode = _encode_with_cleanup
+    return model
 
 
 def _index_embed_local():

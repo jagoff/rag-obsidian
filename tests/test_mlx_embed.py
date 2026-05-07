@@ -174,7 +174,10 @@ def test_mlx_backend_embed_model_alias_resolved(monkeypatch):
     from rag.llm_backend import MLX_MODEL_ALIAS
 
     assert "qwen3-embedding:0.6b" in MLX_MODEL_ALIAS
-    assert "Qwen3-Embedding-0.6B-4bit-DWQ" in MLX_MODEL_ALIAS["qwen3-embedding:0.6b"]
+    # Migración 2026-05-06: 4bit-DWQ (cos ~0.97 vs PyTorch fp16, requiere
+    # reindex) → 8bit (cos ≥0.9977, bit-equivalente funcional). Validación
+    # detallada en docstring de rag/mlx_embed.py.
+    assert "Qwen3-Embedding-0.6B-8bit" in MLX_MODEL_ALIAS["qwen3-embedding:0.6b"]
 
 
 def test_mlx_backend_embed_caches_model(backend_with_fake_embed):

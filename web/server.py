@@ -6667,6 +6667,10 @@ def _redact_pii(text: str) -> tuple[str, int]:
     """
     if not text:
         return text, 0
+    # Single-user opt-out: ver `_PiiRedactFilter.__init__` para rationale.
+    # Override: RAG_PII_REDACT_USER_OUTPUT=0.
+    if os.environ.get("RAG_PII_REDACT_USER_OUTPUT", "1").strip() in ("0", "false", "no"):
+        return text, 0
     out = text
     n = 0
     for pat, repl in _PII_REDACT_PATTERNS:
@@ -6710,10 +6714,21 @@ class _PiiRedactFilter:
     def __init__(self) -> None:
         self._buf = ""
         self._redact_count = 0
+        # Single-user opt-out: el redact protege contra leaks via telemetry/
+        # logs en setups multi-tenant, pero en setups personales (user
+        # pregunta su PROPIO password) bloquea el lookup legítimo.
+        # Override: RAG_PII_REDACT_USER_OUTPUT=0 desactiva el redact en el
+        # stream user-facing. La data sigue auditable via el conteo
+        # `_redact_count` (telemetry-only).
+        self._enabled = os.environ.get(
+            "RAG_PII_REDACT_USER_OUTPUT", "1"
+        ).strip() not in ("0", "false", "no")
 
     def feed(self, chunk: str) -> str:
         if not chunk:
             return ""
+        if not self._enabled:
+            return chunk
         self._buf += chunk
         # Si el buffer entero termina con un PII label (con o sin valor
         # parcial), retenemos hasta el próximo chunk.
@@ -6733,8 +6748,10 @@ class _PiiRedactFilter:
         return out
 
     def flush(self) -> str:
-        if not self._buf:
-            return ""
+        if not self._enabled or not self._buf:
+            out_buf = self._buf
+            self._buf = ""
+            return out_buf
         out, n = _redact_pii(self._buf)
         self._redact_count += n
         self._buf = ""

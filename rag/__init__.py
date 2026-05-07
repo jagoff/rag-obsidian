@@ -17189,6 +17189,12 @@ def _redact_sensitive(text: str) -> str:
     """
     if not text:
         return text
+    # Single-user opt-out (env var): el redact protege contra leaks via
+    # logs/telemetry/cache en setups multi-tenant. En setups personales
+    # (Fer pregunta su PROPIO password en su vault local) bloquea el
+    # lookup legítimo. Override: RAG_PII_REDACT_USER_OUTPUT=0.
+    if os.environ.get("RAG_PII_REDACT_USER_OUTPUT", "1").strip() in ("0", "false", "no"):
+        return text
     text = _OTP_CUE_RE.sub(lambda m: f"{m.group(1)}: <REDACTED>", text)
     text = _BANK_SECRET_RE.sub(lambda m: f"{m.group(1)}: <REDACTED>", text)
     text = _CVV_RE.sub(lambda m: f"{m.group(1)}: <REDACTED>", text)

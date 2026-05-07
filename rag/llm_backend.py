@@ -539,6 +539,19 @@ class MLXBackend(LLMBackend):
         format: str | None = None,
         **kwargs: Any,
     ) -> Any:
+        # HTTP shim path (2026-05-08): cuando RAG_MLX_HTTP_SHIM=1 y el
+        # modelo está mapeado a un puerto en RAG_MLX_HTTP_SHIM_PORTS,
+        # routeamos via OpenAI API local. Razón: in-process MLX bajo
+        # carga sostenida (chat /api/chat con embed + rerank + generate
+        # en serie) trippea el watchdog de Metal (kIOGPUCommandBufferCallback
+        # ErrorHang) y crashea el rag-web. Cada `mlx_lm.server` proceso
+        # tiene su propio Metal context, sin contention con el embedder
+        # in-process del web.
+        _shim_yield = self._maybe_chat_stream_http_shim(model, messages, options, format)
+        if _shim_yield is not None:
+            yield from _shim_yield
+            return
+
         from mlx_lm import stream_generate  # type: ignore[import-not-found]
         from mlx_lm.sample_utils import make_sampler  # type: ignore[import-not-found]
 
@@ -592,6 +605,125 @@ class MLXBackend(LLMBackend):
             done=True,
             done_reason="stop",
         )
+
+    @staticmethod
+    def _shim_port_for(model: str) -> int | None:
+        """Return mlx_lm.server port for a model name, or None if not mapped.
+
+        Mapping read from `RAG_MLX_HTTP_SHIM_PORTS` env var (default:
+        `qwen2.5:7b=8082,qwen2.5:3b=8083`). Match accepts both short name
+        and HF canonical (mlx-community/...). Override per deploy.
+        """
+        if os.environ.get("RAG_MLX_HTTP_SHIM", "").strip() not in ("1", "true", "yes"):
+            return None
+        raw = os.environ.get(
+            "RAG_MLX_HTTP_SHIM_PORTS",
+            "qwen2.5:7b=8082,qwen2.5:3b=8083",
+        )
+        mapping: dict[str, int] = {}
+        for entry in raw.split(","):
+            entry = entry.strip()
+            if "=" not in entry:
+                continue
+            name, port = entry.split("=", 1)
+            try:
+                mapping[name.strip().lower()] = int(port.strip())
+            except ValueError:
+                continue
+        short = to_short_name(model).lower()
+        canonical = to_mlx(model).lower()
+        return mapping.get(short) or mapping.get(canonical)
+
+    def _maybe_chat_stream_http_shim(
+        self,
+        model: str,
+        messages: list[dict[str, str]],
+        options: ChatOptions | None,
+        format: str | None,
+    ):
+        """If model has a shim port, yield streamed ChatResponse via HTTP.
+
+        Returns None when shim disabled or model not mapped — caller falls
+        through to in-process MLX path.
+        """
+        port = self._shim_port_for(model)
+        if port is None:
+            return None
+        try:
+            import urllib.request
+            import json as _json
+        except ImportError:
+            return None
+
+        opts = options or ChatOptions()
+        # Inject JSON-mode nudge into system message (mirror in-process behavior).
+        msgs = list(messages)
+        if format == "json":
+            extra = (
+                "Respond with ONLY a single valid JSON object. "
+                "No prose, no markdown fences, no commentary."
+            )
+            if msgs and msgs[0].get("role") == "system":
+                msgs[0] = {**msgs[0], "content": msgs[0]["content"] + "\n\n" + extra}
+            else:
+                msgs = [{"role": "system", "content": extra}, *msgs]
+
+        canonical = to_mlx(model)
+        body = {
+            "model": canonical,
+            "messages": msgs,
+            "stream": True,
+            "max_tokens": opts.num_predict,
+            "temperature": opts.temperature,
+            "top_p": opts.top_p,
+        }
+        if format == "json":
+            body["response_format"] = {"type": "json_object"}
+        if opts.temperature > 0:
+            body["seed"] = opts.seed
+
+        url = f"http://127.0.0.1:{port}/v1/chat/completions"
+        short_name = to_short_name(model)
+
+        def _gen():
+            req = urllib.request.Request(
+                url,
+                data=_json.dumps(body).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line or not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        break
+                    try:
+                        chunk = _json.loads(payload)
+                    except Exception:
+                        continue
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = (choices[0].get("delta") or {}).get("content") or ""
+                    if not delta:
+                        continue
+                    yield ChatResponse(
+                        model=short_name,
+                        message=Message(role="assistant", content=delta),
+                        done=False,
+                    )
+            self._bump_last_used(model)
+            yield ChatResponse(
+                model=short_name,
+                message=Message(role="assistant", content=""),
+                done=True,
+                done_reason="stop",
+            )
+
+        return _gen()
 
     @staticmethod
     def _apply_chat_template(

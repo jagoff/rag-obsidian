@@ -13235,10 +13235,97 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # delegar al helper como los otros 4 callers (CLI query, chat,
         # serve, build_progressive_context).
         from rag import _format_chunk_for_llm as _rag_format_chunk
+        # Per-note dedup (2026-05-07): el reranker ya rankeó los chunks. Si
+        # una nota tiene varias secciones (ej. `# Dirección` + `# Muebles`)
+        # ambas pueden caer al fast-path; el LLM (qwen2.5:7b 4-bit) bias-ea
+        # hacia el chunk con contenido enumerable (URLs/listas). Conservar
+        # SÓLO el primer chunk por (vault, file) preserva la mejor
+        # representación de cada nota. Override: RAG_CONTEXT_DEDUP_BY_FILE=0.
+        _docs = result["docs"]
+        _metas = result["metas"]
+        # Stale chunk auto-purge (2026-05-07): si el archivo indexado ya no
+        # existe en disco (movido a .trash, renombrado, deleteado), filtrar
+        # esos chunks del contexto. El watch daemon eventualmente los
+        # despinda del index pero la latencia entre delete-on-disk y
+        # purge-on-index puede ser horas. En el ínterin estos chunks
+        # llegan al LLM como "info real" y producen respuestas wrong.
+        # Override: RAG_CONTEXT_PURGE_STALE=0.
+        if os.environ.get("RAG_CONTEXT_PURGE_STALE", "1").strip() not in ("0", "false", "no"):
+            from pathlib import Path as _PathStale
+            _live_docs: list[str] = []
+            _live_metas: list[dict] = []
+            _purged_files: list[str] = []
+            for _d, _m in zip(_docs, _metas):
+                _file_rel = _m.get("file", "") if isinstance(_m, dict) else ""
+                _vault_path = _m.get("_vault", "") if isinstance(_m, dict) else ""
+                _abs = None
+                if _file_rel:
+                    _root = _PathStale(_vault_path) if _vault_path else _PathStale(VAULT_PATH)
+                    _abs = _root / _file_rel
+                # Only purge if path looks like a vault file (skip cross-source
+                # virtual chunks that have no file-on-disk: WhatsApp daily
+                # rollups, calendar events, gmail threads, etc — these have
+                # _abs that won't exist but they're authoritative).
+                _is_vault_md = bool(_file_rel) and _file_rel.endswith(".md") and not _file_rel.startswith("_")
+                if _is_vault_md and _abs and not _abs.exists():
+                    _purged_files.append(_file_rel)
+                    continue
+                _live_docs.append(_d)
+                _live_metas.append(_m)
+            if _purged_files:
+                print(f"[ctx-purge-stale] removed={len(_purged_files)} files={_purged_files[:3]}", flush=True)
+            _docs = _live_docs
+            _metas = _live_metas
+
+        if os.environ.get("RAG_CONTEXT_DEDUP_BY_FILE", "1").strip() not in ("0", "false", "no"):
+            # Dedup por file: cuando hay múltiples chunks de una misma nota,
+            # elegir el chunk cuya H1 (primer línea) matchea MÁS tokens
+            # significativos de la pregunta. Razón: `chunk_id` está en None
+            # en metadata exposed → no podemos usar orden de archivo. El
+            # reranker a veces ranquea más alto a un chunk tangencial por
+            # keyword overlap superficial (ej. URLs con "casa" en el dominio
+            # ranquean por encima de la sección "# Dirección de la casa"
+            # para query "datos de la casa"). H1-keyword match prefiere la
+            # sección cuyo titular literalmente menciona lo pedido.
+            import re as _re_dedup
+            _STOP = {"de","del","la","el","los","las","y","o","u","a","en","con",
+                     "por","para","sobre","es","son","una","un","mi","tu","mis",
+                     "tus","que","qué","cual","cuál","cuales","cuáles","como",
+                     "cómo","dame","decime","cuáles","tengo","hay","tenes","tenés",
+                     "puedo","quiero","necesito"}
+            def _query_tokens(q: str) -> set[str]:
+                toks = _re_dedup.findall(r"\w+", q.lower(), _re_dedup.UNICODE)
+                return {t for t in toks if len(t) >= 3 and t not in _STOP}
+            def _h1_score(doc: str, qtokens: set[str]) -> int:
+                first_line = (doc or "").split("\n", 1)[0].lower()
+                first_line = _re_dedup.sub(r"^#+\s*", "", first_line)
+                doc_toks = set(_re_dedup.findall(r"\w+", first_line, _re_dedup.UNICODE))
+                return len(qtokens & doc_toks)
+            _qtokens = _query_tokens(req.question)
+            _by_file: dict[str, tuple[int, int, str, dict]] = {}  # key → (h1_score, retrieve_rank_negated, doc, meta)
+            _file_first_seen: dict[str, int] = {}
+            for _idx, (_d, _m) in enumerate(zip(_docs, _metas)):
+                _k = f"{_m.get('_vault', '')}::{_m.get('file', '')}" if isinstance(_m, dict) else ""
+                if not _k:
+                    continue
+                if _k not in _file_first_seen:
+                    _file_first_seen[_k] = _idx
+                _hs = _h1_score(_d, _qtokens)
+                # Tuple ordering: higher h1_score wins; tie-breaker = lower retrieve rank.
+                _candidate = (_hs, -_idx, _d, _m)
+                if _k not in _by_file or _candidate > _by_file[_k]:
+                    _by_file[_k] = _candidate
+            _ordered_keys = sorted(_by_file.keys(), key=lambda k: _file_first_seen[k])
+            _dedup_docs = [_by_file[k][2] for k in _ordered_keys]
+            _dedup_metas = [_by_file[k][3] for k in _ordered_keys]
+            if len(_docs) != len(_dedup_docs):
+                print(f"[ctx-dedup] in={len(_docs)} out={len(_dedup_docs)}", flush=True)
+            _docs = _dedup_docs
+            _metas = _dedup_metas
         context = "\n\n---\n\n".join(
             (f"[vault: {m.get('_vault', '?')}]\n" if is_multi else "")
             + _rag_format_chunk(d[:_WEB_CHUNK_CAP], m, role="nota")
-            for d, m in zip(result["docs"], result["metas"])
+            for d, m in zip(_docs, _metas)
         )
 
         # Collect the WA fetch we kicked off before retrieve. By now it's

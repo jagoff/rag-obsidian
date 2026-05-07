@@ -17488,6 +17488,28 @@ def build_progressive_context(
     """
     # Primary context (full chunks) — wrapped in <<<CHUNK>>> fences with
     # OTP/secret redaction via _format_chunk_for_llm (prompt-injection defence).
+    #
+    # Per-note dedup (2026-05-07, bug "dame los datos de la casa"): cuando
+    # una nota tiene varias secciones (ej. `# Dirección` + `# Muebles`),
+    # ambas pueden caer en primary_docs como chunks separados con scores
+    # cercanos. El LLM (qwen2.5:7b 4-bit) bias-ea hacia el chunk con
+    # contenido más "enumerable" (URLs/listas) ignorando el chunk que
+    # realmente responde la pregunta. Como primary_docs ya viene en rank
+    # order del reranker, mantener SÓLO el primer chunk por file preserva
+    # la mejor representación de cada nota y evita confusión multi-chunk.
+    # Override: `RAG_CONTEXT_DEDUP_BY_FILE=0` desactiva.
+    if os.environ.get("RAG_CONTEXT_DEDUP_BY_FILE", "1").strip() not in ("0", "false", "no"):
+        seen_primary_files: set[str] = set()
+        deduped_pairs: list[tuple[str, dict]] = []
+        for d, m in zip(primary_docs, primary_metas):
+            fpath = m.get("file", "") if isinstance(m, dict) else ""
+            if fpath and fpath in seen_primary_files:
+                continue
+            seen_primary_files.add(fpath)
+            deduped_pairs.append((d, m))
+        primary_docs = [d for d, _ in deduped_pairs]
+        primary_metas = [m for _, m in deduped_pairs]
+
     primary = "\n\n---\n\n".join(
         _format_chunk_for_llm(d, m, role="nota")
         for d, m in zip(primary_docs, primary_metas)
@@ -21329,6 +21351,25 @@ def run_chat_turn(req: ChatTurnRequest) -> ChatTurnResult:
     # 5. Build context (single-vault via progressive_context; multi-vault
     # annotates con [vault: name] outside the chunk fences). Mantiene la
     # lógica del loop legacy que ya probaba OK en prod.
+    # Per-note dedup (2026-05-07): aplicar a single+multi-vault. El reranker
+    # ya ordenó los chunks; conservar SÓLO el primero por (vault, file)
+    # evita que múltiples chunks de la misma nota (ej. nota con secciones
+    # `# Dirección` + `# Muebles`) confundan al LLM. Override:
+    # `RAG_CONTEXT_DEDUP_BY_FILE=0`.
+    if os.environ.get("RAG_CONTEXT_DEDUP_BY_FILE", "1").strip() not in ("0", "false", "no"):
+        seen_keys: set[str] = set()
+        deduped_docs: list[str] = []
+        deduped_metas: list[dict] = []
+        for d, m in zip(retrieve_result.docs, retrieve_result.metas):
+            key = f"{m.get('_vault', '')}::{m.get('file', '')}" if isinstance(m, dict) else ""
+            if key and key in seen_keys:
+                continue
+            seen_keys.add(key)
+            deduped_docs.append(d)
+            deduped_metas.append(m)
+        retrieve_result.docs = deduped_docs
+        retrieve_result.metas = deduped_metas
+
     if len(req.vaults) > 1:
         def _fmt_multi(d, m):
             return f"[vault: {m.get('_vault', '?')}] " + _format_chunk_for_llm(d, m, role="nota")

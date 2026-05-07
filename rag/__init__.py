@@ -2342,7 +2342,7 @@ def cleanup_sessions(ttl_days: int = SESSION_TTL_DAYS) -> int:
     return removed
 
 
-EMBED_MODEL = "Qwen/Qwen3-Embedding-4B"  # A/B 2026-05-06: 4B challenger (2560-dim)
+EMBED_MODEL = "qwen3-embedding:0.6b"  # multilingual (ES/EN), 1024-dim, in-process MLX/SentenceTransformer
 # Chat model preference: first available wins.
 # Orden tras bench 2026-04-18 (ver scripts/bench_chat.py, 5 queries × 2 runs
 # warm sobre vault work, rerank_pool default, num_ctx=4096):
@@ -2360,7 +2360,7 @@ CHAT_MODEL_PREFERENCE = (
 )
 HELPER_MODEL = "qwen2.5:3b"      # fast, for internal rewrites (multi-query, HyDE, reformulate)
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"  # cross-encoder, multilingual, MPS-friendly
-_COLLECTION_BASE = "obsidian_notes_v12_q4b"  # A/B 2026-05-06: paralelo a v11, embedder Qwen3-Embedding-4B
+_COLLECTION_BASE = "obsidian_notes_v11"  # v11: 1024-dim, qwen3-embedding:0.6b (revert A/B 2026-05-06: 4B no aprobado por eval)
 
 # ── Cross-source corpus (Phase 1, 2026-04-20 user decisions §10) ──────────
 # The collection stays at v11 (no rename / no re-embed) — source discrimination
@@ -11940,7 +11940,11 @@ def _get_local_embedder():
             # "Qwen/Qwen3-Embedding-0.6B". Passing the ollama name makes
             # sentence_transformers hit the hub HEAD endpoint and fail
             # offline.
-            _local_embedder = SentenceTransformer(EMBED_MODEL, device=_dev)
+            # NOTE: EMBED_MODEL es el alias corto ("qwen3-embedding:0.6b").
+            # El HF repo id real es "Qwen/Qwen3-Embedding-0.6B". Pasar el
+            # alias corto haría que sentence_transformers golpee el HF HEAD
+            # endpoint y falle offline.
+            _local_embedder = SentenceTransformer("Qwen/Qwen3-Embedding-0.6B", device=_dev)
             # MPS cache cleanup wrapper — mismo patrón que get_reranker()
             # / get_nli_model(). El bge-m3 local hace `encode()` (no
             # `predict()`), pero el comportamiento de MPS es idéntico:

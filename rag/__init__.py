@@ -16991,6 +16991,23 @@ def infer_filters(
         )
         if re.search(topic_prep, low):
             continue
+        # Skip title-lookup matches: leaf appears as part of a multi-word
+        # capitalized phrase (typical note title pattern). Examples:
+        # "Info - CBU Alquiler" / "Datos casa Alquiler" / "Algo Keto" — el
+        # user nombra una nota, no describe un topic. Forzar folder filter
+        # excluye notas en otros folders cuyo título matchea el query.
+        # Bug (2026-05-08): "Info - CBU Alquiler" lockeaba folder=Alquiler/
+        # y excluía la nota literal `Info - CBU Alquiler.md` que vive en
+        # `Info/`. Detección: leaf precedido por palabra Title-Case en la
+        # query original (no lowercased). También skip si el query contiene
+        # un dash literal ("Info - X") que es marker fuerte de título.
+        title_case_adj = rf"\b[A-ZÁÉÍÓÚÑ][\wáéíóúñÁÉÍÓÚÑ]{{1,}}\s+{esc_leaf}\b"
+        if re.search(title_case_adj, question, flags=re.IGNORECASE) and (
+            # confirmar que ESA palabra adyacente es title-case en el original
+            re.search(rf"\b[A-ZÁÉÍÓÚÑ][\wáéíóúñ]+\s+(?i:{esc_leaf})\b", question)
+            or " - " in question
+        ):
+            continue
         folder = f
         break
     return folder, tag
@@ -22065,6 +22082,25 @@ def retrieve(
                 return True
             return False
         merged_ordered = [id_ for id_ in merged_ordered if not _drop_id(id_)]
+    # Per-file dedup BEFORE pool truncation (2026-05-08): cuando una nota
+    # tiene múltiples chunks (`MLX backend.md` con 12+ chunks indexados),
+    # el RRF puede llenar los 25 slots del rerank pool con chunks de UNA
+    # sola nota, expulsando notas con 1-2 chunks de match perfecto (ej.
+    # `Info - CBU Alquiler.md`). Conservamos solo el primer chunk por file
+    # — el reranker después ve más diversidad de notas.
+    # Override: RAG_DEDUP_PRE_RERANK=0 vuelve al pool sin dedup.
+    if os.environ.get("RAG_DEDUP_PRE_RERANK", "1").strip() not in ("0", "false", "no"):
+        _seen_files_pre: set[str] = set()
+        _deduped_ids: list[str] = []
+        for _id in merged_ordered:
+            _meta = id_map.get(_id, (None, {}))[1] or {}
+            _f = (_meta.get("file") if isinstance(_meta, dict) else "") or ""
+            if _f and _f in _seen_files_pre:
+                continue
+            if _f:
+                _seen_files_pre.add(_f)
+            _deduped_ids.append(_id)
+        merged_ordered = _deduped_ids
     merged_ordered = merged_ordered[:_effective_pool]
     candidates = [(id_map[id_][0], id_map[id_][1], id_) for id_ in merged_ordered if id_ in id_map]
 

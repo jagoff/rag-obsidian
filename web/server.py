@@ -353,6 +353,42 @@ _READ_NOTE_TRIGGER_RE = re.compile(
 )
 
 
+_SEARCH_VAULT_TRIGGER_RE = re.compile(
+    # "busca|buscá|buscame|encontrame|fijate" + objeto (lo que sigue es
+    # query libre, normalmente palabras o nombre de nota). NO requerimos
+    # qualifier — "busca <X>" siempre debería disparar search_vault para
+    # evitar que el LLM caiga al fallback whatsapp_pending/reminders_due.
+    # 2026-05-07: bug "busca Frases positivas para hablar" → LLM
+    # respondía con template de pendientes, ignorando search.
+    r"\b(?:busca(?:me|r)?|busc[aá](?:me)?|encontrame|encontr[aá]|fijate|"
+    r"fij[aá]te|find(?:me)?|search)\b\s+(?P<query>.{2,120}?)(?:[?.!]|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _detect_search_vault_intent(q: str) -> tuple[str, dict] | None:
+    """Detect 'buscá/buscame/encontrame X' → force search_vault.
+
+    Returns ('search_vault', {'query': <text>}) si matchea, None si no.
+
+    2026-05-07: el LLM (qwen2.5:7b 4-bit) bias-eaba a llamar
+    whatsapp_pending + reminders_due cuando la query empezaba con
+    'busca' — el verbo no está en el routing keyword del addendum y el
+    modelo defaultea a tools de "what's pending" defensivamente.
+    Pre-router fuerza search_vault con la query cruda; el LLM nunca
+    llega a la decisión de tools.
+    """
+    if not q or not q.strip():
+        return None
+    m = _SEARCH_VAULT_TRIGGER_RE.search(q)
+    if not m:
+        return None
+    qtext = (m.group("query") or "").strip()
+    if len(qtext) < 2:
+        return None
+    return ("search_vault", {"query": qtext})
+
+
 def _detect_read_note_intent(q: str) -> tuple[str, dict] | None:
     """Detect 'leé la nota X / abrí X.md / mostrame el archivo X' patterns.
 
@@ -585,6 +621,13 @@ def _detect_tool_intent(q: str) -> list[tuple[str, dict]]:
     _read = _detect_read_note_intent(q)
     if _read is not None:
         return [_read]
+    # search_vault explícito ("busca X / buscame X / encontrame X")
+    # tiene segunda prioridad: el LLM bias-ea a whatsapp_pending /
+    # reminders_due cuando no reconoce el verbo y defaultea a tools de
+    # "what's pending". Forzamos search_vault con la query cruda.
+    _sv = _detect_search_vault_intent(q)
+    if _sv is not None:
+        return [_sv]
     # weather con location explícita tiene prioridad: skipea morning-brief
     # spurioso disparado por "hoy"/"mañana" en _PLANNING_PAT.
     _wx = _detect_weather_explicit_location_intent(q)

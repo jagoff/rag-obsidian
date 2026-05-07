@@ -1,61 +1,36 @@
-"""LLM backend abstraction — MLX (Ola 7, 2026-05-06).
+"""LLM backend abstraction — Apple MLX in-process.
 
-Created 2026-05-05 as part of `99-AI/system/mlx-migration/dispatch.md`.
+Single concrete backend: `MLXBackend` (mlx-lm). Cubre chat / generate /
+embed / VLM (granite via mlx-vlm). Modelos: Qwen2.5-3B / 7B,
+Qwen3-30B-A3B, Qwen3-Embedding-0.6B.
 
-## Status: Ola 7 — OllamaBackend retired
-
-This module defines a thin interface (`LLMBackend`) over the LLM call
-contract used across `rag/__init__.py`. Single concrete backend:
-
-- `MLXBackend` — uses `mlx-lm` (Apple MLX). Cubre chat/generate/embed
-  nativo. Qwen2.5-3B/7B, Qwen3-30B-A3B, granite-vision (VLM),
-  Qwen3-Embedding-0.6B.
-
-`OllamaBackend` was retired in Ola 7. `RAG_LLM_BACKEND=ollama` logs a
-warning and falls back to MLX. Rollback requires re-pull of Ollama chat
-models (~24 GB) before reverting to an older commit.
-
-## Scope post-Ola-6: chat + generate + embed
-
-Embeddings ahora forman parte del contrato (`embed()` agregado en Ola 6).
-SentenceTransformer in-process es el path real del indexer; `MLXBackend.embed()`
-existe como alternativa explícita para callers que ruteen via dispatch.
-
-## Invariants preserved
+## Invariants
 
 - HELPER_OPTIONS (temperature=0, seed=42) — eval reproducibility floor.
 - CHAT_OPTIONS (num_ctx=4096, num_predict=384) — VRAM-budgeted.
-- `keep_alive=-1` semantics → emulated via resident-process + LRU on
-  the MLX side (MLX has no native keep_alive). Eviction policy:
-  Qwen3-30B (~17 GB) is single-tenant (_BIG_MODELS), evicts everything
-  else on load. Small models LRU-capped at _MAX_SMALL_LOADED=3.
+- `keep_alive` kwarg: no-op (MLX in-process). Eviction via LRU + idle
+  TTL (`RAG_MLX_IDLE_TTL`, default 1800s). Qwen3-30B (~17 GB) es
+  single-tenant (`_BIG_MODELS`); small models LRU-capped a
+  `_MAX_SMALL_LOADED=3`.
 
 ## Model name aliasing
 
-The backend accepts both alias names (`qwen2.5:3b`) and MLX HF
-IDs (`mlx-community/Qwen2.5-3B-Instruct-4bit`). `to_mlx()` / `to_short_name()`
-resolve between them via `MLX_MODEL_ALIAS` table.
-
-## What MLX does NOT support (vs Ollama)
-
-- `keep_alive=0` (model unload trick): ignored silently — no-op.
-- Grammar-constrained JSON decode: `format='json'` uses system-prompt nudge
-  + `_extract_json()` post-gen instead.
+Acepta tanto el alias corto (`qwen2.5:3b`) como el MLX HF id
+(`mlx-community/Qwen2.5-3B-Instruct-4bit`). `to_mlx()` / `to_short_name()`
+resuelven entre los dos vía `MLX_MODEL_ALIAS`.
 
 ## Tool-calling
 
-`tools=[...]` is propagated to `tokenizer.apply_chat_template(tools=...)`
-which Qwen2.5-Instruct and Qwen3-Instruct templates support natively. The
-model emits `<tool_call>{...}</tool_call>` blocks; `parse_tool_calls()`
-in `rag.mlx_tool_calls` extracts them into Message.ToolCall objects.
-If the tokenizer template doesn't accept `tools=` (older format), the
-call falls through to a no-tools template — caller can detect the absence
-of `tool_calls` in the response and gracefully degrade.
+`tools=[...]` se propaga a `tokenizer.apply_chat_template(tools=...)` —
+Qwen2.5/3-Instruct templates lo soportan nativo. El modelo emite
+`<tool_call>{...}</tool_call>` y `parse_tool_calls()` los extrae a
+`Message.ToolCall`. Si el template no acepta `tools=`, el caller detecta
+la ausencia de `tool_calls` en la respuesta y degrada gracefully.
 
-## Ola 5 cerrada 2026-05-06
+## Format JSON
 
-Tool-calling nativo MLX via `rag.mlx_tool_calls`, idle-unload watchdog,
-watchdog ollama-chat-daemon retirado (chat 100% in-process MLX).
+`format='json'` usa system-prompt nudge + `_extract_json()` post-gen
+(MLX no tiene grammar-constrained decode nativo).
 """
 
 from __future__ import annotations
@@ -85,8 +60,8 @@ def strip_think_blocks(text: str) -> str:
     These blocks contain prose AND brace characters that confuse JSON
     extractors and structured-output parsers downstream.
 
-    Safe for Ollama output (passthrough when no <think> tag is present).
-    Does NOT strip unclosed tags -- incomplete output is left as-is.
+    No-op si no hay `<think>` tag (passthrough). NO strippea tags sin
+    cerrar — output incompleto queda as-is.
     """
     if not text or "<think>" not in text.lower():
         return text
@@ -94,7 +69,7 @@ def strip_think_blocks(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Model aliases: Ollama name ↔ MLX HuggingFace ID
+# Model aliases: short alias ↔ MLX HuggingFace ID
 # ---------------------------------------------------------------------------
 
 MLX_MODEL_ALIAS: dict[str, str] = {
@@ -151,9 +126,7 @@ class ChatOptions:
     seed: int = 42
     num_ctx: int = 4096
     # 384 matches CHAT_OPTIONS["num_predict"] in rag/__init__.py (median
-    # answer_len=38 chars, p90 approx 200 tokens). A default of 768 caused
-    # callers passing options={} without num_predict to generate 2x more
-    # tokens under MLX than under Ollama (latency + quality regression).
+    # answer_len=38 chars, p90 approx 200 tokens).
     num_predict: int = 384
     top_p: float = 1.0
     stop: tuple[str, ...] = ()
@@ -180,7 +153,7 @@ class _ToolCallFunction(BaseModel):
 
 
 class _ToolCall(BaseModel):
-    """Tool call emitido por el modelo. Shape compatible con `ollama.Message.ToolCall`."""
+    """Tool call emitido por el modelo (function name + arguments dict)."""
 
     function: _ToolCallFunction
 
@@ -233,7 +206,7 @@ class LLMBackend(ABC):
         format: str | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """Chat completion. Returns Ollama-shape dict for compat."""
+        """Chat completion. Returns `ChatResponse` (pydantic BaseModel)."""
 
     @abstractmethod
     def chat_stream(
@@ -349,13 +322,13 @@ class MLXBackend(LLMBackend):
     _MAX_SMALL_LOADED = 3
 
     def __init__(self) -> None:
-        # Lazy import to avoid hard dep when backend is `ollama`
+        # Lazy import — mlx-lm es opcional en pyproject (extra `mlx`).
         try:
             import mlx_lm  # type: ignore[import-not-found]  # noqa: F401
         except ImportError as e:
             raise RuntimeError(
-                "mlx-lm not installed. Run `uv pip install '.[mlx]'` or "
-                "set RAG_LLM_BACKEND=ollama."
+                "mlx-lm not installed. Run `uv tool install --reinstall "
+                "--editable '.[mlx]'`."
             ) from e
 
         # OrderedDict to preserve LRU order: oldest first, newest last
@@ -795,8 +768,7 @@ class MLXBackend(LLMBackend):
         """Batch embedding via MLX Qwen3-Embedding model.
 
         Returns MLX-shape {"embeddings": [[float, ...], ...]} where each
-        inner list is a L2-normalised 1024-dim vector (compatible with
-        qwen3-embedding:0.6b Q4_K_M Ollama vectors, cosine-sim ~0.97).
+        inner list is a L2-normalised 1024-dim vector.
 
         Model is cached in `_loaded_embed` (separate from chat `_loaded` dict)
         and tracked via `_last_used` for watchdog eviction. Uses last-real-token
@@ -927,18 +899,10 @@ _BACKEND_SINGLETON: LLMBackend | None = None
 
 
 def get_backend() -> LLMBackend:
-    """Return the active LLM backend (singleton). Always MLXBackend (Ola 7)."""
+    """Return the active LLM backend (singleton). Único disponible: MLX."""
     global _BACKEND_SINGLETON
     if _BACKEND_SINGLETON is not None:
         return _BACKEND_SINGLETON
-
-    choice = os.environ.get("RAG_LLM_BACKEND", "mlx").lower()
-    if choice == "ollama":
-        import logging
-
-        logging.getLogger(__name__).warning(
-            "OllamaBackend retired in Ola 7; falling back to MLX"
-        )
     _BACKEND_SINGLETON = MLXBackend()
     return _BACKEND_SINGLETON
 

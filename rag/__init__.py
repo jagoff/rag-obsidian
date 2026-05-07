@@ -14361,10 +14361,22 @@ def _apply_reranker_lora_adapter(model, adapter_dir: Path) -> bool:
 # Adapter dir convention: `~/.local/share/obsidian-rag/drafts_ft/`
 DRAFTS_FT_ADAPTER_DIR = Path.home() / ".local" / "share" / "obsidian-rag" / "drafts_ft"
 
-# Modelo base del fine-tune. Override via `RAG_DRAFTS_FT_BASE_MODEL`
+# MLX adapter dir (Fase 1.2 Ola 10, 2026-05-07): separado del PEFT histórico
+# para coexistencia + rollback. El nuevo training script
+# `scripts/finetune_drafts_mlx.py` escribe acá el adapter LoRA producido por
+# `mlx_lm.lora --train --mode dpo`.
+DRAFTS_FT_ADAPTER_DIR_MLX = Path.home() / ".local" / "share" / "obsidian-rag" / "drafts_ft_mlx"
+
+# Modelo base del fine-tune (PEFT path histórico). Override via `RAG_DRAFTS_FT_BASE_MODEL`
 # para experimentos. El default debe matchear el del training script.
 DRAFTS_FT_BASE_MODEL = os.environ.get(
     "RAG_DRAFTS_FT_BASE_MODEL", "Qwen/Qwen2.5-7B-Instruct"
+)
+
+# Modelo base MLX para el path mlx_lm. Override via `RAG_DRAFTS_FT_BASE_MODEL_MLX`.
+# Default: Qwen2.5-7B 4bit MLX, mismo tier que el chat default.
+DRAFTS_FT_BASE_MODEL_MLX = os.environ.get(
+    "RAG_DRAFTS_FT_BASE_MODEL_MLX", "mlx-community/Qwen2.5-7B-Instruct-4bit"
 )
 
 # Cache lazy-loaded del modelo + tokenizer + lock para thread safety.
@@ -14477,6 +14489,71 @@ def _load_drafts_ft_model():
             return None, None
 
 
+def _drafts_ft_backend() -> str:
+    """Resuelve el backend del drafts adapter.
+
+    Default: `mlx` cuando exista el adapter MLX (Ola 10 path nativo).
+    Fallback: `peft` cuando solo exista el PEFT histórico. Override
+    explícito via `RAG_DRAFTS_FT_BACKEND={mlx,peft}`.
+    """
+    explicit = os.environ.get("RAG_DRAFTS_FT_BACKEND", "").strip().lower()
+    if explicit in ("mlx", "peft"):
+        return explicit
+    # Auto-detect: MLX adapter dir tiene prioridad si existe
+    try:
+        if (DRAFTS_FT_ADAPTER_DIR_MLX / "adapters.safetensors").is_file() or \
+           (DRAFTS_FT_ADAPTER_DIR_MLX / "adapter_config.json").is_file():
+            return "mlx"
+    except Exception:
+        pass
+    return "peft"
+
+
+def _generate_draft_preview_mlx(
+    *, original_conversation: str, bot_draft_baseline: str,
+    max_new_tokens: int = 200,
+) -> str:
+    """Path MLX-native del preview generator (Fase 1.2 Ola 10).
+
+    Usa `mlx_lm.load` con `adapter_path=DRAFTS_FT_ADAPTER_DIR_MLX` +
+    `mlx_lm.generate`. Mucho más simple que el PEFT path porque
+    mlx_lm carga adapter LoRA + base model en un solo call.
+    """
+    try:
+        from mlx_lm import generate as _mlx_generate, load as _mlx_load  # type: ignore[import-not-found]
+    except ImportError as exc:
+        _silent_log("drafts_ft_mlx_import_missing", exc)
+        return bot_draft_baseline
+    try:
+        model, tokenizer = _mlx_load(
+            DRAFTS_FT_BASE_MODEL_MLX,
+            adapter_path=str(DRAFTS_FT_ADAPTER_DIR_MLX),
+        )
+    except Exception as exc:
+        _silent_log("drafts_ft_mlx_load_failed", exc)
+        return bot_draft_baseline
+    prompt = (
+        f"{original_conversation}\n\n"
+        f"## Borrador del bot:\n"
+        f"{bot_draft_baseline}\n\n"
+        f"## Mensaje final que mandó Fer:\n"
+    )
+    try:
+        out = _mlx_generate(
+            model, tokenizer,
+            prompt=prompt,
+            max_tokens=max_new_tokens,
+            verbose=False,
+        )
+        text = str(out or "").strip()
+        if text.startswith(prompt):
+            text = text[len(prompt):].strip()
+        return text
+    except Exception as exc:
+        _silent_log("drafts_ft_mlx_generate_failed", exc)
+        return bot_draft_baseline
+
+
 def generate_draft_preview(
     *, original_conversation: str, bot_draft_baseline: str,
     max_new_tokens: int = 200,
@@ -14485,7 +14562,10 @@ def generate_draft_preview(
 
     Contract:
       - Si `RAG_DRAFTS_FT` está OFF → echo del baseline.
-      - Si el adapter no existe / peft falta → echo del baseline +
+      - Backend `mlx` (default cuando existe `drafts_ft_mlx/`) usa
+        `mlx_lm.load` + `mlx_lm.generate`. Backend `peft` (fallback)
+        usa el path histórico transformers + peft.
+      - Si el adapter no existe / dependencias faltan → echo del baseline +
         log a silent_errors.jsonl.
       - Si el modelo carga pero la generación crashea → echo del
         baseline + log.
@@ -14497,6 +14577,15 @@ def generate_draft_preview(
     """
     if not _drafts_ft_enabled():
         return bot_draft_baseline
+
+    if _drafts_ft_backend() == "mlx":
+        return _generate_draft_preview_mlx(
+            original_conversation=original_conversation,
+            bot_draft_baseline=bot_draft_baseline,
+            max_new_tokens=max_new_tokens,
+        )
+
+    # Path histórico PEFT (rollback)
     model, tokenizer = _load_drafts_ft_model()
     if model is None or tokenizer is None:
         return bot_draft_baseline

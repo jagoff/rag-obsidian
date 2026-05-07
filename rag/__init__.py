@@ -5830,7 +5830,7 @@ _CORPUS_HASH_BUCKET: int = int(os.environ.get("RAG_CORPUS_HASH_BUCKET", "500"))
 # (PII redaction, raw tool call stripper, iberian leaks, REGLA 1.b/1.c, etc.).
 # Forzando que las entries del semantic cache pre-fix sean "diferente
 # corpus" → no se sirvan más.
-_FILTER_VERSION = "wave11-2026-05-06"
+_FILTER_VERSION = "wave12-2026-05-07"
 
 
 def _hash_chunk_count(chunk_count: int) -> str:
@@ -14679,7 +14679,18 @@ def get_reranker():
             return _reranker
         import torch
         from sentence_transformers import CrossEncoder
-        if torch.backends.mps.is_available():
+        # Override env var (default auto): RAG_RERANKER_DEVICE={cpu,mps,cuda}.
+        # Why: PyTorch MPS reranker + in-process MLX LLM compite por el mismo
+        # Metal command queue → bajo carga sostenida (web /api/chat con embed +
+        # rerank + generate en serie) el watchdog del kernel mata el command
+        # buffer (kIOGPUCommandBufferCallbackErrorHang) y crashea el proceso.
+        # Forzar CPU para el reranker desacopla GPU contention sin tocar el
+        # path MLX. Cost: ~500ms rerank vs ~30ms MPS — aceptable a cambio de
+        # estabilidad. Rollback: unset env var.
+        device_override = os.environ.get("RAG_RERANKER_DEVICE", "").strip().lower()
+        if device_override in ("cpu", "mps", "cuda"):
+            device = device_override
+        elif torch.backends.mps.is_available():
             device = "mps"
         elif torch.cuda.is_available():
             device = "cuda"
@@ -16967,6 +16978,19 @@ def infer_filters(
             adj = rf"(\b[a-záéíóúñ]{{3,}}\s+{esc}\b|\b{esc}\s+[a-záéíóúñ]{{3,}})"
             if re.search(adj, low):
                 continue
+        # Skip topic-descriptor matches: leaf preceded by a Spanish preposition
+        # signals "talking ABOUT X", not "filter to folder X".
+        # Bug (2026-05-07): "cual es el CBU del alquiler" locked folder=
+        # 02-Areas/Personal/Alquiler and excluded `Info - CBU Alquiler` (vive
+        # en `02-Areas/Personal/Info/`) → LLM agarró el CBU de Expensas en
+        # vez del CBU real del alquiler.
+        esc_leaf = re.escape(leaf)
+        topic_prep = (
+            rf"\b(de|del|sobre|para|en|con|por|contra|tras|ante|bajo|"
+            rf"acerca\s+de|respecto\s+a|relativ[oa]\s+a)\s+{esc_leaf}\b"
+        )
+        if re.search(topic_prep, low):
+            continue
         folder = f
         break
     return folder, tag

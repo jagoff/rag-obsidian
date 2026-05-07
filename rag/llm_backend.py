@@ -559,6 +559,7 @@ class MLXBackend(LLMBackend):
             prompt,
             max_tokens=opts.num_predict,
             sampler=sampler,
+            prefill_step_size=128,
         ):
             yield ChatResponse(
                 model=short_name,
@@ -659,6 +660,7 @@ class MLXBackend(LLMBackend):
             max_tokens=opts.num_predict,
             sampler=sampler,
             verbose=False,
+            prefill_step_size=128,
         )
 
     @staticmethod

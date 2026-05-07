@@ -33,8 +33,15 @@ class _MockCrossEncoder:
 
 
 @pytest.fixture
-def reset_nli_state():
-    """Reset NLI global state before + after each test."""
+def reset_nli_state(monkeypatch):
+    """Reset NLI global state before + after each test.
+
+    Forzá `RAG_NLI_BACKEND=mdeberta` para que estos tests sigan ejecutando
+    el path histórico CrossEncoder + mock — el default cambió a `llm`
+    (qwen2.5:3b) en Fase 5 MLX-full-migration (2026-05-07). Tests del
+    path LLM-as-judge viven aparte (mockean `_mlx_chat`).
+    """
+    monkeypatch.setenv("RAG_NLI_BACKEND", "mdeberta")
     prev_model = rag._nli_model
     prev_last_use = rag._nli_last_use
     rag._nli_model = None
@@ -251,3 +258,114 @@ def test_ground_claims_nli_inference_error_falls_back(reset_nli_state, monkeypat
     result = rag.ground_claims_nli(claims, docs, metas)
     assert result is not None
     assert result.claims[0].verdict == "neutral"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# LLM-as-judge backend (Fase 5 MLX-full-migration, 2026-05-07)
+# ──────────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def llm_judge_backend(monkeypatch):
+    """Forzá `RAG_NLI_BACKEND=llm` (default post-Ola 10) sin tocar singleton mDeBERTa."""
+    monkeypatch.setenv("RAG_NLI_BACKEND", "llm")
+
+
+def _fake_mlx_chat(verdict: str, evidence_idx: int | None = 0, score: float = 0.85):
+    """Construir un fake `_mlx_chat` que devuelve un JSON con el shape esperado."""
+    import json
+
+    body = json.dumps({
+        "verdict": verdict,
+        "evidence_idx": evidence_idx,
+        "score": score,
+    }, ensure_ascii=False)
+
+    class _FakeMessage:
+        def __init__(self, content): self.content = content
+
+    class _FakeResponse:
+        def __init__(self, content): self.message = _FakeMessage(content)
+
+    def _impl(**kwargs):  # noqa: ARG001 — model/messages/options/format ignored
+        return _FakeResponse(body)
+
+    return _impl
+
+
+def test_ground_claims_nli_llm_backend_entails(llm_judge_backend, monkeypatch):
+    """Backend `llm`: el LLM devuelve `entails` → ClaimGrounding.verdict == 'entails'."""
+    monkeypatch.setattr(rag, "_mlx_chat", _fake_mlx_chat("entails", evidence_idx=0, score=0.92))
+    claims = [rag.Claim(text="Ikigai está en 02-Areas/Coaching")]
+    docs = ["Ikigai vive en 02-Areas/Coaching/Ikigai.md desde el reorg"]
+    metas = [{"file": "02-Areas/Coaching/Ikigai.md", "chunk_id": "ikigai::0"}]
+    result = rag.ground_claims_nli(claims, docs, metas)
+    assert result is not None
+    assert result.claims[0].verdict == "entails"
+    assert result.claims[0].evidence_chunk_id == "ikigai::0"
+    assert result.claims[0].score == pytest.approx(0.92)
+
+
+def test_ground_claims_nli_llm_backend_contradicts(llm_judge_backend, monkeypatch):
+    """Backend `llm`: el LLM devuelve `contradicts` → verdict + evidence span."""
+    monkeypatch.setattr(rag, "_mlx_chat", _fake_mlx_chat("contradicts", evidence_idx=1, score=0.8))
+    claims = [rag.Claim(text="El reranker corre en CPU")]
+    docs = [
+        "El reranker es bge-reranker-v2-m3.",
+        "El reranker corre en MPS con float32 forzado (invariant CLAUDE.md).",
+    ]
+    metas = [{"file": "a.md"}, {"file": "b.md", "chunk_id": "b::0"}]
+    result = rag.ground_claims_nli(claims, docs, metas)
+    assert result is not None
+    assert result.claims[0].verdict == "contradicts"
+    assert result.claims[0].evidence_chunk_id == "b::0"
+
+
+def test_ground_claims_nli_llm_backend_malformed_json_falls_back_neutral(
+    llm_judge_backend, monkeypatch
+):
+    """Si el LLM devuelve JSON inválido → claim marcado neutral, no crash."""
+    class _BadMessage:
+        content = "no soy json válido {"
+
+    class _BadResponse:
+        message = _BadMessage()
+
+    monkeypatch.setattr(rag, "_mlx_chat", lambda **_: _BadResponse())
+    claims = [rag.Claim(text="A claim that is long enough")]
+    docs = ["Evidence"]
+    metas = [{"file": "note.md"}]
+    result = rag.ground_claims_nli(claims, docs, metas)
+    assert result is not None
+    assert result.claims[0].verdict == "neutral"
+    assert result.claims[0].score == 0.0
+
+
+def test_ground_claims_nli_llm_backend_refusal_skipped(llm_judge_backend, monkeypatch):
+    """Refusal claims se marcan neutral sin invocar al LLM."""
+    called = {"count": 0}
+    def _spy(**_kwargs):
+        called["count"] += 1
+        raise AssertionError("LLM no debería haber sido llamado para un refusal")
+
+    monkeypatch.setattr(rag, "_mlx_chat", _spy)
+    claims = [rag.Claim(text="No encontré nada", is_refusal=True)]
+    docs = ["any doc"]
+    metas = [{"file": "x.md"}]
+    result = rag.ground_claims_nli(claims, docs, metas)
+    assert result is not None
+    assert result.claims[0].verdict == "neutral"
+    assert called["count"] == 0
+
+
+def test_ground_claims_nli_default_backend_is_llm(monkeypatch):
+    """Sin env var explícito, el default es `llm` (qwen2.5:3b helper)."""
+    # Asegurarse que el env var no esté seteado
+    monkeypatch.delenv("RAG_NLI_BACKEND", raising=False)
+    monkeypatch.setattr(rag, "_mlx_chat", _fake_mlx_chat("entails", evidence_idx=0, score=1.0))
+    claims = [rag.Claim(text="A reasonable claim about the codebase")]
+    docs = ["Some matching evidence chunk text"]
+    metas = [{"file": "default.md", "chunk_id": "d::0"}]
+    result = rag.ground_claims_nli(claims, docs, metas)
+    assert result is not None
+    assert result.claims[0].verdict == "entails"

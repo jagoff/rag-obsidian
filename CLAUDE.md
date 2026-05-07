@@ -6,7 +6,7 @@ Entry points (instalados via `uv tool install --reinstall --editable '.[entities
 - `rag` — CLI indexing/querying/chat/productivity/automation
 - `obsidian-rag-mcp` — MCP server (`rag_query`, `rag_read_note`, `rag_list_notes`, `rag_links`, `rag_stats`)
 
-Extras default: `entities` (gliner NER), `stt` (faster-whisper), `mlx` (LLM backend activo). `spotify` queda opt-in puro — agregarlo solo si OAuth está configurado: `'.[entities,stt,mlx,spotify]'`.
+Extras default: `entities` (gliner NER, **NO MLX-compat por design** — CPU only, opt-in via `RAG_EXTRACT_ENTITIES`, descarte explícito en plan MLX-full-migration por costo migración >> beneficio), `stt` (mlx-whisper post-Ola 10), `mlx` (LLM + embedder backend activo). `spotify` queda opt-in puro — agregarlo solo si OAuth está configurado: `'.[entities,stt,mlx,spotify]'`.
 
 Local-first sobre VAULT + corpus locales (sqlite-vec + MLX + sentence-transformers). Cross-source ingesters cloud (Gmail/Calendar/Drive) requieren creds OAuth en `~/.{gmail,calendar,gdrive}-mcp/`; sin esas creds silent-fail y corpus local sigue funcionando. WhatsApp + Reminders stay local.
 
@@ -30,15 +30,17 @@ Python 3.13, `uv`. Runtime venv: `.venv/bin/python`. Global tool: `~/.local/shar
 | Cómo funciona end-to-end | [`docs/como-funciona.md`](docs/como-funciona.md) |
 | Recovery + problemas | [`docs/recovery.md`](docs/recovery.md), [`docs/problemas-comunes.md`](docs/problemas-comunes.md) |
 
-## MLX migration (Ola 8 — 100% MLX, cero ollama runtime — 2026-05-06)
+## MLX migration (Ola 10 — 100% MLX, hot-path completo — 2026-05-07)
 
-**Estado actual: 100% MLX en todos los paths runtime — incluido el embedder.** Migración completada en 9 olas escalonadas (Ola 1: dispatch + flag, Ola 5: chat hard-cutover, Ola 6: embed in-process via SentenceTransformer, Ola 7: purga `OllamaBackend`, Ola 8: purga branches defensivos + tipos pydantic locales + `import ollama` removido, **Ola 9 (2026-05-06): embedder PyTorch → MLX vía `mlx-lm` + `mlx-community/Qwen3-Embedding-0.6B-8bit`**). Default `RAG_LLM_BACKEND=mlx`, `RAG_EMBED_BACKEND=mlx`. Detalle completo en [`docs/mlx-migration.md`](docs/mlx-migration.md).
+**Estado actual: 100% MLX en todos los paths runtime — embedder + reranker MLX opt-in + STT + NLI**. Migración completada en 10 olas escalonadas (Olas 1-8: chat / embed / purga ollama, **Ola 9 (2026-05-06)**: embedder PyTorch → MLX, **Ola 10 (2026-05-07)**: STT [`faster-whisper`](https://github.com/SYSTRAN/faster-whisper) → [`mlx-whisper`](https://github.com/ml-explore/mlx-examples/tree/main/whisper) + NLI [`mDeBERTa`](https://huggingface.co/MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7) → LLM-as-judge ([`qwen2.5:3b`](https://huggingface.co/mlx-community/Qwen2.5-3B-Instruct-4bit) helper) + bug #4 fix iteration truncada en `_run_index`). Default `RAG_LLM_BACKEND=mlx`, `RAG_EMBED_BACKEND=mlx`, `RAG_NLI_BACKEND=llm`. Detalle completo en [`docs/mlx-migration.md`](docs/mlx-migration.md).
 
 **Mapping**:
 - `qwen2.5:3b` (HELPER) → [`mlx-community/Qwen2.5-3B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-3B-Instruct-4bit)
 - `qwen2.5:7b` (CHAT default) → [`mlx-community/Qwen2.5-7B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-7B-Instruct-4bit)
 - `command-r` / `qwen2.5:14b` (HQ tier) → [`mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit`](https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit)
 - `qwen3-embedding:0.6b` (embedder) → [`mlx-community/Qwen3-Embedding-0.6B-8bit`](https://huggingface.co/mlx-community/Qwen3-Embedding-0.6B-8bit) via [`mlx-lm`](https://github.com/ml-explore/mlx-lm) in-process (`rag/mlx_embed.py`, Ola 9). Cosine ≥0.9977 vs PyTorch fp16 — bit-equivalente funcional, NO requiere reindex (`_COLLECTION_BASE` queda en `obsidian_notes_v12`).
+- `whisper-small` (STT default) → [`mlx-community/whisper-small-mlx`](https://huggingface.co/mlx-community/whisper-small-mlx) via [`mlx-whisper`](https://github.com/ml-explore/mlx-examples/tree/main/whisper) (Ola 10). Toda la familia tiny/base/small/medium/large-v3/large-v3-turbo mapeada en `_WHISPER_NAME_TO_HF` ([`rag/whisper.py`](rag/whisper.py)). API-compat preservada via `_MLXWhisperModelWrapper.transcribe()` → `(segments_iter, info)`.
+- NLI grounding (default OFF, opt-in via `RAG_NLI_GROUNDING=1`) → LLM-as-judge con `qwen2.5:3b` helper ([`rag/postprocess.py`](rag/postprocess.py) `_ground_claims_via_llm`, Ola 10). Rollback al path histórico CrossEncoder + mDeBERTa via `RAG_NLI_BACKEND=mdeberta`.
 
 **Tipos response** ([`rag/llm_backend.py`](rag/llm_backend.py)): `Message`, `ChatResponse`, `GenerateResponse` son pydantic `BaseModel` locales (ya no `from ollama._types import ...`). `Message.ToolCall.Function` preservado via assignment post-class para compat con `parse_tool_calls()`.
 
@@ -248,8 +250,9 @@ Catálogo completo (47+ vars adicionales) en [`docs/env-vars-catalog.md`](docs/e
 - `RAG_EXPAND_MIN_TOKENS=4` — threshold short-query gate.
 - `RAG_CITATION_REPAIR_MAX_BAD=2` (set 0 para disable).
 - `RAG_DEEP_MAX_SECONDS=30` — wall-time cap auto-deep.
-- `RAG_NLI_GROUNDING` (default OFF) — mDeBERTa post-citation-repair. `RAG_NLI_IDLE_TTL=900`.
-- `RAG_NLI_MODE={off,mark,strip}` (default off) — citation NLI verifier. `RAG_NLI_THRESHOLD=0.5`.
+- `RAG_NLI_GROUNDING` (default OFF) — claim-level grounding post-citation-repair. `RAG_NLI_IDLE_TTL=900` (solo aplica al path mDeBERTa).
+- `RAG_NLI_BACKEND={llm,mdeberta}` (default `llm`) — backend del NLI grounding. `llm` usa `qwen2.5:3b` helper via [`rag/postprocess.py`](rag/postprocess.py) `_ground_claims_via_llm` (Ola 10, MLX-compat). `mdeberta` cae al path histórico CrossEncoder + mDeBERTa (rollback).
+- `RAG_NLI_MODE={off,mark,strip}` (default off) — citation NLI verifier (distinto de NLI grounding). `RAG_NLI_THRESHOLD=0.5`.
 - `RAG_CONTRADICTION_PENALTY` (default ON, magnitude `RAG_CONTRADICTION_PENALTY_MAGNITUDE=0.05`).
 - `RAG_MMR` (default OFF, `RAG_MMR_LAMBDA=0.7`, `RAG_MMR_TOP_K=10`). Variante: `RAG_MMR_FOLDER_PENALTY=1` (mutex).
 - `RAG_LLM_JUDGE` (default OFF, prototipo) — score blend cuando top<0.5 AND len≥5. `RAG_LLM_JUDGE_THRESHOLD=0.5`, `RAG_LLM_JUDGE_MIN_CANDIDATES=5`, `RAG_LLM_JUDGE_ALPHA=0.5`.

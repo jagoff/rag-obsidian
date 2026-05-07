@@ -2,8 +2,9 @@
 
 Two responsibilities, one module:
 
-1. **STT primitives** — load `faster-whisper`, transcribe an audio file,
-   cache the result by (abs_path, mtime) in `rag_audio_transcripts`.
+1. **STT primitives** — load [`mlx-whisper`](https://github.com/ml-explore/mlx-examples/tree/main/whisper)
+   (Apple MLX backend, Ola 10), transcribe an audio file, cache the
+   result by (abs_path, mtime) in `rag_audio_transcripts`.
 2. **Learning loop CLI** — admin commands for the vocab + corrections
    pipeline that lives in the sibling package `rag_whisper_learning`
    (vocab refresh, pattern detection, doctor, export/import, stats).
@@ -11,8 +12,10 @@ Two responsibilities, one module:
 ## Surfaces (re-exported on `rag.<name>` via the shim at the bottom of `rag/__init__.py`)
 
 Helpers (callable from Python):
-- `_WHISPER_MODEL_DEFAULT` — string, model name fallback.
-- `_whisper_model_cache` — dict, memoised `WhisperModel` instances by name.
+- `_WHISPER_MODEL_DEFAULT` — string, short alias del modelo (default "small").
+- `_WHISPER_NAME_TO_HF` — dict, map de alias corto a HF repo
+  ([`mlx-community/whisper-*-mlx`](https://huggingface.co/mlx-community)).
+- `_whisper_model_cache` — dict, memoised wrapper instances by short alias.
 - `_load_whisper_model(name)` — lazy + memoised loader.
 - `_audio_transcript_cache_get(abs_path, mtime)` — SQL cache read.
 - `_audio_transcript_cache_put(abs_path, mtime, text, ...)` — SQL cache write.
@@ -28,7 +31,7 @@ Click commands (registered on the global `cli` group at import time):
     - `whisper stats` — aggregated counters.
 
 ## Invariants
-- **`faster-whisper` is optional** (`stt` extras group). `_load_whisper_model`
+- **`mlx-whisper` is optional** (`stt` extras group). `_load_whisper_model`
   raises `RuntimeError` with a concrete `uv tool install ...[stt]` hint if
   it's missing — never silent, because a missing dep here means the user
   asked for transcription and we couldn't do it.
@@ -37,9 +40,14 @@ Click commands (registered on the global `cli` group at import time):
   `_silent_log`.
 - **Cache writes are best-effort.** `_audio_transcript_cache_put` swallows
   errors so the caller still gets the transcript object back.
-- **CPU-only `compute_type="int8"`** by default — 4-8× faster than float32
-  on M-series, imperceptible quality drop for small/base. Switch to
-  `int8_float16` when Metal is wired up (out of MVP scope).
+- **MLX backend** — corre on Apple Silicon GPU (Metal) nativo. 4-8× más rápido
+  que CPU faster-whisper en M-series. Modelos pesos en `mlx-community/`.
+  `_load_whisper_model` resuelve alias corto (small, base, large-v3) al HF
+  repo MLX correspondiente vía `_WHISPER_NAME_TO_HF`.
+- **API-compat con faster-whisper**: `_MLXWhisperModelWrapper.transcribe()`
+  devuelve `(segments_iter, info)` con `segments_iter` yielding objects
+  con `.text` y `info` con `.language` + `.duration` — preserva los call
+  sites + tests que mockean WhisperModel sin cambios downstream.
 
 ## Why deferred imports
 `rag/whisper.py` is loaded at the bottom of `rag/__init__.py` (after `cli`,
@@ -80,31 +88,125 @@ from rag import cli, console
 _WHISPER_MODEL_DEFAULT = "small"
 _whisper_model_cache: dict[str, object] = {}
 
+# Map de alias corto (compat histórico con faster-whisper) al HF repo MLX
+# correspondiente. Pesos viven en mlx-community con quant 4bit/fp16. Si el
+# user pasa un HF repo full (`mlx-community/whisper-*`), se respeta tal cual.
+_WHISPER_NAME_TO_HF: dict[str, str] = {
+    "tiny":           "mlx-community/whisper-tiny-mlx",
+    "tiny.en":        "mlx-community/whisper-tiny.en-mlx",
+    "base":           "mlx-community/whisper-base-mlx",
+    "base.en":        "mlx-community/whisper-base.en-mlx",
+    "small":          "mlx-community/whisper-small-mlx",
+    "small.en":       "mlx-community/whisper-small.en-mlx",
+    "medium":         "mlx-community/whisper-medium-mlx",
+    "medium.en":      "mlx-community/whisper-medium.en-mlx",
+    "large":          "mlx-community/whisper-large-v3-mlx",
+    "large-v2":       "mlx-community/whisper-large-v2-mlx",
+    "large-v3":       "mlx-community/whisper-large-v3-mlx",
+    "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
+}
+
+
+def _resolve_whisper_hf_repo(name: str) -> str:
+    """Resolve un alias corto (small, large-v3) al HF repo MLX. Passthrough
+    si ya viene como HF repo (`mlx-community/...` o cualquier `<org>/<name>`)."""
+    if "/" in name:
+        return name
+    return _WHISPER_NAME_TO_HF.get(name, f"mlx-community/whisper-{name}-mlx")
+
+
+class _MLXWhisperModelWrapper:
+    """Adapter alrededor de `mlx_whisper.transcribe()` que preserva la firma
+    `(segments_iter, info)` que esperaba el call site `wm.transcribe(...)`
+    del backend faster-whisper. Mantiene tests mockeando `_load_whisper_model`
+    sin cambios downstream.
+
+    Internal state es solo el HF repo string — `mlx_whisper.transcribe` carga
+    el modelo lazy en cada llamada (cache propio en su lado por path). Si
+    en el futuro queremos pre-load + reuse, se puede agregar aquí.
+    """
+
+    __slots__ = ("_hf_repo",)
+
+    def __init__(self, hf_repo: str) -> None:
+        self._hf_repo = hf_repo
+
+    def transcribe(
+        self,
+        audio_path: str,
+        language: str | None = None,
+        beam_size: int = 1,  # noqa: ARG002 — accepted for API parity, mlx-whisper has its own decode opts
+        vad_filter: bool = True,  # noqa: ARG002 — mlx-whisper trabaja sin VAD pre-pass; quality OK para nuestros casos
+        **kwargs,  # noqa: ARG002 — swallow any extra kwargs (initial_prompt, etc.) silently
+    ):
+        """Devolver `(segments_iter, info)` como faster-whisper.
+
+        Cada `_Segment` tiene `.text`. `_Info` tiene `.language` + `.duration`.
+        Los kwargs `beam_size` + `vad_filter` se aceptan por compat pero
+        mlx-whisper no los expone con la misma semántica — se ignoran.
+        """
+        try:
+            import mlx_whisper  # type: ignore[import-not-found]
+        except ImportError as exc:  # pragma: no cover — checked en _load_whisper_model
+            raise RuntimeError(
+                "mlx-whisper no está instalado. "
+                "`uv tool install --reinstall --editable '.[stt]'`"
+            ) from exc
+
+        result = mlx_whisper.transcribe(
+            str(audio_path),
+            path_or_hf_repo=self._hf_repo,
+            language=language,
+            verbose=False,
+        )
+
+        class _Segment:
+            __slots__ = ("text",)
+
+            def __init__(self, text: str) -> None:
+                self.text = text
+
+        class _Info:
+            __slots__ = ("language", "duration")
+
+            def __init__(self, lang: str | None, dur: float) -> None:
+                self.language = lang
+                self.duration = dur
+
+        raw_segments = result.get("segments") or []
+        segments = [_Segment(s.get("text", "")) for s in raw_segments]
+        last_end = 0.0
+        if raw_segments:
+            try:
+                last_end = float(raw_segments[-1].get("end", 0.0))
+            except (TypeError, ValueError):
+                last_end = 0.0
+        info = _Info(result.get("language") or language, last_end)
+        return iter(segments), info
+
 
 def _load_whisper_model(name: str):
-    """Lazy-load + memoise a WhisperModel. Raises RuntimeError with a
-    concrete install command when faster-whisper isn't available — never
-    silent, because a missing dep here means the user asked for
-    transcription and we couldn't do it.
+    """Lazy-load + memoise un wrapper MLX whisper. Raises RuntimeError con
+    install hint claro cuando mlx-whisper no está disponible — nunca silent,
+    porque una dep faltante acá significa que el user pidió transcripción y
+    no pudimos.
 
-    Thread-safe: the dict.setdefault pattern below is atomic under the
-    GIL. Loading the same model in two threads at once might duplicate
-    work once, but won't corrupt state.
+    Thread-safe: el `dict.setdefault` pattern es atomic bajo la GIL. Cargar
+    el mismo modelo en dos threads simultáneos puede duplicar trabajo una
+    vez, pero no corrompe estado.
     """
     if name in _whisper_model_cache:
         return _whisper_model_cache[name]
     try:
-        from faster_whisper import WhisperModel  # type: ignore[import-not-found]
+        import mlx_whisper  # type: ignore[import-not-found]  # noqa: F401
     except ImportError as exc:
         raise RuntimeError(
-            "faster-whisper no está instalado. "
+            "mlx-whisper no está instalado. "
             "`uv tool install --reinstall --editable '.[stt]'` "
             "o `uv pip install 'obsidian-rag[stt]'`"
         ) from exc
-    # compute_type="int8" for CPU — 4-8× faster than float32, imperceptible
-    # quality drop for small/base. Switch to "int8_float16" when Metal
-    # acceleration is wired up.
-    model = WhisperModel(name, device="cpu", compute_type="int8")
+    hf_repo = _resolve_whisper_hf_repo(name)
+    model = _MLXWhisperModelWrapper(hf_repo)
     _whisper_model_cache.setdefault(name, model)
     return _whisper_model_cache[name]
 
@@ -164,8 +266,10 @@ def transcribe_audio(
     Args:
         path: Path to the audio file. Any format ffmpeg reads (mp3, m4a,
             wav, opus, mp4, ogg, flac, aac, …).
-        model: faster-whisper model name. Options: tiny / base / small /
-            medium / large-v3 / …. Default "small" (~480MB, balanced).
+        model: alias corto del modelo whisper. Options: tiny / base / small /
+            medium / large-v3 / large-v3-turbo / …. Default "small". El alias
+            se resuelve al repo MLX correspondiente vía `_WHISPER_NAME_TO_HF`
+            (también acepta HF repo full tipo `mlx-community/whisper-...`).
         language: Force a language code (e.g. "es", "en"). None = auto-
             detect.
         use_cache: When True (default), skip the whisper run if we already
@@ -179,7 +283,7 @@ def transcribe_audio(
 
     Raises:
         FileNotFoundError: path doesn't exist.
-        RuntimeError: faster-whisper not installed (see _load_whisper_model).
+        RuntimeError: mlx-whisper not installed (see _load_whisper_model).
     """
     # Re-resolve through `rag` so `monkeypatch.setattr(rag, "_load_whisper_model", ...)`
     # in tests propagates here — see module docstring §"Why deferred imports".

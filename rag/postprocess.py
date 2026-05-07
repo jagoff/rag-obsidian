@@ -45,6 +45,7 @@ __all__ = [
     "_split_prose",
     # NLI grounding
     "ground_claims_nli",
+    "_ground_claims_via_llm",
     # Post-process tasks
     "_pp_task_repair",
     "_pp_task_critique",
@@ -60,6 +61,159 @@ __all__ = [
     "verify_answer_nli",
     "apply_nli_mode",
 ]
+
+
+# ──────────────────────────────────────────────────────────────────────
+# LLM-as-judge backend (Fase 5 MLX-full-migration, 2026-05-07)
+# ──────────────────────────────────────────────────────────────────────
+# Reemplaza `mDeBERTa-v3-base-xnli-multilingual` (sentence-transformers
+# CrossEncoder, NO MLX compat) con qwen2.5:3b helper LLM. Default ON
+# cuando `RAG_NLI_GROUNDING=1`. Rollback: `RAG_NLI_BACKEND=mdeberta`.
+#
+# Trade-offs:
+# - Latencia: ~1-3s por claim vs ~100ms por batch mDeBERTa. OK para
+#   path opt-in (NLI grounding default OFF).
+# - Multilingual ES/EN: qwen2.5:3b nativo, paridad funcional con mDeBERTa.
+# - Sin VRAM extra: el helper ya está warm en chat path (`keep_alive=-1`).
+# - Sin dep torch+sentence-transformers para NLI — Ola 10 puede borrar
+#   `get_nli_model()` + `MoritzLaurer/mDeBERTa-*` cuando se valide
+#   en runtime sostenido.
+
+_NLI_LLM_SYSTEM = (
+    "Sos un evaluador de afirmaciones contra evidencias. "
+    "Devolvé EXCLUSIVAMENTE un JSON con esta forma:\n"
+    '{"verdict": "entails"|"neutral"|"contradicts", '
+    '"evidence_idx": <int 0-based ó null>, '
+    '"score": <float 0..1>}\n'
+    "Reglas:\n"
+    "- 'entails': UNA evidencia respalda directamente la afirmación.\n"
+    "- 'contradicts': UNA evidencia la desmiente directamente.\n"
+    "- 'neutral': ninguna evidencia es concluyente (default si dudás).\n"
+    "- 'evidence_idx': el índice [N] de la evidencia clave, ó null si neutral.\n"
+    "- 'score': tu confianza en el verdict, entre 0 y 1.\n"
+    "No agregues texto fuera del JSON."
+)
+
+
+def _ground_claims_via_llm(
+    claims: "list[Claim]",
+    docs: list[str],
+    metas: list[dict],
+    *,
+    max_claims: int = 20,
+    max_docs_per_claim: int = 5,
+) -> "GroundingResult | None":
+    """LLM-as-judge backend para NLI grounding (reemplazo MLX-compat de mDeBERTa).
+
+    Para cada claim no-refusal, construye un prompt con la afirmación + top
+    `max_docs_per_claim` evidencias y pide al helper LLM (qwen2.5:3b) un
+    veredicto JSON estructurado. Mapea a `ClaimGrounding` preservando el
+    contrato de `ground_claims_nli`.
+
+    Returns None si los inputs están vacíos o exceden `max_claims`.
+    """
+    import json
+    import rag as _rag
+
+    if not claims or not docs:
+        return None
+    if len(claims) > max_claims:
+        return None
+
+    docs_to_use = docs[:max_docs_per_claim]
+    metas_to_use = metas[:max_docs_per_claim]
+
+    groundings: list[ClaimGrounding] = []
+    nli_start = time.time()
+
+    for c in claims:
+        if c.is_refusal:
+            groundings.append(ClaimGrounding(
+                text=c.text, verdict="neutral", score=0.0,
+                start_char=c.start_char, end_char=c.end_char,
+            ))
+            continue
+
+        evidence_lines = []
+        for i, d in enumerate(docs_to_use):
+            evidence_lines.append(f"[{i}] {(d or '')[:400]}")
+        evidence_block = "\n\n".join(evidence_lines)
+        user_prompt = (
+            f"Afirmación:\n{c.text}\n\n"
+            f"Evidencias:\n{evidence_block}\n\n"
+            "Respondé SOLO con el JSON descripto en las instrucciones."
+        )
+
+        try:
+            resp = _rag._mlx_chat(
+                model=_rag.HELPER_MODEL,
+                messages=[
+                    {"role": "system", "content": _NLI_LLM_SYSTEM},
+                    {"role": "user", "content": user_prompt},
+                ],
+                options=_rag.HELPER_OPTIONS,
+                format="json",
+                keep_alive=-1,
+            )
+            content = ""
+            try:
+                content = (resp.message.content or "").strip()
+            except AttributeError:
+                # Defensive: shape no estándar
+                content = str(resp).strip()
+            data = json.loads(content)
+
+            verdict_raw = str(data.get("verdict", "neutral")).lower()
+            if verdict_raw not in ("entails", "neutral", "contradicts"):
+                verdict_raw = "neutral"
+
+            evidence_idx_raw = data.get("evidence_idx")
+            if isinstance(evidence_idx_raw, int):
+                evidence_idx = max(0, min(evidence_idx_raw, len(docs_to_use) - 1))
+            else:
+                evidence_idx = 0
+
+            score_raw = data.get("score", 0.0)
+            try:
+                score = max(0.0, min(1.0, float(score_raw)))
+            except (TypeError, ValueError):
+                score = 0.0
+
+            evidence_span: str | None = None
+            evidence_chunk_id: str | None = None
+            if verdict_raw in ("entails", "contradicts") and docs_to_use:
+                evidence_span = (docs_to_use[evidence_idx] or "")[:200]
+                evidence_chunk_id = (
+                    metas_to_use[evidence_idx].get("chunk_id")
+                    or metas_to_use[evidence_idx].get("file")
+                )
+
+            groundings.append(ClaimGrounding(
+                text=c.text,
+                verdict=verdict_raw,  # type: ignore[arg-type]
+                evidence_chunk_id=evidence_chunk_id,
+                evidence_span=evidence_span,
+                score=score,
+                start_char=c.start_char,
+                end_char=c.end_char,
+            ))
+        except Exception as exc:
+            _rag._silent_log("nli_llm_judge_failed", exc)
+            groundings.append(ClaimGrounding(
+                text=c.text, verdict="neutral", score=0.0,
+                start_char=c.start_char, end_char=c.end_char,
+            ))
+
+    nli_ms = int((time.time() - nli_start) * 1000)
+
+    return GroundingResult(
+        claims=groundings,
+        claims_total=len(groundings),
+        claims_supported=sum(1 for g in groundings if g.verdict == "entails"),
+        claims_contradicted=sum(1 for g in groundings if g.verdict == "contradicts"),
+        claims_neutral=sum(1 for g in groundings if g.verdict == "neutral"),
+        nli_ms=nli_ms,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -305,31 +459,29 @@ def ground_claims_nli(
     cosine_threshold: float = 0.5,
     max_claims: int = 20,
 ) -> GroundingResult | None:
-    """Stub for NLI grounding (Fase B will implement actual NLI inference).
+    """NLI grounding entry point — dispatcha entre LLM-as-judge y mDeBERTa.
 
-    Fase A: returns a GroundingResult with all claims marked "neutral"
-    (safe default). This lets callers integrate the API shape without
-    depending on the NLI model being loaded.
+    Default backend: `llm` (qwen2.5:3b helper, MLX). Rollback opcional via
+    `RAG_NLI_BACKEND=mdeberta` (path histórico CrossEncoder + sentence-
+    transformers). Default cambió en Fase 5 MLX-full-migration (2026-05-07)
+    para quitar la última dep no-MLX del post-processing.
 
-    Fase B will:
-        1. Load mDeBERTa-v3-base-xnli-multilingual-nli-2mil7 via CrossEncoder
-        2. For each claim: embed + cosine prefilter top-3 chunks
-        3. Run NLI on (claim, chunk) pairs → entails/neutral/contradicts
-        4. Apply thresholds: score >= threshold_contradicts → entails
-                           [threshold-0.2, threshold) → neutral
-                           < threshold-0.2 → contradicts
+    Para cada claim:
+        1. LLM-as-judge: prompt qwen2.5:3b con claim + top-5 docs, parse JSON.
+        2. mDeBERTa fallback: cargar CrossEncoder, predict scores (N, 3),
+           argmax sobre [entailment, neutral, contradiction] columns.
 
     Args:
         claims: list of Claim objects from split_claims()
         docs: retrieved chunk display_text (parallel to metas)
         metas: retrieved chunk metadata dicts (file, note, chunk_id, etc.)
-        threshold_contradicts: NLI score threshold for marking contradicts
-        cosine_threshold: minimum cosine for prefilter (skip irrelevant chunks)
-        max_claims: safety gate — skip if claims > max_claims (cost explosion)
+        threshold_contradicts: score threshold para marcar verdict (mDeBERTa path).
+        cosine_threshold: minimum cosine for prefilter (mDeBERTa path; LLM no usa).
+        max_claims: safety gate — skip if claims > max_claims (cost explosion).
 
     Returns:
         GroundingResult with per-claim verdicts + aggregate counts.
-        None if inputs empty or max_claims exceeded.
+        None si inputs vacíos o max_claims excedido.
     """
     # Lazy import to avoid circular dependency
     import rag as _rag
@@ -338,6 +490,13 @@ def ground_claims_nli(
         return None
     if len(claims) > max_claims:
         return None
+
+    backend = os.environ.get("RAG_NLI_BACKEND", "llm").strip().lower()
+    if backend == "llm":
+        return _ground_claims_via_llm(
+            claims, docs, metas, max_claims=max_claims,
+        )
+    # else: fall through al path mDeBERTa histórico
 
     groundings: list[ClaimGrounding] = []
     nli_start = time.time()

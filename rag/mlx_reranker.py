@@ -218,10 +218,18 @@ def is_mlx_reranker_enabled() -> bool:
 def resolve_mlx_reranker_path(model: str | None = None) -> str:
     """Resolve a reranker name (Ollama-style, alias, or HF id) to the MLX HF id.
 
-    Falls back to `DEFAULT_MLX_RERANKER` when the input is the bge-reranker
-    name or empty — that's the typical state right after the swap when call
-    sites still pass `RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"`.
+    Priority:
+      1. `RAG_MLX_RERANKER_MODEL` env var (explicit override) — útil para el
+         sweep `scripts/eval_reranker_mlx_tiers.py` que itera entre tiers
+         (`qwen3-reranker:0.6b` → `:4b` → `:8b`) sin tocar código.
+      2. `model` arg si está y no es bge baseline.
+      3. `DEFAULT_MLX_RERANKER` (Qwen3-Reranker-0.6B-mxfp8) como fallback.
     """
+    explicit = os.environ.get("RAG_MLX_RERANKER_MODEL", "").strip()
+    if explicit:
+        if explicit.startswith("mlx-community/"):
+            return explicit
+        return MLX_RERANKER_ALIASES.get(explicit, explicit)
     if not model or model.startswith("BAAI/"):
         return DEFAULT_MLX_RERANKER
     if model.startswith("mlx-community/"):

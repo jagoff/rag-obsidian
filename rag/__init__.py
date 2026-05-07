@@ -2396,6 +2396,12 @@ SOURCE_WEIGHTS: dict[str, float] = {
     "calls":     0.80,   # log entries: factual but semantically thin
     "whatsapp":  0.75,
     "messages":  0.75,
+    # `pillow` (iOS sleep tracker, despachado en `rag index --source pillow`):
+    # los datos viven en `rag_sleep_sessions` (no escriben chunks al corpus
+    # vectorial), pero la entry queda acá para mantener paridad con
+    # `VALID_SOURCES` + `CONFIDENCE_RERANK_MIN_PER_SOURCE`. Weight nominal
+    # 0.50 — defensivo si por algún motivo escribiera chunks (no debería).
+    "pillow":    0.50,
 }
 
 # Recency half-life per source, in days. None → no decay applied (chunks
@@ -2425,6 +2431,9 @@ SOURCE_RECENCY_HALFLIFE_DAYS: dict[str, float | None] = {
     "whatsapp":    60.0,
     "messages":    60.0,
     "calls":       60.0,
+    # `pillow`: no aplica recency decay porque no escribe chunks al corpus.
+    # Entry presente para coverage del `set(SOURCE_RECENCY_HALFLIFE_DAYS) == VALID_SOURCES`.
+    "pillow":     None,
 }
 
 # Retention windows per source, in days. None → keep forever. Used at
@@ -2443,6 +2452,9 @@ SOURCE_RETENTION_DAYS: dict[str, int | None] = {
     "whatsapp":   180,
     "messages":   180,
     "calls":      180,
+    # `pillow`: el ingester maneja su propio retention sobre `rag_sleep_sessions`.
+    # Acá None para coverage del set check.
+    "pillow":     None,
 }
 
 
@@ -14361,10 +14373,22 @@ def _apply_reranker_lora_adapter(model, adapter_dir: Path) -> bool:
 # Adapter dir convention: `~/.local/share/obsidian-rag/drafts_ft/`
 DRAFTS_FT_ADAPTER_DIR = Path.home() / ".local" / "share" / "obsidian-rag" / "drafts_ft"
 
-# Modelo base del fine-tune. Override via `RAG_DRAFTS_FT_BASE_MODEL`
+# MLX adapter dir (Fase 1.2 Ola 10, 2026-05-07): separado del PEFT histórico
+# para coexistencia + rollback. El nuevo training script
+# `scripts/finetune_drafts_mlx.py` escribe acá el adapter LoRA producido por
+# `mlx_lm.lora --train --mode dpo`.
+DRAFTS_FT_ADAPTER_DIR_MLX = Path.home() / ".local" / "share" / "obsidian-rag" / "drafts_ft_mlx"
+
+# Modelo base del fine-tune (PEFT path histórico). Override via `RAG_DRAFTS_FT_BASE_MODEL`
 # para experimentos. El default debe matchear el del training script.
 DRAFTS_FT_BASE_MODEL = os.environ.get(
     "RAG_DRAFTS_FT_BASE_MODEL", "Qwen/Qwen2.5-7B-Instruct"
+)
+
+# Modelo base MLX para el path mlx_lm. Override via `RAG_DRAFTS_FT_BASE_MODEL_MLX`.
+# Default: Qwen2.5-7B 4bit MLX, mismo tier que el chat default.
+DRAFTS_FT_BASE_MODEL_MLX = os.environ.get(
+    "RAG_DRAFTS_FT_BASE_MODEL_MLX", "mlx-community/Qwen2.5-7B-Instruct-4bit"
 )
 
 # Cache lazy-loaded del modelo + tokenizer + lock para thread safety.
@@ -14477,6 +14501,71 @@ def _load_drafts_ft_model():
             return None, None
 
 
+def _drafts_ft_backend() -> str:
+    """Resuelve el backend del drafts adapter.
+
+    Default: `mlx` cuando exista el adapter MLX (Ola 10 path nativo).
+    Fallback: `peft` cuando solo exista el PEFT histórico. Override
+    explícito via `RAG_DRAFTS_FT_BACKEND={mlx,peft}`.
+    """
+    explicit = os.environ.get("RAG_DRAFTS_FT_BACKEND", "").strip().lower()
+    if explicit in ("mlx", "peft"):
+        return explicit
+    # Auto-detect: MLX adapter dir tiene prioridad si existe
+    try:
+        if (DRAFTS_FT_ADAPTER_DIR_MLX / "adapters.safetensors").is_file() or \
+           (DRAFTS_FT_ADAPTER_DIR_MLX / "adapter_config.json").is_file():
+            return "mlx"
+    except Exception:
+        pass
+    return "peft"
+
+
+def _generate_draft_preview_mlx(
+    *, original_conversation: str, bot_draft_baseline: str,
+    max_new_tokens: int = 200,
+) -> str:
+    """Path MLX-native del preview generator (Fase 1.2 Ola 10).
+
+    Usa `mlx_lm.load` con `adapter_path=DRAFTS_FT_ADAPTER_DIR_MLX` +
+    `mlx_lm.generate`. Mucho más simple que el PEFT path porque
+    mlx_lm carga adapter LoRA + base model en un solo call.
+    """
+    try:
+        from mlx_lm import generate as _mlx_generate, load as _mlx_load  # type: ignore[import-not-found]
+    except ImportError as exc:
+        _silent_log("drafts_ft_mlx_import_missing", exc)
+        return bot_draft_baseline
+    try:
+        model, tokenizer = _mlx_load(
+            DRAFTS_FT_BASE_MODEL_MLX,
+            adapter_path=str(DRAFTS_FT_ADAPTER_DIR_MLX),
+        )
+    except Exception as exc:
+        _silent_log("drafts_ft_mlx_load_failed", exc)
+        return bot_draft_baseline
+    prompt = (
+        f"{original_conversation}\n\n"
+        f"## Borrador del bot:\n"
+        f"{bot_draft_baseline}\n\n"
+        f"## Mensaje final que mandó Fer:\n"
+    )
+    try:
+        out = _mlx_generate(
+            model, tokenizer,
+            prompt=prompt,
+            max_tokens=max_new_tokens,
+            verbose=False,
+        )
+        text = str(out or "").strip()
+        if text.startswith(prompt):
+            text = text[len(prompt):].strip()
+        return text
+    except Exception as exc:
+        _silent_log("drafts_ft_mlx_generate_failed", exc)
+        return bot_draft_baseline
+
+
 def generate_draft_preview(
     *, original_conversation: str, bot_draft_baseline: str,
     max_new_tokens: int = 200,
@@ -14485,7 +14574,10 @@ def generate_draft_preview(
 
     Contract:
       - Si `RAG_DRAFTS_FT` está OFF → echo del baseline.
-      - Si el adapter no existe / peft falta → echo del baseline +
+      - Backend `mlx` (default cuando existe `drafts_ft_mlx/`) usa
+        `mlx_lm.load` + `mlx_lm.generate`. Backend `peft` (fallback)
+        usa el path histórico transformers + peft.
+      - Si el adapter no existe / dependencias faltan → echo del baseline +
         log a silent_errors.jsonl.
       - Si el modelo carga pero la generación crashea → echo del
         baseline + log.
@@ -14497,6 +14589,15 @@ def generate_draft_preview(
     """
     if not _drafts_ft_enabled():
         return bot_draft_baseline
+
+    if _drafts_ft_backend() == "mlx":
+        return _generate_draft_preview_mlx(
+            original_conversation=original_conversation,
+            bot_draft_baseline=bot_draft_baseline,
+            max_new_tokens=max_new_tokens,
+        )
+
+    # Path histórico PEFT (rollback)
     model, tokenizer = _load_drafts_ft_model()
     if model is None or tokenizer is None:
         return bot_draft_baseline
@@ -28094,131 +28195,156 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
                 updated=updated_files,
                 skipped=skipped_files,
             )
-            doc_id_prefix = str(path.relative_to(VAULT_PATH))
-            folder = str(path.relative_to(VAULT_PATH).parent)
-            raw = path.read_text(encoding="utf-8", errors="ignore")
-            # Hash con mtimes de imágenes embebidas — paridad con
-            # `_index_single_file`: una screenshot updateada (sin cambio en el
-            # .md) fuerza reindex para picar el OCR nuevo.
-            h = _file_hash_with_images(raw, path, VAULT_PATH)
+            # Per-file try/except (bug #4 fix, 2026-05-06): proteger el
+            # cuerpo del loop ante exceptions levantadas por archivos
+            # individuales (read_text fail, semantic_chunks chokó, LLM
+            # call timeout en context_summary/synthetic_questions, etc.).
+            # Pre-fix: una exception bubble-up abortaba TODO el loop a
+            # mitad de camino, dejando el corpus parcial (~270 archivos
+            # de 635 elegibles) sin signal claro. Post-fix: log silent +
+            # skip + continuar con el próximo archivo. Audit completo:
+            # `99-AI/system/embedder-fix-2026-05-06/iteration-bug-audit-fk0sbr29.md`.
+            try:
+                doc_id_prefix = str(path.relative_to(VAULT_PATH))
+                folder = str(path.relative_to(VAULT_PATH).parent)
+                raw = path.read_text(encoding="utf-8", errors="ignore")
+                # Hash con mtimes de imágenes embebidas — paridad con
+                # `_index_single_file`: una screenshot updateada (sin cambio en el
+                # .md) fuerza reindex para picar el OCR nuevo.
+                h = _file_hash_with_images(raw, path, VAULT_PATH)
 
-            # Skip unchanged files (hash matches what's stored)
-            existing = file_to_chunks.get(doc_id_prefix, [])
-            if existing and all(eh == h for _, eh in existing):
-                indexed_files.add(doc_id_prefix)
-                skipped_files += 1
-                continue
+                # Skip unchanged files (hash matches what's stored)
+                existing = file_to_chunks.get(doc_id_prefix, [])
+                if existing and all(eh == h for _, eh in existing):
+                    indexed_files.add(doc_id_prefix)
+                    skipped_files += 1
+                    continue
 
-            fm = parse_frontmatter(raw)
-            tags = _normalize_fm_tags(fm)
-            outlinks = extract_wikilinks(raw)
-            text = clean_md(raw)
-            # OCR enrichment: concat el texto de imágenes embebidas al body
-            # antes del chunking. `images_source=raw` porque clean_md() strippea
-            # los `![[img.png]]`. Gated por cache + ocrmac availability.
-            text = _enrich_body_with_ocr(text, path, VAULT_PATH, images_source=raw)
+                fm = parse_frontmatter(raw)
+                tags = _normalize_fm_tags(fm)
+                outlinks = extract_wikilinks(raw)
+                text = clean_md(raw)
+                # OCR enrichment: concat el texto de imágenes embebidas al body
+                # antes del chunking. `images_source=raw` porque clean_md() strippea
+                # los `![[img.png]]`. Gated por cache + ocrmac availability.
+                text = _enrich_body_with_ocr(text, path, VAULT_PATH, images_source=raw)
 
-            # Before touching the collection for this file, check whether the
-            # incoming content contradicts anything already in the vault. When
-            # it does, the note's frontmatter is rewritten in place and we pick
-            # up the new raw/hash here.
-            #
-            # Uses `_dispatch_contradiction_check` so bulk `rag index` doesn't
-            # block on a 5-10s chat-model call per file — the daemon thread
-            # writes `contradicts:` in the background and the next incremental
-            # pass picks it up (idempotent if unchanged).
-            if check_contradictions:
-                updated = _dispatch_contradiction_check(col, path, text, doc_id_prefix)
-                if updated:
-                    raw, h = updated
-                    fm = parse_frontmatter(raw)
-                    tags = _normalize_fm_tags(fm)
-                    outlinks = extract_wikilinks(raw)
+                # Before touching the collection for this file, check whether the
+                # incoming content contradicts anything already in the vault. When
+                # it does, the note's frontmatter is rewritten in place and we pick
+                # up the new raw/hash here.
+                #
+                # Uses `_dispatch_contradiction_check` so bulk `rag index` doesn't
+                # block on a 5-10s chat-model call per file — the daemon thread
+                # writes `contradicts:` in the background and the next incremental
+                # pass picks it up (idempotent if unchanged).
+                if check_contradictions:
+                    updated = _dispatch_contradiction_check(col, path, text, doc_id_prefix)
+                    if updated:
+                        raw, h = updated
+                        fm = parse_frontmatter(raw)
+                        tags = _normalize_fm_tags(fm)
+                        outlinks = extract_wikilinks(raw)
 
-            # File changed (or new) — remove any stale chunks first
-            if existing:
-                col.delete(ids=[eid for eid, _ in existing])
-                updated_files += 1
+                # File changed (or new) — remove any stale chunks first
+                if existing:
+                    col.delete(ids=[eid for eid, _ in existing])
+                    updated_files += 1
 
-            # Contextual embedding: generate or retrieve cached document-level summary
-            ctx_summary = get_context_summary(text, h, path.stem, folder)
-            synth_qs = get_synthetic_questions(text, h, path.stem, folder)
+                # Contextual embedding: generate or retrieve cached document-level summary
+                ctx_summary = get_context_summary(text, h, path.stem, folder)
+                synth_qs = get_synthetic_questions(text, h, path.stem, folder)
 
-            chunks = semantic_chunks(
-                text, path.stem, folder, tags, fm,
-                context_summary=ctx_summary,
-                synthetic_questions=synth_qs,
-            )
-            if not chunks:
-                indexed_files.add(doc_id_prefix)
-                continue
-
-            ids = [f"{doc_id_prefix}::{i}" for i in range(len(chunks))]
-            embed_texts = [c[0] for c in chunks]
-            display_texts = [c[1] for c in chunks]
-            parent_texts = [c[2] for c in chunks]
-            # Contextual Retrieval (Anthropic, Sept 2024) — mismo wrap que
-            # `_index_single_file`. Gated por `RAG_CONTEXTUAL_RETRIEVAL=1`.
-            # Display_texts/parent_texts no se mutan — el contexto vive
-            # sólo en el embedding.
-            embed_texts = _contextual_retrieval.contextualize_chunks(
-                embed_texts=embed_texts,
-                display_texts=display_texts,
-                doc_id=doc_id_prefix,
-                parent_doc_text=text,
-                doc_metadata={"title": path.stem, "folder": folder, "note": path.stem},
-            )
-
-            # Metadata carries hash + searchable frontmatter fields for filtering.
-            base_meta = {
-                "file": doc_id_prefix,
-                "note": path.stem,
-                "folder": folder,
-                "tags": ",".join(tags),
-                "hash": h,
-                "outlinks": ",".join(outlinks),
-                # Cross-source discriminator (Phase 1). See `_index_single_file`
-                # for the same field on the incremental path.
-                "source": _infer_vault_source(doc_id_prefix),
-            }
-            for fm_key in FM_SEARCHABLE_FIELDS:
-                v = fm.get(fm_key)
-                if v not in (None, ""):
-                    base_meta[fm_key] = str(v)
-
-            metadatas = []
-            for p in parent_texts:
-                meta = dict(base_meta)
-                meta["parent"] = p
-                metadatas.append(meta)
-
-            # Encolar en pending_files; el embed real corre en `_flush_batch`
-            # cuando el contador llega al target. Si batching está OFF,
-            # flusheamos inmediatamente (un file == una embed call, igual
-            # que el comportamiento legacy pre-2026-05-04).
-            pending_files.append({
-                "ids": ids,
-                "embed_texts": embed_texts,
-                "display_texts": display_texts,
-                "metadatas": metadatas,
-                "doc_id_prefix": doc_id_prefix,
-                "raw": raw,
-                "path": path,
-                "folder": folder,
-                "tags": tags,
-            })
-            pending_chunk_count += len(ids)
-
-            if not _batch_enabled or pending_chunk_count >= _batch_target:
-                _flush_batch()
-                # Update progress fields tras flush para que la barra refleje
-                # el progreso real (chunks suben en saltos, no por nota).
-                progress.update(
-                    task_id,
-                    chunks=added_chunks,
-                    updated=updated_files,
-                    skipped=skipped_files,
+                chunks = semantic_chunks(
+                    text, path.stem, folder, tags, fm,
+                    context_summary=ctx_summary,
+                    synthetic_questions=synth_qs,
                 )
+                if not chunks:
+                    indexed_files.add(doc_id_prefix)
+                    continue
+
+                ids = [f"{doc_id_prefix}::{i}" for i in range(len(chunks))]
+                embed_texts = [c[0] for c in chunks]
+                display_texts = [c[1] for c in chunks]
+                parent_texts = [c[2] for c in chunks]
+                # Contextual Retrieval (Anthropic, Sept 2024) — mismo wrap que
+                # `_index_single_file`. Gated por `RAG_CONTEXTUAL_RETRIEVAL=1`.
+                # Display_texts/parent_texts no se mutan — el contexto vive
+                # sólo en el embedding.
+                embed_texts = _contextual_retrieval.contextualize_chunks(
+                    embed_texts=embed_texts,
+                    display_texts=display_texts,
+                    doc_id=doc_id_prefix,
+                    parent_doc_text=text,
+                    doc_metadata={"title": path.stem, "folder": folder, "note": path.stem},
+                )
+
+                # Metadata carries hash + searchable frontmatter fields for filtering.
+                base_meta = {
+                    "file": doc_id_prefix,
+                    "note": path.stem,
+                    "folder": folder,
+                    "tags": ",".join(tags),
+                    "hash": h,
+                    "outlinks": ",".join(outlinks),
+                    # Cross-source discriminator (Phase 1). See `_index_single_file`
+                    # for the same field on the incremental path.
+                    "source": _infer_vault_source(doc_id_prefix),
+                }
+                for fm_key in FM_SEARCHABLE_FIELDS:
+                    v = fm.get(fm_key)
+                    if v not in (None, ""):
+                        base_meta[fm_key] = str(v)
+
+                metadatas = []
+                for p in parent_texts:
+                    meta = dict(base_meta)
+                    meta["parent"] = p
+                    metadatas.append(meta)
+
+                # Encolar en pending_files; el embed real corre en `_flush_batch`
+                # cuando el contador llega al target. Si batching está OFF,
+                # flusheamos inmediatamente (un file == una embed call, igual
+                # que el comportamiento legacy pre-2026-05-04).
+                pending_files.append({
+                    "ids": ids,
+                    "embed_texts": embed_texts,
+                    "display_texts": display_texts,
+                    "metadatas": metadatas,
+                    "doc_id_prefix": doc_id_prefix,
+                    "raw": raw,
+                    "path": path,
+                    "folder": folder,
+                    "tags": tags,
+                })
+                pending_chunk_count += len(ids)
+
+                if not _batch_enabled or pending_chunk_count >= _batch_target:
+                    _flush_batch()
+                    # Update progress fields tras flush para que la barra refleje
+                    # el progreso real (chunks suben en saltos, no por nota).
+                    progress.update(
+                        task_id,
+                        chunks=added_chunks,
+                        updated=updated_files,
+                        skipped=skipped_files,
+                    )
+            except Exception as exc:
+                # Aislar el daño a este archivo. Log silent + traceback (para
+                # diagnóstico del root cause del bug #4) + sumar al contador
+                # de skips para que el resumen final muestre cuántos quedaron
+                # afuera. Continúa con el próximo archivo.
+                try:
+                    rel = str(path.relative_to(VAULT_PATH))
+                except Exception:
+                    rel = str(path)
+                _silent_log(
+                    f"run_index_per_file:{rel[:120]}",
+                    exc,
+                    with_traceback=True,
+                )
+                skipped_files += 1
         # Final flush — drena el pending de la última batch parcial.
         _flush_batch()
         # Final flush of postfix counters antes de stop().

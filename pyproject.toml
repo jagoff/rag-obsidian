@@ -85,16 +85,18 @@ spotify = ["spotipy>=2.23"]
 # which is why it's opt-in rather than core.
 # Install: `uv pip install obsidian-rag[entities]`
 entities = ["gliner>=0.2.26"]
-# Speech-to-text (2026-04-22 MVP) via faster-whisper. Enables the
+# Speech-to-text via mlx-whisper (Ola 10, 2026-05-06). Enables the
 # `rag transcribe <audio>` command to turn WhatsApp voice memos, iOS
 # Voice Memos, meeting recordings into searchable text for the vault.
 # Soft dependency: the transcribe command raises RuntimeError with a
 # clear install hint when this extra isn't installed (rag.py:_load_whisper_model).
-# faster-whisper pulls ctranslate2 (~50MB) + needs ffmpeg on PATH to
-# decode anything beyond WAV. Model weights (~480MB for "small")
-# auto-download on first use to ~/.cache/huggingface/hub/.
+# mlx-whisper corre nativo sobre Apple Silicon GPU (Metal) — 4-8× más rápido
+# que faster-whisper CPU+int8 en M-series, mismo Quality. Pesos auto-download
+# de mlx-community/whisper-* a ~/.cache/huggingface/hub/ on first use
+# (~480MB para small). Necesita ffmpeg en PATH para decodificar formatos
+# que no sean WAV.
 # Install: `uv tool install --reinstall --editable '.[stt]'`
-stt = ["faster-whisper>=1.0.0"]
+stt = ["mlx-whisper>=0.4.0"]
 # LoRA fine-tune del cross-encoder reranker (GC#2.C, 2026-04-23) +
 # DPO+LoRA fine-tune del modelo de drafts WhatsApp (GC#3, 2026-05-01).
 #

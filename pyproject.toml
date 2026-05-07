@@ -125,12 +125,13 @@ finetune = [
     "trl>=0.11",
 ]
 # Apple MLX backend para LLMs locales — migración Ollama → MLX
-# completada en Ola 7 (2026-05-06). `RAG_LLM_BACKEND=mlx` es default,
-# OllamaBackend retirada (`get_backend()` siempre devuelve MLXBackend).
-# `ollama>=0.6.1` queda en `dependencies` como compatibility shim mínimo;
-# no hay call sites runtime — se removerá en Ola 8 cuando los tests que
-# todavía importan `ollama` (test_mlx_embed::skipped, test_retrieve_e2e
-# en docstring) se limpien.
+# completada en Olas 0-9 (2026-05-06). `RAG_LLM_BACKEND=mlx` es default
+# y único valor soportado; `OllamaBackend` retirada en Ola 7,
+# `import ollama` purgado en Ola 8, identificadores residuales
+# renombrados en Ola 9. `get_backend()` siempre devuelve `MLXBackend`.
+# `ollama>=0.6.1` removido de `dependencies` en Ola 8: rollback de
+# emergencia requiere `git revert` de Ola 7+ commits + `uv pip install
+# ollama>=0.6.1` manual.
 #
 # `mlx-lm` solo corre en Apple Silicon (sys_platform == 'darwin' +
 # platform_machine == 'arm64'). En CI Linux el extra no se instala y los
@@ -201,9 +202,9 @@ markers = [
     "slow: multi-process stress tests (>1s wall; opt-out with `-m 'not slow'`)",
     "real_vault: test reads the real vault (opt-out of `_isolate_vault_path` autouse). Read-only operations only — writes MUST use monkeypatch.",
     "real_apple: test is allowed to hit the user's real Apple Reminders / Calendar / Contacts (opt-out of `_isolate_apple_integrations` autouse that sets OBSIDIAN_RAG_NO_APPLE=1). Use only for integration smokes; cleanup is the test's responsibility.",
-    "requires_chat_model: test calls ollama via `resolve_chat_model()` or equivalent. Auto-skipped when no CHAT_MODEL_PREFERENCE model is installed (CI on ubuntu-latest, sandbox environments).",
+    "requires_chat_model: test resolves a chat model via `resolve_chat_model()` and dispatches a real LLM call. Auto-skipped when no CHAT_MODEL_PREFERENCE-compatible model is available (CI on ubuntu-latest, sandbox environments without MLX weights).",
     "requires_mlx: test exercises the real `MLXBackend` end-to-end (loads MLX weights, runs `mlx_lm.generate`). Apple Silicon only; auto-skipped if `mlx_lm` is not importable.",
-    "live: end-to-end live tests that spawn `rag serve` + hit ollama with real queries. Double opt-in: requires `RAG_E2E_LIVE=1` env var AND `-m live` or default-skips. ~60s warmup; NOT run in default `pytest tests/` sweep.",
+    "live: end-to-end live tests that spawn `rag serve` + hit the LLM backend (MLX) with real queries. Double opt-in: requires `RAG_E2E_LIVE=1` env var AND `-m live` or default-skips. ~60s warmup; NOT run in default `pytest tests/` sweep.",
     "no_auto_mlx_stub: opt-out of conftest's autouse `_reset_backend_singleton_per_test` MLX dispatch stub. Use for tests that exercise `_mlx_chat` / `_chat_stream_dispatch` directly (e.g. backend telemetry side-effect verification).",
 ]
 

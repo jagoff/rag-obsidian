@@ -3309,14 +3309,14 @@ _CHAT_MODEL_RESOLVED: str | None = None
 def resolve_chat_model() -> str:
     """Pick the first available model from CHAT_MODEL_PREFERENCE.
 
-    Cached per-process so the Ollama `list` call runs at most once. If none
-    are installed, raise a clear error pointing at `ollama pull`.
+    Cached per-process so the model-list lookup runs at most once. If none
+    are installed, raise a clear error pointing at `huggingface-cli download`.
 
-    MLX backend (`RAG_LLM_BACKEND=mlx`): consult the MLX cache via
-    `MLXBackend.list_available()` instead of `ollama.list()`. Match by
-    alias short-name (e.g. `qwen2.5:7b`) — `MLX_MODEL_ALIAS` translates
-    both directions, so a candidate is "available" iff its mapped HF id
-    is present in `~/.cache/huggingface/hub/`.
+    MLX backend (único soportado post-Ola 7): consulta la cache MLX via
+    `MLXBackend.list_available()`. Match por alias short-name
+    (e.g. `qwen2.5:7b`) — `MLX_MODEL_ALIAS` traduce en ambas direcciones,
+    así un candidato es "available" iff su HF id mapeado está presente en
+    `~/.cache/huggingface/hub/`.
     """
     global _CHAT_MODEL_RESOLVED
     if _CHAT_MODEL_RESOLVED is not None:
@@ -11982,7 +11982,8 @@ def _index_embed_local():
     proceso de index también sirve queries (caso raro pero posible).
 
     Returns the loaded SentenceTransformer (con MPS en Apple Silicon),
-    o None si la carga falla — `embed()` cae al path Ollama legacy.
+    o None si la carga falla — `embed()` raisea (post-Ola 6 no hay
+    fallback path; era Ollama legacy, removido).
     """
     return _get_local_embedder()
 
@@ -12015,11 +12016,11 @@ def query_embed_local(
     (bail inmediato). Útil para CLI one-shot donde el warmup async
     arranca ~100-300ms antes del primer embed y podríamos atraparlo
     con un timeout corto (disk cache caliente → bge-m3 load <1s).
-    Medido en `rag_queries` últimos 30d: CLI retrieve p50=11.9s vs
-    web 2.8s — el gap principal es que CLI siempre cae al ollama
-    embed (~150ms extra por variant, +700-1000ms total tras el
-    multi-query expansion). Con timeout=1.5s, la gran mayoría de
-    disco-caliente atrapan el local embedder.
+    Histórico (pre-Ola 6): CLI retrieve p50=11.9s vs web 2.8s — el gap
+    venía de que CLI no warmaba el local embedder y caía al ollama embed
+    HTTP (~150ms × variant, +700-1000ms post multi-query expansion).
+    Post-Ola 6: NO hay path ollama embed; el CLI espera al local
+    embedder con `wait_ready_timeout` (típico ~1.5s disk-cache caliente).
 
     Only intended for query-path embeds (1-3 short strings per call).
     Do NOT use from indexing/watch/ingest — those stay in-process.

@@ -11,7 +11,7 @@ Regresiones que atrapan:
   - Exit code != 0 cuando al menos un step falla (para que launchd lo
     marque rojo en /status).
   - El plist tiene shape correcta: label, schedule 04:00, program args,
-    env vars (OLLAMA_KEEP_ALIVE=-1 crítico para que el warmup persista).
+    env vars (LLM_KEEP_ALIVE=-1 crítico para que el warmup persista).
   - El plist está registrado en `_services_spec` (sino `rag setup` no lo
     instala).
   - /api/status incluye la entry `com.fer.obsidian-rag-wake-up` en la
@@ -294,11 +294,11 @@ def test_wake_up_plist_runs_at_0400_daily():
 
 def test_wake_up_plist_no_ollama_keep_alive_env():
     """Ola 6 cero-Ollama (2026-05-06): modelos chat Ollama purgados del disco.
-    El wake-up plist NO debe setear OLLAMA_KEEP_ALIVE — no hay daemon Ollama.
+    El wake-up plist NO debe setear LLM_KEEP_ALIVE — no hay daemon Ollama.
     """
     d = _parse(rag_module._wake_up_plist(RAG_BIN))
     env = d["EnvironmentVariables"]
-    assert "OLLAMA_KEEP_ALIVE" not in env
+    assert "LLM_KEEP_ALIVE" not in env
 
 
 def test_wake_up_plist_logs_to_rag_log_dir():

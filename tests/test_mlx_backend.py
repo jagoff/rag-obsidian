@@ -11,13 +11,13 @@ import pytest
 
 from rag.llm_backend import (
     MLX_MODEL_ALIAS,
-    OLLAMA_MODEL_ALIAS,
+    SHORT_NAME_ALIAS,
     ChatOptions,
     MLXBackend,
     get_backend,
     reset_backend,
     to_mlx,
-    to_ollama,
+    to_short_name,
 )
 
 # ---------------------------------------------------------------------------
@@ -42,24 +42,24 @@ def test_to_mlx_resolves_aliases():
     assert to_mlx("command-r") == "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit"
     # Already canonical — identity
     assert to_mlx("mlx-community/Foo") == "mlx-community/Foo"
-    # Unknown Ollama name — identity passthrough
+    # Unknown short alias — identity passthrough
     assert to_mlx("unknown:7b") == "unknown:7b"
 
 
 # ---------------------------------------------------------------------------
-# 2. to_ollama inverse mapping
+# 2. to_short_name inverse mapping
 # ---------------------------------------------------------------------------
 
 
-def test_to_ollama_inverse():
-    # MLX canonical → Ollama short name
-    assert to_ollama("mlx-community/Qwen2.5-3B-Instruct-4bit") == "qwen2.5:3b"
-    assert to_ollama("mlx-community/Qwen2.5-7B-Instruct-4bit") == "qwen2.5:7b"
+def test_to_short_name_inverse():
+    # MLX canonical → short alias name
+    assert to_short_name("mlx-community/Qwen2.5-3B-Instruct-4bit") == "qwen2.5:3b"
+    assert to_short_name("mlx-community/Qwen2.5-7B-Instruct-4bit") == "qwen2.5:7b"
     # Unknown MLX id — identity passthrough
-    assert to_ollama("mlx-community/SomethingElse") == "mlx-community/SomethingElse"
-    # Round-trip: to_mlx → to_ollama should give back the original for known names
+    assert to_short_name("mlx-community/SomethingElse") == "mlx-community/SomethingElse"
+    # Round-trip: to_mlx → to_short_name should give back the original for known names
     original = "qwen2.5:3b"
-    assert to_ollama(to_mlx(original)) == original
+    assert to_short_name(to_mlx(original)) == original
 
 
 # ---------------------------------------------------------------------------

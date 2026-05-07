@@ -57,7 +57,7 @@ def _repair_json(raw: str) -> str:
 
 
 def parse_tool_calls(text: str | None) -> list[Any] | None:
-    """Parse Qwen `<tool_call>{...}</tool_call>` blocks → ollama-shape list.
+    """Parse Qwen `<tool_call>{...}</tool_call>` blocks → MLX-shape list.
 
     Returns None when no parseable tool calls are found.
     """

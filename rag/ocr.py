@@ -882,7 +882,7 @@ def _detect_cita_from_ocr(ocr_text: str) -> dict | None:
     `start` → `when`. Eso hace que el upgrade sea transparente para
     callers externos.
     """
-    from rag import _helper_client, _silent_log, HELPER_MODEL, HELPER_OPTIONS, OLLAMA_KEEP_ALIVE
+    from rag import _helper_client, _silent_log, HELPER_MODEL, HELPER_OPTIONS, LLM_KEEP_ALIVE
     if not _cita_detect_enabled():
         return None
     text = (ocr_text or "").strip()
@@ -901,7 +901,7 @@ def _detect_cita_from_ocr(ocr_text: str) -> dict | None:
                 {"role": "user", "content": prompt},
             ],
             options={**HELPER_OPTIONS, "num_predict": 180, "num_ctx": 2048},
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=LLM_KEEP_ALIVE,
             format="json",
         )
         raw = resp.message.content.strip()

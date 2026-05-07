@@ -145,20 +145,20 @@ def test_web_plist_has_rag_reranker_never_unload():
 
 def test_web_plist_no_ollama_keep_alive():
     """Ola 6 cero-Ollama (2026-05-06): modelos chat Ollama purgados del disco.
-    El web plist NO debe setear OLLAMA_KEEP_ALIVE ni OLLAMA_MAX_LOADED_MODELS
+    El web plist NO debe setear LLM_KEEP_ALIVE ni OLLAMA_MAX_LOADED_MODELS
     — no hay daemon Ollama que keep-alivear.
     """
     d = _parse(rag_module._web_plist(RAG_BIN))
     env = d["EnvironmentVariables"]
-    assert "OLLAMA_KEEP_ALIVE" not in env, \
-        "Ola 6: modelos Ollama purgados — OLLAMA_KEEP_ALIVE no debe estar en web plist"
+    assert "LLM_KEEP_ALIVE" not in env, \
+        "Ola 6: modelos Ollama purgados — LLM_KEEP_ALIVE no debe estar en web plist"
     assert "OLLAMA_MAX_LOADED_MODELS" not in env, \
         "Ola 6: OLLAMA_MAX_LOADED_MODELS no debe estar en web plist"
 
 
 def test_indexers_have_local_embed_and_no_ollama_keepalive():
     """Ola 6 cero-Ollama: todos los plists indexers tienen RAG_INDEX_LOCAL_EMBED=1
-    y NO tienen OLLAMA_KEEP_ALIVE (embed path es ahora in-process).
+    y NO tienen LLM_KEEP_ALIVE (embed path es ahora in-process).
     """
     indexer_plists = [
         ("watch", rag_module._watch_plist(RAG_BIN)),
@@ -177,8 +177,8 @@ def test_indexers_have_local_embed_and_no_ollama_keepalive():
         env = d["EnvironmentVariables"]
         assert env.get("RAG_INDEX_LOCAL_EMBED") == "1", \
             f"{name}: falta RAG_INDEX_LOCAL_EMBED=1 (Ola 6 cero-Ollama)"
-        assert "OLLAMA_KEEP_ALIVE" not in env, \
-            f"{name}: OLLAMA_KEEP_ALIVE no debe estar (Ola 6 cero-Ollama)"
+        assert "LLM_KEEP_ALIVE" not in env, \
+            f"{name}: LLM_KEEP_ALIVE no debe estar (Ola 6 cero-Ollama)"
 
 
 def test_web_plist_keepalive_runatload():

@@ -93,7 +93,7 @@ def run_query(
             model=model or rag.resolve_chat_model(),
             messages=messages,
             options=options,
-            keep_alive=rag.OLLAMA_KEEP_ALIVE,
+            keep_alive=rag.LLM_KEEP_ALIVE,
         ):
             c = getattr(chunk.message, "content", None) or ""
             if c and t_first_token is None:

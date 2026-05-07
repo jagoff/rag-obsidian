@@ -437,7 +437,7 @@ def build() -> dict:
     e, retrieve_id = make_box(
         hcenter(cx_center, 720), 1500, 720, 220,
         "multi_retrieve(vaults × sources)\n\n"
-        "1. embed query (local MPS o ollama)\n"
+        "1. embed query (local MPS o the backend)\n"
         "2. BM25 + sqlite-vec semantic\n"
         "3. RRF merge\n"
         "4. cross-encoder rerank (bge-reranker-v2-m3)\n"

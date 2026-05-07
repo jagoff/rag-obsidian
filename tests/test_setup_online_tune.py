@@ -225,14 +225,14 @@ def test_serve_plist_port_7832_and_keepalive():
 def test_serve_plist_warm_model_env():
     """Serve existe para mantener reranker + embedder in-process warm.
 
-    Ola 6 cero-Ollama (2026-05-06): OLLAMA_KEEP_ALIVE y
+    Ola 6 cero-Ollama (2026-05-06): LLM_KEEP_ALIVE y
     OLLAMA_MAX_LOADED_MODELS removidos — no hay daemon Ollama que
     keep-alivear. RAG_LLM_BACKEND=mlx reemplaza la función de calentar
     chat model.
     """
     d = _parse_plist(rag_module._serve_plist(RAG_BIN))
     env = d.get("EnvironmentVariables", {})
-    assert "OLLAMA_KEEP_ALIVE" not in env
+    assert "LLM_KEEP_ALIVE" not in env
     assert "OLLAMA_MAX_LOADED_MODELS" not in env
     assert env.get("RAG_RERANKER_NEVER_UNLOAD") == "1"
     assert env.get("RAG_LOCAL_EMBED") == "1"
@@ -418,10 +418,10 @@ def test_ingester_plist_valid_plist(fn_name, expected_source, expected_interval)
 
     # 6. RAG_INDEX_LOCAL_EMBED=1 en env — Ola 6 cero-Ollama (2026-05-06):
     #    el ingester embeds se hacen in-process con SentenceTransformer.
-    #    OLLAMA_KEEP_ALIVE ya no aplica — no hay daemon Ollama que keep-alivear.
+    #    LLM_KEEP_ALIVE ya no aplica — no hay daemon Ollama que keep-alivear.
     env = d.get("EnvironmentVariables", {})
     assert env.get("RAG_INDEX_LOCAL_EMBED") == "1"
-    assert "OLLAMA_KEEP_ALIVE" not in env
+    assert "LLM_KEEP_ALIVE" not in env
 
 
 def test_ingester_plists_log_paths_distinct():

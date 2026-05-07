@@ -2,7 +2,7 @@
 
 Verifica:
 - Load (model + tokenizer)
-- chat() devuelve ollama-shape ChatResponse (atributo .message.content)
+- chat() devuelve MLX-shape ChatResponse (atributo .message.content)
 - Output no contiene drift (PT/CJK)
 - HQ tier (Qwen3-30B) responde JSON cuando format='json'
 

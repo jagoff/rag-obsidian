@@ -308,7 +308,7 @@ def test_generate_morning_json_returns_none_on_invalid_json(monkeypatch):
     assert rag._generate_morning_json("x") is None
 
 
-@pytest.mark.requires_ollama
+@pytest.mark.requires_chat_model
 def test_generate_morning_json_parses_valid(monkeypatch):
     class _Resp:
         class message:

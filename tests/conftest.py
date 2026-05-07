@@ -33,13 +33,13 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 import pytest
 
 
-# Module-level ollama availability check — evaluated ONCE at collection
-# time. Avoids paying the subprocess + HTTP cost per test when 100+ tests
-# share the same skip condition.
+# Module-level chat-model availability check — evaluated ONCE at collection
+# time. Avoids paying the resolve cost per test when 100+ tests share the
+# same skip condition.
 def _has_chat_model() -> bool:
-    """True if `resolve_chat_model()` finds an installed model in ollama.
-    False when ollama is down, not installed, or no CHAT_MODEL_PREFERENCE
-    model is pulled — CI, fresh dev boxes, sandboxed environments."""
+    """True if `resolve_chat_model()` finds an installed MLX model.
+    False when MLX models no están descargados — CI, fresh dev boxes,
+    sandboxed environments."""
     try:
         import rag
         rag.resolve_chat_model()
@@ -151,51 +151,50 @@ def _reset_backend_singleton_per_test(monkeypatch, request):
 
 
 @pytest.fixture(autouse=True)
-def _skip_if_no_ollama(request):
-    """Skip tests decorated with `@pytest.mark.requires_ollama` when
-    no ollama chat model is available (CI on ubuntu-latest, machines
-    without ollama pulled).
+def _skip_if_no_chat_model(request):
+    """Skip tests decorated with `@pytest.mark.requires_chat_model` when
+    no MLX chat model is available (CI on ubuntu-latest, machines without
+    MLX models descargados).
 
     The marker is applied at either test or module scope:
-        pytestmark = pytest.mark.requires_ollama      # file-wide
-        @pytest.mark.requires_ollama                  # per-test
+        pytestmark = pytest.mark.requires_chat_model      # file-wide
+        @pytest.mark.requires_chat_model                  # per-test
     """
-    if request.node.get_closest_marker("requires_ollama") and not _HAS_CHAT_MODEL:
+    if request.node.get_closest_marker("requires_chat_model") and not _HAS_CHAT_MODEL:
         pytest.skip(
-            "requires ollama with a CHAT_MODEL_PREFERENCE model installed "
-            "(e.g. `ollama pull qwen2.5:7b`); not available in this env"
+            "requires MLX chat model installed (e.g. "
+            "`huggingface-cli download mlx-community/Qwen2.5-7B-Instruct-4bit`); "
+            "not available in this env"
         )
 
 
 @pytest.fixture(autouse=True)
-def _stub_chat_model_cache_if_no_ollama(monkeypatch, request):
-    """En CI / dev boxes sin Ollama corriendo, `rag.resolve_chat_model()`
-    levanta `RuntimeError("Ningún modelo de CHAT_MODEL_PREFERENCE instalado…")`
-    la primera vez que se la llama. Hay un cluster de ~40 tests que mockean
-    `ollama.chat` (la HTTP call real) pero NO mockean el guard, así que
-    el endpoint `/api/chat` falla en `_resolve_web_chat_model()` antes de
-    que los mocks tomen efecto. Esto rompía la suite en CI desde commit
-    5bbf30d (run #325).
+def _stub_chat_model_cache_if_no_chat_model(monkeypatch, request):
+    """En CI / dev boxes sin modelos MLX descargados, `rag.resolve_chat_model()`
+    levanta `RuntimeError("Ningún modelo MLX disponible…")` la primera vez
+    que se la llama. Hay un cluster de tests que mockean `_mlx_chat` pero NO
+    mockean el guard, así que el endpoint `/api/chat` falla en
+    `_resolve_web_chat_model()` antes de que los mocks tomen efecto.
 
-    Approach minimalista: cuando no hay Ollama, pre-poblamos el cache
-    module-level `rag._CHAT_MODEL_RESOLVED` con `qwen2.5:7b` (el primer
-    item de CHAT_MODEL_PREFERENCE). `resolve_chat_model()` short-circuitea
-    al inicio cuando el cache != None, así nunca se llega al
-    `ollama.list()` que fallaría.
+    Approach minimalista: cuando no hay chat model resolvable, pre-poblamos
+    el cache module-level `rag._CHAT_MODEL_RESOLVED` con `qwen2.5:7b` (el
+    primer item de CHAT_MODEL_PREFERENCE). `resolve_chat_model()`
+    short-circuitea al inicio cuando el cache != None, así nunca se llega
+    al `MLXBackend.list_available()` que fallaría.
 
     Tests que validan el path real del guard (`test_chat_keep_alive_guard`
     et al.) usan `monkeypatch.setattr` o resetean `_CHAT_MODEL_RESOLVED = None`
     en su propio fixture autouse — esos overrides ganan por orden de
     aplicación (los autouse de archivo corren después que los de conftest).
-    Tests con marker `requires_ollama` salen skipped via `_skip_if_no_ollama`
-    antes de llegar acá.
+    Tests con marker `requires_chat_model` salen skipped via
+    `_skip_if_no_chat_model` antes de llegar acá.
 
-    Cuando SÍ hay Ollama (entorno dev del usuario), no tocamos nada — la
+    Cuando SÍ hay chat model (entorno dev del usuario), no tocamos nada — la
     suite ejerce el guard real.
     """
     if _HAS_CHAT_MODEL:
         return
-    if request.node.get_closest_marker("requires_ollama"):
+    if request.node.get_closest_marker("requires_chat_model"):
         return
     monkeypatch.setattr("rag._CHAT_MODEL_RESOLVED", "qwen2.5:7b")
 

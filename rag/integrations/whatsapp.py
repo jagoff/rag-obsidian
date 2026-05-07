@@ -52,7 +52,7 @@ LLM-on-WA path:
 
 ## Why deferred imports
 Several helpers (`_silent_log`, `_summary_client`, `HELPER_MODEL`,
-`HELPER_OPTIONS`, `OLLAMA_KEEP_ALIVE`, `_AMBIENT_ANTILOOP_MARKER`,
+`HELPER_OPTIONS`, `LLM_KEEP_ALIVE`, `_AMBIENT_ANTILOOP_MARKER`,
 `AMBIENT_WHATSAPP_BRIDGE_URL`, `_RAG_LOG_DIR`, `_fetch_contact`,
 `_parse_bridge_timestamp`, `INBOX_FOLDER`) live in `rag.__init__`.
 Module-level imports here would deadlock the package load; function-body
@@ -801,7 +801,7 @@ def _infer_observation_category(
             model=rag.HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options={"temperature": 0.0, "seed": 42, "num_predict": 32},
-            keep_alive=rag.OLLAMA_KEEP_ALIVE,
+            keep_alive=rag.LLM_KEEP_ALIVE,
         )
         raw = (resp.message.content or "").strip()
     except Exception as exc:
@@ -2018,7 +2018,7 @@ def _wa_extract_actions(chat_label: str, is_group: bool, messages: list[dict]) -
     asks directed at the user; `questions` are open questions addressed
     to the user that still need an answer.
     """
-    from rag import HELPER_MODEL, HELPER_OPTIONS, OLLAMA_KEEP_ALIVE, _summary_client
+    from rag import HELPER_MODEL, HELPER_OPTIONS, LLM_KEEP_ALIVE, _summary_client
     empty = {"tasks": [], "questions": [], "commitments": []}
     if not messages:
         return empty
@@ -2049,7 +2049,7 @@ def _wa_extract_actions(chat_label: str, is_group: bool, messages: list[dict]) -
             model=HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options={**HELPER_OPTIONS, "num_predict": 320, "num_ctx": 4096},
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=LLM_KEEP_ALIVE,
             format="json",
         )
         raw = (resp.message.content or "").strip()
@@ -2177,7 +2177,7 @@ def _wa_extract_promises(
     + dedup por (text, direction). Silent-fail por contrato: empty
     list on cualquier error (LLM, JSON inválido, etc).
     """
-    from rag import HELPER_MODEL, HELPER_OPTIONS, OLLAMA_KEEP_ALIVE, _summary_client
+    from rag import HELPER_MODEL, HELPER_OPTIONS, LLM_KEEP_ALIVE, _summary_client
     if not messages:
         return []
     candidates = [m for m in messages if not (m.get("text") or "").startswith("\u200b")]
@@ -2223,7 +2223,7 @@ def _wa_extract_promises(
             model=HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options={**HELPER_OPTIONS, "num_predict": 480, "num_ctx": 4096},
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=LLM_KEEP_ALIVE,
             format="json",
         )
         raw = (resp.message.content or "").strip()

@@ -811,13 +811,13 @@ COLLECTION_RESET_SENTINEL = Path.home() / ".local/share/obsidian-rag/collection_
 # ~27815). Prevents two `rag index` invocations from racing for Ollama
 # embeddings and the sqlite-vec write lock at the same time. Backed by
 # `fcntl.flock(LOCK_EX | LOCK_NB)` — non-blocking, so the second caller
-# fails fast with a clear message instead of doubling Ollama load.
+# fails fast with a clear message instead of doubling backend load.
 #
 # Why this exists: 2026-05-01 incident where a parallel devin session
 # kept a `rag index --no-contradict` retry loop alive for 3h. While the
 # index hung in `recvfrom`, the launchd plist for `ingest-safari`
 # scheduled at 12:15 / 18:15 spawned a SECOND `rag index --source safari`
-# that piled on top, doubling Ollama pressure. Net effect: web/chat
+# that piled on top, doubling backend pressure. Net effect: web/chat
 # starved for any Ollama-backed call (semantic + LLM both queued behind
 # the indices). With this lock, the second `rag index` aborts in <1s
 # with `Otro rag index activo`, and the chat keeps flowing.
@@ -3226,7 +3226,7 @@ CHAT_OPTIONS = {
     "temperature": 0, "top_p": 1, "seed": 42,
     # num_ctx MUST match the value used by every other caller to the chat
     # model (web/server.py _WEB_CHAT_NUM_CTX). When two call sites request
-    # the same model with different num_ctx, ollama reinitialises its KV
+    # the same model with different num_ctx, the backend reinitialises its KV
     # cache and the prefix cache for the system prompt is lost — measured
     # 2026-04-20: 20ms cache-hit prefill vs 4400ms cold-reinit (220× hit).
     # 4096 is sized to fit system (1300 tok) + context P99 (1500 tok) +
@@ -3265,103 +3265,42 @@ def _wrap_untrusted(content: str, label: str = "CONTENIDO") -> str:
     safe = content.replace(f"</{label}>", f"</{label}_").replace(f"<{label}>", f"<{label}_")
     return f"<{label}>\n{safe}\n</{label}>"
 
-# Keep models resident in VRAM between queries — avoids 2-3s cold reload.
-# Ollama accepts -1 (forever, as int) or a duration string like "30m".
+# LLM keep_alive — kwarg que se pasa al backend al hacer chat/generate.
 #
-# Historia del default:
-#   - Pre-2026-04-17: `-1` (forever)
-#   - 2026-04-17: → `"20m"` tras el Mac freeze — `-1` pineaba command-r
-#     (~19 GB) permanentemente como wired memory, y en 36 GB unificados eso
-#     bloqueaba al kernel de swappear, triggereando beachballs cuando otra
-#     app crecía.
-#   - 2026-04-21: → `-1` (volvemos). Desde el 2026-04-18 el default de
-#     chat model es **qwen2.5:7b (~4.7 GB)** no command-r (~19 GB). Stack
-#     actual pinned: qwen2.5:7b (4.7) + qwen2.5:3b helper (2) +
-#     bge-m3 (1) ≈ 8 GB — holgado en 36 GB. Los launchd plists (web, serve,
-#     morning, today, ...) ya corren con `-1` sin causar freeze — evidencia
-#     empírica a favor de que el problema original era command-r, no `-1`.
-#   - 2026-04-30 (tarde): → `"20m"` ROLLBACK del 2026-04-21. Reproducimos
-#     el síntoma: ollama directo tomaba 6.85s para 3 tokens (debería <1s),
-#     RagNet /api/chat 41-90s (debería 7-15s). Root cause: con
-#     `OLLAMA_MAX_LOADED_MODELS=3` + `KEEP_ALIVE=-1`, los 3 modelos del
-#     stack (qwen2.5:7b + qwen2.5:3b + bge-m3 = ~9GB VRAM) quedaban
-#     pinned forever. Sumado a Chrome/OrbStack/etc, el unified memory de
-#     36 GB se saturaba y MPS hacia swap → tokens/s caían 10x. Con
-#     `KEEP_ALIVE=20m` los modelos secundarios (qwen2.5:3b helper) se
-#     unloadan si no se tocan; el principal (qwen2.5:7b chat) se mantiene
-#     warm porque siempre se usa. Junto con `MAX_LOADED_MODELS=2` (ver
-#     `~/.local/bin/ollama-env-init.sh`), ollama vuelve a 0.7s/3tok y
-#     RagNet a 14-23s. Mejora 4-10x end-to-end.
+# Post-Ola 8 (2026-05-06): MLX backend in-process. `keep_alive` es no-op
+# en MLX (los modelos viven en `_loaded` con LRU + idle-unload watchdog
+# `RAG_MLX_IDLE_TTL`). El value se sigue propagando como kwarg para
+# preservar la firma compatible.
 #
-# ⚠️ ROLLBACK: si necesitás `-1` por algún motivo puntual (test perf,
-# benchmark sin cold loads), exportá `OLLAMA_KEEP_ALIVE=-1` en tu shell.
-# El env var override sigue funcionando en cualquier dirección.
-#
-# ⚠️ FALLBACK RISK: `resolve_chat_model()` cae a command-r (~19 GB) si
-# qwen2.5:7b + qwen3:30b-a3b no están. Con KEEP_ALIVE=20m (default actual)
-# command-r se descarga si no se usa, evitando el Mac freeze.
+# Default: `-1` (forever). Override via env var `RAG_LLM_KEEP_ALIVE`
+# (acepta entero "30" o duration string "20m"). Por compat con plists
+# legacy también respetamos `LLM_KEEP_ALIVE` si está set.
 def _parse_keep_alive(val: str) -> int | str:
     try:
         return int(val)
     except ValueError:
         return val
-OLLAMA_KEEP_ALIVE = _parse_keep_alive(os.environ.get("OLLAMA_KEEP_ALIVE", "20m"))
 
 
-# Modelos >10 GB cuya wired-pin en 36 GB unified bloquea el kernel de
-# swappear — reproduce el 2026-04-17 Mac freeze. Detectados por nombre
-# exacto (no substring) para evitar false-positives. Si resolve_chat_model()
-# cae a alguno de estos, `chat_keep_alive()` clampea a `_LARGE_KEEP_ALIVE`
-# independientemente de OLLAMA_KEEP_ALIVE — guard defensivo sin requerir
-# intervención manual post-freeze.
-_LARGE_CHAT_MODELS = frozenset({
-    "qwen3:30b-a3b",       # ~18 GB MoE
-    "command-r:latest",    # ~19 GB
-    "command-r",           # alias sin tag (por si CHAT_MODEL_PREFERENCE cambia)
-    "command-r:35b",       # tag explícito si alguien lo agrega
-})
-_LARGE_KEEP_ALIVE = "20m"  # safe cap para modelos grandes
+_keep_alive_raw = (
+    os.environ.get("RAG_LLM_KEEP_ALIVE")
+    or os.environ.get("OLLAMA_KEEP_ALIVE")  # compat plists viejos
+    or "-1"
+)
+LLM_KEEP_ALIVE = _parse_keep_alive(_keep_alive_raw)
 
 
 def chat_keep_alive(model: str | None = None) -> int | str:
-    """Keep_alive para calls al chat model, clampeado para modelos grandes.
+    """Keep_alive value for chat-model LLM calls.
 
-    Guard contra el 2026-04-17 Mac-freeze regression: si el chat model
-    efectivo es command-r (~19 GB) o qwen3:30b-a3b (~18 GB),
-    OLLAMA_KEEP_ALIVE=-1 los pinearía como wired memory en 36 GB unified,
-    bloqueando swap del kernel.
+    Post-Ola 8 (cero-Ollama): MLX backend in-process. `keep_alive` es
+    no-op en MLX — el value pasa al backend solo para preservar la firma
+    compat con call sites históricos. Devuelve `LLM_KEEP_ALIVE` raw.
 
-    Args:
-        model: modelo efectivo a usar en la próxima call a ollama. Si es
-            None, se resuelve via `resolve_chat_model()`. Pasarlo explícito
-            desde sitios como `web/server.py._resolve_web_chat_model()`
-            donde el usuario puede overridear el modelo runtime desde la UI.
-
-    Lógica:
-      - Chat model NO está en _LARGE_CHAT_MODELS → devolver OLLAMA_KEEP_ALIVE
-        tal cual (respeta env var del usuario).
-      - Chat model SÍ está en _LARGE_CHAT_MODELS → clampear a _LARGE_KEEP_ALIVE
-        ("20m"), a menos que el usuario haya seteado RAG_KEEP_ALIVE_LARGE_MODEL
-        explícitamente (opt-out consciente — para quien tenga >64 GB).
-
-    Llamar desde todo call site que use chat model (resolve_chat_model() o
-    _resolve_web_chat_model()). Helper + embed model (qwen2.5:3b, bge-m3)
-    son chicos (<3 GB) y siguen usando OLLAMA_KEEP_ALIVE directo.
+    El parámetro `model` queda sin uso pero mantenemos la firma para no
+    tocar 20+ call sites.
     """
-    if model is None:
-        try:
-            model = resolve_chat_model()
-        except RuntimeError:
-            # Si no hay ningún chat model instalado, no podemos clampear por
-            # nombre — devolvemos OLLAMA_KEEP_ALIVE raw. El caller va a fallar
-            # igual al hacer la call, no es nuestro problema.
-            return OLLAMA_KEEP_ALIVE
-    if model in _LARGE_CHAT_MODELS:
-        override = os.environ.get("RAG_KEEP_ALIVE_LARGE_MODEL")
-        if override:
-            return _parse_keep_alive(override)
-        return _LARGE_KEEP_ALIVE
-    return OLLAMA_KEEP_ALIVE
+    return LLM_KEEP_ALIVE
 
 
 _CHAT_MODEL_RESOLVED: str | None = None
@@ -3375,7 +3314,7 @@ def resolve_chat_model() -> str:
 
     MLX backend (`RAG_LLM_BACKEND=mlx`): consult the MLX cache via
     `MLXBackend.list_available()` instead of `ollama.list()`. Match by
-    Ollama-style alias (e.g. `qwen2.5:7b`) — `MLX_MODEL_ALIAS` translates
+    alias short-name (e.g. `qwen2.5:7b`) — `MLX_MODEL_ALIAS` translates
     both directions, so a candidate is "available" iff its mapped HF id
     is present in `~/.cache/huggingface/hub/`.
     """
@@ -3839,7 +3778,7 @@ _HELPER_SEM: threading.Semaphore = threading.Semaphore(
 
 
 def _mlx_chat_via_backend(**kwargs):
-    """Traduce un call ollama-shape `chat(**kwargs)` al MLX backend.
+    """Traduce un call MLX-shape `chat(**kwargs)` al MLX backend.
 
     Convierte el dict `options` en `ChatOptions`, propaga `tools=[...]`
     al Qwen chat template (Ola 5). Descarta kwargs ollama-only (`think`,
@@ -3880,13 +3819,6 @@ def _mlx_chat(**kwargs):
     return _mlx_chat_via_backend(**kwargs)
 
 
-# Alias retrocompat post-Ola 7: web/server.py + scripts importan
-# `_mlx_or_ollama_chat`. Tras la purga del branch Ollama, ambos paths
-# ruta a MLX. El alias evita tocar 5 callsites en web/server.py + 1 en
-# scripts/ — todos pueden seguir usando el nombre histórico.
-_mlx_or_ollama_chat = _mlx_chat
-
-
 def _chat_stream_dispatch(**kwargs):
     """Streaming dispatcher — rutea a `MLXBackend.chat_stream()`.
 
@@ -3921,7 +3853,7 @@ def _chat_stream_dispatch(**kwargs):
 class _SemaphoredChatClient:
     """Wrapper mínimo sobre `_mlx_chat_via_backend` con semaphore opcional.
 
-    Reemplaza `_TimedOllamaProxy` post-purga Ollama (Ola 7). MLX corre
+    Wrapper sobre el MLX dispatcher. MLX corre
     in-process — los timeouts HTTP ya no aplican. El semaphore sigue
     siendo útil para throttlear llamadas concurrentes al GPU.
     """
@@ -4039,7 +3971,7 @@ def _generate_context_summary(text: str, title: str, folder: str) -> str:
             model=HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options={**HELPER_OPTIONS, "num_predict": 40},
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=LLM_KEEP_ALIVE,
         )
         raw = resp.message.content.strip()
         # Take only the first sentence, cap at 120 chars to avoid prefix bloat
@@ -4183,7 +4115,7 @@ def _generate_synthetic_questions(text: str, title: str, folder: str) -> list[st
     (temp=0, seed=42 via HELPER_OPTIONS). Returns:
       - list[str]: success (possibly empty if the LLM produced no usable
                    questions after cleaning — the note is a legitimate zero)
-      - None:       transient failure (ollama timeout, malformed JSON,
+      - None:       transient failure (backend timeout, malformed JSON,
                    etc) — caller should NOT cache so the next run retries
 
     Bypass: set OBSIDIAN_RAG_SKIP_SYNTHETIC_Q=1 (returns []).
@@ -4206,7 +4138,7 @@ def _generate_synthetic_questions(text: str, title: str, folder: str) -> list[st
             model=HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options={**HELPER_OPTIONS, "num_predict": 220},
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=LLM_KEEP_ALIVE,
             format="json",
         )
         raw = resp.message.content.strip()
@@ -7201,7 +7133,7 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     (
         # VLM caption cache — texto generado por un modelo vision-language
-        # (qwen2.5vl:3b via ollama) cuando el OCR de Apple Vision devuelve
+        # (qwen2.5vl:3b via MLX backend) cuando el OCR de Apple Vision devuelve
         # vacío o muy poco texto. Captionea fotos, diagramas, gráficos,
         # whiteboards, paisajes — imágenes que OCR no puede leer porque no
         # hay texto, pero que siguen teniendo información útil para el
@@ -8548,7 +8480,7 @@ def _sql_write_with_retry(write_fn, error_tag: str, *, attempts: int = 8) -> Non
     `memory_sql_write_failed` / `cpu_sql_write_failed` entries before the
     memory/cpu samplers got retry logic. Lock contention windows longer
     than the 30s `busy_timeout` (e.g. during `_write_feedback_golden_sql`
-    + `embed()` under cold ollama, or concurrent contradiction workers)
+    + `embed()` under cold backend, or concurrent contradiction workers)
     still escape busy-timeout and surface as OperationalError.
 
     **2026-04-22 tuning**: defaults bumped to attempts=5 and backoff range
@@ -10558,7 +10490,7 @@ def _generate_wiki_page_summary(text: str, title: str, folder: str) -> dict | No
             model=HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options={**HELPER_OPTIONS, "num_predict": 400},
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=LLM_KEEP_ALIVE,
             format="json",
         )
         raw = resp.message.content.strip()
@@ -11863,7 +11795,7 @@ def embed(texts: list[str]) -> list[list[float]]:
 # When RAG_LOCAL_EMBED=1 is set, web chat query embedding bypasses the ollama
 # HTTP round-trip (~140ms) and uses a SentenceTransformer in-process singleton
 # (~10-30ms warm).  Only affects the *query* embed for retrieval — the indexing
-# path (bulk chunk embedding) stays on ollama to avoid memory pressure.
+# path (bulk chunk embedding) stays in-process to avoid memory pressure.
 #
 # Requirements:
 #   - BAAI/bge-m3 must be cached in ~/.cache/huggingface/hub/  (not auto-downloaded
@@ -11882,7 +11814,7 @@ _local_embedder_lock = threading.Lock()
 # encode has succeeded (via `_warmup_local_embedder` or an inline call).
 # `query_embed_local` checks this before entering the lock so a one-shot
 # CLI query that races the background warmup doesn't block the main
-# thread for 5-12s — it returns None and the caller falls back to ollama
+# thread for 5-12s — it returns None and the caller falls to in-process
 # embed (~150ms consistent). Once the Event is set, subsequent calls in
 # the same process take the fast in-process path.
 _local_embedder_ready = threading.Event()
@@ -11938,7 +11870,7 @@ LOCAL_EMBED_ENABLED = _LOCAL_EMBED_ENABLED  # public alias (pre-existing)
 # Subcommands that auto-enable RAG_LOCAL_EMBED=1 if the user hasn't set it
 # explicitly. Rule: include only paths that issue ≤ a handful of query
 # embeddings per invocation (interactive retrieval). EXCLUDE bulk paths
-# (index/watch/ingesters) — those stay on ollama to avoid VRAM pressure
+# (index/watch/ingesters) — those stay in-process to avoid VRAM pressure
 # from embedding 10k+ chunks through the SentenceTransformer singleton.
 _LOCAL_EMBED_AUTO_CMDS: frozenset[str] = frozenset({
     "query", "chat", "do", "pendientes",
@@ -11967,7 +11899,7 @@ def _get_local_embedder():
     """Lazy-load BAAI/bge-m3 as a SentenceTransformer for in-process query embeds.
 
     Returns the model instance, or None if the model is not cached locally
-    (silently falls back to ollama in `query_embed_local`).
+    (silently falls to in-process in `query_embed_local`).
 
     Uses MPS on Apple Silicon (same device as reranker).  Caches the model
     globally so subsequent calls are O(1).
@@ -12003,7 +11935,7 @@ def _get_local_embedder():
                 _dev = "cuda"
             else:
                 _dev = "cpu"
-            # NOTE: EMBED_MODEL is the ollama short name
+            # NOTE: EMBED_MODEL is the short alias name
             # ("qwen3-embedding:0.6b"); the HuggingFace repo id is
             # "Qwen/Qwen3-Embedding-0.6B". Passing the ollama name makes
             # sentence_transformers hit the hub HEAD endpoint and fail
@@ -12034,8 +11966,8 @@ def _get_local_embedder():
                 _local_embedder.encode = _encode_with_cleanup
         except Exception as _exc:
             if os.environ.get("RAG_DEBUG"):
-                print(f"[local-embed] unavailable ({_exc}) — falling back to ollama", flush=True)
-            _local_embedder = None  # stays None; callers fall back to ollama
+                print(f"[local-embed] unavailable ({_exc}) — raising (no fallback)", flush=True)
+            _local_embedder = None  # stays None; callers raise (no fallback)
     return _local_embedder
 
 
@@ -12071,7 +12003,7 @@ def query_embed_local(
     races the main thread, and lock contention used to pin the main at
     10-12s (measured 2026-04-21 in `rag_queries.extra_json`: embed_ms
     12014ms while a fresh warmup was loading bge-m3 on MPS). Falling back
-    to ollama embed (~150ms) is strictly better for cold one-shots than
+    to backend embed (~150ms) is strictly better for cold one-shots than
     waiting for a local load that only pays off across many queries.
 
     Long-running processes (`rag serve`, `rag chat`, `rag do`, web server)
@@ -12090,18 +12022,18 @@ def query_embed_local(
     disco-caliente atrapan el local embedder.
 
     Only intended for query-path embeds (1-3 short strings per call).
-    Do NOT use from indexing/watch/ingest — those stay on ollama.
+    Do NOT use from indexing/watch/ingest — those stay in-process.
     """
     if not _local_embed_enabled():
         return None
     # Readiness check. Default: non-blocking (None if not set). When a
     # timeout is passed, block up to `wait_ready_timeout` seconds on the
     # Event. On one-shot CLI paths this lets us catch a warmup that's
-    # milliseconds from completing instead of falling back to ollama.
+    # milliseconds from completing instead of raising (no fallback).
     if not _local_embedder_ready.is_set():
         if wait_ready_timeout and wait_ready_timeout > 0:
             if not _local_embedder_ready.wait(timeout=float(wait_ready_timeout)):
-                return None  # timed out → caller falls back to ollama
+                return None  # timed out → caller falls to in-process
             # else: Event fired during the wait, proceed normally
         else:
             return None
@@ -12144,7 +12076,7 @@ def _warmup_local_embedder() -> bool:
     This helper centralises the warmup so both ``warmup_async`` and
     ``serve`` run the same code. Intentionally best-effort: if the HF cache
     is missing or MPS is out of memory, callers keep working — the retrieve
-    path will fall back to ollama embed via ``query_embed_local()``
+    path will fall back to backend embed via ``query_embed_local()``
     returning None.
 
     Returns True iff the model was loaded AND the dummy encode succeeded,
@@ -12197,7 +12129,7 @@ def hyde_embed(question: str) -> list[float]:
             model=HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options=HELPER_OPTIONS,
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=LLM_KEEP_ALIVE,
         )
         content = resp.message.content.strip()
         if not content:
@@ -12623,10 +12555,12 @@ _LLM_TYPO_LAST: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
 )
 
 # -- Backend telemetry ContextVar (2026-05-05) --
-# Registra que backend LLM se uso en la llamada mas reciente del contexto actual.
-# Seteado por los 4 dispatch points y leido por log_query_event para agregar
-# backend, fallback_reason y backend_active al extra_json de rag_queries.
-# Shape: {"backend": "mlx"|"ollama", "fallback_reason": str|None, "backend_active": str}
+# Registra qué backend LLM se usó en la llamada más reciente del contexto
+# actual. Seteado por los dispatch points y leído por log_query_event para
+# agregar backend, fallback_reason y backend_active al extra_json de
+# rag_queries. Post-Ola 8 (cero-Ollama) el único valor es "mlx" — el shape
+# se preserva para no romper el schema de telemetry histórica.
+# Shape: {"backend": "mlx", "fallback_reason": str|None, "backend_active": str}
 _ACTIVE_BACKEND_CTX: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "rag_active_backend", default=None,
 )
@@ -12635,14 +12569,14 @@ _ACTIVE_BACKEND_CTX: contextvars.ContextVar[dict | None] = contextvars.ContextVa
 def _mark_backend(backend: str, *, fallback_reason: str | None = None) -> None:
     """Setea el ContextVar de backend para el request actual.
 
-    backend = "mlx" | "ollama". fallback_reason solo cuando MLX cayo a Ollama
-    ("tools" | "stream"). None para Ollama nativo o MLX limpio.
+    backend = "mlx" siempre post-Ola 8. `fallback_reason` queda como
+    enum compat ("tools" | "stream") aunque MLX maneja ambos nativo.
     """
     from rag.llm_backend import get_backend
     try:
-        _be_env = get_backend().name  # singleton — refleja el backend real, no env crudo
+        _be_env = get_backend().name  # singleton — refleja el backend real
     except Exception:
-        _be_env = os.environ.get("RAG_LLM_BACKEND", "ollama")
+        _be_env = "mlx"  # post-Ola 8: único backend disponible
     _ACTIVE_BACKEND_CTX.set({
         "backend": backend,
         "fallback_reason": fallback_reason,
@@ -12752,7 +12686,7 @@ def _correct_typos_llm(query: str) -> str:
             model=HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options={**HELPER_OPTIONS, "num_predict": 80},
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=LLM_KEEP_ALIVE,
         )
         corrected = (resp.message.content or "").strip()
         # Sanity: strip quotes that some models add around the answer
@@ -14937,39 +14871,10 @@ def _system_swap_used_gb() -> float | None:
         return None
 
 
-def _kill_ollama_runners() -> int:
-    """Force-kill ollama `runner` subprocesses (NOT `ollama serve` parent).
-
-    Recovery rápido para stuck-load: el daemon `ollama serve` respawnea
-    los runners on-demand al próximo /api/generate. Esto resetea la KV
-    cache y libera RAM/VRAM bajo presión sin requerir reinicio manual
-    de Ollama.app.
-
-    Retorna el count de PIDs killed. Silent-fail si no hay runners.
-    """
-    try:
-        out = subprocess.run(
-            ["/usr/bin/pgrep", "-f", "Ollama.app/Contents/Resources/ollama runner"],
-            capture_output=True, text=True, timeout=3, check=False,
-        ).stdout.strip()
-        if not out:
-            return 0
-        pids = [p for p in out.split("\n") if p.strip().isdigit()]
-        if not pids:
-            return 0
-        subprocess.run(["/bin/kill", "-9", *pids],
-                       capture_output=True, timeout=3, check=False)
-        print(f"[ollama-kill-runners] killed pids={pids}", flush=True)
-        return len(pids)
-    except Exception as exc:
-        _silent_log("kill_ollama_runners", exc)
-        return 0
-
-
 def _handle_memory_pressure(pct_before: float, threshold: float) -> dict:
     """Respuesta escalonada a un evento de memory pressure.
 
-    Paso 1: unload del chat model vía ollama keep_alive=0.
+    Paso 1: unload del chat model vía MLX backend keep_alive=0.
     Paso 2: re-medir; si sigue ≥ threshold, force-unload del reranker.
 
     Ambos pasos son best-effort — cualquier excepción se loggea y el
@@ -15291,10 +15196,10 @@ def warmup_async() -> None:
     en vez de secuencial. Pre-fix el `_run` serializaba:
 
         get_reranker()              # 5s cold MPS
-        embed(["warmup"])           # 5s cold ollama bge-m3
+        embed(["warmup"])           # 5s cold backend bge-m3
         _warmup_local_embedder()    # 5s cold in-process bge-m3 MPS
         _load_corpus + get_pagerank # 130ms
-        chat warmup × 2             # 5s cold ollama qwen2.5:7b
+        chat warmup × 2             # 5s cold backend qwen2.5:7b
 
     Total secuencial ≈ 20s desde el start. El main thread del CLI entra a
     `retrieve()` al ~1-2s post-warmup-start — mucho antes de que el Event
@@ -15305,7 +15210,7 @@ def warmup_async() -> None:
     Medido en rag_queries.extra_json.timing: embed_ms 10277/11375/12014
     en outliers producción 2026-04-22 (CLI `query`).
 
-    Post-fix: 5 threads paralelos. MPS y ollama HTTP son independientes
+    Post-fix: 5 threads paralelos. MPS y backend HTTP son independientes
     (ollama es proceso externo, MPS tiene su propio cuda-equivalent
     context) — corren simultáneos sin contention. El bottleneck pasa de
     20s suma a ~5s max individual. El Event `_local_embedder_ready`
@@ -15358,7 +15263,7 @@ def warmup_async() -> None:
         # Chat model + helper pre-warmup: ~5s cold load cada uno. Ollama
         # serializa GPU calls (OLLAMA_MAX_LOADED_MODELS default 2) pero
         # el load inicial es concurrente con los otros threads (MPS vs
-        # ollama daemon son PIDs distintos). Estos dos sí se serializan
+        # MLX backend son PIDs distintos). Estos dos sí se serializan
         # entre sí dentro del mismo thread para respetar el VRAM
         # presupuesto de ollama.
         #
@@ -15395,7 +15300,7 @@ def warmup_async() -> None:
                 options={"num_predict": 1,
                          "num_ctx": HELPER_OPTIONS["num_ctx"],
                          "temperature": 0},
-                keep_alive=OLLAMA_KEEP_ALIVE,
+                keep_alive=LLM_KEEP_ALIVE,
             )
         except Exception:
             pass
@@ -15769,7 +15674,7 @@ def expand_queries(question: str) -> list[str]:
             model=HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options=HELPER_OPTIONS,
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=LLM_KEEP_ALIVE,
         )
         content = resp.message.content
     except Exception:
@@ -15854,7 +15759,7 @@ def reformulate_and_expand(
             model=HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options={**HELPER_OPTIONS, "num_predict": 192, "num_ctx": 2048},
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=LLM_KEEP_ALIVE,
         )
         lines = [ln.strip(" -*·") for ln in resp.message.content.splitlines() if ln.strip()]
     except Exception:
@@ -16126,7 +16031,7 @@ def _classify_intent_llm(
     """Ask the helper LLM to classify an otherwise-'semantic' query.
 
     Returns one of the 8 valid intents, or None on any transient failure
-    (ollama timeout, JSON parse error, unknown intent, etc). Caller MUST
+    (backend timeout, JSON parse error, unknown intent, etc). Caller MUST
     tolerate None and fall back to the regex result ('semantic').
 
     Cached per-process by lowercased question. TTL 1h; capped at 500
@@ -16168,7 +16073,7 @@ def _classify_intent_llm(
             model=judge_model,
             messages=[{"role": "user", "content": prompt}],
             options={**HELPER_OPTIONS, "num_ctx": 2048, "num_predict": 40},
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=LLM_KEEP_ALIVE,
             format="json",
         )
         raw = resp.message.content.strip()
@@ -18722,7 +18627,7 @@ def _suggest_tags_for_note(
             model=HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options=HELPER_OPTIONS,
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=LLM_KEEP_ALIVE,
         )
         answer = resp.message.content.strip()
     except Exception:
@@ -19875,7 +19780,7 @@ def _cached_anaphora_resolution(
             model=HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options={**HELPER_OPTIONS, "num_ctx": 1024, "num_predict": 96},
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=LLM_KEEP_ALIVE,
         )
         raw = (resp.message.content or "").strip().strip('"').strip("'")
         # Defensive: si el helper devolvió string vacío o algo absurdo
@@ -20047,7 +19952,7 @@ def reformulate_query(
                 model=HELPER_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 options={**HELPER_OPTIONS, "num_ctx": 2048},
-                keep_alive=OLLAMA_KEEP_ALIVE,
+                keep_alive=LLM_KEEP_ALIVE,
             )
             raw = resp.message.content.strip().strip('"')
             return _postprocess_reformulation(question, raw, history)
@@ -20109,7 +20014,7 @@ def _compress_turns(turns: list[dict]) -> str:
             model=HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options={**HELPER_OPTIONS, "num_predict": 320, "num_ctx": 4096},
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=LLM_KEEP_ALIVE,
         )
     except Exception:
         return ""
@@ -20136,7 +20041,7 @@ def _summarize_conversation_history(
     Invariants:
     - Uses ``HELPER_OPTIONS`` (temperature=0, seed=42) — deterministic.
     - Uses ``qwen2.5:3b`` (HELPER_MODEL) — same as ``_compress_turns``.
-    - ``keep_alive=OLLAMA_KEEP_ALIVE`` on every Ollama call.
+    - ``keep_alive=LLM_KEEP_ALIVE`` on every Ollama call.
     - ``_bump_silent_log_counter()`` called on all silent-error paths.
     """
     import hashlib as _hashlib
@@ -20195,7 +20100,7 @@ def _summarize_conversation_history(
             model=HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options={**HELPER_OPTIONS, "num_predict": 200, "num_ctx": 2048},
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=LLM_KEEP_ALIVE,
         )
         summary = (resp.message.content or "").strip()
     except Exception as _e:
@@ -21679,7 +21584,7 @@ def retrieve(
     #    Fast path: when RAG_LOCAL_EMBED=1 (web/serve plists + auto-enable
     #    on query-like CLI subcommands via `_maybe_auto_enable_local_embed`),
     #    try in-process SentenceTransformer embed first (~10-30ms vs ~140ms
-    #    HTTP).  Falls back to ollama silently if model not cached locally.
+    #    HTTP).  Falls to in-process silently if model not cached locally.
     #    Indexing/watch/ingesters stay off the auto-enable allow-list so
     #    bulk chunk embeds continue on ollama.
     where = build_where(folder, tag, date_range)
@@ -21702,7 +21607,7 @@ def retrieve(
         # targets arrancan simultáneos a t=0 del warmup. El local embed
         # termina a t≈5s. Con el default histórico de 1500ms el wait
         # timeaba **siempre** en CLI one-shot → fallback a `embed()`
-        # ollama que tampoco estaba warm (el ollama embed warmup iba
+        # ollama que tampoco estaba warm (el backend embed warmup iba
         # detrás del reranker en la versión secuencial) → cold load
         # ollama 6-12s.
         #
@@ -22896,7 +22801,7 @@ def _judge_sufficiency(question: str, docs: list[str], metas: list[dict]) -> tup
             model=HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options={**HELPER_OPTIONS, "num_predict": 80},
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=LLM_KEEP_ALIVE,
         )
         answer = resp.message.content.strip()
         if answer.upper().startswith("SUFICIENTE"):
@@ -23919,7 +23824,7 @@ def cli(ctx: click.Context) -> None:
     # Auto-enable RAG_LOCAL_EMBED=1 for query-like subcommands (query, chat,
     # do, pendientes, prep, links, dupes) unless the user has explicitly set
     # it. Saves ~100-130ms per query by using the in-process SentenceTransformer
-    # instead of the ollama HTTP round-trip. See rag.py:6970
+    # instead of the backend HTTP round-trip. See rag.py:6970
     # (`_maybe_auto_enable_local_embed`) + CLAUDE.md §Env vars.
     _maybe_auto_enable_local_embed(_effective_subcommand)
 
@@ -27326,7 +27231,7 @@ def _ambient_hook(
 # ── Phase 6: OCR + VLM caption + intent detector moved to `rag.ocr` ──────
 # Three concerns extracted to `rag/ocr.py` (Phase 6, 2026-04-25):
 #   - OCR primitives (Apple Vision via ocrmac).
-#   - VLM caption fallback (qwen2.5vl:3b via ollama).
+#   - VLM caption fallback (qwen2.5vl:3b via MLX backend).
 #   - OCR → intent detector (event/reminder/note classifier).
 # Re-exported at the bottom of this file. `_index_single_file` (the next
 # function) calls into them via `_enrich_body_with_ocr` /
@@ -28837,10 +28742,10 @@ def watch(debounce: float, all_vaults: bool):
             continue
         except Exception as e:
             _err = str(e).lower()
-            if "ollama" in _err or "connect" in _err or "111" in _err:
+            if "connect" in _err or "111" in _err:
                 console.print(
-                    f"[red]✗ {name}: Ollama no responde[/red]\n"
-                    f"[dim]Arrancá el daemon: [cyan]ollama serve[/cyan][/dim]"
+                    f"[red]✗ {name}: backend no responde[/red]\n"
+                    f"[dim]Reiniciá el daemon: [cyan]rag start[/cyan][/dim]"
                 )
             elif "locked" in _err or "corrupt" in _err or "malformed" in _err or "database" in _err:
                 console.print(
@@ -29011,7 +28916,7 @@ def query(
     # Medición real en rag_queries (últimos 30d):
     #   "mandarle un mensaje a mi mamá a las 18.50…" → 66.7s total
     #   "enviale un mensaje a mi mamá a las 18.50…"  → 79.4s total
-    # Con este short-circuit: ~3-5s (sólo la decisión tool-call de ollama).
+    # Con este short-circuit: ~3-5s (sólo la decisión tool-call de the backend).
     # Paridad con `rag chat` que ya hace el mismo check (rag.py:~19656).
     # Regex false-positive → `_handle_chat_create_intent` devuelve
     # `handled=False` y el flow cae en la RAG normal sin haber gastado
@@ -29675,7 +29580,7 @@ def query(
             httpx.ReadTimeout, httpx.ConnectTimeout,
             ConnectionError) as _exc:
         _msg = (
-            f"⚠️ Ollama desconectó mid-stream ({type(_exc).__name__}). "
+            f"⚠️ Backend LLM desconectó mid-stream ({type(_exc).__name__}). "
             "Probable memory pressure — reintentá en unos segundos."
         )
         if plain:
@@ -35136,7 +35041,7 @@ def _replay_query_row(
                     model=resolve_chat_model(),
                     messages=msgs,
                     options=CHAT_OPTIONS,
-                    keep_alive=OLLAMA_KEEP_ALIVE,
+                    keep_alive=LLM_KEEP_ALIVE,
                 )
                 new_text: str = response["message"]["content"]
                 new_hash = hashlib.sha256(new_text.encode()).hexdigest()[:16]
@@ -35548,7 +35453,7 @@ def autotag(path: str, apply: bool, max_tags: int):
         model=HELPER_MODEL,
         messages=[{"role": "user", "content": prompt}],
         options=HELPER_OPTIONS,
-        keep_alive=OLLAMA_KEEP_ALIVE,
+        keep_alive=LLM_KEEP_ALIVE,
     )
     answer = resp.message.content.strip()
 
@@ -39925,8 +39830,8 @@ def capture(text: str | None, from_stdin: bool, tags: tuple[str, ...],
             msg = (
                 f"Ni OCR ni VLM pudieron leer {image_path.name}. "
                 f"Revisá: ocrmac instalado (`uv pip install ocrmac`), "
-                f"VLM pulled (`ollama pull {VLM_MODEL}`), y que la "
-                f"imagen no esté corrupta."
+                f"VLM disponible vía MLX (`huggingface-cli download "
+                f"{VLM_MODEL}`), y que la imagen no esté corrupta."
             )
             click.echo(msg) if plain else console.print(f"[yellow]{msg}[/yellow]")
             return
@@ -42231,7 +42136,7 @@ def _parse_natural_datetime(
             model=HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options=HELPER_OPTIONS,
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=LLM_KEEP_ALIVE,
         )
         raw = (resp.message.content or "").strip()
     except Exception:
@@ -47357,7 +47262,7 @@ def _today_brief_model() -> str:
     Override por env si el user quiere probar `qwen2.5:14b` con paciencia
     o `command-r:latest`. Pipeline:
       1. `OBSIDIAN_RAG_TODAY_MODEL` (env)
-      2. `qwen2.5:7b` (default — ya warm en VRAM por `OLLAMA_KEEP_ALIVE=-1`)
+      2. `qwen2.5:7b` (default — ya warm en VRAM por `LLM_KEEP_ALIVE=-1`)
     No cae a `resolve_chat_model()` para mantener el brief desacoplado
     del modelo del chat — si después cambiamos `OBSIDIAN_RAG_WEB_CHAT_MODEL`,
     el brief sigue usando qwen2.5:7b a menos que se override explícito.
@@ -48816,17 +48721,18 @@ def wake_up(ctx, dry_run: bool, skip_index: bool, skip_bookmarks: bool,
     if not skip_warmup:
         idx = len(steps) + 1
         console.print()
-        console.print(f"[bold cyan]▶ [{idx}/{total_steps}][/bold cyan] ollama warmup")
+        console.print(f"[bold cyan]▶ [{idx}/{total_steps}][/bold cyan] LLM warmup")
         if dry_run:
             console.print("  [dim]dry-run: skippeado[/dim]")
         else:
             step_start = time.perf_counter()
             try:
                 model = resolve_chat_model()
-                # Tiny prompt — solo trigger del model load + keep_alive=-1.
-                # qwen2.5:7b carga en ~3-5s en M3 Max. Con keep_alive=-1
-                # queda en RAM hasta que ollama lo desaloje por presión
-                # de memoria o restart. El primer `rag chat` post-wake-up
+                # Tiny prompt — solo trigger del model load. qwen2.5:7b
+                # MLX carga en ~3-5s en M3 Max. El modelo queda en
+                # `MLXBackend._loaded` hasta que el idle-unload watchdog
+                # lo evicte (RAG_MLX_IDLE_TTL, default 1800s) o memory
+                # pressure dispare. El primer `rag chat` post-wake-up
                 # no paga el cold-start (~400ms de prefill vs. 5s cold).
                 _mlx_chat(
                     model=model,
@@ -48835,12 +48741,12 @@ def wake_up(ctx, dry_run: bool, skip_index: bool, skip_bookmarks: bool,
                     keep_alive=-1,
                 )
                 ms = int((time.perf_counter() - step_start) * 1000)
-                succeeded.append(f"ollama warmup · {model} ({ms}ms)")
+                succeeded.append(f"LLM warmup · {model} ({ms}ms)")
                 console.print(f"  [green]✓[/green] {model} caliente "
                               f"(keep_alive=-1, {ms}ms)")
             except Exception as e:
                 ms = int((time.perf_counter() - step_start) * 1000)
-                failed.append(("ollama warmup",
+                failed.append(("LLM warmup",
                                f"{type(e).__name__}: {e} ({ms}ms)"))
                 console.print(f"  [red]✗[/red] {type(e).__name__}: {e}")
 
@@ -50683,7 +50589,7 @@ def setup(remove: bool):
         )
 
 
-# ── Daemons RagNet (whatsapp-*) y deps externas (ollama / qdrant) ──────────
+# ── Daemons RagNet (whatsapp-*) y dep externa qdrant ──────────────────────
 #
 # Estos labels NO están en `_services_spec` (vienen del repo `whatsapp-listener`
 # y de instaladores externos), pero `rag stop` necesita poder bootoutearlos
@@ -50697,20 +50603,13 @@ def setup(remove: bool):
 #               bridge, healthcheck, vault-sync. Default ON en `rag stop`
 #               porque sin RagNet la UX del sistema queda a medias (web sí,
 #               WhatsApp no).
-#  - ollama   → runtime LLM. Compartido con mem-vault, draft generators y
-#               cualquier otro agente local. Default OFF porque pararlo
-#               rompe mem-vault.
-#  - qdrant   → vector store de mem-vault. Default OFF por la misma razón.
+#  - qdrant   → vector store de mem-vault. Default OFF: compartido con
+#               mem-vault y otros agentes locales.
 _RAG_NET_LABELS: tuple[str, ...] = (
     "com.fer.whatsapp-bridge",
     "com.fer.whatsapp-listener",
     "com.fer.whatsapp-listener-healthcheck",
     "com.fer.whatsapp-vault-sync",
-)
-_OLLAMA_LABELS: tuple[str, ...] = (
-    "homebrew.mxcl.ollama",
-    "com.ollama.ollama",
-    "com.fer.ollama-env-init",
 )
 _QDRANT_LABELS: tuple[str, ...] = (
     "com.fer.qdrant",
@@ -50834,19 +50733,13 @@ def _bootstrap_label(label: str, *, dry_run: bool = False, timeout: int = 30) ->
          "healthcheck/vault-sync). Default: sí.",
 )
 @click.option(
-    "--with-ollama", is_flag=True, default=False,
-    help="Detener también ollama (homebrew.mxcl.ollama + com.ollama.ollama + "
-         "ollama-env-init). Default OFF: ollama es compartido con mem-vault y "
-         "otros agentes locales — pararlo rompe esos flujos.",
-)
-@click.option(
     "--with-qdrant", is_flag=True, default=False,
     help="Detener también qdrant (com.fer.qdrant). Default OFF: compartido "
          "con mem-vault.",
 )
 @click.option(
     "--all", "stop_all", is_flag=True, default=False,
-    help="Atajo para --with-ollama + --with-qdrant + --with-rag-net.",
+    help="Atajo para --with-qdrant + --with-rag-net.",
 )
 @click.option(
     "--yes", "-y", is_flag=True, help="No pedir confirmación.",
@@ -50856,7 +50749,6 @@ def _bootstrap_label(label: str, *, dry_run: bool = False, timeout: int = 30) ->
 )
 def stop(
     with_rag_net: bool,
-    with_ollama: bool,
     with_qdrant: bool,
     stop_all: bool,
     yes: bool,
@@ -50872,15 +50764,14 @@ def stop(
     2. Después el resto de daemons managed (`_services_spec`) y manual
        (cloudflare-tunnel, lgbm-train, etc).
     3. Opcional: RagNet (whatsapp-*) si `--with-rag-net` (default ON).
-    4. Opcional: ollama / qdrant si `--with-ollama` / `--with-qdrant`
-       (default OFF — son compartidos con mem-vault).
+    4. Opcional: qdrant si `--with-qdrant` (default OFF — compartido
+       con mem-vault).
 
     Para volver a levantar todo: `rag start` (regenera plists desde
-    código + bootstrap + catch-up index). Los deps externos compartidos
-    (ollama / qdrant) los volvés a arrancar con su propio `launchctl
-    bootstrap` o desde su repo origen — NO se archivan aunque estén en
-    los targets (categoría `ollama`/`qdrant`) porque son compartidos
-    con mem-vault y otros agentes locales.
+    código + bootstrap + catch-up index). Qdrant lo volvés a arrancar
+    con su propio `launchctl bootstrap` o desde su repo origen — NO se
+    archiva aunque esté en los targets porque es compartido con
+    mem-vault y otros agentes locales.
 
     Archivado de plists: después del bootout, los `.plist` de
     `obsidian-rag-*` y `rag-net` se mueven a
@@ -50889,7 +50780,6 @@ def stop(
     rag corre, ni ahora ni al rebootear". `rag start` los recrea.
     """
     if stop_all:
-        with_ollama = True
         with_qdrant = True
         with_rag_net = True
 
@@ -50915,8 +50805,6 @@ def stop(
         targets.extend((lbl, "rag-net") for lbl in _RAG_NET_LABELS)
     if with_qdrant:
         targets.extend((lbl, "qdrant") for lbl in _QDRANT_LABELS)
-    if with_ollama:
-        targets.extend((lbl, "ollama") for lbl in _OLLAMA_LABELS)
 
     if not targets:
         console.print("[yellow]No hay nada que parar.[/yellow]")
@@ -50940,10 +50828,9 @@ def stop(
     a_watch, p_watch = _split("watchdog")
     a_obs, p_obs = _split("obsidian-rag")
     a_rn, p_rn = _split("rag-net")
-    a_oll, p_oll = _split("ollama")
     a_qd, p_qd = _split("qdrant")
-    n_active = a_watch + a_obs + a_rn + a_oll + a_qd
-    n_stopped = p_watch + p_obs + p_rn + p_oll + p_qd
+    n_active = a_watch + a_obs + a_rn + a_qd
+    n_stopped = p_watch + p_obs + p_rn + p_qd
     n_total = n_active + n_stopped
 
     def _fmt(active: int, stopped: int) -> str:
@@ -50976,10 +50863,6 @@ def stop(
         console.print(f"  [dim]·[/dim] qdrant             : {_fmt(a_qd, p_qd)}")
     else:
         console.print("  [dim]·[/dim] qdrant             : [yellow]skip[/yellow] (default — compartido con mem-vault)")
-    if with_ollama:
-        console.print(f"  [dim]·[/dim] ollama             : {_fmt(a_oll, p_oll)}")
-    else:
-        console.print("  [dim]·[/dim] ollama             : [yellow]skip[/yellow] (default — compartido con mem-vault)")
     console.print()
     if loaded_known and n_active == 0:
         console.print("[green]✓[/green] [dim]nada activo — no hay nada que parar.[/dim]")
@@ -51093,12 +50976,6 @@ def stop(
             "[cyan]launchctl bootstrap gui/$(id -u) "
             "~/Library/LaunchAgents/com.fer.qdrant.plist[/cyan]"
         )
-    if with_ollama:
-        console.print(
-            "  [dim]·[/dim] ollama       : "
-            "[cyan]brew services start ollama[/cyan] "
-            "(o `launchctl bootstrap` del plist correspondiente)"
-        )
     console.print(
         "[dim](Plists quedan en disco; macOS los re-loadea solo al próximo "
         "login. Para borrarlos: `rag setup --remove`.)[/dim]"
@@ -51113,18 +50990,12 @@ def stop(
          "del sistema queda a medias (web sí, WhatsApp no).",
 )
 @click.option(
-    "--with-ollama", is_flag=True, default=False,
-    help="Levantar también ollama (homebrew.mxcl.ollama + com.ollama.ollama "
-         "+ ollama-env-init). Default OFF: ollama suele estar siempre up; "
-         "usalo si lo bajaste con `rag stop --with-ollama`.",
-)
-@click.option(
     "--with-qdrant", is_flag=True, default=False,
     help="Levantar también qdrant (com.fer.qdrant). Default OFF.",
 )
 @click.option(
     "--all", "start_all", is_flag=True, default=False,
-    help="Atajo para --with-rag-net + --with-ollama + --with-qdrant.",
+    help="Atajo para --with-rag-net + --with-qdrant.",
 )
 @click.option(
     "--no-index", is_flag=True, default=False,
@@ -51148,7 +51019,6 @@ def stop(
 def start(
     ctx: click.Context,
     with_rag_net: bool,
-    with_ollama: bool,
     with_qdrant: bool,
     start_all: bool,
     no_index: bool,
@@ -51165,8 +51035,8 @@ def start(
        código (incluye watch / web / digest / morning / today / ingesters
        cross-source / wa-tasks / online-tune / watchdog / wake-hook / ...).
     2. Externos vía `launchctl bootstrap` desde `~/Library/LaunchAgents/`:
-       ollama (si `--with-ollama`), qdrant (si `--with-qdrant`), RagNet
-       (whatsapp-*) si `--with-rag-net` (default ON).
+       qdrant (si `--with-qdrant`), RagNet (whatsapp-*) si `--with-rag-net`
+       (default ON).
     3. Catch-up index incremental (`rag index`, sin `--reset`) — re-indexa
        todo lo que cambió desde el último run del watcher (típicamente
        minutos; si la Mac estuvo dormida varias horas, captura ese gap).
@@ -51175,10 +51045,9 @@ def start(
     Si un externo no tiene plist en disco, lo reporta como "missing" y
     sigue — instalalo desde su repo origen ([whatsapp-listener](https://github.com/jagoff/whatsapp-listener)
     para RagNet, [mem-vault](https://github.com/jagoff/mem-vault) para
-    qdrant, `brew install ollama` para ollama) y re-corré `rag start`.
+    qdrant) y re-corré `rag start`.
     """
     if start_all:
-        with_ollama = True
         with_qdrant = True
         with_rag_net = True
 
@@ -51202,10 +51071,6 @@ def start(
         console.print(f"  [dim]·[/dim] qdrant                  : {len(_QDRANT_LABELS)} daemons")
     else:
         console.print("  [dim]·[/dim] qdrant                  : [yellow]skip[/yellow] (default — usalo si bajaste qdrant)")
-    if with_ollama:
-        console.print(f"  [dim]·[/dim] ollama                  : {len(_OLLAMA_LABELS)} daemons")
-    else:
-        console.print("  [dim]·[/dim] ollama                  : [yellow]skip[/yellow] (default — suele estar siempre up)")
     if no_index:
         console.print("  [dim]·[/dim] catch-up index          : [yellow]skip[/yellow] (--no-index)")
     else:
@@ -51246,9 +51111,6 @@ def start(
             except Exception:
                 pass
         console.print("  [dim]would-call[/dim] [managed] rag setup")
-        if with_ollama:
-            for lbl in _OLLAMA_LABELS:
-                console.print(f"  [dim]would-bootstrap[/dim] [ollama] {lbl}")
         if with_qdrant:
             for lbl in _QDRANT_LABELS:
                 console.print(f"  [dim]would-bootstrap[/dim] [qdrant] {lbl}")
@@ -51307,14 +51169,11 @@ def start(
         # No abortar — los externos podrían levantarse igual.
         _silent_log("rag_start_setup_failed", exc)
 
-    # ── 2. Externos: ollama → qdrant → rag-net ───────────────────────────
-    # Orden: ollama primero (todos dependen de él para LLM), después
-    # qdrant (mem-vault no es runtime-blocking pero si el user lo pidió
-    # quiere que esté up antes de que RagNet arranque a chatear), por
-    # último RagNet (consume web + ollama).
+    # ── 2. Externos: qdrant → rag-net ────────────────────────────────────
+    # Orden: qdrant primero (si el user lo pidió, quiere que esté up antes
+    # de que RagNet arranque a chatear con mem-vault). Después RagNet
+    # (consume web).
     ext_targets: list[tuple[str, str]] = []
-    if with_ollama:
-        ext_targets.extend((lbl, "ollama") for lbl in _OLLAMA_LABELS)
     if with_qdrant:
         ext_targets.extend((lbl, "qdrant") for lbl in _QDRANT_LABELS)
     if with_rag_net:
@@ -55343,13 +55202,8 @@ def _cleanup_chat_uploads(*, ttl_days: int | None = None) -> dict:
     return {"deleted": deleted, "bytes_freed": bytes_freed, "errors": errors}
 
 
-def _check_ollama_health() -> dict:
+def _check_embedder_health() -> dict:
     """Verify the in-process embedder loads OK.
-
-    Ola 6 cero-Ollama (2026-05-06): post-cutover NO consultamos más a Ollama
-    (chat pasó a MLX, embed pasó a SentenceTransformer in-process). El nombre
-    de la función queda por back-compat con callers; semánticamente ahora
-    chequea `_get_local_embedder()` — única dependencia del modelo de embed.
 
     Devuelve `{EMBED_MODEL: "ok"}` si carga, `{EMBED_MODEL: "missing"}` si
     `_get_local_embedder()` retorna None (HF cache no presente, MPS unavailable,
@@ -55360,6 +55214,11 @@ def _check_ollama_health() -> dict:
     except Exception as e:
         return {"error": str(e)}
     return {EMBED_MODEL: "ok" if model is not None else "missing"}
+
+
+# Alias retro-compat: callers viejos importan `_check_ollama_health`.
+# Post-Ola 8: chequea el embedder MLX/SentenceTransformer in-process.
+_check_ollama_health = _check_embedder_health
 
 
 def _prune_url_orphans(vault: Path) -> int:
@@ -56777,8 +56636,11 @@ def run_maintenance(
     except Exception as _cs_e:
         results["conv_summaries_pruned_error"] = str(_cs_e)
 
-    # 13. Ollama health (read-only)
-    results["ollama"] = _check_ollama_health()
+    # 13. Embedder health (read-only) — verifica que el SentenceTransformer
+    # in-process cargue OK. La key se llama "ollama" por back-compat con
+    # consumidores externos del JSON output (legacy alias post-Ola 6).
+    results["ollama"] = _check_embedder_health()
+    results["embedder"] = results["ollama"]  # alias forward-compat
 
     # 14. Dead notes count (read-only)
     try:
@@ -57272,16 +57134,16 @@ def maintenance(dry_run: bool, skip_reindex: bool, skip_logs: bool, verbose: boo
     else:
         console.print("  [bold]Feedback orphans:[/bold] [dim]clean[/dim]")
 
-    # ── Ollama health ──
-    oll = results.get("ollama", {})
+    # ── Embedder health ──
+    oll = results.get("embedder") or results.get("ollama", {})
     if "error" in oll:
-        console.print(f"  [bold]Ollama:[/bold] [red]unreachable: {oll['error']}[/red]")
+        console.print(f"  [bold]Embedder:[/bold] [red]unreachable: {oll['error']}[/red]")
     else:
         missing = [m for m, s in oll.items() if s == "missing"]
         if missing:
-            console.print(f"  [bold]Ollama:[/bold] [red]missing: {', '.join(missing)}[/red]")
+            console.print(f"  [bold]Embedder:[/bold] [red]missing: {', '.join(missing)}[/red]")
         else:
-            console.print(f"  [bold]Ollama:[/bold] [green]{len(oll)} models ok[/green]")
+            console.print(f"  [bold]Embedder:[/bold] [green]{len(oll)} models ok[/green]")
 
     # ── Dead notes ──
     dead = results.get("dead_notes", 0)
@@ -58606,13 +58468,12 @@ _CONFIG_VARS: tuple[tuple[str, str, str, str], ...] = (
     # RAG_STATE_SQL removed from code 2026-05-04; plists still set it as
     # deployment-trail for faster rollback. No code reads the value.
 
-    # — Ollama / models
-    ("OLLAMA_KEEP_ALIVE", "20m", "duration",
-     "Pinea modelos ollama en VRAM indefinidamente. '20m', '-1' forever, etc."),
-    ("RAG_KEEP_ALIVE_LARGE_MODEL", "", "duration",
-     "Opt-out del auto-clamp de chat_keep_alive() para modelos grandes."),
+    # — LLM models
+    ("RAG_LLM_KEEP_ALIVE", "-1", "duration",
+     "kwarg keep_alive para chat/generate. MLX in-process: no-op pero se "
+     "preserva la firma. '20m', '-1' forever, etc."),
     ("RAG_LOCAL_EMBED", "", "bool",
-     "Usa SentenceTransformer(BAAI/bge-m3) in-process para query embed (vs ollama HTTP)."),
+     "Usa SentenceTransformer in-process para query embed (default ON post-Ola 6)."),
     ("OBSIDIAN_RAG_WEB_CHAT_MODEL", "", "str",
      "Override del chat model para el web server. Default: resolve_chat_model()."),
     ("RAG_LOOKUP_MODEL", "qwen2.5:3b", "str",
@@ -60727,7 +60588,7 @@ def _auto_tag_note(
             model=use_model,
             messages=[{"role": "user", "content": prompt}],
             options={**HELPER_OPTIONS, "num_predict": 120},
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=LLM_KEEP_ALIVE,
             format="json",
         )
         raw = resp.message.content.strip()
@@ -61274,7 +61135,7 @@ def _auto_harvest_judge(
     Returns:
       dict {"verdict": "<path>|null", "confidence": float in [0,1],
             "reason": str} on success, or None on any transient failure
-      (ollama timeout, malformed JSON, etc). Callers MUST tolerate None.
+      (backend timeout, malformed JSON, etc). Callers MUST tolerate None.
 
     The verdict "null" (JSON null or the string "none"/"ninguno") means
     "no candidate is a good answer" — the caller interprets that as a
@@ -61310,7 +61171,7 @@ def _auto_harvest_judge(
             model=judge_model,
             messages=[{"role": "user", "content": prompt}],
             options={**HELPER_OPTIONS, "num_ctx": 4096, "num_predict": 200},
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=LLM_KEEP_ALIVE,
             format="json",
         )
         raw = resp.message.content.strip()

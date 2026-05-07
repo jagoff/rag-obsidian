@@ -32,8 +32,8 @@ existe como alternativa explícita para callers que ruteen via dispatch.
 
 ## Model name aliasing
 
-The backend accepts both Ollama-style names (`qwen2.5:3b`) and MLX HF
-IDs (`mlx-community/Qwen2.5-3B-Instruct-4bit`). `to_mlx()` / `to_ollama()`
+The backend accepts both alias names (`qwen2.5:3b`) and MLX HF
+IDs (`mlx-community/Qwen2.5-3B-Instruct-4bit`). `to_mlx()` / `to_short_name()`
 resolve between them via `MLX_MODEL_ALIAS` table.
 
 ## What MLX does NOT support (vs Ollama)
@@ -115,7 +115,7 @@ MLX_MODEL_ALIAS: dict[str, str] = {
     "qwen3-embedding:0.6b": "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ",
 }
 
-OLLAMA_MODEL_ALIAS: dict[str, str] = {v: k for k, v in MLX_MODEL_ALIAS.items()}
+SHORT_NAME_ALIAS: dict[str, str] = {v: k for k, v in MLX_MODEL_ALIAS.items()}
 
 
 def to_mlx(model: str) -> str:
@@ -125,9 +125,13 @@ def to_mlx(model: str) -> str:
     return MLX_MODEL_ALIAS.get(model, model)
 
 
-def to_ollama(model: str) -> str:
-    """Resolve any model name to its Ollama short name."""
-    return OLLAMA_MODEL_ALIAS.get(model, model)
+def to_short_name(model: str) -> str:
+    """Resolve any MLX HuggingFace ID back to its short alias name.
+
+    Inverse de `to_mlx()`. Útil para preservar el nombre corto en
+    `ChatResponse.model` (más legible en logs/feedback que el HF id full).
+    """
+    return SHORT_NAME_ALIAS.get(model, model)
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +141,7 @@ def to_ollama(model: str) -> str:
 
 @dataclass
 class ChatOptions:
-    """Sampling + context options. Mirrors Ollama's `options` dict.
+    """Sampling + context options. Mirrors the backend's `options` dict.
 
     Defaults match `HELPER_OPTIONS` (temperature=0, seed=42) — call sites
     that need chat-tier sampling pass `CHAT_OPTIONS` overrides.
@@ -156,11 +160,11 @@ class ChatOptions:
 
 
 # ---------------------------------------------------------------------------
-# Response types (local replacements for ollama._types)
+# Response types (MLX response types)
 # ---------------------------------------------------------------------------
 # These mirror the shape that MLXBackend.chat() / generate() / chat_stream()
 # return. Pydantic BaseModel preserva la API que los call sites ya esperan
-# de los tipos ollama-shape:
+# de los tipos MLX-shape:
 #   - attribute access (resp.message.content, resp.done, ...)
 #   - `tc.model_dump()` para serializar tool_calls a JSON
 #   - nested ToolCall + Function dentro de Message para que
@@ -182,7 +186,7 @@ class _ToolCall(BaseModel):
 
 
 class Message(BaseModel):
-    """Single chat message (assistant turn). Mirrors ollama.Message shape."""
+    """Single chat message (assistant turn). Mirrors Message shape."""
 
     role: str
     content: str | None = None
@@ -190,14 +194,14 @@ class Message(BaseModel):
 
 
 # Attribute aliases post-class-body (pydantic v2 trata las asignaciones in-body
-# como fields). Esto preserva la sintaxis ollama-shape original que los call
+# como fields). Esto preserva la sintaxis MLX-shape original que los call
 # sites ya esperan: `Message.ToolCall(function=Message.ToolCall.Function(...))`.
 _ToolCall.Function = _ToolCallFunction  # type: ignore[attr-defined]
 Message.ToolCall = _ToolCall  # type: ignore[attr-defined]
 
 
 class ChatResponse(BaseModel):
-    """Non-streaming chat completion response. Mirrors ollama.ChatResponse."""
+    """Non-streaming chat completion response. MLX-shape response."""
 
     model: str
     message: Message
@@ -206,7 +210,7 @@ class ChatResponse(BaseModel):
 
 
 class GenerateResponse(BaseModel):
-    """Raw generate (no chat template) response. Mirrors ollama.GenerateResponse."""
+    """Raw generate (no chat template) response. MLX-shape response."""
 
     model: str
     response: str
@@ -271,7 +275,7 @@ class LLMBackend(ABC):
         keep_alive: str | int = -1,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """Batch embedding. Returns ollama-shape: {"embeddings": [[float, ...], ...]}.
+        """Batch embedding. Returns MLX-shape: {"embeddings": [[float, ...], ...]}.
 
         Each inner list is L2-normalised 1024-dim (qwen3-embedding compatible).
         """
@@ -296,7 +300,7 @@ class LLMBackend(ABC):
 class MLXBackend(LLMBackend):
     """Apple MLX backend via `mlx-lm`. Resident-models + LRU eviction.
 
-    Returns ollama-shape responses (`ChatResponse` / `GenerateResponse`)
+    Returns MLX-shape responses (`ChatResponse` / `GenerateResponse`)
     so call sites that read `r["message"]["content"]` or `r.message.content`
     keep working without changes.
 
@@ -545,7 +549,7 @@ class MLXBackend(LLMBackend):
         if tool_calls:
             msg_kwargs["tool_calls"] = tool_calls
         return ChatResponse(
-            model=to_ollama(model),
+            model=to_short_name(model),
             message=Message(**msg_kwargs),
             done=True,
             done_reason="stop",
@@ -573,7 +577,7 @@ class MLXBackend(LLMBackend):
 
             mx.random.seed(opts.seed)
 
-        ollama_model = to_ollama(model)
+        short_name = to_short_name(model)
         for response in stream_generate(
             mlx_model,
             tokenizer,
@@ -582,14 +586,14 @@ class MLXBackend(LLMBackend):
             sampler=sampler,
         ):
             yield ChatResponse(
-                model=ollama_model,
+                model=short_name,
                 message=Message(role="assistant", content=response.text),
                 done=False,
             )
 
         self._bump_last_used(model)
         yield ChatResponse(
-            model=ollama_model,
+            model=short_name,
             message=Message(role="assistant", content=""),
             done=True,
             done_reason="stop",
@@ -607,7 +611,7 @@ class MLXBackend(LLMBackend):
         mlx_model, tokenizer = self._load(model)
         text = self._mlx_generate(mlx_model, tokenizer, prompt, opts)
         return GenerateResponse(
-            model=to_ollama(model),
+            model=to_short_name(model),
             response=text,
             done=True,
             done_reason="stop",
@@ -790,7 +794,7 @@ class MLXBackend(LLMBackend):
     ) -> dict[str, Any]:
         """Batch embedding via MLX Qwen3-Embedding model.
 
-        Returns ollama-shape {"embeddings": [[float, ...], ...]} where each
+        Returns MLX-shape {"embeddings": [[float, ...], ...]} where each
         inner list is a L2-normalised 1024-dim vector (compatible with
         qwen3-embedding:0.6b Q4_K_M Ollama vectors, cosine-sim ~0.97).
 
@@ -959,5 +963,5 @@ __all__ = [
     "reset_backend",
     "strip_think_blocks",
     "to_mlx",
-    "to_ollama",
+    "to_short_name",
 ]

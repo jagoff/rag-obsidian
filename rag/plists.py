@@ -127,7 +127,7 @@ def _serve_plist(rag_bin: str) -> str:
     minute to catch memory pressure before Metal returns
     `kIOGPUCommandBufferCallbackErrorOutOfMemory`).
 
-    Post-2026-05-06 (Ola 6 cero-Ollama): OLLAMA_KEEP_ALIVE y
+    Post-2026-05-06 (Ola 6 cero-Ollama): LLM_KEEP_ALIVE y
     OLLAMA_MAX_LOADED_MODELS removidos — no hay daemon Ollama al que
     keep-alivear (modelos chat purgados del disco).
 
@@ -182,7 +182,7 @@ def _web_plist(rag_bin: str) -> str:
     so `sentence_transformers` hit huggingface.co on every cold load; the
     2026-04-22 `web.error.log` had **64 `[local-embed] unavailable
     (couldn't connect to huggingface.co)` entries** that silently dropped
-    the daemon back to ollama embed (~140ms vs ~10-30ms in-process).
+    the daemon back to backend embed (~140ms vs ~10-30ms in-process).
 
     It also lacked RAG_MEMORY_PRESSURE_INTERVAL, which the default of 60s
     left too coarse — `web.error.log` recorded **23 MPS Metal command-
@@ -1111,7 +1111,7 @@ def _ingest_whatsapp_plist(rag_bin: str) -> str:
 
     `RAG_INDEX_LOCAL_EMBED=1` (Ola 6, 2026-05-06 cero-Ollama): embedder
     in-process siempre activo. Reemplaza el bulk-embed path via Ollama HTTP
-    que requería `OLLAMA_KEEP_ALIVE=-1` para pin bge-m3 en VRAM.
+    que requería `LLM_KEEP_ALIVE=-1` para pin bge-m3 en VRAM.
 
     `RunAtLoad=true` (2026-04-22): garantiza run inmediato al instalar o
     post-reboot; sin esto el primer refresh se demoraba hasta 15min tras

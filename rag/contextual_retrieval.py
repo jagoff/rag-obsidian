@@ -277,7 +277,7 @@ def generate_chunk_context(
             model=_rag.HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options={**_rag.HELPER_OPTIONS, "num_predict": NUM_PREDICT},
-            keep_alive=_rag.OLLAMA_KEEP_ALIVE,
+            keep_alive=_rag.LLM_KEEP_ALIVE,
         )
         raw = resp.message.content.strip()
     except Exception as exc:

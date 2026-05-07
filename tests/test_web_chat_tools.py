@@ -437,7 +437,7 @@ def test_gmail_recent_caps_at_12_total_threads(monkeypatch):
 # ── 3. No-tool-calls path ──────────────────────────────────────────────────
 
 
-@pytest.mark.requires_ollama
+@pytest.mark.requires_chat_model
 def test_chat_endpoint_no_tools_path(chat_env, capsys):
     responses = [
         # Tool-deciding round 1 — no tool_calls.
@@ -485,7 +485,7 @@ def test_chat_endpoint_no_tools_path(chat_env, capsys):
 # ── 4. Single-tool path ────────────────────────────────────────────────────
 
 
-@pytest.mark.requires_ollama
+@pytest.mark.requires_chat_model
 def test_chat_endpoint_tool_path(chat_env, capsys):
     # Stub the weather collector so it returns deterministic JSON.
     chat_env.setattr(
@@ -539,7 +539,7 @@ def test_chat_endpoint_tool_path(chat_env, capsys):
 # ── 5. Parallel tools in one round ─────────────────────────────────────────
 
 
-@pytest.mark.requires_ollama
+@pytest.mark.requires_chat_model
 def test_chat_endpoint_parallel_tools(chat_env, capsys):
     chat_env.setattr(tools_mod, "_agent_tool_weather", lambda loc=None: '{"w": 1}')
     chat_env.setattr(server_mod, "_fetch_finance", lambda anchor: {"spend": 100})
@@ -606,7 +606,7 @@ def test_chat_endpoint_parallel_tools(chat_env, capsys):
 # ── 6. Serial bucket precedes parallel ─────────────────────────────────────
 
 
-@pytest.mark.requires_ollama
+@pytest.mark.requires_chat_model
 def test_chat_endpoint_serial_then_parallel(chat_env, capsys):
     chat_env.setattr(tools_mod, "_agent_tool_search", lambda q, k=5: '[]')
     chat_env.setattr(tools_mod, "_agent_tool_weather", lambda loc=None: '{"w": 1}')
@@ -647,7 +647,7 @@ def test_chat_endpoint_serial_then_parallel(chat_env, capsys):
 # ── 7. Tool exception is caught and stream completes ───────────────────────
 
 
-@pytest.mark.requires_ollama
+@pytest.mark.requires_chat_model
 def test_chat_endpoint_tool_exception_recovers(chat_env, capsys):
     def _blow_up(loc=None):
         raise RuntimeError("api down")
@@ -697,7 +697,7 @@ def test_chat_endpoint_tool_exception_recovers(chat_env, capsys):
 # ── 8. Round cap respected + nudge appended ────────────────────────────────
 
 
-@pytest.mark.requires_ollama
+@pytest.mark.requires_chat_model
 def test_chat_timing_log_sanitizes_infinity_confidence(chat_env, capsys, monkeypatch):
     """Regression 2026-04-21 (batch B.4): cuando `retrieve()` devuelve
     `float('-inf')` (corpus vacío / meta-chat path), el `[chat-timing]`
@@ -740,7 +740,7 @@ def test_chat_timing_log_sanitizes_infinity_confidence(chat_env, capsys, monkeyp
     assert not math.isnan(float(top)), f"done.top_score nan: {top}"
 
 
-@pytest.mark.requires_ollama
+@pytest.mark.requires_chat_model
 def test_chat_endpoint_topic_shift_no_cache_key_unbound_error(chat_env, capsys, monkeypatch):
     """Regression 2026-04-21 (bug #3): cuando la /api/chat llega con
     `history` no vacío (skipping el bloque que computa `_cache_key`) y
@@ -816,7 +816,7 @@ def test_chat_endpoint_topic_shift_no_cache_key_unbound_error(chat_env, capsys, 
     assert "topic_shift=person" in line, line
 
 
-@pytest.mark.requires_ollama
+@pytest.mark.requires_chat_model
 def test_chat_endpoint_round_cap_respected(chat_env, capsys):
     """2026-04-28 wave-3: el loop ahora rompe tras la 1ra ronda con tools
     ejecutadas, así que el round_cap nudge YA NO se emite — el LLM nunca
@@ -879,7 +879,7 @@ def _empty_retrieve_result(query: str = "x") -> dict:
     }
 
 
-@pytest.mark.requires_ollama
+@pytest.mark.requires_chat_model
 def test_empty_retrieve_with_forced_tools_skips_bail(chat_env, monkeypatch):
     """Regression 2026-04-22 (Fer F.): "qué tengo para hacer esta semana?"
     matchea `reminders_due` + `calendar_ahead` via `_detect_tool_intent`,
@@ -930,7 +930,7 @@ def test_empty_retrieve_with_forced_tools_skips_bail(chat_env, monkeypatch):
     assert "calendar_ahead" in tool_names_called
 
 
-@pytest.mark.requires_ollama
+@pytest.mark.requires_chat_model
 def test_empty_retrieve_without_forced_tools_still_bails(chat_env, monkeypatch):
     """No-regression: cuando el retrieve viene vacío Y el query no matchea
     el pre-router, el bail `Sin resultados relevantes.` sigue firing. Solo
@@ -950,7 +950,7 @@ def test_empty_retrieve_without_forced_tools_still_bails(chat_env, monkeypatch):
     assert "Sin resultados" in empty_payload.get("message", "")
 
 
-@pytest.mark.requires_ollama
+@pytest.mark.requires_chat_model
 def test_low_conf_bypass_with_forced_tools_skips_bypass(chat_env, monkeypatch):
     """Regression 2026-04-22 (mismo user report): si el retrieve devuelve
     docs pero confidence < CONFIDENCE_RERANK_MIN (0.015), el handler
@@ -1001,7 +1001,7 @@ def test_low_conf_bypass_with_forced_tools_skips_bypass(chat_env, monkeypatch):
     assert "calendar_ahead" in tool_names_called
 
 
-@pytest.mark.requires_ollama
+@pytest.mark.requires_chat_model
 def test_low_conf_bypass_without_forced_tools_still_fires(chat_env, monkeypatch):
     """No-regression: cuando no hay forced tools, el bypass sigue firing
     (template canned, ahorro de 5-8s de LLM cold prefill sobre queries
@@ -1023,7 +1023,7 @@ def test_low_conf_bypass_without_forced_tools_still_fires(chat_env, monkeypatch)
 # ── 10. Source-specific intent hint — bug report 2026-04-24 ──────────────
 
 
-@pytest.mark.requires_ollama
+@pytest.mark.requires_chat_model
 def test_source_intent_hint_injected_when_pre_router_fires_gmail(
     chat_env, monkeypatch,
 ):
@@ -1087,7 +1087,7 @@ def test_source_intent_hint_injected_when_pre_router_fires_gmail(
     assert "No encontré mails recientes en tu corpus" in hint_msg
 
 
-@pytest.mark.requires_ollama
+@pytest.mark.requires_chat_model
 def test_source_intent_hint_omitted_when_no_source_specific_tools(
     chat_env, monkeypatch,
 ):
@@ -1127,7 +1127,7 @@ def test_source_intent_hint_omitted_when_no_source_specific_tools(
 # ── 10.5. CONTEXTO preservation cuando todos los tools del pre-router vuelven vacíos ─
 
 
-@pytest.mark.requires_ollama
+@pytest.mark.requires_chat_model
 def test_empty_tool_output_preserves_vault_context(chat_env, monkeypatch):
     """Regression 2026-04-24 iteración 2 (Fer F.): el user preguntó
     "cuales son mis ultimos mails?", el pre-router disparó `gmail_recent`
@@ -1199,7 +1199,7 @@ def test_empty_tool_output_preserves_vault_context(chat_env, monkeypatch):
     assert "_Sin mails pendientes._" in user_content
 
 
-@pytest.mark.requires_ollama
+@pytest.mark.requires_chat_model
 def test_nonempty_tool_output_replaces_vault_context(chat_env, monkeypatch):
     """No-regresión: cuando el pre-router dispara un tool con DATA (no
     empty), el comportamiento original se mantiene — el CONTEXTO se
@@ -1254,7 +1254,7 @@ def test_nonempty_tool_output_replaces_vault_context(chat_env, monkeypatch):
 # ── 10.7. `source_specific` flag en el done event ─────────────────────────
 
 
-@pytest.mark.requires_ollama
+@pytest.mark.requires_chat_model
 def test_done_event_flags_source_specific_true_for_gmail_query(
     chat_env, monkeypatch,
 ):
@@ -1285,7 +1285,7 @@ def test_done_event_flags_source_specific_true_for_gmail_query(
     )
 
 
-@pytest.mark.requires_ollama
+@pytest.mark.requires_chat_model
 def test_done_event_flags_source_specific_false_for_generic_query(
     chat_env, monkeypatch,
 ):
@@ -1315,7 +1315,7 @@ def test_done_event_flags_source_specific_false_for_generic_query(
     )
 
 
-@pytest.mark.requires_ollama
+@pytest.mark.requires_chat_model
 def test_done_event_flags_source_specific_false_for_weather_only(
     chat_env, monkeypatch,
 ):
@@ -1387,7 +1387,7 @@ def chat_env_prod(monkeypatch):
     return monkeypatch
 
 
-@pytest.mark.requires_ollama
+@pytest.mark.requires_chat_model
 def test_llm_tool_decide_fires_when_pre_router_misses_and_vault_weak(
     chat_env_prod, monkeypatch, capsys,
 ):
@@ -1442,7 +1442,7 @@ def test_llm_tool_decide_fires_when_pre_router_misses_and_vault_weak(
     )
 
 
-@pytest.mark.requires_ollama
+@pytest.mark.requires_chat_model
 def test_llm_tool_decide_skipped_when_pre_router_matches(
     chat_env_prod, monkeypatch,
 ):
@@ -1486,7 +1486,7 @@ def test_llm_tool_decide_skipped_when_pre_router_matches(
     assert mock.calls[0].get("stream") is True
 
 
-@pytest.mark.requires_ollama
+@pytest.mark.requires_chat_model
 def test_llm_tool_decide_skipped_when_vault_strong(
     chat_env_prod, monkeypatch,
 ):

@@ -1,6 +1,6 @@
 # obsidian-rag
 
-RAG local sobre el vault de Obsidian, fully local: sqlite-vec + Ollama + sentence-transformers. Sin cloud, sin telemetría.
+RAG local sobre el vault de Obsidian, fully local: sqlite-vec + MLX + sentence-transformers. Sin cloud, sin telemetría.
 
 > **Para la guía de arquitectura interna y decisiones de diseño, ver [CLAUDE.md](./CLAUDE.md).** Este README es la **referencia operativa**: comandos, flags, paths, schemas, recetas — lo que se olvida y hay que poder buscar.
 
@@ -33,7 +33,7 @@ RAG local sobre el vault de Obsidian, fully local: sqlite-vec + Ollama + sentenc
 
 Una sola CLI (`rag`) sobre el paquete `~/repositories/obsidian-rag/rag/` (`__init__.py` ~64k LOC core + sub-módulos especializados, post-split 2026-05-04) + un MCP server (`obsidian-rag-mcp`) sobre `mcp_server.py`.
 
-> **Nota MLX cutover (2026-05-06)**: el stack chat migró de Ollama a [MLX](https://github.com/ml-explore/mlx-lm). Default `RAG_LLM_BACKEND=mlx`. Solo `qwen3-embedding:0.6b` sigue corriendo en Ollama. Las tablas y diagramas de abajo aún muestran nombres `qwen2.5:Xb` / `command-r` por compatibilidad de helper bindings — bajo MLX se resuelven a sus equivalentes 4bit ([`Qwen2.5-3B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-3B-Instruct-4bit), [`Qwen2.5-7B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-7B-Instruct-4bit), [`Qwen3-30B-A3B-Instruct-2507-4bit`](https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit)). Detalle en [`docs/mlx-migration.md`](./docs/mlx-migration.md) y [CLAUDE.md](./CLAUDE.md).
+> **Nota MLX (Olas 0-8 cerradas 2026-05-06)**: stack 100% [MLX](https://github.com/ml-explore/mlx-lm) — chat, embed (in-process via SentenceTransformer + MPS), VLM (granite via mlx-vlm) y reranker. Default `RAG_LLM_BACKEND=mlx` (único backend disponible). Las tablas y diagramas de abajo aún muestran nombres `qwen2.5:Xb` / `command-r` como aliases cortos — bajo MLX se resuelven a sus equivalentes 4bit ([`Qwen2.5-3B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-3B-Instruct-4bit), [`Qwen2.5-7B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-7B-Instruct-4bit), [`Qwen3-30B-A3B-Instruct-2507-4bit`](https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit)). Detalle en [`docs/mlx-migration.md`](./docs/mlx-migration.md) y [CLAUDE.md](./CLAUDE.md).
 
 ```mermaid
 graph TD
@@ -57,7 +57,7 @@ graph TD
     end
 
     subgraph LLM["LLM backend"]
-        Embed["qwen3-embedding:0.6b (1024d)<br/>Ollama localhost:11434"]
+        Embed["qwen3-embedding:0.6b (1024d)<br/>SentenceTransformer in-process"]
         subgraph MLX["MLX (Apple Silicon, default)"]
             Helper["Qwen2.5-3B-Instruct-4bit<br/>(helper)"]
             Chat["Qwen2.5-7B-Instruct-4bit<br/>(chat default)"]
@@ -89,10 +89,10 @@ graph TD
 Quickstart end-to-end (asumiendo macOS + Homebrew + `uv` ya instalado):
 
 ```bash
-# 1. Verificar que Ollama está corriendo (sólo embedder post-MLX cutover 2026-05-06)
-ollama list   # debe incluir qwen3-embedding:0.6b
+# 1. Verificar modelos MLX descargados (cache HuggingFace)
+ls ~/.cache/huggingface/hub/ | grep mlx-community
 # Si falta:
-ollama pull qwen3-embedding:0.6b
+huggingface-cli download mlx-community/Qwen2.5-7B-Instruct-4bit
 # Los modelos chat (Qwen2.5-3B/7B-Instruct-4bit, Qwen3-30B-A3B-Instruct-2507-4bit)
 # se descargan automáticamente del Hugging Face Hub al primer uso vía mlx-lm.
 # Para pre-pullear: huggingface-cli download mlx-community/Qwen2.5-7B-Instruct-4bit
@@ -111,7 +111,7 @@ rag index
 
 # 4. Levantar el sistema completo: daemons obsidian-rag-* + RagNet + catch-up
 #    incremental al último minuto de uso. Idempotente. Para parar todo:
-#    `rag stop` (default ON RagNet, OFF ollama/qdrant).
+#    `rag stop` (default ON RagNet, OFF qdrant).
 rag start
 
 # 5. Verificar que el sistema está sano
@@ -120,7 +120,7 @@ launchctl list | grep obsidian-rag    # los 35 servicios deben aparecer
 ```
 
 **Dependencias del sistema** (Homebrew):
-- [`ollama`](https://ollama.com) corriendo en `localhost:11434` con `bge-m3`, `qwen2.5:3b`, `command-r:latest` instalados.
+- Modelos MLX descargados (`mlx-community/Qwen2.5-3B-Instruct-4bit`, `mlx-community/Qwen2.5-7B-Instruct-4bit`, `Qwen/Qwen3-Embedding-0.6B`) — `huggingface-cli download <model-id>`.
 - Python 3.13 vía [`uv`](https://docs.astral.sh/uv/).
 - Para integraciones cross-source opcionales (Gmail/Calendar): credenciales OAuth en `~/.gmail-mcp/` (ver [`docs/design-cross-source-corpus.md`](./docs/design-cross-source-corpus.md)).
 - Para WhatsApp ingest: el bridge `~/whatsapp-listener/` corriendo en `localhost:8080`.
@@ -177,32 +177,32 @@ launchctl list | grep obsidian-rag    # los 35 servicios deben aparecer
 
 ### Interacciones con el LLM backend
 
-> **Post-MLX cutover (2026-05-06)**: la tabla de abajo conserva los nombres `qwen2.5:Xb` / `command-r` por valor histórico y porque los helper bindings siguen referenciándolos por nombre. Bajo el default `RAG_LLM_BACKEND=mlx`, [`rag/llm_backend.py`](./rag/llm_backend.py) los resuelve a sus equivalentes MLX 4bit en runtime. Solo `qwen3-embedding:0.6b` corre nativo en Ollama. Detalle: [`docs/mlx-migration.md`](./docs/mlx-migration.md).
+> **Stack MLX (Olas 0-8 cerradas 2026-05-06)**: el código activo es 100% MLX. La tabla de abajo conserva los nombres cortos `qwen2.5:Xb` / `command-r` como aliases — bajo `RAG_LLM_BACKEND=mlx` (único disponible), [`rag/llm_backend.py`](./rag/llm_backend.py) los resuelve a sus equivalentes MLX 4bit en runtime. Detalle: [`docs/mlx-migration.md`](./docs/mlx-migration.md).
 
 Cada operación del pipeline va a un modelo específico. El reranker vive en sentence-transformers aparte (MPS+float32, **no fp16** — colapsó en 2 A/Bs).
 
-![Ollama interactions](./docs/diagrams/ollama-interactions.svg)
+![LLM interactions](./docs/diagrams/ollama-interactions.svg) <!-- legacy filename, content currently shows the MLX/embedder graph -->
 
 | Operación | Modelo | Vía |
 |---|---|---|
-| Index embeddings (chunks + URL contexts) | `bge-m3` | Ollama `embed` |
-| Query embeddings (variantes) | `bge-m3` | Ollama `embed` |
-| Expand queries (3 paraphrases) | `qwen2.5:3b` | Ollama `chat` |
-| Reformulate con session history | `qwen2.5:3b` | Ollama `chat` |
-| HyDE (opt-in `--hyde`) | `qwen2.5:3b` | Ollama `chat` |
-| Autotag / inbox tag suggestion | `qwen2.5:3b` | Ollama `chat` |
-| Answer generation (query + chat) | `command-r:latest` | Ollama `chat` streaming |
-| Contradiction detection (fase 1 + 2) | `command-r:latest` | Ollama `chat` (JSON strict) |
-| Weekly digest / morning brief / prep | `command-r:latest` | Ollama `chat` |
-| Surface "por qué este puente" | `command-r:latest` | Ollama `chat` |
-| Agent loop (`rag do`) | `command-r:latest` | Ollama `chat` tool-calling |
+| Index embeddings (chunks + URL contexts) | `qwen3-embedding:0.6b` | SentenceTransformer in-process |
+| Query embeddings (variantes) | `qwen3-embedding:0.6b` | SentenceTransformer in-process |
+| Expand queries (3 paraphrases) | `qwen2.5:3b` (MLX) | `_mlx_chat` |
+| Reformulate con session history | `qwen2.5:3b` (MLX) | `_mlx_chat` |
+| HyDE (opt-in `--hyde`) | `qwen2.5:3b` (MLX) | `_mlx_chat` |
+| Autotag / inbox tag suggestion | `qwen2.5:3b` (MLX) | `_mlx_chat` |
+| Answer generation (query + chat) | `qwen2.5:7b` (MLX) | `_chat_stream_dispatch` |
+| Contradiction detection (fase 1 + 2) | `command-r` → `Qwen3-30B-A3B` (MLX) | `_mlx_chat` (JSON strict) |
+| Weekly digest / morning brief / prep | `command-r` → `Qwen3-30B-A3B` (MLX) | `_mlx_chat` |
+| Surface "por qué este puente" | `command-r` → `Qwen3-30B-A3B` (MLX) | `_mlx_chat` |
+| Agent loop (`rag do`) | `command-r` → `Qwen3-30B-A3B` (MLX) | `_mlx_chat` tool-calling nativo |
 | Cross-encoder rerank | `BAAI/bge-reranker-v2-m3` | sentence-transformers local (**MPS+fp32**, fp16 falla — ver CLAUDE.md invariant) |
 
 Fallback resolver de `resolve_chat_model()`: `command-r:latest` → `qwen2.5:14b` → `phi4:latest`. El primero instalado gana.
 
 ### Topología de servicios
 
-Launchd + CLIs + bots + Ollama + storage — qué corre solo, qué dispara qué, qué escribe dónde.
+Launchd + CLIs + bots + MLX + storage — qué corre solo, qué dispara qué, qué escribe dónde.
 
 ![Services topology](./docs/diagrams/services-topology.svg)
 
@@ -459,10 +459,10 @@ Skips: frontmatter, fenced/inline code, existing wikilinks, markdown links, HTML
 
 | Comando | Función |
 |---|---|
-| `rag start [--all] [--without-rag-net] [--no-index] [-y] [--dry-run]` | **Levanta TODO el sistema** y reindexa al último minuto de uso. Simétrico a `rag stop`. Orden: (1) `rag setup` regenera + carga los 35 `obsidian-rag-*` managed; (2) opcionalmente bootstrap-ea daemons externos (RagNet `whatsapp-*` default ON, ollama / qdrant default OFF); (3) corre `rag index` incremental para capturar cambios de archivos editados desde el último tick del watcher (cubre el gap si la Mac estuvo dormida). Idempotente. |
+| `rag start [--all] [--without-rag-net] [--no-index] [-y] [--dry-run]` | **Levanta TODO el sistema** y reindexa al último minuto de uso. Simétrico a `rag stop`. Orden: (1) `rag setup` regenera + carga los 35 `obsidian-rag-*` managed; (2) opcionalmente bootstrap-ea daemons externos (RagNet `whatsapp-*` default ON, qdrant default OFF); (3) corre `rag index` incremental para capturar cambios de archivos editados desde el último tick del watcher (cubre el gap si la Mac estuvo dormida). Idempotente. |
 | `rag setup` | Instala los 16 launchd plists `com.fer.obsidian-rag-*` (watch, web, digest, morning, today, anticipate, ingest-{whatsapp,gmail,calendar,reminders}, wa-tasks, reminder-wa-push, **wa-scheduled-send**, maintenance, calibrate, auto-harvest, online-tune, …). Idempotente — re-correr recarga. Subset de `rag start` (no incluye externos ni catch-up). Ver tabla completa en [§Automation (launchd)](#automation-launchd). |
 | `rag setup --remove` | Desinstala todos los servicios obsidian-rag-* (borra plists del disco). |
-| `rag stop [--all] [--without-rag-net] [--with-ollama] [--with-qdrant] [-y] [--dry-run]` | **Para TODO el sistema** en un solo comando. Inverso de `rag start`. Orden: watchdog/wake-hook primero (para que no rebootstrap-een), después el resto de obsidian-rag-*, opcional RagNet (default ON), opcional ollama/qdrant (default OFF — son compartidos con mem-vault). |
+| `rag stop [--all] [--without-rag-net] [--with-qdrant] [-y] [--dry-run]` | **Para TODO el sistema** en un solo comando. Inverso de `rag start`. Orden: watchdog/wake-hook primero (para que no rebootstrap-een), después el resto de obsidian-rag-*, opcional RagNet (default ON), opcional qdrant (default OFF — compartido con mem-vault). |
 | `rag wa-scheduled-send [--dry-run] [--late-threshold-min 5] [--max-retries 5] [--max-per-run 20]` | Worker manual del envío de mensajes de WhatsApp programados. Lo dispara automáticamente el plist `com.fer.obsidian-rag-wa-scheduled-send` cada 5 min, pero podés correrlo a mano para debug — `--dry-run` calcula sin enviar ni mover status. Idempotente: cada row se mueve `pending`→`sent`/`sent_late`/`failed` en una sola transacción. |
 | `rag remind-wa [--dry-run] [--window-min 5] [--max-overdue-min 1440]` | Worker manual del push de Apple Reminders próximos a vencer al JID ambient. Cron equivalente: `com.fer.obsidian-rag-reminder-wa-push` cada 5 min. Idempotente vía `rag_reminder_wa_pushed`. |
 | `rag ambient {status,disable,test,log}` | Manage del ambient hook (ver [§Ambient Agent](#ambient-agent-co-autor-del-inbox)). |
@@ -579,7 +579,7 @@ Las **3 más críticas** que casi siempre vas a querer setear:
 | Env var | Default | Función |
 |---|---|---|
 | `OBSIDIAN_RAG_VAULT` | iCloud Notes | Override del vault path. Las collections se namespace con sha8 del path. |
-| `OLLAMA_KEEP_ALIVE` | `-1` (forever) | Pasado a cada `ollama.chat/embed`. Evita reload de modelos entre queries. Acepta int (segundos) o duration string ("30m"). |
+| `RAG_LLM_KEEP_ALIVE` | `-1` (forever) | kwarg `keep_alive` propagado al backend MLX. No-op en MLX (el backend tiene LRU + idle-unload watchdog propio), preservado por compat de firma. Acepta int o duration string ("30m"). Compat alias: `OLLAMA_KEEP_ALIVE`. |
 | `HF_HUB_OFFLINE` / `TRANSFORMERS_OFFLINE` | `1` | Reranker se carga del caché local. |
 
 **Stack de modelos** (definidos al tope de `rag/__init__.py` — nombres lógicos; backend MLX los resuelve a equivalentes 4bit en runtime):
@@ -588,7 +588,7 @@ Las **3 más críticas** que casi siempre vas a querer setear:
 |---|---|---|
 | Chat (answers + contradiction judgment + prep + digest) | `qwen2.5:7b` (default) / `command-r` o `qwen2.5:14b` (HQ tier) | [`Qwen2.5-7B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-7B-Instruct-4bit) / [`Qwen3-30B-A3B-Instruct-2507-4bit`](https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit) |
 | Helper (paraphrase, HyDE, history reformulation, autotag) | `qwen2.5:3b` | [`Qwen2.5-3B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-3B-Instruct-4bit) |
-| Embeddings | `qwen3-embedding:0.6b` (multilingual, 1024d) — Ollama | NO migra a MLX, sigue en Ollama |
+| Embeddings | `qwen3-embedding:0.6b` (multilingual, 1024d) — MLX in-process | Sí, in-process via SentenceTransformer + MPS |
 | Reranker | `BAAI/bge-reranker-v2-m3` | sentence-transformers in-process, `device=mps`+`float32` |
 
 **Decoding** (deterministic — esto es retrieval, no creative writing):
@@ -669,12 +669,12 @@ Expuestos por `obsidian-rag-mcp` vía stdio. Registro en `~/.claude.json` (Claud
 
 ```bash
 rag start                      # levanta TODO el sistema + reindex al último minuto (RagNet incluido)
-rag start --all                # idem + ollama + qdrant
+rag start --all                # idem + qdrant
 rag start --no-index -y        # solo bootstrap, sin catch-up index
 rag start --dry-run            # mostrar qué levantaría sin ejecutar
 
 rag stop                       # para TODO en un solo comando (inverso de rag start)
-rag stop --all -y              # incluye ollama + qdrant + sin confirmación
+rag stop --all -y              # incluye qdrant + sin confirmación
 
 rag setup                      # subset de rag start: install/recarga managed (los 35 servicios)
 rag setup --remove             # uninstall
@@ -848,7 +848,7 @@ Single-bot consolidado en `~/whatsapp-listener/listener.ts` (Bun + TypeScript). 
 
 | Síntoma | Causa probable | Fix |
 |---|---|---|
-| `rag query` cuelga o tarda 60s+ | Modelo cold-loaded (Ollama liberó VRAM) | Setear `OLLAMA_KEEP_ALIVE=-1` (default ya). Verificar `ollama ps`. |
+| `rag query` cuelga o tarda 60s+ | Modelo cold-loaded (idle-unload watchdog evictó MLX) | Setear `RAG_MLX_IDLE_TTL=0` para disable idle-unload. Verificar `RAG_MLX_IDLE_TTL` en plist. |
 | Reranker tardando ~3× lo normal | Sentence-transformers cayó a CPU en uv venv | Verificar `get_reranker()` fuerza `device="mps"+fp16`. NO remover esa línea. |
 | `rag chat --counter` da false positives | Query-time detector usa command-r ya, debería estar bien | Si pasa, mirar `helper_raw` en `queries.jsonl`. Tunear el prompt en `find_contradictions`. |
 | Phase 2 contradictions ruidosas en frontmatter | command-r flagueando matices como contradicción | Bajar verbosidad: `rag index --no-contradict` para una corrida; o tunear el prompt. |
@@ -903,7 +903,7 @@ Single-bot consolidado en `~/whatsapp-listener/listener.ts` (Bun + TypeScript). 
 | `tests/test_surface.py` | Centroides + graph distance + pair filtering |
 | `tests/test_vaults.py` | Registry add/use/remove + precedence (env > registry > default) + per-vault collection |
 
-Correr: `.venv/bin/python -m pytest tests/ -q`. pytest está en `[project.optional-dependencies].dev`. Los modelos se monkeypatchean donde hace falta (no se llama Ollama ni se carga el reranker de verdad).
+Correr: `.venv/bin/python -m pytest tests/ -q`. pytest está en `[project.optional-dependencies].dev`. Los modelos se monkeypatchean donde hace falta (no se llama el LLM ni se carga el reranker de verdad).
 
 ### Targets rápidos
 
@@ -914,6 +914,6 @@ Correr: `.venv/bin/python -m pytest tests/ -q`. pytest está en `[project.option
 | `make test-all` | Suite completa, incluyendo `@pytest.mark.slow` | ~110s |
 | `make coverage` | `pytest-cov` sobre `rag.py + web + mcp_server` (HTML en `htmlcov/`) | ~50s |
 
-Cobertura actual (2026-04-20): total 54% (rag.py 55%, web/server.py 38%, mcp_server.py 85%, web/conversation_writer.py 95%). El gap está concentrado en `web/server.py` (endpoints que requieren Ollama + vault real — la mayoría no están ejercitados por unit tests).
+Cobertura actual (2026-04-20): total 54% (rag.py 55%, web/server.py 38%, mcp_server.py 85%, web/conversation_writer.py 95%). El gap está concentrado en `web/server.py` (endpoints que requieren MLX + vault real — la mayoría no están ejercitados por unit tests).
 
 `pytest-xdist` y `pytest-cov` son opcionales: `uv pip install pytest-xdist pytest-cov` dentro del venv local (ya están listadas en `[project.optional-dependencies].dev`).

@@ -16,7 +16,7 @@ Two consumers:
   pre-fix `round(None)` killed the morning brief).
 - `_weather_comment(question, forecast)` → uses the helper LLM (qwen2.5:3b) to
   generate a 1-2 sentence opinion on a forecast. Tied to the helper-LLM stack
-  (`_helper_client`, `HELPER_MODEL`, `HELPER_OPTIONS`, `OLLAMA_KEEP_ALIVE`),
+  (`_helper_client`, `HELPER_MODEL`, `HELPER_OPTIONS`, `LLM_KEEP_ALIVE`),
   imported lazily because that stack lives in `rag.__init__`.
 
 ## Invariants
@@ -30,7 +30,7 @@ Two consumers:
 
 ## Why deferred imports for the helper LLM
 `_weather_comment` calls Ollama via `_helper_client()` — that helper, plus
-`HELPER_MODEL`, `HELPER_OPTIONS`, and `OLLAMA_KEEP_ALIVE`, all live in
+`HELPER_MODEL`, `HELPER_OPTIONS`, and `LLM_KEEP_ALIVE`, all live in
 `rag.__init__`. Module-level `from rag import …` here would trigger a circular
 import during package load. Deferred (function-body) imports run after
 `rag.__init__` finishes loading, so they always succeed.
@@ -438,7 +438,7 @@ def _fetch_weather_forecast(location: str = WEATHER_LOCATION) -> dict | None:
 
 def _weather_comment(question: str, forecast: str) -> str:
     """Generate a brief conversational comment relating the forecast to the question."""
-    from rag import HELPER_MODEL, HELPER_OPTIONS, OLLAMA_KEEP_ALIVE, _helper_client
+    from rag import HELPER_MODEL, HELPER_OPTIONS, LLM_KEEP_ALIVE, _helper_client
     prompt = (
         "Pronóstico:\n"
         f"{forecast}\n\n"
@@ -454,7 +454,7 @@ def _weather_comment(question: str, forecast: str) -> str:
             model=HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options={**HELPER_OPTIONS, "num_predict": 80},
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=LLM_KEEP_ALIVE,
         )
         # 2026-04-29: filter PT→ES post-gen. El comentario sobre el
         # pronóstico aparece en el morning brief (WhatsApp + vault) y

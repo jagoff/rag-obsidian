@@ -335,7 +335,7 @@ def synthesize_cluster(
             {"role": "user", "content": _synth_user_prompt(cluster)},
         ],
         options=rag.CHAT_OPTIONS,
-        keep_alive=rag.OLLAMA_KEEP_ALIVE,
+        keep_alive=rag.LLM_KEEP_ALIVE,
     )
     if hasattr(resp, "message"):
         body = (getattr(resp.message, "content", "") or "").strip()

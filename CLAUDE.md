@@ -8,7 +8,7 @@ Entry points (instalados via `uv tool install --reinstall --editable '.[entities
 
 Extras default: `entities` (gliner NER), `stt` (faster-whisper), `mlx` (LLM backend activo). `spotify` queda opt-in puro — agregarlo solo si OAuth está configurado: `'.[entities,stt,mlx,spotify]'`.
 
-Local-first sobre VAULT + corpus locales (sqlite-vec + Ollama/MLX + sentence-transformers). Cross-source ingesters cloud (Gmail/Calendar/Drive) requieren creds OAuth en `~/.{gmail,calendar,gdrive}-mcp/`; sin esas creds silent-fail y corpus local sigue funcionando. WhatsApp + Reminders stay local.
+Local-first sobre VAULT + corpus locales (sqlite-vec + MLX + sentence-transformers). Cross-source ingesters cloud (Gmail/Calendar/Drive) requieren creds OAuth en `~/.{gmail,calendar,gdrive}-mcp/`; sin esas creds silent-fail y corpus local sigue funcionando. WhatsApp + Reminders stay local.
 
 Python 3.13, `uv`. Runtime venv: `.venv/bin/python`. Global tool: `~/.local/share/uv/tools/obsidian-rag/`.
 
@@ -63,7 +63,7 @@ Español rioplatense (voseo) por default. Regla universal en [`~/.claude/CLAUDE.
 Invocar `pm` ANTES de empezar cuando AL MENOS UNO:
 
 1. Cruza ≥2 agent domains (retrieval + brief, llm + ingestion, integrations + vault-health).
-2. Toca un invariant listado en [`pm.md`](.claude/agents/pm.md): schema version `_COLLECTION_BASE`, eval floor (singles/chains CI), reranker `device="mps"` + `float32`, HELPER model binding (`reformulate_query` + `qwen2.5:3b`), confidence gates (`CONFIDENCE_RERANK_MIN`, `CONFIDENCE_DEEP_THRESHOLD`), Ollama `keep_alive=-1`, session-id regex, local-first.
+2. Toca un invariant listado en [`pm.md`](.claude/agents/pm.md): schema version `_COLLECTION_BASE`, eval floor (singles/chains CI), reranker `device="mps"` + `float32`, HELPER model binding (`reformulate_query` + `qwen2.5:3b`), confidence gates (`CONFIDENCE_RERANK_MIN`, `CONFIDENCE_DEEP_THRESHOLD`), `RAG_LLM_KEEP_ALIVE=-1`, session-id regex, local-first.
 3. Hay peers activos (`mcp__claude-peers__list_peers(scope: "repo")` > 1) Y su `set_summary` se solapa.
 4. No sabés qué agent owns la work.
 
@@ -161,7 +161,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fer.obsidian-rag-web
 .venv/bin/python -m pytest tests/test_foo.py -q --pdb              # drop a pdb on fail
 ```
 
-Conftest autouse fixture `_force_ollama_backend_for_tests` fuerza `RAG_LLM_BACKEND=ollama` por test — los tests que necesitan el mock fake-Ollama deben monkeypatchear `ollama.chat` directamente.
+Conftest autouse fixture `_reset_backend_singleton_per_test` resetea el singleton entre tests + auto-stubea `_mlx_chat`/`_chat_stream_dispatch` (post-Ola 7). Tests que mockean LLM hacen `monkeypatch.setattr(rag, "_mlx_chat", _fake)` — su patch gana sobre el auto-stub.
 
 ## Commands (canonical subset)
 
@@ -224,16 +224,16 @@ Catálogo completo (47+ vars adicionales) en [`docs/env-vars-catalog.md`](docs/e
 - `OBSIDIAN_RAG_INDEX_WA_MONTHLY=1` — opt-in al double-indexing WA monthly rollups (default OFF post-2026-04-22).
 
 **Backend LLM** (ver MLX section arriba):
-- `RAG_LLM_BACKEND={ollama,mlx}` — default `mlx`.
+- `RAG_LLM_BACKEND` — único valor soportado: `mlx` (default). El valor `ollama` queda como compat alias: loguea warning + cae a MLX.
 - `RAG_MLX_IDLE_TTL` (default 1800s), `RAG_MLX_IDLE_DISABLE=1`.
 
 **Performance + memoria**:
-- `OLLAMA_KEEP_ALIVE=-1` (default forever). Auto-clamp a `_LARGE_KEEP_ALIVE="20m"` para `_LARGE_CHAT_MODELS` (command-r, qwen3:30b-a3b). Override: `RAG_KEEP_ALIVE_LARGE_MODEL`. **Nota post-MLX cutover (2026-05-06)**: estos modelos están purgados del disco — el clamp es código defensivo que solo dispara si alguien hace re-pull para rollback. En estado actual (default `RAG_LLM_BACKEND=mlx`) nunca se ejecuta.
+- `RAG_LLM_KEEP_ALIVE=-1` (default forever). Compat alias: `OLLAMA_KEEP_ALIVE` (legacy plists). MLX in-process — no-op pero el value se sigue propagando como kwarg al backend para preservar la firma con call sites históricos. El clamp por modelo grande (`_LARGE_CHAT_MODELS`) fue removido en Ola 8 — MLX maneja eviction propio (LRU + idle-unload watchdog).
 - `RAG_MEMORY_PRESSURE_DISABLE=1` — desactiva watchdog (default ON, threshold 85%, interval 60s). Bajo pressure: unload chat + force-unload reranker (bypassa `RAG_RERANKER_NEVER_UNLOAD`).
 - `RAG_RERANKER_NEVER_UNLOAD=1` — pina reranker en MPS VRAM. Cost ~2-3 GB.
 - `RAG_RERANKER_IDLE_TTL=900` — segundos idle-unload.
 - `RAG_LOCAL_EMBED=1` — in-process bge-m3 (set en plists web + serve, auto-set en CLI query-like). NO en indexing/watch.
-- `RAG_LOCAL_EMBED_WAIT_MS=6000` — budget Event ready antes fallback Ollama.
+- `RAG_LOCAL_EMBED_WAIT_MS=6000` — budget Event ready antes de raise (post-Ola 6: no hay fallback, solo el path local).
 
 **Async writers** (default ON desde audit 2026-04-24):
 - Set `RAG_LOG_{QUERY,BEHAVIOR,FT_RATING,AMBIENT,CONTRADICTIONS,ARCHIVE,TUNE,SURFACE}_ASYNC=0` + `RAG_METRICS_ASYNC=0` para opt-out.
@@ -254,7 +254,7 @@ Catálogo completo (47+ vars adicionales) en [`docs/env-vars-catalog.md`](docs/e
 - `RAG_LLM_JUDGE` (default OFF, prototipo) — score blend cuando top<0.5 AND len≥5. `RAG_LLM_JUDGE_THRESHOLD=0.5`, `RAG_LLM_JUDGE_MIN_CANDIDATES=5`, `RAG_LLM_JUDGE_ALPHA=0.5`.
 - `RAG_QUERY_DECOMPOSE` (default OFF, prototipo) — sub-retrieves + RRF. `RAG_QUERY_DECOMPOSE_LLM_FALLBACK=0`, `RAG_QUERY_DECOMPOSE_MAX_WORKERS=3`.
 - `RAG_INTENT_RECENCY` (default ON, Quick Win #3) — halflife per intent (recent ×0.3, historical ×3.0, neutral ×1.0).
-- `RAG_TYPO_CORRECTION` — default ON con Ollama / **OFF con MLX** (resolved `_resolve_typo_correction_default()` por bug 2026-05-05: qwen2.5:3b parafrasea agresivo bajo MLX). Override `=1` siempre gana. `RAG_TYPO_JACCARD_MIN=0.7` solo multi-token.
+- `RAG_TYPO_CORRECTION` — default OFF (post-Ola 8: MLX-only path). qwen2.5:3b bajo MLX parafrasea agresivo (bug 2026-05-05). Override `=1` para forzar ON. `RAG_TYPO_JACCARD_MIN=0.7` solo multi-token.
 - `RAG_HISTORY_SUMMARY` (default ON, Quick Win #5).
 - `RAG_ANAPHORA_RESOLVER` (default ON, Quick Win #1).
 - `RAG_CONTEXTUAL_RETRIEVAL=1` (default OFF, prototipo Anthropic).
@@ -298,7 +298,7 @@ Detalle completo del pipeline en [`docs/retrieval-internals.md`](docs/retrieval-
 ```
 query → typo correct → anaphora resolve → classify_intent → infer_filters
       → adaptive routing → decomposition gate → expand_queries (qwen2.5:3b)
-      → embed qwen3-embedding:0.6b (1024d, vía Ollama) → sqlite-vec sem + BM25 → RRF + dedup → expand to parent
+      → embed qwen3-embedding:0.6b (1024d, in-process MLX) → sqlite-vec sem + BM25 → RRF + dedup → expand to parent
       → rerank (bge-reranker-v2-m3, MPS+fp32) → LLM judge gate
       → score loop (recency/intent/behavior/contradiction/feedback)
       → MMR diversification → contradiction penalty → seen_titles soft penalty (-0.1)

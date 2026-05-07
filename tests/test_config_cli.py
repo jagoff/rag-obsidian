@@ -32,12 +32,11 @@ def test_curated_vars_tuple_shape():
 
 
 def test_curated_names_are_rag_prefixed():
-    """All curated names start with RAG_ or OBSIDIAN_RAG_ or OLLAMA_."""
+    """All curated names start with RAG_ or OBSIDIAN_RAG_."""
     for name, *_ in rag._CONFIG_VARS:
         assert (
             name.startswith("RAG_")
             or name.startswith("OBSIDIAN_RAG_")
-            or name.startswith("OLLAMA_")
         )
 
 
@@ -54,7 +53,7 @@ def test_curated_has_core_vars():
     assert "RAG_MMR_DIVERSITY" in names
     assert "RAG_PPR_TOPIC" in names
     assert "RAG_LLM_INTENT" in names
-    assert "OLLAMA_KEEP_ALIVE" in names
+    assert "RAG_LLM_KEEP_ALIVE" in names
 
 
 # ── _collect_env_var_names_from_source ───────────────────────────────────
@@ -76,13 +75,17 @@ def test_source_scan_picks_up_known_vars():
 
 
 def test_source_scan_prefixed_only():
-    """No stray non-RAG/non-OLLAMA vars leak through."""
+    """No stray non-RAG vars leak through. `OLLAMA_KEEP_ALIVE` queda como
+    excepción legacy: solo aparece en un único `os.environ.get(...)` en
+    `rag/__init__.py:3287` como compat alias para plists viejos. El alias
+    actual canonical es `RAG_LLM_KEEP_ALIVE`."""
     names = rag._collect_env_var_names_from_source()
     for n in names:
+        if n == "OLLAMA_KEEP_ALIVE":
+            continue  # legacy compat alias, ver rag/__init__.py:3287
         assert (
             n.startswith("RAG_")
             or n.startswith("OBSIDIAN_RAG_")
-            or n.startswith("OLLAMA_")
         )
 
 

@@ -100,7 +100,7 @@ from rag import (  # noqa: E402
     _ragvec_state_conn,
     _sql_append_event,
     MORNING_FOLDER,
-    OLLAMA_KEEP_ALIVE,
+    LLM_KEEP_ALIVE,
     chat_keep_alive,
     SESSION_HISTORY_WINDOW,
     _collect_screentime,
@@ -5547,7 +5547,7 @@ def followups(req: FollowupsRequest) -> dict:
     from rag import load_prompt as _lp
     prompt = _lp("followups", version="v1") + f"\n\n{ctx}\n\nJSON:"
     try:
-        from rag import _mlx_or_ollama_chat as _moc
+        from rag import _mlx_chat as _moc
         resp = _moc(
             model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
@@ -6640,7 +6640,7 @@ def _sanitize_error_for_user(exc: Exception, *, phase: str = "unknown") -> str:
             }
             return user_msgs.get(phase, "Hubo un error procesando tu consulta — probá de nuevo o reformulá.")
     # No matchea — el mensaje del exception es probablemente safe (ej.
-    # "vault X no encontrado", "ollama timeout"). Devolverlo prefixado
+    # "vault X no encontrado", "backend timeout"). Devolverlo prefixado
     # con el phase para context.
     if not raw:
         return f"Error desconocido en {phase}."
@@ -9219,7 +9219,7 @@ _HOME_SOFT_TTL = 120.0      # serve cached without bg-refresh under this age
 # Pre-warmer cadence — bumped 25s → 300s on 2026-04-17 after chat latency
 # blew up to 30-160s. Each cycle fans out 14 top-level + 9 sub-fetchers and can eat
 # 6-27s of ollama + MPS + disk, which starves concurrent /api/chat requests
-# waiting for the same ollama daemon. 5-minute refresh is plenty for a
+# waiting for the same MLX backend. 5-minute refresh is plenty for a
 # dashboard — the home page SWRs on visit anyway.
 _HOME_BG_INTERVAL = 300.0
 # Live chat-in-flight counter. While > 0, the prewarmer skips its cycle so
@@ -9341,7 +9341,7 @@ def _diagnose_home_slowdown() -> dict:
     """Best-effort sniff of *why* a home-compute is slow. Returns a
     dict with `cause: str` and `details: dict`.
 
-    Probes are cheap — a 500ms ollama HTTP timeout, a vm_stat read, a
+    Probes are cheap — a 500ms backend HTTP timeout, a vm_stat read, a
     reranker-load-time check. We never block the SSE stream more than
     ~1s on these.
     """
@@ -9408,7 +9408,7 @@ _WARMING_BODY = json.dumps({
 def _home_refresh(regenerate: bool = False) -> None:
     """Compute + publish under condition; never run two computes in parallel.
     Silent-fail keeps last good payload visible if a fetcher dependency
-    (icalBuddy, whisper, ollama) is momentarily down.
+    (icalBuddy, whisper, the backend) is momentarily down.
 
     Concurrency:
     - Si NO hay otro compute en curso: tomamos el slot y computamos.
@@ -9776,7 +9776,7 @@ _HOME_PREWARMER_STARTED = False
 
 # Prewarmer flipped a ON por default tras 2026-04-24 (cancel-on-disconnect +
 # `_CHAT_INFLIGHT` skip-cycle ya en su lugar). Pre-flip era opt-in porque
-# el fan-out (14 channel fetchers, varios pegando ollama) podía starvear
+# el fan-out (14 channel fetchers, varios pegando the backend) podía starvear
 # `/api/chat` mid-cycle. La protección actual:
 #
 #   1. Skip-cycle: si `_CHAT_INFLIGHT > 0`, el loop duerme 10s y reintenta.
@@ -11290,7 +11290,7 @@ async def api_query(req: QueryRequest, request: Request) -> dict:
             {"role": "user", "content": user_msg},
         ]
         _keep_alive = chat_keep_alive(web_model)
-        from rag import _mlx_or_ollama_chat as _moc
+        from rag import _mlx_chat as _moc
         resp = await asyncio.wait_for(
             asyncio.to_thread(
                 _moc,
@@ -12176,7 +12176,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     from rag import get_db_for as _rag_get_db_for
                     _sem_col = _rag_get_db_for(vaults[0][1])
                     # Doble-embed fix (audit perf 2026-04-26): pre-fix
-                    # SIEMPRE iba por ollama HTTP (~140ms warm, 10s cold)
+                    # SIEMPRE iba por backend HTTP (~140ms warm, 10s cold)
                     # y después `retrieve()` re-embeddeaba la misma query
                     # con `query_embed_local` (~30ms MPS) — 2× embed por
                     # query. Si el local está warm (Event set en steady-
@@ -13537,7 +13537,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # drift, not MPS contention.
 
         print(
-            f"[chat-model-keepalive] model={_web_model} keep_alive={OLLAMA_KEEP_ALIVE}"
+            f"[chat-model-keepalive] model={_web_model} keep_alive={LLM_KEEP_ALIVE}"
             f" num_ctx={_WEB_CHAT_OPTIONS['num_ctx']} fast_path={_fast_path}"
             f" mode={mode} mode_origin={mode_origin}",
             flush=True,
@@ -14358,7 +14358,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             # exception, ttft hasta donde llegamos, ctx_chars, num_ctx
             # efectivo y qué tools corrieron en este turno — todo lo
             # necesario para distinguir "modelo cold-load" vs "context
-            # explotó" vs "ollama daemon wedged" sin re-instrumentar.
+            # explotó" vs "MLX backend wedged" sin re-instrumentar.
             _err_ttft_ms = (
                 int((time.perf_counter() - _t_llm_start) * 1000)
                 if not _first_token_logged
@@ -15887,7 +15887,7 @@ def _status_probe_self() -> dict:
 
 
 def _status_probe_ollama() -> dict:
-    """Check ollama daemon is reachable — used only for embeddings post-MLX cutover."""
+    """Check MLX backend is reachable — used only for embeddings post-MLX cutover."""
     import urllib.request
     t0 = time.monotonic()
     try:
@@ -19685,7 +19685,7 @@ def auto_fix(req: _AutoFixRequest, request: Request) -> StreamingResponse:
         for turn_n in range(1, _AUTO_FIX_MAX_TURNS + 1):
             yield f"data: {json.dumps({'type': 'turn', 'n': turn_n})}\n\n"
             try:
-                from rag import _mlx_or_ollama_chat as _moc
+                from rag import _mlx_chat as _moc
                 resp = _moc(
                     model=model,
                     messages=messages,

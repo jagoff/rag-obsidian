@@ -314,7 +314,7 @@ def llm_judge_candidates(
     from rag import (
         HELPER_MODEL,
         HELPER_OPTIONS,
-        OLLAMA_KEEP_ALIVE,
+        LLM_KEEP_ALIVE,
         _helper_client,
         _silent_log,
     )
@@ -338,7 +338,7 @@ def llm_judge_candidates(
             model=HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options=options,
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=LLM_KEEP_ALIVE,
             format="json",
         )
         raw = resp.message.content if hasattr(resp, "message") else ""

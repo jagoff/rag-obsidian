@@ -3717,6 +3717,60 @@ function appendSources(parent, items, confidence) {
       if (parentTurn && parentTurn.dataset.q) row.dataset.q = parentTurn.dataset.q;
       if (parentTurn && parentTurn.dataset.session) row.dataset.session = parentTurn.dataset.session;
     }
+    // Per-source thumbs-up: marca esta nota como la correcta para esta
+    // pregunta. Posta a /api/feedback con rating=+1, corrective_path=<file>.
+    // Atajo del flow 👎 → cards: para cuando el LLM se equivocó pero la
+    // fuente correcta SÍ apareció listada, click directo aprende sin
+    // forzar al user a votar negativo primero.
+    // Aplica solo a paths vault-relative (skip cross-source: WhatsApp,
+    // calendar, gmail) y solo cuando hay turn_id resolveable.
+    if (
+      s.file
+      && s.file.indexOf("://") === -1
+      && parentTurn
+      && parentTurn.dataset
+      && parentTurn.dataset.turnId
+    ) {
+      const thumb = document.createElement("button");
+      thumb.type = "button";
+      thumb.className = "source-thumb";
+      thumb.setAttribute("aria-label", "marcar como fuente correcta");
+      thumb.title = "marcar como fuente correcta — entrena el ranker";
+      thumb.textContent = "👍";
+      const _q = parentTurn.dataset.q || "";
+      const _turn_id = parentTurn.dataset.turnId;
+      const _session_id = parentTurn.dataset.session || null;
+      const _path = s.file;
+      thumb.addEventListener("click", async (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (thumb.disabled) return;
+        thumb.disabled = true;
+        thumb.classList.add("picked");
+        try {
+          const res = await fetch("/api/feedback", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              turn_id: _turn_id,
+              rating: 1,
+              q: _q,
+              paths: items.map((x) => x && x.file).filter(Boolean),
+              corrective_path: _path,
+              session_id: _session_id,
+            }),
+          });
+          if (!res.ok) throw new Error("HTTP " + res.status);
+          thumb.textContent = "✓";
+          thumb.title = "anotado — el ranker aprende";
+        } catch (err) {
+          thumb.disabled = false;
+          thumb.classList.remove("picked");
+          thumb.title = "error — reintentá";
+        }
+      });
+      row.appendChild(thumb);
+    }
     wrap.appendChild(row);
     rows.push(row);
   }
@@ -4640,6 +4694,10 @@ async function send(question, opts = {}) {
           ? question.slice(0, 300) : question;
       }
       if (sessionId) turn.dataset.session = sessionId;
+      // Pin turn_id ANTES de appendSources para que el botón thumbs-up
+      // per-source pueda accederlo via parentTurn.dataset.turnId. Sin
+      // esto el botón no se renderiza (gate require turnId).
+      if (parsed.turn_id) turn.dataset.turnId = parsed.turn_id;
       if (!hadProposal && !isMetachat && sources && sources.length) {
         appendSources(turn, sources, conf);
       }

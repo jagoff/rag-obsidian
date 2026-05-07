@@ -359,7 +359,7 @@ body {
 
 .source-row {
   display: grid;
-  grid-template-columns: auto 1fr 2fr;
+  grid-template-columns: auto 1fr 2fr auto;
   gap: 12px;
   align-items: baseline;
   font-size: 13px;
@@ -4167,7 +4167,7 @@ body {
 
 .source-row {
   display: grid;
-  grid-template-columns: auto 1fr 2fr;
+  grid-template-columns: auto 1fr 2fr auto;
   gap: 12px;
   align-items: baseline;
   font-size: 13px;
@@ -8421,3 +8421,28 @@ main:focus-visible {
   margin-left: 4px;
   font-variant-numeric: tabular-nums;
 }
+
+/* Per-source thumbs-up — atajo para marcar una fuente como correcta
+   sin pasar por el flow de 👎 → cards (2026-05-07). */
+.source-row .source-thumb {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-dim);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 0 6px;
+  border-radius: 4px;
+  opacity: 0;
+  transition: opacity 120ms ease, background 120ms ease, color 120ms ease;
+  line-height: 1;
+}
+.source-row:hover .source-thumb { opacity: 0.6; }
+.source-row .source-thumb:hover { opacity: 1; background: var(--bg-elev); color: var(--green); }
+.source-row .source-thumb.picked {
+  opacity: 1;
+  color: var(--green);
+  background: transparent;
+  border-color: var(--green);
+  cursor: default;
+}
+.source-row .source-thumb:disabled { cursor: default; }

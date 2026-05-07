@@ -11945,6 +11945,21 @@ def _get_local_embedder():
             # alias corto haría que sentence_transformers golpee el HF HEAD
             # endpoint y falle offline.
             _local_embedder = SentenceTransformer("Qwen/Qwen3-Embedding-0.6B", device=_dev)
+            # Cap max_seq_length post-load (2026-05-06 fix root cause):
+            # Qwen3-Embedding default es 8192 tokens; chunks reales casi
+            # nunca pasan de ~500 (chunker token-aware). Sin cap, MPS
+            # aloca attention 8192² × dim para batches grandes →
+            # RuntimeError "Invalid buffer size: 64.00 GiB" en
+            # `index_batch_embed` (reproducido HOY 16:26 con batch=64).
+            # Cap a 512 cubre el 99% de chunks reales sin truncar nada
+            # útil; deja batches grandes seguros. Override:
+            # `RAG_LOCAL_EMBED_MAX_SEQ_LEN`.
+            try:
+                _max_seq = int(os.environ.get("RAG_LOCAL_EMBED_MAX_SEQ_LEN", "512"))
+                if _max_seq > 0:
+                    _local_embedder.max_seq_length = _max_seq
+            except (TypeError, ValueError):
+                _local_embedder.max_seq_length = 512
             # MPS cache cleanup wrapper — mismo patrón que get_reranker()
             # / get_nli_model(). El bge-m3 local hace `encode()` (no
             # `predict()`), pero el comportamiento de MPS es idéntico:
@@ -27818,21 +27833,26 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
 
     # Batching agresivo (2026-05-04): acumular chunks de N notas y mandar
     # `embed()` en batches grandes en lugar de por nota. Reduce el overhead
-    # RPC contra Ollama (mean 522ms / call → mismo costo amortizado sobre
-    # 64 chunks). Para 6157 chunks: 2101 calls → ~100 calls.
+    # del embed call (in-process MPS encode amortiza el setup del kernel
+    # sobre el batch entero). Para 6157 chunks: 2101 calls → ~400 calls.
     #
     # Gateado por `RAG_INDEX_BATCH_EMBEDS` (default ON, "1"). Si rompe
     # algo en el wild, exportar `RAG_INDEX_BATCH_EMBEDS=0` lo restaura
     # al comportamiento legacy (un embed call por nota).
     #
-    # Tamaño configurable via `RAG_INDEX_BATCH_SIZE` (default 64 chunks).
+    # Tamaño configurable via `RAG_INDEX_BATCH_SIZE` (default 16 chunks).
+    # Default bajado de 64 → 16 (2026-05-06): post-Ola 6 in-process MPS
+    # con Qwen3-Embedding seq_len=512 (capeado en `_get_local_embedder()`),
+    # 16 × 512² × 1024 × 4B ≈ 17 GB peak — dentro del cap MPS sin
+    # crashear. Con 64 chunks y seq_len descapeado (8192) explotaba en
+    # 64 GiB (silent_errors.jsonl `index_batch_embed` 16:26-16:28).
     _batch_enabled = os.environ.get(
         "RAG_INDEX_BATCH_EMBEDS", "1"
     ).strip().lower() not in ("0", "false", "no")
     try:
-        _batch_target = int(os.environ.get("RAG_INDEX_BATCH_SIZE", "64"))
+        _batch_target = int(os.environ.get("RAG_INDEX_BATCH_SIZE", "16"))
     except (TypeError, ValueError):
-        _batch_target = 64
+        _batch_target = 16
     if _batch_target < 1:
         _batch_target = 1
 

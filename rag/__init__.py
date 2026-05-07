@@ -2351,7 +2351,7 @@ CHAT_MODEL_PREFERENCE = (
 )
 HELPER_MODEL = "qwen2.5:3b"      # fast, for internal rewrites (multi-query, HyDE, reformulate)
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"  # cross-encoder, multilingual, MPS-friendly
-_COLLECTION_BASE = "obsidian_notes_v11"  # v11: 1024-dim, qwen3-embedding:0.6b (revert A/B 2026-05-06: 4B no aprobado por eval)
+_COLLECTION_BASE = "obsidian_notes_v12"  # v12: 1024-dim, qwen3-embedding:0.6b + pre-split chunker (2026-05-06): líneas >1500 chars se splittean antes del embed → invalida cache v11 (chunks con shape distinta post-split)
 
 # ── Cross-source corpus (Phase 1, 2026-04-20 user decisions §10) ──────────
 # The collection stays at v11 (no rename / no re-embed) — source discrimination
@@ -5818,7 +5818,7 @@ _CORPUS_HASH_BUCKET: int = int(os.environ.get("RAG_CORPUS_HASH_BUCKET", "500"))
 # (PII redaction, raw tool call stripper, iberian leaks, REGLA 1.b/1.c, etc.).
 # Forzando que las entries del semantic cache pre-fix sean "diferente
 # corpus" → no se sirvan más.
-_FILTER_VERSION = "wave9-2026-05-06"
+_FILTER_VERSION = "wave10-2026-05-06"
 
 
 def _hash_chunk_count(chunk_count: int) -> str:
@@ -11511,6 +11511,85 @@ def _compute_parent(body: str, chunk_start: int, chunk_end: int) -> str:
     return body[section_start:section_end].strip()
 
 
+def _split_oversized_lines(text: str, max_chars: int = 1500) -> str:
+    """Pre-split de líneas mayores a `max_chars` antes del chunker.
+
+    Algunos archivos del vault traen líneas individuales de >10k chars
+    (transcripts YouTube emitidos por `youtube_transcript_api` sin newlines,
+    Chrome history dumps con visits concatenados, WhatsApp monthly rollups
+    con eventos en una sola línea). El chunker token-aware procesa OK estas
+    líneas pero el embedder MPS recibe el párrafo entero como UN token
+    sequence, alocando attention proporcional al input real (~38 GB peak
+    para 12k chars / 3000 tokens en Qwen3-Embedding) — satura GPU pool y
+    deja el proceso en `state U` (uninterruptible sleep) sin disparar
+    RuntimeError visible.
+
+    Reproducido HOY 2026-05-06: indexer hangea en ~archivo idx 158-172/635
+    de forma repetible, dejando el corpus al 17% (1062/6000+ chunks vault
+    esperados). El cap `tokenizer.model_max_length=512` (Opción 1) cierra
+    el síntoma del embedder, este pre-split (Opción 2) es defensa en
+    profundidad: garantiza que el chunker, BM25, reranker y cualquier
+    consumer downstream vea contenido con shape razonable.
+
+    Estrategia: si una línea supera `max_chars`, partir por (en orden
+    de preferencia):
+    1. ` · ` (separador común en feeds bullet-style)
+    2. `. ` (fin de oración natural)
+    3. `; ` (separador secundario)
+    4. ` ` (whitespace fallback en chunks de `max_chars`)
+
+    El split mantiene la información — solo agrega `\\n` en boundaries
+    semánticos. Re-encadenable mentalmente por el lector. NO altera
+    archivos del vault (es read-time).
+
+    Caso edge: archivos con código minified (líneas largas legítimas sin
+    separator). El whitespace-cada-N-chars fallback los corta arbitrario,
+    pero el chunker downstream re-merges si quedan demasiado chicos
+    (`MIN_CHUNK` threshold). Aceptable porque el embedder ya no procesa
+    tokens enteros del minified, solo chunks bounded.
+    """
+    out_lines = []
+    for line in text.split("\n"):
+        if len(line) <= max_chars:
+            out_lines.append(line)
+            continue
+        # Split agresivo: probar separators en orden
+        split_done = False
+        for sep in (" · ", ". ", "; "):
+            if sep in line:
+                parts = line.split(sep)
+                buf: list[str] = []
+                cur_len = 0
+                for part in parts:
+                    if cur_len + len(part) > max_chars and buf:
+                        out_lines.append(sep.join(buf))
+                        buf = [part]
+                        cur_len = len(part)
+                    else:
+                        buf.append(part)
+                        cur_len += len(part) + len(sep)
+                if buf:
+                    out_lines.append(sep.join(buf))
+                split_done = True
+                break
+        if not split_done:
+            # Sin separator útil — fallback a chunks fijos por whitespace
+            words = line.split(" ")
+            buf = []
+            cur_len = 0
+            for word in words:
+                if cur_len + len(word) > max_chars and buf:
+                    out_lines.append(" ".join(buf))
+                    buf = [word]
+                    cur_len = len(word)
+                else:
+                    buf.append(word)
+                    cur_len += len(word) + 1
+            if buf:
+                out_lines.append(" ".join(buf))
+    return "\n".join(out_lines)
+
+
 def semantic_chunks(
     text: str, note_title: str, folder: str, tags: list[str], fm: dict,
     context_summary: str = "",
@@ -11552,6 +11631,19 @@ def semantic_chunks(
     # each chunk carries global context in its embedding vector.
     if context_summary:
         prefix = f"{prefix}\nContexto: {context_summary}"
+
+    # Pre-split de líneas mayores a `RAG_CHUNKER_MAX_LINE_CHARS` (default
+    # 1500): defensa en profundidad junto al cap del tokenizer (Opción 1).
+    # Garantiza que el chunker downstream + el embedder + el reranker vean
+    # contenido con shape razonable. NO altera archivos del vault, es
+    # read-time. Override via env var. Bug original 2026-05-06: indexer
+    # hangea silencioso (`state U`) en archivos con líneas de 12k+ chars.
+    try:
+        _max_line = int(os.environ.get("RAG_CHUNKER_MAX_LINE_CHARS", "1500"))
+        if _max_line > 0:
+            text = _split_oversized_lines(text, max_chars=_max_line)
+    except (TypeError, ValueError):
+        text = _split_oversized_lines(text, max_chars=1500)
 
     stripped = text.strip()
     if not stripped:
@@ -11929,8 +12021,28 @@ def _get_local_embedder():
                 _max_seq = int(os.environ.get("RAG_LOCAL_EMBED_MAX_SEQ_LEN", "512"))
                 if _max_seq > 0:
                     _local_embedder.max_seq_length = _max_seq
+                    # Cap también el tokenizer subyacente (Opción 1 fix
+                    # 2026-05-06): sin esto el tokenizer Rust de HF procesa
+                    # el input completo antes de truncar al output cap,
+                    # alocando attention buffers proporcional al input
+                    # original. En archivos con líneas >12k chars (~3000
+                    # tokens en un párrafo, e.g., transcripts YouTube,
+                    # Chrome history dumps), MPS pide ~38 GB transitorio
+                    # que satura GPU pool y deja el proceso en `state U`
+                    # (uninterruptible sleep) sin disparar RuntimeError
+                    # visible. El cap del tokenizer trunca el input ANTES
+                    # de pasar al modelo. Defensa en profundidad junto al
+                    # cap del modelo de la línea anterior.
+                    try:
+                        _local_embedder.tokenizer.model_max_length = _max_seq
+                    except Exception:
+                        pass
             except (TypeError, ValueError):
                 _local_embedder.max_seq_length = 512
+                try:
+                    _local_embedder.tokenizer.model_max_length = 512
+                except Exception:
+                    pass
             # MPS cache cleanup wrapper — mismo patrón que get_reranker()
             # / get_nli_model(). El bge-m3 local hace `encode()` (no
             # `predict()`), pero el comportamiento de MPS es idéntico:

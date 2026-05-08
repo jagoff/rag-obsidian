@@ -46,6 +46,10 @@ def db_env(tmp_path, monkeypatch):
     monkeypatch.setattr(rag, "DB_PATH", tmp_path)
     monkeypatch.setattr(rag, "_SQL_STATE_ERROR_LOG",
                          tmp_path / "sql_state_errors.jsonl")
+    # Reset contradiction priors cache so each test reads fresh from its own DB.
+    monkeypatch.setattr(rag, "_contradiction_priors_cache", None)
+    monkeypatch.setattr(rag, "_contradiction_priors_cache_key_sql", None)
+    monkeypatch.setattr(rag, "_contradiction_priors_cache_loaded_at", None)
     # Pre-create tables so reader doesn't have to.
     conn = _open_db(tmp_path)
     conn.close()

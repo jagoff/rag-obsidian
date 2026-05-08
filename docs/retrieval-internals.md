@@ -32,7 +32,7 @@ Intent dispatch: semantic | synthesis | comparison | count | list | recent | age
 
 **Auto-deep**: cuando `top_score < CONFIDENCE_DEEP_THRESHOLD=0.10`, helper judge sufficiency → sub-query → segundo retrieve → merge. Max 3 iters + 30s wall-time. Disable: `--no-deep`.
 
-**Rerank pool** (`RERANK_POOL_MAX = 15`, dropped from 30 on 2026-04-21): pool=15 domina vs 30 — hit@5 idéntico, MRR chains +5pp, P95 singles -66%. Web `/api/chat` pasa `rerank_pool=5` explícito.
+**Rerank pool** (`RERANK_POOL_MAX = 25`, bumpeado de 15 el 2026-04-25): el set golden creció a n=60 con queries cross-source y pool=15 expulsaba candidatos correctos. Historia: 30→15 (2026-04-21) — pool=15 dominó vs 30: hit@5 idéntico, MRR chains +5pp, P95 singles -66%. Path `retrieve_only` usa `RERANK_POOL_RETRIEVE_ONLY=10`. Web `/api/chat` no-list-intent usa `RAG_WEB_RERANK_POOL=3` (default).
 
 **Corpus cache** (`_load_corpus`): BM25 + vocab built once, invalidated by `col.count()` delta. Cold 341ms → warm 2ms.
 

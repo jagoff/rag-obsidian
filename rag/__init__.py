@@ -4316,6 +4316,16 @@ _behavior_priors_cache_loaded_at: float | None = None
 # function that re-enters (defensive; today's callers don't).
 _behavior_priors_lock = threading.RLock()
 
+# Contradiction priors cache — mismo patrón que behavior priors.
+# La tabla `rag_contradictions` cambia menos frecuentemente que
+# `rag_behavior` (solo el daemon contradiction-radar escribe), por eso
+# TTL más largo: 300s.  Cache key = MAX(ts) en rag_contradictions.
+_contradiction_priors_cache: dict[str, float] | None = None
+_contradiction_priors_cache_key_sql: str | None = None
+_contradiction_priors_cache_loaded_at: float | None = None
+_CONTRADICTION_PRIORS_TTL_SECONDS = 300.0
+_contradiction_priors_lock = threading.RLock()
+
 
 def _compute_behavior_priors_from_rows(rows_iter) -> dict:
     """Fold behavior rows (dict-like, with `event`/`path`/`ts`/`dwell_ms`) into the
@@ -4779,36 +4789,88 @@ def _load_contradiction_priors(
     `_load_behavior_priors` para evitar el corte de 3h al borde del
     window cuando `ts` se inserta en local time (AR=UTC-3) y SQLite
     `'now'` retorna UTC. Audit 2026-04-26 H3.
+
+    Cache: MAX(ts) de `rag_contradictions` como cache key — mismo patrón
+    que `_load_behavior_priors`. TTL 300s (la tabla cambia mucho más
+    despacio que rag_behavior — solo el daemon contradiction-radar
+    escribe). Stale-fallback si retry exhausts. Ambos callers usan
+    defaults (window_days=90, max_paths=5000) → cache simple sin keying.
     """
     import math
-    def _read():
-        with _ragvec_state_conn() as conn:
-            sql = (
-                "SELECT subject_path, COUNT(DISTINCT ts) AS n"
-                " FROM rag_contradictions"
-                " WHERE ts >= datetime('now','localtime',?)"
-                "   AND subject_path IS NOT NULL AND subject_path != ''"
-                " GROUP BY subject_path"
-                " ORDER BY n DESC"
-                " LIMIT ?"
-            )
-            rows = conn.execute(
-                sql, (f"-{int(window_days)} days", int(max_paths))
-            ).fetchall()
-        out: dict[str, float] = {}
-        for r in rows:
-            path = r[0]
-            n = int(r[1] or 0)
-            if not path or n <= 0:
-                continue
-            out[path] = math.log1p(n)
-        return out
+    global _contradiction_priors_cache, _contradiction_priors_cache_key_sql
+    global _contradiction_priors_cache_loaded_at
 
-    result = _sql_read_with_retry(
-        _read, "contradiction_priors_sql_read_failed",
-        default={}, attempts=3,
-    )
-    return result if isinstance(result, dict) else {}
+    with _contradiction_priors_lock:
+        _prefetched_max_ts: str | None = None
+        if (
+            _contradiction_priors_cache is not None
+            and _contradiction_priors_cache_loaded_at is not None
+        ):
+            try:
+                with _ragvec_state_conn() as _conn_ttl:
+                    _curr_max_ts = _sql_max_ts(_conn_ttl, "rag_contradictions")
+                if _curr_max_ts == _contradiction_priors_cache_key_sql:
+                    _contradiction_priors_cache_loaded_at = time.monotonic()
+                    return _contradiction_priors_cache
+                _prefetched_max_ts = _curr_max_ts
+            except Exception:
+                if (
+                    time.monotonic() - _contradiction_priors_cache_loaded_at
+                ) < _CONTRADICTION_PRIORS_TTL_SECONDS:
+                    return _contradiction_priors_cache
+
+        def _read():
+            with _ragvec_state_conn() as conn:
+                max_ts = (
+                    _prefetched_max_ts
+                    if _prefetched_max_ts is not None
+                    else _sql_max_ts(conn, "rag_contradictions")
+                )
+                if max_ts is None:
+                    return ("empty", {}, "")
+                if (
+                    _contradiction_priors_cache is not None
+                    and _contradiction_priors_cache_key_sql == max_ts
+                ):
+                    return ("hit", _contradiction_priors_cache, max_ts)
+                sql = (
+                    "SELECT subject_path, COUNT(DISTINCT ts) AS n"
+                    " FROM rag_contradictions"
+                    " WHERE ts >= datetime('now','localtime',?)"
+                    "   AND subject_path IS NOT NULL AND subject_path != ''"
+                    " GROUP BY subject_path"
+                    " ORDER BY n DESC"
+                    " LIMIT ?"
+                )
+                rows = conn.execute(
+                    sql, (f"-{int(window_days)} days", int(max_paths))
+                ).fetchall()
+            out: dict[str, float] = {}
+            for r in rows:
+                path = r[0]
+                n = int(r[1] or 0)
+                if not path or n <= 0:
+                    continue
+                out[path] = math.log1p(n)
+            return ("rebuilt", out, max_ts)
+
+        _retry_result = _sql_read_with_retry(
+            _read, "contradiction_priors_sql_read_failed",
+            default=None, attempts=3,
+        )
+        if _retry_result is not None:
+            kind, snapshot, max_ts = _retry_result
+            if kind in ("empty", "rebuilt"):
+                _contradiction_priors_cache = snapshot
+                _contradiction_priors_cache_key_sql = max_ts if kind == "rebuilt" else ""
+            _contradiction_priors_cache_loaded_at = time.monotonic()
+            return snapshot
+
+        if _contradiction_priors_cache is not None:
+            _contradiction_priors_cache_key_sql = ""
+            return _contradiction_priors_cache
+
+        return {}
 
 
 class RankerWeights:
@@ -15838,13 +15900,6 @@ def _record_learned_paraphrase(
         return False
 
 
-# Thread-local state que expand_queries() muta para exponer al caller
-# (query()) el delta de typo correction. Se usa lista de 1 elemento para
-# mutabilidad desde una inner function sin `nonlocal`. El GIL garantiza
-# que expand_queries runs serially dentro de cada retrieve() — no hace
-# falta lock. Reset a [None] en cada llamada a expand_queries().
-_expand_last_llm_typo_original: list[str | None] = [None]
-_expand_last_llm_typo_corrected: list[str | None] = [None]
 
 
 _CONTENT_STOPWORDS_ES = frozenset({
@@ -15979,11 +16034,10 @@ def expand_queries(question: str) -> list[str]:
     if corrected_question != question:
         _llm_typo_original_for_log = question
         question = corrected_question
-    # Exponer el delta al caller (query()) via thread-local para logging.
-    # Usamos una variable de módulo protegida por el GIL — expand_queries
-    # corre single-threaded dentro de cada retrieve() call.
-    _expand_last_llm_typo_original[0] = _llm_typo_original_for_log
-    _expand_last_llm_typo_corrected[0] = corrected_question if _llm_typo_original_for_log else None
+    # El delta de typo correction se expone al caller via ContextVar
+    # (_LLM_TYPO_LAST) — thread-safe + asyncio-safe. Seteado por
+    # _correct_typos_llm() y cosechado por _apply_typo_telemetry(rr)
+    # dentro de retrieve()/_final_rr. No se necesita ningún write aquí.
 
     tokens = question.strip().split()
     # Audit 2026-04-26 (L1): consultar cache ANTES del gate de tokens.
@@ -20695,20 +20749,12 @@ class RetrieveResult:
     llm_judge_top_score_after: float = 0.0
     llm_judge_parse_failed: bool = False
     llm_judge_n_candidates: int = 0
-    # Quick Win #4 — LLM typo correction telemetry (2026-05-04, refactor
-    # 2026-05-04 evening): pre-refactor estos campos vivían en variables
-    # de módulo (`_expand_last_llm_typo_original[0]` /
-    # `_expand_last_llm_typo_corrected[0]`) que el web server multi-thread
-    # podía pisar entre requests concurrentes (data race silencioso). El
-    # síntoma medible: 0 rows con `llm_typo_corrected` para `cmd=web` en
-    # 30 días aunque el feature corre por default.
-    #
-    # El fix mueve el state al `RetrieveResult`: `_correct_typos_llm`
-    # escribe a un `ContextVar` (thread-safe + asyncio-safe), `retrieve()`
-    # / `multi_retrieve()` lo cosechan después de `expand_queries()` y
-    # poblan estos campos via `_apply_typo_telemetry(rr)`. `to_log_event`
-    # los exporta al dict del log. Los callers (CLI `query()`, `serve()`,
-    # web `gen()`) leen del `result` en vez de las globals — sin races.
+    # Quick Win #4 — LLM typo correction telemetry (2026-05-04).
+    # `_correct_typos_llm` escribe a `_LLM_TYPO_LAST` (ContextVar,
+    # thread-safe + asyncio-safe). `retrieve()` lo cosecha post-
+    # `expand_queries()` via `_apply_typo_telemetry(rr)` y pobla estos
+    # campos. Callers (CLI `query()`, `serve()`, web `gen()`) leen del
+    # `result` — sin globals mutables, sin races.
     llm_typo_corrected: bool = False
     llm_typo_original: str | None = None
     llm_typo_corrected_text: str | None = None
@@ -29913,11 +29959,6 @@ def query(
         counter=counter,
     )
 
-    # Resetear el estado de LLM typo correction antes de retrieve() para
-    # que el logging al final refleje ESTA query, no una anterior.
-    _expand_last_llm_typo_original[0] = None
-    _expand_last_llm_typo_corrected[0] = None
-
     def _do_retrieve():
         result = retrieve(**_retrieve_kwargs)
         # Auto-deep: if first-pass confidence is borderline, run iterative
@@ -30417,9 +30458,12 @@ def query(
         # via qwen2.5:3b antes del embed. `llm_typo_original` guarda la query
         # antes de la corrección para análisis posterior. Ambos son None si
         # la feature no disparó (query ya correcta o gate OFF).
-        "llm_typo_corrected": _expand_last_llm_typo_original[0] is not None,
-        "llm_typo_original": _expand_last_llm_typo_original[0],
-        "llm_typo_corrected_text": _expand_last_llm_typo_corrected[0],
+        # Leemos de `result` (RetrieveResult): _apply_typo_telemetry(rr)
+        # ya pobló estos campos desde el ContextVar _LLM_TYPO_LAST dentro
+        # de retrieve() — thread-safe, sin globals mutable.
+        "llm_typo_corrected": result.get("llm_typo_corrected", False),
+        "llm_typo_original": result.get("llm_typo_original"),
+        "llm_typo_corrected_text": result.get("llm_typo_corrected_text"),
         # GC#2.A telemetry fix 2026-04-22 — intent lived only in top-level
         # query() state pre-fix; extra_json logging made 97% of rag_queries
         # rows show `intent=NULL`, breaking any analytics on intent share.
@@ -31496,9 +31540,9 @@ def chat(
         except Exception:
             _chat_turn_intent = None
         with console.status("[dim]buscando…[/dim]", spinner="dots"):
-            # Pool default (RERANK_POOL_MAX=15, ver bench 2026-04-21 arriba).
-            # Multi-query (3 variantes) × N vaults genera <15 candidates
-            # únicos post-RRF en mayoría de queries → 15 cubre todo.
+            # Pool default (RERANK_POOL_MAX=25, ver bench 2026-04-25 arriba).
+            # Multi-query (3 variantes) × N vaults genera <25 candidates
+            # únicos post-RRF en mayoría de queries → 25 cubre todo.
             result = multi_retrieve(
                 vaults_resolved, question, k, folder, history, tag, precise,
                 multi_query=_multi_enabled, auto_filter=not no_auto_filter,
@@ -51059,29 +51103,23 @@ def daemons_kickstart_overdue():
     )
 
 
-@cli.command()
-@click.option("--remove", is_flag=True,
-              help="Desinstalar los servicios en lugar de instalarlos")
-def setup(remove: bool):
-    """Instalar (o desinstalar) los servicios launchd que mantienen el RAG vivo
-    sin intervención: `rag watch` (auto-reindex) y `rag digest` (semanal).
-    Idempotente — re-correr lo recarga.
+def _setup_install(
+    rag_bin: str,
+    *,
+    remove: bool = False,
+    only_labels: frozenset[str] | None = None,
+) -> None:
+    """Lógica interna de install/uninstall de los services managed.
+
+    Llamada por el Click command `setup` y por `rag start` (que pasa
+    `only_labels=_MINIMAL_MANAGED_LABELS` cuando el usuario pide `--minimal`).
+
+    Cuando `only_labels` no es None, los labels de `_services_spec()` que
+    NO estén en el set reciben el mismo trato que `_DEPRECATED_LABELS`:
+    bootout + unlink de disco. Semánticamente: "para este run, lo no
+    listado está deprecated".
     """
     import subprocess
-    rag_bin = _rag_binary()
-    if not Path(rag_bin).is_file():
-        console.print(f"[red]No encuentro el binario `rag`:[/red] {rag_bin}")
-        # Incluir el extra `[entities]` por default — sin él, gliner no se
-        # instala en el uv tool venv y los ingesters loggean
-        # `[feature: entities] dep \`gliner\` not available` cada corrida +
-        # la feature de entity-aware retrieval queda desactivada
-        # silenciosamente. Aprendido el 2026-04-25 en una sesión donde los
-        # 5 *.error.log se llenaron de ese warning durante días sin que
-        # nadie lo notara. Si querés MUY mínimo (e.g. CI sin GPU/MPS),
-        # corré `uv tool install --reinstall --editable .` (sin extra) y
-        # exportá `RAG_EXTRACT_ENTITIES=0` para silenciar.
-        console.print("[dim]Instalá primero: uv tool install --reinstall --editable '.[entities]'[/dim]")
-        return
     _LAUNCH_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
     _RAG_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -51116,6 +51154,16 @@ def setup(remove: bool):
                 console.print(f"[green]✓[/green] removido: {label}")
             else:
                 console.print(f"[dim]· no estaba instalado: {label}[/dim]")
+            continue
+        # Filtro `only_labels`: si está set y este label no está adentro,
+        # tratarlo como deprecated (bootout ya hecho arriba + unlink).
+        if only_labels is not None and label not in only_labels:
+            if plist_path.exists():
+                plist_path.unlink()
+                console.print(
+                    f"[dim]·[/dim] skip {label} "
+                    f"[dim](fuera del set mínimo — plist removido del disco)[/dim]"
+                )
             continue
         # Install gates: si falta un pre-requisito (credencial / opt-in file),
         # skipear el install con nota. El plist cargado sin su pre-req solo
@@ -51154,6 +51202,31 @@ def setup(remove: bool):
         except subprocess.CalledProcessError as e:
             stderr = e.stderr.decode(errors="ignore") if e.stderr else ""
             console.print(f"[red]✗[/red] falló cargar {label}: {stderr.strip()}")
+
+
+@cli.command()
+@click.option("--remove", is_flag=True,
+              help="Desinstalar los servicios en lugar de instalarlos")
+def setup(remove: bool):
+    """Instalar (o desinstalar) los servicios launchd que mantienen el RAG vivo
+    sin intervención: `rag watch` (auto-reindex) y `rag digest` (semanal).
+    Idempotente — re-correr lo recarga.
+    """
+    rag_bin = _rag_binary()
+    if not Path(rag_bin).is_file():
+        console.print(f"[red]No encuentro el binario `rag`:[/red] {rag_bin}")
+        # Incluir el extra `[entities]` por default — sin él, gliner no se
+        # instala en el uv tool venv y los ingesters loggean
+        # `[feature: entities] dep \`gliner\` not available` cada corrida +
+        # la feature de entity-aware retrieval queda desactivada
+        # silenciosamente. Aprendido el 2026-04-25 en una sesión donde los
+        # 5 *.error.log se llenaron de ese warning durante días sin que
+        # nadie lo notara. Si querés MUY mínimo (e.g. CI sin GPU/MPS),
+        # corré `uv tool install --reinstall --editable .` (sin extra) y
+        # exportá `RAG_EXTRACT_ENTITIES=0` para silenciar.
+        console.print("[dim]Instalá primero: uv tool install --reinstall --editable '.[entities]'[/dim]")
+        return
+    _setup_install(rag_bin, remove=remove, only_labels=None)
 
     if not remove:
         # Pre-build Apple Contacts disk cache. La primera invocación del
@@ -51231,6 +51304,21 @@ _RAG_NET_LABELS: tuple[str, ...] = (
 _QDRANT_LABELS: tuple[str, ...] = (
     "com.fer.qdrant",
 )
+
+# Set mínimo viable que `rag start --minimal` (default ON desde 2026-05-08)
+# instala. Sin briefs, sin learning loops, sin productividad pasiva — solo
+# lo necesario para que el chat web funcione + watch para que el corpus
+# quede al día + watchdog/wake-hook para self-healing post Mac wake +
+# maintenance para WAL checkpoint y rotación de logs. Los managed que
+# queden afuera reciben el mismo trato que `_DEPRECATED_LABELS` durante el
+# install (bootout + unlink). `rag start --full` instala los 30.
+_MINIMAL_MANAGED_LABELS: frozenset[str] = frozenset({
+    "com.fer.obsidian-rag-watch",
+    "com.fer.obsidian-rag-web",
+    "com.fer.obsidian-rag-daemon-watchdog",
+    "com.fer.obsidian-rag-wake-hook",
+    "com.fer.obsidian-rag-maintenance",
+})
 
 
 def _loaded_launchd_labels(timeout: int = 5) -> set[str]:
@@ -51601,6 +51689,14 @@ def stop(
 
 @cli.command()
 @click.option(
+    "--minimal/--full", "minimal", default=True,
+    help="Mínimo viable (5 daemons: watch/web/daemon-watchdog/wake-hook/"
+         "maintenance) vs full (los 30 de _services_spec, incluyendo briefs, "
+         "learning loops y productividad pasiva). Default: mínimo. Lo NO "
+         "instalado en modo mínimo se bootouts + removido del disco — "
+         "re-correr con `--full` regenera todo.",
+)
+@click.option(
     "--with-rag-net/--without-rag-net", default=True,
     help="Levantar también daemons de RagNet/WhatsApp (whatsapp-bridge/"
          "listener/healthcheck/vault-sync). Default: sí — sin RagNet la UX "
@@ -51635,6 +51731,7 @@ def stop(
 @click.pass_context
 def start(
     ctx: click.Context,
+    minimal: bool,
     with_rag_net: bool,
     with_qdrant: bool,
     start_all: bool,
@@ -51674,12 +51771,23 @@ def start(
         console.print("[dim]Instalá primero: uv tool install --reinstall --editable '.[entities]'[/dim]")
         return
 
-    managed_count = len(_services_spec(rag_bin))
+    spec_total = len(_services_spec(rag_bin))
+    if minimal:
+        only_labels: frozenset[str] | None = _MINIMAL_MANAGED_LABELS
+        managed_count = len(_MINIMAL_MANAGED_LABELS)
+        scope_label = (
+            f"[bold]mínimo[/bold] ({managed_count} de {spec_total}: watch/web/"
+            "daemon-watchdog/wake-hook/maintenance)"
+        )
+    else:
+        only_labels = None
+        managed_count = spec_total
+        scope_label = f"[bold]full[/bold] ({spec_total})"
 
     # ── Preview ──────────────────────────────────────────────────────────
     console.print()
     console.print("[bold]rag start[/bold] — voy a levantar el sistema:")
-    console.print(f"  [dim]·[/dim] obsidian-rag-* (managed): {managed_count} daemons via [cyan]rag setup[/cyan]")
+    console.print(f"  [dim]·[/dim] obsidian-rag-* (managed): {scope_label}")
     if with_rag_net:
         console.print(f"  [dim]·[/dim] RagNet (whatsapp-*)     : {len(_RAG_NET_LABELS)} daemons")
     else:
@@ -51727,7 +51835,27 @@ def start(
                     console.print("  [dim]would-skip[/dim] [harness] no hay default seteado")
             except Exception:
                 pass
-        console.print("  [dim]would-call[/dim] [managed] rag setup")
+        if minimal:
+            installed = sorted(_MINIMAL_MANAGED_LABELS)
+            console.print(
+                f"  [dim]would-install[/dim] [managed-minimal] {len(installed)} labels:"
+            )
+            for lbl in installed:
+                console.print(f"    [dim]·[/dim] {lbl}")
+            removed = sorted(
+                lbl for lbl, _, _ in _services_spec(rag_bin)
+                if lbl not in _MINIMAL_MANAGED_LABELS
+            )
+            if removed:
+                console.print(
+                    f"  [dim]would-remove[/dim] [managed-out-of-scope] "
+                    f"{len(removed)} labels"
+                )
+        else:
+            console.print(
+                f"  [dim]would-install[/dim] [managed-full] "
+                f"{len(_services_spec(rag_bin))} labels"
+            )
         if with_qdrant:
             for lbl in _QDRANT_LABELS:
                 console.print(f"  [dim]would-bootstrap[/dim] [qdrant] {lbl}")
@@ -51774,13 +51902,15 @@ def start(
             console.print(f"[dim]--apply-default falló silenciosamente: {_exc!r}[/dim]")
 
     # ── 1. obsidian-rag-* via setup callback ─────────────────────────────
-    # `setup` regenera los plists desde código (captura overrides del
-    # schedule auto-tune + cualquier cambio en _services_spec) y los
-    # carga vía `launchctl load`. Ya es idempotente.
+    # `_setup_install` regenera los plists desde código (captura overrides
+    # del schedule auto-tune + cualquier cambio en _services_spec) y los
+    # carga vía `launchctl load`. Ya es idempotente. Cuando `minimal=True`,
+    # los labels fuera de `_MINIMAL_MANAGED_LABELS` se bootouts + remueven
+    # del disco (mismo trato que `_DEPRECATED_LABELS`).
     console.print()
     console.print("[bold cyan]▸ obsidian-rag-* (managed daemons)[/bold cyan]")
     try:
-        ctx.invoke(setup, remove=False)
+        _setup_install(rag_bin, remove=False, only_labels=only_labels)
     except Exception as exc:
         console.print(f"[red]✗[/red] setup falló: {exc!r}")
         # No abortar — los externos podrían levantarse igual.

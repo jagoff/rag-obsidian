@@ -138,3 +138,47 @@ def test_services_spec_manual_no_overlap_with_spec():
     manual_labels = {item["label"] for item in rag._services_spec_manual()}
     overlap = managed_labels & manual_labels
     assert not overlap, f"Labels duplicados managed/manual: {overlap}"
+
+
+def test_minimal_managed_labels_subset_of_spec():
+    """`_MINIMAL_MANAGED_LABELS` debe ser subset de los labels de `_services_spec()`.
+
+    Si alguien remueve un daemon del spec sin actualizar `_MINIMAL_MANAGED_LABELS`,
+    `rag start --minimal` (default) intentaría instalar un label que ya no existe.
+    """
+    managed_labels = {label for label, _, _ in _iter_managed_factories()}
+    minimal = rag._MINIMAL_MANAGED_LABELS
+    assert minimal <= managed_labels, (
+        f"_MINIMAL_MANAGED_LABELS tiene labels fuera del spec: "
+        f"{minimal - managed_labels}"
+    )
+    # Mínimo viable per acuerdo 2026-05-08 con el user (rag start clean):
+    # watch + web + daemon-watchdog + wake-hook + maintenance.
+    assert len(minimal) == 5, f"Esperado 5 minimal labels, got {len(minimal)}"
+
+
+def test_setup_install_only_labels_filter(tmp_path, monkeypatch):
+    """`_setup_install(only_labels=X)` instala solo labels en X y skipea el resto.
+
+    Mockea `_LAUNCH_AGENTS_DIR` a tmp_path y `subprocess.run` para evitar
+    `launchctl load` real. Verifica que post-install el directorio tiene
+    SOLO los plists del filtro.
+    """
+    import subprocess as sp
+
+    monkeypatch.setattr(rag, "_LAUNCH_AGENTS_DIR", tmp_path)
+    monkeypatch.setattr(rag, "_RAG_LOG_DIR", tmp_path / "logs")
+    # `launchctl load`/`unload` mock: siempre retorna éxito sin tocar el sistema.
+    monkeypatch.setattr(
+        sp, "run",
+        lambda *a, **kw: sp.CompletedProcess(args=a, returncode=0, stdout=b"", stderr=b""),
+    )
+
+    only = frozenset({
+        "com.fer.obsidian-rag-watch",
+        "com.fer.obsidian-rag-web",
+    })
+    rag._setup_install(_RAG_BIN, remove=False, only_labels=only)
+
+    installed = {p.stem for p in tmp_path.glob("*.plist")}
+    assert installed == only, f"Esperado solo {only}, got {installed}"

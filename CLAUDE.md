@@ -171,7 +171,8 @@ Conftest autouse fixture `_reset_backend_singleton_per_test` resetea el singleto
 uv tool install --reinstall --editable '.[entities,stt,mlx]'
 
 # Bootstrap (idempotente)
-rag start                                                        # levanta todos los daemons + RagNet + catch-up
+rag start                                                        # mínimo viable (5: watch/web/daemon-watchdog/wake-hook/maintenance) + RagNet + catch-up
+rag start --full                                                 # los 30 daemons del spec (briefs + learning loops + cross-source ingest)
 rag stop                                                         # frena todo
 rag health                                                       # snapshot unificado: corpus, latencia, feedback, calibration
 
@@ -294,7 +295,7 @@ Detalle completo del pipeline en [`docs/retrieval-internals.md`](docs/retrieval-
 
 **Confidence gate**: `top_score < 0.015` (CONFIDENCE_RERANK_MIN) + no `--force` → refuse sin LLM call. Per-source override scaffolding existe (`CONFIDENCE_RERANK_MIN_PER_SOURCE`).
 
-**`RERANK_POOL_MAX = 15`** (dropped from 30 on 2026-04-21): pool=15 domina vs 30 — hit@5 idéntico, MRR chains +5pp, P95 singles -66%.
+**`RERANK_POOL_MAX = 25`** (bumpeado de 15 el 2026-04-25): el golden set creció de n=42 a n=60 con queries cross-source (Phase 1.f) y pool=15 expulsaba candidatos correctos del top-15. Bump 15→25 para dar margen al reranker en queries difíciles. Historia: bump original 30→15 (2026-04-21) — pool=15 dominó vs 30 en el set anterior: hit@5 idéntico, MRR chains +5pp, P95 singles -66%. `rag tune` invoca con `k_pool=RERANK_POOL_MAX=25`. Path `retrieve_only` usa `RERANK_POOL_RETRIEVE_ONLY=10` (WhatsApp listener).
 
 **Cache locks**: `_context_cache_lock`, `_synthetic_q_cache_lock`, `_mentions_cache_lock`, `_embed_cache_lock`, `_corpus_cache_lock` (RLock), `_contacts_cache_lock`. LLM calls **outside** lock.
 

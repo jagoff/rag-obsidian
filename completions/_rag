@@ -806,7 +806,8 @@ _rag_cmd_inbox() {
 
 _rag_cmd_index() {
     _arguments \
-        '--reset[Borrar índice antes de reindexar]' \
+        '--full[Re-embed total: borra colección y reindexa todo el vault desde cero]' \
+        '--reset[(deprecated) alias histórico de --full]' \
         '--no-contradict[Saltear el check de contradicciones en notas nuevas/modificadas]' \
         '--source=[Indexar desde una fuente non-vault (whatsapp, calendar, gmail, reminders). Omitir = vault.]:SOURCE:(vault whatsapp gmail calendar reminders contacts bookmarks chrome claude drive github mail moze music reviews spotify youtube)' \
         '--since=[ISO timestamp — acotar el ingest al rango (>=). Solo para sources non-vault.]:SINCE_OPT:' \

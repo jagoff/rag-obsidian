@@ -27,8 +27,8 @@ Todos los comandos de `rag` en un solo lugar. Agrupados por qué hacen, no por o
 Indexa tu vault. Incremental — solo re-procesa notas que cambiaron desde la última corrida.
 
 ```bash
-rag index                           # incremental
-rag index --reset                   # borra y reconstruye todo (lento)
+rag index                           # incremental (default — skip por hash)
+rag index --full                    # borra y reconstruye todo (lento)
 rag index --no-contradict           # saltea el check de contradicciones
 rag index --source whatsapp         # indexa WhatsApp en vez del vault
 rag index --source calendar         # idem para calendario

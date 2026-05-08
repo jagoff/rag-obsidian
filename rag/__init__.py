@@ -28884,7 +28884,12 @@ def _peek_index_lock_holder() -> str:
 
 
 @cli.command()
-@click.option("--reset", is_flag=True, help="Borrar índice antes de reindexar")
+@click.option("--full", "full_flag", is_flag=True,
+              help="Re-embed total: borra la colección y reindexa todo el vault desde cero. "
+                   "Usar tras bump de schema o cambio de modelo. Sin este flag, `rag index` "
+                   "es incremental (skippea archivos cuyo hash no cambió).")
+@click.option("--reset", "reset_legacy", is_flag=True, hidden=True,
+              help="(deprecated) alias histórico de --full. Será removido en una próxima versión.")
 @click.option("--no-contradict", is_flag=True, help="Saltear el check de contradicciones en notas nuevas/modificadas")
 @click.option("--source", "source_opt", default=None,
               help="Indexar desde una fuente non-vault (whatsapp, calendar, gmail, reminders). Omitir = vault.")
@@ -28902,21 +28907,25 @@ def _peek_index_lock_holder() -> str:
 @click.option("--contextual", is_flag=True,
               help="Activar Contextual Retrieval (Anthropic Sept 2024) "
                    "para esta invocación. Setea RAG_CONTEXTUAL_RETRIEVAL=1 "
-                   "internamente. Combinar con --reset para full re-embed "
+                   "internamente. Combinar con --full para full re-embed "
                    "con contextos chunk-level (~1 LLM call por chunk).")
 @click.option("--fast", is_flag=True,
               help="Modo rápido: saltea enriquecimientos LLM opcionales "
                    "(context summary, synthetic questions, contextual retrieval) "
                    "y los pre-syncs cross-source (gmail/calendar/whatsapp/etc). "
-                   "Acelera ~10x el `--reset` full a cambio de un index sin "
+                   "Acelera ~10x el `--full` a cambio de un index sin "
                    "summaries enriquecidos. Los chunks se embeben igual.")
-def index(reset: bool, no_contradict: bool, source_opt: str | None,
+def index(full_flag: bool, reset_legacy: bool, no_contradict: bool, source_opt: str | None,
           since_opt: str | None, dry_run: bool, max_chats: int | None,
           vault_scope: str | None, contextual: bool, fast: bool):
-    """Indexar notas del vault (incremental, detecta cambios por hash).
+    """Indexar notas del vault — **incremental por default**, detecta cambios por hash.
+
+    Skippea cualquier archivo cuyo content-hash matchee lo ya indexado. Para
+    forzar un re-embed total (tras bump de schema o cambio de modelo), pasar
+    `--full`: borra la colección y reindexa el vault entero desde cero.
 
     En el camino incremental, cada nota nueva o modificada pasa por un check
-    de contradicciones contra el resto del vault. Con `--reset` se omite
+    de contradicciones contra el resto del vault. Con `--full` se omite
     (full reindex haría O(n²) llamadas al helper). `--no-contradict` lo
     saltea también en incremental.
 
@@ -28930,6 +28939,18 @@ def index(reset: bool, no_contradict: bool, source_opt: str | None,
     gatean por vault — solo corren en el target canónico para no
     contaminar vaults secundarios con notas MOZE/WA/Gmail/etc.
     """
+    # `--reset` queda como alias deprecated de `--full`. Si el caller pasa
+    # el flag legacy, advertimos por stderr y propagamos al path canónico.
+    # El nombre interno `reset` se mantiene a partir de acá para no tocar
+    # las ~30 referencias internas del cuerpo (docstrings, branch checks,
+    # `_run_index(reset=...)` call, etc.) en este commit.
+    if reset_legacy and not full_flag:
+        click.echo(
+            "[deprecated] --reset es alias histórico de --full y será removido. "
+            "Usá `rag index --full` en scripts y plists.",
+            err=True,
+        )
+    reset = full_flag or reset_legacy
     # Process-level mutex: aborta limpio si ya hay otro `rag index` activo.
     # El `--no-contradict` zombie del 2026-05-01 + el plist `ingest-safari`
     # disparándose en paralelo era la combinación tóxica que dejaba al

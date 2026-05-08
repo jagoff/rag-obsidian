@@ -13126,7 +13126,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             _purged_files_src: list[str] = []
             for _idx, _m in enumerate(_metas_in):
                 _f = _m.get("file", "") if isinstance(_m, dict) else ""
-                _vp = _m.get("_vault", "") if isinstance(_m, dict) else ""
+                _vp = _m.get("_vault_path", "") if isinstance(_m, dict) else ""
                 _is_vault_md = bool(_f) and _f.endswith(".md") and not _f.startswith("_")
                 if _is_vault_md:
                     _root = _PathSrc(_vp) if _vp else _PathSrc(VAULT_PATH)
@@ -13354,7 +13354,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             _purged_files: list[str] = []
             for _d, _m in zip(_docs, _metas):
                 _file_rel = _m.get("file", "") if isinstance(_m, dict) else ""
-                _vault_path = _m.get("_vault", "") if isinstance(_m, dict) else ""
+                _vault_path = _m.get("_vault_path", "") if isinstance(_m, dict) else ""
                 _abs = None
                 if _file_rel:
                     _root = _PathStale(_vault_path) if _vault_path else _PathStale(VAULT_PATH)

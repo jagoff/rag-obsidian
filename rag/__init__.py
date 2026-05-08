@@ -15831,6 +15831,102 @@ _expand_last_llm_typo_original: list[str | None] = [None]
 _expand_last_llm_typo_corrected: list[str | None] = [None]
 
 
+_CONTENT_STOPWORDS_ES = frozenset({
+    "el","la","los","las","un","una","unos","unas","de","del","al","a","en",
+    "con","por","para","que","qué","cuál","cual","cuáles","cuales","cómo","como",
+    "dónde","donde","cuándo","cuando","cuánto","cuanto","quién","quien","es","son",
+    "fue","ser","estar","está","esta","este","estos","estas","ese","esa","eso",
+    "esos","esas","mi","mis","tu","tus","su","sus","yo","vos","tú","nos","nosotros",
+    "vosotros","ustedes","ellos","ellas","tengo","tienes","tenes","tenés","tiene",
+    "tienen","hay","hubo","hubieron","fue","fueron","sé","sabes","sabes","sabe",
+    "saben","sabés","y","o","u","ni","pero","sin","sobre","bajo","tras","contra",
+    "ante","durante","mediante","si","sí","no","más","mas","menos","muy","mucho",
+    "poco","todo","todos","todas","toda","ningún","ninguna","alguien","algo",
+    "vault","obsidian","notas","nota","archivo","archivos","sistema",
+    "buscar","busca","busco","buscame","buscá","encontrar","encuentro","encontrame",
+    "dame","decime","mostrame","fijate","muestra","leé","abrí","explicame",
+    "info","sobre","acerca","respecto","relativo","relativa","relativos","relativas",
+})
+
+
+def _extract_content_keywords(question: str) -> str:
+    """Extract content tokens (non-stopwords) from question.
+
+    Devuelve la query reducida a las palabras significativas. Cubre el
+    caso "Hay poemas en la vault?" → "poemas" — el embedder enfoca en
+    el keyword sin diluir con prosa funcional.
+
+    Returns empty string si no quedan tokens útiles.
+    """
+    if not question:
+        return ""
+    tokens = re.findall(r"\w+", question, flags=re.UNICODE)
+    out: list[str] = []
+    for t in tokens:
+        if len(t) < 3:
+            continue
+        if t.lower() in _CONTENT_STOPWORDS_ES:
+            continue
+        out.append(t)
+    return " ".join(out)
+
+
+def _spanish_singular_variants(question: str) -> list[str]:
+    """Generate singular variants by demorphologizing Spanish plurals.
+
+    Cheap, no-LLM. Reglas básicas:
+      - words ending in 'es' (≥4 chars): drop 'es' (poemas→poema, redes→red,
+        flores→flor). Skip "es" if it's a stopword.
+      - words ending in 'as' / 'os' (≥4 chars): drop 's' (notas→nota,
+        gastos→gasto).
+      - words ending in 'ces': replace with 'z' (luces→luz, voces→voz).
+
+    Returns up to 1 variant string (the original question with each
+    morphological-plural word swapped for its singular). Empty list if no
+    plural-like words found or variant equals original.
+
+    Conservative: solo aplica cuando hay ≥1 palabra con sufijo plural y la
+    palabra restante tiene ≥3 chars (evita false-positives sobre stopwords
+    "los"/"las"/"es"). NO LLM, NO cache, ~50µs.
+    """
+    if not question:
+        return []
+    _VOWELS = set("aeiouáéíóúü")
+    tokens = re.split(r"(\s+|\W+)", question)
+    out: list[str] = []
+    changed = False
+    for t in tokens:
+        low = t.lower()
+        # Skip stopwords + función-words conjugados (sabes, tenes, ves, ...)
+        # — `_CONTENT_STOPWORDS_ES` ya cubre verbos comunes en 2da persona.
+        if low in _CONTENT_STOPWORDS_ES or len(low) < 4:
+            out.append(t)
+            continue
+        if low.endswith("ces") and len(low) >= 5:
+            out.append(t[:-3] + "z")
+            changed = True
+        elif low.endswith("es") and len(low) >= 5:
+            # Discriminación: "frases" (e antes de s = vowel-stem) → "frase"
+            # vs "redes" (d antes de es = consonant-stem) → "red".
+            stem_char = low[-3]
+            if stem_char in _VOWELS:
+                out.append(t[:-1])  # drop just 's' → frase
+            else:
+                out.append(t[:-2])  # drop 'es' → red
+            changed = True
+        elif low.endswith(("as", "os")) and len(low) >= 4:
+            out.append(t[:-1])
+            changed = True
+        else:
+            out.append(t)
+    if not changed:
+        return []
+    variant = "".join(out)
+    if variant.strip().lower() == question.strip().lower():
+        return []
+    return [variant]
+
+
 def expand_queries(question: str) -> list[str]:
     """Generate 2 paraphrases for multi-query retrieval. Returns [original, p1, p2].
 
@@ -15887,6 +15983,15 @@ def expand_queries(question: str) -> list[str]:
     if hit is not None:
         return list(hit)
     if len(tokens) < _EXPAND_MIN_TOKENS:
+        # Cheap morphological fallback (2026-05-08): Spanish queries con
+        # plurales NO matchean títulos en singular — el embedder qwen3
+        # distingue "poemas" vs "poema" como vectores distintos. Bug:
+        # "Hay poemas en la vault?" → top score 0.03 (noise) aunque exista
+        # `Poema - Invictus.md`. Generar variant singular como fallback
+        # zero-LLM. Activado siempre que skipeamos el LLM expand.
+        variants_singular = _spanish_singular_variants(question)
+        if variants_singular:
+            return [question, *variants_singular]
         return [question]
     # Learned-paraphrases short-circuit: if we have ≥2-hit paraphrases
     # for this exact query, use them and skip the LLM call.
@@ -15941,6 +16046,15 @@ def expand_queries(question: str) -> list[str]:
         kept.append(ln)
         if len(kept) >= 2:
             break
+    # Augment with cheap morphological singular variants (Spanish plurals).
+    # Aplica AUNQUE el LLM expand haya devuelto variants — el LLM tiende a
+    # parafrasear vocabulario sin tocar morfología (poemas → poemas en otra
+    # frase), pero el embedder distingue plural/singular. La variant
+    # singular barata cubre ese gap zero-cost. Idempotente vía dedup.
+    sing = _spanish_singular_variants(question)
+    for s in sing:
+        if s and s not in kept and s != question:
+            kept.append(s)
     result = [question] + kept
     with _expand_cache_lock:
         cache[question] = result
@@ -21898,6 +22012,41 @@ def retrieve(
                 variants = expand_queries(search_query)
             except Exception:
                 variants = [search_query]
+        # Build keyword + singular variants. PRIORIDAD: queries más
+        # focalizadas (keyword extraction + singular morphology) van
+        # PRIMERO en el orden de variants — la lista RRF acumula IDs
+        # en orden de primera aparición y trunca a `_effective_pool`
+        # (default 25). Si la query original llena el pool con noise,
+        # los chunks relevantes de las variants específicas no llegan
+        # al reranker. Bug "Hay poemas en la vault?" — la query larga
+        # devolvía chunks irrelevantes que llenaban el pool antes que
+        # variant `poema` pudiera surfacear `Poema - Invictus.md`.
+        _front_variants: list[str] = []
+        try:
+            _kw = _extract_content_keywords(search_query)
+            if _kw and _kw.strip().lower() != search_query.strip().lower():
+                _front_variants.append(_kw)
+                for _ks in _spanish_singular_variants(_kw):
+                    if _ks:
+                        _front_variants.append(_ks)
+        except Exception:
+            pass
+        try:
+            for _sing in _spanish_singular_variants(search_query):
+                if _sing:
+                    _front_variants.append(_sing)
+        except Exception:
+            pass
+        # Insert front_variants before the original (which is variants[0]).
+        # Dedup keeps the first occurrence order.
+        if _front_variants:
+            seen_v = set()
+            new_variants: list[str] = []
+            for v in [*_front_variants, *variants]:
+                if v and v not in seen_v:
+                    seen_v.add(v)
+                    new_variants.append(v)
+            variants = new_variants
 
     # 4. Retrieve per variant, union IDs.
     #    Non-HyDE path: batch-embed all variants en un solo encode().

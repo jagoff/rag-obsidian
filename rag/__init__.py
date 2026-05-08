@@ -12188,11 +12188,8 @@ def _load_pytorch_embedder():
             try:
                 return _orig_encode(*args, **kwargs)
             finally:
-                try:
-                    import torch as _torch
-                    _torch.mps.empty_cache()
-                except Exception:
-                    pass
+                # MLX-aware: skipea cuando backend full-MLX (no-op).
+                _torch_mps_empty_cache()
 
         model.encode = _encode_with_cleanup
     return model
@@ -14802,11 +14799,8 @@ def get_reranker():
                 try:
                     return _orig_predict(*args, **kwargs)
                 finally:
-                    try:
-                        import torch as _torch
-                        _torch.mps.empty_cache()
-                    except Exception:
-                        pass
+                    # MLX-aware: skipea cuando backend full-MLX (no-op).
+                    _torch_mps_empty_cache()
             _reranker.predict = _predict_with_cleanup
     return _reranker
 
@@ -14849,15 +14843,8 @@ def maybe_unload_reranker(force: bool = False) -> bool:
                 pass
             del _reranker
             _reranker = None
-            try:
-                import torch
-                if torch.backends.mps.is_available():
-                    torch.mps.empty_cache()
-            except Exception:
-                # MPS cache drop is best-effort — torch may not be
-                # importable (Intel mac) or MPS backend may be down.
-                # Failing here just means VRAM is freed on next GC cycle.
-                pass
+            # MLX-aware: skipea cuando backend full-MLX (MLX maneja propio cache).
+            _torch_mps_empty_cache()
             gc.collect()
         except Exception as exc:
             # Called out in code-review-followup as a site where silent
@@ -15431,7 +15418,21 @@ def _periodic_mps_cache_drop_loop(interval: int) -> None:
 def _torch_mps_empty_cache() -> None:
     """Best-effort MPS cache drop. No-op si torch/MPS no está disponible
     (Intel mac o ambiente sin MPS).
+
+    MLX-aware (2026-05-08): cuando AMBOS backends son MLX (post-Ola 9 default),
+    `torch.mps.empty_cache()` invalida los Metal command buffers de MLX en
+    ejecución → GPU Hang Error reproducible determinísticamente. En ese caso
+    es no-op — MLX maneja su propia cache (`mx.clear_cache()`).
+
+    Override manual: `RAG_FORCE_MPS_EMPTY_CACHE=1` (rollback al comportamiento
+    histórico). Solo necesario si el operador todavía tiene un consumidor
+    PyTorch/MPS pinned (ej. reranker bge en MPS) y necesita drop explícito.
     """
+    embed_backend = os.environ.get("RAG_EMBED_BACKEND", "mlx").strip().lower()
+    llm_backend = os.environ.get("RAG_LLM_BACKEND", "mlx").strip().lower()
+    force = os.environ.get("RAG_FORCE_MPS_EMPTY_CACHE", "").strip().lower() in ("1", "true", "yes")
+    if (embed_backend == "mlx" and llm_backend == "mlx") and not force:
+        return
     try:
         import torch
         if torch.backends.mps.is_available():
@@ -15488,10 +15489,30 @@ def start_memory_pressure_watchdog() -> bool:
         # fragmentada cada N segundos. Si el operador desactiva el watchdog
         # de pressure (RAG_MEMORY_PRESSURE_DISABLE=1) el cache drop también
         # se desactiva — son la misma defensa de memoria.
+        #
+        # MLX-aware (2026-05-08): cuando el embedder corre en MLX (post-Ola 9
+        # default), `torch.mps.empty_cache()` corriendo en thread paralelo
+        # invalida los Metal command buffers de MLX → GPU Hang Error en
+        # `rag index` (`kIOGPUCommandBufferCallbackErrorHang/InnocentVictim`).
+        # Reproducido determinísticamente 2026-05-08 con 6 retries idénticos.
+        # Cuando ambos backends son MLX, skipeamos el daemon — MLX maneja su
+        # propia cache (`mx.clear_cache()`). Solo activamos cuando todavía
+        # hay un consumidor PyTorch/MPS pinned (ej. reranker bge en MPS).
+        embed_backend = os.environ.get("RAG_EMBED_BACKEND", "mlx").strip().lower()
+        llm_backend = os.environ.get("RAG_LLM_BACKEND", "mlx").strip().lower()
+        mlx_only = (embed_backend == "mlx" and llm_backend == "mlx")
         try:
             mps_interval = int(os.environ.get("RAG_MPS_CACHE_DROP_INTERVAL", "60"))
         except ValueError:
             mps_interval = 60
+        if mlx_only and "RAG_MPS_CACHE_DROP_INTERVAL" not in os.environ:
+            # Auto-skip cuando backend full-MLX y el operador no forzó override.
+            mps_interval = 0
+            print(
+                "[mps-cache-drop] skipped (RAG_{EMBED,LLM}_BACKEND=mlx) — "
+                "evita conflict con Metal command buffers de MLX",
+                flush=True,
+            )
         if mps_interval > 0:
             t_mps = threading.Thread(
                 target=_periodic_mps_cache_drop_loop,
@@ -28426,18 +28447,30 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
     # del embed call (in-process MPS encode amortiza el setup del kernel
     # sobre el batch entero). Para 6157 chunks: 2101 calls → ~400 calls.
     #
-    # Gateado por `RAG_INDEX_BATCH_EMBEDS` (default ON, "1"). Si rompe
-    # algo en el wild, exportar `RAG_INDEX_BATCH_EMBEDS=0` lo restaura
-    # al comportamiento legacy (un embed call por nota).
+    # Gateado por `RAG_INDEX_BATCH_EMBEDS`. Default depende del backend
+    # (MLX-aware desde 2026-05-08 — bug GPU Hang en batched path):
+    #
+    #   - PyTorch/MPS embedder (`RAG_EMBED_BACKEND=pytorch`): default ON.
+    #     El batched path acumula chunks de N notas y manda `embed()` en
+    #     batches grandes. Reduce overhead del kernel setup MPS y baja
+    #     2101→400 calls para 6157 chunks.
+    #   - MLX embedder (default post-Ola 9): default OFF. El batched path
+    #     dispara `[METAL] Command buffer execution failed` reproducible
+    #     determinísticamente cuando llega al primer flush con archivos
+    #     mixed-len + URL indexing en cascada (bug 2026-05-08, 7 retries
+    #     idénticos a 447-468/681). El path no-batched (un embed por nota)
+    #     funciona en 49s para 4 archivos stale + 405 URLs.
+    #
+    # Override manual: `RAG_INDEX_BATCH_EMBEDS=1` fuerza el batched path
+    # aunque MLX (no recomendado hasta que se patche el flush_batch).
+    # `=0` fuerza no-batched aunque PyTorch.
     #
     # Tamaño configurable via `RAG_INDEX_BATCH_SIZE` (default 16 chunks).
-    # Default bajado de 64 → 16 (2026-05-06): post-Ola 6 in-process MPS
-    # con Qwen3-Embedding seq_len=512 (capeado en `_get_local_embedder()`),
-    # 16 × 512² × 1024 × 4B ≈ 17 GB peak — dentro del cap MPS sin
-    # crashear. Con 64 chunks y seq_len descapeado (8192) explotaba en
-    # 64 GiB (silent_errors.jsonl `index_batch_embed` 16:26-16:28).
+    # Solo aplica cuando batched está ON.
+    _embed_backend = os.environ.get("RAG_EMBED_BACKEND", "mlx").strip().lower()
+    _batch_default = "0" if _embed_backend == "mlx" else "1"
     _batch_enabled = os.environ.get(
-        "RAG_INDEX_BATCH_EMBEDS", "1"
+        "RAG_INDEX_BATCH_EMBEDS", _batch_default
     ).strip().lower() not in ("0", "false", "no")
     try:
         _batch_target = int(os.environ.get("RAG_INDEX_BATCH_SIZE", "16"))
@@ -28522,11 +28555,10 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
         # 2026-05-06 PID 29718). Combinado con
         # `start_memory_pressure_watchdog()` arriba para defensa en
         # profundidad.
-        try:
-            import torch as _torch
-            _torch.mps.empty_cache()
-        except Exception:
-            pass
+        # MLX-aware: `_torch_mps_empty_cache()` no-op cuando backend full-MLX
+        # (post-Ola 9 default) — invalidar Metal command buffers desde Python
+        # mientras MLX está procesando un batch produce GPU Hang Error.
+        _torch_mps_empty_cache()
 
     try:
         for path in md_files:
@@ -51901,7 +51933,42 @@ def start(
         except Exception as _exc:
             console.print(f"[dim]--apply-default falló silenciosamente: {_exc!r}[/dim]")
 
-    # ── 1. obsidian-rag-* via setup callback ─────────────────────────────
+    # ── 1. Catch-up incremental index (ANTES de bootstrap daemons) ───────
+    # MLX-aware reorder (2026-05-08): el catch-up corre PRIMERO porque el
+    # web/watch bootstrappados cargan MLX en sus propios procesos vía
+    # warmup_async, y co-residency MLX × N procesos triggerea
+    # `[METAL] Command buffer execution failed` reproducible
+    # determinísticamente (memoria 94a2a13e). Antes el orden era:
+    # 1) setup_install daemons → 2) externos → 3) catch-up index.
+    # El índex era el ÚLTIMO con web/watch ya cargando MLX en paralelo.
+    # Ahora corre el index PRIMERO con el proceso `rag start` solo, y
+    # DESPUÉS bootstrappa daemons (que pueden ir cargando MLX
+    # tranquilamente sin conflicto).
+    if not no_index:
+        console.print()
+        console.print("[bold cyan]▸ catch-up index (incremental)[/bold cyan]")
+        try:
+            ctx.invoke(
+                index,
+                reset=False,
+                no_contradict=False,
+                source_opt=None,
+                since_opt=None,
+                dry_run=False,
+                max_chats=None,
+                vault_scope=None,
+            )
+        except SystemExit as e:
+            if e.code != 0:
+                console.print(
+                    "[yellow]·[/yellow] catch-up skip "
+                    "(otro `rag index` activo, retry manual con `rag index`)"
+                )
+        except Exception as exc:
+            console.print(f"[yellow]·[/yellow] catch-up falló: {exc!r}")
+            _silent_log("rag_start_index_failed", exc)
+
+    # ── 2. obsidian-rag-* via setup callback ─────────────────────────────
     # `_setup_install` regenera los plists desde código (captura overrides
     # del schedule auto-tune + cualquier cambio en _services_spec) y los
     # carga vía `launchctl load`. Ya es idempotente. Cuando `minimal=True`,
@@ -51962,40 +52029,6 @@ def start(
                     label=label, action="bootstrap",
                     exit_code=result["exit_code"], reason="rag start (failed)",
                 )
-
-    # ── 3. Catch-up incremental index ────────────────────────────────────
-    # Por qué: `rag setup` cargó el watcher pero éste solo escucha file
-    # system events EN VIVO — si la Mac estuvo dormida o el watcher no
-    # corría, los archivos editados en ese período no se reindexan
-    # automáticamente. Un `rag index` incremental (hash-based) cubre el
-    # gap. Sincrónico para que el user vea el output en tiempo real.
-    #
-    # El comando `index` ya tiene su propio process-lock (300s wait); si
-    # otro `rag index` arrancó por un cron justo ahora, este invoke
-    # espera o falla limpio con sys.exit(1) — lo capturamos.
-    if not no_index:
-        console.print()
-        console.print("[bold cyan]▸ catch-up index (incremental)[/bold cyan]")
-        try:
-            ctx.invoke(
-                index,
-                reset=False,
-                no_contradict=False,
-                source_opt=None,
-                since_opt=None,
-                dry_run=False,
-                max_chats=None,
-                vault_scope=None,
-            )
-        except SystemExit as e:
-            if e.code != 0:
-                console.print(
-                    "[yellow]·[/yellow] catch-up skip "
-                    "(otro `rag index` activo, retry manual con `rag index`)"
-                )
-        except Exception as exc:
-            console.print(f"[yellow]·[/yellow] catch-up falló: {exc!r}")
-            _silent_log("rag_start_index_failed", exc)
 
     # ── Summary ──────────────────────────────────────────────────────────
     console.print()
@@ -63368,11 +63401,8 @@ def get_nli_model():
                     try:
                         return _orig_nli_predict(*args, **kwargs)
                     finally:
-                        try:
-                            import torch as _torch
-                            _torch.mps.empty_cache()
-                        except Exception:
-                            pass
+                        # MLX-aware: skipea cuando backend full-MLX (no-op).
+                        _torch_mps_empty_cache()
                 _nli_model.predict = _nli_predict_with_cleanup
         except Exception as exc:
             _silent_log("nli_load_failed", exc)

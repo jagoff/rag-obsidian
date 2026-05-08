@@ -230,10 +230,15 @@ Catálogo completo (47+ vars adicionales) en [`docs/env-vars-catalog.md`](docs/e
 - `RAG_LLM_BACKEND` — único valor soportado: `mlx` (default). El valor `ollama` queda como compat alias: loguea warning + cae a MLX.
 - `RAG_MLX_IDLE_TTL` (default 1800s), `RAG_MLX_IDLE_DISABLE=1`.
 
+**Indexing**:
+- `RAG_INDEX_BATCH_EMBEDS` — gobierna el batched embed path en `_run_index_inner` (`_flush_batch`). **MLX-aware default desde 2026-05-08**: cuando `RAG_EMBED_BACKEND=mlx` (default Ola 9), default `0` (path no-batched). Cuando `RAG_EMBED_BACKEND=pytorch`, default `1` (batched, como antes). El batched path en MLX dispara `[METAL] Command buffer execution failed` reproducible; no-batched (un embed por nota) anda en 35s para vault de 681 archivos con 4 stale + 405 URLs. Override manual: `=1` fuerza batched aunque MLX (desaconsejado hasta patch real del flush_batch).
+- `RAG_INDEX_BATCH_SIZE` — solo aplica cuando batched ON. Default 16 chunks.
+
 **Performance + memoria**:
 - `RAG_LLM_KEEP_ALIVE=-1` (default forever). Compat alias: `OLLAMA_KEEP_ALIVE` (legacy plists). MLX in-process — no-op pero el value se sigue propagando como kwarg al backend para preservar la firma con call sites históricos. El clamp por modelo grande (`_LARGE_CHAT_MODELS`) fue removido en Ola 8 — MLX maneja eviction propio (LRU + idle-unload watchdog).
 - `RAG_MEMORY_PRESSURE_DISABLE=1` — desactiva watchdog (default ON, threshold 85%, interval 60s). Bajo pressure: unload chat + force-unload reranker (bypassa `RAG_RERANKER_NEVER_UNLOAD`).
 - `RAG_RERANKER_NEVER_UNLOAD=1` — pina reranker en MPS VRAM. Cost ~2-3 GB.
+- `RAG_FORCE_MPS_EMPTY_CACHE=1` — fuerza `torch.mps.empty_cache()` aunque backend sea full-MLX. Default: skip cuando `RAG_EMBED_BACKEND=mlx` Y `RAG_LLM_BACKEND=mlx` para evitar invalidar command buffers MLX (bug 2026-05-08, GPU Hang Error reproducible). Activar solo si tenés reranker bge en MPS pinned y necesitás drop explícito.
 - `RAG_RERANKER_IDLE_TTL=900` — segundos idle-unload.
 - `RAG_LOCAL_EMBED=1` — in-process embedder (set en plists web + serve, auto-set en CLI query-like). NO en indexing/watch.
 - `RAG_LOCAL_EMBED_WAIT_MS=6000` — budget Event ready antes de raise (post-Ola 6: no hay fallback, solo el path local).

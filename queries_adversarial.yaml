@@ -1,241 +1,178 @@
 queries:
-- question: qué herramienta de gestión del tiempo usa covey
+- question: qué kpi calcula el tiempo de realización del valor
   expected:
-  - 02-Areas/Coaching/Contenido/Ideas contenido.md
-- question: qué porcentaje calcula para el overrun
+  - 02-Areas/Coaching/Contenido/OKR - Agile quest.md
+- question: niveles ingresos para audiencia de lujo
   expected:
-  - 04-Archive/Companies/Moka/Moka - Agenda PM.md
-- question: qué tipo de cambio maneja el modelo de kübler-ross
+  - 04-Archive/Companies/02 BBI/BBI - Segmentacion futuros clientes.md
+- question: nda en qué mail
   expected:
-  - 02-Areas/Personal/Letras - Escritos/Quotes  Frases.md
-- question: rutinas saludables para reducir estrés
-  expected:
-  - 04-Archive/Companies/Moka/Ingresos/Moka - Pasantes Catolica.md
-- question: cómo reducir el tamaño de imágenes jpg
-  expected:
-  - 04-Archive/Companies/Moka/Estandares/Standard - Chequeo de performance.md
-- question: qué hacer para verificar urls absolutas en staging
-  expected:
-  - 04-Archive/Companies/Moka/Estandares/Standard - Chequear que no queden urls absolutas
-    apuntando a staging.md
-- question: marketing holístico para redes sociales
-  expected:
-  - 04-Archive/Companies/02 BBI/BBI - Copywrite.md
-- question: qué configuración ajustó para el axe fx iii
-  expected:
-  - 02-Areas/Personal/Guitar/Guitar - AXE FX 3.md
-- question: seguridad web inyección sql low hanging fruit
-  expected:
-  - 02-Areas/Personal/Cursos/Curso Master en ciberseguridad - Cronograma.md
-- question: qué esperaba matilde
-  expected:
-  - 02-Areas/Personal/Letras - Escritos/Quotes  Frases.md
-- question: cuándo se implementa un world cafe
-  expected:
-  - 03-Resources/Agile/Unfix.md
-- question: cómo bbi busca talento para ventas
-  expected:
-  - 04-Archive/Companies/02 BBI/BBI - Busqueda lider de ventas.md
-- question: cuánto cuesta y cómo pagar el transporte anibal
-  expected:
-  - 02-Areas/Personal/Moto - Yamaha R6 - Datos - Services.md
-- question: qué beneficios genera moka para mantener la empresa en funcionamiento
-  expected:
-  - 04-Archive/Companies/Moka/HHRR/Moka - The 3 strikes policy.md
-- question: revisar checklist de l10 y headlines para mejorar calidad de meeting
-  expected:
-  - 04-Archive/Companies/Moka/Moka - LVL10.md
-- question: qué desafíos del negocio para resolver
-  expected:
-  - 04-Archive/Companies/Moka/Moka - LVL10.md
-- question: qué tipo de contenido para redes sociales
-  expected:
-  - 04-Archive/Companies/02 BBI/BBI - Role play closers 1.md
-- question: cómo configurar newsletter para proyectos
-  expected:
-  - 04-Archive/Companies/Moka/Estandares/Standard - Listado básico de necesidades
-    aplicable a cualquier proyecto.md
-- question: cómo verificar cambios en www.escobarford.com.ar
+  - 04-Archive/Companies/Moka/Ingresos/Moka - Ingresos - Mail pre-onboarding.md
+- question: qué sitios tienen vulnerabilidades desactualizadas
   expected:
   - 04-Archive/Companies/Moka/Estandares/Standard - Pentesting.md
-- question: transparencia en sueldos para proyectar gastos
+- question: capacitación paso a paso de cómo funcionan ventas
   expected:
-  - 04-Archive/Companies/Moka/1 a 1/Moka team - Gibi 1-1.md
-- question: horario fer cambios
+  - 04-Archive/Companies/02 BBI/1 a 1/BBI - Tom 1 a 1.md
+- question: qué tipo de relación queremos tener con cada segmento de clientes
   expected:
-  - 02-Areas/Ingles/Ingles.md
-- question: qué hace nag con actualizaciones de wordpress
-  expected:
-  - 04-Archive/Companies/Moka/Estandares/Standard - Lineamientos generales Moka.md
+  - 04-Archive/Companies/02 BBI/BBI - Business Model Canvas.md
 - question: cómo tocar down in a hole por partes
   expected:
   - 02-Areas/Personal/Guitar/Guitar.md
-- question: habilidades para liderazgo eficaz
+- question: descongelamiento cómo movimiento reforzar
+  expected:
+  - 02-Areas/Coaching/Fer Coach.md
+- question: qué diseño de losas para piscina elegir
+  expected:
+  - 04-Archive/Companies/02 BBI/BBI - Role Play (Piletas).md
+- question: sirve @2x para thumbnails
+  expected:
+  - 04-Archive/Companies/Moka/Estandares/Standard - Chequeo de performance.md
+- question: qué hace un experto en metodologías ágiles
+  expected:
+  - 02-Areas/Coaching/Fer coach - Bio.md
+- question: qué hacer para introducir un tema en una sesión de trabajo
+  expected:
+  - 03-Resources/Tech/Chat GPT prompts.md
+- question: sos la sal de este mar en puente
+  expected:
+  - 01-Projects/Album-Muros-Fractales/Letra - Sal - Acordes.md
+- question: urgencia cambio crear
+  expected:
+  - 02-Areas/Coaching/Contenido/Art - Modelos organizacionales.md
+- question: quién actualiza w3-total-cache
+  expected:
+  - 04-Archive/Companies/Moka/Estandares/Standard - Pentesting.md
+- question: por qué es difícil mantenerse contento en el trabajo de andres
+  expected:
+  - 04-Archive/Companies/Moka/1 a 1/Moka - 1 a 1 - Octubre.md
+- question: disfunciones equipo exitoso
+  expected:
+  - 02-Areas/Coaching/Fer Coach.md
+- question: qué buscaban en los pm para incorporar
+  expected:
+  - 04-Archive/Companies/Moka/Ingresos/Moka - Notas recruitment.md
+- question: qué módulo se llama user manager en el webinar anterior
+  expected:
+  - 04-Archive/Companies/Flowing Code - Vadin.md
+- question: qué framework agile usa para mejorar workflow de equipo
+  expected:
+  - 01-Projects/Video-Content-Branding/Personal - Identidad.md
+- question: flexibilidad horaria qué ofrece la agencia
+  expected:
+  - 04-Archive/Companies/Moka/Wordpress/Moka - Busqueda - Programador PHP con solidos
+    conocimientos en WordPress.md
+- question: respiración consciente qué
+  expected:
+  - 01-Projects/Charla-Ansiedad-Laboral/Coaching - Charla sobre Ansiedad y Estres
+    en el ambito Laboral.md
+- question: por qué no 4 horas de trabajo
+  expected:
+  - 04-Archive/Companies/Moka/Old/Moka - 4 days work week.md
+- question: cómo manejar conflictos en equipo
+  expected:
+  - 01-Projects/Curso-Liderazgo-Estrategico/Coaching - Curso de liderazgo.md
+- question: qué back-end en wordpress
+  expected:
+  - 04-Archive/Companies/Moka/Wordpress/Moka - Busqueda - Programador PHP con solidos
+    conocimientos en WordPress.md
+- question: backup cron job centos
+  expected:
+  - 04-Archive/Companies/Moka/Old/Compass Fairs - Cron  Crontab settings.md
+- question: desventajas de la política de aumento de sueldos
+  expected:
+  - 04-Archive/Companies/Moka/HHRR/Moka - Sobre la politica de ajuste de sueldo.md
+- question: sugerencias de respuestas para chatbots
+  expected:
+  - 04-Archive/Companies/02 BBI/BBI - New services ideas.md
+- question: como estructurar ingresos para startups
+  expected:
+  - 02-Areas/Coaching/Fer coach - Bio.md
+- question: rutinas saludables para reducir estrés
+  expected:
+  - 04-Archive/Companies/Moka/Ingresos/Moka - Pasantes Catolica.md
+- question: qué revela el reflejo de sangre
+  expected:
+  - 01-Projects/Exploraciones-Musicales-2026/Ascension Polimetrica.md
+- question: libertad de trabajo, presion con clientes pesados
+  expected:
+  - 04-Archive/Companies/Moka/1 a 1/Moka - 1 a 1 - Octubre.md
+- question: qué hace lean inception con el ecosistema de código flujo
+  expected:
+  - 03-Resources/Agile/Unfix.md
+- question: configuración profesional y experiencia de usuario para compra
+  expected:
+  - 04-Archive/Companies/02 BBI/BBI - Paquetes páginas web.md
+- question: política ajuste sueldo moka
+  expected:
+  - 04-Archive/Companies/Moka/HHRR/Moka - Sobre la politica de ajuste de sueldo.md
+- question: qué feedback revisar para meeting
+  expected:
+  - 04-Archive/Companies/Moka/KPIs/Moka - Level 10 Ops.md
+- question: activos vs pasivos qué
   expected:
   - 02-Areas/Coaching/Contenido/Guia para Convertirte en Millonario.md
+- question: qué herramienta de gestión del tiempo usa covey
+  expected:
+  - 02-Areas/Coaching/Contenido/Ideas contenido.md
+- question: cómo conservar la belleza entre los dedos
+  expected:
+  - 02-Areas/Personal/Letras - Escritos/El eco plomizo - Gerard Manley Hopkins.md
+- question: urgencia cambio cómo crear
+  expected:
+  - 04-Archive/Companies/Crombie/Crombie - Propuesta consultoria.md
 - question: me siento motivada para terminar tarea antes y disfrutar tarde con amigos
   expected:
   - 02-Areas/Personal/Articulos/Articulos - Como trabajar de lunes a jueves y no morir
     en el intento.md
-- question: enfocarse en el aprendizaje para crecimiento
+- question: configurar vary para imágenes
   expected:
-  - 01-Projects/Curso-Liderazgo-Estrategico/Coaching - Curso de liderazgo.md
-- question: cómo promover la comunicación en el equipo
+  - 04-Archive/Companies/Moka/Estandares/Standard - Add Expires headers  Leverage
+    browser caching.md
+- question: agile adaptación start-up qué
   expected:
-  - 04-Archive/Companies/Moka/HHRR/Moka - Training benefit.md
+  - 01-Projects/Video-Content-Branding/Personal - Identidad.md
+- question: problemas viendo para mejorar trabajo
+  expected:
+  - 04-Archive/Companies/Moka/1 a 1/Moka - 1 a 1 - Octubre.md
+- question: qué hace pablo en soporte
+  expected:
+  - 04-Archive/Companies/Moka/Old/Moka - FODA 2017.md
+- question: qué experimentó moka para reducir horas de trabajo
+  expected:
+  - 04-Archive/Companies/Moka/Old/Moka - How to work from Monday to Thursday and not
+    die trying.md
 - question: miniatura para previsualizar theme
   expected:
   - 04-Archive/Companies/Moka/Estandares/Standard - Listado básico de necesidades
     aplicable a cualquier proyecto.md
-- question: discutir items de agenda para próxima reunión de uno a uno
+- question: qué frase usaban para motivarse en el experimento
   expected:
-  - 04-Archive/Companies/Moka/1 a 1/Moka team - Flor 1-1.md
+  - 02-Areas/Personal/Articulos/How to work from Monday to Thursday and not die trying.md
 - question: configurar perfil notion
   expected:
   - 04-Archive/Companies/Moka/Ingresos/Moka - Onboarding notion.md
-- question: agile adaptación start-up qué
-  expected:
-  - 01-Projects/Video-Content-Branding/Personal - Identidad.md
-- question: sos la sal de este mar en puente
-  expected:
-  - 01-Projects/Album-Muros-Fractales/Letra - Sal - Acordes.md
-- question: qué transformación agile promueve
-  expected:
-  - 01-Projects/Video-Content-Branding/Personal - Identidad.md
-- question: qué mejorar para aumentar la eficacia de la presentación digital
-  expected:
-  - 04-Archive/Companies/Moka/Sales/Moka - OKR Ventas.md
-- question: balance librería familia
-  expected:
-  - 02-Areas/Personal/Articulos/Articulos - Como trabajar de lunes a jueves y no morir
-    en el intento.md
-- question: qué manejar el estrés con la matriz covey
+- question: qué mediré para mis metas de comunicación
   expected:
   - 01-Projects/Curso-Liderazgo-Estrategico/Coaching - Curso de liderazgo.md
-- question: introducción video qué destacar
-  expected:
-  - 01-Projects/Video-Content-Branding/Personal - Identidad.md
-- question: qué obstáculos están encontrando en su proceso de mejora
-  expected:
-  - 04-Archive/Companies/Moka/Sales/Moka - Sales.md
-- question: cómo respirar transforma el dolor en conciencia
-  expected:
-  - 01-Projects/Exploraciones-Musicales-2026/Que queda cuando no queda nada (Rap version).md
-- question: nginx cómo expires gzip vary
-  expected:
-  - 04-Archive/Companies/Moka/Old/Moka - Server setup Stack.md
-- question: técnica seo específica para backlinks
-  expected:
-  - 04-Archive/Companies/02 BBI/BBI - Role play closers 1.md
-- question: qué influyó en la mejora del grupo en la primera prueba
-  expected:
-  - 04-Archive/Companies/Moka/Old/Moka - 4 days work week.md
-- question: paquete yerba mate precio
-  expected:
-  - 04-Archive/Companies/Moka/Old/Moka - Cajas navidad 2022.md
-- question: cómo se formó rafael
-  expected:
-  - 02-Areas/Grecia/Grecia - Carta campamento escolar.md
-- question: cómo configurar cuenta alternativa google
-  expected:
-  - 04-Archive/Companies/Moka/Ingresos/Moka - Alta de usuarios nuevos.md
-- question: qué moka tiene años de experiencia
-  expected:
-  - 04-Archive/Companies/Moka/Moka -  Brand voice guidelines.md
-- question: qué tipo de guitar y fx usan
-  expected:
-  - 02-Areas/Personal/Guitar/Guitar.md
-- question: por qué es difícil mantenerse contento en el trabajo de andres
-  expected:
-  - 04-Archive/Companies/Moka/1 a 1/Moka - 1 a 1 - Octubre.md
-- question: hashtags para aumentar seguidores
-  expected:
-  - 03-Resources/Agile/Objetivos SMART.md
-- question: cómo recuperar urls de una página
-  expected:
-  - 04-Archive/Companies/Moka/QA/QA - Open Graph.md
-- question: qué bug afectó el diseño de la página de landing
-  expected:
-  - 04-Archive/Companies/02 BBI/BBI - Status de finalizacion de consultoria.md
-- question: notion ux configuración
-  expected:
-  - 03-Resources/Info/Info - Notion templates.md
-- question: qué es nps cuando es solo de una vez
-  expected:
-  - 04-Archive/Companies/Moka/KPIs/Moka - KPI Satisfacción de equipo (TSAT).md
-- question: qué metodologías agile usa para startups
-  expected:
-  - 02-Areas/Coaching/Fer coach - Bio.md
-- question: por qué querríamos 4 días de trabajo
-  expected:
-  - 04-Archive/Companies/Moka/Old/Moka - How to work from Monday to Thursday and not
-    die trying.md
-- question: cortinas qué tamaño
-  expected:
-  - 02-Areas/Personal/Home - Cortinas.md
-- question: qué hacer con horas sobrantes en proyectos
-  expected:
-  - 04-Archive/Companies/Moka/Estandares/Standard - Lineamientos generales Moka.md
-- question: qué impacto positivo logró moka con su 4d laboral
-  expected:
-  - 02-Areas/Personal/Articulos/How to work from Monday to Thursday and not die trying.md
-- question: servicios digitales qué
-  expected:
-  - 04-Archive/Companies/02 BBI/BBI - Mail bienvenida.md
-- question: qué hace moka para que mis ideas se hagan realidad
-  expected:
-  - 04-Archive/Companies/Moka/Moka -  Brand voice guidelines.md
-- question: cómo configurar acceso akash
-  expected:
-  - 04-Archive/Companies/Moka/Ingresos/Moka - Akash accesos.md
-- question: qué estrategia integral para marketing digital
-  expected:
-  - 04-Archive/Companies/02 BBI/BBI - Status de finalizacion de consultoria.md
-- question: motivación empleados qué
-  expected:
-  - 01-Projects/Curso-Liderazgo-Estrategico/Coaching - Curso de liderazgo.md
-- question: qué ofrece para proyectos de piscinas
-  expected:
-  - 04-Archive/Companies/02 BBI/BBI - Role Play (Piletas).md
-- question: qué framework agile usa para mejorar workflow de equipo
-  expected:
-  - 01-Projects/Video-Content-Branding/Personal - Identidad.md
-- question: qué tecnologías abiertas usar para mejor gasto de pago
-  expected:
-  - 04-Archive/Companies/Moka/1 a 1/Moka team - 1 a 1.md
-- question: cómo iniciar reuniones con dinámicas sencillas
-  expected:
-  - 02-Areas/Coaching/Contenido/Estructuras liberadoras.md
-- question: qué convenció al equipo de la idea principal
-  expected:
-  - 04-Archive/Companies/Moka/Old/Moka - How to work from Monday to Thursday and not
-    die trying.md
-- question: config wp 301 para https
-  expected:
-  - 04-Archive/Companies/Moka/Wordpress/Wordpress - Setup for HTTPS Configuration.md
-- question: urgencia cambio crear
+- question: urgencia y liderazgo en cambio
   expected:
   - 02-Areas/Coaching/Contenido/Art - Modelos organizacionales.md
-- question: valores moka equipo
+- question: introducción musical y bienvenida
   expected:
-  - 04-Archive/Companies/Moka/Ingresos/Moka - Alta de usuarios nuevos.md
-- question: habrá pruebas de 3 meses
+  - 01-Projects/Podcast-Coaching-Ep01/Podcast - Episodio 01 - Coaching.md
+- question: quién debe agregar al maquetador
   expected:
-  - 04-Archive/Companies/02 BBI/BBI - Mail bienvenida.md
-- question: qué número de teléfono para grecia
+  - 04-Archive/Companies/Moka/Estandares/Standard - Preparar material para maquetadores
+    externo.md
+- question: qué es tvp en desarrollo de software
   expected:
-  - 02-Areas/Grecia/Grecia - Cumple.md
-- question: cómo se funde la realidad en la nada
+  - 03-Resources/Agile/Unfix.md
+- question: nordstrom innovación lab qué
   expected:
-  - 01-Projects/Exploraciones-Musicales-2026/Que queda cuando no queda nada (Rap version).md
-- question: configurar analytics para pruebas de producción
+  - 02-Areas/Personal/Cursos/Curso - PSU.md
+- question: qué aumenta sin criterio logico
   expected:
-  - 04-Archive/Companies/Moka/Estandares/Standard - Chequeo de pre-lanzamiento.md
-- question: qué encontrarás en la lista de canciones
-  expected:
-  - 02-Areas/Personal/Guitar/Guitar.md
-- question: cómo reducir distracciones externas
-  expected:
-  - 01-Projects/Charla-Ansiedad-Laboral/Coaching - Charla sobre Ansiedad y Estres
-    en el ambito Laboral.md
+  - 04-Archive/Companies/Moka/HHRR/Moka - Sobre la politica de ajuste de sueldo.md
 chains: []

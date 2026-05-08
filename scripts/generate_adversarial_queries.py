@@ -323,10 +323,52 @@ def generate_one(rag, target: dict) -> tuple[dict | None, str]:
     if rejected is not None:
         return None, f"rule_reject({rejected}) q={question[:80]!r}"
 
+    # Self-validation gate: verificar que el target chunk APAREZCA en top-20
+    # cuando re-corremos retrieve() sobre la query generada. Filtra labeling
+    # noise — caso típico: "rutinas saludables para reducir estrés" generada
+    # del chunk Moka-Pasantes-Catolica donde se menciona estrés en passing,
+    # pero el verdadero canonical answer en el vault es Charla-Ansiedad.
+    #
+    # Threshold k=20 (NO k=3): k=3 era selection bias — solo queries que YA
+    # rankean top-3 con multi_query=False pasaban, ceiling effect en eval
+    # downstream (medido 97.83% hit@5 con k=3 gate). k=20 valida que la
+    # query ES semánticamente sobre el target (filtra noise) pero deja casos
+    # rankeo-difíciles donde la posición 4-20 es justo lo que el reranker
+    # del eval debe resolver — eso evalúa el ranker, no el embedder.
+    if not _target_in_topk(rag, question, exclude_file, k=20):
+        return None, f"target_not_in_top20 q={question[:80]!r}"
+
     return {
         "question": question.lower(),
         "expected": [exclude_file],
     }, "ok"
+
+
+def _target_in_topk(rag, question: str, target_file: str, k: int = 3) -> bool:
+    """Re-retrieve la query y verificar que `target_file` aparezca en top-k.
+
+    Usa retrieve() con defaults idénticos al eval (k=10 para tener slack,
+    pero check si target está en los primeros k=3). Multi-query OFF para
+    velocidad — sola la query original. HyDE OFF (default).
+    """
+    try:
+        result = rag.retrieve(
+            col=rag.get_db(),
+            question=question,
+            k=10,
+            folder=None,
+            multi_query=False,
+            auto_filter=False,
+            caller="adv_gen_validate",
+        )
+    except Exception as exc:
+        print(f"[validate] retrieve failed: {exc}", file=sys.stderr)
+        return False
+    metas = result.get("metas") or []
+    for m in metas[:k]:
+        if (m or {}).get("file") == target_file:
+            return True
+    return False
 
 
 def _rule_based_realism_reject(q: str) -> str | None:

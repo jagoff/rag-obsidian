@@ -13108,6 +13108,43 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             for rel in _mention_paths
         ]
 
+        # Stale-chunk purge ANTES de emitir sources (2026-05-08): el index
+        # contiene chunks de notas movidas a `.trash/`. La fast-path purge
+        # downstream los filtra del LLM context, pero sources event los
+        # mostraba al user → desconcierto ("ves la nota en sources, LLM
+        # dice no encontré nada"). Filtrar acá unifica ambas vistas.
+        # Override: RAG_CONTEXT_PURGE_STALE=0.
+        if (
+            os.environ.get("RAG_CONTEXT_PURGE_STALE", "1").strip()
+            not in ("0", "false", "no")
+        ):
+            from pathlib import Path as _PathSrc
+            _docs_in = result.get("docs") or []
+            _metas_in = result.get("metas") or []
+            _scores_in = result.get("scores") or []
+            _keep_idx: list[int] = []
+            _purged_files_src: list[str] = []
+            for _idx, _m in enumerate(_metas_in):
+                _f = _m.get("file", "") if isinstance(_m, dict) else ""
+                _vp = _m.get("_vault", "") if isinstance(_m, dict) else ""
+                _is_vault_md = bool(_f) and _f.endswith(".md") and not _f.startswith("_")
+                if _is_vault_md:
+                    _root = _PathSrc(_vp) if _vp else _PathSrc(VAULT_PATH)
+                    if not (_root / _f).exists():
+                        _purged_files_src.append(_f)
+                        continue
+                _keep_idx.append(_idx)
+            if _purged_files_src:
+                print(
+                    f"[sources-purge-stale] removed={len(_purged_files_src)} "
+                    f"files={_purged_files_src[:3]}",
+                    flush=True,
+                )
+                result["metas"] = [_metas_in[i] for i in _keep_idx]
+                result["scores"] = [_scores_in[i] for i in _keep_idx]
+                if _docs_in:
+                    result["docs"] = [_docs_in[i] for i in _keep_idx if i < len(_docs_in)]
+
         yield _sse("sources", {
             "items": (
                 []

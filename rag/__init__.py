@@ -4968,6 +4968,22 @@ _TITLE_MATCH_STOPWORDS = frozenset({
     "no", "si", "sí", "mas", "más", "muy", "tambien", "también",
     "se", "le", "les", "me", "te", "nos", "os", "yo", "tu", "vos",
     "mi", "mis", "tus", "su", "sus", "ya", "muy",
+    # Verbos auxiliares + funcionales (alta frecuencia, no son parte de
+    # títulos). Bug 2026-05-08: "Hay X en mis notas?" diluía coverage
+    # del título X porque "hay" / "notas" / "vault" no estaban acá.
+    "hay", "tengo", "tenes", "tenés", "tiene", "tienen",
+    "sabes", "sabe", "saben", "sabés",
+    "puedo", "puede", "podes", "podés",
+    "quiero", "queres", "querés", "necesito",
+    "buscar", "busca", "buscame", "busco", "busc",
+    "encontrar", "encontrame", "encuentro", "encuentra",
+    "dame", "decime", "mostrame", "fijate", "explicame",
+    "leer", "leeme", "leé", "lee", "abrir", "abrí",
+    # Vault/sistema vocabulary que el user usa en queries pero no es
+    # parte de títulos.
+    "vault", "obsidian", "nota", "notas", "archivo", "archivos",
+    "sistema", "info", "informacion", "información",
+    "acerca", "respecto", "relativo",
     # English: determiners, conjunctions, prepositions, WH, auxiliaries
     "of", "the", "an", "to", "at", "on", "for", "with", "from", "as",
     "by", "into", "out", "is", "are", "was", "were", "be", "been",
@@ -22525,6 +22541,30 @@ def retrieve(
             _tm = _title_match_score(question, meta)
             if _tm > 0.0:
                 final += weights.title_match * _tm
+                # Full-coverage exact-match bonus (2026-05-08): cuando el
+                # title contiene TODOS los tokens significativos del query
+                # Y el query es corto (≤4 tokens significativos), aplicar
+                # un boost adicional. Bug observado: queries tipo "Hay X
+                # en mis notas?" donde el reranker prefiere otra nota por
+                # match semántico cross-related (ej. "Dinamicas grupales"
+                # → "Moka - Notas 1 a 1" ranqueaba más alto). El boost
+                # cubre el gap típico (0.1-0.3) que el title_match weight
+                # solo (0.265 max) no puede cerrar. Override:
+                # `RAG_TITLE_EXACT_BONUS=0` desactiva.
+                if _tm >= 0.999:
+                    try:
+                        _q_tok_count = len(_tokenize_for_title_match(question))
+                    except Exception:
+                        _q_tok_count = 0
+                    if 1 <= _q_tok_count <= 4:
+                        try:
+                            _exact_bonus = float(os.environ.get(
+                                "RAG_TITLE_EXACT_BONUS", "0.5"
+                            ))
+                        except ValueError:
+                            _exact_bonus = 0.5
+                        if _exact_bonus > 0:
+                            final += _exact_bonus
         # Graph PageRank: notes with more inbound wikilinks are more
         # authoritative. Score is normalised [0,1] via rank/max_rank.
         # Feature #6: if personalized PPR was computed for this query,

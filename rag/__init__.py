@@ -14795,8 +14795,24 @@ def get_reranker():
         # que necesiten determinismo del MPS allocator).
         if device == "mps" and os.environ.get("RAG_RERANKER_NO_CLEANUP", "").strip() not in ("1", "true", "yes"):
             _orig_predict = _reranker.predict
+            # Forward lock global — comparte con MLXBackend chat/embed
+            # (`_MLX_FORWARD_LOCK`). reranker bge corre en PyTorch MPS, NO MLX,
+            # pero comparte el mismo Metal device físico — un `predict()` en
+            # paralelo a un forward MLX de chat o embed colisiona en el
+            # command-buffer driver y dispara `kIOGPUCommandBufferCallback
+            # ErrorHang` (memo `obsidian_rag_web_service_gpu_hang_loop`,
+            # 2026-05-06, residual). Importamos lazy para no acoplar el
+            # CLI standalone al import de mlx_lm.
+            try:
+                from rag.llm_backend import _MLX_FORWARD_LOCK as _fwd_lock
+            except Exception:
+                _fwd_lock = None
+
             def _predict_with_cleanup(*args, **kwargs):
                 try:
+                    if _fwd_lock is not None:
+                        with _fwd_lock:
+                            return _orig_predict(*args, **kwargs)
                     return _orig_predict(*args, **kwargs)
                 finally:
                     # MLX-aware: skipea cuando backend full-MLX (no-op).

@@ -167,7 +167,15 @@ class MLXEmbedder:
     def _encode_batch(self, texts: list[str]) -> np.ndarray:
         """Forward MLX único sobre `texts` con padding RIGHT al max_len del
         batch. Devuelve `(B, D)` fp32 numpy normalizado L2.
+
+        El forward (línea `model.model(...)` + `mx.eval`) corre bajo
+        `_MLX_FORWARD_LOCK` (rag.llm_backend) — mismo lock que MLXBackend
+        chat/embed/generate — para evitar colisión Metal con otro forward
+        concurrente del mismo proceso (memo
+        `obsidian_rag_web_service_gpu_hang_loop`, web home-refresh).
         """
+        from rag.llm_backend import _MLX_FORWARD_LOCK
+
         assert _mx is not None and self._model is not None
         ids_list, lengths = self._tokenize_truncated(texts)
         max_len = max(lengths)
@@ -176,17 +184,18 @@ class MLXEmbedder:
             pad_id = getattr(self._mlx_tokenizer, "eos_token_id", None) or 0
         padded = [ids + [int(pad_id)] * (max_len - len(ids)) for ids in ids_list]
         ids_arr = _mx.array(padded)
-        # Backbone forward (sin lm_head). Devuelve hidden states (B, T, D).
-        h = self._model.model(ids_arr)
-        batch_idx = _mx.arange(len(texts))
-        last_idx = _mx.array([L - 1 for L in lengths])
-        last = h[batch_idx, last_idx, :]  # (B, D)
-        norm = _mx.linalg.norm(last, axis=-1, keepdims=True)
-        # Guard contra division-by-zero: norm 0 implica hidden state nulo
-        # (no debería pasar en práctica, pero el wrapper aplica un floor).
-        emb = last / (norm + 1e-12)
-        emb_fp32 = emb.astype(_mx.float32)
-        _mx.eval(emb_fp32)
+        with _MLX_FORWARD_LOCK:
+            # Backbone forward (sin lm_head). Devuelve hidden states (B, T, D).
+            h = self._model.model(ids_arr)
+            batch_idx = _mx.arange(len(texts))
+            last_idx = _mx.array([L - 1 for L in lengths])
+            last = h[batch_idx, last_idx, :]  # (B, D)
+            norm = _mx.linalg.norm(last, axis=-1, keepdims=True)
+            # Guard contra division-by-zero: norm 0 implica hidden state nulo
+            # (no debería pasar en práctica, pero el wrapper aplica un floor).
+            emb = last / (norm + 1e-12)
+            emb_fp32 = emb.astype(_mx.float32)
+            _mx.eval(emb_fp32)
         return np.array(emb_fp32)
 
     def encode(

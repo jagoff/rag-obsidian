@@ -268,6 +268,19 @@ class LLMBackend(ABC):
 
 
 # ---------------------------------------------------------------------------
+# Forward lock global — serializa cualquier inference Metal MLX in-process
+# (chat / chat_stream / generate / embed). Compartido por MLXBackend y
+# por MLXEmbedder (rag/mlx_embed.py) para que un forward de embed y uno de
+# chat NO colisionen en el mismo device. Sin este lock, el ThreadPool de
+# `_home_compute` (web/server.py) lanza ~14 fetchers concurrentes — varios
+# invocan MLX → command buffers Metal colisionan → kIOGPUCommandBufferCallback
+# ErrorHang + InnocentVictim. El cold-load (`_load`) queda fuera del lock
+# para que cargas paralelas de modelos distintos no se serialicen.
+# ---------------------------------------------------------------------------
+_MLX_FORWARD_LOCK = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
 # MLXBackend
 # ---------------------------------------------------------------------------
 
@@ -354,6 +367,14 @@ class MLXBackend(LLMBackend):
         # so concurrent `chat()` calls on already-resident models don't block
         # behind a 3-8s cold load running in another thread.
         self._loaded_lock = threading.RLock()
+        # Forward lock compartido a nivel módulo (`_MLX_FORWARD_LOCK`) — el
+        # mismo lock vive en `rag.mlx_embed.MLXEmbedder` para que un embed y
+        # un chat NO colisionen en Metal. Memo `obsidian_rag_web_service_gpu_hang_loop`
+        # (2026-05-06): residual del web crash loop por concurrencia MLX en
+        # `_home_compute`. El HTTP shim resuelve qwen2.5:7b puntual (proc aparte);
+        # este lock cubre lo que queda in-process. NO toca `_load()` — solo el
+        # forward — para que cold-load en otro thread no serialice contra forwards.
+        self._forward_lock = _MLX_FORWARD_LOCK
         self._last_used: dict[str, float] = {}
         self._watchdog_thread: threading.Thread | None = None
         self._watchdog_stop = threading.Event()
@@ -505,7 +526,8 @@ class MLXBackend(LLMBackend):
         prompt = self._apply_chat_template(
             tokenizer, messages, format=format, tools=tools,
         )
-        text = self._mlx_generate(mlx_model, tokenizer, prompt, opts)
+        with self._forward_lock:
+            text = self._mlx_generate(mlx_model, tokenizer, prompt, opts)
         self._bump_last_used(model)
 
         tool_calls = None
@@ -566,27 +588,34 @@ class MLXBackend(LLMBackend):
             mx.random.seed(opts.seed)
 
         short_name = to_short_name(model)
-        for response in stream_generate(
-            mlx_model,
-            tokenizer,
-            prompt,
-            max_tokens=opts.num_predict,
-            sampler=sampler,
-            prefill_step_size=128,
-        ):
+        # acquire/release explícito (no `with`) para garantizar que el lock se
+        # libera incluso si el caller corta el iterador antes del done=True
+        # (GeneratorExit) — el `finally` corre en ambos paths.
+        self._forward_lock.acquire()
+        try:
+            for response in stream_generate(
+                mlx_model,
+                tokenizer,
+                prompt,
+                max_tokens=opts.num_predict,
+                sampler=sampler,
+                prefill_step_size=128,
+            ):
+                yield ChatResponse(
+                    model=short_name,
+                    message=Message(role="assistant", content=response.text),
+                    done=False,
+                )
+
+            self._bump_last_used(model)
             yield ChatResponse(
                 model=short_name,
-                message=Message(role="assistant", content=response.text),
-                done=False,
+                message=Message(role="assistant", content=""),
+                done=True,
+                done_reason="stop",
             )
-
-        self._bump_last_used(model)
-        yield ChatResponse(
-            model=short_name,
-            message=Message(role="assistant", content=""),
-            done=True,
-            done_reason="stop",
-        )
+        finally:
+            self._forward_lock.release()
 
     def generate(
         self,
@@ -598,7 +627,8 @@ class MLXBackend(LLMBackend):
     ) -> Any:
         opts = options or ChatOptions()
         mlx_model, tokenizer = self._load(model)
-        text = self._mlx_generate(mlx_model, tokenizer, prompt, opts)
+        with self._forward_lock:
+            text = self._mlx_generate(mlx_model, tokenizer, prompt, opts)
         return GenerateResponse(
             model=to_short_name(model),
             response=text,
@@ -947,8 +977,10 @@ class MLXBackend(LLMBackend):
 
         batch_size = input_ids.shape[0]
 
-        # Forward pass through the embedding body (bypass lm_head)
-        hidden = embed_model.model(input_ids)  # (batch, seq, hidden_dim)
+        # Forward pass through the embedding body (bypass lm_head). Bajo el
+        # lock global para no colisionar con un chat MLX concurrente.
+        with self._forward_lock:
+            hidden = embed_model.model(input_ids)  # (batch, seq, hidden_dim)
 
         # Last-real-token pooling. For each row find the index of the last
         # non-pad token. `attention_mask` is 1 for real tokens, 0 for pads.

@@ -34250,7 +34250,17 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool,
     # so an unwritable DB never breaks the CLI. `/api/home._fetch_eval_trend`
     # tails the last N entries to surface drift against the CLAUDE.md baseline.
     # SQL-only since T10.
-    if singles_snap or chains_snap:
+    #
+    # Auto-skip cuando --file ≠ queries.yaml: el trend gobierna el floor del
+    # nightly auto-rollback (`rag tune --online`). Runs sobre datasets
+    # alternos (queries_adversarial.yaml, sweeps ad-hoc) NO deben mezclarse
+    # con la baseline canónica — distinto N + query distribution, contamina
+    # el hit@5 de gating.
+    _is_default_eval_file = (
+        path.name == "queries.yaml"
+        and path.parent == pathlib.Path.cwd()
+    )
+    if (singles_snap or chains_snap) and _is_default_eval_file:
         entry = {"ts": datetime.now().isoformat(timespec="seconds")}
         if singles_snap:
             entry["singles"] = singles_snap

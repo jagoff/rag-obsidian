@@ -423,6 +423,14 @@ class MLXBackend(LLMBackend):
 
         Llamado por el watchdog daemon. Mantiene `_loaded`, `_loaded_embed`
         y `_last_used` en sync. No-op si TTL <= 0.
+
+        Bug Hunt 2026-05-08 H1: el path previo sólo hacía `_loaded.pop()`
+        sin `mx.clear_cache()`. En Apple Silicon, Metal mantiene las
+        wired pages aunque el OrderedDict drop-eé las refs Python — el
+        VRAM nunca se libera bajo idle, sólo bajo memory pressure
+        watchdog. Fix: replicar el pattern de `unload()` (clear cache +
+        gc) fuera del lock cuando se evictó algo. También cleanup de
+        `_last_used` orfanas (Bug Hunt M2).
         """
         if self._idle_ttl <= 0:
             return
@@ -437,6 +445,27 @@ class MLXBackend(LLMBackend):
                 self._loaded.pop(mid, None)
                 self._loaded_embed.pop(mid, None)
                 self._last_used.pop(mid, None)
+            # Cleanup keys orfanas en _last_used (Bug Hunt M2): si un
+            # `unload(model)` previo pop-eó de los dicts pero falló al
+            # limpiar `_last_used`, se queda atorada.
+            orphan = [
+                mid for mid in list(self._last_used)
+                if mid not in self._loaded and mid not in self._loaded_embed
+            ]
+            for mid in orphan:
+                self._last_used.pop(mid, None)
+        if stale:
+            # Liberar VRAM Metal — fuera del lock para no bloquear
+            # otros load/chat. mx.clear_cache + gc.collect es safe
+            # cuando no hay refs vivas a buffers MLX (las refs se
+            # dropearon arriba al pop).
+            try:
+                import gc as _gc
+                import mlx.core as _mx  # type: ignore[import-not-found]
+                _mx.clear_cache()
+                _gc.collect()
+            except Exception:
+                pass
 
     def _load(self, model_id: str) -> tuple[Any, Any]:
         """Get or load (model, tokenizer) for `model_id`. LRU bump on hit.

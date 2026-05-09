@@ -47999,13 +47999,30 @@ def _setup_install(
     # Bootout + unlink plists que fueron consolidados / removidos de
     # `_services_spec`. Sin este pass, el plist viejo sigue cargado en
     # paralelo con su reemplazo → doble envío / race conditions.
+    # Bug Hunt 2026-05-08 H Tel 3: `launchctl load`/`unload` están
+    # deprecated desde macOS Ventura y en macOS Sequoia (25.5.0, OS
+    # actual) producen warnings o silently fail. El resto del control-
+    # plane (`_execute_reconcile_action`, `_bootstrap_brief_plist`) ya
+    # usa `bootstrap`/`bootout` correctamente — sólo `_setup_install`
+    # quedó en la API vieja. Migración: bootout acepta exit-code 3
+    # (no estaba cargado, OK); bootstrap acepta 37 (ya estaba cargado).
+    _uid = os.getuid()
+    _domain = f"gui/{_uid}"
+
+    def _bootout(plist_path: Path, label: str) -> None:
+        """`launchctl bootout` reemplazo de `launchctl unload`."""
+        try:
+            subprocess.run(
+                ["launchctl", "bootout", f"{_domain}/{label}"],
+                check=False, capture_output=True,
+            )
+        except Exception:
+            pass
+
     for deprecated in _DEPRECATED_LABELS:
         dep_plist = _LAUNCH_AGENTS_DIR / f"{deprecated}.plist"
         if dep_plist.exists():
-            subprocess.run(
-                ["launchctl", "unload", str(dep_plist)],
-                check=False, capture_output=True,
-            )
+            _bootout(dep_plist, deprecated)
             dep_plist.unlink()
             console.print(
                 f"[dim]·[/dim] deprecated: {deprecated} "
@@ -48014,12 +48031,9 @@ def _setup_install(
 
     for label, fname, content in _services_spec(rag_bin):
         plist_path = _LAUNCH_AGENTS_DIR / fname
-        # Always unload first so a stale version doesn't linger after reinstall.
+        # Always bootout first so a stale version doesn't linger after reinstall.
         if plist_path.exists():
-            subprocess.run(
-                ["launchctl", "unload", str(plist_path)],
-                check=False, capture_output=True,
-            )
+            _bootout(plist_path, label)
         if remove:
             if plist_path.exists():
                 plist_path.unlink()
@@ -48066,14 +48080,22 @@ def _setup_install(
                 continue
         plist_path.write_text(content, encoding="utf-8")
         try:
-            subprocess.run(
-                ["launchctl", "load", str(plist_path)],
-                check=True, capture_output=True,
+            # Bug Hunt H Tel 3: `bootstrap` reemplaza `load`. Exit 37
+            # = ya estaba cargado (no es error real, idempotencia OK).
+            res = subprocess.run(
+                ["launchctl", "bootstrap", _domain, str(plist_path)],
+                check=False, capture_output=True,
             )
-            console.print(f"[green]✓[/green] cargado: [bold]{label}[/bold]")
-        except subprocess.CalledProcessError as e:
-            stderr = e.stderr.decode(errors="ignore") if e.stderr else ""
-            console.print(f"[red]✗[/red] falló cargar {label}: {stderr.strip()}")
+            if res.returncode in (0, 37):
+                console.print(f"[green]✓[/green] cargado: [bold]{label}[/bold]")
+            else:
+                stderr = res.stderr.decode(errors="ignore") if res.stderr else ""
+                console.print(
+                    f"[red]✗[/red] falló cargar {label} (exit={res.returncode}): "
+                    f"{stderr.strip()}"
+                )
+        except Exception as exc:
+            console.print(f"[red]✗[/red] falló cargar {label}: {exc}")
 
 
 @cli.command()

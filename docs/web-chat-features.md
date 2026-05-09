@@ -38,7 +38,7 @@ Dos sanity checks: (1) `len(corrected) > 1.5 * len(query)` → reject; (2) **`RA
 
 ## Episodic memory ([`web/conversation_writer.py`](../web/conversation_writer.py), silent write)
 
-Post `/api/chat` `done` event, daemon thread append a `04-Archive/99-obsidian-system/99-AI/conversations/YYYY-MM-DD-HHMM-<slug>.md`. One note per `session_id`, multi-turn. Index `session_id → relative_path` en `rag_conversations_index` (SQL upsert). Atomic .md write via `os.replace`. **Excluido del index** (`is_excluded`: prefix `04-Archive/99-obsidian-system/` + legacy `00-Inbox/conversations/` + `04-Archive/conversations/`) — leak hallucinations back si indexado.
+Post `/api/chat` `done` event, daemon thread append a `99-obsidian/99-AI/conversations/YYYY-MM-DD-HHMM-<slug>.md`. One note per `session_id`, multi-turn. Index `session_id → relative_path` en `rag_conversations_index` (SQL upsert). Atomic .md write via `os.replace`. **Excluido del index** (`is_excluded`: prefix `99-obsidian/` + legacy `00-Inbox/conversations/` + `04-Archive/conversations/`) — leak hallucinations back si indexado.
 
 **Shutdown drain** (`_CONV_WRITERS` + `@app.on_event("shutdown")`): cada writer in-flight registra. `_drain_conversation_writers` joins con 5s budget. Stragglers → `_CONV_PENDING_PATH` (`conversation_turn_pending.jsonl`) → re-aplicado en próximo startup por `_retry_pending_conversation_turns`. Threads daemon=True por design (wedged write no debe bloquear exit).
 

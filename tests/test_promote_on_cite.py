@@ -21,8 +21,8 @@ def tmp_vault_with_convs(tmp_path, monkeypatch, fake_embed):
         "01-Projects",
         "02-Areas",
         "03-Resources",
-        "04-Archive/99-obsidian-system/99-AI/conversations",
-        "04-Archive/99-obsidian-system/99-AI/reviews",
+        "99-obsidian/99-AI/conversations",
+        "99-obsidian/99-AI/reviews",
     ):
         (vault / d).mkdir(parents=True)
     monkeypatch.setattr(rag, "VAULT_PATH", vault)
@@ -40,7 +40,7 @@ def tmp_vault_with_convs(tmp_path, monkeypatch, fake_embed):
 
 
 def _write_conv(vault: Path, slug: str, sources: list[str], days_ago: int = 1):
-    conv_dir = vault / "04-Archive/99-obsidian-system/99-AI/conversations"
+    conv_dir = vault / "99-obsidian/99-AI/conversations"
     p = conv_dir / f"{slug}.md"
     created = (datetime.now() - timedelta(days=days_ago)).isoformat(timespec="seconds")
     src_block = "\n".join(f"  - {s}" for s in sources)

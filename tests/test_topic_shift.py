@@ -78,7 +78,7 @@ def test_person_fired_with_different_prior_topic_drops_history(monkeypatch):
     # El caso reportado. build_person_context matcheó "mama" en la query
     # actual. El turno anterior NO menciona a la misma persona. → shift.
     monkeypatch.setattr(rag, "_match_mentions_in_query", lambda q, *a, **k: (
-        ["04-Archive/99-obsidian-system/99-Mentions/Mama.md"] if "mama" in q.lower() else []
+        ["99-obsidian/99-Mentions/Mama.md"] if "mama" in q.lower() else []
     ))
     shifted, reason, _cos = rag.detect_topic_shift(
         "busca informacion sobre mi mama",
@@ -93,7 +93,7 @@ def test_person_fired_same_person_keeps_history(monkeypatch):
     # "contame sobre mi mama" → "busca info sobre mi mama": misma persona
     # matcheada en ambos turnos. Es follow-up natural → keep history.
     monkeypatch.setattr(rag, "_match_mentions_in_query", lambda q, *a, **k: (
-        ["04-Archive/99-obsidian-system/99-Mentions/Mama.md"] if "mama" in q.lower() else []
+        ["99-obsidian/99-Mentions/Mama.md"] if "mama" in q.lower() else []
     ))
     shifted, reason, _cos = rag.detect_topic_shift(
         "busca informacion sobre mi mama",

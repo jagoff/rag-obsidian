@@ -1,6 +1,6 @@
 # Migración Ollama → MLX — Retrospectiva post-cutover
 
-> Doc técnica de referencia. PM doc + estado vivo en el vault: [`99-AI/system/mlx-migration/dispatch.md`](obsidian://open?vault=Notes&file=04-Archive%2F99-obsidian-system%2F99-AI%2Fsystem%2Fmlx-migration%2Fdispatch).
+> Doc técnica de referencia. PM doc + estado vivo en el vault: [`99-AI/system/mlx-migration/dispatch.md`](obsidian://open?vault=Notes&file=04-Archive%2F99-obsidian%2F99-AI%2Fsystem%2Fmlx-migration%2Fdispatch).
 > Código de la abstracción: [`rag/llm_backend.py`](../rag/llm_backend.py).
 > Iniciado: **2026-05-05**. Estado: **Ola 5 cerrada — Migración MLX completada 2026-05-06. Default `RAG_LLM_BACKEND=mlx` en producción. Modelos chat Ollama purgados del disco.**
 
@@ -17,7 +17,7 @@
 
 Ollama sigue siendo dependencia para dos componentes fuera del scope de esta migración:
 
-- **`qwen3-embedding:0.6b`** — embedder activo. El path de embedding usa `ollama.embed()` directamente (no el `LLMBackend` ABC). Migración separada en [`99-AI/system/embedding-swap-qwen3-8b/`](obsidian://open?vault=Notes&file=04-Archive%2F99-obsidian-system%2F99-AI%2Fsystem%2Fembedding-swap-qwen3-8b%2Fplan).
+- **`qwen3-embedding:0.6b`** — embedder activo. El path de embedding usa `ollama.embed()` directamente (no el `LLMBackend` ABC). Migración separada en [`99-AI/system/embedding-swap-qwen3-8b/`](obsidian://open?vault=Notes&file=04-Archive%2F99-obsidian%2F99-AI%2Fsystem%2Fembedding-swap-qwen3-8b%2Fplan).
 - **`OllamaBackend`** en [`rag/llm_backend.py`](../rag/llm_backend.py) se preserva como insurance de rollback histórico. Si no se necesita en ~6 meses (≈ octubre 2026), es candidate a borrar.
 
 **Embeddings (`bge-m3`) no entran en este scope.** Ese path usa `sentence-transformers` directamente, no Ollama.
@@ -328,7 +328,7 @@ Equivalencia con Ollama:
 
 ## Plan de cutover (5 olas)
 
-Detalle vivo en [`dispatch.md`](obsidian://open?vault=Notes&file=04-Archive%2F99-obsidian-system%2F99-AI%2Fsystem%2Fmlx-migration%2Fdispatch). Resumen:
+Detalle vivo en [`dispatch.md`](obsidian://open?vault=Notes&file=04-Archive%2F99-obsidian%2F99-AI%2Fsystem%2Fmlx-migration%2Fdispatch). Resumen:
 
 | Ola | Scope | Estado |
 |---|---|---|
@@ -417,7 +417,7 @@ Mantener dos backends para siempre es deuda. El código (`LLMBackend` ABC + dos 
 
 ### ¿Por qué embeddings quedan separados?
 
-`bge-m3` y `qwen3-embedding:0.6b` son modelos de embedding (no LLM generativos). El call path usa `sentence-transformers` / `ollama.embed()` directamente, no el `LLMBackend` ABC. Migrar embeddings a MLX requiere portear a formato MLX o swappear por otro modelo. Es un proyecto independiente: [`99-AI/system/embedding-swap-qwen3-8b/`](obsidian://open?vault=Notes&file=04-Archive%2F99-obsidian-system%2F99-AI%2Fsystem%2Fembedding-swap-qwen3-8b%2Fplan).
+`bge-m3` y `qwen3-embedding:0.6b` son modelos de embedding (no LLM generativos). El call path usa `sentence-transformers` / `ollama.embed()` directamente, no el `LLMBackend` ABC. Migrar embeddings a MLX requiere portear a formato MLX o swappear por otro modelo. Es un proyecto independiente: [`99-AI/system/embedding-swap-qwen3-8b/`](obsidian://open?vault=Notes&file=04-Archive%2F99-obsidian%2F99-AI%2Fsystem%2Fembedding-swap-qwen3-8b%2Fplan).
 
 ### ¿Por qué Qwen3-30B-A3B y no command-r en MLX?
 
@@ -438,9 +438,9 @@ El helper-tier es ultra-sensible (memoria `project_reformulate_helper_vs_chat`).
 - Código backend: [`rag/llm_backend.py`](../rag/llm_backend.py).
 - Tool-calling MLX: [`rag/mlx_tool_calls.py`](../rag/mlx_tool_calls.py).
 - Benchmark harness: [`benchmarks/bench_mlx_vs_ollama.py`](../benchmarks/bench_mlx_vs_ollama.py).
-- PM doc: [`99-AI/system/mlx-migration/dispatch.md`](obsidian://open?vault=Notes&file=04-Archive%2F99-obsidian-system%2F99-AI%2Fsystem%2Fmlx-migration%2Fdispatch).
+- PM doc: [`99-AI/system/mlx-migration/dispatch.md`](obsidian://open?vault=Notes&file=04-Archive%2F99-obsidian%2F99-AI%2Fsystem%2Fmlx-migration%2Fdispatch).
 - Repo CLAUDE.md: [`CLAUDE.md`](../CLAUDE.md) (sección "MLX migration").
-- Embedding migration paralela: [`99-AI/system/embedding-swap-qwen3-8b/plan`](obsidian://open?vault=Notes&file=04-Archive%2F99-obsidian-system%2F99-AI%2Fsystem%2Fembedding-swap-qwen3-8b%2Fplan).
+- Embedding migration paralela: [`99-AI/system/embedding-swap-qwen3-8b/plan`](obsidian://open?vault=Notes&file=04-Archive%2F99-obsidian%2F99-AI%2Fsystem%2Fembedding-swap-qwen3-8b%2Fplan).
 
 ### Memorias relevantes (mem-vault)
 

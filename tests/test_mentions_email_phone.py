@@ -16,7 +16,7 @@ import pytest
 import rag
 
 
-MENTIONS_SUBPATH = rag._MENTIONS_FOLDER  # "04-Archive/99-obsidian-system/99-Mentions"
+MENTIONS_SUBPATH = rag._MENTIONS_FOLDER  # "99-obsidian/99-Mentions"
 
 
 @pytest.fixture

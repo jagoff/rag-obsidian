@@ -319,7 +319,7 @@ If regression > 2pp: add `"00-Inbox/conversations"` to the default `OBSIDIAN_RAG
 - Script: <ref_file file="/Users/fer/repositories/obsidian-rag/scripts/consolidate_conversations.py" /> (24KB, 2026-04-27).
 - Plist: `com.fer.obsidian-rag-consolidate.plist` (Mondays 06:00), loaded in `launchctl list`.
 - CLI: `rag consolidate [--window-days 14] [--threshold 0.75] [--min-cluster 3] [--dry-run] [--apply]`.
-- Conversations folder moved post-2026-04-25 to `04-Archive/99-obsidian-system/99-AI/conversations/` (same exclusion contract preserved).
+- Conversations folder moved post-2026-04-25 to `99-obsidian/99-AI/conversations/` (same exclusion contract preserved).
 
 **Goal**: `scripts/consolidate_conversations.py`, run weekly by launchd, finds clusters of ≥3 semantically similar conversations within a 14-day window and writes a single synthesized note to `01-Projects/` or `03-Resources/`, archiving the originals.
 

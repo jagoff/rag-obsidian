@@ -48,7 +48,7 @@ __all__ = [
 # Organizations 2026-05-04).
 CITATION_PROMOTE_THRESHOLD = int(os.getenv("RAG_ARCHIVE_CITE_THRESHOLD", "2"))
 CITATION_WINDOW_DAYS = int(os.getenv("RAG_ARCHIVE_CITE_WINDOW_DAYS", "30"))
-_CONVERSATIONS_REL = "04-Archive/99-obsidian-system/99-AI/conversations"
+_CONVERSATIONS_REL = "99-obsidian/99-AI/conversations"
 
 # ── ARCHIVER (rag archive) ───────────────────────────────────────────────────
 # Cyclical cleanup: mueve las notas detectadas por `find_dead_notes` a
@@ -438,7 +438,7 @@ def _render_archive_result(result: dict, apply: bool, plain: bool) -> None:
 
 
 def _write_archive_report(result: dict, apply: bool) -> Path | None:
-    """Write a human-readable Markdown report to 04-Archive/99-obsidian-system/99-AI/reviews/YYYY-MM-archive.md.
+    """Write a human-readable Markdown report to 99-obsidian/99-AI/reviews/YYYY-MM-archive.md.
     Appends a dated section if the file already exists (monthly cadence can
     hit the same file twice if triggered manually between cycles).
     """
@@ -446,7 +446,7 @@ def _write_archive_report(result: dict, apply: bool) -> Path | None:
     skipped = result["skipped"]
     if not plan and not skipped:
         return None
-    reviews_dir = _rag.VAULT_PATH / "04-Archive/99-obsidian-system/99-AI/reviews"
+    reviews_dir = _rag.VAULT_PATH / "99-obsidian/99-AI/reviews"
     reviews_dir.mkdir(parents=True, exist_ok=True)
     ym = datetime.now().strftime("%Y-%m")
     path = reviews_dir / f"{ym}-archive.md"

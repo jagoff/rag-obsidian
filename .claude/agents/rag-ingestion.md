@@ -61,7 +61,7 @@ You are the ingestion specialist for `/Users/fer/repositories/obsidian-rag` (pos
 - **Dry-run default** for everything destructive (`--save` for `read`/`prep`, `--apply` for `inbox`/`wikilinks`).
 - **New notes default to `00-Inbox/`** — only `rag inbox --apply` (or explicit `inbox`-style routing) moves them out. PARA folder creation is OK in `03-Resources/` if the topic warrants. Memory: `feedback_note_routing_default_inbox`.
 - **Daily note tracking**: notes routed out of Inbox get a wikilink in `00-Inbox/Daily note.md` under today's date.
-- **mem-vault memory dir** at `04-Archive/99-obsidian-system/99-AI/memory/` is NOT excluded by `is_excluded()` — `rag index` lo scanea, los `.md` entran al index del vault `home`. MCP `mem-vault` es writer canónico, `rag` reader adicional.
+- **mem-vault memory dir** at `99-obsidian/99-AI/memory/` is NOT excluded by `is_excluded()` — `rag index` lo scanea, los `.md` entran al index del vault `home`. MCP `mem-vault` es writer canónico, `rag` reader adicional.
 
 ## YouTube specifics
 

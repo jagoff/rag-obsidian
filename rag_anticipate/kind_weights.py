@@ -196,6 +196,11 @@ def apply_kind_weight(kind: str, score: float) -> float:
         result = float(score) * float(w)
     except Exception:
         return 0.0
+    # Bug Hunt 2026-05-08 H Brief 2: defensive double-clamp. `_lookup_kind_weight`
+    # ya filtra weights fuera de `[_MIN_WEIGHT, _MAX_WEIGHT]` (set fail si SQL
+    # tiene 10.0). Pero si alguien corrupta la DB POST-read (race) o cambia
+    # la validación, este clamp final garantiza que el caller nunca recibe
+    # un score fuera de `[0, 1]`. NO cambia nada en runtime normal.
     return max(0.0, min(1.0, result))
 
 

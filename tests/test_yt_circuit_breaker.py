@@ -258,7 +258,7 @@ class TestSyncYoutubeTranscriptsCircuitBreakerAbortEarly:
             pass  # Silent fail, table may not exist in fresh DB
 
         # Crear 3 videos en el vault (en la ruta que _collect_youtube_video_ids busca)
-        yt_dir = vault_root / "04-Archive/99-obsidian-system/99-AI/external-ingest/YouTube"
+        yt_dir = vault_root / "99-obsidian/99-AI/external-ingest/YouTube"
         yt_dir.mkdir(parents=True)
         (yt_dir / "2026-05-04.md").write_text(
             "# YouTube Daily\n"

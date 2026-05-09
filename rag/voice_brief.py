@@ -256,8 +256,14 @@ def synthesize_brief_audio(
             pass
         return None
 
-    # AIFF → OGG/Opus. Si ffmpeg falta, fallback a AIFF (.aiff) — el
-    # bridge igual lo manda como media; pesa más pero funciona.
+    # AIFF → OGG/Opus. Bug Hunt 2026-05-08 H Brief 3: el comentario
+    # original decía "el bridge igual lo manda como media; pesa más
+    # pero funciona". Falso — el bridge WhatsApp espera audio/ogg
+    # (Opus) específicamente; un .aiff (audio/x-aiff) puede ser
+    # rechazado o el iPhone no lo reproduce in-line como voice note.
+    # Fix: si ffmpeg falta, retornamos None para forzar text-only
+    # (más útil que un audio que no se reproduce). Loggeamos el caso
+    # para que el operador sepa que falta la dep.
     final_path: Path | None = None
     if _ffmpeg_available():
         if _aiff_to_ogg(aiff_path, out_path):
@@ -267,8 +273,18 @@ def synthesize_brief_audio(
         except Exception:
             pass
     else:
-        # Sin ffmpeg → dejamos el AIFF como artifact final.
-        final_path = aiff_path
+        try:
+            aiff_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        _silent_log(
+            "voice_brief_ffmpeg_missing",
+            RuntimeError(
+                "ffmpeg no instalado — voice brief skip, fallback a text-only. "
+                "Instalar con `brew install ffmpeg` para activar voz."
+            ),
+        )
+        return None
 
     if final_path is None or not final_path.is_file():
         return None

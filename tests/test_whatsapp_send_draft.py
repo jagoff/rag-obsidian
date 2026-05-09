@@ -411,7 +411,7 @@ def test_lookup_vault_contact_filename_match(monkeypatch, tmp_path):
     """`Mama.md` en `99-Contacts/` → match por filename exact."""
     from rag.integrations import whatsapp as wa_mod
 
-    contacts_dir = tmp_path / "04-Archive/99-obsidian-system/99-Contacts"
+    contacts_dir = tmp_path / "99-obsidian/99-Contacts"
     contacts_dir.mkdir(parents=True)
     (contacts_dir / "Mama.md").write_text(
         "[[Mama|@Mama]]\n"
@@ -436,7 +436,7 @@ def test_lookup_vault_contact_strips_possessive(monkeypatch, tmp_path):
     """`mi Mama` y `a mi Mama` strippean prefix → matchean `Mama.md`."""
     from rag.integrations import whatsapp as wa_mod
 
-    contacts_dir = tmp_path / "04-Archive/99-obsidian-system/99-Contacts"
+    contacts_dir = tmp_path / "99-obsidian/99-Contacts"
     contacts_dir.mkdir(parents=True)
     (contacts_dir / "Mama.md").write_text(
         "- **Apellido / nombre completo**: Monica\n"
@@ -453,7 +453,7 @@ def test_lookup_vault_contact_relation_match(monkeypatch, tmp_path):
     """`mama` (sin filename `Mama.md`) → match por `Relación: Madre`."""
     from rag.integrations import whatsapp as wa_mod
 
-    contacts_dir = tmp_path / "04-Archive/99-obsidian-system/99-Contacts"
+    contacts_dir = tmp_path / "99-obsidian/99-Contacts"
     contacts_dir.mkdir(parents=True)
     # Filename arbitrario "Carmen Pérez" (NO matchea filename "mama").
     (contacts_dir / "Carmen Pérez.md").write_text(
@@ -474,7 +474,7 @@ def test_lookup_vault_contact_alias_yaml_match(monkeypatch, tmp_path):
     """Alias en frontmatter YAML matchea (e.g. `aliases: [Sebastián]`)."""
     from rag.integrations import whatsapp as wa_mod
 
-    contacts_dir = tmp_path / "04-Archive/99-obsidian-system/99-Contacts"
+    contacts_dir = tmp_path / "99-obsidian/99-Contacts"
     contacts_dir.mkdir(parents=True)
     (contacts_dir / "Seba.md").write_text(
         "---\n"
@@ -503,7 +503,7 @@ def test_lookup_vault_contact_skips_template_files(monkeypatch, tmp_path):
     """`_template.md` y archivos con prefijo `_` se ignoran."""
     from rag.integrations import whatsapp as wa_mod
 
-    contacts_dir = tmp_path / "04-Archive/99-obsidian-system/99-Contacts"
+    contacts_dir = tmp_path / "99-obsidian/99-Contacts"
     contacts_dir.mkdir(parents=True)
     (contacts_dir / "_template.md").write_text(
         "- **Teléfono**: +54 9 ...\n"
@@ -524,7 +524,7 @@ def test_lookup_vault_contact_filters_phone_placeholder(monkeypatch, tmp_path):
     """Placeholder `+54 9 ...` del template NO se considera teléfono real."""
     from rag.integrations import whatsapp as wa_mod
 
-    contacts_dir = tmp_path / "04-Archive/99-obsidian-system/99-Contacts"
+    contacts_dir = tmp_path / "99-obsidian/99-Contacts"
     contacts_dir.mkdir(parents=True)
     (contacts_dir / "Astor.md").write_text(
         "- **Apellido / nombre completo**: Ferrari Astor\n"
@@ -545,7 +545,7 @@ def test_jid_from_contact_prefers_vault_over_apple(monkeypatch, tmp_path):
     (la nota del user es la fuente autoritativa)."""
     from rag.integrations import whatsapp as wa_mod
 
-    contacts_dir = tmp_path / "04-Archive/99-obsidian-system/99-Contacts"
+    contacts_dir = tmp_path / "99-obsidian/99-Contacts"
     contacts_dir.mkdir(parents=True)
     (contacts_dir / "Mama.md").write_text(
         "- **Apellido / nombre completo**: Monica Ferrari\n"
@@ -580,7 +580,7 @@ def test_jid_from_contact_returns_no_phone_when_vault_incomplete(
     devuelve `error=no_phone` para que el user complete la nota."""
     from rag.integrations import whatsapp as wa_mod
 
-    contacts_dir = tmp_path / "04-Archive/99-obsidian-system/99-Contacts"
+    contacts_dir = tmp_path / "99-obsidian/99-Contacts"
     contacts_dir.mkdir(parents=True)
     (contacts_dir / "Astor.md").write_text(
         "- **Apellido / nombre completo**: Ferrari Astor\n"
@@ -606,7 +606,7 @@ def test_append_contact_observation_creates_section(monkeypatch, tmp_path):
     """Primera observación → crea sección `## Observaciones` al final."""
     from rag.integrations import whatsapp as wa_mod
 
-    contacts_dir = tmp_path / "04-Archive/99-obsidian-system/99-Contacts"
+    contacts_dir = tmp_path / "99-obsidian/99-Contacts"
     contacts_dir.mkdir(parents=True)
     seba = contacts_dir / "Seba.md"
     seba.write_text(
@@ -633,7 +633,7 @@ def test_append_contact_observation_smart_append_to_category(monkeypatch, tmp_pa
     """Con `category="Preferencias"` → crea bullet `**Preferencias**: Vino`."""
     from rag.integrations import whatsapp as wa_mod
 
-    contacts_dir = tmp_path / "04-Archive/99-obsidian-system/99-Contacts"
+    contacts_dir = tmp_path / "99-obsidian/99-Contacts"
     contacts_dir.mkdir(parents=True)
     seba = contacts_dir / "Seba.md"
     seba.write_text(
@@ -660,7 +660,7 @@ def test_append_contact_observation_appends_to_existing_category(
     """Si el bullet `**X**:` ya existe, append al value separado por coma."""
     from rag.integrations import whatsapp as wa_mod
 
-    contacts_dir = tmp_path / "04-Archive/99-obsidian-system/99-Contacts"
+    contacts_dir = tmp_path / "99-obsidian/99-Contacts"
     contacts_dir.mkdir(parents=True)
     seba = contacts_dir / "Seba.md"
     seba.write_text(
@@ -682,7 +682,7 @@ def test_append_contact_observation_idempotent(monkeypatch, tmp_path):
     """Misma observación 2 veces → segunda llamada skip con duplicate_skipped."""
     from rag.integrations import whatsapp as wa_mod
 
-    contacts_dir = tmp_path / "04-Archive/99-obsidian-system/99-Contacts"
+    contacts_dir = tmp_path / "99-obsidian/99-Contacts"
     contacts_dir.mkdir(parents=True)
     seba = contacts_dir / "Seba.md"
     seba.write_text("- **Notas**: viejo amigo\n")
@@ -704,7 +704,7 @@ def test_append_contact_observation_resolves_aliases(monkeypatch, tmp_path):
     también resuelven al archivo correcto."""
     from rag.integrations import whatsapp as wa_mod
 
-    contacts_dir = tmp_path / "04-Archive/99-obsidian-system/99-Contacts"
+    contacts_dir = tmp_path / "99-obsidian/99-Contacts"
     contacts_dir.mkdir(parents=True)
     (contacts_dir / "Mama.md").write_text(
         "- **Apellido / nombre completo**: Monica\n"
@@ -725,7 +725,7 @@ def test_append_contact_observation_returns_error_when_not_in_vault(
     """Contact que no existe en `99-Contacts/` → reason='contact_not_in_vault'."""
     from rag.integrations import whatsapp as wa_mod
 
-    contacts_dir = tmp_path / "04-Archive/99-obsidian-system/99-Contacts"
+    contacts_dir = tmp_path / "99-obsidian/99-Contacts"
     contacts_dir.mkdir(parents=True)
     monkeypatch.setattr(wa_mod, "_vault_contacts_dir", lambda: contacts_dir)
     wa_mod._VAULT_CONTACTS_CACHE = None

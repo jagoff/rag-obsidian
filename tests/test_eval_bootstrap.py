@@ -87,7 +87,7 @@ def test_queries_yaml_cross_source_prefixes_cover_all_valid_sources():
                              "contacts://", "calls://", "safari://",
                              "drive://"}
     # vault + memory are file-backed (memory lives at
-    # 04-Archive/99-obsidian-system/99-AI/memory/<slug>.md inside the vault) →
+    # 99-obsidian/99-AI/memory/<slug>.md inside the vault) →
     # neither uses a `<source>://` prefix.
     expected_whitelisted = rag.VALID_SOURCES - {"vault", "memory"}
     prefix_sources = {p.rstrip("://") for p in CROSS_SOURCE_PREFIXES}
@@ -98,7 +98,7 @@ def test_queries_yaml_cross_source_prefixes_cover_all_valid_sources():
 
 
 def test_queries_yaml_has_underrepresented_folders():
-    """After expansion, 03-Resources + 04-Archive coverage must
+    """After expansion, 03-Resources + 99-obsidian (system) coverage must
     each be nontrivial (>=3 queries). Singles-only — chains are bonus.
 
     2026-04-27: 01-Projects floor removed. Vault reorg moved all
@@ -107,6 +107,11 @@ def test_queries_yaml_has_underrepresented_folders():
     Only 01-Projects/RAG/fuentes de informacion.md survives — not enough
     content for meaningful golden queries. Re-add the floor once the user
     populates 01-Projects with active project notes.
+
+    2026-05-08: `04-Archive` floor reemplazado por `99-obsidian` después
+    del move del system folder de `04-Archive/99-obsidian-system/` a
+    `99-obsidian/` en la raíz del vault. Las queries de sistema ahora
+    cuentan en `99-obsidian` en lugar de `04-Archive`.
     """
     data = yaml.safe_load((REPO_ROOT / "queries.yaml").read_text(encoding="utf-8"))
     folders: dict[str, int] = {}
@@ -115,7 +120,7 @@ def test_queries_yaml_has_underrepresented_folders():
             top = p.split("/", 1)[0]
             folders[top] = folders.get(top, 0) + 1
     assert folders.get("03-Resources", 0) >= 3, folders
-    assert folders.get("04-Archive", 0) >= 3, folders
+    assert folders.get("99-obsidian", 0) >= 3, folders
 
 
 def test_queries_yaml_singles_count():

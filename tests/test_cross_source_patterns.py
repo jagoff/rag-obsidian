@@ -397,14 +397,14 @@ def test_collect_vault_notes_touched_counts_by_mtime(tmp_path, monkeypatch):
     import os
 
     (tmp_path / "01-Projects").mkdir()
-    (tmp_path / "04-Archive" / "99-obsidian-system").mkdir(parents=True)
+    (tmp_path / "99-obsidian").mkdir(parents=True)
     (tmp_path / ".obsidian").mkdir()
 
     user_note = tmp_path / "01-Projects" / "alpha.md"
     user_note.write_text("alpha", encoding="utf-8")
     user_note2 = tmp_path / "01-Projects" / "beta.md"
     user_note2.write_text("beta", encoding="utf-8")
-    system_note = tmp_path / "04-Archive" / "99-obsidian-system" / "auto.md"
+    system_note = tmp_path / "99-obsidian" / "auto.md"
     system_note.write_text("auto", encoding="utf-8")
     obsidian_note = tmp_path / ".obsidian" / "workspace.md"
     obsidian_note.write_text("ws", encoding="utf-8")

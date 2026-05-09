@@ -555,7 +555,7 @@ def test_speaker_label_from_me_always_yo() -> None:
 
 def test_speaker_label_resolves_dossier_name(tmp_path, monkeypatch) -> None:
     """JID con phone registrado en 99-Mentions/X.md → nombre del dossier."""
-    mentions = tmp_path / "04-Archive/99-obsidian-system/99-Mentions"
+    mentions = tmp_path / "99-obsidian/99-Mentions"
     mentions.mkdir(parents=True)
     (mentions / "Maria.md").write_text(
         "- **Teléfono**: +54 9 342 430 3891\n", encoding="utf-8",
@@ -575,7 +575,7 @@ def test_speaker_label_masks_unmapped_phone(tmp_path, monkeypatch) -> None:
     """JID sin dossier match + sin Contacts match → last-4 masked ('…3891').
     Mockea Apple Contacts al vacío para que el test no dependa del address
     book del host (que sí tiene a Maria en el entorno del autor)."""
-    mentions = tmp_path / "04-Archive/99-obsidian-system/99-Mentions"
+    mentions = tmp_path / "99-obsidian/99-Mentions"
     mentions.mkdir(parents=True)  # empty folder, no dossiers
     rag._phone_index_cache = None
     rag._mentions_cache = None
@@ -598,7 +598,7 @@ def test_speaker_label_masks_unmapped_phone(tmp_path, monkeypatch) -> None:
 
 def test_speaker_label_empty_sender_falls_back_to_chat_name(tmp_path, monkeypatch) -> None:
     """sender='' + chat_name='Juan' → 'Juan' (1-on-1 chat sin JID sender)."""
-    (tmp_path / "04-Archive/99-obsidian-system/99-Mentions").mkdir(parents=True)
+    (tmp_path / "99-obsidian/99-Mentions").mkdir(parents=True)
     rag._phone_index_cache = None
     rag._mentions_cache = None
     monkeypatch.setattr(rag, "VAULT_PATH", tmp_path)
@@ -614,7 +614,7 @@ def test_speaker_label_invariant_in_chunk_body(tmp_path, monkeypatch) -> None:
     """Chunks generados via chunk_conversation usan el speaker resolved.
     Full flow: dossier con phone → chunk body empieza con 'Maria:' en lugar
     del JID numérico."""
-    mentions = tmp_path / "04-Archive/99-obsidian-system/99-Mentions"
+    mentions = tmp_path / "99-obsidian/99-Mentions"
     mentions.mkdir(parents=True)
     (mentions / "Maria.md").write_text(
         "- **Teléfono**: +54 9 342 430 3891\n", encoding="utf-8",

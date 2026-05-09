@@ -31,10 +31,10 @@ import rag
 @pytest.fixture
 def vault(tmp_path: Path) -> Path:
     """Minimal vault with a 99-Mentions folder containing two dossiers."""
-    mentions = tmp_path / "04-Archive/99-obsidian-system/99-Mentions"
+    mentions = tmp_path / "99-obsidian/99-Mentions"
     mentions.mkdir(parents=True)
     (mentions / "Grecia.md").write_text(
-        "[[04-Archive/99-obsidian-system/99-Mentions/Grecia|@Grecia]]\n"
+        "[[99-obsidian/99-Mentions/Grecia|@Grecia]]\n"
         "- **Relación**: hija\n",
         encoding="utf-8",
     )
@@ -90,7 +90,7 @@ def _seed_messages(db: Path, rows: list[tuple]) -> None:
 
 def test_parse_mention_dossier_without_frontmatter(vault: Path) -> None:
     d = rag._parse_mention_dossier(
-        "04-Archive/99-obsidian-system/99-Mentions/Grecia.md",
+        "99-obsidian/99-Mentions/Grecia.md",
         vault_root=vault,
     )
     # `phone_digits` added 2026-04-21 alongside `name` / `aliases` — the
@@ -100,7 +100,7 @@ def test_parse_mention_dossier_without_frontmatter(vault: Path) -> None:
 
 def test_parse_mention_dossier_with_aliases(vault: Path) -> None:
     d = rag._parse_mention_dossier(
-        "04-Archive/99-obsidian-system/99-Mentions/Seba.md",
+        "99-obsidian/99-Mentions/Seba.md",
         vault_root=vault,
     )
     assert d["name"] == "Seba"
@@ -130,7 +130,7 @@ def test_lookup_prefers_chat_name_match(vault: Path, wa_db: Path) -> None:
          "2026-04-18 09:00:00", 0, ""),
     ])
     msgs = rag._lookup_wa_mentions_for_entity(
-        "04-Archive/99-obsidian-system/99-Mentions/Grecia.md",
+        "99-obsidian/99-Mentions/Grecia.md",
         vault_root=vault, db_path=wa_db,
     )
     assert len(msgs) == 2
@@ -146,7 +146,7 @@ def test_lookup_caps_at_limit(vault: Path, wa_db: Path) -> None:
         for i in range(10)
     ])
     msgs = rag._lookup_wa_mentions_for_entity(
-        "04-Archive/99-obsidian-system/99-Mentions/Grecia.md",
+        "99-obsidian/99-Mentions/Grecia.md",
         vault_root=vault, db_path=wa_db, limit=3,
     )
     assert len(msgs) == 3
@@ -162,7 +162,7 @@ def test_lookup_alias_hits_grecias_group(vault: Path, wa_db: Path) -> None:
          "2026-04-19 18:11:00", 0, ""),
     ])
     msgs = rag._lookup_wa_mentions_for_entity(
-        "04-Archive/99-obsidian-system/99-Mentions/Grecia.md",
+        "99-obsidian/99-Mentions/Grecia.md",
         vault_root=vault, db_path=wa_db,
     )
     assert len(msgs) == 1
@@ -184,7 +184,7 @@ def test_lookup_skips_empty_and_status_broadcast(vault: Path, wa_db: Path) -> No
          "2026-04-20 07:00:00", 0, ""),
     ])
     msgs = rag._lookup_wa_mentions_for_entity(
-        "04-Archive/99-obsidian-system/99-Mentions/Grecia.md",
+        "99-obsidian/99-Mentions/Grecia.md",
         vault_root=vault, db_path=wa_db,
     )
     assert [m["id"] for m in msgs] == ["ok"]
@@ -201,7 +201,7 @@ def test_lookup_handles_alias_tokens(vault: Path, wa_db: Path) -> None:
          "2026-04-19 16:00:00", 0, ""),
     ])
     msgs = rag._lookup_wa_mentions_for_entity(
-        "04-Archive/99-obsidian-system/99-Mentions/Seba.md",
+        "99-obsidian/99-Mentions/Seba.md",
         vault_root=vault, db_path=wa_db,
     )
     ids = [m["id"] for m in msgs]
@@ -213,7 +213,7 @@ def test_lookup_returns_empty_when_db_missing(vault: Path, tmp_path: Path) -> No
     missing = tmp_path / "no-db.sqlite"
     assert not missing.exists()
     msgs = rag._lookup_wa_mentions_for_entity(
-        "04-Archive/99-obsidian-system/99-Mentions/Grecia.md",
+        "99-obsidian/99-Mentions/Grecia.md",
         vault_root=vault, db_path=missing,
     )
     assert msgs == []
@@ -222,7 +222,7 @@ def test_lookup_returns_empty_when_db_missing(vault: Path, tmp_path: Path) -> No
 def test_lookup_returns_empty_for_stemless_mention(tmp_path: Path, wa_db: Path) -> None:
     """A mention dossier whose stem is shorter than the min-token length
     cannot be safely matched (would hit unrelated content). Returns []."""
-    mentions = tmp_path / "04-Archive/99-obsidian-system/99-Mentions"
+    mentions = tmp_path / "99-obsidian/99-Mentions"
     mentions.mkdir(parents=True)
     (mentions / "Al.md").write_text("- short", encoding="utf-8")  # stem=Al, 2 chars
     _seed_messages(wa_db, [
@@ -230,7 +230,7 @@ def test_lookup_returns_empty_for_stemless_mention(tmp_path: Path, wa_db: Path) 
          "2026-04-20 09:00:00", 0, ""),
     ])
     msgs = rag._lookup_wa_mentions_for_entity(
-        "04-Archive/99-obsidian-system/99-Mentions/Al.md",
+        "99-obsidian/99-Mentions/Al.md",
         vault_root=tmp_path, db_path=wa_db,
     )
     assert msgs == []
@@ -371,7 +371,7 @@ def test_cross_ref_skips_past_dates(vault: Path, wa_db: Path) -> None:
 @pytest.fixture
 def vault_with_yo(tmp_path: Path) -> Path:
     """Vault with a Yo.md dossier (body-only, no aliases)."""
-    mentions = tmp_path / "04-Archive/99-obsidian-system/99-Mentions"
+    mentions = tmp_path / "99-obsidian/99-Mentions"
     mentions.mkdir(parents=True)
     (mentions / "Yo.md").write_text(
         "[[Yo|@Yo]]\n"
@@ -392,7 +392,7 @@ def test_nickname_from_body_last_token(vault_with_yo: Path) -> None:
 def test_nickname_prefers_aliases_over_body(tmp_path: Path) -> None:
     """User-declared alias wins — the `Fer` in aliases beats `Fernando`
     extracted from the body."""
-    mentions = tmp_path / "04-Archive/99-obsidian-system/99-Mentions"
+    mentions = tmp_path / "99-obsidian/99-Mentions"
     mentions.mkdir(parents=True)
     (mentions / "Yo.md").write_text(
         "---\n"
@@ -409,7 +409,7 @@ def test_nickname_prefers_aliases_over_body(tmp_path: Path) -> None:
 
 
 def test_nickname_inline_aliases(tmp_path: Path) -> None:
-    mentions = tmp_path / "04-Archive/99-obsidian-system/99-Mentions"
+    mentions = tmp_path / "99-obsidian/99-Mentions"
     mentions.mkdir(parents=True)
     (mentions / "Yo.md").write_text(
         "---\naliases: [Fede, Federico Serra]\n---\n"
@@ -421,7 +421,7 @@ def test_nickname_inline_aliases(tmp_path: Path) -> None:
 
 
 def test_nickname_none_when_yo_missing(tmp_path: Path) -> None:
-    (tmp_path / "04-Archive/99-obsidian-system/99-Mentions").mkdir(parents=True)
+    (tmp_path / "99-obsidian/99-Mentions").mkdir(parents=True)
     # No Yo.md written.
     rag._user_nickname_cache = None
     assert rag._load_user_nickname(tmp_path) is None
@@ -429,7 +429,7 @@ def test_nickname_none_when_yo_missing(tmp_path: Path) -> None:
 
 def test_nickname_none_when_body_field_empty(tmp_path: Path) -> None:
     """Empty 'Apellido / nombre completo' → no fallback name."""
-    mentions = tmp_path / "04-Archive/99-obsidian-system/99-Mentions"
+    mentions = tmp_path / "99-obsidian/99-Mentions"
     mentions.mkdir(parents=True)
     (mentions / "Yo.md").write_text(
         "- **Apellido / nombre completo**:\n",
@@ -441,7 +441,7 @@ def test_nickname_none_when_body_field_empty(tmp_path: Path) -> None:
 
 def test_nickname_cached_by_mtime(tmp_path: Path) -> None:
     """Subsequent calls with unchanged mtime return the cached value."""
-    mentions = tmp_path / "04-Archive/99-obsidian-system/99-Mentions"
+    mentions = tmp_path / "99-obsidian/99-Mentions"
     mentions.mkdir(parents=True)
     yo = mentions / "Yo.md"
     yo.write_text(
@@ -464,7 +464,7 @@ def test_nickname_cached_by_mtime(tmp_path: Path) -> None:
 @pytest.fixture
 def vault_with_phones(tmp_path: Path) -> Path:
     """Vault with Mentions dossiers carrying phones for sender resolution."""
-    mentions = tmp_path / "04-Archive/99-obsidian-system/99-Mentions"
+    mentions = tmp_path / "99-obsidian/99-Mentions"
     mentions.mkdir(parents=True)
     (mentions / "Grecia.md").write_text(
         "[[Grecia|@Grecia]]\n"

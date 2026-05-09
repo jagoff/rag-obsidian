@@ -169,7 +169,7 @@ def _default_llm_call(prompt: str, *, model: str = DEFAULT_GEN_MODEL) -> str:
             "num_ctx": 4096,
             "num_predict": DEFAULT_NUM_PREDICT,
         },
-        keep_alive=rag.OLLAMA_KEEP_ALIVE,
+        keep_alive=rag.LLM_KEEP_ALIVE,
         format="json",
     )
     return (resp.message.content or "").strip()

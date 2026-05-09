@@ -73,7 +73,7 @@ def find_stale_matches(
     aquellas con todas las sources presentes no son "stale" (RAG normal
     debería retrieve la nota directo).
     """
-    conv_dir = vault / "04-Archive/99-obsidian-system/99-AI/conversations"
+    conv_dir = vault / "99-obsidian/99-AI/conversations"
     if not conv_dir.is_dir():
         return []
     q_tokens = _tokenize(query)

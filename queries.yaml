@@ -76,7 +76,7 @@ queries:
 
   - question: "qué reranker tiene el sistema"
     expected:
-      - 04-Archive/99-obsidian-system/99-AI/memory/reference_obsidian_rag.md
+      - 99-obsidian/99-AI/memory/reference_obsidian_rag.md
 
   # Coaching
   - question: "charla sobre ansiedad y estrés laboral"
@@ -213,15 +213,15 @@ queries:
   # 04-Archive — memorias PARA
   - question: "feedback sobre stack local free"
     expected:
-      - 04-Archive/99-obsidian-system/99-AI/memory/feedback_local_free_stack.md
+      - 99-obsidian/99-AI/memory/feedback_local_free_stack.md
 
   - question: "por qué hyde falla con modelos chicos"
     expected:
-      - 04-Archive/99-obsidian-system/99-AI/memory/feedback_hyde_small_models.md
+      - 99-obsidian/99-AI/memory/feedback_hyde_small_models.md
 
   - question: "estructura PARA del vault"
     expected:
-      - 04-Archive/99-obsidian-system/99-AI/memory/feedback_obsidian_para.md
+      - 99-obsidian/99-AI/memory/feedback_obsidian_para.md
 
   # 03-Resources/Personal-ref/Info — queries diagnósticas
   - question: "info del banco santander"
@@ -276,10 +276,10 @@ queries:
   # según rag.eval, pero el síntoma de health real es N>=2 expected en top-k.
   - question: "cuál es mi stack de IA local"
     expected:
-      - 04-Archive/99-obsidian-system/99-AI/memory/feedback_local_free_stack.md
-      - 04-Archive/99-obsidian-system/99-AI/memory/reference_ollama.md
-      - 04-Archive/99-obsidian-system/99-AI/memory/reference_obsidian_rag.md
-      - 04-Archive/99-obsidian-system/99-AI/memory/reference_obsidian_rag_services.md
+      - 99-obsidian/99-AI/memory/feedback_local_free_stack.md
+      - 99-obsidian/99-AI/memory/reference_ollama.md
+      - 99-obsidian/99-AI/memory/reference_obsidian_rag.md
+      - 99-obsidian/99-AI/memory/reference_obsidian_rag_services.md
     note: "synthesis intent: stack local IA — cross-ref ollama + rag local + servicios + feedback. (2026-04-27: removed obsidian-rag - Modelos y performance.md, trashed)"
 
   - question: "qué temas de coaching trabajé este año"
@@ -306,7 +306,7 @@ queries:
 
   - question: "qué decisiones de diseño tomé sobre el reranker"
     expected:
-      - 04-Archive/99-obsidian-system/99-AI/memory/feedback_hyde_small_models.md
+      - 99-obsidian/99-AI/memory/feedback_hyde_small_models.md
     note: "synthesis intent: decisiones técnicas sobre reranking. (2026-04-27: removed 4 dead paths trashed in vault reorg)"
 
   # (2026-04-24) Removido query "todo lo que hay sobre claude peers" —

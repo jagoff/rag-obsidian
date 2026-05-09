@@ -629,6 +629,19 @@ def _pp_task_repair(
 
     repair_bad = _rag.verify_citations(repair_full, metas)
     ok = not repair_bad
+    # Bug Hunt 2026-05-08 H2: si el repair LLM se asusta y devuelve un
+    # refusal sin .md (ej. "No tengo información clara"), `verify_citations`
+    # retorna `[]` (no hay bad porque no hay citations en absoluto) y
+    # `ok=True` → la respuesta original con N-1 citations válidas se
+    # pierde. Guard: rechazar el repair cuando NO contiene ningún `.md`
+    # citado y el original SÍ tenía citations válidas.
+    if ok:
+        repair_has_cite = ".md" in repair_full
+        orig_valid_cites = sum(
+            1 for path in valid_paths if path and path in (full_orig or "")
+        )
+        if not repair_has_cite and orig_valid_cites >= 1:
+            ok = False
     return {
         "ran": True,
         "ok": ok,

@@ -60,7 +60,7 @@ def _lazy_imports():
 _EXCLUDED_PREFIXES = (
     "00-Inbox/conversations/",   # chats con el LLM, no hechos del user
     "99-Mentions/",               # auto-generated mention notes
-    "04-Archive/99-obsidian-system/",  # system artifacts (99-AI/, plans, specs)
+    "99-obsidian/",  # system artifacts (99-AI/, plans, specs)
 )
 _DAILY_NOTE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\.md$")
 

@@ -1,9 +1,9 @@
-"""Cleanup transient folders bajo `04-Archive/99-obsidian-system/99-AI/`.
+"""Cleanup transient folders bajo `99-obsidian/99-AI/`.
 
 Background (2026-04-27): el vault Obsidian acumula carpetas de "sistema"
 (outputs de scripts, transcripts efímeros, drafts de commits, exports
 auto-regenerados) bajo `99-AI/`. Esos archivos NO contaminan el RAG
-porque `is_excluded()` ya filtra todo `04-Archive/99-obsidian-system/`
+porque `is_excluded()` ya filtra todo `99-obsidian/`
 del indexado, pero sí ocupan espacio en disco e iCloud, y ensucian el
 graph view de Obsidian + las búsquedas full-text del propio Obsidian
 (no del RAG). Este script los purga periódicamente moviéndolos al
@@ -141,7 +141,7 @@ def _move_to_trash(file: Path, vault: Path, base: Path, dry_run: bool) -> Path:
 
     El nombre flat se computa relativo al `base` (99-AI/), no al `vault`,
     para que el resultado sea conciso (`tmp-commit_msg.txt` y no
-    `04-Archive-99-obsidian-system-99-AI-tmp-commit_msg.txt`).
+    `99-obsidian-99-AI-tmp-commit_msg.txt`).
 
     Si el destino existe, sufija con `.1`, `.2`, ... para no pisar.
     """
@@ -232,7 +232,7 @@ def run(
     - The 99-AI/ base folder doesn't exist (fresh setup, nothing to clean)
     """
     vault = vault if vault is not None else _resolve_vault()
-    base = vault / "04-Archive" / "99-obsidian-system" / "99-AI"
+    base = vault / "99-obsidian" / "99-AI"
 
     summary: dict[str, Any] = {
         "ok": True,

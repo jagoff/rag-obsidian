@@ -9,9 +9,9 @@ You are the brief curator for `/Users/fer/repositories/obsidian-rag` (post-split
 
 ## What you own
 
-- `rag morning` (`cmd_morning`, `_collect_morning_evidence`) — `04-Archive/99-obsidian-system/99-AI/reviews/YYYY-MM-DD.md` (36h lookback)
-- `rag today` (`cmd_today`) — `04-Archive/99-obsidian-system/99-AI/reviews/YYYY-MM-DD-evening.md`, `[00:00, now)` window, 4 fixed sections, feeds next morning organically
-- `rag digest` (`cmd_digest`) — weekly narrative `04-Archive/99-obsidian-system/99-AI/reviews/YYYY-WNN.md` (consumes contradiction radar Phase 2 sidecar)
+- `rag morning` (`cmd_morning`, `_collect_morning_evidence`) — `99-obsidian/99-AI/reviews/YYYY-MM-DD.md` (36h lookback)
+- `rag today` (`cmd_today`) — `99-obsidian/99-AI/reviews/YYYY-MM-DD-evening.md`, `[00:00, now)` window, 4 fixed sections, feeds next morning organically
+- `rag digest` (`cmd_digest`) — weekly narrative `99-obsidian/99-AI/reviews/YYYY-WNN.md` (consumes contradiction radar Phase 2 sidecar)
 - `rag pendientes` — unified mid-day dashboard (loops + reminders + low-confidence queries)
 - Deterministic renderers: `_render_morning_agenda_section`, `_render_morning_gmail_section`, `_render_system_activity_section`, `_render_screentime_section`, `_render_drive_activity_section`
 - Structured prompt + JSON parse: `_render_morning_structured_prompt`, `_generate_morning_json`
@@ -81,7 +81,7 @@ Brief code in `rag/__init__.py` (cmd_morning, cmd_today, cmd_digest, cmd_pendien
 ## Validation loop
 
 1. `.venv/bin/python -m pytest tests/test_morning*.py tests/test_today*.py tests/test_digest*.py tests/test_brief_diff*.py tests/test_pendientes*.py tests/test_screentime*.py tests/test_drive_activity*.py tests/test_voice_brief*.py tests/test_brief_schedule*.py tests/test_today_correlator*.py -q`
-2. `rag morning --voice --dry-run` — manual smoke (incl. voice brief Phase 2.C OGG/Opus generation). Diff against yesterday's `04-Archive/99-obsidian-system/99-AI/reviews/` to spot regressions visually.
+2. `rag morning --voice --dry-run` — manual smoke (incl. voice brief Phase 2.C OGG/Opus generation). Diff against yesterday's `99-obsidian/99-AI/reviews/` to spot regressions visually.
 3. `rag today --dry-run` and `rag digest --week $(date +%G-W%V) --dry-run` — same drill.
 4. `rag brief schedule status` after schedule-related changes; `rag brief stats` to confirm feedback loop intact.
 5. If you changed the WhatsApp push: post a manual message with the dry-run output to RagNet to confirm formatting (or skip if listener offline).

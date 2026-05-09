@@ -414,7 +414,7 @@ def _c_queries_existential(start: str, end: str) -> dict[str, float]:
 def _c_gmail_received(start: str, end: str) -> dict[str, float]:
     """Count de mensajes gmail recibidos por día.
 
-    Source: notas en `<vault>/04-Archive/99-obsidian-system/99-AI/external-ingest/Gmail/<YYYY-MM-DD>.md` que
+    Source: notas en `<vault>/99-obsidian/99-AI/external-ingest/Gmail/<YYYY-MM-DD>.md` que
     el ingester de gmail genera 1×/día con un dump de las últimas 48h.
     El frontmatter trae `message_count: N` que es el count exacto.
     Más confiable que parsear el body buscando subjects (formato puede
@@ -430,7 +430,7 @@ def _c_gmail_received(start: str, end: str) -> dict[str, float]:
         from rag import VAULT_PATH  # noqa: PLC0415
     except Exception:
         return {}
-    folder = VAULT_PATH / "04-Archive" / "99-obsidian-system" / "99-AI" / "external-ingest" / "Gmail"
+    folder = VAULT_PATH / "99-obsidian" / "99-AI" / "external-ingest" / "Gmail"
     if not folder.exists() or not folder.is_dir():
         return {}
     out: dict[str, float] = {}
@@ -470,7 +470,7 @@ def _c_vault_notes_touched(start: str, end: str) -> dict[str, float]:
     rglob completo del vault filtrando:
       - Solo `.md`
       - NO system files (`.obsidian/`, files que arrancan con `_`)
-      - NO bajo `04-Archive/99-obsidian-system/` (auto-generated)
+      - NO bajo `99-obsidian/` (auto-generated)
       - mtime dentro del rango pedido
 
     Cuesta más que las queries SQL (~200ms para vault chico,
@@ -505,7 +505,7 @@ def _c_vault_notes_touched(start: str, end: str) -> dict[str, float]:
             parts = rel.parts
             if any(p.startswith(".") or p.startswith("_") for p in parts):
                 continue
-            if len(parts) >= 2 and parts[0] == "04-Archive" and parts[1] == "99-obsidian-system":
+            if len(parts) >= 2 and parts[0] == "99-obsidian":
                 continue
             try:
                 mtime = path.stat().st_mtime

@@ -45,7 +45,7 @@ def _set_mtime(path: Path, days_ago: float) -> None:
 @pytest.fixture
 def vault(tmp_path: Path) -> Path:
     """Crea la estructura mínima del vault con `99-AI/` y todas las carpetas."""
-    base = tmp_path / "04-Archive" / "99-obsidian-system" / "99-AI"
+    base = tmp_path / "99-obsidian" / "99-AI"
     for folder in [
         "tmp", "conversations", "sessions", "Wiki",
         "plans", "system", "reviews",
@@ -60,7 +60,7 @@ def vault(tmp_path: Path) -> Path:
 
 def test_dry_run_moves_nothing(vault: Path):
     """Dry-run reporta lo correcto pero NO modifica el FS."""
-    base = vault / "04-Archive/99-obsidian-system/99-AI"
+    base = vault / "99-obsidian/99-AI"
     old = base / "tmp" / "ancient.txt"
     old.write_text("antiguo")
     _set_mtime(old, 30)  # 30 días, > TTL de tmp/ (7d)
@@ -76,7 +76,7 @@ def test_dry_run_moves_nothing(vault: Path):
 
 def test_apply_moves_to_trash(vault: Path):
     """Apply real mueve archivos viejos a `<vault>/.trash/`."""
-    base = vault / "04-Archive/99-obsidian-system/99-AI"
+    base = vault / "99-obsidian/99-AI"
     old = base / "tmp" / "old-commit.txt"
     old.write_text("legacy")
     _set_mtime(old, 30)
@@ -94,7 +94,7 @@ def test_apply_moves_to_trash(vault: Path):
 
 def test_ttl_respects_age(vault: Path):
     """Archivo dentro del TTL se queda; archivo fuera se mueve."""
-    base = vault / "04-Archive/99-obsidian-system/99-AI"
+    base = vault / "99-obsidian/99-AI"
     fresh = base / "conversations" / "ayer.md"
     fresh.write_text("reciente")
     _set_mtime(fresh, 1)  # 1 día, dentro del TTL de conversations (30d)
@@ -113,7 +113,7 @@ def test_ttl_respects_age(vault: Path):
 
 def test_wiki_wipe_ignores_ttl(vault: Path):
     """Wiki/ es wipe completo — incluso archivos recientes se van."""
-    base = vault / "04-Archive/99-obsidian-system/99-AI"
+    base = vault / "99-obsidian/99-AI"
     brand_new = base / "Wiki" / "index.md"
     brand_new.write_text("auto-generated")
     _set_mtime(brand_new, 0.001)  # creado hace segundos
@@ -131,7 +131,7 @@ def test_wiki_wipe_ignores_ttl(vault: Path):
 
 def test_protected_folders_untouched(vault: Path):
     """memory/ y skills/ nunca se tocan, ni archivos viejos."""
-    base = vault / "04-Archive/99-obsidian-system/99-AI"
+    base = vault / "99-obsidian/99-AI"
     for protected in PROTECTED:
         ancient = base / protected / "anciano.md"
         ancient.write_text("debe quedarse")
@@ -148,7 +148,7 @@ def test_protected_folders_untouched(vault: Path):
 
 def test_unknown_folder_skipped(vault: Path):
     """Carpeta nueva que aparece bajo 99-AI/ se reporta y NO se toca."""
-    base = vault / "04-Archive/99-obsidian-system/99-AI"
+    base = vault / "99-obsidian/99-AI"
     (base / "novedad").mkdir()
     file_in_unknown = base / "novedad" / "data.txt"
     file_in_unknown.write_text("misterio")
@@ -165,7 +165,7 @@ def test_unknown_folder_skipped(vault: Path):
 
 def test_ds_store_purged_everywhere(vault: Path):
     """`.DS_Store` se borra incluso dentro de carpetas protegidas."""
-    base = vault / "04-Archive/99-obsidian-system/99-AI"
+    base = vault / "99-obsidian/99-AI"
     (base / ".DS_Store").write_text("garbage")
     (base / "memory" / ".DS_Store").write_text("garbage")
     (base / "skills" / ".DS_Store").write_text("garbage")
@@ -197,7 +197,7 @@ def test_missing_99ai_returns_ok_false(tmp_path: Path):
 
 def test_trash_collision_suffixes(vault: Path):
     """Si ya existe el destino en .trash/, sufija con .1, .2, ..."""
-    base = vault / "04-Archive/99-obsidian-system/99-AI"
+    base = vault / "99-obsidian/99-AI"
     trash = vault / ".trash"
     trash.mkdir()
     # Pre-existente: simulamos que un cleanup anterior dejó el mismo nombre
@@ -218,7 +218,7 @@ def test_trash_collision_suffixes(vault: Path):
 
 def test_subfolders_in_system_respected(vault: Path):
     """`system/<slug>/file.md` con TTL 180d aplica al archivo, no al dir."""
-    base = vault / "04-Archive/99-obsidian-system/99-AI"
+    base = vault / "99-obsidian/99-AI"
     slug = base / "system" / "mi-slug"
     slug.mkdir()
     old = slug / "ancient.md"

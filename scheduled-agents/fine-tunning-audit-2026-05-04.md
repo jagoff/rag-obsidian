@@ -17,7 +17,7 @@ Para más contexto leé `CLAUDE.md` (sección "fine_tunning" si existe; si no, g
 Generá un reporte markdown con queries SQL para que el user las corra contra `telemetry.db` (vos NO podés ejecutarlas). Path destino:
 
 ```
-04-Archive/99-obsidian-system/99-AI/system/fine-tunning-audit-2026-05-04.md
+99-obsidian/99-AI/system/fine-tunning-audit-2026-05-04.md
 ```
 
 Usá `Write` tool — **NO commitees** este archivo (vive sólo en el filesystem del workspace temporal del agent; el user lo recupera del session output).
@@ -119,7 +119,7 @@ Objetivo: cuando el user puntúa un item de `stream='retrieval_answer'` en el pa
 
 En el message final al user, incluí:
 
-1. Path absoluto del audit markdown que escribiste (debe ser `04-Archive/99-obsidian-system/99-AI/system/fine-tunning-audit-2026-05-04.md` — si lo escribiste ahí, OK).
+1. Path absoluto del audit markdown que escribiste (debe ser `99-obsidian/99-AI/system/fine-tunning-audit-2026-05-04.md` — si lo escribiste ahí, OK).
 2. URL del PR creado en `https://github.com/jagoff/rag-obsidian/pull/...` (cuando hagas `git push -u`, GitHub responde con la URL para crear el PR — incluila).
 3. Summary del wiring: líneas tocadas, tests añadidos, output del pytest.
 

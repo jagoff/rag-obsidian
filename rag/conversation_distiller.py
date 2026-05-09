@@ -41,13 +41,13 @@ __all__ = [
 ]
 
 # Donde aterrizan las notas destiladas. Bajo
-# `04-Archive/99-obsidian-system/99-AI/runbooks/from-conversations/`
+# `99-obsidian/99-AI/runbooks/from-conversations/`
 # para cumplir la regla CLAUDE.md global del user: "todo lo que se
 # genere por fuera de Obsidian y se genere por medio de AI o con fines
 # de AI tiene que ir a 99-AI". `is_excluded()` whitelistea
 # `99-AI/runbooks/` (subcarpeta agregada al lado de `99-AI/memory/`,
 # `99-AI/external-ingest/`).
-RUNBOOKS_DIR = "04-Archive/99-obsidian-system/99-AI/runbooks/from-conversations"
+RUNBOOKS_DIR = "99-obsidian/99-AI/runbooks/from-conversations"
 
 # Floor de confianza para considerar destilable. Las conversations con
 # confidence_avg < threshold tienen respuestas dudosas y no las queremos
@@ -148,7 +148,7 @@ def find_orphaned_conversations(
     Skip de conversations que ya fueron destiladas (frontmatter
     ``distilled_to: <runbook_path>``).
     """
-    conv_dir = vault / "04-Archive/99-obsidian-system/99-AI/conversations"
+    conv_dir = vault / "99-obsidian/99-AI/conversations"
     if not conv_dir.is_dir():
         return []
     out: list[dict] = []

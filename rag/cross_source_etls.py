@@ -161,7 +161,7 @@ TARJETAS_BACKUP_DIR = Path(
 # Obsidian y se genere por medio de AI o con fines de AI tiene que ir
 # a 99-AI". Definido temprano (antes de MOZE/Tarjetas/etc subpaths) para
 # que las constantes de módulo lo puedan referenciar.
-_EXTERNAL_INGEST_BASE = "04-Archive/99-obsidian-system/99-AI/external-ingest"
+_EXTERNAL_INGEST_BASE = "99-obsidian/99-AI/external-ingest"
 MOZE_VAULT_SUBPATH = os.environ.get(
     "OBSIDIAN_RAG_MOZE_FOLDER",
     f"{_EXTERNAL_INGEST_BASE}/Finanzas/MOZE",
@@ -1002,7 +1002,7 @@ def _sync_whatsapp_notes(vault_root: Path) -> dict:
     """Trigger the WhatsApp → vault ETL script and parse its summary line.
 
     Mirrors the MOZE pre-index pattern: produces `.md` files in
-    `<vault>/04-Archive/99-obsidian-system/99-AI/external-ingest/WhatsApp/<chat>/YYYY-MM.md` so the regular rglob
+    `<vault>/99-obsidian/99-AI/external-ingest/WhatsApp/<chat>/YYYY-MM.md` so the regular rglob
     picks them up. Subprocess to keep it as a single source of truth — the
     same script that the `com.fer.whatsapp-vault-sync` launchd plist runs
     every 15 min. Silent-fail when the script is missing (other machines).

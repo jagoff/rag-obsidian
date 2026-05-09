@@ -6,7 +6,7 @@ import pytest
 import rag
 
 
-MENTIONS_REL = "04-Archive/99-obsidian-system/99-Mentions"
+MENTIONS_REL = "99-obsidian/99-Mentions"
 
 
 @pytest.fixture(autouse=True)

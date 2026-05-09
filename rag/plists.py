@@ -629,7 +629,7 @@ def _distill_plist(rag_bin: str) -> str:
 def _consolidate_plist(rag_bin: str) -> str:
     """Weekly episodic-memory consolidation — Mondays 06:00 local. Promotes
     recurring conversation clusters from
-    04-Archive/99-obsidian-system/99-AI/conversations/ to PARA and
+    99-obsidian/99-AI/conversations/ to PARA and
     archives the originals (see plans/episodic-memory.md Phase 2)."""
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -669,7 +669,7 @@ def _consolidate_plist(rag_bin: str) -> str:
 def _vault_cleanup_plist(rag_bin: str) -> str:
     """Daily vault transient-folder cleanup — every day at 02:00.
 
-    Mueve archivos viejos en `04-Archive/99-obsidian-system/99-AI/{{tmp,
+    Mueve archivos viejos en `99-obsidian/99-AI/{{tmp,
     conversations, sessions, plans, system, reviews}}/` y wipe completo
     de `Wiki/` al `.trash/` del vault. `memory/` y `skills/` están
     explícitamente protegidos. Reversible: los archivos quedan en
@@ -2124,7 +2124,7 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
         ("com.fer.obsidian-rag-consolidate", "com.fer.obsidian-rag-consolidate.plist",
          _consolidate_plist(rag_bin)),
         # Daily vault transient cleanup (2026-04-27) — barre carpetas de
-        # "sistema" bajo 04-Archive/99-obsidian-system/99-AI/ con TTLs por
+        # "sistema" bajo 99-obsidian/99-AI/ con TTLs por
         # carpeta y mueve archivos viejos a `.trash/` del vault. Whitelist:
         # `memory/` + `skills/`. Lógica en scripts/cleanup_vault_transient.py.
         ("com.fer.obsidian-rag-vault-cleanup",

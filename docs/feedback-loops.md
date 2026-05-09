@@ -46,7 +46,7 @@ CLI: `rag voice-brief generate --date YYYY-MM-DD [--apply --voice "Diego" --text
 
 ## Whisper learning loop
 
-Sistema transcripción audios WA aprende del corpus + correcciones. Plan completo: [vault](obsidian://open?vault=Notes&file=04-Archive%2F99-obsidian-system%2F99-AI%2Fsystem%2Fwhatsapp-whisper-learning%2Fplan).
+Sistema transcripción audios WA aprende del corpus + correcciones. Plan completo: [vault](obsidian://open?vault=Notes&file=04-Archive%2F99-obsidian%2F99-AI%2Fsystem%2Fwhatsapp-whisper-learning%2Fplan).
 
 3 surfaces: (1) **Pasivo** — daemon `com.fer.obsidian-rag-whisper-vocab` (03:15) → `rag_whisper_vocab` (caps por source: 100 corrections, 100 contacts, 200 notes, 100 chats). (2) **Explícito** — `/fix <texto>` por WA marca última transcripción gold. (3) **Confidence-gated LLM correct** — si `avg_logprob < -0.8`, listener pasa output por `qwen2.5:7b` con sysprompt + few-shot + vocab hints.
 

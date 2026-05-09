@@ -312,7 +312,7 @@ def test_services_spec_includes_maintenance():
 
 def test_services_spec_includes_vault_cleanup():
     """Added 2026-04-27: daily `rag vault-cleanup` a las 02:00 mueve
-    archivos transitorios en `04-Archive/99-obsidian-system/99-AI/{tmp,
+    archivos transitorios en `99-obsidian/99-AI/{tmp,
     conversations, sessions, plans, system, reviews}/` (TTLs por carpeta)
     + wipe completo de `Wiki/` al `.trash/` del vault. `memory/` y
     `skills/` están en whitelist."""

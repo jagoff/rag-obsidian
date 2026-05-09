@@ -257,7 +257,13 @@ def should_consider_decomposition(
     if not q:
         return False
     # Scope explícito — saltarse decomposition.
+    # Bug Hunt 2026-05-08 H3: el `source` kwarg se aceptaba pero se
+    # ignoraba. Una query single-source (ej. `source="whatsapp"`) ya
+    # tiene scope estrecho — sub-retrieves en paralelo gastan 2-3× el
+    # budget sin recall ganado. Tratamos `source` igual que folder/tag.
     if folder or tag or path:
+        return False
+    if source is not None and source not in ("vault", "all", ""):
         return False
     # Si algún pattern explícito matchea, bypass token floor + nombre-propio
     # — la regex ya provee alta precisión.

@@ -6,7 +6,7 @@ Covers the pure-Python pieces end-to-end without touching ollama:
   - classify_target_folder distinguishes project vs resource
   - promote() + archive_originals() + render frontmatter + wikilinks
   - _unique_path collision handling
-  - is_excluded gates 04-Archive/99-obsidian-system/99-AI/_archive/conversations/
+  - is_excluded gates 99-obsidian/99-AI/_archive/conversations/
     (path nuevo) y la ruta legacy 04-Archive/conversations/ (defense-in-depth)
   - run() end-to-end with monkeypatched embed + synthesise
 """
@@ -30,8 +30,8 @@ def tmp_vault(tmp_path: Path, monkeypatch):
     vault = tmp_path / "vault"
     # `04-Archive/...` se crea con parents=True abajo, no hace falta el
     # segundo mkdir() para `04-Archive` (FileExistsError tras la rename
-    # del 2026-04-25 que movió las conversations bajo 99-obsidian-system/).
-    (vault / "04-Archive" / "99-obsidian-system" / "99-AI" / "conversations").mkdir(parents=True)
+    # del 2026-04-25 que movió las conversations bajo 99-obsidian/).
+    (vault / "99-obsidian" / "99-AI" / "conversations").mkdir(parents=True)
     (vault / "01-Projects").mkdir()
     (vault / "03-Resources").mkdir()
     monkeypatch.setattr(rag, "VAULT_PATH", vault)
@@ -47,7 +47,7 @@ def _seed_conversation(
     """Write a conversation note matching the Phase 1 writer schema."""
     created_dt = created or datetime.now()
     sources = sources or []
-    folder = vault / "04-Archive" / "99-obsidian-system" / "99-AI" / "conversations"
+    folder = vault / "99-obsidian" / "99-AI" / "conversations"
     folder.mkdir(parents=True, exist_ok=True)
     slug = conversation_writer.slugify(question)
     path = folder / f"{created_dt.strftime('%Y-%m-%d-%H%M')}-{slug}.md"
@@ -91,7 +91,7 @@ def test_scan_reads_first_turn_and_metadata(tmp_vault: Path):
         sources=["02-Areas/Coaching.md"],
     )
     items = cc.scan_conversations(
-        tmp_vault / "04-Archive" / "99-obsidian-system" / "99-AI" / "conversations", window_days=14,
+        tmp_vault / "99-obsidian" / "99-AI" / "conversations", window_days=14,
     )
     assert len(items) == 1
     it = items[0]
@@ -99,7 +99,7 @@ def test_scan_reads_first_turn_and_metadata(tmp_vault: Path):
     assert it.first_answer == "El Ikigai es un concepto japonés."
     assert it.turns == 1
     assert "02-Areas/Coaching.md" in it.sources
-    assert it.rel_path.startswith("04-Archive/99-obsidian-system/99-AI/conversations/")
+    assert it.rel_path.startswith("99-obsidian/99-AI/conversations/")
 
 
 def test_scan_respects_window_days(tmp_vault: Path, monkeypatch):
@@ -117,7 +117,7 @@ def test_scan_respects_window_days(tmp_vault: Path, monkeypatch):
         question="pregunta reciente", answer="respuesta reciente",
     )
     items = cc.scan_conversations(
-        tmp_vault / "04-Archive" / "99-obsidian-system" / "99-AI" / "conversations", window_days=14,
+        tmp_vault / "99-obsidian" / "99-AI" / "conversations", window_days=14,
     )
     assert len(items) == 1
     assert items[0].first_question == "pregunta reciente"
@@ -125,10 +125,10 @@ def test_scan_respects_window_days(tmp_vault: Path, monkeypatch):
 
 def test_scan_skips_malformed(tmp_vault: Path):
     # Missing frontmatter closing
-    bad = tmp_vault / "04-Archive" / "99-obsidian-system" / "99-AI" / "conversations" / "broken.md"
+    bad = tmp_vault / "99-obsidian" / "99-AI" / "conversations" / "broken.md"
     bad.write_text("---\nno-closing\n\n## Turn 1\n> q\n\na\n", encoding="utf-8")
     items = cc.scan_conversations(
-        tmp_vault / "04-Archive" / "99-obsidian-system" / "99-AI" / "conversations", window_days=14,
+        tmp_vault / "99-obsidian" / "99-AI" / "conversations", window_days=14,
     )
     assert items == []
 
@@ -236,7 +236,7 @@ def test_promote_writes_frontmatter_and_origin_wikilinks(tmp_vault: Path):
         sources=["02-Areas/Bar.md"],
     )
     items = cc.scan_conversations(
-        tmp_vault / "04-Archive" / "99-obsidian-system" / "99-AI" / "conversations", window_days=14,
+        tmp_vault / "99-obsidian" / "99-AI" / "conversations", window_days=14,
     )
     assert len(items) == 2
     written = cc.promote(
@@ -251,7 +251,7 @@ def test_promote_writes_frontmatter_and_origin_wikilinks(tmp_vault: Path):
     assert "Body de prueba con [[Coaching]]." in text
     # Archive wikilinks present
     assert "## Conversaciones originales" in text
-    assert "[[04-Archive/99-obsidian-system/99-AI/_archive/conversations/" in text
+    assert "[[99-obsidian/99-AI/_archive/conversations/" in text
     # Sources referenciadas
     assert "[[02-Areas/Foo]]" in text
     assert "[[02-Areas/Bar]]" in text
@@ -261,14 +261,14 @@ def test_archive_moves_originals_into_monthly_folder(tmp_vault: Path):
     p1 = _seed_conversation(tmp_vault, session_id="a", question="q1", answer="a1")
     p2 = _seed_conversation(tmp_vault, session_id="b", question="q2", answer="a2")
     items = cc.scan_conversations(
-        tmp_vault / "04-Archive" / "99-obsidian-system" / "99-AI" / "conversations", window_days=14,
+        tmp_vault / "99-obsidian" / "99-AI" / "conversations", window_days=14,
     )
     moved = cc.archive_originals(tmp_vault, items)
     assert len(moved) == 2
     for m in moved:
         assert m.exists()
-        # Under 04-Archive/99-obsidian-system/99-AI/_archive/conversations/YYYY-MM/
-        assert "04-Archive/99-obsidian-system/99-AI/_archive/conversations" in str(m)
+        # Under 99-obsidian/99-AI/_archive/conversations/YYYY-MM/
+        assert "99-obsidian/99-AI/_archive/conversations" in str(m)
     # Originals gone
     assert not p1.exists()
     assert not p2.exists()
@@ -324,7 +324,7 @@ def test_synthesize_cluster_uses_h1_when_present(tmp_vault: Path, monkeypatch):
     queremos agarrar EL H1, no la oración descriptiva que viene después."""
     p1 = _seed_conversation(tmp_vault, session_id="x", question="q", answer="a")
     items = cc.scan_conversations(
-        tmp_vault / "04-Archive" / "99-obsidian-system" / "99-AI" / "conversations",
+        tmp_vault / "99-obsidian" / "99-AI" / "conversations",
         window_days=14,
     )
 
@@ -358,7 +358,7 @@ def test_synthesize_cluster_rejects_long_prose_first_line(tmp_vault: Path, monke
         question="qué dice sobre autoridad", answer="...",
     )
     items = cc.scan_conversations(
-        tmp_vault / "04-Archive" / "99-obsidian-system" / "99-AI" / "conversations",
+        tmp_vault / "99-obsidian" / "99-AI" / "conversations",
         window_days=14,
     )
     fake_body = (
@@ -383,14 +383,14 @@ def test_synthesize_cluster_rejects_long_prose_first_line(tmp_vault: Path, monke
 # ── Index exclusion ───────────────────────────────────────────────────────
 
 def test_is_excluded_covers_archived_conversations():
-    # Nuevo path post-2026-04-30: archive vive bajo `99-obsidian-system/99-AI/_archive/`
-    # — queda excluido por el prefix general `04-Archive/99-obsidian-system/`
+    # Nuevo path post-2026-04-30: archive vive bajo `99-obsidian/99-AI/_archive/`
+    # — queda excluido por el prefix general `99-obsidian/`
     # (no por la rama defensiva legacy).
     assert rag.is_excluded(
-        "04-Archive/99-obsidian-system/99-AI/_archive/conversations/2026-04/foo.md"
+        "99-obsidian/99-AI/_archive/conversations/2026-04/foo.md"
     ) is True
     assert rag.is_excluded(
-        "04-Archive/99-obsidian-system/99-AI/_archive/conversations/2025-12/bar.md"
+        "99-obsidian/99-AI/_archive/conversations/2025-12/bar.md"
     ) is True
     # Path legacy pre-2026-04-30: rama defensiva específica para archivos
     # que el user no haya migrado todavía.
@@ -400,30 +400,30 @@ def test_is_excluded_covers_archived_conversations():
     assert rag.is_excluded("04-Archive/WhatsApp/chat.md") is False
     assert rag.is_excluded("04-Archive/OtherProject/note.md") is False
     # Inbox conversations still excluded too (regression guard)
-    assert rag.is_excluded("04-Archive/99-obsidian-system/99-AI/conversations/foo.md") is True
+    assert rag.is_excluded("99-obsidian/99-AI/conversations/foo.md") is True
 
 
 def test_is_excluded_indexes_mem_vault_memories():
     """Las memorias persistentes del MCP `mem-vault` viven bajo
-    `04-Archive/99-obsidian-system/99-AI/memory/` y son la única excepción
+    `99-obsidian/99-AI/memory/` y son la única excepción
     (junto con `99-Mentions/`) al exclude del prefix de system folders.
     Las queremos indexadas para que `rag query` recupere bug patterns,
     decisiones y convenciones que el user acumuló entre sesiones.
     """
     # ✅ memory/ excepcionado
-    assert rag.is_excluded("04-Archive/99-obsidian-system/99-AI/memory/foo.md") is False
+    assert rag.is_excluded("99-obsidian/99-AI/memory/foo.md") is False
     assert rag.is_excluded(
-        "04-Archive/99-obsidian-system/99-AI/memory/bug_pattern_xyz.md"
+        "99-obsidian/99-AI/memory/bug_pattern_xyz.md"
     ) is False
     # ✅ 99-Mentions sigue indexado (regression guard, este caso es histórico)
-    assert rag.is_excluded("04-Archive/99-obsidian-system/99-Mentions/Maria.md") is False
+    assert rag.is_excluded("99-obsidian/99-Mentions/Maria.md") is False
     # ❌ Otras subcarpetas de 99-AI/ siguen excluidas
-    assert rag.is_excluded("04-Archive/99-obsidian-system/99-AI/reviews/2026-04-29.md") is True
-    assert rag.is_excluded("04-Archive/99-obsidian-system/99-AI/conversations/x.md") is True
-    assert rag.is_excluded("04-Archive/99-obsidian-system/99-AI/system/foo/plan.md") is True
+    assert rag.is_excluded("99-obsidian/99-AI/reviews/2026-04-29.md") is True
+    assert rag.is_excluded("99-obsidian/99-AI/conversations/x.md") is True
+    assert rag.is_excluded("99-obsidian/99-AI/system/foo/plan.md") is True
     # ❌ Otras carpetas de system siguen excluidas
-    assert rag.is_excluded("04-Archive/99-obsidian-system/99-Templates/x.md") is True
-    assert rag.is_excluded("04-Archive/99-obsidian-system/99-Attachments/img.png") is True
+    assert rag.is_excluded("99-obsidian/99-Templates/x.md") is True
+    assert rag.is_excluded("99-obsidian/99-Attachments/img.png") is True
 
 
 # ── End-to-end run() ─────────────────────────────────────────────────────
@@ -462,7 +462,7 @@ def test_run_dry_run_does_not_write(tmp_vault: Path, monkeypatch):
     # No consolidated note written
     assert not (tmp_vault / "03-Resources").glob("*.md").__iter__().__next__() \
         if list((tmp_vault / "03-Resources").glob("*.md")) else True
-    assert list((tmp_vault / "04-Archive" / "99-obsidian-system" / "99-AI" / "conversations").glob("*.md"))
+    assert list((tmp_vault / "99-obsidian" / "99-AI" / "conversations").glob("*.md"))
 
 
 def test_run_real_promotes_and_archives(tmp_vault: Path, monkeypatch):
@@ -500,13 +500,13 @@ def test_run_real_promotes_and_archives(tmp_vault: Path, monkeypatch):
     # Consolidated note lives in 03-Resources (no action signals → resources).
     promoted = list((tmp_vault / "03-Resources").glob("Ikigai*.md"))
     assert len(promoted) == 1
-    # Archive got the three originals — vive bajo `99-obsidian-system/99-AI/_archive/`
+    # Archive got the three originals — vive bajo `99-obsidian/99-AI/_archive/`
     archived = list(
-        (tmp_vault / "04-Archive" / "99-obsidian-system" / "99-AI" / "_archive" / "conversations").rglob("*.md")
+        (tmp_vault / "99-obsidian" / "99-AI" / "_archive" / "conversations").rglob("*.md")
     )
     assert len(archived) == 3
     # Singleton stayed in inbox
-    remaining = list((tmp_vault / "04-Archive" / "99-obsidian-system" / "99-AI" / "conversations").glob("*.md"))
+    remaining = list((tmp_vault / "99-obsidian" / "99-AI" / "conversations").glob("*.md"))
     assert len(remaining) == 1
     # Log record written
     log = (tmp_vault / "consolidation.log").read_text(encoding="utf-8")
@@ -538,7 +538,7 @@ def test_run_skips_cluster_on_synth_failure(tmp_vault: Path, monkeypatch):
     assert summary["n_promoted"] == 0
     assert summary["n_archived"] == 0
     # Originals untouched
-    remaining = list((tmp_vault / "04-Archive" / "99-obsidian-system" / "99-AI" / "conversations").glob("*.md"))
+    remaining = list((tmp_vault / "99-obsidian" / "99-AI" / "conversations").glob("*.md"))
     assert len(remaining) == 3
     # Cluster entry recorded the error
     assert any("error" in c for c in summary["clusters"])
@@ -584,7 +584,7 @@ def test_run_bails_when_promoted_note_missing(tmp_vault: Path, monkeypatch):
     assert summary["n_promoted"] == 0
     assert summary["n_archived"] == 0
     # Originals untouched in 00-Inbox (the key invariant).
-    remaining = list((tmp_vault / "04-Archive" / "99-obsidian-system" / "99-AI" / "conversations").glob("*.md"))
+    remaining = list((tmp_vault / "99-obsidian" / "99-AI" / "conversations").glob("*.md"))
     assert len(remaining) == 3
     # Error is reported for observability.
     assert any(
@@ -622,7 +622,7 @@ def test_run_bails_when_promoted_note_is_empty(tmp_vault: Path, monkeypatch):
     summary = cc.run(vault_root=tmp_vault, window_days=14, dry_run=False)
     assert summary["n_promoted"] == 0
     assert summary["n_archived"] == 0
-    remaining = list((tmp_vault / "04-Archive" / "99-obsidian-system" / "99-AI" / "conversations").glob("*.md"))
+    remaining = list((tmp_vault / "99-obsidian" / "99-AI" / "conversations").glob("*.md"))
     assert len(remaining) == 3
 
 

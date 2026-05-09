@@ -74,7 +74,7 @@ def test_brief_queue_filters_positive_only(tmp_db: sqlite3.Connection) -> None:
 def test_brief_queue_includes_negative_dominant(tmp_db: sqlite3.Connection) -> None:
     """A brief with 2 negative and 0 positive ratings should appear."""
     now = datetime.now().isoformat(timespec="seconds")
-    dedup_key = "04-Archive/99-obsidian-system/99-AI/reviews/2026-04-29-morning.md"
+    dedup_key = "99-obsidian/99-AI/reviews/2026-04-29-morning.md"
 
     tmp_db.execute(
         "INSERT INTO rag_brief_feedback (ts, dedup_key, rating) VALUES (?, ?, ?)",
@@ -98,7 +98,7 @@ def test_brief_queue_includes_negative_dominant(tmp_db: sqlite3.Connection) -> N
 def test_brief_queue_excludes_already_rated(tmp_db: sqlite3.Connection) -> None:
     """A brief that already has a row in rag_ft_panel_ratings should be excluded."""
     now = datetime.now().isoformat(timespec="seconds")
-    dedup_key = "04-Archive/99-obsidian-system/99-AI/reviews/2026-04-29-morning.md"
+    dedup_key = "99-obsidian/99-AI/reviews/2026-04-29-morning.md"
 
     # Add negative feedback
     tmp_db.execute(
@@ -120,7 +120,7 @@ def test_brief_queue_excludes_already_rated(tmp_db: sqlite3.Connection) -> None:
 def test_brief_queue_dedup_by_dedup_key(tmp_db: sqlite3.Connection) -> None:
     """Multiple rows with the same dedup_key should aggregate into one queue item."""
     now = datetime.now().isoformat(timespec="seconds")
-    dedup_key = "04-Archive/99-obsidian-system/99-AI/reviews/2026-04-29-morning.md"
+    dedup_key = "99-obsidian/99-AI/reviews/2026-04-29-morning.md"
 
     # Add 3 rows: 1 negative, 1 mute, 0 positive
     tmp_db.execute(

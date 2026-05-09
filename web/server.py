@@ -23,6 +23,26 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
+# === MLX_LM EAGER PRELOAD (2026-05-08) ======================================
+# `transformers` 5.x + `accelerate` 1.13 race: cuando un thread no-main
+# (prewarm del reranker) inicia `from transformers import AutoTokenizer`
+# antes de que el main thread haya tocado `mlx_lm`, `accelerate.state`
+# queda en estado parcialmente inicializado en `sys.modules` y todo
+# import posterior de `mlx_lm` raisa `cannot import name 'AcceleratorState'
+# from partially initialized module 'accelerate.state'`. Eso decapita
+# `MLXBackend()` con un `RuntimeError("mlx-lm not installed")` engañoso
+# (el `from e` cause real es el circular import).
+#
+# Fix: forzar el import de `mlx_lm` aquí, en el main thread, ANTES de que
+# cualquier prewarm thread arranque. Una vez `transformers` y `accelerate`
+# quedan inicializados limpios en `sys.modules`, los handlers de las
+# requests pueden hacer `import mlx_lm` libremente desde cualquier thread.
+try:
+    import mlx_lm  # noqa: F401, PLC0415
+except ImportError:
+    pass
+# === END MLX_LM EAGER PRELOAD ===============================================
+
 # === LOKY SEMAPHORE LEAK FIX (2026-04-25) ===================================
 # `tqdm` (transitively pulled by sentence-transformers / transformers) crea
 # un `multiprocessing.RLock()` lazy en su primer `tqdm.get_lock()` para
@@ -57,6 +77,127 @@ try:
 except Exception:  # pragma: no cover - tqdm not installed
     pass
 # === END LOKY SEMAPHORE LEAK FIX ============================================
+
+# === THREAD-SAFE CACHE HELPER (2026-05-08) ==================================
+# Generic thread-safe cache to reduce lock proliferation. Consolidates
+# the pattern of dict + ts + lock that was repeated 10+ times across
+# dashboard endpoints. Prevents lock ordering issues and reduces surface area.
+class ThreadSafeCache:
+    """Thread-safe cache with TTL and single-flight refresh."""
+    
+    def __init__(self, ttl: float = 60.0):
+        self._lock = threading.Lock()
+        self._cache: dict = {"ts": 0.0, "payload": None}
+        self._ttl = ttl
+        self._refreshing = False
+    
+    def get(self) -> tuple[float, dict] | None:
+        """Get cached payload if fresh. Returns (ts, payload) or None."""
+        with self._lock:
+            entry = self._cache
+            if entry["ts"] == 0.0:
+                return None
+            if time.time() - entry["ts"] > self._ttl:
+                return None
+            return (entry["ts"], entry["payload"])
+    
+    def put(self, payload: dict) -> None:
+        """Update cache with new payload."""
+        with self._lock:
+            self._cache = {"ts": time.time(), "payload": payload}
+            self._refreshing = False
+    
+    def is_refreshing(self) -> bool:
+        """Check if a refresh is in progress (single-flight guard)."""
+        with self._lock:
+            return self._refreshing
+    
+    def set_refreshing(self, value: bool) -> None:
+        """Set refresh flag (single-flight guard)."""
+        with self._lock:
+            self._refreshing = value
+
+
+class ThreadSafeCacheMultiKey:
+    """Thread-safe cache with TTL and multi-key support.
+
+    Used for caches that need to store multiple values keyed by a tuple
+    (or any hashable). Automatically evicts stale entries on each `put`,
+    plus optional LRU-style eviction by age when ``max_size`` está
+    seteado (cap absoluto al número de entries vivas).
+    """
+    def __init__(self, ttl: float = 60.0, max_size: int | None = None):
+        self._lock = threading.Lock()
+        self._cache: dict[Any, dict] = {}
+        self._ttl = ttl
+        # Cap opcional al # de entries. Cuando se setea, post-put evictamos
+        # las más viejas (por `ts`) hasta dejar exactamente `max_size`. Sin
+        # esto, un cache muy usado podría inflarse aunque las entries no
+        # estén "stale" todavía (el cutoff es `ttl + 5s`).
+        self._max_size = max_size
+        self._refreshing: dict[Any, bool] = {}
+
+    def get(self, key: Any) -> tuple[float, Any] | None:
+        """Get cached value for key if fresh, else None."""
+        now = time.time()
+        with self._lock:
+            entry = self._cache.get(key)
+            if entry is not None:
+                if (now - entry["ts"]) < self._ttl:
+                    return (entry["ts"], entry["payload"])
+        return None
+
+    def put(self, key: Any, payload: Any) -> None:
+        """Update cached value for key and evict stale entries."""
+        now = time.time()
+        with self._lock:
+            self._cache[key] = {"ts": now, "payload": payload}
+            self._refreshing.pop(key, None)
+            # Evict stale entries (TTL + small grace).
+            cutoff = now - (self._ttl + 5.0)
+            stale = [k for k, v in self._cache.items() if v["ts"] < cutoff]
+            for k in stale:
+                self._cache.pop(k, None)
+                self._refreshing.pop(k, None)
+            # Cap absoluto: si seguimos por encima de max_size, evictamos
+            # los `n` más viejos por `ts` ascendente. Es LRU-by-write,
+            # no LRU-by-access — adecuado para los caches del dashboard
+            # donde un usuario "viejo" probablemente no vuelva.
+            if self._max_size is not None and len(self._cache) > self._max_size:
+                sorted_keys = sorted(
+                    self._cache.items(), key=lambda kv: kv[1]["ts"],
+                )
+                excess = len(self._cache) - self._max_size
+                for k, _ in sorted_keys[:excess]:
+                    self._cache.pop(k, None)
+                    self._refreshing.pop(k, None)
+
+    def clear(self) -> None:
+        """Reset el cache + flags de refresh. Usado por el chat cache
+        cuando el user pidió wipe del histórico (ej. invalidar después
+        de un re-index del vault)."""
+        with self._lock:
+            self._cache.clear()
+            self._refreshing.clear()
+
+    def delete(self, key: Any) -> None:
+        """Remove key explícito (idempotente — no rompe si no existe).
+        Usado por el SSE counter cuando una IP suelta su último slot —
+        deja el cache liviano en vez de esperar al TTL natural."""
+        with self._lock:
+            self._cache.pop(key, None)
+            self._refreshing.pop(key, None)
+
+    def start_refresh(self, key: Any) -> bool:
+        """Mark refresh as in progress for key. Returns True if we won the race."""
+        with self._lock:
+            if self._refreshing.get(key, False):
+                return False
+            self._refreshing[key] = True
+            return True
+
+
+# === END THREAD-SAFE CACHE HELPER =======================================
 
 # pillow-heif registra el HEIC/HEIF reader/writer en PIL. Audit 2026-04-25
 # R2-OCR #4 followup: sin esto, las fotos del iPhone (HEIC default) eran
@@ -491,8 +632,14 @@ _ANAPHORIC_REFERENCE_RE = re.compile(
     # "los/las anteriores", "los demás", "el primero", "el último"
     r"|(?:los|las)\s+(?:anteriores?|dem[aá]s|primeros?|[uú]ltimos?)"
     r"|el\s+(?:primero|[uú]ltimo|m[aá]s\s+\w+|de\s+\w+)"
-    # "cuál es/podría/sería/podés/puedo el más X" / "cuál podría posponer"
-    r"|cu[aá]l\s+(?:es|podr[ií]a|ser[ií]a|pod[eé]s|puedo|deber[ií]a|tendr[ií]a)"
+    # "cuál es el más X" — solo anaphoric cuando incluye superlativo/comparativo.
+    # Antes esto era `cu[aá]l\s+(?:es|...)` sin guard, lo cual matcheaba
+    # "cuál es el descargo del alquiler" (factual, no anafórico) y disparaba
+    # carryover del tool del turno previo. Bug repro 2026-05-08.
+    r"|cu[aá]l\s+(?:es|son)\s+(?:el|la|los|las|lo)\s+(?:m[aá]s|menos|mejor|peor)\b"
+    # "cuál podría/sería/podés/puedo/debería/tendría" — verbos modales sin
+    # sustantivo concreto suelen ser anafóricos ("cuál podría posponer?").
+    r"|cu[aá]l\s+(?:podr[ií]a|ser[ií]a|pod[eé]s|puedo|deber[ií]a|tendr[ií]a)"
     # "qué tan X", "qué X es lo más Y", "qué es lo más X"
     r"|qu[eé]\s+(?:tan|es\s+lo\s+m[aá]s|es\s+m[aá]s)"
     # "cuáles son los más X", "cuáles puedo X"
@@ -659,7 +806,7 @@ def _detect_tool_intent(q: str) -> list[tuple[str, dict]]:
 #                   `_format_forced_tool_output` (p.ej. "### Mails").
 #   digest_hint   — dónde más buscar items indexados en el CONTEXTO si la
 #                   live section está vacía. Para mails: las notas de
-#                   04-Archive/99-obsidian-system/99-AI/external-ingest/Gmail/YYYY-MM-DD.md usan un `## <asunto>`
+#                   99-obsidian/99-AI/external-ingest/Gmail/YYYY-MM-DD.md usan un `## <asunto>`
 #                   por mail con From/Date/Snippet debajo — extraer esos
 #                   H2 da un listado crudo de "mis últimos mails" que el
 #                   user espera. Otros sources tienen su propio formato.
@@ -677,7 +824,7 @@ _SOURCE_INTENT_META: dict[str, dict[str, str]] = {
         "live_section": "### Mails",
         "digest_hint": (
             "Si en el CONTEXTO hay notas del vault del tipo "
-            "`04-Archive/99-obsidian-system/99-AI/external-ingest/Gmail/YYYY-MM-DD.md` (cada `## <asunto>` "
+            "`99-obsidian/99-AI/external-ingest/Gmail/YYYY-MM-DD.md` (cada `## <asunto>` "
             "dentro es UN mail, con su **From:**, **Date:** y **Snippet:**), "
             "extraé esos asuntos y listálos uno por línea — son LITERALMENTE "
             "los últimos mails del usuario. NO digas 'en tu nota' ni "
@@ -724,7 +871,7 @@ _SOURCE_INTENT_META: dict[str, dict[str, str]] = {
         "digest_hint": (
             "La sección live trae los chats donde el user debe el próximo "
             "mensaje (último inbound sin reply). Si en el CONTEXTO hay "
-            "notas de `04-Archive/99-obsidian-system/99-AI/external-ingest/WhatsApp/<contacto>/YYYY-MM.md` con "
+            "notas de `99-obsidian/99-AI/external-ingest/WhatsApp/<contacto>/YYYY-MM.md` con "
             "más contexto de esos chats, podés complementar. NUNCA "
             "inventes conversaciones de WhatsApp — si la sección live "
             "está vacía decilo explícitamente en vez de citar otras "
@@ -769,7 +916,7 @@ def _build_source_intent_hint(forced_tool_names: list[str]) -> str | None:
 
     1. Dónde buscar primero (la sección live del tool: "### Mails").
     2. Dónde buscar si la live está vacía (notas indexadas del vault con
-       formato conocido — p.ej. 04-Archive/99-obsidian-system/99-AI/external-ingest/Gmail/YYYY-MM-DD.md tiene
+       formato conocido — p.ej. 99-obsidian/99-AI/external-ingest/Gmail/YYYY-MM-DD.md tiene
        un H2 por mail, listar esos H2 == listar los últimos mails).
     3. Formato de respuesta esperado (viñetas, shape por item).
     4. Qué PROHIBIR explícitamente (decir "tus notas" / "otras fuentes" /
@@ -785,7 +932,7 @@ def _build_source_intent_hint(forced_tool_names: list[str]) -> str | None:
     - Iter 2: con el tool disparando pero vacío, el CONTEXTO se reemplazaba
       → LLM sin material para fallback → "te dejo otras fuentes" abstracto.
     - Iter 3 (este): con el CONTEXTO preservado, el LLM tiene notas de
-      `04-Archive/99-obsidian-system/99-AI/external-ingest/Gmail/*.md` disponibles, PERO hablaba de "tu nota
+      `99-obsidian/99-AI/external-ingest/Gmail/*.md` disponibles, PERO hablaba de "tu nota
       del 22 de abril" y "fuentes" en lugar de extraer los asuntos de
       los mails. User feedback textual: "en vez de fuentes (que no tiene
       sentido porque son notas de obsidian) trae los titulos de los
@@ -851,7 +998,7 @@ def _build_source_intent_hint(forced_tool_names: list[str]) -> str | None:
 # reconocimiento de intent, pero GENÉRICO en el fallback. Causa: el pre-
 # router reemplazó el CONTEXTO entero con el output de gmail_recent
 # (que vino vacío → sólo "_Sin mails pendientes._"), descartando la
-# retrieve del vault que había devuelto `04-Archive/99-obsidian-system/99-AI/external-ingest/Gmail/2026-04-22.md`
+# retrieve del vault que había devuelto `99-obsidian/99-AI/external-ingest/Gmail/2026-04-22.md`
 # (el digest de mails indexado). Sin material en CONTEXTO, el LLM
 # resolvió el fallback con una frase abstracta. Este helper permite
 # detectar empty-state y preservar el vault retrieve en ese caso.
@@ -2339,7 +2486,7 @@ _WEB_SYSTEM_PROMPT_V1 = (
 # del CONTEXTO ("María es tu hermano"). Endurecemos REGLA 0 para
 # incluir portugués e italiano explícitamente (contagion bajo fast-path
 # WA con contactos brasileros).
-_WEB_SYSTEM_PROMPT_V2 = 'Eres un asistente de consulta sobre las notas personales de Obsidian del usuario. NO sos un modelo de conocimiento general.\n\nREGLA 0 — IDIOMA: respondé SIEMPRE en español rioplatense. PROHIBIDO emitir tokens en portugués, inglés, italiano, ni otros idiomas/alfabetos (汉字, русский, etc.); caracteres fuera del alfabeto latino sólo se permiten dentro de una cita literal entre comillas. Si el CONTEXTO contiene mensajes en otros idiomas (ej. WhatsApp con contactos brasileros), traducilos al responder. Si la pregunta viene en otro idioma, traducila y respondé en español.\n\nREGLA 1 — ENGANCHÁTE CON EL CONTEXTO: el CONTEXTO de abajo es lo que el retriever consideró más cercano. Resumí SIEMPRE lo que aporta, aun si es breve o tangencial. Si el CONTEXTO es pobre, describí brevemente lo que sí aparece. PROHIBIDO refusal tipo "no tengo información" — siempre devolvé el mejor resumen posible del CONTEXTO. Fuera del CONTEXTO no inventes (ver REGLA 3).\n\nREGLA 1.a — INTENT (CRÍTICO, lee la pregunta primero): clasificá la PREGUNTA antes de enumerar nada.\n\n  (A) PREGUNTA-DATO ("dame los datos de X" / "cuál es la dirección/CBU/teléfono/fecha/precio de X" / "decime X" / "explicame X" / "qué dice la nota sobre X" / "dónde está X"): devolvé el FACT específico de X. Buscá la sección/chunk del CONTEXTO que LITERALMENTE contiene ese dato (dirección, número, descripción, fecha). PROHIBIDO listar URLs / muebles / recursos / links de OTRAS secciones del mismo documento — son tangenciales a la pregunta. Si la nota tiene "Dirección de la casa" + "Muebles" y el user pidió "datos de la casa", citá la dirección (calle, ciudad, CP), NO la lista de muebles.\n\n  (B) PREGUNTA-INVENTARIO ("¿qué tenés sobre X?" / "¿qué hay de X?" / "listame X" / "¿qué notas tengo de X?" / "¿qué links/recursos de X?" / "enumerame X"): enumerá en bullets cortos los ítems concretos del CONTEXTO — links, URLs, números, fechas, nombres — verbatim. PROHIBIDO meta-resumen tipo "las notas mencionan recursos sobre X" cuando el CONTEXTO contiene la lista — listá los items.\n\n  Default ante ambigüedad: PREGUNTA-DATO. Sólo enumerá si la pregunta usa explícitamente "qué tenés / qué hay / listame / cuáles son los X".\n\nREGLA 1.d — RANK-1 ES CANÓNICO: cuando dos chunks del CONTEXTO contienen valores DISTINTOS para el mismo dato (CBU, teléfono, dirección, alias, mail, fecha, número de cuenta, código), usá el del PRIMER chunk listado (rank 1, score más alto) — esa es tu fuente más confiable. NUNCA elijas rank 2/3 sobre rank 1 sólo porque el folder o título "matchea mejor" la palabra de la pregunta — el reranker ya hizo ese trabajo. Si genuinamente parecen referirse a entidades distintas (ej. CBU para alquiler vs CBU para expensas), aclará "para X tu nota dice Y; para Z tenés W" — pero priorizá el rank 1 al elegir el dato principal.\n\nREGLA 1.b — DATOS TRANSACCIONALES FINANCIEROS (excepción ESPECÍFICA y ACOTADA a REGLA 1): SOLO aplica cuando la pregunta nombra EXPLÍCITAMENTE banco/tarjeta/visa/mastercard/amex/MOZE/dolares/pesos/USD/ARS/montos/consumos/movimientos. En esos casos: NUNCA inventes ni copies de notas tangenciales. SOLO cita números/fechas/comercios que aparecen literalmente bajo ### Gastos o ### Tarjetas. Si esas secciones NO están, o están pero vacías, respondé "No tengo data fresca de [X] — el último export del banco puede no estar al día." y CORTÁ ahí. Si hay AMBAS secciones (MOZE + Tarjetas) y la pregunta menciona "tarjeta/visa/master/amex/crédito", priorizá ### Tarjetas. Para CALENDARIO/REMINDERS/MAILS/WHATSAPP/CLIMA/DRIVE — citá literal de la sección correspondiente cuando esté presente, pero NUNCA uses el template de "data fresca/export" (esos no tienen "exports" — los devolvés ya frescos via tool calls).\n\nREGLA 1.b.1 — ALCANCE de REGLA 1.b (PROHIBICIÓN EXPLÍCITA): REGLA 1.b NO aplica a preguntas sobre notas, conceptos, temas, ideas, técnicas, proyectos, conocimiento, conceptos abstractos, métodos, frameworks, libros, autores, citas. Para esas: REGLA 1 (engancháte con el CONTEXTO). El template "No tengo data fresca de [X] — el último export del [...] puede no estar al día" está PROHIBIDO para queries que NO sean financieras explícitas. Si el vault no tiene matches sobre un concepto/técnica/tema, respondé en LENGUAJE NATURAL: "No encontré nada en tus notas sobre [X]. Probá buscar como [variante1] o [variante2], o agregá una nota si querés trackearlo." NO uses la palabra "export", NO digas "no tengo data fresca", NO menciones "el último [algo]".\n\nREGLA 1.c — NO FALSE CONFIRMATIONS (CRÍTICA, security-related): NUNCA digas "se ha programado/agregado/creado/cancelado/eliminado/modificado/actualizado [X]" si NO ejecutaste literalmente la tool correspondiente en este turno. Si el user pide editar/sumar/cambiar/cancelar algo PREVIAMENTE creado y NO tenés tool para hacer ese edit (no existe `propose_reminder_edit`, `propose_calendar_cancel`, etc.), DECILE textualmente: "No puedo editar/cancelar lo anterior desde acá — abrí Apple Reminders/Calendar y modificá manualmente. Si querés, puedo crear uno nuevo con [X] (el viejo queda como está)." PROHIBIDO confirmar acciones que no se ejecutaron.\n\nREGLA 2 — NO CITAR NOTAS INLINE: la UI ya muestra la lista de fuentes (nota, score, ruta) debajo. PROHIBIDO markdown links `[Título](ruta.md)`, nombres con extensión (`algo.md`), rutas PARA (`03-Resources/…`, `02-Areas/…`) ni el título completo como header. Referencias implícitas OK: "según tus notas", "en tu nota sobre X".\n\nREGLA 3 — MARCAR EXTERNO (excepcional, no rutinario): usá `<<ext>>...<</ext>>` SOLO para (a) conocimiento general externo al CONTEXTO (ej: \'React es una librería de UI de Meta\' si el CONTEXTO no tiene React), (b) opinión/inferencia tuya que NO se deriva del CONTEXTO, (c) link a docs oficiales permitido por REGLA 4.6. Parafraseo rutinario, reordenamientos, conectores (\'también\', \'además\', \'en resumen\'), síntesis — TODO eso NO lleva marcador. Marcar cada oración con `<<ext>>` es un BUG. Ante duda, NO marques.\n\nREGLA 4 — FORMATO: 2-4 oraciones o lista corta. Dato clave primero, contexto mínimo (qué hace, cómo se invoca) después. Si piden un comando, herramienta o parámetro Y el CONTEXTO tiene su uso (firma, ejemplo, en qué MCP vive), ese uso es OBLIGATORIO en la respuesta.\n\nREGLA 4.5 — PRESERVAR LINKS DEL CONTENIDO: URLs (http://, https://) y wikilinks ([[Nota]]) que vivan DENTRO del cuerpo de una nota son data, no citas-fuente — copialos LITERAL. REGLA 2 sólo prohíbe citar la ruta del chunk; los links internos son clickeables.\n\nREGLA 4.6 — LINK A DOCS OFICIALES (raro, MUY acotado): TOTALMENTE PROHIBIDO en queries sobre personas ("qué sabés de X", "hablame de Y"), eventos, recordatorios, mails, gastos, WhatsApp, calendar, o cualquier dato del vault. SOLO aplica cuando (a) la pregunta nombra EXPLÍCITAMENTE un software/herramienta/producto externo (ej. "cómo configuro OmniFocus", "qué features tiene Obsidian"), (b) el CONTEXTO del vault se queda corto, y (c) tenés certeza del dominio raíz oficial. Formato: `<<ext>>Más info: <dominio-raíz></ext>>`. En TODOS los demás casos NO agregues link externo, aunque la respuesta sea breve. Ante duda, NO lo incluyas.\n\nREGLA 5 — SEGUÍ EL HILO: es una conversación. Pronombres ("ella", "eso"), referencias elípticas ("y de X?", "profundizá") o temas asumidos se resuelven con los turns previos. No trates la pregunta como si empezara de cero.\n\nREGLA 6 — TRATAMIENTO: hablale DIRECTAMENTE al usuario en 2da persona, tuteo rioplatense ("vos", "tenés", "te"). El usuario ES quien pregunta. PROHIBIDO 3ra persona ("el usuario", "la hija del usuario", "le"). Traducí: "la hija del usuario" → "tu hija"; "las notas del usuario" → "tus notas".\n\nREGLA 7 — NO FUSIONAR PERSONAS: si el CONTEXTO menciona varias personas (ej. una "María" contacto + otra "María" de otro chat + un "Mario"), NUNCA mezcles sus atributos. Si no podés distinguir a quién pertenece cada dato, decí "hay varias personas con ese nombre en tus notas" y listá lo más seguro. PROHIBIDO inventar parentesco ("María es tu hermana/o") si el CONTEXTO no lo afirma LITERALMENTE con esa palabra — si una nota dice "mi prima María" y otra "María Fernández, colega", NO unifiques. Respetá el género/pronombre tal como aparece en cada cita — no los "corrijas" al género preguntado.'
+_WEB_SYSTEM_PROMPT_V2 = 'Eres un asistente de consulta sobre las notas personales de Obsidian del usuario. NO sos un modelo de conocimiento general.\n\nREGLA 0 — IDIOMA: respondé SIEMPRE en español rioplatense. PROHIBIDO emitir tokens en portugués, inglés, italiano, ni otros idiomas/alfabetos (汉字, русский, etc.); caracteres fuera del alfabeto latino sólo se permiten dentro de una cita literal entre comillas. Si el CONTEXTO contiene mensajes en otros idiomas (ej. WhatsApp con contactos brasileros), traducilos al responder. Si la pregunta viene en otro idioma, traducila y respondé en español.\n\nREGLA 1 — ENGANCHÁTE CON EL CONTEXTO: el CONTEXTO de abajo es lo que el retriever consideró más cercano. Resumí SIEMPRE lo que aporta, aun si es breve o tangencial. Si el CONTEXTO es pobre, describí brevemente lo que sí aparece. PROHIBIDO refusal tipo "no tengo información" — siempre devolvé el mejor resumen posible del CONTEXTO. Fuera del CONTEXTO no inventes (ver REGLA 3).\n\nREGLA 1.a — INTENT (CRÍTICO, lee la pregunta primero): clasificá la PREGUNTA antes de enumerar nada.\n\n  (A) PREGUNTA-DATO ("dame los datos de X" / "cuál es la dirección/CBU/teléfono/fecha/precio de X" / "decime X" / "explicame X" / "qué dice la nota sobre X" / "dónde está X"): devolvé el FACT específico de X. Buscá la sección/chunk del CONTEXTO que LITERALMENTE contiene ese dato (dirección, número, descripción, fecha). PROHIBIDO listar URLs / muebles / recursos / links de OTRAS secciones del mismo documento — son tangenciales a la pregunta. Si la nota tiene "Dirección de la casa" + "Muebles" y el user pidió "datos de la casa", citá la dirección (calle, ciudad, CP), NO la lista de muebles.\n\n  (B) PREGUNTA-INVENTARIO ("¿qué tenés sobre X?" / "¿qué hay de X?" / "listame X" / "¿qué notas tengo de X?" / "¿qué links/recursos de X?" / "enumerame X"): enumerá en bullets cortos los ítems concretos del CONTEXTO — links, URLs, números, fechas, nombres — verbatim. PROHIBIDO meta-resumen tipo "las notas mencionan recursos sobre X" cuando el CONTEXTO contiene la lista — listá los items.\n\n  Default ante ambigüedad: PREGUNTA-DATO. Sólo enumerá si la pregunta usa explícitamente "qué tenés / qué hay / listame / cuáles son los X".\n\nREGLA 1.d — RANK-1 ES CANÓNICO: cuando dos chunks del CONTEXTO contienen valores DISTINTOS para el mismo dato (CBU, teléfono, dirección, alias, mail, fecha, número de cuenta, código), usá el del PRIMER chunk listado (rank 1, score más alto) — esa es tu fuente más confiable. NUNCA elijas rank 2/3 sobre rank 1 sólo porque el folder o título "matchea mejor" la palabra de la pregunta — el reranker ya hizo ese trabajo. Si genuinamente parecen referirse a entidades distintas (ej. CBU para alquiler vs CBU para expensas), aclará "para X tu nota dice Y; para Z tenés W" — pero priorizá el rank 1 al elegir el dato principal.\n\nREGLA 1.b — DATOS TRANSACCIONALES FINANCIEROS (excepción ESPECÍFICA y ACOTADA a REGLA 1): SOLO aplica cuando la pregunta nombra EXPLÍCITAMENTE banco/tarjeta/visa/mastercard/amex/MOZE/dolares/pesos/USD/ARS/montos/consumos/movimientos. En esos casos: NUNCA inventes ni copies de notas tangenciales. SOLO cita números/fechas/comercios que aparecen literalmente bajo ### Gastos o ### Tarjetas. Si esas secciones NO están, o están pero vacías, respondé "No tengo data fresca de [X] — el último export del banco puede no estar al día." y CORTÁ ahí. Si hay AMBAS secciones (MOZE + Tarjetas) y la pregunta menciona "tarjeta/visa/master/amex/crédito", priorizá ### Tarjetas. Para CALENDARIO/REMINDERS/MAILS/WHATSAPP/CLIMA/DRIVE — citá literal de la sección correspondiente cuando esté presente, pero NUNCA uses el template de "data fresca/export" (esos no tienen "exports" — los devolvés ya frescos via tool calls).\n\nREGLA 1.b.1 — ALCANCE de REGLA 1.b (PROHIBICIÓN EXPLÍCITA): REGLA 1.b NO aplica a preguntas sobre notas, conceptos, temas, ideas, técnicas, proyectos, conocimiento, conceptos abstractos, métodos, frameworks, libros, autores, citas. Para esas: REGLA 1 (engancháte con el CONTEXTO). El template "No tengo data fresca de [X] — el último export del [...] puede no estar al día" está PROHIBIDO para queries que NO sean financieras explícitas. Si el vault no tiene matches sobre un concepto/técnica/tema, respondé en LENGUAJE NATURAL: "No encontré nada en tus notas sobre [X]. Probá buscar como [variante1] o [variante2], o agregá una nota si querés trackearlo." NO uses la palabra "export", NO digas "no tengo data fresca", NO menciones "el último [algo]".\n\nREGLA 1.c — NO FALSE CONFIRMATIONS (CRÍTICA, security-related): NUNCA digas "se ha programado/agregado/creado/cancelado/eliminado/modificado/actualizado [X]" si NO ejecutaste literalmente la tool correspondiente en este turno. Si el user pide editar/sumar/cambiar/cancelar algo PREVIAMENTE creado y NO tenés tool para hacer ese edit (no existe `propose_reminder_edit`, `propose_calendar_cancel`, etc.), DECILE textualmente: "No puedo editar/cancelar lo anterior desde acá — abrí Apple Reminders/Calendar y modificá manualmente. Si querés, puedo crear uno nuevo con [X] (el viejo queda como está)." PROHIBIDO confirmar acciones que no se ejecutaron.\n\nREGLA 2 — NO CITAR NOTAS INLINE: la UI ya muestra la lista de fuentes (nota, score, ruta) debajo. PROHIBIDO markdown links `[Título](ruta.md)`, nombres con extensión (`algo.md`), rutas PARA (`03-Resources/…`, `02-Areas/…`) ni el título completo como header. Referencias implícitas OK: "según tus notas", "en tu nota sobre X".\n\nREGLA 3 — MARCAR EXTERNO (excepcional, no rutinario): usá `<<ext>>...<</ext>>` SOLO para (a) conocimiento general externo al CONTEXTO (ej: \'React es una librería de UI de Meta\' si el CONTEXTO no tiene React), (b) opinión/inferencia tuya que NO se deriva del CONTEXTO, (c) link a docs oficiales permitido por REGLA 4.6. Parafraseo rutinario, reordenamientos, conectores (\'también\', \'además\', \'en resumen\'), síntesis — TODO eso NO lleva marcador. Marcar cada oración con `<<ext>>` es un BUG. Ante duda, NO marques.\n\nREGLA 4 — FORMATO: 2-4 oraciones o lista corta. Dato clave primero, contexto mínimo (qué hace, cómo se invoca) después. Si piden un comando, herramienta o parámetro Y el CONTEXTO tiene su uso (firma, ejemplo, en qué MCP vive), ese uso es OBLIGATORIO en la respuesta.\n\nREGLA 4.5 — PRESERVAR LINKS DEL CONTENIDO: URLs (http://, https://) y wikilinks ([[Nota]]) que vivan DENTRO del cuerpo de una nota son data, no citas-fuente — copialos LITERAL. REGLA 2 sólo prohíbe citar la ruta del chunk; los links internos son clickeables.\n\nREGLA 4.6 — LINK A DOCS OFICIALES (raro, MUY acotado): TOTALMENTE PROHIBIDO en queries sobre personas ("qué sabés de X", "hablame de Y"), eventos, recordatorios, mails, gastos, WhatsApp, calendar, o cualquier dato del vault. SOLO aplica cuando (a) la pregunta nombra EXPLÍCITAMENTE un software/herramienta/producto externo (ej. "cómo configuro OmniFocus", "qué features tiene Obsidian"), (b) el CONTEXTO del vault se queda corto, y (c) tenés certeza del dominio raíz oficial. Formato: `<<ext>>Más info: <dominio-raíz></ext>>`. En TODOS los demás casos NO agregues link externo, aunque la respuesta sea breve. Ante duda, NO lo incluyas.\n\nREGLA 5 — SEGUÍ EL HILO: es una conversación. Pronombres ("ella", "eso"), referencias elípticas ("y de X?", "profundizá") o temas asumidos se resuelven con los turns previos. No trates la pregunta como si empezara de cero.\n\nREGLA 6 — TRATAMIENTO: hablale DIRECTAMENTE al usuario en 2da persona, tuteo rioplatense ("vos", "tenés", "te"). El usuario ES quien pregunta. PROHIBIDO 3ra persona ("el usuario", "la hija del usuario", "le"). Traducí: "la hija del usuario" → "tu hija"; "las notas del usuario" → "tus notas".\n\nREGLA 6.a — AUTO-REFERENCIA: cuando describas tus propias acciones (búsqueda, lectura, hallazgo, mirada al CONTEXTO), usá primera persona SINGULAR ("encontré", "busqué", "leí", "vi", "miré"), NUNCA plural ("encontramos", "buscamos", "leímos", "vimos"). Sos UN asistente solo, no un colectivo. PROHIBIDO el "nosotros" académico/editorial. También válido el impersonal: "en la nota aparece...", "la nota dice...".\n\nREGLA 7 — NO FUSIONAR PERSONAS: si el CONTEXTO menciona varias personas (ej. una "María" contacto + otra "María" de otro chat + un "Mario"), NUNCA mezcles sus atributos. Si no podés distinguir a quién pertenece cada dato, decí "hay varias personas con ese nombre en tus notas" y listá lo más seguro. PROHIBIDO inventar parentesco ("María es tu hermana/o") si el CONTEXTO no lo afirma LITERALMENTE con esa palabra — si una nota dice "mi prima María" y otra "María Fernández, colega", NO unifiques. Respetá el género/pronombre tal como aparece en cada cita — no los "corrijas" al género preguntado.'
 
 # Selector con fallback seguro a v1 si el env var toma un valor raro.
 _WEB_SYSTEM_PROMPT = (
@@ -3737,15 +3884,12 @@ _CHAT_RATE_WINDOW = 60.0
 # converger a O(n²) y dominar CPU del handler. Deque hace el shift
 # constant-time. Los tests que hacen `_CHAT_BUCKETS.clear()` siguen
 # funcionando igual (deque soporta `.clear()`).
-_RATE_LIMIT_LOCK = _threading.Lock()
-
-
 def _check_rate_limit(bucket: dict[str, "_collections.deque"], ip: str,
                       limit: int, window: float) -> None:
     """Sliding-window rate limit per-IP. Raises HTTPException 429 on breach."""
     now = time.time()
     cutoff = now - window
-    with _RATE_LIMIT_LOCK:
+    with _threading.Lock():
         events = bucket[ip]
         # `popleft()` O(1) en deque. Antes con `list.pop(0)` cada remoción
         # era O(len(events)) → bajo carga con 30 events en ventana el
@@ -7789,7 +7933,7 @@ _TODAY_FM_SPLIT = re.compile(r"^---\s*\n.*?\n---\s*\n", re.DOTALL)
 
 
 def _persist_today_brief(date_label: str, narrative: str) -> None:
-    """Write the regenerated brief to `04-Archive/99-obsidian-system/99-AI/reviews/YYYY-MM-DD-evening.md` so
+    """Write the regenerated brief to `99-obsidian/99-AI/reviews/YYYY-MM-DD-evening.md` so
     subsequent `/api/home` calls hit the cached path. Mirrors the CLI
     `rag today` write — same frontmatter shape so contradiction detection
     and ambient skip rules treat both files the same. Silent-fail.
@@ -7816,7 +7960,7 @@ def _persist_today_brief(date_label: str, narrative: str) -> None:
 
 
 def _today_cached_narrative(date_label: str) -> str | None:
-    """Return narrative from `04-Archive/99-obsidian-system/99-AI/reviews/YYYY-MM-DD-evening.md` if present.
+    """Return narrative from `99-obsidian/99-AI/reviews/YYYY-MM-DD-evening.md` if present.
     CLI `rag today` writes this file, so we avoid re-running the LLM when the
     brief was already generated today.
     """
@@ -8825,8 +8969,7 @@ def _fetch_finance(now: datetime | None = None) -> dict | None:
 _CARDS_CACHE: dict = {"key": None, "payload": None}
 # Lock para read-then-write atómico (audit 2026-04-26): pre-fix dos threads
 # concurrentes podían ver pareja inconsistente (key nuevo + payload viejo)
-# si uno leía mientras otro escribía. Lock simple — el path no recursa.
-_CARDS_CACHE_LOCK = threading.Lock()
+# si uno leía mientras otro escribía. ThreadSafeCache maneja esto internamente.
 
 # Regex para extraer marca + últimos 4 del nombre de archivo o sheet name.
 # Tolera "Visa Crédito terminada en 1059", "Visa 1059", "Mastercard 5234",
@@ -9288,6 +9431,12 @@ _HOME_BG_INTERVAL = 300.0
 # lock) because multiple concurrent chats are fine — they serialise on
 # ollama anyway, and we only care about "nobody chatting" vs "someone is".
 _CHAT_INFLIGHT = 0
+# Lock anti-race del counter de arriba. Crítico: si esto se cambiara a
+# `with threading.Lock()` por call (objeto efímero), no habría exclusión
+# mutua real entre threads de uvicorn — el counter se corrompería bajo
+# carga concurrente y el home-prewarmer (que lee `_CHAT_INFLIGHT > 0`
+# para skip-cycle) se intercalaría con chats activos compitiendo por
+# `_MLX_FORWARD_LOCK`. Singleton de módulo, mismo patrón que `_CPU_LOCK`.
 _CHAT_INFLIGHT_LOCK = threading.Lock()
 # Rolling window of recent home-compute totals (seconds). Powers the
 # `degraded` SSE event: when an in-flight stream exceeds 2× the median
@@ -9297,9 +9446,19 @@ _CHAT_INFLIGHT_LOCK = threading.Lock()
 # Bounded to last 20 entries (≈10min at the 30s prewarmer cadence + 60s
 # auto-refresh) — old enough to capture day-to-day variance, recent
 # enough not to anchor on stale baselines after a restart.
-_HOME_COMPUTE_HISTORY: list[float] = []
-_HOME_COMPUTE_HISTORY_LOCK = threading.Lock()
 _HOME_COMPUTE_HISTORY_MAX = 20
+# Rolling window de últimos N totales de compute (segundos). `deque(maxlen=N)`
+# auto-evicta el más viejo al pushear el N+1, sin TTL — la idea es "últimos N
+# samples reales", no "últimos N segundos". `ThreadSafeCacheMultiKey` no era
+# semánticamente correcto acá (single key, value-overwrite ≠ rolling list)
+# y además el `default_factory` / `max_size` que se le pasaba ni siquiera
+# son kwargs de su `__init__` (bug de instanciación bloqueaba ~50 tests al
+# collection time hasta el fix 2026-05-08). Lock dedicado para snapshot
+# atómico cuando _home_compute_degraded_threshold itera el contenido.
+_HOME_COMPUTE_HISTORY: _collections.deque[float] = _collections.deque(
+    maxlen=_HOME_COMPUTE_HISTORY_MAX,
+)
+_HOME_COMPUTE_HISTORY_LOCK = threading.Lock()
 # Floor below which we don't bother computing degraded thresholds —
 # avoids spamming "degraded" early on when we only have 1-2 samples
 # from a fast warm cache (≈1.5s) and 2× would fire on any cold-ish run.
@@ -9329,9 +9488,7 @@ def _record_home_compute_total(
     if elapsed_s <= 0 or elapsed_s > 600:
         return
     with _HOME_COMPUTE_HISTORY_LOCK:
-        _HOME_COMPUTE_HISTORY.append(elapsed_s)
-        if len(_HOME_COMPUTE_HISTORY) > _HOME_COMPUTE_HISTORY_MAX:
-            _HOME_COMPUTE_HISTORY.pop(0)
+        _HOME_COMPUTE_HISTORY.append(float(elapsed_s))
 
     # Persist sync — single-row INSERT to telemetry.db is sub-ms warm
     # and benefits from `busy_timeout=30000` to absorb transient locks.
@@ -9380,7 +9537,8 @@ def _hydrate_home_compute_history_from_sql() -> None:
         return
     samples = [float(r[0]) for r in reversed(rows)]
     with _HOME_COMPUTE_HISTORY_LOCK:
-        _HOME_COMPUTE_HISTORY[:] = samples
+        _HOME_COMPUTE_HISTORY.clear()
+        _HOME_COMPUTE_HISTORY.extend(samples)
 
 
 def _home_compute_degraded_threshold() -> float:
@@ -10110,35 +10268,15 @@ def _ensure_corpus_prewarmer() -> None:
 #   - hay history (follow-ups dependen del turno previo, el key no refleja eso)
 #   - el response fue vacío/error
 #   - _wa_in_query matcheó (WA data change rápidamente, datos frescos importan)
-_CHAT_CACHE: "OrderedDict[str, dict]" = __import__("collections").OrderedDict()
-_CHAT_CACHE_MAX = 100
-_CHAT_CACHE_TTL = float(os.environ.get("RAG_WEB_CHAT_CACHE_TTL", "86400"))  # default 24h, override via env
-_CHAT_CACHE_LOCK = threading.Lock()
+_CHAT_CACHE = ThreadSafeCacheMultiKey(
+    ttl=float(os.environ.get("RAG_WEB_CHAT_CACHE_TTL", "86400")),  # default 24h
+    max_size=int(os.environ.get("RAG_WEB_CHAT_CACHE_MAX", "100")),
+)
 
 
 def _chat_cache_key(question: str, vault_scope: str, model: str, vault_chunks: int) -> str:
     raw = f"{question.strip().lower()}|{vault_scope}|{model}|{vault_chunks}"
     return __import__("hashlib").sha256(raw.encode()).hexdigest()[:16]
-
-
-def _chat_cache_get(key: str) -> dict | None:
-    with _CHAT_CACHE_LOCK:
-        entry = _CHAT_CACHE.get(key)
-        if not entry:
-            return None
-        if time.time() - entry["ts"] > _CHAT_CACHE_TTL:
-            del _CHAT_CACHE[key]
-            return None
-        _CHAT_CACHE.move_to_end(key)
-        return dict(entry)
-
-
-def _chat_cache_put(key: str, payload: dict) -> None:
-    with _CHAT_CACHE_LOCK:
-        _CHAT_CACHE[key] = {"ts": time.time(), **payload}
-        _CHAT_CACHE.move_to_end(key)
-        while len(_CHAT_CACHE) > _CHAT_CACHE_MAX:
-            _CHAT_CACHE.popitem(last=False)
 
 
 def _collect_today_evidence_multi(
@@ -10218,7 +10356,7 @@ def _home_compute(
     Per-channel silent-fail: if one source errors (e.g. Gmail OAuth expired,
     icalBuddy not installed), that key is missing/empty but the rest renders.
     `regenerate=true` forces a fresh LLM narrative (~10s); default reuses the
-    cached brief from `04-Archive/99-obsidian-system/99-AI/reviews/<date>-evening.md` if present.
+    cached brief from `99-obsidian/99-AI/reviews/<date>-evening.md` if present.
 
     `progress` (optional): callback invoked as
     `progress(stage, status, elapsed_ms, error_message)` where status is one
@@ -12113,7 +12251,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             _cache_key = _chat_cache_key(
                 question, req.vault_scope or "", _resolve_web_chat_model(), _vault_chunks
             )
-            _cached = _chat_cache_get(_cache_key)
+            _cached = _CHAT_CACHE.get(_cache_key)
             if _cached:
                 # Replay completo como SSE. Status `cached` NO es redundante
                 # aunque el `done` event también lleve `cached: True` — el
@@ -12374,7 +12512,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                         # Hydrate LRU so next-turn exact-match hits O(1).
                         if _cache_key is not None:
                             try:
-                                _chat_cache_put(_cache_key, {
+                                _CHAT_CACHE.put(_cache_key, {
                                     "text": _sem_text,
                                     "sources_items": _sem_sources,
                                     "top_score": _sem_top,
@@ -12796,17 +12934,17 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     "00-Inbox/conversations/",
                     # Nueva ubicación canónica desde 2026-04-25 — sistema vive
                     # bajo 99-AI/, fuera del PARA del user.
-                    "04-Archive/99-obsidian-system/99-AI/conversations/",
+                    "99-obsidian/99-AI/conversations/",
                     # mem-vault: memorias del agente sobre bugs/decisiones del
                     # sistema. Son metadata interna, no contenido del user.
                     # Sin este filtro, una memoria recién guardada puede volver
                     # como source de la próxima query (observado 2026-05-01:
                     # query "crear cuenta" trajo `obsidian_rag_preflight_
                     # ollama_probe_post_restart...md` como source #4).
-                    "04-Archive/99-obsidian-system/99-AI/memory/",
+                    "99-obsidian/99-AI/memory/",
                     # Planning docs / specs / post-mortems internos del agente.
                     # Mismo razonamiento que memory/: no son del user.
-                    "04-Archive/99-obsidian-system/99-AI/system/",
+                    "99-obsidian/99-AI/system/",
                 ),
                 intent=_intent_for_log,
                 caller="web",
@@ -13836,7 +13974,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     with _ToolExecutor(max_workers=5) as _pool:
                         _futs = [_pool.submit(_run_tool, n, a) for n, a in _f_parallel]
                         for _fut in _as_completed(_futs):
-                            _n, _res, _ms = _fut.result()
+                            _n, _res, _ms = _fut.result(timeout=30.0)
                             _pre_parallel_max_ms = max(_pre_parallel_max_ms, _ms)
                             _forced_results.append((_n, _res, _ms))
                             yield _sse("status", {"stage": "tool_done", "name": _n, "ms": _ms})
@@ -13866,7 +14004,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 # vault y agregamos el tool output como sección explícita
                 # "CONSULTAS EN VIVO (todas vacías)". Racional: si el user
                 # preguntó por "últimos mails" y `gmail_recent` vino vacío,
-                # pero el retrieve pulló `04-Archive/99-obsidian-system/99-AI/external-ingest/Gmail/2026-04-22.md`
+                # pero el retrieve pulló `99-obsidian/99-AI/external-ingest/Gmail/2026-04-22.md`
                 # (digest indexado de mails), queremos que el LLM pueda
                 # usar ese digest como fallback concreto en vez de
                 # contestar "te dejo otras fuentes" en abstracto. Con el
@@ -14290,7 +14428,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     try:
                         _futures = [_ex.submit(_exec_one, na) for na in _parallel]
                         for _fut in _as_completed(_futures):
-                            _name, _out, _elapsed_ms = _fut.result()
+                            _name, _out, _elapsed_ms = _fut.result(timeout=30.0)
                             if _elapsed_ms > _round_parallel_max_ms:
                                 _round_parallel_max_ms = _elapsed_ms
                             _round_tool_names.append(_name)
@@ -14901,7 +15039,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     {**_source_payload(m, s), "bar": _score_bar(float(s))}
                     for m, s in zip(result["metas"], result["scores"])
                 ]
-                _chat_cache_put(_cache_key, {
+                _CHAT_CACHE.put(_cache_key, {
                     "text": full,
                     "sources_items": _sources_items,
                     "top_score": round(_sanitize_confidence(result["confidence"]), 3),
@@ -14998,9 +15136,7 @@ def dashboard_page() -> FileResponse:
 # El user pidió: "tablero igual estéticamente al resto, exclusivamente de
 # finanzas". El payload se cachea 60s (la data cambia cuando el user
 # re-exporta MOZE o tira un PDF nuevo, no más rápido que eso).
-_FINANCE_DASH_CACHE: dict = {"ts": 0.0, "payload": None, "key": None}
-_FINANCE_DASH_LOCK = threading.Lock()
-_FINANCE_DASH_TTL = 60.0
+_FINANCE_DASH_CACHE = ThreadSafeCacheMultiKey(ttl=60.0, max_size=10)
 
 
 @app.get("/finance")
@@ -15018,18 +15154,13 @@ def finance_api(months: int = 12, window_days: int = 30) -> dict:
     """
     months = max(1, min(int(months or 12), 36))
     window_days = max(7, min(int(window_days or 30), 365))
-    key = (months, window_days)
-    now_ts = time.time()
-    with _FINANCE_DASH_LOCK:
-        hit = _FINANCE_DASH_CACHE
-        if hit["key"] == key and hit["payload"] and now_ts - hit["ts"] < _FINANCE_DASH_TTL:
-            return hit["payload"]
+    key = str((months, window_days))
+    cached = _FINANCE_DASH_CACHE.get(key)
+    if cached:
+        return cached
     from web.finance_dashboard import snapshot
     payload = snapshot(months=months, window_days=window_days)
-    with _FINANCE_DASH_LOCK:
-        _FINANCE_DASH_CACHE["ts"] = now_ts
-        _FINANCE_DASH_CACHE["key"] = key
-        _FINANCE_DASH_CACHE["payload"] = payload
+    _FINANCE_DASH_CACHE.put(key, payload)
     return payload
 
 
@@ -15043,9 +15174,7 @@ def finance_api(months: int = 12, window_days: int = 30) -> dict:
 #      (force-directed) que muestra cómo están conectadas tus notas.
 #
 # Performance budget: cold ~200-500ms, warm <5ms. TTL 60s.
-_ATLAS_DASH_CACHE: dict = {"ts": 0.0, "payload": None, "key": None}
-_ATLAS_DASH_LOCK = threading.Lock()
-_ATLAS_DASH_TTL = 60.0
+_ATLAS_DASH_CACHE = ThreadSafeCacheMultiKey(ttl=60.0, max_size=10)
 
 
 @app.get("/atlas")
@@ -15064,22 +15193,17 @@ def atlas_api(window_days: int = 30, top_entities: int = 50, graph_top_notes: in
     window_days = max(7, min(int(window_days or 30), 365))
     top_entities = max(5, min(int(top_entities or 50), 200))
     graph_top_notes = max(50, min(int(graph_top_notes or 250), 2000))
-    key = (window_days, top_entities, graph_top_notes)
-    now_ts = time.time()
-    with _ATLAS_DASH_LOCK:
-        hit = _ATLAS_DASH_CACHE
-        if hit["key"] == key and hit["payload"] and now_ts - hit["ts"] < _ATLAS_DASH_TTL:
-            return hit["payload"]
+    key = str((window_days, top_entities, graph_top_notes))
+    cached = _ATLAS_DASH_CACHE.get(key)
+    if cached:
+        return cached
     from web.atlas_dashboard import snapshot
     payload = snapshot(
         window_days=window_days,
         top_entities=top_entities,
         graph_top_notes=graph_top_notes,
     )
-    with _ATLAS_DASH_LOCK:
-        _ATLAS_DASH_CACHE["ts"] = now_ts
-        _ATLAS_DASH_CACHE["key"] = key
-        _ATLAS_DASH_CACHE["payload"] = payload
+    _ATLAS_DASH_CACHE.put(key, payload)
     return payload
 
 
@@ -15303,7 +15427,7 @@ def atlas_pulse_recent_api(since_id: int = 0, limit: int = 30) -> dict:
 # como está).
 #
 # Doc del plan en el vault:
-# `04-Archive/99-obsidian-system/99-AI/system/whatsapp-whisper-learning/plan.md`
+# `99-obsidian/99-AI/system/whatsapp-whisper-learning/plan.md`
 
 def _esc(s: str) -> str:
     """HTML escape para evitar XSS desde texto del usuario (chats, transcripts)."""
@@ -16295,9 +16419,7 @@ def _status_dispatch_one(entry: dict) -> dict:
 # Cache corto del payload entero — si la UI auto-refreshea cada 5s, no
 # queremos hacer 25 subprocess.run por cada request. 3s es suficiente
 # para que un F5 manual vea cambios recientes sin hammerear launchctl.
-_STATUS_CACHE: dict = {"ts": 0.0, "payload": None}
-_STATUS_CACHE_TTL = 3.0
-_STATUS_CACHE_LOCK = threading.Lock()
+_STATUS_CACHE = ThreadSafeCache(ttl=3.0)
 
 
 def _status_build_payload() -> dict:
@@ -16325,14 +16447,26 @@ def _status_build_payload() -> dict:
     results: list[dict] = [{} for _ in _STATUS_CATALOG]
     # Thread pool con >1 worker aun para checks rápidos — el cuello es
     # los ~25 `launchctl print` (20-40ms c/u). Con 8 workers, ~100ms
-    # total vs. 800ms seriales.
+    # total vs. 800ms seriales. Timeout de 5s por check para evitar
+    # que un check colgado bloquee el endpoint.
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
         futs = {pool.submit(_status_dispatch_one, entry): i
                 for i, entry in enumerate(_STATUS_CATALOG)}
         for fut in concurrent.futures.as_completed(futs):
             i = futs[fut]
             try:
-                results[i] = fut.result()
+                results[i] = fut.result(timeout=5.0)
+            except concurrent.futures.TimeoutError:
+                entry = _STATUS_CATALOG[i]
+                results[i] = {
+                    "id": entry.get("id", entry.get("target", "?")),
+                    "name": entry.get("name", "?"),
+                    "kind": entry.get("kind", "?"),
+                    "status": "down",
+                    "detail": "timeout del check (>5s)",
+                    "category": entry["category"],
+                    "category_label": entry["category_label"],
+                }
             except Exception as e:
                 entry = _STATUS_CATALOG[i]
                 results[i] = {
@@ -16388,21 +16522,21 @@ def api_status(nocache: int = 0) -> dict:
     persistencia es necesaria para el heatmap del card #5 — el resto de
     los cards se computan on-demand de fuentes pre-existentes.
     """
-    now = time.monotonic()
-    with _STATUS_CACHE_LOCK:
-        cached = _STATUS_CACHE["payload"]
-        fresh = (now - _STATUS_CACHE["ts"]) < _STATUS_CACHE_TTL
-    if nocache or not fresh or cached is None:
+    if nocache:
         payload = _status_build_payload()
-        with _STATUS_CACHE_LOCK:
-            _STATUS_CACHE["payload"] = payload
-            _STATUS_CACHE["ts"] = now
-        # Hook de persistencia para el heatmap del uptime card (#5).
-        # Rate-limited internamente a 60s; cualquier excepción se traga
-        # para no bajar el endpoint principal.
+        _STATUS_CACHE.put(payload)
         _persist_status_samples(payload)
         return payload
-    return cached
+    
+    cached = _STATUS_CACHE.get()
+    if cached is None:
+        payload = _status_build_payload()
+        _STATUS_CACHE.put(payload)
+        _persist_status_samples(payload)
+        return payload
+    
+    ts, payload = cached
+    return payload
 
 
 # ── /api/status/action — start / stop launchd-controlled services ────
@@ -16470,9 +16604,7 @@ def status_action(req: StatusActionRequest) -> dict:
     # Invalidar cache para que el proximo /api/status refleje el cambio
     # (kickstart cambia state a running en <1s; sin esto la UI mostraria
     # info vieja por hasta 3s - el TTL del cache).
-    with _STATUS_CACHE_LOCK:
-        _STATUS_CACHE["ts"] = 0.0
-        _STATUS_CACHE["payload"] = None
+    _STATUS_CACHE.put({"ts": 0.0, "payload": None})
 
     return {
         "ok": out.returncode == 0,
@@ -16511,9 +16643,7 @@ def status_action(req: StatusActionRequest) -> dict:
 #   }
 # Valores null para buckets vacíos (el frontend les pone gap en el SVG).
 
-_LATENCY_CACHE_TTL = 60.0
-_LATENCY_CACHE: dict = {"ts": 0.0, "payload": None}
-_LATENCY_CACHE_LOCK = threading.Lock()
+_LATENCY_CACHE = ThreadSafeCache(ttl=60.0)
 
 
 def _status_latency_build_payload() -> dict:
@@ -16659,17 +16789,19 @@ def status_latency(nocache: int = 0) -> dict:
     """Hourly p50/p95/p99 series of /api/chat total_ms over the last 24h
     plus a 7d baseline for delta computation. Drives the latency sparkline
     on /status. Cached 60s; `?nocache=1` forces refresh."""
-    now = time.monotonic()
-    with _LATENCY_CACHE_LOCK:
-        cached = _LATENCY_CACHE["payload"]
-        fresh = (now - _LATENCY_CACHE["ts"]) < _LATENCY_CACHE_TTL
-    if nocache or not fresh or cached is None:
+    if nocache:
         payload = _status_latency_build_payload()
-        with _LATENCY_CACHE_LOCK:
-            _LATENCY_CACHE["payload"] = payload
-            _LATENCY_CACHE["ts"] = now
+        _LATENCY_CACHE.put(payload)
         return payload
-    return cached
+    
+    cached = _LATENCY_CACHE.get()
+    if cached is None:
+        payload = _status_latency_build_payload()
+        _LATENCY_CACHE.put(payload)
+        return payload
+    
+    ts, payload = cached
+    return payload
 
 
 # ── /api/status/errors — error-budget para el donut del /status ──────
@@ -16708,9 +16840,7 @@ def status_latency(nocache: int = 0) -> dict:
 #     "delta_pct": 46.8,                  # vs prev_24h
 #   }
 
-_ERRORS_CACHE_TTL = 30.0
-_ERRORS_CACHE: dict = {"ts": 0.0, "payload": None}
-_ERRORS_CACHE_LOCK = threading.Lock()
+_ERRORS_CACHE = ThreadSafeCacheMultiKey(ttl=30.0, max_size=1)
 
 # Cuántos `where/event` distintos mostramos en la breakdown antes de
 # colapsar el resto en `other`. 6 es el sweet spot — entra en la card
@@ -16853,17 +16983,16 @@ def status_errors(nocache: int = 0) -> dict:
     "requests". Mostramos counts absolutos + delta vs ayer, que es
     honesto y alineado con cómo vive la telemetría hoy.
     """
-    now = time.monotonic()
-    with _ERRORS_CACHE_LOCK:
-        cached = _ERRORS_CACHE["payload"]
-        fresh = (now - _ERRORS_CACHE["ts"]) < _ERRORS_CACHE_TTL
-    if nocache or not fresh or cached is None:
+    if nocache:
         payload = _status_errors_build_payload()
-        with _ERRORS_CACHE_LOCK:
-            _ERRORS_CACHE["payload"] = payload
-            _ERRORS_CACHE["ts"] = now
+        _ERRORS_CACHE.put("default", payload)
         return payload
-    return cached
+    cached = _ERRORS_CACHE.get("default")
+    if cached:
+        return cached
+    payload = _status_errors_build_payload()
+    _ERRORS_CACHE.put("default", payload)
+    return payload
 
 
 # ── /api/status/freshness — cuándo corrió por última vez cada fuente ──
@@ -16908,9 +17037,7 @@ def status_errors(nocache: int = 0) -> dict:
 #   drift ≥ 3.0         → stale (el ingestor probablemente se wedgeó)
 #   file missing        → unknown (no corrió nunca o el log fue borrado)
 
-_FRESHNESS_CACHE_TTL = 30.0
-_FRESHNESS_CACHE: dict = {"ts": 0.0, "payload": None}
-_FRESHNESS_CACHE_LOCK = threading.Lock()
+_FRESHNESS_CACHE = ThreadSafeCache(ttl=30.0)
 
 # Catálogo de fuentes. El orden acá define el orden en la UI (stable,
 # lo que permite al user aprender la tabla "de memoria"). `sla_seconds`
@@ -17094,17 +17221,19 @@ def status_freshness(nocache: int = 0) -> dict:
     los actuales lo hacen, al menos un timestamp header). Si alguno
     deja de hacerlo, hay que migrarlo a un marker file explícito.
     """
-    now_mono = time.monotonic()
-    with _FRESHNESS_CACHE_LOCK:
-        cached = _FRESHNESS_CACHE["payload"]
-        fresh = (now_mono - _FRESHNESS_CACHE["ts"]) < _FRESHNESS_CACHE_TTL
-    if nocache or not fresh or cached is None:
+    if nocache:
         payload = _status_freshness_build_payload()
-        with _FRESHNESS_CACHE_LOCK:
-            _FRESHNESS_CACHE["payload"] = payload
-            _FRESHNESS_CACHE["ts"] = now_mono
+        _FRESHNESS_CACHE.put(payload)
         return payload
-    return cached
+    
+    cached = _FRESHNESS_CACHE.get()
+    if cached is None:
+        payload = _status_freshness_build_payload()
+        _FRESHNESS_CACHE.put(payload)
+        return payload
+    
+    ts, payload = cached
+    return payload
 
 
 # ── /api/status/logs — eventos recientes WARN/ERROR ──────────────────
@@ -17146,8 +17275,7 @@ def status_freshness(nocache: int = 0) -> dict:
 _LOGS_CACHE_TTL = 15.0  # más corto que errors (30s) porque queremos
                           # ver eventos nuevos rápido — log-tail debería
                           # sentirse "live"
-_LOGS_CACHE: dict = {}    # cached por (window, limit, level) tuple
-_LOGS_CACHE_LOCK = threading.Lock()
+_LOGS_CACHE = ThreadSafeCacheMultiKey(ttl=15.0)
 
 # Allowed values para los query params; sirven también para el contract
 # tests + el frontend pickea de acá.
@@ -17311,24 +17439,19 @@ def status_logs(
     lim = max(1, min(int(limit), _LOGS_MAX_LIMIT))
 
     cache_key = (window_s, lim, level)
-    now_mono = time.monotonic()
-    with _LOGS_CACHE_LOCK:
-        entry = _LOGS_CACHE.get(cache_key)
-        fresh = entry is not None and (now_mono - entry["ts"]) < _LOGS_CACHE_TTL
-    if nocache or not fresh:
+    if nocache:
         payload = _status_logs_build_payload(window_s, lim, level)
-        with _LOGS_CACHE_LOCK:
-            _LOGS_CACHE[cache_key] = {"payload": payload, "ts": now_mono}
-            # Evict stale entries — sin esto el dict crece sin bound porque
-            # cada combinación de (window, limit, level) crea una key nueva
-            # y el TTL check de arriba sólo decide si DEVOLVER la cache,
-            # no la limpia. Crecimiento observado en sesiones largas.
-            cutoff = now_mono - (_LOGS_CACHE_TTL + 5.0)
-            stale = [k for k, v in _LOGS_CACHE.items() if v["ts"] < cutoff]
-            for k in stale:
-                _LOGS_CACHE.pop(k, None)
+        _LOGS_CACHE.put(cache_key, payload)
         return payload
-    return entry["payload"]
+    
+    cached = _LOGS_CACHE.get(cache_key)
+    if cached is None:
+        payload = _status_logs_build_payload(window_s, lim, level)
+        _LOGS_CACHE.put(cache_key, payload)
+        return payload
+    
+    ts, payload = cached
+    return payload
 
 
 # ── /api/status/uptime — heatmap 7d × 24h por servicio core ──────────
@@ -17494,9 +17617,7 @@ def _status_periodic_probe_loop() -> None:
             # Update el cache módulo-level así un user que llega justo
             # ahora consume la data fresca sin re-build (3s TTL del
             # `/api/status` cache).
-            with _STATUS_CACHE_LOCK:
-                _STATUS_CACHE["payload"] = payload
-                _STATUS_CACHE["ts"] = time.monotonic()
+            _STATUS_CACHE.put(payload)
             _persist_status_samples(payload)
         except Exception as exc:
             print(f"[status-probe] tick failed: {type(exc).__name__}: {exc}",
@@ -17543,9 +17664,7 @@ def _stop_status_probe_thread() -> None:
 # Cache para el endpoint /uptime — el query es relativamente caro
 # (window function sobre 50k rows agrupadas por hora), TTL más largo
 # que los otros cards porque los buckets de uptime cambian de a poco.
-_UPTIME_CACHE_TTL = 90.0
-_UPTIME_CACHE: dict = {"ts": 0.0, "payload": None}
-_UPTIME_CACHE_LOCK = threading.Lock()
+_UPTIME_CACHE = ThreadSafeCache(ttl=90.0)
 
 
 def _status_uptime_build_payload() -> dict:
@@ -17640,17 +17759,17 @@ def status_uptime(nocache: int = 0) -> dict:
     datos". Después de unas horas de uso normal, los recientes se
     pueblan; después de 7d el cuadro está full.
     """
-    now_mono = time.monotonic()
-    with _UPTIME_CACHE_LOCK:
-        cached = _UPTIME_CACHE["payload"]
-        fresh = (now_mono - _UPTIME_CACHE["ts"]) < _UPTIME_CACHE_TTL
-    if nocache or not fresh or cached is None:
+    if nocache:
         payload = _status_uptime_build_payload()
-        with _UPTIME_CACHE_LOCK:
-            _UPTIME_CACHE["payload"] = payload
-            _UPTIME_CACHE["ts"] = now_mono
+        _UPTIME_CACHE.put(payload)
         return payload
-    return cached
+    cached = _UPTIME_CACHE.get()
+    if cached:
+        ts, payload = cached
+        return payload
+    payload = _status_uptime_build_payload()
+    _UPTIME_CACHE.put(payload)
+    return payload
 
 
 @app.get("/status")
@@ -17850,9 +17969,7 @@ _LOG_RECENT_ERROR_WINDOW_S = 86400
 # rápido (~5ms), pero la heurística de "error_count_recent" lee la cola
 # de varios files para detectar errores → más caro. Cache 10s mantiene
 # la página snappy sin perder responsiveness real.
-_LOGS_INDEX_CACHE: dict = {"ts": 0.0, "payload": None}
-_LOGS_INDEX_CACHE_TTL = 10.0
-_LOGS_INDEX_CACHE_LOCK = threading.Lock()
+_LOGS_INDEX_CACHE = ThreadSafeCache(ttl=10.0)
 
 
 def _classify_log_line(line: str) -> str:
@@ -18219,19 +18336,19 @@ def logs_index(nocache: int = 0) -> dict:
     """Lista de todos los archivos de log del stack, agrupados por service,
     con status agregado (ok/warn/error) y preview de la última línea.
 
-    Cacheado `_LOGS_INDEX_CACHE_TTL` segundos. ?nocache=1 fuerza refresh.
+    Cacheado 10s. ?nocache=1 fuerza refresh.
     """
-    now_mono = time.monotonic()
-    with _LOGS_INDEX_CACHE_LOCK:
-        cached = _LOGS_INDEX_CACHE["payload"]
-        fresh = (now_mono - _LOGS_INDEX_CACHE["ts"]) < _LOGS_INDEX_CACHE_TTL
-    if nocache or not fresh or cached is None:
+    if nocache:
         payload = _build_logs_index_payload()
-        with _LOGS_INDEX_CACHE_LOCK:
-            _LOGS_INDEX_CACHE["payload"] = payload
-            _LOGS_INDEX_CACHE["ts"] = now_mono
+        _LOGS_INDEX_CACHE.put(payload)
         return payload
-    return cached
+    cached = _LOGS_INDEX_CACHE.get()
+    if cached:
+        ts, payload = cached
+        return payload
+    payload = _build_logs_index_payload()
+    _LOGS_INDEX_CACHE.put(payload)
+    return payload
 
 
 @app.get("/api/logs/file")
@@ -18341,9 +18458,7 @@ _LOG_GLOBAL_DEFAULT_WINDOW_S = 3600  # 1h
 _LOG_GLOBAL_MAX_WINDOW_S = 7 * 86400  # 7 días
 _LOG_GLOBAL_MAX_LINES = 1000
 
-_LOG_GLOBAL_CACHE: dict = {}
-_LOG_GLOBAL_CACHE_TTL = 8.0
-_LOG_GLOBAL_CACHE_LOCK = threading.Lock()
+_LOG_GLOBAL_CACHE = ThreadSafeCacheMultiKey(ttl=8.0)
 
 
 def _build_global_errors_payload(window_s: int, level_filter: str) -> dict:
@@ -18499,21 +18614,17 @@ def logs_global_errors(
         )
     window_s = max(60, min(int(since_seconds), _LOG_GLOBAL_MAX_WINDOW_S))
     cache_key = (window_s, level)
-    now_mono = time.monotonic()
-    with _LOG_GLOBAL_CACHE_LOCK:
-        entry = _LOG_GLOBAL_CACHE.get(cache_key)
-        fresh = entry is not None and (now_mono - entry["ts"]) < _LOG_GLOBAL_CACHE_TTL
-    if nocache or not fresh:
+    if nocache:
         payload = _build_global_errors_payload(window_s, level)
-        with _LOG_GLOBAL_CACHE_LOCK:
-            _LOG_GLOBAL_CACHE[cache_key] = {"payload": payload, "ts": now_mono}
-            # Evict stale — ver _LOGS_CACHE para el rationale.
-            cutoff = now_mono - (_LOG_GLOBAL_CACHE_TTL + 5.0)
-            stale = [k for k, v in _LOG_GLOBAL_CACHE.items() if v["ts"] < cutoff]
-            for k in stale:
-                _LOG_GLOBAL_CACHE.pop(k, None)
+        _LOG_GLOBAL_CACHE.put(cache_key, payload)
         return payload
-    return entry["payload"]
+    cached = _LOG_GLOBAL_CACHE.get(cache_key)
+    if cached:
+        ts, payload = cached
+        return payload
+    payload = _build_global_errors_payload(window_s, level)
+    _LOG_GLOBAL_CACHE.put(cache_key, payload)
+    return payload
 
 
 # ── /api/logs/rankings — agregaciones rankeables del stack ────────────
@@ -18558,9 +18669,8 @@ def logs_global_errors(
 #   ver para depurar (cualquier service ruidoso es candidato a o ajustar
 #   el log level o investigar por qué loggea tanto).
 
-_RANKINGS_CACHE: dict = {}
 _RANKINGS_CACHE_TTL = 8.0
-_RANKINGS_CACHE_LOCK = threading.Lock()
+_RANKINGS_CACHE = ThreadSafeCacheMultiKey(ttl=8.0)
 
 
 # Signature normalizer para clustering de error lines. Estrategia: strip
@@ -19120,20 +19230,12 @@ def logs_rankings(
     n = max(1, min(int(top_n), 50))
     cache_key = (window_s, n)
     now_mono = time.monotonic()
-    with _RANKINGS_CACHE_LOCK:
-        entry = _RANKINGS_CACHE.get(cache_key)
-        fresh = entry is not None and (now_mono - entry["ts"]) < _RANKINGS_CACHE_TTL
+    cached, fresh = _RANKINGS_CACHE.get(cache_key, now_mono)
     if nocache or not fresh:
         payload = _build_rankings_payload(window_s, n)
-        with _RANKINGS_CACHE_LOCK:
-            _RANKINGS_CACHE[cache_key] = {"payload": payload, "ts": now_mono}
-            # Evict stale — ver _LOGS_CACHE para el rationale.
-            cutoff = now_mono - (_RANKINGS_CACHE_TTL + 5.0)
-            stale = [k for k, v in _RANKINGS_CACHE.items() if v["ts"] < cutoff]
-            for k in stale:
-                _RANKINGS_CACHE.pop(k, None)
+        _RANKINGS_CACHE.set(cache_key, payload, now_mono)
         return payload
-    return entry["payload"]
+    return cached
 
 
 # ── /api/diagnose-error — LLM-powered error diagnosis ─────────────────
@@ -21084,8 +21186,7 @@ def status_home() -> dict:
                            "by_cause": []},
         }
 
-    with _HOME_COMPUTE_HISTORY_LOCK:
-        history_size = len(_HOME_COMPUTE_HISTORY)
+    history_size = len(_HOME_COMPUTE_HISTORY)
     payload["threshold_s"] = round(_home_compute_degraded_threshold(), 2)
     payload["floor_s"] = _HOME_COMPUTE_DEGRADED_FLOOR
     payload["cold"] = history_size < 3
@@ -21967,29 +22068,34 @@ try:
         _SSE_MAX_PER_IP = _SSE_MAX_PER_IP_DEFAULT
 except (TypeError, ValueError):
     _SSE_MAX_PER_IP = _SSE_MAX_PER_IP_DEFAULT
-_SSE_CONNECTIONS_PER_IP: dict[str, int] = {}
-_SSE_CONNECTIONS_LOCK = _threading.Lock()
+_SSE_CONNECTIONS_PER_IP = ThreadSafeCacheMultiKey(
+    ttl=86400.0,  # 24h - no expira por tiempo, solo por release
+)
+
+
+def _sse_get_count(ip: str) -> int:
+    """Helper interno — devuelve el count (int) o 0 si miss/stale."""
+    res = _SSE_CONNECTIONS_PER_IP.get(ip)
+    return int(res[1]) if res else 0
 
 
 def _sse_acquire_slot(ip: str) -> bool:
     """Reserva un slot SSE para `ip`. Devuelve False si ya hay
     `_SSE_MAX_PER_IP` conexiones activas. Audit 2026-04-25 R2-Performance #3."""
-    with _SSE_CONNECTIONS_LOCK:
-        current = _SSE_CONNECTIONS_PER_IP.get(ip, 0)
-        if current >= _SSE_MAX_PER_IP:
-            return False
-        _SSE_CONNECTIONS_PER_IP[ip] = current + 1
-        return True
+    current = _sse_get_count(ip)
+    if current >= _SSE_MAX_PER_IP:
+        return False
+    _SSE_CONNECTIONS_PER_IP.put(ip, current + 1)
+    return True
 
 
 def _sse_release_slot(ip: str) -> None:
     """Libera un slot SSE para `ip` (idempotente con el contador a 0)."""
-    with _SSE_CONNECTIONS_LOCK:
-        current = _SSE_CONNECTIONS_PER_IP.get(ip, 0)
-        if current <= 1:
-            _SSE_CONNECTIONS_PER_IP.pop(ip, None)
-        else:
-            _SSE_CONNECTIONS_PER_IP[ip] = current - 1
+    current = _sse_get_count(ip)
+    if current <= 1:
+        _SSE_CONNECTIONS_PER_IP.delete(ip)
+    else:
+        _SSE_CONNECTIONS_PER_IP.put(ip, current - 1)
 
 
 def _stream_max_id(conn, table: str) -> int:
@@ -22205,9 +22311,8 @@ def _stream_payload(kind: str, ev: dict) -> dict:
 # cambian más lento (eval runs son nightly, tune runs son nightly, weights
 # se reescriben 1/día). Sirve directo desde RAM si hay hit warm.
 
-_LEARNING_CACHE: dict[int, tuple[float, dict]] = {}
-_LEARNING_CACHE_LOCK = threading.Lock()  # audit 2026-04-26 — race en SSE concurrente
 _LEARNING_TTL = 60.0
+_LEARNING_CACHE = ThreadSafeCacheMultiKey(ttl=60.0)
 
 
 @app.get("/learning")
@@ -22225,10 +22330,9 @@ def learning_api(days: int = 30) -> dict:
     funciones de `web.learning_queries` envuelven sus reads con
     `_sql_read_with_retry` y devuelven shape vacío en error)."""
     now_ts = time.time()
-    with _LEARNING_CACHE_LOCK:
-        hit = _LEARNING_CACHE.get(days)
-        if hit and now_ts - hit[0] < _LEARNING_TTL:
-            return hit[1]
+    cached, fresh = _LEARNING_CACHE.get(days, now_ts)
+    if fresh and cached is not None:
+        return cached
     # Lazy import: módulo nuevo, no queremos cargarlo al import-time del
     # servidor si nadie pide /learning. Después del primer hit
     # queda cacheado por el import system; las llamadas subsiguientes son
@@ -22273,13 +22377,7 @@ def learning_api(days: int = 30) -> dict:
             "vault_intelligence": vault_intelligence(days),
         },
     }
-    with _LEARNING_CACHE_LOCK:
-        _LEARNING_CACHE[days] = (now_ts, payload)
-        # Evict stale — ver _LOGS_CACHE para el rationale.
-        cutoff = now_ts - (_LEARNING_TTL + 5.0)
-        stale = [k for k, v in _LEARNING_CACHE.items() if v[0] < cutoff]
-        for k in stale:
-            _LEARNING_CACHE.pop(k, None)
+    _LEARNING_CACHE.set(days, payload, now_ts)
     return payload
 
 
@@ -23058,12 +23156,19 @@ def _stop_cpu_sampler() -> None:
 
 
 @app.get("/api/system-cpu")
-def system_cpu_api(minutes: int = 360) -> dict:
+async def system_cpu_api(minutes: int = 360) -> dict:
     """Last `minutes` of rag-stack CPU samples + a freshly computed current.
 
     Values are `% of one core` per category. Can exceed 100 per category
     (sum across multithreaded procs). `ncores` is included so the client
     can render a secondary scale as % of total CPU if desired.
+
+    Audit 2026-05-08 (fix perf #4): `time.sleep(_CPU_LIVE_INTERVAL)` (~2s)
+    consumía 1 worker del threadpool de FastAPI durante toda la ventana
+    de muestreo. Bajo polling concurrente del dashboard, exhaustaba el
+    pool y encolaba chat/query. Ahora el handler es `async def` y delega
+    la ventana de medición a `asyncio.sleep` + `asyncio.to_thread` para
+    los samples → el thread queda libre para otro request.
     """
     minutes = max(5, min(minutes, 1440))
     cutoff = datetime.now() - timedelta(minutes=minutes)
@@ -23079,12 +23184,13 @@ def system_cpu_api(minutes: int = 360) -> dict:
         except Exception:
             continue
 
-    # Snapshot current via a short-gap sample (sleep in a worker thread
-    # would block this sync handler; just use a small synchronous window).
+    # Snapshot current sin bloquear el threadpool: el sample en sí corre
+    # en thread (psutil + parsing JSON), pero la espera de la ventana
+    # vive en el event loop.
     probe: dict = {}
-    _sample_cpu(probe)
-    time.sleep(_CPU_LIVE_INTERVAL)
-    current = _sample_cpu(probe)
+    await asyncio.to_thread(_sample_cpu, probe)
+    await asyncio.sleep(_CPU_LIVE_INTERVAL)
+    current = await asyncio.to_thread(_sample_cpu, probe)
 
     return {
         "categories": list(_MEMORY_CATEGORIES),

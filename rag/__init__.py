@@ -17240,6 +17240,14 @@ class RetrieveResult:
     # `rag_contradictions`. Surfaced en `extra_json` del query log para
     # poder medir cuán a menudo el penalty fire en producción.
     contradiction_penalty_applied: int = 0
+    # Bug Hunt 2026-05-08 (M Tel contradiction_penalty empty): cantidad de
+    # paths con contradicciones no resueltas en `rag_contradictions` AL
+    # MOMENTO de evaluar el feature, INDEPENDIENTE de si matcheó algo.
+    # `None` = feature OFF / counter mode / silent_log triggered.
+    # `0` = feature ON pero DB vacía. `>0` = N candidates en DB. Cuando
+    # `applied < n_bad_paths` significa "feature funcionando pero ningún
+    # path coincidió" — útil para distinguir bugs de matching de DB vacía.
+    contradiction_penalty_n_bad_paths: int | None = None
     # MMR diversification (2026-04-29): cuántos slots del scored_all fueron
     # re-ordenados por la pasada MMR (rag/mmr_diversification.py). 0 cuando
     # el feature está apagado (RAG_MMR=0 + RAG_MMR_FOLDER_PENALTY=0), cuando
@@ -19303,6 +19311,19 @@ def retrieve(
     #   RAG_CONTRADICTION_PENALTY=0           → desactiva
     #   RAG_CONTRADICTION_PENALTY_MAGNITUDE   → magnitud (default 0.05)
     _contradiction_penalty_count = 0
+    # Bug Hunt 2026-05-08 (M Tel contradiction_penalty empty): telemetría
+    # del feature pre-fix sólo loggeaba `contradiction_penalty_applied`
+    # (count de matches). Cuando ese contador era 0, no había forma de
+    # distinguir entre los 4 modos:
+    #   (a) feature OFF (RAG_CONTRADICTION_PENALTY=0)
+    #   (b) feature ON + counter=True (radar mode)
+    #   (c) feature ON + DB sin contradicciones (rag_contradictions vacía)
+    #   (d) feature ON + DB con N bad_paths pero NINGUNO matchea scored_all
+    # Análisis SQL de tipo "qué fracción del tráfico no matchea?" era
+    # imposible. Fix: emitir `contradiction_penalty_n_bad_paths` (int o
+    # None) — None = feature OFF/skip, 0 = DB vacía, >0 = N candidates en
+    # DB sin importar si hubo match. Persisted en extra_json del query log.
+    _contradiction_penalty_n_bad_paths: int | None = None
     if (
         scored_all
         and not counter
@@ -19316,6 +19337,10 @@ def retrieve(
             )
             with _ragvec_state_conn() as _cp_conn:
                 _bad_paths = _load_contradiction_paths(_cp_conn)
+            # Set n_bad_paths AUNQUE _bad_paths esté vacío — eso captura
+            # el modo (c) "DB sin contradicciones" como señal distinta de
+            # (a) "feature OFF" (que deja n_bad_paths=None).
+            _contradiction_penalty_n_bad_paths = len(_bad_paths)
             if _bad_paths:
                 # Adapter: el helper espera list[dict] con `path`+`score`.
                 # Conservamos el índice original para reconstruir scored_all
@@ -19804,6 +19829,7 @@ def retrieve(
         fast_path=_fast_path,
         intent=intent,
         contradiction_penalty_applied=int(_contradiction_penalty_count),
+        contradiction_penalty_n_bad_paths=_contradiction_penalty_n_bad_paths,
         mmr_applied=int(_mmr_applied_count),
         temporal_intent=_temporal_intent,
         llm_judge_fired=bool(_llm_judge_telemetry.get("llm_judge_fired", False)),
@@ -27074,6 +27100,9 @@ def query(
         "deep_retrieve_exit_reason": result.get("deep_retrieve_exit_reason"),
         "contradiction_penalty_applied": int(
             result.get("contradiction_penalty_applied", 0) or 0,
+        ),
+        "contradiction_penalty_n_bad_paths": result.get(
+            "contradiction_penalty_n_bad_paths",
         ),
         "mmr_applied": int(result.get("mmr_applied", 0) or 0),
         # Sprint 3-A (2026-05-04): replay payload fields.

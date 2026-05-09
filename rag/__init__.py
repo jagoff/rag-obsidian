@@ -44062,6 +44062,63 @@ def bridge_reauth(keep_session: bool, yes: bool):
     )
 
 
+@cli.command("contact-dossier")
+@click.argument("contact_name", required=False, default="")
+@click.option("--all", "all_contacts", is_flag=True,
+              help="Regenerar dossier de TODOS los contactos del vault.")
+@click.option("--dry-run", is_flag=True, help="No escribir, solo mostrar.")
+def contact_dossier(contact_name: str, all_contacts: bool, dry_run: bool):
+    """Generar el dossier per-contacto en `99-Contacts/<name>.md`.
+
+    Game Changer #2: cada contacto tiene una sección `## Dossier` viva
+    con LLM-resumen de la conversación reciente, promesas abiertas,
+    eventos próximos, vibe + sugerencia next step. El listener TS lee
+    el dossier antes de generar drafts → respuestas contextuales en
+    lugar de genéricas.
+
+    Ejemplos:
+      rag contact-dossier Maria              # regenera 1 contacto
+      rag contact-dossier --all              # regenera todos
+      rag contact-dossier Seba --dry-run     # ver el JSON sin escribir
+    """
+    from rag.integrations.whatsapp.dossier import (
+        generate_dossier, write_dossier_to_note, render_dossier_markdown,
+        refresh_all_dossiers,
+    )
+    if all_contacts:
+        console.print("[dim]regenerando dossier de todos los contactos…[/dim]")
+        result = refresh_all_dossiers(dry_run=dry_run)
+        console.print(
+            f"[green]✓[/green] processed={result['processed']} "
+            f"skipped={result['skipped']} errors={result['errors']}"
+        )
+        for entry in result["by_contact"][:30]:
+            tag = {"written": "✓", "would_write": "·",
+                   "skipped": "↷", "error": "✗",
+                   "exception": "💥"}.get(entry["status"], "?")
+            detail = f" [dim]{entry.get('detail', '')}[/dim]" if entry.get("detail") else ""
+            console.print(f"  {tag} {entry['contact']}{detail}")
+        return
+
+    if not contact_name:
+        console.print("[red]✗ falta nombre del contacto (o usá --all)[/red]")
+        raise click.exceptions.Exit(1)
+
+    dossier = generate_dossier(contact_name)
+    if dossier.get("error"):
+        console.print(f"[red]✗ error:[/red] {dossier['error']}")
+        raise click.exceptions.Exit(1)
+    if dry_run:
+        console.print(render_dossier_markdown(dossier))
+        return
+    ok = write_dossier_to_note(contact_name, dossier)
+    if ok:
+        console.print(f"[green]✓ dossier escrito[/green] en `99-Contacts/{contact_name}.md`")
+    else:
+        console.print("[red]✗ no pude escribir el dossier (nota no encontrada?)[/red]")
+        raise click.exceptions.Exit(1)
+
+
 @cli.command("contact-note")
 @click.argument("contact_name")
 @click.argument("observation")

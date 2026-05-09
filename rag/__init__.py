@@ -46558,6 +46558,47 @@ def stop(
     )
 
 
+def _run_catch_up_index(ctx: click.Context) -> None:
+    """Catch-up incremental index del vault, llamado por `rag start`.
+
+    Refactor 2026-05-09 (Phase 2d preliminar): extraido del cuerpo de
+    `start` para destrabar la extracción del comando a `rag/cli/setup.py`.
+    `start` invocaba `ctx.invoke(index, ...)` directamente, que es legítimo
+    pero ata el comando al closure del Click context y no se mueve limpio
+    a un módulo externo. Ahora `start` llama esta helper, y la helper
+    encapsula el `ctx.invoke` (preserva error handling SystemExit-aware
+    + silent_log idéntico al inline original).
+
+    Behavior idéntico al inline pre-refactor:
+    - Si otra instancia de `rag index` está corriendo (lock contention
+      → SystemExit code != 0), informa al user con un mensaje "skip" y
+      sigue (no aborta `start`).
+    - Si tira excepción no-Exit, la loggea silent y avisa.
+    """
+    console.print()
+    console.print("[bold cyan]▸ catch-up index (incremental)[/bold cyan]")
+    try:
+        ctx.invoke(
+            index,
+            reset=False,
+            no_contradict=False,
+            source_opt=None,
+            since_opt=None,
+            dry_run=False,
+            max_chats=None,
+            vault_scope=None,
+        )
+    except SystemExit as e:
+        if e.code != 0:
+            console.print(
+                "[yellow]·[/yellow] catch-up skip "
+                "(otro `rag index` activo, retry manual con `rag index`)"
+            )
+    except Exception as exc:
+        console.print(f"[yellow]·[/yellow] catch-up falló: {exc!r}")
+        _silent_log("rag_start_index_failed", exc)
+
+
 @cli.command()
 @click.option(
     "--minimal/--full", "minimal", default=True,
@@ -46784,28 +46825,7 @@ def start(
     # DESPUÉS bootstrappa daemons (que pueden ir cargando MLX
     # tranquilamente sin conflicto).
     if not no_index:
-        console.print()
-        console.print("[bold cyan]▸ catch-up index (incremental)[/bold cyan]")
-        try:
-            ctx.invoke(
-                index,
-                reset=False,
-                no_contradict=False,
-                source_opt=None,
-                since_opt=None,
-                dry_run=False,
-                max_chats=None,
-                vault_scope=None,
-            )
-        except SystemExit as e:
-            if e.code != 0:
-                console.print(
-                    "[yellow]·[/yellow] catch-up skip "
-                    "(otro `rag index` activo, retry manual con `rag index`)"
-                )
-        except Exception as exc:
-            console.print(f"[yellow]·[/yellow] catch-up falló: {exc!r}")
-            _silent_log("rag_start_index_failed", exc)
+        _run_catch_up_index(ctx)
 
     # ── 2. obsidian-rag-* via setup callback ─────────────────────────────
     # `_setup_install` regenera los plists desde código (captura overrides

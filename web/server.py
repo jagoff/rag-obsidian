@@ -213,7 +213,7 @@ try:
 except ImportError:
     _HEIC_AVAILABLE = False
 
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
@@ -377,192 +377,13 @@ from web._intent_detection import (  # noqa: E402, F401
 # max_workers=2 permite overlap en burst sin starvar el OS thread pool.
 _WA_FETCH_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="wa-fetch")
 
-# Metadata por tool source-specific, usada para componer el hint de
-# "intención explícita" que se le pasa al LLM cuando el pre-router
-# disparó un tool. Campos:
-#   label         — cómo nombramos la fuente al user ("tus mails/correos").
-#   live_section  — header de la sección fresca en CONTEXTO que renderea
-#                   `_format_forced_tool_output` (p.ej. "### Mails").
-#   digest_hint   — dónde más buscar items indexados en el CONTEXTO si la
-#                   live section está vacía. Para mails: las notas de
-#                   99-obsidian/99-AI/external-ingest/Gmail/YYYY-MM-DD.md usan un `## <asunto>`
-#                   por mail con From/Date/Snippet debajo — extraer esos
-#                   H2 da un listado crudo de "mis últimos mails" que el
-#                   user espera. Otros sources tienen su propio formato.
-#   item_shape    — ejemplo del formato que debe usar cada bullet en la
-#                   respuesta final, para que el LLM no invente prosa
-#                   cuando el user pidió un listado.
-#   empty_phrase  — frase explícita cuando NO hay nada ni live ni en
-#                   digest. Reemplaza el vago "te dejo otras fuentes".
-#
-# Weather / finance_summary NO están acá porque no son "fuentes" que el
-# user busca — son resúmenes autogenerados sin concepto de ausencia.
-_SOURCE_INTENT_META: dict[str, dict[str, str]] = {
-    "gmail_recent": {
-        "label": "tus mails/correos",
-        "live_section": "### Mails",
-        "digest_hint": (
-            "Si en el CONTEXTO hay notas del vault del tipo "
-            "`99-obsidian/99-AI/external-ingest/Gmail/YYYY-MM-DD.md` (cada `## <asunto>` "
-            "dentro es UN mail, con su **From:**, **Date:** y **Snippet:**), "
-            "extraé esos asuntos y listálos uno por línea — son LITERALMENTE "
-            "los últimos mails del usuario. NO digas 'en tu nota' ni "
-            "menciones la ruta de la nota: los asuntos SON los mails."
-        ),
-        "item_shape": "- <asunto> (de <remitente>)",
-        "empty_phrase": "No encontré mails recientes en tu corpus",
-    },
-    "calendar_ahead": {
-        "label": "tu calendario/agenda/eventos",
-        "live_section": "### Calendario",
-        "digest_hint": (
-            "Si en el CONTEXTO hay notas con eventos (morning brief, "
-            "agenda del día), extraé los títulos de los eventos y listálos."
-        ),
-        "item_shape": "- <título> (<fecha/hora>)",
-        "empty_phrase": "No tenés eventos en el horizonte",
-    },
-    "reminders_due": {
-        "label": "tus recordatorios/pendientes",
-        "live_section": "### Recordatorios",
-        "digest_hint": (
-            "Si en el CONTEXTO hay notas que mencionan tareas pendientes "
-            "(morning/evening brief, PARA projects), extraelas y listálas."
-        ),
-        "item_shape": "- <tarea> (<fecha si tiene>)",
-        "empty_phrase": "No tenés recordatorios pendientes",
-    },
-    "drive_search": {
-        "label": "tu Google Drive",
-        "live_section": "### Google Drive",
-        "digest_hint": (
-            "La sección live trae los archivos encontrados con su body "
-            "exportado. Si el user pidió un dato concreto (precio, deuda, "
-            "cantidad), citálo TEXTUAL del body si está; si no aparece, "
-            "decí explícitamente que buscaste y no encontraste ese dato."
-        ),
-        "item_shape": "- <nombre del archivo> (<tipo>) · <dato relevante o 'sin match'>",
-        "empty_phrase": "No encontré nada en tu Google Drive que matchee",
-    },
-    "whatsapp_pending": {
-        "label": "tus chats de WhatsApp esperando respuesta",
-        "live_section": "### WhatsApp",
-        "digest_hint": (
-            "La sección live trae los chats donde el user debe el próximo "
-            "mensaje (último inbound sin reply). Si en el CONTEXTO hay "
-            "notas de `99-obsidian/99-AI/external-ingest/WhatsApp/<contacto>/YYYY-MM.md` con "
-            "más contexto de esos chats, podés complementar. NUNCA "
-            "inventes conversaciones de WhatsApp — si la sección live "
-            "está vacía decilo explícitamente en vez de citar otras "
-            "fuentes como si fueran WA."
-        ),
-        "item_shape": "- <contacto> (hace <Xh/d>): <último mensaje>",
-        "empty_phrase": "No hay chats de WhatsApp esperando tu respuesta",
-    },
-    "whatsapp_search": {
-        "label": "tus mensajes de WhatsApp (búsqueda por contenido)",
-        "live_section": "### WhatsApp",
-        "digest_hint": (
-            "La sección live trae los mensajes WhatsApp matcheantes a la "
-            "query, ordenados por relevancia. Cada bullet tiene "
-            "`[<contacto> · <fecha>] <snippet>`; si arranca con `yo →` el "
-            "mensaje lo mandó el user, no el contacto. NUNCA inventes "
-            "conversaciones — citá TEXTUAL de los snippets que aparecen, "
-            "y si la sección live está vacía decilo explícitamente."
-        ),
-        "item_shape": "- <contacto> (<fecha>): <cita textual del snippet>",
-        "empty_phrase": "No encontré mensajes de WhatsApp que matcheen tu búsqueda",
-    },
-}
-
-
-# Retrocompatibilidad: el helper previo `_SOURCE_INTENT_LABEL` es un
-# mapping más chico (label + section) que usan los tests directos.
-# Lo mantenemos derivado de `_SOURCE_INTENT_META` para no romper imports
-# viejos ni tener dos sources of truth que puedan divergir.
-_SOURCE_INTENT_LABEL: dict[str, tuple[str, str]] = {
-    name: (meta["label"], meta["live_section"])
-    for name, meta in _SOURCE_INTENT_META.items()
-}
-
-
-def _build_source_intent_hint(forced_tool_names: list[str]) -> str | None:
-    """Compone un system message turn-scoped que le dice al LLM cómo
-    responder cuando el user preguntó explícitamente por una fuente
-    concreta (mails / calendario / recordatorios).
-
-    El hint combina:
-
-    1. Dónde buscar primero (la sección live del tool: "### Mails").
-    2. Dónde buscar si la live está vacía (notas indexadas del vault con
-       formato conocido — p.ej. 99-obsidian/99-AI/external-ingest/Gmail/YYYY-MM-DD.md tiene
-       un H2 por mail, listar esos H2 == listar los últimos mails).
-    3. Formato de respuesta esperado (viñetas, shape por item).
-    4. Qué PROHIBIR explícitamente (decir "tus notas" / "otras fuentes" /
-       "te dejo esto por si ayuda" — vocabulario abstracto que no le
-       sirve al user cuando pidió una lista concreta).
-    5. Frase canned cuando NO hay nada (reemplaza el vago "te dejo
-       otras fuentes").
-
-    Motivación histórica (2026-04-24, user report iter 1-3):
-
-    - Iter 1: regex plurales faltaba → `gmail_recent` no disparaba → el
-      sistema respondía con WhatsApp sin reconocer intent.
-    - Iter 2: con el tool disparando pero vacío, el CONTEXTO se reemplazaba
-      → LLM sin material para fallback → "te dejo otras fuentes" abstracto.
-    - Iter 3 (este): con el CONTEXTO preservado, el LLM tiene notas de
-      `99-obsidian/99-AI/external-ingest/Gmail/*.md` disponibles, PERO hablaba de "tu nota
-      del 22 de abril" y "fuentes" en lugar de extraer los asuntos de
-      los mails. User feedback textual: "en vez de fuentes (que no tiene
-      sentido porque son notas de obsidian) trae los titulos de los
-      mails". Este hint ahora explicita el formato deseado.
-
-    Devuelve None si ninguna tool es source-specific (solo weather o
-    finance_summary). En ese caso no hay hint que agregar y el system
-    prompt default alcanza.
-    """
-    metas = [_SOURCE_INTENT_META[n] for n in forced_tool_names
-             if n in _SOURCE_INTENT_META]
-    if not metas:
-        return None
-
-    def _join(parts: list[str]) -> str:
-        if len(parts) == 1:
-            return parts[0]
-        if len(parts) == 2:
-            return f"{parts[0]} y {parts[1]}"
-        return ", ".join(parts[:-1]) + f" y {parts[-1]}"
-
-    labels = [m["label"] for m in metas]
-    sections = [m["live_section"] for m in metas]
-    joined_labels = _join(labels)
-    joined_sections = _join(sections)
-    digest_block = "\n".join(f"  • {m['digest_hint']}" for m in metas)
-    shape_block = "\n".join(f"  • {m['item_shape']}" for m in metas)
-    empty_phrase = _join([m["empty_phrase"] for m in metas])
-
-    return (
-        f"INTENCIÓN EXPLÍCITA DEL USUARIO: pidió {joined_labels}. "
-        f"Tu tarea es devolver un LISTADO CONCRETO, no un resumen abstracto "
-        f"ni una referencia a 'fuentes' del sistema.\n\n"
-        f"ORDEN DE BÚSQUEDA en el CONTEXTO:\n"
-        f"  1. Sección live {joined_sections}: si tiene items, listálos.\n"
-        f"  2. Si la sección live está vacía, buscá en el resto del "
-        f"CONTEXTO data indexada de esta fuente:\n{digest_block}\n\n"
-        f"FORMATO DE RESPUESTA — lista con viñetas, un item por línea:\n"
-        f"{shape_block}\n\n"
-        f"PROHIBIDO:\n"
-        f"  • Decir 'en tu nota X', 'en tus fuentes', 'te dejo otras "
-        f"fuentes que podrían ayudarte', 'revisá tus notas' — el user "
-        f"pidió los items directamente, no una meta-referencia.\n"
-        f"  • Mencionar rutas del vault (`03-Resources/...`, "
-        f"`04-Archive/...`) ni el sistema PARA.\n"
-        f"  • Resumir en prosa cuando la pregunta exige un listado.\n"
-        f"  • Responder sobre WhatsApp u otras fuentes como si fueran la "
-        f"respuesta principal cuando el usuario pidió {joined_labels}.\n\n"
-        f"SI NO HAY DATA NI LIVE NI INDEXADA: respondé exactamente "
-        f"'{empty_phrase}' — sin agregar sugerencias de fallback."
-    )
+# Source intent hint extraído a  (Phase W2,
+# 2026-05-08). Re-importamos los nombres acá para back-compat.
+from web._source_intent import (  # noqa: E402, F401
+    _SOURCE_INTENT_LABEL,
+    _SOURCE_INTENT_META,
+    _build_source_intent_hint,
+)
 
 
 # Forced-tool output renderer + per-tool formatters extraídos a
@@ -605,106 +426,19 @@ from rag import (  # noqa: E402
 )
 
 
-# Canned replies for the meta-chat short-circuit. Buckets keyed by the
-# class of input; within a bucket we pick one variant by hashing the
-# message + the current minute so the same phrase in a tight window is
-# stable (no user surprise if they re-send) but repeat visits pick
-# different variants (feels alive, not scripted).
-_METACHAT_GREETING = (
-    "¡Hola! Preguntame lo que quieras sobre tus notas, o decime *recordame …* / *agendá …* si querés crear algo.",
-    "Hola 👋 ¿en qué te ayudo? Probá una pregunta sobre tus notas o pedime *recordame …* / *agendá …*.",
-    "¡Buenas! Tirame una pregunta, o decime *recordame X* / *el viernes 20hs X* para crear un recordatorio o evento.",
+# Meta-chat + degenerate-query short-circuits extraídos a
+#  (Phase W2, 2026-05-08).
+from web._metachat import (  # noqa: E402, F401
+    _DEGENERATE_REPLIES,
+    _METACHAT_BYE,
+    _METACHAT_GREETING,
+    _METACHAT_META,
+    _METACHAT_THANKS,
+    _is_degenerate_query,
+    _metachat_bucket,
+    _pick_degenerate_reply,
+    _pick_metachat_reply,
 )
-_METACHAT_THANKS = (
-    "¡De nada!",
-    "¡Cuando quieras!",
-    "👌",
-)
-_METACHAT_META = (
-    "Puedo responder sobre tus notas, crear recordatorios (*recordame X*) y eventos de calendar (*el viernes 20hs …*). Probá algo.",
-    "Consulto tu vault de Obsidian y creo recordatorios / eventos desde texto libre. ¿Qué necesitás?",
-    "Leo tus notas y armo recordatorios o eventos cuando se los pedís en lenguaje natural. Tirame algo concreto.",
-)
-_METACHAT_BYE = (
-    "¡Hasta luego!",
-    "¡Nos vemos!",
-    "👋",
-)
-
-
-def _metachat_bucket(q: str) -> tuple[str, ...]:
-    """Classify the meta-chat message into a response bucket."""
-    s = q.strip().lower().lstrip("¿ ").lstrip()
-    if s.startswith(("gracias", "muchas gracias", "mil gracias",
-                     "dale gracias", "thanks", "thx")):
-        return _METACHAT_THANKS
-    if s.startswith(("chau", "bye", "adiós", "adios", "nos vemos")):
-        return _METACHAT_BYE
-    if s.startswith(("qué podés", "que podes", "qué sabés", "que sabes",
-                     "cómo funcion", "como funcion", "cómo te us",
-                     "como te us", "qué comandos", "que comandos",
-                     "ayuda", "help", "quién sos", "quien sos",
-                     "quién es este", "quien es este")):
-        return _METACHAT_META
-    return _METACHAT_GREETING
-
-
-def _pick_metachat_reply(q: str, *, now: float | None = None) -> str:
-    """Pick a canned reply for a meta-chat turn.
-
-    Variation seed = hash(q) XOR minute-bucket. Same input within the
-    same minute returns the same variant (stable on retry); different
-    inputs or different minutes rotate. Tests monkey-patch with fixed
-    `now` for determinism.
-    """
-    import hashlib
-    import time as _time
-    bucket = _metachat_bucket(q)
-    ts = now if now is not None else _time.time()
-    minute = int(ts // 60)
-    seed = int(hashlib.sha256(f"{q}|{minute}".encode()).hexdigest()[:8], 16)
-    return bucket[seed % len(bucket)]
-
-
-# ── Degenerate query short-circuit (2026-04-23) ──────────────────────
-# Queries con <2 caracteres alfanuméricos (ej. "x", "?", "?¡@#") caían
-# al retrieve + rerank y devolvían chunks random de WhatsApp porque el
-# matching semántico sobre un input casi vacío es puro ruido. Medido en
-# scratch_eval: `?¡@#` → 395 chars de contenido WA sin relación. Ahora
-# devolvemos una respuesta canned antes de tocar retrieve/LLM,
-# invitando al usuario a reformular.
-_DEGENERATE_REPLIES: tuple[str, ...] = (
-    "No entendí tu pregunta. Podés reformularla con más detalle?",
-    "Necesito un poco más de contexto. Qué querés consultar de tus notas?",
-    "Tu mensaje parece muy corto o sin contenido. Preguntame algo concreto sobre el vault.",
-)
-
-
-def _is_degenerate_query(q: str) -> bool:
-    """True si la query tiene <2 caracteres alfanuméricos totales.
-
-    Evita que `"x"`, `"?"`, `"?¡@#"`, strings de puro símbolo, o cadenas
-    vacías disparen el pipeline full — no hay suficiente señal para que
-    el retrieve devuelva algo útil ni para que el LLM produzca una
-    respuesta honesta. Metachat tiene su propio short-circuit; esta
-    función se encarga de lo que no alcanza ni siquiera a ser saludo.
-    """
-    if not q or not q.strip():
-        return True
-    alphanum = sum(1 for c in q if c.isalnum())
-    return alphanum < 2
-
-
-def _pick_degenerate_reply(q: str, *, now: float | None = None) -> str:
-    """Pick a canned reply for a degenerate-query turn. Same seeding as
-    metachat (hash(q) XOR minute-bucket) so retries stay stable.
-    """
-    import hashlib
-    import time as _time
-    ts = now if now is not None else _time.time()
-    minute = int(ts // 60)
-    seed = int(hashlib.sha256(f"{q}|{minute}".encode()).hexdigest()[:8], 16)
-    return _DEGENERATE_REPLIES[seed % len(_DEGENERATE_REPLIES)]
 
 
 # Post-stream filter enforcing REGLA 0 at the byte level. qwen2.5:7b and
@@ -1010,7 +744,12 @@ app.add_middleware(
     # que el browser no adjunte cookies en requests cross-origin al server.
     allow_credentials=(False if (_allow_tunnel and not _tunnel_credentials) else True),
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
+    # Whitelist explícita en lugar de "*" para evitar headers arbitrarios desde
+    # devices LAN cuando OBSIDIAN_RAG_ALLOW_LAN=1. Cubre los headers que el
+    # frontend (chat + dashboard + PWA) usa: Content-Type para JSON,
+    # Authorization para el admin token (Bearer), Accept para SSE
+    # (text/event-stream) + JSON, X-Requested-With para `fetch()` con cred.
+    allow_headers=["Content-Type", "Authorization", "Accept", "X-Requested-With"],
 )
 
 # ── Admin token — protege endpoints de pánico / destructivos ─────────────────
@@ -9656,17 +9395,24 @@ def _home_compute(
 
 
 @app.get("/api/pendientes")
-def pendientes_api(days: int = 14) -> dict:
+def pendientes_api(days: int = Query(default=14, ge=1, le=365)) -> dict:
     """Raw JSON view of the services layer. Useful for a dedicated pendientes
     card in the UI or for third-party clients; the chat endpoint uses the
     same `_pendientes_collect` internally when intent matches.
+
+    `days` clamped a `[1, 365]` (Bug Hunt 2026-05-08 C2/M1) — sin clamp,
+    `?days=99999` cargaba toda la historia en RAM y saturaba el threadpool
+    cuando los SSE streams del chat ya están consumiéndolo.
     """
     col = get_db()
     now = datetime.now()
     try:
         ev = _pendientes_collect(col, now, days=days)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        # Bug Hunt 2026-05-08 H2: NO exponer `str(exc)` que puede leakear
+        # paths del vault o stack traces de SQLite. Loguear interno.
+        print(f"[pendientes_api] failed: {exc}", file=sys.stderr)
+        raise HTTPException(status_code=500, detail="pendientes failed")
     urgent = _pendientes_urgent(ev, now)
     return {
         "generated_at": now.isoformat(timespec="seconds"),
@@ -19937,7 +19683,8 @@ _DASHBOARD_TTL = 30.0
 
 
 @app.get("/api/dashboard")
-def dashboard_api(days: int = 30) -> dict:
+def dashboard_api(days: int = Query(default=30, ge=1, le=365)) -> dict:
+    """`days` clamped a `[1, 365]` (Bug Hunt 2026-05-08 C2/M1)."""
     now_ts = time.time()
     hit = _DASHBOARD_CACHE.get(days)
     if hit and now_ts - hit[0] < _DASHBOARD_TTL:

@@ -82,8 +82,8 @@ def test_sync_chrome_history_writes_chrome_and_youtube(tmp_path):
     assert stats["urls"] == 3
     assert stats["youtube_videos"] == 2
     today = time.strftime("%Y-%m-%d")
-    chrome_md = (tmp_path / "03-Resources/Chrome" / f"{today}.md").read_text()
-    yt_md = (tmp_path / "03-Resources/YouTube" / f"{today}.md").read_text()
+    chrome_md = (tmp_path / "99-obsidian/99-AI/external-ingest/Chrome" / f"{today}.md").read_text()
+    yt_md = (tmp_path / "99-obsidian/99-AI/external-ingest/YouTube" / f"{today}.md").read_text()
     assert "Post" in chrome_md and "Cool video" in chrome_md
     assert "Cool video" in yt_md and "Mobile vid" in yt_md
     assert "example.com/post" not in yt_md  # only watch?v=
@@ -317,13 +317,13 @@ def test_sync_claude_code_silent_without_dir(tmp_path, monkeypatch):
 
 
 def test_sync_youtube_transcripts_skips_existing(tmp_path, monkeypatch):
-    yt_dir = tmp_path / "03-Resources/YouTube"
+    yt_dir = tmp_path / "99-obsidian/99-AI/external-ingest/YouTube"
     yt_dir.mkdir(parents=True)
     (yt_dir / "2026-04-19.md").write_text(
         "- `12:00` [Video](https://www.youtube.com/watch?v=abc123)\n",
         encoding="utf-8",
     )
-    transcripts_dir = tmp_path / "03-Resources/YouTube/transcripts"
+    transcripts_dir = tmp_path / "99-obsidian/99-AI/external-ingest/YouTube/transcripts"
     transcripts_dir.mkdir(parents=True)
     (transcripts_dir / "abc123.md").write_text("---\n---\nexisting\n", encoding="utf-8")
     called = []
@@ -409,7 +409,7 @@ def test_sync_spotify_top_refresh_skipped_when_recent(tmp_path, monkeypatch):
 
 
 def test_sync_youtube_transcripts_fetches_new(tmp_path, monkeypatch):
-    yt_dir = tmp_path / "03-Resources/YouTube"
+    yt_dir = tmp_path / "99-obsidian/99-AI/external-ingest/YouTube"
     yt_dir.mkdir(parents=True)
     (yt_dir / "2026-04-19.md").write_text(
         "- `12:00` [Cool video](https://www.youtube.com/watch?v=newvid)\n",
@@ -419,7 +419,7 @@ def test_sync_youtube_transcripts_fetches_new(tmp_path, monkeypatch):
     stats = rag._sync_youtube_transcripts(tmp_path)
     assert stats["fetched_this_run"] == 1
     assert stats["files_written"] == 1
-    body = (tmp_path / "03-Resources/YouTube/transcripts/newvid.md").read_text()
+    body = (tmp_path / "99-obsidian/99-AI/external-ingest/YouTube/transcripts/newvid.md").read_text()
     assert "Cool video" in body and "transcript text" in body
     assert "language: es" in body
 

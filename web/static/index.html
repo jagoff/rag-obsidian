@@ -760,8 +760,18 @@
        against silent file swap (compromised server, botched re-vendor).
        Regenerate when upgrading: `cat web/static/vendor/marked.min.js
        | openssl dgst -sha384 -binary | openssl base64 -A` -->
+  <!-- marked@18.0.2 — debe cargarse ANTES del módulo porque markdown.mjs
+       lo usa como global. No defer para que esté disponible en el mismo
+       tick que app.mjs. -->
   <script src="/static/vendor/marked.min.js"
           integrity="sha384-VFZ9RElp7G/IxAGHV8iq2n2RuDktt4iBszz0AX1jzsKdHQRQoRi3LlUhxx31gpx0"></script>
-  <script src="/static/app.js?v=2026-05-07-source-thumb"></script>
+  <!-- Bundle legado — vanilla JS, global scope. Debe ir ANTES del módulo
+       para que los globals (messagesEl, send, etc.) estén definidos cuando
+       app.mjs y los módulos ES se evalúan. -->
+  <script src="/static/app.js?v=2026-05-09-esm-phase1"></script>
+  <!-- Entry point del módulo ES — carga utils/markdown/settings/voice/session.
+       type="module" implica defer, así que corre tras el DOMContentLoaded
+       y tras el bundle clásico de arriba. -->
+  <script type="module" src="/static/js/app.mjs?v=2026-05-09-esm-phase1"></script>
 </body>
 </html>

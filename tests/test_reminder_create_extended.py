@@ -129,11 +129,16 @@ def test_create_reminder_with_list_name(monkeypatch):
     assert 'of list "Trabajo"' in script
 
 
-def test_create_reminder_list_name_escaped(monkeypatch):
+def test_create_reminder_list_name_with_quotes_rejected(monkeypatch):
+    """Bug H-4: list_name con `"` se rechaza (allowlist `_APPLESCRIPT_SAFE_RE`
+    excluye comillas). Pre-fix se escapaban; post-fix abortamos antes de
+    invocar osascript — el usuario ve el error inmediatamente en lugar de
+    pasar input sospechoso al AppleScript runtime."""
     m = _capture_osascript(monkeypatch)
-    rag._create_reminder("x", list_name='"weird" list')
-    script = m.call_args[0][0]
-    assert r'\"weird\" list' in script
+    ok, err = rag._create_reminder("x", list_name='"weird" list')
+    assert ok is False
+    assert "no permitidos" in err
+    assert m.call_args is None, "osascript NO debería haberse invocado"
 
 
 # ── Nuevo: recurrence (best-effort) ─────────────────────────────────────────
@@ -188,9 +193,11 @@ def test_create_reminder_empty_osascript_output(monkeypatch):
     assert ok is False
 
 
-def test_create_reminder_name_quote_escape(monkeypatch):
+def test_create_reminder_name_with_quotes_rejected(monkeypatch):
+    """Bug H-4: name con `"` se rechaza (allowlist `_APPLESCRIPT_SAFE_RE`
+    excluye comillas). Mismo cambio de contrato que list_name."""
     m = _capture_osascript(monkeypatch)
-    rag._create_reminder('tiene "comillas"')
-    script = m.call_args[0][0]
-    # Comillas escapadas para que el AppleScript string literal no se rompa.
-    assert r'\"comillas\"' in script
+    ok, err = rag._create_reminder('tiene "comillas"')
+    assert ok is False
+    assert "no permitidos" in err
+    assert m.call_args is None, "osascript NO debería haberse invocado"

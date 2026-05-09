@@ -146,22 +146,31 @@ def test_create_event_with_recurrence(monkeypatch):
 # ── Escaping ────────────────────────────────────────────────────────────────
 
 
-def test_create_event_quotes_in_title_escaped(monkeypatch):
+def test_create_event_quotes_in_title_rejected(monkeypatch):
+    """Bug H-4: title con `"` ahora se rechaza (no está en `_APPLESCRIPT_SAFE_RE`).
+
+    Pre-fix el escapeo backslash+quote permitía pasar la comilla escapada al
+    script. Post-fix, la allowlist es más estricta (mismo patrón que el
+    contact-search path) — sin paréntesis/comillas/backquote en title.
+    """
     m = _capture_osascript(monkeypatch)
-    rag._create_calendar_event(
+    ok, err = rag._create_calendar_event(
         'reunión "urgente"', datetime(2026, 4, 25, 14, 0),
     )
-    script = m.call_args[0][0]
-    assert r'\"urgente\"' in script
+    assert ok is False
+    assert "no permitidos" in err
+    assert m.call_args is None, "osascript NO debería haberse invocado"
 
 
-def test_create_event_quotes_in_location_escaped(monkeypatch):
+def test_create_event_quotes_in_location_rejected(monkeypatch):
+    """Bug H-4: location con `"` también se rechaza."""
     m = _capture_osascript(monkeypatch)
-    rag._create_calendar_event(
+    ok, err = rag._create_calendar_event(
         "x", datetime(2026, 4, 25, 14, 0), location='"Bar" en esquina',
     )
-    script = m.call_args[0][0]
-    assert r'\"Bar\"' in script
+    assert ok is False
+    assert "no permitidos" in err
+    assert m.call_args is None, "osascript NO debería haberse invocado"
 
 
 # ── Errores ─────────────────────────────────────────────────────────────────

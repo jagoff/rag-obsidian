@@ -39962,11 +39962,29 @@ def _create_calendar_event(
     # respondió en 8s, hay un problema real (Calendar.app frozen,
     # autocompletion lock, etc.) y prefiero fallar rápido para que el
     # caller decida (retry / show error / queue).
-    safe_title = nm.replace("\\", "\\\\").replace('"', '\\"')
+    #
+    # Bug H-4 (security 2026-05-08): mismo patrón que `_create_reminder` —
+    # el escapeo backslash+quote no protege contra newline injection.
+    # Validamos `title`, `calendar`, `location` con la allowlist
+    # `_APPLESCRIPT_SAFE_RE`. `notes` queda free-form pero neutraliza
+    # `\r`/`\n` y backtick.
+    safe_title = _sanitize_applescript_string(nm)
+    if safe_title is None:
+        _silent_log(
+            "applescript_injection_blocked",
+            {"field": "calendar_title", "value_preview": nm[:40]},
+        )
+        return False, "título contiene caracteres no permitidos"
 
     # Calendar selector: named or first-writable fallback.
     if calendar:
-        safe_cal = calendar.replace("\\", "\\\\").replace('"', '\\"')
+        safe_cal = _sanitize_applescript_string(calendar)
+        if safe_cal is None:
+            _silent_log(
+                "applescript_injection_blocked",
+                {"field": "calendar_name", "value_preview": calendar[:40]},
+            )
+            return False, "calendar contiene caracteres no permitidos"
         cal_sel = f'set _cal to first calendar whose name is "{safe_cal}"\n'
     else:
         cal_sel = "set _cal to first calendar whose writable is true\n"
@@ -39983,10 +40001,24 @@ def _create_calendar_event(
     if all_day:
         props.append("allday event:true")
     if location:
-        safe_loc = location.replace("\\", "\\\\").replace('"', '\\"')
+        safe_loc = _sanitize_applescript_string(location)
+        if safe_loc is None:
+            _silent_log(
+                "applescript_injection_blocked",
+                {"field": "calendar_location", "value_preview": location[:40]},
+            )
+            return False, "location contiene caracteres no permitidos"
         props.append(f'location:"{safe_loc}"')
     if notes:
-        safe_desc = notes.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+        # Free-form multi-línea — escapeo manual + neutralización de `\r`/`\n`
+        # y backtick (idéntico al path de `_create_reminder`).
+        safe_desc = (
+            notes.replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\r", " ")
+            .replace("\n", "\\n")
+            .replace("`", "")
+        )
         props.append(f'description:"{safe_desc}"')
     props_str = ", ".join(props)
 

@@ -19904,12 +19904,24 @@ def _dashboard_compute_sql(days: int = 30) -> dict:
     cutoff = datetime.now() - timedelta(days=days)
     cutoff_iso = cutoff.isoformat(timespec="seconds")
 
-    # Well-earlier floor — we still need "all time" count + full feedback for
-    # corrective-miss/neg-reason surfacing (JSONL path uses the full file).
-    ancient_iso = "0000-01-01T00:00:00"
+    # H-5 fix (2026-05-08): el "ancient floor" era literalmente epoch
+    # (`0000-01-01T00:00:00`) lo que combinado con la ausencia de LIMIT en
+    # `_sql_query_window` arrastraba TODO el historial de `rag_tune` y
+    # `rag_surface_log` a Python por cada poll del dashboard (60s).
+    # Ahora acotamos a 1 año hacia atrás + cap a 5000 rows per table como
+    # red de seguridad complementaria.
+    ancient_iso = (datetime.now() - timedelta(days=365)).isoformat(timespec="seconds")
+    # Cap por tabla para call sites del dashboard. Combinado con `ORDER BY ts`
+    # devuelve los más antiguos de la ventana, pero la ventana ya está acotada
+    # (cutoff_iso = `days` atrás, ancient_iso = 1 año atrás), así que en la
+    # práctica vemos el set completo cuando el corpus es chico y los 5000
+    # rows iniciales de la ventana cuando es grande. RAM cap ~2-5 MB por tabla.
+    _DASH_ROW_LIMIT = 5000
 
     with _ragvec_state_conn() as conn:
-        q_rows_window = _sql_query_window(conn, "rag_queries", cutoff_iso)
+        q_rows_window = _sql_query_window(
+            conn, "rag_queries", cutoff_iso, limit=_DASH_ROW_LIMIT,
+        )
         # total_queries_all_time: COUNT(*) directo — no necesitamos traer las
         # rows completas, solo el número. Pre-fix traía TODO el historial (O(n)
         # RAM) para después hacer `len(all_queries)`.
@@ -19920,24 +19932,36 @@ def _dashboard_compute_sql(days: int = 30) -> dict:
         except Exception:
             _q_all_total = 0
         # fb_rows_all: feedback all-time; necesitamos las rows para path-counts,
-        # corrective-misses y neg-reasons. Cap defensivo 10 000 para evitar RAM
-        # proporcional al historial bajo polling 60s. En prod el feedback es <500
-        # rows; el cap es solo red de seguridad. Usamos query directa con LIMIT
-        # porque _sql_query_window no tiene parámetro limit.
+        # corrective-misses y neg-reasons. Cap defensivo 5000 (alineado con
+        # _DASH_ROW_LIMIT) para evitar RAM proporcional al historial bajo
+        # polling 60s. En prod el feedback es <500 rows; el cap es solo red
+        # de seguridad. Usamos query directa con LIMIT acá porque
+        # `_sql_query_window` filtra siempre por `ts >= since` y este caso
+        # quiere all-time (sin floor de tiempo).
         import sqlite3 as _sqlite3_fb
         _prev_rf = conn.row_factory
         try:
             conn.row_factory = _sqlite3_fb.Row
             fb_rows_all = list(conn.execute(
-                "SELECT * FROM rag_feedback ORDER BY ts LIMIT 10000"
+                "SELECT * FROM rag_feedback ORDER BY ts LIMIT 5000"
             ).fetchall())
         finally:
             conn.row_factory = _prev_rf
-        amb_rows = _sql_query_window(conn, "rag_ambient", cutoff_iso)
-        contra_rows = _sql_query_window(conn, "rag_contradictions", cutoff_iso)
-        filing_rows = _sql_query_window(conn, "rag_filing_log", cutoff_iso)
-        tune_rows = _sql_query_window(conn, "rag_tune", ancient_iso)
-        surface_rows = _sql_query_window(conn, "rag_surface_log", ancient_iso)
+        amb_rows = _sql_query_window(
+            conn, "rag_ambient", cutoff_iso, limit=_DASH_ROW_LIMIT,
+        )
+        contra_rows = _sql_query_window(
+            conn, "rag_contradictions", cutoff_iso, limit=_DASH_ROW_LIMIT,
+        )
+        filing_rows = _sql_query_window(
+            conn, "rag_filing_log", cutoff_iso, limit=_DASH_ROW_LIMIT,
+        )
+        tune_rows = _sql_query_window(
+            conn, "rag_tune", ancient_iso, limit=_DASH_ROW_LIMIT,
+        )
+        surface_rows = _sql_query_window(
+            conn, "rag_surface_log", ancient_iso, limit=_DASH_ROW_LIMIT,
+        )
         # Implicit signals KPI (2026-04-22): count rag_behavior events
         # grouped by type in the dashboard window. Feeds the "signals"
         # panel so the user can see at a glance whether the ranker-vivo

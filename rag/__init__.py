@@ -7794,12 +7794,22 @@ def _sql_query_window(
     until_ts: str | None = None,
     where: str | None = None,
     params: tuple = (),
+    limit: int | None = None,
 ) -> list:
     """SELECT * FROM `table` WHERE ts >= since_ts [AND ts < until_ts] [AND <where>].
 
     Returns a list of sqlite3.Row. Caller controls the window; the index on
     `ts` keeps this fast up to ~millions of rows per table. `where` is raw
     SQL appended with AND — only used from trusted internal call sites.
+
+    `limit` opcional: cuando se pasa, agrega `LIMIT ?` al final del SQL.
+    Sirve como red de seguridad para call sites del dashboard donde
+    `days=30` + daemons activos pueden traer 6000+ rows a
+    `list[sqlite3.Row]` por poll (~1-3 MB RAM cada vez). Combinado con el
+    `ORDER BY ts`, devuelve los `limit` rows MÁS ANTIGUOS dentro de la
+    ventana — los call sites que quieren los más recientes deben acotar
+    también la ventana (e.g., last 365d). Default `None` preserva
+    back-compat con call sites históricos que no necesitan cap.
     """
     clauses = ["ts >= ?"]
     args: list = [since_ts]
@@ -7810,6 +7820,9 @@ def _sql_query_window(
         clauses.append(f"({where})")
         args.extend(params)
     sql = f"SELECT * FROM {table} WHERE {' AND '.join(clauses)} ORDER BY ts"
+    if limit is not None:
+        sql += " LIMIT ?"
+        args.append(int(limit))
     # Row factory is set per-query so callers upstream don't need to manage
     # connection-level config. Restore to whatever was in place after.
     prev_row_factory = conn.row_factory

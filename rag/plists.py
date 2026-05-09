@@ -8,6 +8,12 @@ so callers that do ``import rag; rag._watch_plist(...)`` keep working
 without any change.  Callers may also import directly::
 
     from rag.plists import _watch_plist
+
+Schema-driven (refactor 2026-05-09): cada `_*_plist()` arma un dict de
+spec y delega el render del XML a `_render_plist(spec)`. El XML
+generado es plist-equivalente al hand-written original (parseable por
+plistlib + plutil idéntico), con normalización de whitespace dentro de
+arrays (compact one-line) y ordering de keys consistente.
 """
 from __future__ import annotations
 
@@ -40,6 +46,10 @@ __all__ = [
 _LAUNCH_AGENTS_DIR = Path.home() / "Library/LaunchAgents"
 _RAG_LOG_DIR = Path.home() / ".local/share/obsidian-rag"
 
+_DEFAULT_PATH = (
+    f"/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin"
+)
+
 
 def _rag_binary() -> str:
     """Best-effort path to the installed `rag` binary. Default uv tool path
@@ -59,6 +69,181 @@ def _rag_binary() -> str:
     return found or str(candidates[0])
 
 
+# ─── Schema-driven plist renderer ───────────────────────────────────────────
+#
+# Spec dict keys (todas opcionales salvo `label` + `program_arguments`):
+#
+#   label: str               Label launchd full (e.g. "com.fer.obsidian-rag-watch").
+#   program_arguments: list  Argv del proceso (rag_bin + args, o /bin/bash + script).
+#   env: dict[str, str]      Vars adicionales para EnvironmentVariables. HOME y
+#                            PATH se inyectan SIEMPRE primero (en ese orden);
+#                            el caller no necesita pasarlas.
+#   schedule: dict | None    Forma del schedule. Una sola key:
+#                              {"interval_s": int}     → StartInterval
+#                              {"calendar": dict}      → StartCalendarInterval (single dict)
+#                              {"calendar_list": list} → StartCalendarInterval (array of dicts)
+#                            None → no schedule (útil para KeepAlive=true puro).
+#   run_at_load: bool|None   <true/> o <false/>. None → key omitida.
+#   keep_alive: bool|None    <true/> o <false/>. None → key omitida.
+#   throttle_s: int|None     ThrottleInterval en segundos.
+#   throttle_key: str        "ThrottleInterval" (default) o "Throttle"
+#                            (daemon-watchdog usa la key corta).
+#   throttle_after_logs: bool  Si True, ThrottleInterval va DESPUÉS de los
+#                            log paths (mood-poll). Default False.
+#   exit_timeout_s: int|None ExitTimeOut.
+#   process_type: str|None   "Interactive" / "Background" / etc.
+#   working_dir: str|None    WorkingDirectory.
+#   stdout_path: str         Path absoluto del log stdout.
+#   stderr_path: str         Path absoluto del log stderr.
+#   extra_env_xml: str       Líneas extra a appendear al final del bloque
+#                            EnvironmentVariables (escape hatch para el
+#                            YOUTUBE_API_KEY condicional del web plist).
+
+_PLIST_HEADER = (
+    '<?xml version="1.0" encoding="UTF-8"?>\n'
+    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+    '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+    '<plist version="1.0">\n'
+)
+
+
+def _render_plist(spec: dict) -> str:
+    """Render a launchd plist XML string from a structured spec dict.
+
+    See module-level doc-block for the full list of supported spec keys.
+    The output preserves the historical compact one-line format
+    (`<key>X</key><value/>` per line) so existing tests that grep for
+    specific tokens (e.g. ``"<key>RunAtLoad</key><false/>"``) keep
+    passing without any change.
+    """
+    label = spec["label"]
+    program_args = spec["program_arguments"]
+    env = spec.get("env") or {}
+    extra_env_xml = spec.get("extra_env_xml", "")
+    schedule = spec.get("schedule")
+    run_at_load = spec.get("run_at_load")
+    keep_alive = spec.get("keep_alive")
+    throttle_s = spec.get("throttle_s")
+    throttle_key = spec.get("throttle_key", "ThrottleInterval")
+    throttle_after_logs = spec.get("throttle_after_logs", False)
+    exit_timeout_s = spec.get("exit_timeout_s")
+    process_type = spec.get("process_type")
+    working_dir = spec.get("working_dir")
+    stdout_path = spec["stdout_path"]
+    stderr_path = spec["stderr_path"]
+
+    lines: list[str] = []
+    lines.append(_PLIST_HEADER)
+    lines.append("<dict>\n")
+    lines.append(f"  <key>Label</key><string>{label}</string>\n")
+
+    # ProgramArguments
+    lines.append("  <key>ProgramArguments</key>\n")
+    lines.append("  <array>\n")
+    for arg in program_args:
+        lines.append(f"    <string>{arg}</string>\n")
+    lines.append("  </array>\n")
+
+    # EnvironmentVariables — HOME y PATH siempre primero, luego en orden
+    # de inserción del caller. Caller puede overridear PATH pasándolo en `env`
+    # (raro, pero `_serve_watchdog_plist` lo hace).
+    lines.append("  <key>EnvironmentVariables</key>\n")
+    lines.append("  <dict>\n")
+    lines.append(f"    <key>HOME</key><string>{Path.home()}</string>\n")
+    custom_path = env.get("PATH")
+    lines.append(
+        f"    <key>PATH</key><string>{custom_path or _DEFAULT_PATH}</string>\n"
+    )
+    for k, v in env.items():
+        if k in ("HOME", "PATH"):
+            continue
+        lines.append(f"    <key>{k}</key><string>{v}</string>\n")
+    if extra_env_xml:
+        lines.append(extra_env_xml)
+    lines.append("  </dict>\n")
+
+    # Schedule
+    if schedule is not None:
+        if "interval_s" in schedule:
+            lines.append(
+                f"  <key>StartInterval</key><integer>{int(schedule['interval_s'])}</integer>\n"
+            )
+        elif "calendar" in schedule:
+            cal = schedule["calendar"]
+            lines.append("  <key>StartCalendarInterval</key>\n")
+            lines.append("  <dict>\n")
+            for k in ("Weekday", "Day", "Hour", "Minute"):
+                if k in cal:
+                    lines.append(
+                        f"    <key>{k}</key><integer>{int(cal[k])}</integer>\n"
+                    )
+            lines.append("  </dict>\n")
+        elif "calendar_list" in schedule:
+            lines.append("  <key>StartCalendarInterval</key>\n")
+            lines.append("  <array>\n")
+            for cal in schedule["calendar_list"]:
+                inner = "".join(
+                    f"<key>{k}</key><integer>{int(cal[k])}</integer>"
+                    for k in ("Weekday", "Day", "Hour", "Minute")
+                    if k in cal
+                )
+                lines.append(f"    <dict>{inner}</dict>\n")
+            lines.append("  </array>\n")
+        else:
+            raise ValueError(f"Unknown schedule shape: {schedule!r}")
+
+    # RunAtLoad / KeepAlive
+    if run_at_load is True:
+        lines.append("  <key>RunAtLoad</key><true/>\n")
+    elif run_at_load is False:
+        lines.append("  <key>RunAtLoad</key><false/>\n")
+    if keep_alive is True:
+        lines.append("  <key>KeepAlive</key><true/>\n")
+    elif keep_alive is False:
+        lines.append("  <key>KeepAlive</key><false/>\n")
+
+    # Throttle (default: pre-logs)
+    if throttle_s is not None and not throttle_after_logs:
+        lines.append(
+            f"  <key>{throttle_key}</key><integer>{int(throttle_s)}</integer>\n"
+        )
+
+    # ExitTimeOut / ProcessType / WorkingDirectory
+    if exit_timeout_s is not None:
+        lines.append(
+            f"  <key>ExitTimeOut</key><integer>{int(exit_timeout_s)}</integer>\n"
+        )
+    if process_type is not None:
+        lines.append(f"  <key>ProcessType</key><string>{process_type}</string>\n")
+    if working_dir is not None:
+        lines.append(f"  <key>WorkingDirectory</key><string>{working_dir}</string>\n")
+
+    # Standard logs
+    lines.append(f"  <key>StandardOutPath</key><string>{stdout_path}</string>\n")
+    lines.append(f"  <key>StandardErrorPath</key><string>{stderr_path}</string>\n")
+
+    # Throttle (post-logs, only mood-poll uses this ordering)
+    if throttle_s is not None and throttle_after_logs:
+        lines.append(
+            f"  <key>{throttle_key}</key><integer>{int(throttle_s)}</integer>\n"
+        )
+
+    lines.append("</dict>\n")
+    lines.append("</plist>\n")
+    return "".join(lines)
+
+
+def _logs(slug: str) -> tuple[str, str]:
+    """Helper: standard `<_RAG_LOG_DIR>/<slug>.log` + `.error.log` paths."""
+    return (
+        f"{_RAG_LOG_DIR}/{slug}.log",
+        f"{_RAG_LOG_DIR}/{slug}.error.log",
+    )
+
+
+# ─── Plist factories ────────────────────────────────────────────────────────
+
+
 def _watch_plist(rag_bin: str) -> str:
     """Persistent watchdog observing ALL registered vaults in a single process.
 
@@ -70,33 +255,21 @@ def _watch_plist(rag_bin: str) -> str:
     (sqlite-vec + sentence-transformers imported once, not per vault), so
     ~3-4 GB of RAM savings vs. running a second watch service.
     """
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-watch</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>watch</string>
-    <string>--all-vaults</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>RAG_INDEX_LOCAL_EMBED</key><string>1</string>
-    <key>HF_HUB_OFFLINE</key><string>1</string>
-    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
-  </dict>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>ThrottleInterval</key><integer>30</integer>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/watch.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/watch.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("watch")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-watch",
+        "program_arguments": [rag_bin, "watch", "--all-vaults"],
+        "env": {
+            "RAG_INDEX_LOCAL_EMBED": "1",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+        },
+        "run_at_load": True,
+        "keep_alive": True,
+        "throttle_s": 30,
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _serve_plist(rag_bin: str) -> str:
@@ -135,42 +308,29 @@ def _serve_plist(rag_bin: str) -> str:
     the host reboots. ThrottleInterval=30 prevents crash loops from burning
     CPU.
     """
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-serve</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>serve</string>
-    <string>--port</string>
-    <string>7832</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-    <key>PYTHONUNBUFFERED</key><string>1</string>
-    <key>RAG_RERANKER_NEVER_UNLOAD</key><string>1</string>
-    <key>RAG_LOCAL_EMBED</key><string>1</string>
-    <key>RAG_STATE_SQL</key><string>1</string>
-    <key>HF_HUB_OFFLINE</key><string>1</string>
-    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
-    <key>FASTEMBED_CACHE_PATH</key><string>{Path.home()}/.cache/fastembed</string>
-    <key>RAG_MEMORY_PRESSURE_INTERVAL</key><string>20</string>
-    <key>RAG_LLM_BACKEND</key><string>mlx</string>
-  </dict>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>ThrottleInterval</key><integer>30</integer>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/serve.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/serve.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("serve")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-serve",
+        "program_arguments": [rag_bin, "serve", "--port", "7832"],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "PYTHONUNBUFFERED": "1",
+            "RAG_RERANKER_NEVER_UNLOAD": "1",
+            "RAG_LOCAL_EMBED": "1",
+            "RAG_STATE_SQL": "1",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+            "FASTEMBED_CACHE_PATH": f"{Path.home()}/.cache/fastembed",
+            "RAG_MEMORY_PRESSURE_INTERVAL": "20",
+            "RAG_LLM_BACKEND": "mlx",
+        },
+        "run_at_load": True,
+        "keep_alive": True,
+        "throttle_s": 30,
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _web_plist(rag_bin: str) -> str:
@@ -211,7 +371,7 @@ def _web_plist(rag_bin: str) -> str:
     # Youtube key is optional — include only if present in the env to avoid
     # hard-coding a secret at setup time. Most installs leave it blank.
     youtube_key = os.environ.get("YOUTUBE_API_KEY", "")
-    yt_line = (
+    yt_xml = (
         f"    <key>YOUTUBE_API_KEY</key><string>{youtube_key}</string>\n"
         if youtube_key else ""
     )
@@ -235,46 +395,36 @@ def _web_plist(rag_bin: str) -> str:
     # network error" + "tu › a ver si tengo otra referencia error: Failed to
     # fetch" — 2 turnos perdidos por turno de respawn. Ver
     # docs/eval-2026-04-28/playwright-conversations-bug-log.md MEDIUM #12.
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-web</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{venv_python}</string>
-    <string>{web_server}</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>PYTHONUNBUFFERED</key><string>1</string>
-    <key>OBSIDIAN_RAG_WEB_CHAT_MODEL</key><string>{chat_model}</string>
-    <key>RAG_LOCAL_EMBED</key><string>1</string>
-    <key>RAG_RERANKER_NEVER_UNLOAD</key><string>1</string>
-    <key>RAG_STATE_SQL</key><string>1</string>
-    <key>HF_HUB_OFFLINE</key><string>1</string>
-    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
-    <key>FASTEMBED_CACHE_PATH</key><string>{Path.home()}/.cache/fastembed</string>
-    <key>RAG_MEMORY_PRESSURE_INTERVAL</key><string>20</string>
-    <key>RAG_MEMORY_PRESSURE_THRESHOLD</key><string>80</string>
-    <key>RAG_MEMORY_PRESSURE_SWAP_GB</key><string>8.0</string>
-    <key>RAG_AUTO_FIX_WORKER</key><string>1</string>
-    <key>RAG_AUTO_FIX_HOURLY_CAP</key><string>12</string>
-    <key>RAG_LLM_BACKEND</key><string>mlx</string>
-{yt_line}  </dict>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>ThrottleInterval</key><integer>30</integer>
-  <key>ExitTimeOut</key><integer>20</integer>
-  <key>ProcessType</key><string>Interactive</string>
-  <key>WorkingDirectory</key><string>{working_dir}</string>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/web.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/web.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("web")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-web",
+        "program_arguments": [str(venv_python), str(web_server)],
+        "env": {
+            "PYTHONUNBUFFERED": "1",
+            "OBSIDIAN_RAG_WEB_CHAT_MODEL": chat_model,
+            "RAG_LOCAL_EMBED": "1",
+            "RAG_RERANKER_NEVER_UNLOAD": "1",
+            "RAG_STATE_SQL": "1",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+            "FASTEMBED_CACHE_PATH": f"{Path.home()}/.cache/fastembed",
+            "RAG_MEMORY_PRESSURE_INTERVAL": "20",
+            "RAG_MEMORY_PRESSURE_THRESHOLD": "80",
+            "RAG_MEMORY_PRESSURE_SWAP_GB": "8.0",
+            "RAG_AUTO_FIX_WORKER": "1",
+            "RAG_AUTO_FIX_HOURLY_CAP": "12",
+            "RAG_LLM_BACKEND": "mlx",
+        },
+        "extra_env_xml": yt_xml,
+        "run_at_load": True,
+        "keep_alive": True,
+        "throttle_s": 30,
+        "exit_timeout_s": 20,
+        "process_type": "Interactive",
+        "working_dir": str(working_dir),
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _digest_plist(rag_bin: str, hour: int = 22, minute: int = 0) -> str:
@@ -286,35 +436,25 @@ def _digest_plist(rag_bin: str, hour: int = 22, minute: int = 0) -> str:
     auto-tune writer enforces the safe band before persisting, so a
     pref-driven override never lands outside `[21:00, 23:30]`.
     """
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-digest</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>digest</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-    <key>RAG_LLM_BACKEND</key><string>mlx</string>
-  </dict>
-  <key>StartCalendarInterval</key>
-  <dict>
-    <key>Weekday</key><integer>0</integer>
-    <key>Hour</key><integer>{int(hour)}</integer>
-    <key>Minute</key><integer>{int(minute)}</integer>
-  </dict>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/digest.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/digest.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("digest")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-digest",
+        "program_arguments": [rag_bin, "digest"],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "RAG_LLM_BACKEND": "mlx",
+        },
+        "schedule": {
+            "calendar": {
+                "Weekday": 0,
+                "Hour": int(hour),
+                "Minute": int(minute),
+            },
+        },
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _morning_plist(rag_bin: str, hour: int = 7, minute: int = 0) -> str:
@@ -337,39 +477,26 @@ def _morning_plist(rag_bin: str, hour: int = 7, minute: int = 0) -> str:
     """
     h = int(hour)
     m = int(minute)
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-morning</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>morning</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-    <key>RAG_EXPLORE</key><string>1</string>
-    <key>RAG_MORNING_VOICE</key><string></string>
-    <key>RAG_LLM_BACKEND</key><string>mlx</string>
-  </dict>
-  <key>StartCalendarInterval</key>
-  <array>
-    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>{h}</integer><key>Minute</key><integer>{m}</integer></dict>
-    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>{h}</integer><key>Minute</key><integer>{m}</integer></dict>
-    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>{h}</integer><key>Minute</key><integer>{m}</integer></dict>
-    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>{h}</integer><key>Minute</key><integer>{m}</integer></dict>
-    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>{h}</integer><key>Minute</key><integer>{m}</integer></dict>
-  </array>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/morning.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/morning.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("morning")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-morning",
+        "program_arguments": [rag_bin, "morning"],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "RAG_EXPLORE": "1",
+            "RAG_MORNING_VOICE": "",
+            "RAG_LLM_BACKEND": "mlx",
+        },
+        "schedule": {
+            "calendar_list": [
+                {"Weekday": wd, "Hour": h, "Minute": m}
+                for wd in (1, 2, 3, 4, 5)
+            ],
+        },
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _today_plist(rag_bin: str, hour: int = 22, minute: int = 0) -> str:
@@ -383,38 +510,25 @@ def _today_plist(rag_bin: str, hour: int = 22, minute: int = 0) -> str:
     """
     h = int(hour)
     m = int(minute)
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-today</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>today</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-    <key>RAG_EXPLORE</key><string>1</string>
-    <key>RAG_LLM_BACKEND</key><string>mlx</string>
-  </dict>
-  <key>StartCalendarInterval</key>
-  <array>
-    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>{h}</integer><key>Minute</key><integer>{m}</integer></dict>
-    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>{h}</integer><key>Minute</key><integer>{m}</integer></dict>
-    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>{h}</integer><key>Minute</key><integer>{m}</integer></dict>
-    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>{h}</integer><key>Minute</key><integer>{m}</integer></dict>
-    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>{h}</integer><key>Minute</key><integer>{m}</integer></dict>
-  </array>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/today.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/today.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("today")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-today",
+        "program_arguments": [rag_bin, "today"],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "RAG_EXPLORE": "1",
+            "RAG_LLM_BACKEND": "mlx",
+        },
+        "schedule": {
+            "calendar_list": [
+                {"Weekday": wd, "Hour": h, "Minute": m}
+                for wd in (1, 2, 3, 4, 5)
+            ],
+        },
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _wa_fast_plist(rag_bin: str) -> str:
@@ -439,31 +553,20 @@ def _wa_fast_plist(rag_bin: str) -> str:
     Silent-fail end-to-end: cada sub-job corre en try/except — si uno
     crashea, el otro corre igual. El worker siempre exit 0.
     """
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-wa-fast</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>wa-fast</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-    <key>RAG_LLM_BACKEND</key><string>mlx</string>
-  </dict>
-  <key>StartInterval</key><integer>300</integer>
-  <key>RunAtLoad</key><false/>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/wa-fast.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/wa-fast.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("wa-fast")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-wa-fast",
+        "program_arguments": [rag_bin, "wa-fast"],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "RAG_LLM_BACKEND": "mlx",
+        },
+        "schedule": {"interval_s": 300},
+        "run_at_load": False,
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 # `_wa_tasks_plist` moved to `rag.integrations.whatsapp` (Phase 1b,
@@ -472,35 +575,21 @@ def _wa_fast_plist(rag_bin: str) -> str:
 
 def _emergent_plist(rag_bin: str) -> str:
     """Proactive #2 — emergent theme detector, viernes 10am."""
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-emergent</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>emergent</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-    <key>RAG_LLM_BACKEND</key><string>mlx</string>
-  </dict>
-  <key>StartCalendarInterval</key>
-  <dict>
-    <key>Weekday</key><integer>5</integer>
-    <key>Hour</key><integer>10</integer>
-    <key>Minute</key><integer>0</integer>
-  </dict>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/emergent.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/emergent.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("emergent")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-emergent",
+        "program_arguments": [rag_bin, "emergent"],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "RAG_LLM_BACKEND": "mlx",
+        },
+        "schedule": {
+            "calendar": {"Weekday": 5, "Hour": 10, "Minute": 0},
+        },
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _patterns_plist(rag_bin: str) -> str:
@@ -512,35 +601,21 @@ def _patterns_plist(rag_bin: str) -> str:
     Antes del rename, este plist exiteaba con código 2 (Click muestra
     el help del grupo).
     """
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-patterns</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>feedback-patterns</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-    <key>RAG_LLM_BACKEND</key><string>mlx</string>
-  </dict>
-  <key>StartCalendarInterval</key>
-  <dict>
-    <key>Weekday</key><integer>0</integer>
-    <key>Hour</key><integer>20</integer>
-    <key>Minute</key><integer>0</integer>
-  </dict>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/patterns.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/patterns.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("patterns")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-patterns",
+        "program_arguments": [rag_bin, "feedback-patterns"],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "RAG_LLM_BACKEND": "mlx",
+        },
+        "schedule": {
+            "calendar": {"Weekday": 0, "Hour": 20, "Minute": 0},
+        },
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _archive_plist(rag_bin: str) -> str:
@@ -548,38 +623,21 @@ def _archive_plist(rag_bin: str) -> str:
     the gate (>20 plan entries) short-circuits to a dry-run + notification
     so un-supervised drift can't accidentally move half the vault.
     """
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-archive</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>archive</string>
-    <string>--apply</string>
-    <string>--notify</string>
-    <string>--report</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-    <key>RAG_LLM_BACKEND</key><string>mlx</string>
-  </dict>
-  <key>StartCalendarInterval</key>
-  <dict>
-    <key>Day</key><integer>1</integer>
-    <key>Hour</key><integer>23</integer>
-    <key>Minute</key><integer>0</integer>
-  </dict>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/archive.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/archive.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("archive")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-archive",
+        "program_arguments": [rag_bin, "archive", "--apply", "--notify", "--report"],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "RAG_LLM_BACKEND": "mlx",
+        },
+        "schedule": {
+            "calendar": {"Day": 1, "Hour": 23, "Minute": 0},
+        },
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _distill_plist(rag_bin: str) -> str:
@@ -595,35 +653,20 @@ def _distill_plist(rag_bin: str) -> str:
     antes de que el original desaparezca (defense-in-depth con la regla
     promote-on-cite del archive).
     """
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-distill</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>distill-conversations</string>
-    <string>--apply</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-  </dict>
-  <key>StartCalendarInterval</key>
-  <dict>
-    <key>Weekday</key><integer>0</integer>
-    <key>Hour</key><integer>22</integer>
-    <key>Minute</key><integer>30</integer>
-  </dict>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/distill.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/distill.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("distill")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-distill",
+        "program_arguments": [rag_bin, "distill-conversations", "--apply"],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+        },
+        "schedule": {
+            "calendar": {"Weekday": 0, "Hour": 22, "Minute": 30},
+        },
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _consolidate_plist(rag_bin: str) -> str:
@@ -631,39 +674,24 @@ def _consolidate_plist(rag_bin: str) -> str:
     recurring conversation clusters from
     99-obsidian/99-AI/conversations/ to PARA and
     archives the originals (see plans/episodic-memory.md Phase 2)."""
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-consolidate</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>consolidate</string>
-    <string>--apply</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-    <key>RAG_STATE_SQL</key><string>1</string>
-    <key>RAG_LLM_BACKEND</key><string>mlx</string>
-  </dict>
-  <key>StartCalendarInterval</key>
-  <dict>
-    <key>Weekday</key><integer>1</integer>
-    <key>Hour</key><integer>6</integer>
-    <key>Minute</key><integer>0</integer>
-  </dict>
-  <key>RunAtLoad</key><false/>
-  <key>KeepAlive</key><false/>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/consolidate.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/consolidate.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("consolidate")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-consolidate",
+        "program_arguments": [rag_bin, "consolidate", "--apply"],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "RAG_STATE_SQL": "1",
+            "RAG_LLM_BACKEND": "mlx",
+        },
+        "schedule": {
+            "calendar": {"Weekday": 1, "Hour": 6, "Minute": 0},
+        },
+        "run_at_load": False,
+        "keep_alive": False,
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _vault_cleanup_plist(rag_bin: str) -> str:
@@ -689,35 +717,22 @@ def _vault_cleanup_plist(rag_bin: str) -> str:
     políticas por carpeta documentados ahí. Para auditar qué se va a
     borrar sin tocar nada: `rag vault-cleanup --dry-run --json`.
     """
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-vault-cleanup</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>vault-cleanup</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-  </dict>
-  <key>StartCalendarInterval</key>
-  <dict>
-    <key>Hour</key><integer>2</integer>
-    <key>Minute</key><integer>0</integer>
-  </dict>
-  <key>RunAtLoad</key><false/>
-  <key>KeepAlive</key><false/>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/vault-cleanup.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/vault-cleanup.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("vault-cleanup")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-vault-cleanup",
+        "program_arguments": [rag_bin, "vault-cleanup"],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+        },
+        "schedule": {
+            "calendar": {"Hour": 2, "Minute": 0},
+        },
+        "run_at_load": False,
+        "keep_alive": False,
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _anticipate_plist(rag_bin: str) -> str:
@@ -734,32 +749,20 @@ def _anticipate_plist(rag_bin: str) -> str:
     per-kind: `rag silence anticipate-calendar` etc. Kill switch global:
     `RAG_ANTICIPATE_DISABLED=1`.
     """
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-anticipate</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>anticipate</string>
-    <string>run</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-    <key>RAG_LLM_BACKEND</key><string>mlx</string>
-  </dict>
-  <key>StartInterval</key><integer>600</integer>
-  <key>RunAtLoad</key><false/>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/anticipate.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/anticipate.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("anticipate")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-anticipate",
+        "program_arguments": [rag_bin, "anticipate", "run"],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "RAG_LLM_BACKEND": "mlx",
+        },
+        "schedule": {"interval_s": 600},
+        "run_at_load": False,
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _maintenance_plist(rag_bin: str) -> str:
@@ -787,36 +790,23 @@ def _maintenance_plist(rag_bin: str) -> str:
     exclusive lock. `RunAtLoad=false` — first run happens at the next
     04:00, so `rag setup` doesn't block on a potentially-long VACUUM.
     """
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-maintenance</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>maintenance</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-    <key>RAG_STATE_SQL</key><string>1</string>
-  </dict>
-  <key>StartCalendarInterval</key>
-  <dict>
-    <key>Hour</key><integer>4</integer>
-    <key>Minute</key><integer>0</integer>
-  </dict>
-  <key>RunAtLoad</key><false/>
-  <key>KeepAlive</key><false/>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/maintenance.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/maintenance.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("maintenance")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-maintenance",
+        "program_arguments": [rag_bin, "maintenance"],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "RAG_STATE_SQL": "1",
+        },
+        "schedule": {
+            "calendar": {"Hour": 4, "Minute": 0},
+        },
+        "run_at_load": False,
+        "keep_alive": False,
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _calibration_plist(rag_bin: str) -> str:
@@ -836,40 +826,26 @@ def _calibration_plist(rag_bin: str) -> str:
     calibrar — el flag solo afecta NUEVAS queries del web/serve plists.
     Detalle del rollout en commit `4f7e41f`.
     """
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-calibrate</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>calibrate</string>
-    <string>--since</string>
-    <string>90</string>
-    <string>--as-json</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-    <key>RAG_STATE_SQL</key><string>1</string>
-    <key>RAG_SCORE_CALIBRATION</key><string>1</string>
-  </dict>
-  <key>StartCalendarInterval</key>
-  <dict>
-    <key>Hour</key><integer>4</integer>
-    <key>Minute</key><integer>30</integer>
-  </dict>
-  <key>RunAtLoad</key><false/>
-  <key>KeepAlive</key><false/>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/calibrate.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/calibrate.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("calibrate")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-calibrate",
+        "program_arguments": [
+            rag_bin, "calibrate", "--since", "90", "--as-json",
+        ],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "RAG_STATE_SQL": "1",
+            "RAG_SCORE_CALIBRATION": "1",
+        },
+        "schedule": {
+            "calendar": {"Hour": 4, "Minute": 30},
+        },
+        "run_at_load": False,
+        "keep_alive": False,
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _auto_harvest_plist(rag_bin: str) -> str:
@@ -887,43 +863,27 @@ def _auto_harvest_plist(rag_bin: str) -> str:
 
     RunAtLoad=false — no conviene blockear rag setup con un run completo.
     """
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-auto-harvest</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>feedback</string>
-    <string>auto-harvest</string>
-    <string>--since</string>
-    <string>1</string>
-    <string>--limit</string>
-    <string>50</string>
-    <string>--json</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-    <key>RAG_STATE_SQL</key><string>1</string>
-    <key>RAG_LLM_BACKEND</key><string>mlx</string>
-  </dict>
-  <key>StartCalendarInterval</key>
-  <dict>
-    <key>Hour</key><integer>3</integer>
-    <key>Minute</key><integer>0</integer>
-  </dict>
-  <key>RunAtLoad</key><false/>
-  <key>KeepAlive</key><false/>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/auto-harvest.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/auto-harvest.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("auto-harvest")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-auto-harvest",
+        "program_arguments": [
+            rag_bin, "feedback", "auto-harvest",
+            "--since", "1", "--limit", "50", "--json",
+        ],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "RAG_STATE_SQL": "1",
+            "RAG_LLM_BACKEND": "mlx",
+        },
+        "schedule": {
+            "calendar": {"Hour": 3, "Minute": 0},
+        },
+        "run_at_load": False,
+        "keep_alive": False,
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _active_learning_nudge_plist(rag_bin: str) -> str:
@@ -939,40 +899,26 @@ def _active_learning_nudge_plist(rag_bin: str) -> str:
     del CLI si se necesita re-tunear (no env vars hoy — el plist es la
     fuente unica del schedule + parametros).
     """
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-active-learning-nudge</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>active-learning</string>
-    <string>nudge</string>
-    <string>--json</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-    <key>RAG_STATE_SQL</key><string>1</string>
-    <key>RAG_LLM_BACKEND</key><string>mlx</string>
-  </dict>
-  <key>StartCalendarInterval</key>
-  <dict>
-    <key>Weekday</key><integer>1</integer>
-    <key>Hour</key><integer>10</integer>
-    <key>Minute</key><integer>0</integer>
-  </dict>
-  <key>RunAtLoad</key><false/>
-  <key>KeepAlive</key><false/>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/active-learning-nudge.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/active-learning-nudge.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("active-learning-nudge")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-active-learning-nudge",
+        "program_arguments": [
+            rag_bin, "active-learning", "nudge", "--json",
+        ],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "RAG_STATE_SQL": "1",
+            "RAG_LLM_BACKEND": "mlx",
+        },
+        "schedule": {
+            "calendar": {"Weekday": 1, "Hour": 10, "Minute": 0},
+        },
+        "run_at_load": False,
+        "keep_alive": False,
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _online_tune_plist(rag_bin: str) -> str:
@@ -994,43 +940,27 @@ def _online_tune_plist(rag_bin: str) -> str:
     explícito en el plist para no depender del default del código.
     """
     working_dir = Path(__file__).resolve().parent.parent
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-online-tune</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>tune</string>
-    <string>--online</string>
-    <string>--days</string>
-    <string>14</string>
-    <string>--apply</string>
-    <string>--yes</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-    <key>RAG_EVAL_GATE_TIMEOUT_S</key><string>2400</string>
-    <key>RAG_LLM_BACKEND</key><string>mlx</string>
-  </dict>
-  <key>StartCalendarInterval</key>
-  <dict>
-    <key>Hour</key><integer>3</integer>
-    <key>Minute</key><integer>30</integer>
-  </dict>
-  <key>RunAtLoad</key><false/>
-  <key>KeepAlive</key><false/>
-  <key>WorkingDirectory</key><string>{working_dir}</string>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/online-tune.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/online-tune.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("online-tune")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-online-tune",
+        "program_arguments": [
+            rag_bin, "tune", "--online", "--days", "14", "--apply", "--yes",
+        ],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "RAG_EVAL_GATE_TIMEOUT_S": "2400",
+            "RAG_LLM_BACKEND": "mlx",
+        },
+        "schedule": {
+            "calendar": {"Hour": 3, "Minute": 30},
+        },
+        "run_at_load": False,
+        "keep_alive": False,
+        "working_dir": str(working_dir),
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _implicit_feedback_plist(rag_bin: str) -> str:
@@ -1066,36 +996,22 @@ def _implicit_feedback_plist(rag_bin: str) -> str:
         f'{rag_bin} feedback classify-sessions --json'
     )
     cmd_xml = cmd.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-implicit-feedback</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/bin/bash</string>
-    <string>-c</string>
-    <string>{cmd_xml}</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-  </dict>
-  <key>StartCalendarInterval</key>
-  <dict>
-    <key>Hour</key><integer>3</integer>
-    <key>Minute</key><integer>25</integer>
-  </dict>
-  <key>RunAtLoad</key><false/>
-  <key>KeepAlive</key><false/>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/implicit-feedback.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/implicit-feedback.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("implicit-feedback")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-implicit-feedback",
+        "program_arguments": ["/bin/bash", "-c", cmd_xml],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+        },
+        "schedule": {
+            "calendar": {"Hour": 3, "Minute": 25},
+        },
+        "run_at_load": False,
+        "keep_alive": False,
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _ingest_whatsapp_plist(rag_bin: str) -> str:
@@ -1119,35 +1035,22 @@ def _ingest_whatsapp_plist(rag_bin: str) -> str:
     arranque del Mac devuelva data stale. El incremental cost es chico (<1s
     cuando no hay nuevos).
     """
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-ingest-whatsapp</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>index</string>
-    <string>--source</string>
-    <string>whatsapp</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-    <key>RAG_INDEX_LOCAL_EMBED</key><string>1</string>
-    <key>HF_HUB_OFFLINE</key><string>1</string>
-    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
-  </dict>
-  <key>StartInterval</key><integer>900</integer>
-  <key>RunAtLoad</key><true/>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/ingest-whatsapp.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/ingest-whatsapp.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("ingest-whatsapp")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-ingest-whatsapp",
+        "program_arguments": [rag_bin, "index", "--source", "whatsapp"],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "RAG_INDEX_LOCAL_EMBED": "1",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+        },
+        "schedule": {"interval_s": 900},
+        "run_at_load": True,
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _ingest_cross_source_plist(rag_bin: str) -> str:
@@ -1172,33 +1075,22 @@ def _ingest_cross_source_plist(rag_bin: str) -> str:
     un user nuevo vea data cross-source en la primera hora (en vez de
     esperar la próxima hora redonda).
     """
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-ingest-cross-source</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>ingest-cross-source</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-    <key>RAG_INDEX_LOCAL_EMBED</key><string>1</string>
-    <key>HF_HUB_OFFLINE</key><string>1</string>
-    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
-  </dict>
-  <key>StartInterval</key><integer>3600</integer>
-  <key>RunAtLoad</key><true/>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/ingest-cross-source.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/ingest-cross-source.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("ingest-cross-source")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-ingest-cross-source",
+        "program_arguments": [rag_bin, "ingest-cross-source"],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "RAG_INDEX_LOCAL_EMBED": "1",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+        },
+        "schedule": {"interval_s": 3600},
+        "run_at_load": True,
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _ingest_gmail_plist(rag_bin: str) -> str:
@@ -1215,35 +1107,22 @@ def _ingest_gmail_plist(rag_bin: str) -> str:
     y cada HTTP call cuesta quota. Si querés ingest más frecuente, bajar el
     interval manual y monitorear `rag log` para ver si golpeaste quota.
     """
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-ingest-gmail</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>index</string>
-    <string>--source</string>
-    <string>gmail</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-    <key>RAG_INDEX_LOCAL_EMBED</key><string>1</string>
-    <key>HF_HUB_OFFLINE</key><string>1</string>
-    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
-  </dict>
-  <key>StartInterval</key><integer>3600</integer>
-  <key>RunAtLoad</key><true/>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/ingest-gmail.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/ingest-gmail.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("ingest-gmail")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-ingest-gmail",
+        "program_arguments": [rag_bin, "index", "--source", "gmail"],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "RAG_INDEX_LOCAL_EMBED": "1",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+        },
+        "schedule": {"interval_s": 3600},
+        "run_at_load": True,
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _ingest_calendar_plist(rag_bin: str) -> str:
@@ -1261,35 +1140,22 @@ def _ingest_calendar_plist(rag_bin: str) -> str:
     (correr el OAuth flow manual antes del primer run); sin esos archivos el
     ingester silent-drops (loader retorna None).
     """
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-ingest-calendar</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>index</string>
-    <string>--source</string>
-    <string>calendar</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-    <key>RAG_INDEX_LOCAL_EMBED</key><string>1</string>
-    <key>HF_HUB_OFFLINE</key><string>1</string>
-    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
-  </dict>
-  <key>StartInterval</key><integer>3600</integer>
-  <key>RunAtLoad</key><true/>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/ingest-calendar.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/ingest-calendar.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("ingest-calendar")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-ingest-calendar",
+        "program_arguments": [rag_bin, "index", "--source", "calendar"],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "RAG_INDEX_LOCAL_EMBED": "1",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+        },
+        "schedule": {"interval_s": 3600},
+        "run_at_load": True,
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _ingest_reminders_plist(rag_bin: str) -> str:
@@ -1312,188 +1178,103 @@ def _ingest_reminders_plist(rag_bin: str) -> str:
     falla (Full Disk Access denegado, Reminders.app not running), el
     ingester silent-drops y la próxima corrida lo reintenta.
     """
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-ingest-reminders</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>index</string>
-    <string>--source</string>
-    <string>reminders</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-    <key>RAG_INDEX_LOCAL_EMBED</key><string>1</string>
-    <key>HF_HUB_OFFLINE</key><string>1</string>
-    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
-  </dict>
-  <key>StartInterval</key><integer>3600</integer>
-  <key>RunAtLoad</key><true/>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/ingest-reminders.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/ingest-reminders.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("ingest-reminders")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-ingest-reminders",
+        "program_arguments": [rag_bin, "index", "--source", "reminders"],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "RAG_INDEX_LOCAL_EMBED": "1",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+        },
+        "schedule": {"interval_s": 3600},
+        "run_at_load": True,
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _ingest_calls_plist(rag_bin: str) -> str:
     """Ingester de Apple Calls — cada 6 horas, mantine la tabla rag_calls
     actualizada con llamadas perdidas/entrantes/salientes del CallHistory."""
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-ingest-calls</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>index</string>
-    <string>--source</string>
-    <string>calls</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-    <key>RAG_INDEX_LOCAL_EMBED</key><string>1</string>
-    <key>HF_HUB_OFFLINE</key><string>1</string>
-    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
-  </dict>
-  <key>StartCalendarInterval</key>
-  <array>
-    <dict>
-      <key>Hour</key><integer>0</integer>
-      <key>Minute</key><integer>0</integer>
-    </dict>
-    <dict>
-      <key>Hour</key><integer>6</integer>
-      <key>Minute</key><integer>0</integer>
-    </dict>
-    <dict>
-      <key>Hour</key><integer>12</integer>
-      <key>Minute</key><integer>0</integer>
-    </dict>
-    <dict>
-      <key>Hour</key><integer>18</integer>
-      <key>Minute</key><integer>0</integer>
-    </dict>
-  </array>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/ingest-calls.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/ingest-calls.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("ingest-calls")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-ingest-calls",
+        "program_arguments": [rag_bin, "index", "--source", "calls"],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "RAG_INDEX_LOCAL_EMBED": "1",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+        },
+        "schedule": {
+            "calendar_list": [
+                {"Hour": 0, "Minute": 0},
+                {"Hour": 6, "Minute": 0},
+                {"Hour": 12, "Minute": 0},
+                {"Hour": 18, "Minute": 0},
+            ],
+        },
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _ingest_safari_plist(rag_bin: str) -> str:
     """Ingester de Safari — cada 6 horas, mantine la tabla rag_safari
     actualizada con history + bookmarks."""
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-ingest-safari</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>index</string>
-    <string>--source</string>
-    <string>safari</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-    <key>RAG_INDEX_LOCAL_EMBED</key><string>1</string>
-    <key>HF_HUB_OFFLINE</key><string>1</string>
-    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
-  </dict>
-  <key>StartCalendarInterval</key>
-  <array>
-    <dict>
-      <key>Hour</key><integer>0</integer>
-      <key>Minute</key><integer>15</integer>
-    </dict>
-    <dict>
-      <key>Hour</key><integer>6</integer>
-      <key>Minute</key><integer>15</integer>
-    </dict>
-    <dict>
-      <key>Hour</key><integer>12</integer>
-      <key>Minute</key><integer>15</integer>
-    </dict>
-    <dict>
-      <key>Hour</key><integer>18</integer>
-      <key>Minute</key><integer>15</integer>
-    </dict>
-  </array>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/ingest-safari.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/ingest-safari.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("ingest-safari")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-ingest-safari",
+        "program_arguments": [rag_bin, "index", "--source", "safari"],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "RAG_INDEX_LOCAL_EMBED": "1",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+        },
+        "schedule": {
+            "calendar_list": [
+                {"Hour": 0, "Minute": 15},
+                {"Hour": 6, "Minute": 15},
+                {"Hour": 12, "Minute": 15},
+                {"Hour": 18, "Minute": 15},
+            ],
+        },
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _ingest_drive_plist(rag_bin: str) -> str:
     """Ingester de Google Drive — cada 6 horas, mantine la tabla rag_drive
     actualizada con DAO + documentos compartidos."""
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-ingest-drive</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>index</string>
-    <string>--source</string>
-    <string>drive</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-    <key>RAG_INDEX_LOCAL_EMBED</key><string>1</string>
-    <key>HF_HUB_OFFLINE</key><string>1</string>
-    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
-  </dict>
-  <key>StartCalendarInterval</key>
-  <array>
-    <dict>
-      <key>Hour</key><integer>1</integer>
-      <key>Minute</key><integer>0</integer>
-    </dict>
-    <dict>
-      <key>Hour</key><integer>7</integer>
-      <key>Minute</key><integer>0</integer>
-    </dict>
-    <dict>
-      <key>Hour</key><integer>13</integer>
-      <key>Minute</key><integer>0</integer>
-    </dict>
-    <dict>
-      <key>Hour</key><integer>19</integer>
-      <key>Minute</key><integer>0</integer>
-    </dict>
-  </array>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/ingest-drive.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/ingest-drive.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("ingest-drive")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-ingest-drive",
+        "program_arguments": [rag_bin, "index", "--source", "drive"],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "RAG_INDEX_LOCAL_EMBED": "1",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+        },
+        "schedule": {
+            "calendar_list": [
+                {"Hour": 1, "Minute": 0},
+                {"Hour": 7, "Minute": 0},
+                {"Hour": 13, "Minute": 0},
+                {"Hour": 19, "Minute": 0},
+            ],
+        },
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _ingest_pillow_plist(rag_bin: str) -> str:
@@ -1506,39 +1287,24 @@ def _ingest_pillow_plist(rag_bin: str) -> str:
     Schedule único en lugar de cada-N-horas porque el archivo solo cambia
     1×/día post wake-up; correr más veces sería desperdicio de wake en el
     Mac. Si el sync de iCloud demora, el run del día siguiente lo recoge."""
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-ingest-pillow</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>index</string>
-    <string>--source</string>
-    <string>pillow</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-    <key>RAG_INDEX_LOCAL_EMBED</key><string>1</string>
-    <key>HF_HUB_OFFLINE</key><string>1</string>
-    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
-  </dict>
-  <key>StartCalendarInterval</key>
-  <dict>
-    <key>Hour</key><integer>9</integer>
-    <key>Minute</key><integer>30</integer>
-  </dict>
-  <key>RunAtLoad</key><true/>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/ingest-pillow.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/ingest-pillow.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("ingest-pillow")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-ingest-pillow",
+        "program_arguments": [rag_bin, "index", "--source", "pillow"],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "RAG_INDEX_LOCAL_EMBED": "1",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+        },
+        "schedule": {
+            "calendar": {"Hour": 9, "Minute": 30},
+        },
+        "run_at_load": True,
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _mood_poll_plist(rag_bin: str) -> str:
@@ -1570,34 +1336,24 @@ def _mood_poll_plist(rag_bin: str) -> str:
     poll_script = repo_root / "scripts" / "mood_poll.py"
     # Reuso del mismo Python del uv tool venv que usa spotify-poll.
     uv_python = Path.home() / ".local/share/uv/tools/obsidian-rag/bin/python3"
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-mood-poll</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{uv_python}</string>
-    <string>{poll_script}</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>RAG_MOOD_ENABLED</key><string>1</string>
-    <key>RAG_STATE_SQL</key><string>1</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-  </dict>
-  <key>StartInterval</key><integer>1800</integer>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><false/>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/mood-poll.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/mood-poll.error.log</string>
-  <key>ThrottleInterval</key><integer>60</integer>
-</dict>
-</plist>
-"""
+    out, err = _logs("mood-poll")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-mood-poll",
+        "program_arguments": [str(uv_python), str(poll_script)],
+        "env": {
+            "RAG_MOOD_ENABLED": "1",
+            "RAG_STATE_SQL": "1",
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+        },
+        "schedule": {"interval_s": 1800},
+        "run_at_load": True,
+        "keep_alive": False,
+        "throttle_s": 60,
+        "throttle_after_logs": True,  # único caso con ThrottleInterval después de logs
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _spotify_poll_plist(rag_bin: str) -> str:
@@ -1619,31 +1375,20 @@ def _spotify_poll_plist(rag_bin: str) -> str:
     repo_root = Path(__file__).resolve().parent.parent
     poll_script = repo_root / "scripts" / "spotify_poll.py"
     uv_python = Path.home() / ".local/share/uv/tools/obsidian-rag/bin/python3"
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-spotify-poll</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{uv_python}</string>
-    <string>{poll_script}</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>RAG_STATE_SQL</key><string>1</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-  </dict>
-  <key>StartInterval</key><integer>60</integer>
-  <key>RunAtLoad</key><true/>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/spotify-poll.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/spotify-poll.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("spotify-poll")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-spotify-poll",
+        "program_arguments": [str(uv_python), str(poll_script)],
+        "env": {
+            "RAG_STATE_SQL": "1",
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+        },
+        "schedule": {"interval_s": 60},
+        "run_at_load": True,
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _routing_rules_plist(rag_bin: str) -> str:
@@ -1659,32 +1404,21 @@ def _routing_rules_plist(rag_bin: str) -> str:
     WhatsApp lo aplica en el próximo dispatch. Sin esto, el loop
     quedaba half-closed (collector OK, trainer OK, apply ✗).
     """
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-routing-rules</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>routing</string>
-    <string>extract-rules</string>
-    <string>--auto-promote</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-  </dict>
-  <key>StartInterval</key><integer>300</integer>
-  <key>RunAtLoad</key><false/>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/routing-rules.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/routing-rules.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("routing-rules")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-routing-rules",
+        "program_arguments": [
+            rag_bin, "routing", "extract-rules", "--auto-promote",
+        ],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+        },
+        "schedule": {"interval_s": 300},
+        "run_at_load": False,
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _whisper_vocab_plist(rag_bin: str) -> str:
@@ -1700,35 +1434,20 @@ def _whisper_vocab_plist(rag_bin: str) -> str:
     aprendía términos nuevos del corpus reciente. Ver memoria
     `whisper-vocab-plist-fix-2026-05-01` en mem-vault para el detalle.
     """
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-whisper-vocab</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>whisper</string>
-    <string>vocab</string>
-    <string>refresh</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-  </dict>
-  <key>StartCalendarInterval</key>
-  <dict>
-    <key>Hour</key><integer>3</integer>
-    <key>Minute</key><integer>15</integer>
-  </dict>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/whisper-vocab.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/whisper-vocab.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("whisper-vocab")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-whisper-vocab",
+        "program_arguments": [rag_bin, "whisper", "vocab", "refresh"],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+        },
+        "schedule": {
+            "calendar": {"Hour": 3, "Minute": 15},
+        },
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _wake_up_plist(rag_bin: str) -> str:
@@ -1748,34 +1467,21 @@ def _wake_up_plist(rag_bin: str) -> str:
     patterns/emergent — los amortigua (si alguno no corrió porque la
     Mac estaba en sleep a su horario, wake-up lo re-ejecuta).
     """
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-wake-up</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>wake-up</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-    <key>RAG_LLM_BACKEND</key><string>mlx</string>
-  </dict>
-  <key>StartCalendarInterval</key>
-  <dict>
-    <key>Hour</key><integer>4</integer>
-    <key>Minute</key><integer>0</integer>
-  </dict>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/wake-up.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/wake-up.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("wake-up")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-wake-up",
+        "program_arguments": [rag_bin, "wake-up"],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "RAG_LLM_BACKEND": "mlx",
+        },
+        "schedule": {
+            "calendar": {"Hour": 4, "Minute": 0},
+        },
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _serve_watchdog_plist(rag_bin: str) -> str:  # noqa: ARG001 (rag_bin no usado)
@@ -1806,28 +1512,20 @@ def _serve_watchdog_plist(rag_bin: str) -> str:  # noqa: ARG001 (rag_bin no usad
     """
     repo_root = Path(__file__).resolve().parent.parent
     watchdog_script = repo_root / "scripts" / "rag-serve-watchdog.sh"
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-serve-watchdog</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/bin/bash</string>
-    <string>{watchdog_script}</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
-  </dict>
-  <key>StartInterval</key><integer>60</integer>
-  <key>RunAtLoad</key><true/>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/serve-watchdog.stdout.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/serve-watchdog.stderr.log</string>
-</dict>
-</plist>
-"""
+    # serve-watchdog usa stdout.log/stderr.log (no .log/.error.log).
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-serve-watchdog",
+        "program_arguments": ["/bin/bash", str(watchdog_script)],
+        "env": {
+            # Override del PATH default — este watchdog NO necesita
+            # ~/.local/bin (preservado del original).
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+        },
+        "schedule": {"interval_s": 60},
+        "run_at_load": True,
+        "stdout_path": f"{_RAG_LOG_DIR}/serve-watchdog.stdout.log",
+        "stderr_path": f"{_RAG_LOG_DIR}/serve-watchdog.stderr.log",
+    })
 
 
 def _brief_auto_tune_plist(rag_bin: str) -> str:
@@ -1851,41 +1549,26 @@ def _brief_auto_tune_plist(rag_bin: str) -> str:
     kind via `launchctl`. `RunAtLoad=false` so `rag setup` doesn't
     fire it on install (no point — there's nothing to tune yet).
     """
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-brief-auto-tune</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>brief</string>
-    <string>schedule</string>
-    <string>auto-tune</string>
-    <string>--apply</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-    <key>RAG_STATE_SQL</key><string>1</string>
-    <key>RAG_LLM_BACKEND</key><string>mlx</string>
-  </dict>
-  <key>StartCalendarInterval</key>
-  <dict>
-    <key>Weekday</key><integer>0</integer>
-    <key>Hour</key><integer>3</integer>
-    <key>Minute</key><integer>0</integer>
-  </dict>
-  <key>RunAtLoad</key><false/>
-  <key>KeepAlive</key><false/>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/brief-auto-tune.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/brief-auto-tune.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("brief-auto-tune")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-brief-auto-tune",
+        "program_arguments": [
+            rag_bin, "brief", "schedule", "auto-tune", "--apply",
+        ],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "RAG_STATE_SQL": "1",
+            "RAG_LLM_BACKEND": "mlx",
+        },
+        "schedule": {
+            "calendar": {"Weekday": 0, "Hour": 3, "Minute": 0},
+        },
+        "run_at_load": False,
+        "keep_alive": False,
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _daemon_watchdog_plist(rag_bin: str) -> str:
@@ -1911,35 +1594,24 @@ def _daemon_watchdog_plist(rag_bin: str) -> str:
     (deprecado 2026-05-01), pero ahora para TODO el stack de daemons
     en lugar de solo `serve`.
     """
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-daemon-watchdog</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>daemons</string>
-    <string>reconcile</string>
-    <string>--apply</string>
-    <string>--gentle</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-    <key>RAG_STATE_SQL</key><string>1</string>
-  </dict>
-  <key>StartInterval</key><integer>300</integer>
-  <key>RunAtLoad</key><true/>
-  <key>Throttle</key><integer>60</integer>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/daemon-watchdog.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/daemon-watchdog.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("daemon-watchdog")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-daemon-watchdog",
+        "program_arguments": [
+            rag_bin, "daemons", "reconcile", "--apply", "--gentle",
+        ],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "RAG_STATE_SQL": "1",
+        },
+        "schedule": {"interval_s": 300},
+        "run_at_load": True,
+        "throttle_s": 60,
+        "throttle_key": "Throttle",  # único caso que usa la key corta
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _wake_hook_plist(rag_bin: str) -> str:
@@ -1969,34 +1641,22 @@ def _wake_hook_plist(rag_bin: str) -> str:
     script_path = (
         Path(__file__).resolve().parent.parent / "scripts" / "wake_hook.py"
     )
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-wake-hook</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/usr/bin/env</string>
-    <string>python3</string>
-    <string>{script_path}</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-    <key>RAG_WAKE_HOOK_RAG_BIN</key><string>{rag_bin}</string>
-    <key>RAG_WAKE_HOOK_POLL_SECONDS</key><string>60</string>
-  </dict>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>ThrottleInterval</key><integer>30</integer>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/wake-hook.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/wake-hook.error.log</string>
-</dict>
-</plist>
-"""
+    out, err = _logs("wake-hook")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-wake-hook",
+        "program_arguments": ["/usr/bin/env", "python3", str(script_path)],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "RAG_WAKE_HOOK_RAG_BIN": rag_bin,
+            "RAG_WAKE_HOOK_POLL_SECONDS": "60",
+        },
+        "run_at_load": True,
+        "keep_alive": True,
+        "throttle_s": 30,
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
@@ -2299,5 +1959,3 @@ def _services_spec_manual() -> list[dict]:
         {"label": "com.fer.obsidian-rag-synth-refresh", "category": "manual_keep"},
         {"label": "com.fer.obsidian-rag-log-rotate", "category": "manual_keep"},
     ]
-
-

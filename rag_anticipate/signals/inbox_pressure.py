@@ -14,11 +14,13 @@ Diseño:
   vive bajo `99-obsidian/99-AI/conversations/` y ya
   ni siquiera está bajo el inbox, pero dejamos la lógica de "no recursivo"
   por si en el futuro cae otra subcarpeta acá (ej. `00-Inbox/voice/`).
-- Ventana de edad: `min_age_hours=24` default. Si bajamos el umbral, cada
-  vez que el user captura rápido una idea el signal grita; demasiado alto y
-  el pile-up tarda en dispararse.
-- Threshold de emisión: 15 notas. Score escala linealmente hasta 35+ → 1.0.
-  Con <15 no emite (el umbral "me siento inundado" empírico del user).
+- Ventana de edad: `min_age_hours=12` default (bajado de 24 el 2026-05-09
+  porque dejaba notas de la mañana fuera del trigger por la tarde). Si
+  bajamos más el umbral, cada vez que el user captura rápido una idea el
+  signal grita; demasiado alto y el pile-up tarda en dispararse.
+- Threshold de emisión: 10 notas (bajado de 15 el 2026-05-09 — audit signals
+  showed que con 15 nunca disparó en 30d). Score escala linealmente hasta
+  30+ → 1.0. Con <10 no emite.
 - dedup_key por fecha → 1 push por día máx, independiente de cuántas veces
   corra el cron. snooze_hours=48 como doble cinturón (si el user clickea
   "snooze" o el push falla, no lo repetimos por 2 días).
@@ -37,14 +39,18 @@ _INBOX_DIR = "00-Inbox"
 
 # Edad mínima (horas) para que una nota cuente como "stale". Capturas de hoy
 # no cuentan — el user las va a procesar durante el día.
-_INBOX_MIN_AGE_HOURS = 24
+# Bajado 24 → 12 (2026-05-09): el threshold de 24h dejaba notas de la mañana
+# fuera del trigger por la tarde. 12h cubre el ciclo "captura → triar mismo día".
+_INBOX_MIN_AGE_HOURS = 12
 
-# Threshold para emitir. Con <15 notas stale, no disparamos. 15 es el punto
-# donde el user reporta "ya se acumuló demasiado, necesito triar".
-_INBOX_EMIT_THRESHOLD = 15
+# Threshold para emitir. Bajado 15 → 10 (2026-05-09): audit de signals showed
+# that inbox_pressure nunca disparó en 30d con el threshold 15 — el user mantiene
+# el inbox <15 cuando triа diario, así que el push nunca alcanzaba para
+# recordarle "se está acumulando" hasta que ya era tarde.
+_INBOX_EMIT_THRESHOLD = 10
 
 # Score ramp: (count - threshold) / _INBOX_SCORE_RAMP + base.
-# Con count=15 → 0.4; con count=35 (threshold + ramp) → 1.0.
+# Con count=10 → 0.4; con count=30 (threshold + ramp) → 1.0.
 _INBOX_SCORE_BASE = 0.4
 _INBOX_SCORE_RAMP = 20.0
 
@@ -100,7 +106,7 @@ def _count_stale_inbox(vault: Path, min_age_hours: int = _INBOX_MIN_AGE_HOURS) -
 
 @register_signal(name="inbox_pressure", snooze_hours=48)
 def inbox_pressure_signal(now: datetime) -> list:
-    """Emite MÁXIMO 1 candidate cuando el inbox tiene ≥15 notas stale (>24h).
+    """Emite MÁXIMO 1 candidate cuando el inbox tiene ≥10 notas stale (>12h).
 
     Silent-fail total: cualquier error (vault no accesible, permission,
     is_excluded throws, lo que sea) → `[]`. El orchestrator tiene su propio
@@ -132,14 +138,14 @@ def inbox_pressure_signal(now: datetime) -> list:
         if count < _INBOX_EMIT_THRESHOLD:
             return []
 
-        # Score: 0.4 en el threshold (15), escala hasta 1.0 en 35+.
+        # Score: 0.4 en el threshold (10), escala hasta 1.0 en 30+.
         score = min(
             1.0,
             (count - _INBOX_EMIT_THRESHOLD) / _INBOX_SCORE_RAMP + _INBOX_SCORE_BASE,
         )
 
         message = (
-            f"📥 Inbox acumulado: {count} notas sin triar (>24h). "
+            f"📥 Inbox acumulado: {count} notas sin triar (>{_INBOX_MIN_AGE_HOURS}h). "
             f"¿`rag inbox --apply` o triage manual?"
         )
 

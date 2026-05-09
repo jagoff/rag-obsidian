@@ -17,12 +17,12 @@ Algoritmo (silent-fail end-to-end):
    - frontmatter `tags:` que contenga `to-read` o `unread`
    - inline `#to-read` o `#unread` en el body
    - O bien la nota vive en `03-Resources/Reading/` (folder convention)
-3. Contar el total. Si `count >= 10` → emit UN candidate.
+3. Contar el total. Si `count >= 5` → emit UN candidate.
 
-Score: `min(1.0, (count - 10) / 30.0 + 0.5)`
-- count=10  → 0.5  (justo arriba del threshold del orchestrator 0.35)
-- count=25  → 1.0  (saturado: ya es un problema serio)
-- count=40+ → 1.0
+Score: `min(1.0, (count - 5) / 30.0 + 0.5)`
+- count=5  → 0.5  (justo arriba del threshold del orchestrator 0.35)
+- count=20 → 1.0  (saturado: ya es un problema serio)
+- count=35+ → 1.0
 
 dedup_key: `reading_backlog:{ISO_year}-W{ISO_week:02d}` — 1 push máximo
 por semana ISO. Combinado con `snooze_hours=168` (1 semana), el user
@@ -45,16 +45,18 @@ from rag_anticipate.signals.base import register_signal
 
 # Edad mínima (días) para que una nota cuente como "stale" en el backlog.
 # Capturas de esta semana NO cuentan — el user todavía las puede procesar
-# en su flujo normal. 7 días = "ya pasó un ciclo y sigue sin tocarse".
-_BACKLOG_MIN_AGE_DAYS = 7
+# en su flujo normal. Bajado 7 → 3 (2026-05-09): el ciclo de lectura del
+# user es de 2-3 días según behavior, no semanal — 7d era heredado de
+# la heurística genérica de inbox_pressure.
+_BACKLOG_MIN_AGE_DAYS = 3
 
-# Threshold para emitir. <10 notas en backlog: no molestamos. El user
-# percibe ~10 como "ya se acumuló demasiado" según la heurística general
-# del agente (mismo orden de magnitud que `inbox_pressure`).
-_BACKLOG_EMIT_THRESHOLD = 10
+# Threshold para emitir. Bajado 10 → 5 (2026-05-09): audit signals showed
+# que reading_backlog nunca disparó en 30d. Con 5 ya hay valor en el
+# recordatorio (≥1 semana de items acumulados).
+_BACKLOG_EMIT_THRESHOLD = 5
 
 # Score ramp: (count - threshold) / _BACKLOG_SCORE_RAMP + base.
-# count=10 → 0.5; count=40 → 1.0 (saturado a partir de count=40).
+# count=5 → 0.5; count=35 → 1.0 (saturado a partir de count=35).
 _BACKLOG_SCORE_BASE = 0.5
 _BACKLOG_SCORE_RAMP = 30.0
 
@@ -220,8 +222,8 @@ def _count_reading_backlog(vault: Path, min_age_days: int = _BACKLOG_MIN_AGE_DAY
 
 @register_signal(name="reading_backlog", snooze_hours=168)
 def reading_backlog_signal(now: datetime) -> list:
-    """Emite MÁXIMO 1 candidate cuando el backlog de reading list ≥10 notas
-    con mtime ≥ 7 días atrás.
+    """Emite MÁXIMO 1 candidate cuando el backlog de reading list ≥5 notas
+    con mtime ≥ 3 días atrás.
 
     Silent-fail total: cualquier error → `[]`. Ver docstring del módulo.
     """
@@ -241,14 +243,14 @@ def reading_backlog_signal(now: datetime) -> list:
         if count < _BACKLOG_EMIT_THRESHOLD:
             return []
 
-        # Score: 0.5 en el threshold (10), saturado a 1.0 con count=40+.
+        # Score: 0.5 en el threshold (5), saturado a 1.0 con count=35+.
         score = min(
             1.0,
             (count - _BACKLOG_EMIT_THRESHOLD) / _BACKLOG_SCORE_RAMP + _BACKLOG_SCORE_BASE,
         )
 
         message = (
-            f"📚 {count} notas en backlog de lectura (≥7d). "
+            f"📚 {count} notas en backlog de lectura (≥{_BACKLOG_MIN_AGE_DAYS}d). "
             f"¿Clear session de 1h o archivar?"
         )
 

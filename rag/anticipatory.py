@@ -90,6 +90,7 @@ ese schema antes de invocar las funciones de aquí.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import time
@@ -965,6 +966,191 @@ def anticipate_explain_cmd():
         f"\n[dim]Threshold actual: {_ANTICIPATE_MIN_SCORE:.2f}. "
         f"Override con RAG_ANTICIPATE_MIN_SCORE.[/dim]"
     )
+
+
+@anticipate.command("diagnose")
+@click.option("--days", type=int, default=7, show_default=True,
+              help="Ventana de stats sent vs selected.")
+def anticipate_diagnose_cmd(days: int):
+    """Health snapshot del pipeline anticipate end-to-end.
+
+    Una sola pantalla que responde "¿por qué no me llegan los pushes?":
+      - Per-signal: registered/silent/error + último candidate emitted
+      - Gating real: ambient.json state, quiet hours ahora, kill switch
+      - Stats últimos N días: candidates emitted, selected, sent
+      - Recommendations accionables si detecta gaps comunes (ambient
+        missing → comando exacto para fixearlo, etc.)
+
+    Read-only, no LLM calls, no efectos. Diseñado para correr a mano
+    cuando algo no anda y necesito un panorama rápido sin abrir SQL.
+    """
+    from datetime import datetime as _dt
+
+    from rich.table import Table
+    from rich.panel import Panel
+
+    now = _dt.now()
+    rows_sql = _diag_count_per_kind(days=days)
+    sent_total = sum(r["sent"] for r in rows_sql.values())
+    selected_total = sum(r["selected"] for r in rows_sql.values())
+
+    # 1. Per-signal table — qué emite vs qué está silent
+    t = Table(title=f"Signals · {len(_ANTICIPATE_SIGNALS)} registered")
+    t.add_column("signal"); t.add_column("now", justify="right")
+    t.add_column(f"{days}d emit", justify="right")
+    t.add_column(f"{days}d sel", justify="right")
+    t.add_column(f"{days}d sent", justify="right")
+    t.add_column("status")
+
+    live_counts: dict[str, int] = {}
+    for label, fn in _ANTICIPATE_SIGNALS:
+        kind = f"anticipate-{label}"
+        try:
+            cands = fn(now) or []
+            n_now = len(cands)
+            err = None
+        except Exception as exc:
+            n_now = -1
+            err = f"{type(exc).__name__}: {str(exc)[:40]}"
+        live_counts[kind] = n_now
+
+        sql_row = rows_sql.get(kind, {"emit": 0, "selected": 0, "sent": 0})
+        if err:
+            status = f"[red]ERR[/red] {err}"
+        elif n_now > 0:
+            status = "[green]fires[/green]"
+        elif sql_row["emit"] > 0:
+            status = f"[yellow]silent ahora[/yellow] (emitió {sql_row['emit']}× en {days}d)"
+        else:
+            status = f"[dim]silent {days}d[/dim]"
+
+        t.add_row(
+            kind.replace("anticipate-", ""),
+            f"{n_now}" if n_now >= 0 else "-",
+            f"{sql_row['emit']}",
+            f"{sql_row['selected']}",
+            f"{sql_row['sent']}",
+            status,
+        )
+    console.print(t)
+
+    # 2. Gating panel — el "¿por qué sent=0?" check
+    gating_lines: list[str] = []
+    issues: list[str] = []
+
+    # Kill switch global
+    kill_switch = os.environ.get("RAG_ANTICIPATE_DISABLED", "").strip()
+    if kill_switch and kill_switch.lower() not in ("0", "false", "no", ""):
+        gating_lines.append("[red]✗[/red] RAG_ANTICIPATE_DISABLED=1 — kill switch activo")
+        issues.append("Bajar `RAG_ANTICIPATE_DISABLED` para destrabar")
+    else:
+        gating_lines.append("[green]✓[/green] kill switch off")
+
+    # ambient.json — lazy import del path desde rag/__init__.py para evitar
+    # circular import (anticipatory carga ANTES que la sección donde está
+    # AMBIENT_CONFIG_PATH definido).
+    try:
+        from rag import AMBIENT_CONFIG_PATH as _amb_path  # noqa: PLC0415
+    except Exception:
+        _amb_path = Path.home() / ".local/share/obsidian-rag/ambient.json"
+    if _amb_path.is_file():
+        try:
+            cfg = json.loads(_amb_path.read_text(encoding="utf-8"))
+            jid = cfg.get("jid") or ""
+            enabled = bool(cfg.get("enabled"))
+            if enabled and jid:
+                gating_lines.append(
+                    f"[green]✓[/green] ambient enabled · jid=[cyan]{jid[:40]}[/cyan]"
+                )
+            else:
+                gating_lines.append(
+                    f"[red]✗[/red] ambient.json existe pero enabled={enabled} jid={jid!r}"
+                )
+                issues.append(
+                    "`rag ambient enable --jid <JID> --force` (o /enable_ambient en el bot)"
+                )
+        except Exception as exc:
+            gating_lines.append(f"[red]✗[/red] ambient.json corrupto: {exc}")
+            issues.append("`rm ~/.local/share/obsidian-rag/ambient.json` y re-habilitar")
+    else:
+        gating_lines.append("[red]✗[/red] ambient.json missing — TODOS los pushes fallan")
+        issues.append("`rag ambient enable --jid <JID>` (o `/enable_ambient` desde el bot)")
+
+    # Quiet hours ahora
+    try:
+        from rag_anticipate.quiet_hours import is_in_quiet_hours
+        quiet, reason = is_in_quiet_hours(now)
+        if quiet:
+            gating_lines.append(f"[yellow]⊘[/yellow] quiet hours ahora ({reason})")
+        else:
+            gating_lines.append("[green]✓[/green] no quiet hours")
+    except Exception as exc:
+        gating_lines.append(f"[dim]quiet hours check failed: {exc}[/dim]")
+
+    console.print(Panel(
+        "\n".join(gating_lines),
+        title="Gating",
+        border_style="blue",
+    ))
+
+    # 3. Top issues — qué accionar
+    if issues:
+        console.print("\n[bold red]Acción requerida:[/bold red]")
+        for i, issue in enumerate(issues, 1):
+            console.print(f"  {i}. {issue}")
+    else:
+        if sent_total == 0 and selected_total > 0:
+            console.print(
+                f"\n[yellow]Atención:[/yellow] {selected_total} selected pero 0 sent en {days}d. "
+                "Revisar log del proactive_push (`rag log proactive`)."
+            )
+        elif selected_total == 0 and sum(r["emit"] for r in rows_sql.values()) > 0:
+            console.print(
+                "\n[dim]Hay candidates emitidos pero ninguno selected — todos "
+                "filtered por snooze o quiet hours. Si esperabas push, esperar al "
+                "siguiente tick post-snooze.[/dim]"
+            )
+        else:
+            console.print(
+                f"\n[green]Pipeline sano:[/green] {sent_total} sent / "
+                f"{selected_total} selected en {days}d."
+            )
+
+
+def _diag_count_per_kind(*, days: int) -> dict[str, dict]:
+    """Read rag_anticipate_candidates: count emit/selected/sent per kind.
+
+    Silent-fail con dict vacío si la DB está down — el caller maneja la
+    rendering sin asumir keys.
+    """
+    from rag import _ragvec_state_conn  # noqa: PLC0415
+    out: dict[str, dict] = {}
+    try:
+        with _ragvec_state_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT kind,
+                       COUNT(*) AS emit,
+                       SUM(selected) AS sel,
+                       SUM(sent) AS sent
+                FROM rag_anticipate_candidates
+                WHERE ts > datetime('now', '-' || ? || ' days')
+                GROUP BY kind
+                """,
+                (days,),
+            ).fetchall()
+    except Exception:
+        return out
+    for r in rows or ():
+        try:
+            out[r[0]] = {
+                "emit": int(r[1] or 0),
+                "selected": int(r[2] or 0),
+                "sent": int(r[3] or 0),
+            }
+        except Exception:
+            continue
+    return out
 
 
 # ── Phase 2 CLI subcommands ──────────────────────────────────────────────────

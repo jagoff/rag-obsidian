@@ -136,6 +136,72 @@ from rag.integrations.whatsapp.tasks_writer import (  # noqa: F401
 from rag.integrations.whatsapp.plist import _wa_tasks_plist  # noqa: F401
 
 
+# ── Setattr-mirror para tests ───────────────────────────────────────────────
+# Tests pre-split hacían `monkeypatch.setattr(wa_mod, "_vault_contacts_dir",
+# fake)` y el patch propagaba a los call sites internos porque todo vivía en
+# el mismo módulo (Python lookup local lee el `__dict__` actualizado).
+# Post-split los call sites internos viven en sub-módulos (ej. `_load_vault_contacts`
+# en `contacts.py` llama a `_vault_contacts_dir()` del mismo `contacts.py`),
+# así que un patch en el namespace del package NO propaga.
+#
+# Solución: custom ModuleType cuyo `__setattr__` mirrorea al sub-módulo
+# original del nombre. Se construye un map name → submódulo escaneando los
+# attrs no-dunder de cada sub-módulo al cargarse el package. Así
+# `monkeypatch.setattr(wa_pkg, "_vault_contacts_dir", fake)` también setea
+# `contacts._vault_contacts_dir = fake` y el call site interno ve el patch.
+import sys as _sys  # noqa: E402  — al final del init, una vez los sub-módulos cargaron
+from types import ModuleType as _ModuleType  # noqa: E402
+
+
+def _build_attr_owner_map() -> dict[str, str]:
+    """Mapa `attr_name → submódulo` para mirroring de monkeypatches.
+
+    Se escanea cada sub-módulo y se quedan los nombres no-dunder (incluye
+    privados `_foo` para que tests que patchean `_VAULT_CONTACTS_CACHE` o
+    `_PROMISE_REGEX_HINTS` también propaguen). Si el mismo nombre aparece
+    en múltiples sub-módulos, gana el primero (orden del listado abajo) —
+    no debería pasar porque los `__all__` son disjuntos.
+    """
+    sub_modules = (
+        "_constants", "send", "contacts", "observations", "resolve",
+        "fetch", "tasks_state", "tasks_extract", "tasks_writer", "plist",
+    )
+    out: dict[str, str] = {}
+    pkg = __name__
+    for sub_name in sub_modules:
+        sub = _sys.modules.get(f"{pkg}.{sub_name}")
+        if sub is None:
+            continue
+        for attr_name in vars(sub):
+            if attr_name.startswith("__"):
+                continue
+            out.setdefault(attr_name, sub_name)
+    return out
+
+
+_ATTR_OWNER_MAP: dict[str, str] = _build_attr_owner_map()
+
+
+class _WhatsappPackageModule(_ModuleType):
+    """Package module subclass que mirrorea setattr al sub-módulo dueño.
+
+    Soluciona el split-monkeypatch propagation problem para el caso
+    intra-package: tests patchean en el package namespace pero el call
+    site interno de un sub-módulo lee de su propio `__dict__`.
+    """
+
+    def __setattr__(self, name: str, value):  # type: ignore[override]
+        super().__setattr__(name, value)
+        sub_name = _ATTR_OWNER_MAP.get(name)
+        if sub_name:
+            sub = _sys.modules.get(f"{__name__}.{sub_name}")
+            if sub is not None:
+                setattr(sub, name, value)
+
+
+_sys.modules[__name__].__class__ = _WhatsappPackageModule
+
+
 __all__ = [
     # Constants
     "WHATSAPP_NOTE_MAX_CHARS",

@@ -204,7 +204,7 @@ def _map_brief_state_row(brief_path: str, cited_path: str) -> dict:
     ts = datetime.now().isoformat(timespec="seconds")
     pair_key = f"{brief_path}\x00{cited_path}"
     bt = "today" if brief_path.endswith("-evening.md") else (
-        "morning" if "/04-Archive/99-obsidian-system/99-AI/reviews/" in brief_path or brief_path.startswith("04-Archive/99-obsidian-system/99-AI/reviews/") else "unknown"
+        "morning" if "/99-obsidian/99-AI/reviews/" in brief_path or brief_path.startswith("99-obsidian/99-AI/reviews/") else "unknown"
     )
     return {"pair_key": pair_key, "brief_type": bt, "kind": "cited",
             "path": cited_path, "first_ts": ts, "last_ts": ts}

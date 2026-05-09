@@ -3924,6 +3924,57 @@ def mail_send(req: MailSendRequest, request: Request) -> dict:
     }
 
 
+@app.get("/api/dossier")
+def get_dossier(name: str, days: int = 30, max_messages: int = 30) -> dict:
+    """Devuelve el dossier multi-source de un contacto (on-demand).
+
+    Game Changer GC6 (2026-05-09): wireup HTTP del `generate_dossier()`
+    que ya existía como cron daily pero no estaba expuesto via API.
+    Trigger desde el listener WA: `/contexto Maria` → este endpoint →
+    formatear el dict resultante para mandarlo al chat.
+
+    Pipeline:
+        1. Resuelve contact name contra `99-Contacts/<name>.md`.
+        2. Pull WA recent + promises + calendar + vault notes.
+        3. LLM-resume todo en JSON estructurado (helper qwen2.5:3b).
+
+    Read-only — no escribe nada al vault (vs `write_dossier_to_note()`
+    del cron). Sin auth (read path).
+
+    Query params:
+        name: nombre del contacto (obligatorio). Ej: "Maria", "Seba".
+        days: ventana de WA history (1-90, default 30).
+        max_messages: cap de mensajes WA al pasar al LLM (5-100, default 30).
+    """
+    name = (name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name parameter required")
+    days = max(1, min(int(days), 90))
+    max_messages = max(5, min(int(max_messages), 100))
+    try:
+        from rag.integrations.whatsapp.dossier import generate_dossier
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"dossier module unavailable: {e}") from e
+
+    try:
+        result = generate_dossier(
+            contact_name=name,
+            days=days,
+            max_messages=max_messages,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"generate_dossier failed: {str(e)[:200]}") from e
+
+    if not isinstance(result, dict):
+        return {"ok": False, "error": "dossier returned non-dict", "name": name}
+    if result.get("error"):
+        # generate_dossier devuelve {"error": "..."} en silent-fail.
+        # 200 con error en body (no 4xx) — el listener decide qué hacer
+        # con el mensaje user-facing.
+        return {"ok": False, "error": str(result["error"]), "name": name}
+    return {"ok": True, "name": name, "dossier": result}
+
+
 @app.get("/api/contacts")
 def list_contacts(q: str = "", kind: str = "any", limit: int = 20) -> dict:
     """Contact picker para el popover de ``/wzp`` y ``/mail`` del web chat.

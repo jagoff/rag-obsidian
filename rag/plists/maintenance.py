@@ -56,6 +56,8 @@ def _maintenance_plist(rag_bin: str) -> str:
         },
         "run_at_load": False,
         "keep_alive": False,
+        "process_type": "Background",
+        "low_priority_io": True,
         "stdout_path": out,
         "stderr_path": err,
     })
@@ -97,6 +99,8 @@ def _vault_cleanup_plist(rag_bin: str) -> str:
         },
         "run_at_load": False,
         "keep_alive": False,
+        "process_type": "Background",
+        "low_priority_io": True,
         "stdout_path": out,
         "stderr_path": err,
     })
@@ -116,12 +120,16 @@ def _consolidate_plist(rag_bin: str) -> str:
             "TERM": "dumb",
             "RAG_STATE_SQL": "1",
             "RAG_LLM_BACKEND": "mlx",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
         },
         "schedule": {
             "calendar": {"Weekday": 1, "Hour": 6, "Minute": 0},
         },
         "run_at_load": False,
         "keep_alive": False,
+        "process_type": "Background",
+        "low_priority_io": True,
         "stdout_path": out,
         "stderr_path": err,
     })

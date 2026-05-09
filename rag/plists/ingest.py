@@ -50,6 +50,8 @@ def _ingest_whatsapp_plist(rag_bin: str) -> str:
         },
         "schedule": {"interval_s": 900},
         "run_at_load": True,
+        "throttle_s": 30,
+        "process_type": "Background",
         "stdout_path": out,
         "stderr_path": err,
     })
@@ -90,6 +92,9 @@ def _ingest_cross_source_plist(rag_bin: str) -> str:
         },
         "schedule": {"interval_s": 3600},
         "run_at_load": True,
+        "throttle_s": 60,
+        "process_type": "Background",
+        "low_priority_io": True,
         "stdout_path": out,
         "stderr_path": err,
     })

@@ -32,10 +32,14 @@ def _emergent_plist(rag_bin: str) -> str:
             "NO_COLOR": "1",
             "TERM": "dumb",
             "RAG_LLM_BACKEND": "mlx",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
         },
         "schedule": {
             "calendar": {"Weekday": 5, "Hour": 10, "Minute": 0},
         },
+        "process_type": "Background",
+        "low_priority_io": True,
         "stdout_path": out,
         "stderr_path": err,
     })
@@ -58,10 +62,14 @@ def _patterns_plist(rag_bin: str) -> str:
             "NO_COLOR": "1",
             "TERM": "dumb",
             "RAG_LLM_BACKEND": "mlx",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
         },
         "schedule": {
             "calendar": {"Weekday": 0, "Hour": 20, "Minute": 0},
         },
+        "process_type": "Background",
+        "low_priority_io": True,
         "stdout_path": out,
         "stderr_path": err,
     })
@@ -80,10 +88,14 @@ def _archive_plist(rag_bin: str) -> str:
             "NO_COLOR": "1",
             "TERM": "dumb",
             "RAG_LLM_BACKEND": "mlx",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
         },
         "schedule": {
             "calendar": {"Day": 1, "Hour": 23, "Minute": 0},
         },
+        "process_type": "Background",
+        "low_priority_io": True,
         "stdout_path": out,
         "stderr_path": err,
     })
@@ -113,6 +125,8 @@ def _distill_plist(rag_bin: str) -> str:
         "schedule": {
             "calendar": {"Weekday": 0, "Hour": 22, "Minute": 30},
         },
+        "process_type": "Background",
+        "low_priority_io": True,
         "stdout_path": out,
         "stderr_path": err,
     })
@@ -120,6 +134,11 @@ def _distill_plist(rag_bin: str) -> str:
 
 def _anticipate_plist(rag_bin: str) -> str:
     """Anticipatory agent — every 10 min. Evalúa señales y empuja top-1 a WA.
+
+    Cadencia 15min (ex 10min, audit 2026-05-09): el daily_cap=3 hace que
+    pollear más seguido no compre coverage adicional — el evento más
+    sensible es calendar proximity con threshold 15min, así un tick
+    cada 15min lo captura igual con −33% LLM calls/día (96 vs 144).
 
     Game-changer 2026-04-24: el RAG deja de ser puramente "pull" y pasa a
     "push" cuando tiene algo timely para decirte. 3 señales activas:
@@ -140,9 +159,12 @@ def _anticipate_plist(rag_bin: str) -> str:
             "NO_COLOR": "1",
             "TERM": "dumb",
             "RAG_LLM_BACKEND": "mlx",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
         },
-        "schedule": {"interval_s": 600},
+        "schedule": {"interval_s": 900},
         "run_at_load": False,
+        "process_type": "Background",
         "stdout_path": out,
         "stderr_path": err,
     })
@@ -172,12 +194,16 @@ def _active_learning_nudge_plist(rag_bin: str) -> str:
             "TERM": "dumb",
             "RAG_STATE_SQL": "1",
             "RAG_LLM_BACKEND": "mlx",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
         },
         "schedule": {
             "calendar": {"Weekday": 1, "Hour": 10, "Minute": 0},
         },
         "run_at_load": False,
         "keep_alive": False,
+        "process_type": "Background",
+        "low_priority_io": True,
         "stdout_path": out,
         "stderr_path": err,
     })
@@ -209,12 +235,16 @@ def _active_learning_suggest_goldens_plist(rag_bin: str) -> str:
             "TERM": "dumb",
             "RAG_STATE_SQL": "1",
             "RAG_LLM_BACKEND": "mlx",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
         },
         "schedule": {
             "calendar": {"Weekday": 1, "Hour": 11, "Minute": 0},
         },
         "run_at_load": False,
         "keep_alive": False,
+        "process_type": "Background",
+        "low_priority_io": True,
         "stdout_path": out,
         "stderr_path": err,
     })
@@ -252,12 +282,16 @@ def _brief_auto_tune_plist(rag_bin: str) -> str:
             "TERM": "dumb",
             "RAG_STATE_SQL": "1",
             "RAG_LLM_BACKEND": "mlx",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
         },
         "schedule": {
             "calendar": {"Weekday": 0, "Hour": 3, "Minute": 0},
         },
         "run_at_load": False,
         "keep_alive": False,
+        "process_type": "Background",
+        "low_priority_io": True,
         "stdout_path": out,
         "stderr_path": err,
     })

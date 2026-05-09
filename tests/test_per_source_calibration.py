@@ -373,8 +373,11 @@ def test_calibration_plist_valid_xml_and_schedule():
     from xml.etree import ElementTree as ET
     content = rag._calibration_plist("/usr/local/bin/rag")
     ET.fromstring(content)
-    assert "<integer>4</integer>" in content  # Hour=4
-    assert "<integer>30</integer>" in content  # Minute=30
+    # Stagger 04:30 → 05:00 (audit 2026-05-09): online-tune dura 24min
+    # warm en mac M-chip y 04:30 caía dentro de su ventana de exclusive
+    # locks. 05:00 le da margen sin tocar maintenance (04:00).
+    assert "<integer>5</integer>" in content  # Hour=5
+    assert "<integer>0</integer>" in content  # Minute=0
     assert "calibrate" in content
     # 2026-04-30: rolleado de "0" → "1" — el daemon entrenaba pero
     # `calibrate_score()` bailea con el flag apagado, así que el

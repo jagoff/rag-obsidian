@@ -45,9 +45,13 @@ def _wa_fast_plist(rag_bin: str) -> str:
             "NO_COLOR": "1",
             "TERM": "dumb",
             "RAG_LLM_BACKEND": "mlx",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
         },
         "schedule": {"interval_s": 300},
         "run_at_load": False,
+        "throttle_s": 30,
+        "process_type": "Background",
         "stdout_path": out,
         "stderr_path": err,
     })

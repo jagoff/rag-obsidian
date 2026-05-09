@@ -6,8 +6,9 @@ Surface:
   ``com.fer.obsidian-rag-wa-tasks``. Cron 30min, lee delta del bridge SQLite,
   escribe `00-Inbox/WA-YYYY-MM-DD.md` con tasks/questions/commitments.
 
-Generators consumidos por `rag/plists.py:2013` (``_wa_tasks_plist``) y por
-el setup loop (`rag setup` que escribe los plists a `~/Library/LaunchAgents/`).
+Generators consumidos por `rag/plists/_spec.py` (``_services_spec()`` lo
+re-exporta vía lazy import) y por el setup loop (`rag setup` que escribe
+los plists a `~/Library/LaunchAgents/`).
 """
 
 from __future__ import annotations
@@ -41,9 +42,14 @@ def _wa_tasks_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
+    <key>RAG_LLM_BACKEND</key><string>mlx</string>
+    <key>HF_HUB_OFFLINE</key><string>1</string>
+    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
   </dict>
   <key>StartInterval</key><integer>1800</integer>
   <key>RunAtLoad</key><false/>
+  <key>ThrottleInterval</key><integer>60</integer>
+  <key>ProcessType</key><string>Background</string>
   <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/wa-tasks.log</string>
   <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/wa-tasks.error.log</string>
 </dict>

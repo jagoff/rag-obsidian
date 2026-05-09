@@ -44,10 +44,14 @@ def _wake_up_plist(rag_bin: str) -> str:
             "NO_COLOR": "1",
             "TERM": "dumb",
             "RAG_LLM_BACKEND": "mlx",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
         },
         "schedule": {
             "calendar": {"Hour": 4, "Minute": 0},
         },
+        "process_type": "Background",
+        "low_priority_io": True,
         "stdout_path": out,
         "stderr_path": err,
     })
@@ -91,6 +95,8 @@ def _daemon_watchdog_plist(rag_bin: str) -> str:
         "run_at_load": True,
         "throttle_s": 60,
         "throttle_key": "Throttle",  # único caso que usa la key corta
+        "exit_timeout_s": 10,
+        "process_type": "Background",
         "stdout_path": out,
         "stderr_path": err,
     })

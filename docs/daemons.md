@@ -1,6 +1,18 @@
 # Daemons del proyecto
 
-Source de verdad: lista de tuplas en [`rag/__init__.py`](../rag/__init__.py) función `_services_spec()`. Manuales (no en `_services_spec`): `cloudflare-tunnel`, `cloudflare-tunnel-watcher`, `lgbm-train`, `paraphrases-train`, `synth-refresh`, `spotify-poll`, `log-rotate` — trackeados por control plane via `_services_spec_manual()`.
+Source de verdad: lista de tuplas en [`rag/plists/_spec.py`](../rag/plists/_spec.py) función `_services_spec()`. Factories por dominio en `rag/plists/{briefs,control,ingest,learning,maintenance,persistent,poll,proactive,wa}.py` + `rag/integrations/whatsapp/plist.py`. Renderer XML schema-driven en `rag/plists/_render.py`. Manuales (no en `_services_spec`): `synth-refresh`, `log-rotate` — trackeados por control plane via `_services_spec_manual()`.
+
+## Resource budget defaults (audit 2026-05-09)
+
+Aplicado a TODOS los plists managed:
+
+- **`ProcessType=Background`** — todos salvo `web` (Interactive) + `watch` (Adaptive). Baja prioridad scheduler vs procesos foreground del user.
+- **`LowPriorityIO=true`** — solo en batch nocturno (auto-harvest, online-tune, calibrate, implicit-feedback, whisper-vocab, maintenance, vault-cleanup, consolidate, archive, distill, brief-auto-tune, drift-watcher, active-learning-*, emergent, patterns, wake-up, routing-rules, ingest-cross-source). Bajo I/O contention si user vuelve a la app a las 3 AM.
+- **`HF_HUB_OFFLINE=1` + `TRANSFORMERS_OFFLINE=1`** — todos los plists con `RAG_LLM_BACKEND=mlx`. Evita HEAD requests a HuggingFace en cold-start + previene hang post-Mac-wake si la red está caída.
+- **`ThrottleInterval`** — frequent workers: routing-rules (5min) + wa-fast (5min) usan 30s; ingest-* y wa-tasks usan 60s. Evita spawn loops bajo backoff.
+- **`ExitTimeOut=10s` en `daemon-watchdog`** — preventivo contra hang en SQL locked.
+- **Cadencias bajadas** (no aportaban coverage): anticipate 10min→15min, spotify-poll 60s→5min.
+- **Stagger nightly**: calibrate 04:30→05:00 (libera ventana de online-tune que dura ~24min en M-chip).
 
 ## Listado actual
 

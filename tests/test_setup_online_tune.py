@@ -299,13 +299,18 @@ def test_services_spec_includes_vault_cleanup():
 
 def test_services_spec_includes_anticipate():
     """Added 2026-04-24 — game-changer: el RAG empuja info timely sin que
-    preguntes. Cada 10 min evalúa 3 señales (calendar proximity / temporal
-    echo / stale commitment) y empuja top-1 a WhatsApp vía proactive_push."""
+    preguntes. Evalúa 3 señales (calendar proximity / temporal echo /
+    stale commitment) y empuja top-1 a WhatsApp vía proactive_push.
+
+    Cadencia 15min (ex 10min, audit 2026-05-09): el daily_cap=3 hace que
+    pollear más seguido no compre coverage adicional — el threshold más
+    sensible (calendar proximity) ya cubre eventos próximos en 15min.
+    Bajamos −33% LLM calls/día (96 vs 144)."""
     specs = rag_module._services_spec(RAG_BIN)
     labels = {s[0] for s in specs}
     assert "com.fer.obsidian-rag-anticipate" in labels
     plist = rag_module._anticipate_plist(RAG_BIN)
-    assert "<key>StartInterval</key><integer>600</integer>" in plist  # 10 min
+    assert "<key>StartInterval</key><integer>900</integer>" in plist  # 15 min
     assert "<key>RunAtLoad</key><false/>" in plist
     assert "<string>anticipate</string>" in plist
     assert "<string>run</string>" in plist

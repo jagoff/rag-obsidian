@@ -63,13 +63,14 @@ def _mood_poll_plist(rag_bin: str) -> str:
         "keep_alive": False,
         "throttle_s": 60,
         "throttle_after_logs": True,  # único caso con ThrottleInterval después de logs
+        "process_type": "Background",
         "stdout_path": out,
         "stderr_path": err,
     })
 
 
 def _spotify_poll_plist(rag_bin: str) -> str:
-    """Spotify poller — corre `scripts/spotify_poll.py` cada 60s para
+    """Spotify poller — corre `scripts/spotify_poll.py` cada 5min para
     grabar el track actualmente en reproducción en `rag_spotify_log`.
 
     Lógica: script llama `record_now_playing()` desde rag.integrations.
@@ -81,8 +82,13 @@ def _spotify_poll_plist(rag_bin: str) -> str:
     se usan para context en briefs ("escuchabas X ayer") y futuro mood
     scoring.
 
+    Cadencia 5min (ex 60s, audit 2026-05-09): el track resolution
+    granular no aporta a los briefs (que muestran top-N del día) y el
+    mood scoring promedia por horas. Bajamos −83% spawn overhead
+    (1440→288 ticks/día) sin pérdida de signal útil.
+
     `RunAtLoad=true` para que bootstrap lance inmediatamente sin esperar
-    60s al primer tick.
+    al primer tick.
     """
     repo_root = _repo_root()
     poll_script = repo_root / "scripts" / "spotify_poll.py"
@@ -96,8 +102,10 @@ def _spotify_poll_plist(rag_bin: str) -> str:
             "NO_COLOR": "1",
             "TERM": "dumb",
         },
-        "schedule": {"interval_s": 60},
+        "schedule": {"interval_s": 300},
         "run_at_load": True,
+        "throttle_s": 60,
+        "process_type": "Background",
         "stdout_path": out,
         "stderr_path": err,
     })

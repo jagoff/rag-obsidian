@@ -26,7 +26,15 @@ Spec dict keys (todas opcionales salvo `label` + `program_arguments`):
   throttle_after_logs: bool  Si True, ThrottleInterval va DESPUÉS de los
                            log paths (mood-poll). Default False.
   exit_timeout_s: int|None ExitTimeOut.
-  process_type: str|None   "Interactive" / "Background" / etc.
+  process_type: str|None   "Interactive" / "Background" / "Adaptive" / "Standard".
+  low_priority_io: bool|None  LowPriorityIO — bajar prioridad I/O del proceso
+                           bajo el scheduler de macOS (usa flag IOPOL_THROTTLE).
+                           Pensado para batch nocturno (auto-harvest, online-tune,
+                           maintenance, etc.) que NO debe pisar el chat/web del
+                           user si éste vuelve a la app a las 3 AM.
+  nice: int|None           Nice. Range 0..20 (mayor = menos prioridad CPU).
+                           Default macOS para Background es ya algo +5; setear
+                           explícito 5-10 sólo para batch realmente pesado.
   working_dir: str|None    WorkingDirectory.
   stdout_path: str         Path absoluto del log stdout.
   stderr_path: str         Path absoluto del log stderr.
@@ -131,6 +139,8 @@ def _render_plist(spec: dict) -> str:
     throttle_after_logs = spec.get("throttle_after_logs", False)
     exit_timeout_s = spec.get("exit_timeout_s")
     process_type = spec.get("process_type")
+    low_priority_io = spec.get("low_priority_io")
+    nice = spec.get("nice")
     working_dir = spec.get("working_dir")
     stdout_path = spec["stdout_path"]
     stderr_path = spec["stderr_path"]
@@ -218,6 +228,12 @@ def _render_plist(spec: dict) -> str:
         )
     if process_type is not None:
         lines.append(f"  <key>ProcessType</key><string>{process_type}</string>\n")
+    if low_priority_io is True:
+        lines.append("  <key>LowPriorityIO</key><true/>\n")
+    elif low_priority_io is False:
+        lines.append("  <key>LowPriorityIO</key><false/>\n")
+    if nice is not None:
+        lines.append(f"  <key>Nice</key><integer>{int(nice)}</integer>\n")
     if working_dir is not None:
         lines.append(f"  <key>WorkingDirectory</key><string>{working_dir}</string>\n")
 

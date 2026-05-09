@@ -218,3 +218,122 @@ def test_setup_install_only_labels_filter(tmp_path, monkeypatch):
 
     installed = {p.stem for p in tmp_path.glob("*.plist")}
     assert installed == only, f"Esperado solo {only}, got {installed}"
+
+
+# ── Resource-budget audit (2026-05-09) ─────────────────────────────────────
+#
+# Garantizan que la ronda de optimización mantiene los defaults:
+#   - Batch nocturnos: ProcessType=Background + LowPriorityIO=true.
+#   - daemon-watchdog: ExitTimeOut presente (evita hang en SQL locked).
+#   - Frecuencias largas: anticipate ≥ 900s, spotify-poll ≥ 300s.
+#   - Stagger: calibrate corre 05:00 (no 04:30, evita overlap online-tune).
+#   - HF_HUB_OFFLINE=1 explícito en plists que cargan modelos MLX.
+#
+# Si se borra una de estas keys por accidente, este test grita.
+
+
+_BATCH_NIGHTLY_LABELS = frozenset({
+    "com.fer.obsidian-rag-auto-harvest",
+    "com.fer.obsidian-rag-online-tune",
+    "com.fer.obsidian-rag-calibrate",
+    "com.fer.obsidian-rag-implicit-feedback",
+    "com.fer.obsidian-rag-whisper-vocab",
+    "com.fer.obsidian-rag-drift-watcher",
+    "com.fer.obsidian-rag-maintenance",
+    "com.fer.obsidian-rag-vault-cleanup",
+    "com.fer.obsidian-rag-consolidate",
+    "com.fer.obsidian-rag-archive",
+    "com.fer.obsidian-rag-distill",
+    "com.fer.obsidian-rag-emergent",
+    "com.fer.obsidian-rag-patterns",
+    "com.fer.obsidian-rag-active-learning-nudge",
+    "com.fer.obsidian-rag-active-learning-suggest-goldens",
+    "com.fer.obsidian-rag-brief-auto-tune",
+    "com.fer.obsidian-rag-wake-up",
+    "com.fer.obsidian-rag-routing-rules",
+    "com.fer.obsidian-rag-ingest-cross-source",
+})
+
+
+def _xml_for(label: str) -> str:
+    for lbl, _fname, xml_str in _iter_managed_factories():
+        if lbl == label:
+            return xml_str
+    raise AssertionError(f"Label {label} no está en _services_spec()")
+
+
+def test_batch_nightly_have_background_and_low_priority_io():
+    """Daemons batch nocturnos deben tener ProcessType=Background +
+    LowPriorityIO=true para no pisar chat/web del user en horarios
+    no programados (post-wake, user despierto temprano, etc)."""
+    failures = []
+    for label in _BATCH_NIGHTLY_LABELS:
+        xml_str = _xml_for(label)
+        if "<key>ProcessType</key><string>Background</string>" not in xml_str:
+            failures.append(f"{label}: falta ProcessType=Background")
+        if "<key>LowPriorityIO</key><true/>" not in xml_str:
+            failures.append(f"{label}: falta LowPriorityIO=true")
+    assert not failures, "\n".join(failures)
+
+
+def test_daemon_watchdog_has_exit_timeout():
+    """daemon-watchdog corre cada 5min. ExitTimeOut=10s evita hang
+    si SQL queda locked durante reconcile."""
+    xml_str = _xml_for("com.fer.obsidian-rag-daemon-watchdog")
+    assert "<key>ExitTimeOut</key><integer>10</integer>" in xml_str
+    assert "<key>ProcessType</key><string>Background</string>" in xml_str
+
+
+def test_anticipate_cadence_is_15min():
+    """anticipate baja 10min → 15min (audit 2026-05-09): daily_cap=3
+    hace que pollear más seguido no compre coverage."""
+    xml_str = _xml_for("com.fer.obsidian-rag-anticipate")
+    assert "<key>StartInterval</key><integer>900</integer>" in xml_str
+    assert "<key>StartInterval</key><integer>600</integer>" not in xml_str
+
+
+def test_spotify_poll_cadence_is_5min():
+    """spotify-poll baja 60s → 300s (audit 2026-05-09): track granular
+    no aporta a briefs ni mood scoring; -83% spawn overhead."""
+    xml_str = _xml_for("com.fer.obsidian-rag-spotify-poll")
+    assert "<key>StartInterval</key><integer>300</integer>" in xml_str
+    assert "<key>StartInterval</key><integer>60</integer>" not in xml_str
+
+
+def test_calibrate_staggered_to_5am():
+    """calibrate 04:30 → 05:00 (audit 2026-05-09): online-tune dura 24min
+    en mac M-chip, 04:30 se solapaba al final del tune."""
+    xml_str = _xml_for("com.fer.obsidian-rag-calibrate")
+    assert "<key>Hour</key><integer>5</integer>" in xml_str
+    sched = xml_str.split("StartCalendarInterval")[1].split("</dict>")[0]
+    assert "<integer>30</integer>" not in sched
+
+
+def test_frequent_workers_have_throttle():
+    """Plists con StartInterval ≤ 5min deben tener ThrottleInterval
+    para evitar spawn loops bajo backoff."""
+    targets = {
+        "com.fer.obsidian-rag-routing-rules",
+        "com.fer.obsidian-rag-wa-fast",
+    }
+    failures = []
+    for label in targets:
+        xml_str = _xml_for(label)
+        if "ThrottleInterval" not in xml_str and "<key>Throttle</key>" not in xml_str:
+            failures.append(f"{label}: falta Throttle/ThrottleInterval")
+    assert not failures, "\n".join(failures)
+
+
+def test_mlx_plists_have_offline_flags():
+    """Plists con RAG_LLM_BACKEND=mlx deben tener HF_HUB_OFFLINE=1 +
+    TRANSFORMERS_OFFLINE=1 para que cold-start post-sleep no se cuelgue
+    si la red está caída + ahorrar HEAD requests a HuggingFace."""
+    failures = []
+    for label, _fname, xml_str in _iter_managed_factories():
+        if "<key>RAG_LLM_BACKEND</key><string>mlx</string>" not in xml_str:
+            continue
+        if "<key>HF_HUB_OFFLINE</key><string>1</string>" not in xml_str:
+            failures.append(f"{label}: tiene RAG_LLM_BACKEND=mlx pero falta HF_HUB_OFFLINE=1")
+        if "<key>TRANSFORMERS_OFFLINE</key><string>1</string>" not in xml_str:
+            failures.append(f"{label}: tiene RAG_LLM_BACKEND=mlx pero falta TRANSFORMERS_OFFLINE=1")
+    assert not failures, "\n".join(failures)

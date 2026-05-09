@@ -31,6 +31,8 @@ def _digest_plist(rag_bin: str, hour: int = 22, minute: int = 0) -> str:
             "NO_COLOR": "1",
             "TERM": "dumb",
             "RAG_LLM_BACKEND": "mlx",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
         },
         "schedule": {
             "calendar": {
@@ -74,6 +76,8 @@ def _morning_plist(rag_bin: str, hour: int = 7, minute: int = 0) -> str:
             "RAG_EXPLORE": "1",
             "RAG_MORNING_VOICE": "",
             "RAG_LLM_BACKEND": "mlx",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
         },
         "schedule": {
             "calendar_list": [
@@ -106,6 +110,8 @@ def _today_plist(rag_bin: str, hour: int = 22, minute: int = 0) -> str:
             "TERM": "dumb",
             "RAG_EXPLORE": "1",
             "RAG_LLM_BACKEND": "mlx",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
         },
         "schedule": {
             "calendar_list": [

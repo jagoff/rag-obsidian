@@ -50,12 +50,16 @@ def _auto_harvest_plist(rag_bin: str) -> str:
             "TERM": "dumb",
             "RAG_STATE_SQL": "1",
             "RAG_LLM_BACKEND": "mlx",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
         },
         "schedule": {
             "calendar": {"Hour": 3, "Minute": 0},
         },
         "run_at_load": False,
         "keep_alive": False,
+        "process_type": "Background",
+        "low_priority_io": True,
         "stdout_path": out,
         "stderr_path": err,
     })
@@ -91,12 +95,16 @@ def _online_tune_plist(rag_bin: str) -> str:
             "TERM": "dumb",
             "RAG_EVAL_GATE_TIMEOUT_S": "2400",
             "RAG_LLM_BACKEND": "mlx",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
         },
         "schedule": {
             "calendar": {"Hour": 3, "Minute": 30},
         },
         "run_at_load": False,
         "keep_alive": False,
+        "process_type": "Background",
+        "low_priority_io": True,
         "working_dir": str(working_dir),
         "stdout_path": out,
         "stderr_path": err,
@@ -104,8 +112,10 @@ def _online_tune_plist(rag_bin: str) -> str:
 
 
 def _calibration_plist(rag_bin: str) -> str:
-    """Nightly score calibration — 04:30, after auto-harvest (03:00) and
-    online-tune (03:30). The --since 90 window covers the last 3 months
+    """Nightly score calibration — 05:00, after auto-harvest (03:00) and
+    online-tune (03:30). Stagger 04:30 → 05:00 (audit 2026-05-09) para
+    no solapar con `maintenance` 04:00 + dar margen a online-tune que
+    en mac M-chip tarda 24min warm. The --since 90 window covers the last 3 months
     of feedback for training isotonic per source; re-runs are cheap
     (<1s typical) because everything's in-process.
 
@@ -133,10 +143,12 @@ def _calibration_plist(rag_bin: str) -> str:
             "RAG_SCORE_CALIBRATION": "1",
         },
         "schedule": {
-            "calendar": {"Hour": 4, "Minute": 30},
+            "calendar": {"Hour": 5, "Minute": 0},
         },
         "run_at_load": False,
         "keep_alive": False,
+        "process_type": "Background",
+        "low_priority_io": True,
         "stdout_path": out,
         "stderr_path": err,
     })
@@ -188,6 +200,8 @@ def _implicit_feedback_plist(rag_bin: str) -> str:
         },
         "run_at_load": False,
         "keep_alive": False,
+        "process_type": "Background",
+        "low_priority_io": True,
         "stdout_path": out,
         "stderr_path": err,
     })
@@ -218,6 +232,9 @@ def _routing_rules_plist(rag_bin: str) -> str:
         },
         "schedule": {"interval_s": 300},
         "run_at_load": False,
+        "throttle_s": 30,
+        "process_type": "Background",
+        "low_priority_io": True,
         "stdout_path": out,
         "stderr_path": err,
     })
@@ -268,6 +285,8 @@ def _drift_watcher_plist(rag_bin: str) -> str:
         "schedule": {"interval_s": 21600},  # 6h
         "run_at_load": True,
         "keep_alive": False,
+        "process_type": "Background",
+        "low_priority_io": True,
         "working_dir": str(repo),
         "stdout_path": out,
         "stderr_path": err,
@@ -298,6 +317,8 @@ def _whisper_vocab_plist(rag_bin: str) -> str:
         "schedule": {
             "calendar": {"Hour": 3, "Minute": 15},
         },
+        "process_type": "Background",
+        "low_priority_io": True,
         "stdout_path": out,
         "stderr_path": err,
     })

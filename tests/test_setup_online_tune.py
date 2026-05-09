@@ -112,9 +112,6 @@ def test_watch_plist_uses_all_vaults():
 
 @pytest.mark.parametrize("plist_fn,label,expected_interval", [
     (rag_module._ingest_whatsapp_plist, "whatsapp", 900),
-    (rag_module._ingest_gmail_plist,    "gmail",    3600),
-    (rag_module._ingest_calendar_plist, "calendar", 3600),
-    (rag_module._ingest_reminders_plist, "reminders", 3600),
 ])
 def test_ingester_plists_run_at_load_and_interval(plist_fn, label, expected_interval):
     """Regression (2026-04-22): reminders estaba en interval 6h (21600s) y
@@ -125,7 +122,11 @@ def test_ingester_plists_run_at_load_and_interval(plist_fn, label, expected_inte
       - `RunAtLoad=true` en los 4 → corrida inmediata al cargar el service.
       - Reminders interval 21600 → 3600 (alineado con gmail/calendar).
 
-    Este test guardspora los intervals exactos y la bandera RunAtLoad.
+    Histórico (Fase 2a, 2026-05-09): gmail/calendar/reminders consolidados
+    en `ingest-cross-source` desde 2026-05-04; sus factories individuales
+    se borraron junto con sus entries en este parametrize. El test queda
+    sólo guardando la regla de RunAtLoad+interval para `ingest_whatsapp`,
+    que sigue separado por su cadencia 15 min (hot path WA).
     """
     d = _parse_plist(plist_fn(RAG_BIN))
     assert d.get("RunAtLoad") is True, (
@@ -199,43 +200,6 @@ def test_services_spec_excludes_serve_and_serve_watchdog():
     labels = [s[0] for s in specs]
     assert "com.fer.obsidian-rag-serve" not in labels
     assert "com.fer.obsidian-rag-serve-watchdog" not in labels
-
-
-@requires_plutil
-def test_serve_plist_valid_plist():
-    xml = rag_module._serve_plist(RAG_BIN)
-    result = subprocess.run(
-        ["plutil", "-lint", "-"],
-        input=xml.encode(),
-        capture_output=True,
-    )
-    assert result.returncode == 0, result.stderr.decode()
-
-
-def test_serve_plist_port_7832_and_keepalive():
-    d = _parse_plist(rag_module._serve_plist(RAG_BIN))
-    args = d["ProgramArguments"]
-    assert args[0] == RAG_BIN
-    assert args[1] == "serve"
-    assert "7832" in args  # listener.ts hardcodes this port
-    assert d["KeepAlive"] is True
-    assert d["RunAtLoad"] is True
-
-
-def test_serve_plist_warm_model_env():
-    """Serve existe para mantener reranker + embedder in-process warm.
-
-    Ola 6 cero-Ollama (2026-05-06): LLM_KEEP_ALIVE y
-    OLLAMA_MAX_LOADED_MODELS removidos — no hay daemon Ollama que
-    keep-alivear. RAG_LLM_BACKEND=mlx reemplaza la función de calentar
-    chat model.
-    """
-    d = _parse_plist(rag_module._serve_plist(RAG_BIN))
-    env = d.get("EnvironmentVariables", {})
-    assert "LLM_KEEP_ALIVE" not in env
-    assert "OLLAMA_MAX_LOADED_MODELS" not in env
-    assert env.get("RAG_RERANKER_NEVER_UNLOAD") == "1"
-    assert env.get("RAG_LOCAL_EMBED") == "1"
 
 
 def test_services_spec_total_count():
@@ -378,9 +342,9 @@ def test_services_spec_includes_ingesters():
 
 @pytest.mark.parametrize("fn_name,expected_source,expected_interval", [
     ("_ingest_whatsapp_plist", "whatsapp", 900),    # 15 min
-    ("_ingest_gmail_plist", "gmail", 3600),         # 1 hora
-    ("_ingest_reminders_plist", "reminders", 3600), # 1 hora (bajado desde 6h el 2026-04-22)
-    ("_ingest_calendar_plist", "calendar", 3600),   # 1 hora
+    # Histórico (Fase 2a, 2026-05-09): gmail/reminders/calendar consolidados
+    # en `ingest-cross-source` desde 2026-05-04; sus factories se borraron
+    # junto con estos entries del parametrize.
 ])
 @requires_plutil
 def test_ingester_plist_valid_plist(fn_name, expected_source, expected_interval):
@@ -426,23 +390,28 @@ def test_ingester_plist_valid_plist(fn_name, expected_source, expected_interval)
 
 def test_ingester_plists_log_paths_distinct():
     """Cada ingester escribe a su propio stdout/stderr log para que el user
-    pueda leer `ingest-whatsapp.log` sin mezclar con gmail/reminders."""
+    pueda leer `ingest-whatsapp.log` sin mezclar con cross-source.
+
+    Histórico (Fase 2a, 2026-05-09): el for-loop incluía
+    `_ingest_gmail_plist` + `_ingest_reminders_plist` — ambos
+    consolidados en `ingest-cross-source` desde 2026-05-04 y removidos
+    junto con sus factories. Quedan whatsapp + cross-source como las
+    dos cadencias separadas.
+    """
     paths = set()
-    for fn_name in ["_ingest_whatsapp_plist", "_ingest_gmail_plist",
-                    "_ingest_reminders_plist"]:
+    for fn_name in ["_ingest_whatsapp_plist", "_ingest_cross_source_plist"]:
         d = _parse_plist(getattr(rag_module, fn_name)(RAG_BIN))
         paths.add(d["StandardOutPath"])
         paths.add(d["StandardErrorPath"])
-    # 3 ingesters × 2 paths (out/err) = 6 distinct paths
-    assert len(paths) == 6
+    # 2 ingesters × 2 paths (out/err) = 4 distinct paths
+    assert len(paths) == 4
 
 
 def test_ingester_plists_no_rag_explore():
     """Los ingesters NO deben tener `RAG_EXPLORE=1` — ese flag pertenece a
     retrieval paths (morning/today), no al indexing. Si se cuela, el
     ingester podría sesgar qué chunks escribe basándose en randomness."""
-    for fn_name in ["_ingest_whatsapp_plist", "_ingest_gmail_plist",
-                    "_ingest_reminders_plist"]:
+    for fn_name in ["_ingest_whatsapp_plist", "_ingest_cross_source_plist"]:
         d = _parse_plist(getattr(rag_module, fn_name)(RAG_BIN))
         env = d.get("EnvironmentVariables", {})
         assert "RAG_EXPLORE" not in env, (

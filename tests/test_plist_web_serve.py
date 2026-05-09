@@ -1,4 +1,4 @@
-"""Tests for the web + serve launchd plist generators.
+"""Tests for the web launchd plist generator.
 
 Gates the 3 env vars whose absence produced 23 MPS Command-Buffer OOMs + 64
 `[local-embed] unavailable (couldn't connect to huggingface.co)` entries in
@@ -17,10 +17,13 @@ Gates the 3 env vars whose absence produced 23 MPS Command-Buffer OOMs + 64
 
 The env gets applied at module-init of `rag.py:21` via `os.environ.setdefault`,
 but that runs AFTER launchd invokes the entry point. If the entry point (web
-daemon invokes `python web/server.py`, serve invokes `rag serve`) imports any
-module transitively touching huggingface_hub before `rag.py`'s setdefault
-fires, the offline flags miss their window. Setting them explicitly in the
-plist dict closes that race.
+daemon invokes `python web/server.py`) imports any module transitively touching
+huggingface_hub before `rag.py`'s setdefault fires, the offline flags miss
+their window. Setting them explicitly in the plist dict closes that race.
+
+Histórico (Fase 2a, 2026-05-09): los tests de `_serve_plist` se removieron
+junto con la función — el daemon estaba deprecado desde 2026-05-01 y FastAPI
+web cubre los endpoints reales.
 """
 from __future__ import annotations
 
@@ -164,13 +167,6 @@ def test_indexers_have_local_embed_and_no_ollama_keepalive():
         ("watch", rag_module._watch_plist(RAG_BIN)),
         ("ingest_whatsapp", rag_module._ingest_whatsapp_plist(RAG_BIN)),
         ("ingest_cross_source", rag_module._ingest_cross_source_plist(RAG_BIN)),
-        ("ingest_gmail", rag_module._ingest_gmail_plist(RAG_BIN)),
-        ("ingest_calendar", rag_module._ingest_calendar_plist(RAG_BIN)),
-        ("ingest_reminders", rag_module._ingest_reminders_plist(RAG_BIN)),
-        ("ingest_calls", rag_module._ingest_calls_plist(RAG_BIN)),
-        ("ingest_safari", rag_module._ingest_safari_plist(RAG_BIN)),
-        ("ingest_drive", rag_module._ingest_drive_plist(RAG_BIN)),
-        ("ingest_pillow", rag_module._ingest_pillow_plist(RAG_BIN)),
     ]
     for name, xml in indexer_plists:
         d = _parse(xml)
@@ -202,46 +198,6 @@ def test_web_plist_stdout_stderr_paths():
 @requires_plutil
 def test_web_plist_plutil_lint():
     xml = rag_module._web_plist(RAG_BIN)
-    result = subprocess.run(
-        ["plutil", "-lint", "-"], input=xml.encode(), capture_output=True,
-    )
-    assert result.returncode == 0, result.stderr.decode()
-
-
-# ─────────────────────────── _serve_plist ──────────────────────────────────
-
-
-def test_serve_plist_has_hf_hub_offline():
-    d = _parse(rag_module._serve_plist(RAG_BIN))
-    env = d["EnvironmentVariables"]
-    assert env.get("HF_HUB_OFFLINE") == "1"
-
-
-def test_serve_plist_has_transformers_offline():
-    d = _parse(rag_module._serve_plist(RAG_BIN))
-    env = d["EnvironmentVariables"]
-    assert env.get("TRANSFORMERS_OFFLINE") == "1"
-
-
-def test_serve_plist_has_fastembed_cache_path():
-    """Same rationale as the web plist version — see that test for context."""
-    d = _parse(rag_module._serve_plist(RAG_BIN))
-    env = d["EnvironmentVariables"]
-    cache = env.get("FASTEMBED_CACHE_PATH", "")
-    home = str(Path.home())
-    assert cache.startswith(home) and cache.endswith(".cache/fastembed"), \
-        f"FASTEMBED_CACHE_PATH should be HOME/.cache/fastembed (persistent), got {cache!r}"
-
-
-def test_serve_plist_has_rag_memory_pressure_interval_20():
-    d = _parse(rag_module._serve_plist(RAG_BIN))
-    env = d["EnvironmentVariables"]
-    assert env.get("RAG_MEMORY_PRESSURE_INTERVAL") == "20"
-
-
-@requires_plutil
-def test_serve_plist_plutil_lint():
-    xml = rag_module._serve_plist(RAG_BIN)
     result = subprocess.run(
         ["plutil", "-lint", "-"], input=xml.encode(), capture_output=True,
     )

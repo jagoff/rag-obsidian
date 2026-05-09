@@ -157,6 +157,38 @@ def test_minimal_managed_labels_subset_of_spec():
     assert len(minimal) == 5, f"Esperado 5 minimal labels, got {len(minimal)}"
 
 
+def test_deprecated_plist_functions_are_gone():
+    """Las 9 funciones deprecadas (serve + 7 ingesters consolidados) NO existen.
+
+    Si alguien las re-introduce sin re-introducir el daemon en
+    `_services_spec`, este test las detecta — re-creando solo la factory sin
+    el entry en el spec deja el plist huérfano (no se instala, pero los
+    tests verdes te hacen creer que sí). Los labels siguen en
+    `_DEPRECATED_LABELS` para que `rag setup` haga el bootout en disco.
+
+    Borradas en Fase 2a (2026-05-09):
+      - `_serve_plist`, `_serve_watchdog_plist` (rag serve replaced by FastAPI web)
+      - `_ingest_{gmail,calendar,reminders,calls,safari,drive,pillow}_plist`
+        (consolidadas en ingest-cross-source desde 2026-05-04)
+    """
+    from rag import plists
+    for name in [
+        "_serve_plist",
+        "_serve_watchdog_plist",
+        "_ingest_gmail_plist",
+        "_ingest_calendar_plist",
+        "_ingest_reminders_plist",
+        "_ingest_calls_plist",
+        "_ingest_safari_plist",
+        "_ingest_drive_plist",
+        "_ingest_pillow_plist",
+    ]:
+        assert not hasattr(plists, name), (
+            f"{name} fue removida en Fase 2a (2026-05-09) — si la "
+            f"necesitás de nuevo, agregala TAMBIÉN a _services_spec()."
+        )
+
+
 def test_setup_install_only_labels_filter(tmp_path, monkeypatch):
     """`_setup_install(only_labels=X)` instala solo labels en X y skipea el resto.
 

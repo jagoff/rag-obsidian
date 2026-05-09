@@ -24,7 +24,7 @@ from rag._constants import _GOOGLE_TOKEN_PATH
 
 __all__ = [
     "_LAUNCH_AGENTS_DIR", "_RAG_LOG_DIR", "_GOOGLE_TOKEN_PATH",
-    "_rag_binary", "_watch_plist", "_serve_plist", "_web_plist",
+    "_rag_binary", "_watch_plist", "_web_plist",
     "_digest_plist", "_morning_plist", "_today_plist", "_wa_fast_plist",
     "_emergent_plist", "_patterns_plist", "_archive_plist",
     "_distill_plist",
@@ -32,11 +32,9 @@ __all__ = [
     "_maintenance_plist", "_calibration_plist", "_auto_harvest_plist",
     "_active_learning_nudge_plist", "_online_tune_plist",
     "_implicit_feedback_plist", "_ingest_whatsapp_plist",
-    "_ingest_cross_source_plist", "_ingest_gmail_plist",
-    "_ingest_calendar_plist", "_ingest_reminders_plist",
-    "_ingest_calls_plist", "_ingest_safari_plist", "_ingest_drive_plist",
-    "_ingest_pillow_plist", "_mood_poll_plist", "_routing_rules_plist",
-    "_whisper_vocab_plist", "_wake_up_plist", "_serve_watchdog_plist",
+    "_ingest_cross_source_plist",
+    "_mood_poll_plist", "_routing_rules_plist",
+    "_whisper_vocab_plist", "_wake_up_plist",
     "_brief_auto_tune_plist", "_daemon_watchdog_plist", "_wake_hook_plist",
     "_services_spec", "_google_token_exists", "_calendar_creds_exist",
     "_mood_daemon_opted_in", "_DEPRECATED_LABELS", "_INSTALL_GATES",
@@ -146,7 +144,7 @@ def _render_plist(spec: dict) -> str:
 
     # EnvironmentVariables — HOME y PATH siempre primero, luego en orden
     # de inserción del caller. Caller puede overridear PATH pasándolo en `env`
-    # (raro, pero `_serve_watchdog_plist` lo hace).
+    # (raro; el `_serve_watchdog_plist` histórico lo hacía pre-borrado 2026-05-09).
     lines.append("  <key>EnvironmentVariables</key>\n")
     lines.append("  <dict>\n")
     lines.append(f"    <key>HOME</key><string>{Path.home()}</string>\n")
@@ -263,67 +261,6 @@ def _watch_plist(rag_bin: str) -> str:
             "RAG_INDEX_LOCAL_EMBED": "1",
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
-        },
-        "run_at_load": True,
-        "keep_alive": True,
-        "throttle_s": 30,
-        "stdout_path": out,
-        "stderr_path": err,
-    })
-
-
-def _serve_plist(rag_bin: str) -> str:
-    """[DEPRECATED 2026-05-01] Persistent `rag serve` HTTP query server on port 7832.
-
-    NO instalado por `rag setup` desde 2026-05-01 — ver doc-block en
-    `_services_spec` para el rationale completo (split-brain con
-    `com.fer.obsidian-rag-web` + crash-loop bajo memory pressure). La
-    función queda en el módulo para retrocompat de tests
-    (`test_plist_web_serve.py`, `test_setup_online_tune.py`) y para que
-    el user pueda re-instalar manualmente si tiene una razón fuerte.
-
-    This is the hot path for the WhatsApp listener (and any other bot
-    integration): it keeps the reranker, bge-m3 embedder, BM25 corpus, and
-    chat model warm in memory so each request skips the ~5-10s subprocess
-    cold-start that listener.ts's fallback pays per message.
-
-    Env vars mirror the web plist: RAG_RERANKER_NEVER_UNLOAD=1 (cross-encoder
-    stays resident, no 9s reload after idle eviction), RAG_LOCAL_EMBED=1
-    (in-process SentenceTransformer for query embedding, ~10-30ms vs ~140ms
-    via HTTP), RAG_STATE_SQL=1 (deployment symmetry — no-op post-T10),
-    HF_HUB_OFFLINE=1 + TRANSFORMERS_OFFLINE=1 (close the race where HEAD
-    probes to huggingface.co fire BEFORE rag.py's module-init setdefault —
-    see test_plist_web_serve.py for rationale; was causing 64× [local-embed]
-    unavailable in web.error.log pre-2026-04-22),
-    RAG_MEMORY_PRESSURE_INTERVAL=20 (the default 60s missed the MPS-OOM
-    window measured in web.error.log; 20s gives the watchdog 3 samples per
-    minute to catch memory pressure before Metal returns
-    `kIOGPUCommandBufferCallbackErrorOutOfMemory`).
-
-    Post-2026-05-06 (Ola 6 cero-Ollama): LLM_KEEP_ALIVE y
-    OLLAMA_MAX_LOADED_MODELS removidos — no hay daemon Ollama al que
-    keep-alivear (modelos chat purgados del disco).
-
-    KeepAlive + RunAtLoad mean launchd will resurrect it if it crashes or
-    the host reboots. ThrottleInterval=30 prevents crash loops from burning
-    CPU.
-    """
-    out, err = _logs("serve")
-    return _render_plist({
-        "label": "com.fer.obsidian-rag-serve",
-        "program_arguments": [rag_bin, "serve", "--port", "7832"],
-        "env": {
-            "NO_COLOR": "1",
-            "TERM": "dumb",
-            "PYTHONUNBUFFERED": "1",
-            "RAG_RERANKER_NEVER_UNLOAD": "1",
-            "RAG_LOCAL_EMBED": "1",
-            "RAG_STATE_SQL": "1",
-            "HF_HUB_OFFLINE": "1",
-            "TRANSFORMERS_OFFLINE": "1",
-            "FASTEMBED_CACHE_PATH": f"{Path.home()}/.cache/fastembed",
-            "RAG_MEMORY_PRESSURE_INTERVAL": "20",
-            "RAG_LLM_BACKEND": "mlx",
         },
         "run_at_load": True,
         "keep_alive": True,
@@ -1093,220 +1030,6 @@ def _ingest_cross_source_plist(rag_bin: str) -> str:
     })
 
 
-def _ingest_gmail_plist(rag_bin: str) -> str:
-    """Cross-source: Gmail ingester, cada 1h.
-
-    Incremental via `historyId` cursor almacenado en `rag_gmail_state`. Llama
-    a la API de Google Gmail así que respeta rate limits (default quota
-    suficiente para 1 run/h en corpus típico ~50k emails). Cold run (bootstrap
-    365d retention) puede tardar minutos; subsecuent runs son típicamente
-    <30s con cero emails nuevos.
-
-    Interval 3600s (1h) es conservative — Gmail API es cloud-hosted
-    (user override §10.6 rompe local-first pero el tradeoff está documentado)
-    y cada HTTP call cuesta quota. Si querés ingest más frecuente, bajar el
-    interval manual y monitorear `rag log` para ver si golpeaste quota.
-    """
-    out, err = _logs("ingest-gmail")
-    return _render_plist({
-        "label": "com.fer.obsidian-rag-ingest-gmail",
-        "program_arguments": [rag_bin, "index", "--source", "gmail"],
-        "env": {
-            "NO_COLOR": "1",
-            "TERM": "dumb",
-            "RAG_INDEX_LOCAL_EMBED": "1",
-            "HF_HUB_OFFLINE": "1",
-            "TRANSFORMERS_OFFLINE": "1",
-        },
-        "schedule": {"interval_s": 3600},
-        "run_at_load": True,
-        "stdout_path": out,
-        "stderr_path": err,
-    })
-
-
-def _ingest_calendar_plist(rag_bin: str) -> str:
-    """Cross-source: Google Calendar ingester, cada 1h.
-
-    Incremental via `syncToken` cursor por calendar en `rag_calendar_state`.
-    Google Calendar API (cloud-hosted — user override §10.6 rompe local-first).
-    Bootstrap pulls 2y history + 180d future (§2.6 del design doc), subsequent
-    runs son típicamente <10s (singleEvents=True expand RRULEs per instance, pero
-    el delta típico es chico).
-
-    Interval 3600s (1h) alineado con Gmail — ambos son Google OAuth cloud y
-    los eventos de Calendar no cambian tan frecuentemente que valga la pena
-    bajarlo. Requiere `~/.calendar-mcp/gcp-oauth.keys.json` + `credentials.json`
-    (correr el OAuth flow manual antes del primer run); sin esos archivos el
-    ingester silent-drops (loader retorna None).
-    """
-    out, err = _logs("ingest-calendar")
-    return _render_plist({
-        "label": "com.fer.obsidian-rag-ingest-calendar",
-        "program_arguments": [rag_bin, "index", "--source", "calendar"],
-        "env": {
-            "NO_COLOR": "1",
-            "TERM": "dumb",
-            "RAG_INDEX_LOCAL_EMBED": "1",
-            "HF_HUB_OFFLINE": "1",
-            "TRANSFORMERS_OFFLINE": "1",
-        },
-        "schedule": {"interval_s": 3600},
-        "run_at_load": True,
-        "stdout_path": out,
-        "stderr_path": err,
-    })
-
-
-def _ingest_reminders_plist(rag_bin: str) -> str:
-    """Cross-source: Apple Reminders ingester, cada 1h.
-
-    AppleScript full-scan (~7-100s dependiendo de cuántos reminders). Incremental
-    via content-hash diff post-fetch — solo re-embedea los cambiados. En steady
-    state con 0 cambios el run termina en ~7s (solo el scan sin embedding).
-
-    Interval bajado de 6h → 1h (2026-04-22): empíricamente "37 fetched · 0
-    indexados · 0 borrados · 7s" — el costo es negligible y reminders es la
-    fuente MÁS dinámica en el día a día del usuario (marcar como done, crear
-    nuevos). Alineado con gmail/calendar (1h) así las queries tipo "qué tengo
-    esta semana" + "qué reminders pendientes" devuelven data fresh.
-
-    `RunAtLoad=true`: corre inmediatamente al instalar / post-reboot, no hay
-    que esperar 1h para ver el primer refresh.
-
-    Local-only (EventKit via osascript); no OAuth quota. Si el AppleScript
-    falla (Full Disk Access denegado, Reminders.app not running), el
-    ingester silent-drops y la próxima corrida lo reintenta.
-    """
-    out, err = _logs("ingest-reminders")
-    return _render_plist({
-        "label": "com.fer.obsidian-rag-ingest-reminders",
-        "program_arguments": [rag_bin, "index", "--source", "reminders"],
-        "env": {
-            "NO_COLOR": "1",
-            "TERM": "dumb",
-            "RAG_INDEX_LOCAL_EMBED": "1",
-            "HF_HUB_OFFLINE": "1",
-            "TRANSFORMERS_OFFLINE": "1",
-        },
-        "schedule": {"interval_s": 3600},
-        "run_at_load": True,
-        "stdout_path": out,
-        "stderr_path": err,
-    })
-
-
-def _ingest_calls_plist(rag_bin: str) -> str:
-    """Ingester de Apple Calls — cada 6 horas, mantine la tabla rag_calls
-    actualizada con llamadas perdidas/entrantes/salientes del CallHistory."""
-    out, err = _logs("ingest-calls")
-    return _render_plist({
-        "label": "com.fer.obsidian-rag-ingest-calls",
-        "program_arguments": [rag_bin, "index", "--source", "calls"],
-        "env": {
-            "NO_COLOR": "1",
-            "TERM": "dumb",
-            "RAG_INDEX_LOCAL_EMBED": "1",
-            "HF_HUB_OFFLINE": "1",
-            "TRANSFORMERS_OFFLINE": "1",
-        },
-        "schedule": {
-            "calendar_list": [
-                {"Hour": 0, "Minute": 0},
-                {"Hour": 6, "Minute": 0},
-                {"Hour": 12, "Minute": 0},
-                {"Hour": 18, "Minute": 0},
-            ],
-        },
-        "stdout_path": out,
-        "stderr_path": err,
-    })
-
-
-def _ingest_safari_plist(rag_bin: str) -> str:
-    """Ingester de Safari — cada 6 horas, mantine la tabla rag_safari
-    actualizada con history + bookmarks."""
-    out, err = _logs("ingest-safari")
-    return _render_plist({
-        "label": "com.fer.obsidian-rag-ingest-safari",
-        "program_arguments": [rag_bin, "index", "--source", "safari"],
-        "env": {
-            "NO_COLOR": "1",
-            "TERM": "dumb",
-            "RAG_INDEX_LOCAL_EMBED": "1",
-            "HF_HUB_OFFLINE": "1",
-            "TRANSFORMERS_OFFLINE": "1",
-        },
-        "schedule": {
-            "calendar_list": [
-                {"Hour": 0, "Minute": 15},
-                {"Hour": 6, "Minute": 15},
-                {"Hour": 12, "Minute": 15},
-                {"Hour": 18, "Minute": 15},
-            ],
-        },
-        "stdout_path": out,
-        "stderr_path": err,
-    })
-
-
-def _ingest_drive_plist(rag_bin: str) -> str:
-    """Ingester de Google Drive — cada 6 horas, mantine la tabla rag_drive
-    actualizada con DAO + documentos compartidos."""
-    out, err = _logs("ingest-drive")
-    return _render_plist({
-        "label": "com.fer.obsidian-rag-ingest-drive",
-        "program_arguments": [rag_bin, "index", "--source", "drive"],
-        "env": {
-            "NO_COLOR": "1",
-            "TERM": "dumb",
-            "RAG_INDEX_LOCAL_EMBED": "1",
-            "HF_HUB_OFFLINE": "1",
-            "TRANSFORMERS_OFFLINE": "1",
-        },
-        "schedule": {
-            "calendar_list": [
-                {"Hour": 1, "Minute": 0},
-                {"Hour": 7, "Minute": 0},
-                {"Hour": 13, "Minute": 0},
-                {"Hour": 19, "Minute": 0},
-            ],
-        },
-        "stdout_path": out,
-        "stderr_path": err,
-    })
-
-
-def _ingest_pillow_plist(rag_bin: str) -> str:
-    """Ingester de Pillow (iOS sleep tracker) — corre 1×/día a las 09:30
-    (post wake-up típico) para cargar la noche anterior. El export vive en
-    `~/Library/Mobile Documents/com~apple~CloudDocs/Sueño/PillowData.txt`,
-    sincronizado por Pillow Pro vía iCloud Drive. Silent-fail si el archivo
-    no existe.
-
-    Schedule único en lugar de cada-N-horas porque el archivo solo cambia
-    1×/día post wake-up; correr más veces sería desperdicio de wake en el
-    Mac. Si el sync de iCloud demora, el run del día siguiente lo recoge."""
-    out, err = _logs("ingest-pillow")
-    return _render_plist({
-        "label": "com.fer.obsidian-rag-ingest-pillow",
-        "program_arguments": [rag_bin, "index", "--source", "pillow"],
-        "env": {
-            "NO_COLOR": "1",
-            "TERM": "dumb",
-            "RAG_INDEX_LOCAL_EMBED": "1",
-            "HF_HUB_OFFLINE": "1",
-            "TRANSFORMERS_OFFLINE": "1",
-        },
-        "schedule": {
-            "calendar": {"Hour": 9, "Minute": 30},
-        },
-        "run_at_load": True,
-        "stdout_path": out,
-        "stderr_path": err,
-    })
-
-
 def _mood_poll_plist(rag_bin: str) -> str:
     """Mood signal poller — corre `scripts/mood_poll.py` cada 30 min para
     juntar señales de Spotify + journal + WA outbound + queries +
@@ -1484,50 +1207,6 @@ def _wake_up_plist(rag_bin: str) -> str:
     })
 
 
-def _serve_watchdog_plist(rag_bin: str) -> str:  # noqa: ARG001 (rag_bin no usado)
-    """[DEPRECATED 2026-05-01] Watchdog del `rag serve` (port 7832).
-
-    NO instalado por `rag setup` desde 2026-05-01 — ver doc-block en
-    `_services_spec` para el rationale (deprecación de `rag serve`).
-    La función queda para retrocompat; el script `rag-serve-watchdog.sh`
-    sigue en el repo por la misma razón.
-
-    Watchdog del web server — corre cada 60s, healthcheck HTTP +
-    catchup de plists nightly que se saltearon su window por Mac dormida.
-
-    Originalmente vivía en `scripts/com.fer.obsidian-rag-serve-watchdog.plist`
-    con paths hardcoded al repo (`~/repositories/obsidian-rag/scripts/...`).
-    Migrado a generación dinámica el 2026-04-27 (después del audit
-    subagent 2297bb6e que detectó el riesgo: si Fer mueve el repo, el
-    plist viejo apunta a un path que ya no existe).
-
-    El script bash `rag-serve-watchdog.sh` queda en el repo (es lógica
-    no-Python que se mantiene mejor como bash standalone). El plist
-    apunta a su path absoluto vía `Path(__file__).resolve().parent.parent
-    / "scripts" / "rag-serve-watchdog.sh"` — si el repo se mueve, el
-    siguiente `rag setup` regenera el plist con el path nuevo.
-
-    Schedule: `StartInterval=60` + `RunAtLoad=true` (corre al boot).
-    Lo de catchup de nightly plists se documenta dentro del script.
-    """
-    repo_root = Path(__file__).resolve().parent.parent
-    watchdog_script = repo_root / "scripts" / "rag-serve-watchdog.sh"
-    # serve-watchdog usa stdout.log/stderr.log (no .log/.error.log).
-    return _render_plist({
-        "label": "com.fer.obsidian-rag-serve-watchdog",
-        "program_arguments": ["/bin/bash", str(watchdog_script)],
-        "env": {
-            # Override del PATH default — este watchdog NO necesita
-            # ~/.local/bin (preservado del original).
-            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
-        },
-        "schedule": {"interval_s": 60},
-        "run_at_load": True,
-        "stdout_path": f"{_RAG_LOG_DIR}/serve-watchdog.stdout.log",
-        "stderr_path": f"{_RAG_LOG_DIR}/serve-watchdog.stderr.log",
-    })
-
-
 def _brief_auto_tune_plist(rag_bin: str) -> str:
     """Sunday 03:00 weekly auto-tune of brief schedules (2026-04-29).
 
@@ -1695,34 +1374,15 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
     return [
         ("com.fer.obsidian-rag-watch", "com.fer.obsidian-rag-watch.plist",
          _watch_plist(rag_bin)),
-        # ── DEPRECATED 2026-05-01: `com.fer.obsidian-rag-serve` removido ─────
-        # Histórico: `rag serve --port 7832` corría un BaseHTTPServer simple
-        # como hot-path para el WhatsApp listener. Coexistía con
-        # `com.fer.obsidian-rag-web` (FastAPI port 8765) — los dos plists
-        # peleaban por VRAM (cada uno carga qwen2.5:7b chat + qwen2.5:3b
-        # lookup + bge-m3 embedder + bge-reranker-v2-m3) bajo memory
-        # pressure. Resultado observado el 2026-05-01: el `rag serve` se
-        # colgaba en el `embed(["warmup"])` con `httpx.RemoteProtocolError`
-        # mientras el FastAPI consumía el slot de ollama, crash-loopeaba via
-        # `KeepAlive=true`, y degradaba al `BaseHTTPServer` que sólo
-        # responde `/health` (404 a `/api/*`).
-        #
-        # Decisión: el FastAPI (`com.fer.obsidian-rag-web`) cubre todos los
-        # endpoints reales (chat web + frontend + cloudflare tunnel). El
-        # WhatsApp listener tiene fallback a subprocess (`rag query`,
-        # ~5-10s cold start por mensaje) cuando :7832 no responde — flow
-        # confirmado en `whatsapp-listener/listener.ts:1652` ("Server down
-        # — fall through to subprocess"). El cost extra es aceptable
-        # mientras eliminamos el split-brain de servers + el loop crash.
-        #
-        # Re-activación: si en el futuro hay razón fuerte para tener un
-        # endpoint sync JSON dedicado (ej. otro bot con SLA <2s/query), la
-        # opción más limpia es agregar un `POST /api/query` al FastAPI con
-        # el mismo wire-format que el legacy `/query` del rag serve, y
-        # apuntar el listener a `:8765` con `RAG_SERVE_URL=http://127.0.0.1:8765`.
-        # Mientras tanto, `_serve_plist` + `_serve_watchdog_plist` siguen
-        # como funciones (los tests `test_plist_web_serve.py` validan su
-        # shape) pero NO se instalan por `rag setup`.
+        # Nota histórica (2026-05-01): `com.fer.obsidian-rag-serve` +
+        # `com.fer.obsidian-rag-serve-watchdog` fueron deprecados — split-brain
+        # con FastAPI web + crash-loop bajo memory pressure. FastAPI cubre todos
+        # los endpoints reales; WA listener cae a subprocess `rag query` cuando
+        # :7832 no responde. Las factories `_serve_plist` + `_serve_watchdog_plist`
+        # se borraron en Fase 2a (2026-05-09); los labels siguen en
+        # `_DEPRECATED_LABELS` para que `rag setup` los bootouts en disco.
+        # Re-activación: agregar `POST /api/query` al FastAPI y apuntar el
+        # listener a :8765 (no resucitar el plist viejo).
         # ────────────────────────────────────────────────────────────────────
         # Web UI daemon — previously installed manually outside `rag setup`
         # (Apr 2026), which left HF_HUB_OFFLINE + RAG_MEMORY_PRESSURE_INTERVAL
@@ -1831,13 +1491,6 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
         ("com.fer.obsidian-rag-spotify-poll",
          "com.fer.obsidian-rag-spotify-poll.plist",
          _spotify_poll_plist(rag_bin)),
-        # ── DEPRECATED 2026-05-01: `com.fer.obsidian-rag-serve-watchdog` ──
-        # Servía para healthcheck del `rag serve` (port 7832), removido
-        # cuando bajamos `com.fer.obsidian-rag-serve`. Ver doc-block
-        # extenso arriba donde se quita el entry de `serve` para el
-        # rationale completo. Si re-activás el `serve`, también re-agregá
-        # este watchdog.
-        # ────────────────────────────────────────────────────────────────
         # Brief schedule auto-tune (2026-04-29) — Sunday 03:00 reads
         # rag_brief_feedback last 30d, decides whether to shift any of
         # morning/today/digest plists' StartCalendarInterval forward

@@ -140,13 +140,14 @@ def test_apple_splash_files_exist():
 
 
 def test_all_three_html_pages_reference_manifest():
-    """home.html, index.html (chat) y dashboard.html DEBEN linkear el
-    manifest, apple-touch-icon, y el register-sw script. Si alguien
-    edita uno de los HTML y se olvida, queda con PWA parcial."""
+    """home.html, index.html (chat), dashboard.html y status.html DEBEN
+    linkear el manifest, apple-touch-icon, register-sw.js y los 10 splash
+    screens. Si alguien edita un HTML y se olvida, la PWA queda parcial."""
     pages = {
         "/": "home.html",
         "/chat": "index.html",
         "/dashboard": "dashboard.html",
+        "/status": "status.html",
     }
     for route, _ in pages.items():
         resp = _client.get(route)
@@ -160,7 +161,8 @@ def test_all_three_html_pages_reference_manifest():
         assert "apple-mobile-web-app-capable" in html, (
             f"{route}: missing iOS standalone meta"
         )
-        # Contamos los 10 splash screens.
+        # Contamos los 10 splash screens en los 4 shells (M-1 fix: status.html
+        # previamente los omitía → apertura sin splash desde home screen).
         splash_count = html.count("apple-touch-startup-image")
         assert splash_count >= 10, (
             f"{route}: only {splash_count}/10 splash screens"

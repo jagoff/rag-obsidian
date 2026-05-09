@@ -1,0 +1,204 @@
+/* ── Mobile layout ─────────────────────────────────────────────────── */
+
+@media (max-width: 767px) {
+  /* Sidebar off-screen por default; desliza con data-state="open". */
+  #sidebar {
+    width: min(86vw, 320px);
+    transform: translateX(-100%);
+    border-right: 1px solid var(--sidebar-border);
+    box-shadow: none;
+  }
+  #sidebar[data-state="open"] {
+    transform: translateX(0);
+    box-shadow: var(--shadow-lg);
+  }
+  /* El "collapsed" no aplica en mobile — no hay sidebar visible al
+     mismo tiempo que el chat. Forzamos expanded layout visualmente. */
+  #sidebar[data-state="collapsed"] { width: min(86vw, 320px); }
+  #sidebar[data-state="collapsed"] .sidebar-brand-full { display: inline; }
+  #sidebar[data-state="collapsed"] .sidebar-brand-mini { display: none; }
+  #sidebar[data-state="collapsed"] .sidebar-search { display: flex; }
+  #sidebar[data-state="collapsed"] .sidebar-footer-controls { display: flex; }
+  #sidebar[data-state="collapsed"] .sidebar-footer-actions {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  #sidebar[data-state="collapsed"] .icon-btn {
+    justify-content: flex-start;
+    padding: 8px 10px;
+    gap: 8px;
+  }
+  #sidebar[data-state="collapsed"] .icon-btn-label { display: inline; }
+  #sidebar[data-state="collapsed"] .sidebar-btn-label { display: inline; }
+  #sidebar[data-state="collapsed"] .sidebar-new-btn {
+    justify-content: flex-start;
+    padding: 10px 12px;
+  }
+  #sidebar[data-state="collapsed"] .session-item {
+    padding: 8px 10px;
+    text-align: left;
+    font-size: 13px;
+  }
+  #sidebar[data-state="collapsed"] .session-item .session-meta {
+    display: block;
+  }
+  #sidebar[data-state="collapsed"] .session-item .session-title {
+    max-width: none;
+  }
+  #sidebar[data-state="collapsed"] .sidebar-section-label {
+    justify-content: space-between;
+  }
+  #sidebar[data-state="collapsed"] .sidebar-section-label > span {
+    display: inline;
+  }
+
+  /* Backdrop sibling del sidebar — se activa cuando la sidebar está
+     abierta en mobile. Click en el backdrop cierra (data-sidebar-close). */
+  #sidebar[data-state="open"] ~ #sidebar-backdrop {
+    display: block;
+  }
+
+  /* Override del bloque legacy `@media (max-width: 640px)` que escondía
+     #tts-toggle, #vault-picker, #chat-mode-toggle cuando vivían en el
+     topbar. Ahora viven en la sidebar — queremos que sigan visibles
+     dentro de ella en mobile. */
+  #sidebar #tts-toggle { display: inline-flex; }
+  #sidebar #vault-picker,
+  #sidebar #chat-mode-toggle,
+  #sidebar #vault-picker-label,
+  #sidebar #chat-mode-label { display: revert; }
+  #sidebar #vault-picker {
+    /* `revert` devuelve a `display: inline-block` (select default). La
+       sidebar-footer-row lo quiere como flex item full-width. */
+    display: block;
+    width: 100%;
+  }
+  #sidebar #chat-mode-toggle { display: flex; width: 100%; }
+
+  /* Collapse button → hide in mobile (no makes sense when drawer).
+     Close button (X) takes over. Specificity con #sidebar prefix para
+     vencer al `.icon-btn` genérico. */
+  #sidebar .sidebar-collapse-btn { display: none; }
+  #sidebar .sidebar-close-btn { display: inline-flex; }
+
+  /* #chat bajo la sidebar: respeta el mobile-header fijo arriba. */
+  #chat {
+    padding-top: calc(58px + env(safe-area-inset-top, 0px));
+  }
+}
+
+/* Reduced-motion: no animation, corte seco. */
+@media (prefers-reduced-motion: reduce) {
+  #sidebar,
+  #chat {
+    transition: none;
+  }
+  #sidebar .sidebar-backdrop { animation: none; }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * Empty state (2026-04-24) — claude.ai landing pattern
+ * ═══════════════════════════════════════════════════════════════════════
+ * Cuando #messages no tiene .line (ningún turn real, sólo eventual meta),
+ * el JS agrega `.chat-empty` al body via MutationObserver. En ese estado:
+ *   · #empty-hero se muestra centrado verticalmente con greeting + hint.
+ *   · #composer sale de `position: fixed` y pasa a ser flex-item del
+ *     #chat — queda debajo del hero, ambos centrados en el viewport.
+ *   · #input min-height sube de 48 → 96px (~4 rows) para que el user
+ *     sienta el hero como "voy a escribir algo importante acá".
+ *   · Cuando el primer turn arriba (hidratación de sesión o submit), la
+ *     clase se remueve → composer vuelve al bottom fijo + hero oculto.
+ * ═══════════════════════════════════════════════════════════════════════*/
+
+#empty-hero {
+  display: none;   /* Default: sólo aparece en empty state */
+  text-align: center;
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 0 16px 32px;
+}
+.empty-hero-title {
+  margin: 0 0 12px;
+  font-size: clamp(22px, 3.4vw, 30px);
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+}
+.empty-hero-sub {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 13px;
+  letter-spacing: 0.01em;
+  line-height: 1.5;
+}
+.empty-hero-sub kbd {
+  font-family: inherit;
+  font-size: 11px;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-dim);
+  background: var(--bg-elev);
+  margin: 0 1px;
+  vertical-align: baseline;
+  line-height: 1.4;
+}
+
+body.chat-empty #empty-hero {
+  display: block;
+}
+
+/* Cuando empty: #chat centra verticalmente con flex (ya es flex-column
+   con min-height:100vh). Sacamos el padding-bottom de 180px porque el
+   composer ya no está fijo al bottom, entonces no hace falta reservarlo. */
+body.chat-empty #chat {
+  justify-content: center;
+  padding-top: 0;
+  padding-bottom: 40px;
+}
+
+/* Desactiva el position:fixed del composer en empty state — pasa a ser
+   flex-item dentro del #chat. El background gradient tampoco tiene
+   sentido (no hay mensajes detrás que se fundan). Auto-center con margin. */
+body.chat-empty #composer {
+  position: static;
+  background: transparent;
+  padding: 0;
+  width: 100%;
+  max-width: 760px;
+  margin: 0 auto;
+  transition: none;
+}
+body.chat-empty #composer-inner {
+  max-width: 100%;
+}
+
+/* Más espacio de escritura en empty state — ~4 rows visibles de default.
+   El autoGrow del JS respeta esto: si scrollHeight es menor al
+   min-height, la CSS gana. */
+body.chat-empty #input {
+  min-height: 96px;
+}
+
+/* En empty state también agrandamos el padding del card para el
+   "hero vibe" — más aire alrededor del texto. */
+body.chat-empty #input-wrap {
+  padding: 18px 20px 14px 20px;
+}
+
+/* Mobile empty-state: compactar el hero para que no le gane al composer.
+   Mobile ya no centra verticalmente tan agresivo porque el viewport es
+   corto; preferimos el composer visible primero y el hero un poco arriba. */
+@media (max-width: 767px) {
+  body.chat-empty #chat {
+    justify-content: flex-start;
+    padding-top: calc(78px + env(safe-area-inset-top, 0px));
+  }
+  body.chat-empty #empty-hero {
+    padding: 24px 16px 24px;
+  }
+  body.chat-empty #input {
+    min-height: 72px;
+  }
+}

@@ -1,0 +1,248 @@
+/* ── Toast notifications ────────────────────────────────────────────────
+ * Fixed top-right stack. Used to confirm successful Calendar / Reminders
+ * creation prominently (more visible than the inline chip on the card,
+ * which scrolls out of view once the chat continues).
+ */
+.toast-container {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 9999;
+  pointer-events: none;
+}
+.toast {
+  background: var(--bg-card);
+  color: var(--text);
+  padding: 10px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--border-strong);
+  font-size: 13px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+  pointer-events: auto;
+  min-width: 200px;
+  max-width: 360px;
+  opacity: 0;
+  transform: translateX(12px);
+  transition: opacity var(--dur-base) var(--ease-out),
+              transform var(--dur-base) var(--ease-out);
+}
+.toast-visible {
+  opacity: 1;
+  transform: translateX(0);
+}
+.toast-ok {
+  border-left: 3px solid var(--green);
+}
+.toast-err {
+  border-left: 3px solid var(--red);
+}
+.toast-info {
+  border-left: 3px solid var(--cyan);
+}
+.toast-msg {
+  flex: 1;
+  display: inline-block;
+}
+.toast {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.toast-action {
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  color: var(--cyan);
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: background var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out);
+  flex-shrink: 0;
+}
+.toast-action:hover:not(:disabled) {
+  background: rgba(121, 192, 255, 0.1);
+  border-color: var(--cyan-dim);
+}
+.toast-action:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+@media (prefers-reduced-motion: reduce) {
+  .toast {
+    transition: opacity 0.01ms;
+    transform: none;
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   FLAT LOOK — libre de bordes + separadores
+   Override al final de la cascada: setea --border / --border-strong a
+   transparent para que los 46 selectores que los usan como border-color
+   queden chatos. Los indicators de estado (proposal-status, created-chip,
+   feedback-up/down) usan colores de acento (--green/--red/--cyan), así
+   que NO se ven afectados — mantienen su función semántica.
+
+   Restauraciones puntuales para los ~5 sitios que usan las vars como
+   NO-border (scrollbar, dot separator entre tool-chips, hover de botones).
+   ══════════════════════════════════════════════════════════════════════ */
+:root {
+  --border: transparent;
+  --border-strong: transparent;
+}
+
+/* Scrollbar — mantener visible con un gris tenue. */
+* { scrollbar-color: var(--text-faint) transparent; }
+*::-webkit-scrollbar-thumb { background: var(--text-faint); }
+*::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
+
+/* Separador "·" entre tool-chips — restaurar color tenue. */
+.tool-chip + .tool-chip::before { color: var(--text-faint); }
+
+/* Proposal button hover — feedback visual en hover. */
+.proposal-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   NO-BOLD — todas las fuentes en peso regular (400)
+   Override al final de la cascada: neutraliza los font-weight: 500/600/700
+   del archivo + los browser defaults (strong, b, h1-h6, th). El input,
+   topbar, prompts, headers markdown, tablas, kbd, slash-menu, proposal
+   cards, help modal — todo queda en regular. Borrar este bloque para
+   volver a la jerarquía tipográfica por pesos.
+   ══════════════════════════════════════════════════════════════════════ */
+.topbar-title,
+.prompt,
+.topbar-link,
+#help-btn,
+.slash-item .slash-cmd,
+kbd,
+.proposal-title,
+.modal-head h2,
+.modal-card section h3,
+.text.rag h1,
+.text.rag h2,
+.text.rag h3,
+.text.rag h4,
+.text.rag h5,
+.text.rag h6,
+.text.rag th,
+.text.rag strong,
+.text.rag b,
+/* browser defaults fuera de .text.rag --------------------------- */
+h1, h2, h3, h4, h5, h6,
+strong, b, th {
+  font-weight: 400;
+}
+
+
+/* ═════════════════════════════════════════════════════════════════════════
+ * Mobile / iPhone adaptación — 2026-04-22
+ *
+ * Mantiene la estética mac-term existente (SF Mono, bg `#1a1a1f`, cyan/
+ * green accents, prompt `tu ›`). Cambios mobile-específicos:
+ *
+ *   - Topbar compacta: sólo logo + help button. Vault/modelo/voz/links
+ *     secundarios se ocultan — el usuario promedio de mobile abre el
+ *     chat, pregunta, sale; no necesita cambiar vault ni toggle voz.
+ *   - Composer sticky al bottom con safe-area-inset-bottom para iPhone
+ *     con home indicator / Dynamic Island.
+ *   - `#input` font-size a 16px: Safari iOS hace auto-zoom en inputs
+ *     de <16px — rompe el layout y molesta al usuario. 16px lo evita.
+ *   - Messages ocupan todo el viewport-width (menos un micro gutter).
+ *   - Touch targets ≥ 44×44 px (Apple HIG mínimo accesible).
+ *   - Prompts `tu ›` y `rag ›` quedan IDÉNTICOS a desktop — la identidad
+ *     visual del chat se conserva entre devices.
+ *
+ * Breakpoints:
+ *   - 640px: tablet / phone landscape. Topbar se compacta.
+ *   - 480px: phone portrait puro. Input a 16px, bubbles full-width,
+ *     safe-area activo.
+ *
+ * Backend (rag._classify_device + device en rag_queries.extra_json) ya
+ * sabe quién está preguntando; este CSS adapta el render.
+ * ═══════════════════════════════════════════════════════════════════════*/
+
+@media (max-width: 640px) {
+  /* Topbar: esconder controles secundarios. Logo + help siguen visibles.
+     Mismo patrón de safe-area-inset-top que el breakpoint desktop —
+     bajo PWA standalone en iPhone el topbar sube al área del notch y
+     queda el logo tapado si no compensamos. */
+  #topbar {
+    padding: calc(10px + env(safe-area-inset-top, 0px)) 12px 8px;
+  }
+  .topbar-inner {
+    gap: 8px;
+    padding-bottom: 8px;
+  }
+  /* Hide secondary controls: voz toggle, vault picker, modelo picker,
+     link a home + dashboard. El help button se mantiene para que el
+     user pueda descubrir atajos aun en mobile. */
+  #tts-toggle,
+  #vault-picker-label,
+  #vault-picker,
+  #chat-mode-label,
+  #chat-mode-toggle,
+  .topbar-link {
+    display: none;
+  }
+  /* Chat area: usa todo el ancho, sin max-width desktop. */
+  #chat {
+    padding: 60px 0 0;
+  }
+  #messages {
+    max-width: 100vw;
+    padding: 0 12px;
+  }
+  /* Composer sticky al bottom, con safe-area para iPhone. */
+  #composer {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    padding: 8px 12px calc(8px + env(safe-area-inset-bottom, 0px));
+    background: linear-gradient(0deg, var(--bg) 80%, transparent 100%);
+    z-index: 9;
+    margin: 0;
+  }
+  #composer-inner {
+    max-width: 100%;
+  }
+  /* Deja espacio al bottom para que el último message no quede detrás del
+     composer fixed. 120px cubre composer alto (~70px) + safe-area. */
+  #messages {
+    padding-bottom: 120px;
+  }
+
+  /* ── Mobile composer tweaks ──────────────────────────────────────
+     Botones a 40×40 (mínimo HIG iOS razonable para un circle dentro
+     de un card card). La kbd-hint se esconde — en iPhone no hay
+     teclado físico, mostrar "Enter · Shift+Enter" sólo ocupa espacio. */
+  .send-btn,
+  .stop-btn {
+    width: 40px;
+    height: 40px;
+  }
+  .composer-hint {
+    display: none;
+  }
+  #help-btn {
+    min-width: 44px;
+    min-height: 44px;
+    padding: 0 10px;
+  }
+  /* Input crece hasta max 30vh — evita que textos largos empujen el
+     chat fuera de la pantalla cuando el keyboard está abierto. */
+  #input {
+    max-height: 30vh;
+  }
+}
+
+/* En desktop el menu-btn no tiene sentido — todos los controles que
+   exponelo ya están visibles en el topbar. Se oculta siempre en >640px. */
+.topbar-btn-mobile { display: none; }

@@ -1,0 +1,266 @@
+:root {
+  --bg: #15151a;
+  --bg-elev: #1d1d23;
+  --bg-card: #212127;
+  --border: #33333a;
+  --border-strong: #3e3e46;
+  --text: #ececed;
+  --text-dim: #8a8a90;
+  --text-faint: #6a6a70;
+  --green: #7ee787;
+  --cyan: #79c0ff;
+  --cyan-dim: #3b7aa1;
+  --yellow: #e3c27a;
+  --red: #ff7b72;
+  --purple: #d2a8ff;
+  --accent: var(--cyan);
+  --accent-dim: #475569;
+
+  /* Motion tokens — unificados para que todas las transitions compartan
+     timing y curves. ease-out en enter (snappy landing), ease-in en exit. */
+  --dur-fast: 120ms;
+  --dur-base: 180ms;
+  --dur-slow: 260ms;
+  --ease-out: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --ease-in:  cubic-bezier(0.55, 0.06, 0.68, 0.19);
+  --ease-inout: cubic-bezier(0.65, 0, 0.35, 1);
+
+  /* Spacing rhythm — escala 4/6/10/16/22 usada en gaps y padding. */
+  --space-1: 4px;
+  --space-2: 6px;
+  --space-3: 10px;
+  --space-4: 16px;
+  --space-5: 22px;
+
+  /* Elevation — sombras sutiles para composer y modal. */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 10px 40px rgba(0, 0, 0, 0.5);
+
+  /* Focus ring — cyan glow de 2px, visible sin ser chillón. */
+  --focus-ring: 0 0 0 2px color-mix(in srgb, var(--cyan) 55%, transparent);
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  /* Defensa en profundidad: cualquier child que se overflow horizontal
+     se clipea acá en lugar de hacer al body más ancho que el viewport,
+     lo que rompería `position: fixed` (ej. modal de /help, sidebar
+     drawer). Bug histórico: #quick-chips con max-width hard-coded
+     forzaba body a 760px en mobile y el modal renderaba off-screen. */
+  overflow-x: hidden;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "SF Mono", "Menlo", "Monaco", "JetBrains Mono", ui-monospace, monospace;
+  font-size: 14px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  /* iOS standalone PWA polish — todo opt-in para native-feel sin romper
+     la web en browser normal:
+       · text-size-adjust: iOS reescala el texto en landscape por default
+         (presume que la web "no está pensada para mobile" y bumpea fonts
+         unilateralmente). 100% lo desactiva — ya somos responsive.
+       · tap-highlight-color: el flash gris al tapear links/buttons no
+         existe en apps nativas; transparent lo mata.
+       · -webkit-touch-callout: none evita el menú contextual "Copiar /
+         Compartir" al long-press en elementos UI (sigue andando dentro
+         de textarea/input/output via overrides más abajo). */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Pull-to-refresh/bounce off en el container raíz — en una PWA standalone
+   el bounce de WebKit delata que "es una webview"; native apps suelen
+   anclar el scroll al contenido. El `contain` también previene que el
+   gesto propague scroll al parent (iOS rebota todo el body si no). */
+html {
+  overscroll-behavior-y: none;
+}
+
+/* Text selection: permitida en mensajes del chat y en inputs; deshabilitada
+   en chrome (topbar, botones, tabs) para que los long-press no abran el
+   menú de selección por accidente al scrollear. El `#messages` override
+   devuelve select al contenido útil. */
+body {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+#messages, #messages *, textarea, input, .md-output, .md-output *,
+.message, .message *, .answer, .answer *, pre, code, kbd {
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
+}
+
+#topbar {
+  position: fixed;
+  top: 0;
+  right: 0;
+  left: 0;
+  /* padding-top suma safe-area-inset-top para dejar el notch / Dynamic
+     Island libres cuando se corre en PWA standalone (sin safari chrome).
+     En browser normal safe-area-inset-top = 0 → no afecta. El
+     `env(..., 0)` fallback protege contra browsers viejos. */
+  padding: calc(16px + env(safe-area-inset-top, 0px)) 20px 10px;
+  background: linear-gradient(180deg, var(--bg) 70%, transparent 100%);
+  z-index: 10;
+  font-size: 12px;
+}
+
+.topbar-inner {
+  max-width: 1400px;
+  margin: 0 auto;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.topbar-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--cyan);
+  letter-spacing: 0.01em;
+  transition: opacity 140ms ease-out;
+}
+.topbar-title[role="button"]:hover { opacity: 0.7; }
+.topbar-title[role="button"]:focus-visible {
+  outline: 1px solid var(--cyan);
+  outline-offset: 3px;
+  border-radius: 2px;
+}
+.topbar-title span {
+  color: var(--text-faint);
+  font-weight: 400;
+}
+
+.topbar-meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.topbar-link {
+  color: var(--cyan-dim);
+  text-decoration: none;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-elev);
+  transition: border-color 0.15s, color 0.15s;
+}
+
+/* Touch devices: bump topbar-link a >=44x44 (Apple HIG / WCAG 2.5.5).
+   En desktop con mouse el padding 4x10 + line-height ~17px = ~25px
+   alto queda compacto. En iPad / iPhone landscape (que NO matchea
+   el `max-width: 640px` que esconde los links) el touch target era
+   29x67 — falla regular del pulgar al cambiar entre home/chat/dashboard. */
+@media (pointer: coarse) {
+  .topbar-link {
+    min-height: 44px;
+    padding: 10px 14px;
+    display: inline-flex;
+    align-items: center;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+  }
+}
+.topbar-link:hover {
+  color: var(--cyan);
+  border-color: var(--border-strong);
+}
+
+#vault-picker-label {
+  color: var(--text-faint);
+}
+
+#vault-picker {
+  background: var(--bg-elev);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 24px 4px 8px;
+  font-family: inherit;
+  font-size: 12px;
+  outline: none;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path fill='%238a8a90' d='M0 0l5 6 5-6z'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  transition: border-color 0.15s, color 0.15s;
+}
+
+#vault-picker:hover, #vault-picker:focus {
+  border-color: var(--border-strong);
+  color: var(--cyan);
+}
+
+/* Chat mode toggle (sidebar) ---------------------------------------
+   Segmented 3-state radio group. Replaces the old #model_picker select.
+   Active state uses the same accent treatment as other "active" chips
+   in the UI. Keep ARIA radiogroup contract intact (keyboard nav lives
+   in app.js).                                                       */
+#chat-mode-label {
+  color: var(--text-faint);
+}
+.chat-mode-toggle {
+  display: flex;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  width: 100%;
+}
+.chat-mode-btn {
+  flex: 1;
+  padding: 4px 6px;
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 0.8rem;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+.chat-mode-btn:not(:last-child) {
+  border-right: 1px solid var(--border);
+}
+.chat-mode-btn:hover {
+  background: var(--bg-elev);
+  color: var(--text);
+}
+.chat-mode-btn[aria-checked="true"] {
+  background: var(--accent);
+  color: var(--bg);
+}
+.chat-mode-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+#chat {
+  max-width: 860px;
+  margin: 0 auto;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  padding: 78px 24px 180px 24px;
+}
+
+#messages {
+  display: flex;
+  flex-direction: column;
+}

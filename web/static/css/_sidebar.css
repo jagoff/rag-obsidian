@@ -1,0 +1,519 @@
+/* ── Mobile header (hamburger + brand) ─────────────────────────────── */
+
+#mobile-header {
+  display: none;   /* desktop default; activated in mobile breakpoint */
+}
+
+@media (max-width: 767px) {
+  #mobile-header {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: calc(52px + env(safe-area-inset-top, 0px));
+    padding: env(safe-area-inset-top, 0px) 6px 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    background: linear-gradient(180deg, var(--bg) 85%, transparent 100%);
+    z-index: 20;
+    pointer-events: auto;
+  }
+  .mobile-brand {
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--cyan);
+    margin: 0;
+    letter-spacing: 0.01em;
+    flex: 1;
+    text-align: center;
+  }
+  .mobile-brand span {
+    color: var(--text-faint);
+    font-weight: 400;
+  }
+  /* Hamburger + new-chat botones usan .icon-btn — cumplen 44×44 por
+     padding/min-width definidos en el bloque .icon-btn universal. */
+}
+
+/* ── Sidebar shell ─────────────────────────────────────────────────── */
+
+#sidebar {
+  position: fixed;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: var(--sidebar-w);
+  background: var(--sidebar-bg);
+  border-right: 1px solid var(--sidebar-border);
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  /* Safe-area para el notch del iPhone en landscape. */
+  padding-left: env(safe-area-inset-left, 0);
+  transition: width var(--dur-base) var(--ease-out),
+              transform var(--dur-base) var(--ease-out);
+  /* Prevent body text selection when dragging over the sidebar. */
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+#sidebar[data-state="collapsed"] {
+  width: var(--sidebar-w-mini);
+}
+
+#sidebar-backdrop.sidebar-backdrop {
+  display: none;   /* sólo se muestra en mobile cuando data-state="open" */
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  -webkit-backdrop-filter: blur(2px);
+  backdrop-filter: blur(2px);
+  z-index: 25;   /* under #sidebar (30), over page content */
+  animation: sheetFadeIn var(--dur-base) var(--ease-out);
+}
+
+.sidebar-inner {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;   /* children handle their own scroll */
+  padding: calc(12px + env(safe-area-inset-top, 0px)) 10px 10px;
+  gap: 10px;
+}
+
+/* ── Top row: brand + collapse/close ───────────────────────────────── */
+
+.sidebar-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 2px;
+  min-height: 28px;
+}
+
+.sidebar-brand {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--cyan);
+  letter-spacing: 0.01em;
+  flex: 1;
+  overflow: hidden;
+  cursor: pointer;
+  transition: opacity var(--dur-fast) var(--ease-out);
+}
+.sidebar-brand:hover { opacity: 0.78; }
+.sidebar-brand-full {
+  white-space: nowrap;
+}
+.sidebar-brand-full span {
+  color: var(--text-faint);
+  font-weight: 400;
+}
+.sidebar-brand-mini {
+  display: none;
+  font-size: 18px;
+}
+
+#sidebar[data-state="collapsed"] .sidebar-brand-full { display: none; }
+#sidebar[data-state="collapsed"] .sidebar-brand-mini {
+  display: inline;
+  text-align: center;
+  width: 100%;
+}
+
+.sidebar-collapse-btn {
+  flex-shrink: 0;
+  transition: transform var(--dur-base) var(--ease-out),
+              background-color var(--dur-fast) var(--ease-out);
+}
+#sidebar[data-state="collapsed"] .sidebar-collapse-btn .icon-collapse {
+  transform: rotate(180deg);
+}
+/* Close button: desktop hidden, mobile visible (toggled en el mobile
+   breakpoint más abajo). Specificity con #sidebar prefix para ganarle
+   al `.icon-btn { display: inline-flex }` genérico que aparece más
+   abajo en el cascade. */
+#sidebar .sidebar-close-btn {
+  display: none;
+}
+
+/* ── New-chat button (claude.ai hero) ──────────────────────────────── */
+
+.sidebar-new-btn {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  min-height: 40px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out);
+}
+.sidebar-new-btn:hover {
+  background: var(--sidebar-hover);
+  border-color: var(--border-strong);
+  color: var(--cyan);
+}
+.sidebar-new-btn:active { transform: scale(0.98); }
+.sidebar-new-btn .icon-new { flex-shrink: 0; }
+.sidebar-btn-label {
+  flex: 1;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#sidebar[data-state="collapsed"] .sidebar-new-btn {
+  justify-content: center;
+  padding: 10px 0;
+}
+#sidebar[data-state="collapsed"] .sidebar-btn-label { display: none; }
+
+/* ── Search input ──────────────────────────────────────────────────── */
+
+.sidebar-search {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  min-height: 34px;
+  transition: border-color var(--dur-fast) var(--ease-out);
+}
+.sidebar-search:focus-within {
+  border-color: var(--border-strong);
+}
+.sidebar-search .icon-search {
+  color: var(--text-faint);
+  flex-shrink: 0;
+}
+.sidebar-search input[type="search"] {
+  flex: 1;
+  background: transparent;
+  border: 0;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  outline: none;
+  padding: 6px 0;
+  min-width: 0;
+}
+.sidebar-search input::placeholder { color: var(--text-faint); }
+.sidebar-search input::-webkit-search-cancel-button { appearance: none; }
+
+#sidebar[data-state="collapsed"] .sidebar-search { display: none; }
+
+/* ── Sessions list ─────────────────────────────────────────────────── */
+
+.sidebar-sessions {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  margin: 0 -4px;
+  padding: 0 4px;
+  /* Subtle scrollbar — match the minimalist chrome. */
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+.sidebar-sessions::-webkit-scrollbar { width: 6px; }
+.sidebar-sessions::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 3px;
+}
+.sidebar-sessions::-webkit-scrollbar-track { background: transparent; }
+
+.sidebar-section-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-faint);
+  padding: 10px 8px 6px;
+}
+
+#sidebar[data-state="collapsed"] .sidebar-section-label {
+  justify-content: center;
+}
+#sidebar[data-state="collapsed"] .sidebar-section-label > span { display: none; }
+
+.icon-btn-sm {
+  background: transparent;
+  border: 0;
+  color: var(--text-faint);
+  padding: 3px;
+  border-radius: 4px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+  transition: color var(--dur-fast) var(--ease-out),
+              background-color var(--dur-fast) var(--ease-out);
+}
+.icon-btn-sm:hover { color: var(--text); background: var(--sidebar-hover); }
+
+.sessions-list {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.session-item {
+  display: block;
+  padding: 8px 10px;
+  border-radius: 8px;
+  color: var(--text-dim);
+  font-size: 13px;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border: 1px solid transparent;
+  transition: background-color var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out);
+}
+.session-item:hover {
+  background: var(--sidebar-hover);
+  color: var(--text);
+}
+.session-item[aria-current="true"] {
+  background: var(--sidebar-active);
+  color: var(--cyan);
+  border-color: var(--border-strong);
+}
+.session-item .session-title {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-item .session-meta {
+  display: block;
+  font-size: 10px;
+  color: var(--text-faint);
+  margin-top: 2px;
+  letter-spacing: 0.02em;
+}
+
+.sessions-empty {
+  padding: 14px 10px;
+  color: var(--text-faint);
+  font-size: 12px;
+  text-align: center;
+  font-style: italic;
+}
+.sessions-empty.sessions-error { color: var(--red); font-style: normal; }
+
+/* En collapsed mode (desktop only) el historial desaparece completo —
+   los títulos truncados a 2-3 chars ("Hol", "cua…") no son útiles ni
+   legibles, distraen más que ayudan. El user que quiere ver la lista
+   expande la sidebar.
+   Scopeado a @media ≥768px porque en mobile el estado "collapsed" es
+   un leftover persistido (el sidebar mobile abre como drawer full-
+   width y no tiene variante icon-only). Sin scope, un user que tenía
+   collapsed en desktop abriría el drawer mobile sin el historial. */
+@media (min-width: 768px) {
+  #sidebar[data-state="collapsed"] .sidebar-sessions {
+    display: none;
+  }
+}
+
+/* ── Controls block: pickers + actions ─────────────────────────────────
+   2026-04-24: movido del bottom al top de la sidebar por pedido del user
+   ("vault, modo, voz, home, dashboard arriba de todo"). El nombre
+   `.sidebar-footer-*` se preserva para no romper nada — no hay JS que
+   se enganche (grep: zero hits en app.js). Border pasó de top→bottom
+   y se sacó la safe-area-inset-bottom (ya no está pegado al edge). */
+
+.sidebar-footer {
+  border-bottom: 1px solid var(--sidebar-border);
+  padding-bottom: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.sidebar-footer-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.sidebar-footer-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 2px;
+}
+.sidebar-footer-row > label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-faint);
+  min-width: 48px;
+  flex-shrink: 0;
+}
+
+/* Override del style genérico del vault picker (que asumía topbar) para
+   que ocupe todo el ancho disponible dentro de la sidebar. */
+#sidebar #vault-picker {
+  flex: 1;
+  min-width: 0;
+  max-width: none;
+  font-size: 12px;
+  padding: 5px 24px 5px 8px;
+  background-color: var(--bg);
+}
+
+#sidebar[data-state="collapsed"] .sidebar-footer-controls { display: none; }
+
+.sidebar-footer-actions {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 4px;
+}
+
+#sidebar[data-state="collapsed"] .sidebar-footer-actions {
+  grid-template-columns: 1fr;
+}
+
+/* ── Bottom-footer (meta-actions: ayuda + status) ──────────────────────
+   2026-04-24: el bloque principal de controles vive arriba (sidebar-
+   footer después del brand), pero ayuda y status quedaron acá abajo
+   como estaban antes. Border-top separa del sessions-list; safe-area-
+   inset-bottom respeta el home indicator del iPhone en PWA standalone.
+   Grid de 2 columnas (mismo layout que sidebar-footer-actions) que
+   colapsa a 1 columna cuando la sidebar está icon-only. */
+.sidebar-footer-bottom {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 4px;
+  border-top: 1px solid var(--sidebar-border);
+  padding-top: 10px;
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+#sidebar[data-state="collapsed"] .sidebar-footer-bottom {
+  grid-template-columns: 1fr;
+}
+
+/* ── Generic icon-btn used across sidebar + mobile-header ──────────── */
+
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  min-height: 36px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 12px;
+  text-decoration: none;
+  cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out);
+}
+.icon-btn:hover {
+  background: var(--sidebar-hover);
+  color: var(--text);
+}
+.icon-btn:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+.icon-btn-glyph {
+  font-weight: 700;
+  font-size: 14px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+}
+.icon-btn-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Help button in sidebar: override el width:26px hardcoded del topbar
+   viejo para que ocupe todo el grid cell (tal como voz/home/dashboard). */
+#sidebar #help-btn {
+  width: auto;
+  height: auto;
+  padding: 8px 10px;
+  justify-content: flex-start;
+  margin-left: 0;
+  font-weight: normal;
+}
+
+/* TTS toggle in sidebar: mimic the sheet-toggle look (pressed = cyan). */
+#sidebar #tts-toggle {
+  /* Override the original topbar-btn styling for sidebar use. */
+  color: var(--text-dim);
+  background: transparent;
+}
+#sidebar #tts-toggle[aria-pressed="true"] {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+#sidebar #tts-toggle .tts-icon {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.4;
+  flex-shrink: 0;
+  transition: opacity var(--dur-fast) var(--ease-out);
+}
+#sidebar #tts-toggle[aria-pressed="true"] .tts-icon { opacity: 1; }
+
+#sidebar[data-state="collapsed"] .icon-btn {
+  justify-content: center;
+  padding: 10px 0;
+  gap: 0;
+}
+#sidebar[data-state="collapsed"] .icon-btn-label { display: none; }
+
+/* ── #chat layout shift: reserve left space for sidebar ────────────── */
+
+@media (min-width: 768px) {
+  #chat {
+    /* Reserve room for the sidebar. The transition matches the
+       sidebar's width transition so the content shift stays smooth
+       when toggling collapsed/expanded. */
+    padding-left: calc(var(--sidebar-w) + 24px);
+    transition: padding-left var(--dur-base) var(--ease-out);
+  }
+  #sidebar[data-state="collapsed"] ~ #chat {
+    padding-left: calc(var(--sidebar-w-mini) + 24px);
+  }
+}

@@ -1,0 +1,490 @@
+/* Turns ------------------------------------------------------------ */
+.turn {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-bottom: 22px;
+}
+
+.turn + .turn {
+  padding-top: 22px;
+  border-top: 1px dashed var(--border);
+}
+
+.line {
+  display: flex;
+  align-items: flex-start;
+  gap: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Mini-gap between the user's question and the rag response — the turn's
+   flex `gap: 10px` was too tight when the reply started flush below. */
+.line + .line { margin-top: 6px; }
+
+.prompt {
+  flex-shrink: 0;
+  font-weight: 700;
+  user-select: none;
+}
+
+.prompt.user { color: var(--green); }
+.prompt.rag  { color: var(--cyan); }
+
+.prompt::after { content: " "; white-space: pre; }
+
+.text {
+  flex: 1;
+  /* Flex items default to min-width: auto, which lets their intrinsic
+     content size push them past the flex container's edge when a
+     single inline element (long link, blockquote with a single long
+     sentence, pre block) can't break. Forcing min-width: 0 makes the
+     flex item honour its parent's width and lets word-break / nowrap
+     rules inside the child elements take effect.
+     overflow-wrap: anywhere is a safety net for unbreakable strings
+     (URLs, hashes, filenames) — break at any character if needed. */
+  min-width: 0;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+
+.text.user {
+  color: var(--text);
+  white-space: pre-wrap;
+}
+
+.text.rag {
+  white-space: normal;
+}
+
+.meta {
+  color: var(--text-dim);
+  padding-left: 2ch;
+  font-size: 13px;
+}
+
+/* Streaming caret */
+.text.rag.pending::after {
+  content: "▍";
+  color: var(--text-dim);
+  animation: blink 1s steps(2) infinite;
+  margin-left: 1px;
+}
+
+@keyframes blink {
+  50% { opacity: 0; }
+}
+
+/* Sources table -------------------------------------------------- */
+.sources {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sources-rule {
+  color: var(--text-faint);
+  font-size: 12px;
+  padding-bottom: 4px;
+}
+
+.source-row {
+  display: grid;
+  grid-template-columns: auto 1fr 2fr auto;
+  gap: 12px;
+  align-items: baseline;
+  font-size: 13px;
+  padding: 1px 0;
+}
+
+.source-row .bar {
+  color: var(--text-dim);
+  font-family: inherit;
+  white-space: pre;
+}
+.source-row .bar.bar-good { color: var(--green); }
+.source-row .bar.bar-mid  { color: var(--yellow); }
+.source-row .bar.bar-low  { color: var(--red); }
+
+.source-row .note {
+  color: var(--cyan);
+  font-weight: 700;
+  text-decoration: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.source-row .note:hover {
+  text-decoration: underline;
+}
+
+.source-row .path {
+  color: var(--cyan-dim);
+  text-decoration: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.source-row .path:hover { text-decoration: underline; color: var(--cyan); }
+
+.related {
+  margin-top: 12px;
+  padding-left: 2ch;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+}
+.related-head {
+  color: var(--text-faint);
+  letter-spacing: 0.02em;
+  padding-bottom: 2px;
+}
+.related-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  color: var(--text-dim);
+  text-decoration: none;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  transition: color 120ms ease, border-color 120ms ease;
+  overflow: hidden;
+}
+.related-item:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+.related-badge {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
+  flex-shrink: 0;
+  min-width: 56px;
+}
+.related-deezer .related-badge { color: #a238ff; }
+.related-youtube .related-badge { color: #ff0033; }
+.related-title {
+  color: var(--text);
+  font-weight: 500;
+  flex-shrink: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.related-sub {
+  color: var(--text-faint);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.web-search {
+  margin-top: 8px;
+  padding-left: 2ch;
+  font-size: 12px;
+}
+.web-search-link {
+  color: var(--text-faint);
+  text-decoration: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 10px;
+  display: inline-block;
+  transition: color 120ms ease, border-color 120ms ease;
+}
+.web-search-link:hover {
+  color: var(--cyan);
+  border-color: var(--cyan-dim);
+}
+.web-search-link.inline {
+  padding: 1px 8px;
+  font-size: 0.85em;
+  margin-left: 4px;
+  vertical-align: baseline;
+  white-space: nowrap;
+}
+
+/* Fallback cluster — disparado por el `done` event con
+   low_conf_bypass=true. Más prominente que .web-search-link.inline
+   (cta visible, 3 botones en row) pero más liviano que .enrich-block
+   (sin border top heavy). Tonos por dominio: Google cyan, YouTube
+   rojo, Wikipedia amarillo — no competimos con los colores del
+   badge de confianza, todos wireframe-only en rest. */
+.fallback-cluster {
+  margin-top: 10px;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--bg-elev) 60%, transparent);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.fallback-head {
+  color: var(--text-dim);
+  font-size: 12px;
+  letter-spacing: 0.02em;
+}
+.fallback-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.fallback-btn {
+  display: inline-flex;
+  align-items: center;
+  padding: 5px 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-dim);
+  text-decoration: none;
+  font-size: 12.5px;
+  transition: color 120ms ease, border-color 120ms ease, background 120ms ease;
+  white-space: nowrap;
+}
+.fallback-btn:hover {
+  color: var(--text);
+  background: var(--bg-elev);
+}
+.fallback-google:hover  { border-color: var(--cyan-dim);   color: var(--cyan); }
+.fallback-youtube:hover { border-color: #a33;              color: var(--red); }
+.fallback-wiki:hover    { border-color: #8a6c33;           color: var(--yellow); }
+
+/* Enrichment footer (WA/Calendar/Reminders cross-refs) ---------- */
+.enrich-block {
+  margin-top: 12px;
+  padding: 10px 14px 8px 14px;
+  border-top: 1px dashed var(--border);
+  font-size: 13px;
+  color: var(--text-dim);
+}
+.enrich-head {
+  color: var(--text-faint);
+  font-size: 11.5px;
+  letter-spacing: 0.04em;
+  padding-bottom: 6px;
+  text-transform: lowercase;
+}
+.enrich-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 0;
+}
+.enrich-icon {
+  flex-shrink: 0;
+  width: 1.4em;
+  text-align: center;
+  color: var(--text-faint);
+}
+.enrich-text-col {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.enrich-text { color: var(--text); }
+.enrich-snippet { color: var(--text-faint); font-style: italic; }
+.enrich-time {
+  color: var(--text-faint);
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+  font-size: 11.5px;
+  flex-shrink: 0;
+}
+
+/* NLI grounding panel (RAG_NLI_GROUNDING=1) ---------------------- */
+.grounding-panel {
+  margin-top: 12px;
+  padding: 8px 14px;
+  border-top: 1px dashed var(--border);
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+.grounding-panel > summary {
+  cursor: pointer;
+  color: var(--text-faint);
+  font-size: 11.5px;
+  letter-spacing: 0.04em;
+  list-style: none;
+  user-select: none;
+}
+.grounding-panel > summary::-webkit-details-marker { display: none; }
+.grounding-list {
+  margin: 6px 0 0 0;
+  padding: 0 0 0 0.8em;
+  list-style: none;
+}
+.grounding-claim {
+  padding: 2px 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.grounding-claim-entails    { color: var(--green); }
+.grounding-claim-contradicts { color: var(--red); }
+.grounding-claim-neutral    { color: var(--text-faint); }
+.grounding-note {
+  color: var(--text-faint);
+  font-style: italic;
+}
+
+/* Feedback bar --------------------------------------------------- */
+.feedback {
+  margin-top: 8px;
+  padding-top: 8px;
+  padding-left: 2ch;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  font-size: 12px;
+  color: var(--text-faint);
+  border-top: 1px solid var(--border);
+}
+
+.feedback-prompt {
+  color: var(--text-faint);
+  letter-spacing: 0.02em;
+}
+
+.fb-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  flex-shrink: 0;
+  white-space: nowrap;
+  transition: border-color 120ms ease, color 120ms ease, background 120ms ease;
+}
+
+.fb-btn .fb-icon {
+  width: 14px;
+  height: 14px;
+  display: block;
+  flex-shrink: 0;
+  color: var(--text-faint);
+  transition: color 120ms ease;
+}
+
+.fb-btn.fb-up   .fb-icon { color: var(--green); }
+.fb-btn.fb-down .fb-icon { color: var(--red); }
+
+.fb-btn:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  color: var(--text);
+  background: color-mix(in srgb, var(--bg-elev) 60%, transparent);
+}
+.fb-btn:hover:not(:disabled) .fb-icon { color: var(--text); }
+
+.fb-btn.fb-up:hover:not(:disabled),
+.fb-btn.fb-up:hover:not(:disabled) .fb-icon   { color: var(--green); }
+.fb-btn.fb-up:hover:not(:disabled)            { border-color: var(--green); }
+.fb-btn.fb-down:hover:not(:disabled),
+.fb-btn.fb-down:hover:not(:disabled) .fb-icon { color: var(--red); }
+.fb-btn.fb-down:hover:not(:disabled)          { border-color: var(--red); }
+
+.fb-btn.picked.fb-up,
+.fb-btn.picked.fb-up .fb-icon {
+  color: var(--green);
+}
+.fb-btn.picked.fb-up {
+  border-color: var(--green);
+  background: color-mix(in srgb, var(--green) 12%, transparent);
+}
+.fb-btn.picked.fb-down,
+.fb-btn.picked.fb-down .fb-icon {
+  color: var(--red);
+}
+.fb-btn.picked.fb-down {
+  border-color: var(--red);
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+}
+/* Redo button — cyan to distinguish from the binary feedback buttons
+   (green/red). Clicking "regenerar" isn't a quality signal, it's a
+   request for a retry, so it gets its own colour semantics. */
+.fb-btn.fb-redo .fb-icon { color: var(--cyan); }
+.fb-btn.fb-redo:hover:not(:disabled),
+.fb-btn.fb-redo:hover:not(:disabled) .fb-icon { color: var(--cyan); }
+.fb-btn.fb-redo:hover:not(:disabled)          { border-color: var(--cyan); }
+.fb-btn.fb-redo.picked,
+.fb-btn.fb-redo.picked .fb-icon {
+  color: var(--cyan);
+}
+.fb-btn.fb-redo.picked {
+  border-color: var(--cyan);
+  background: color-mix(in srgb, var(--cyan) 12%, transparent);
+}
+.fb-btn.dimmed {
+  opacity: 0.35;
+  border-color: var(--border);
+}
+.fb-btn:disabled { cursor: default; }
+
+.feedback .msg-action  { margin-left: auto; }
+.feedback-status        { color: var(--text-faint); }
+.feedback-status.ok     { color: var(--green); }
+.feedback-status.warn   { color: var(--yellow); }
+.feedback-status.err    { color: var(--red); }
+
+/* Optional reason input, opened when 👎 is clicked.
+   Lives on its own row just under the thumbs bar so the layout doesn't
+   jump, and uses the same monospace/muted palette as the rest. */
+.feedback-reason {
+  flex-basis: 100%;
+  margin-top: 6px;
+  padding-left: 2ch;
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  font-size: 12px;
+  flex-wrap: wrap;
+}
+
+.fb-reason-input {
+  flex: 1;
+  min-width: 180px;
+  max-width: 520px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  outline: none;
+  transition: border-color 120ms ease;
+}
+.fb-reason-input::placeholder { color: var(--text-faint); }
+.fb-reason-input:focus { border-color: var(--border-strong); }
+
+.fb-text-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 4px;
+  text-decoration: underline;
+  text-decoration-color: var(--border);
+  text-underline-offset: 3px;
+}
+.fb-text-btn:hover { color: var(--text); text-decoration-color: var(--text-dim); }
+.fb-text-btn.fb-text-muted { color: var(--text-faint); }
+.fb-text-btn.fb-text-muted:hover { color: var(--text-dim); }

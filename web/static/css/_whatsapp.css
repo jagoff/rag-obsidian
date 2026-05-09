@@ -1,0 +1,850 @@
+/* ── WhatsApp scheduling UI ───────────────────────────────────────────
+ * Extiende el card de "Mensaje de WhatsApp" (.proposal-whatsapp) con:
+ *   - chip de schedule arriba (📅 Programado para mañana 9:00)
+ *   - botón ⏰ icon-only al lado de [Enviar] para abrir popover
+ *   - popover inline (NO modal) con datetime-local + chips de tiempo rápido
+ * Reusa los color tokens del tema (--green / --orange / --red / --text-dim)
+ * para que dark/light theme se mantenga consistente sin overrides. */
+
+.proposal-wa-schedule-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 4px 0 6px 0;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--bg-elev) 60%, transparent);
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.3;
+  width: fit-content;
+  max-width: 100%;
+}
+/* Default visual = pending (grey). The .pending class is added explicitly
+   in JS so the variant selectors below override it cleanly via specificity
+   (same selector, later in source order wins). */
+.proposal-wa-schedule-chip.pending {
+  color: var(--text-dim);
+  border-color: var(--border);
+}
+.proposal-wa-schedule-chip.sent {
+  color: var(--green);
+  border-color: color-mix(in srgb, var(--green) 50%, var(--border));
+  background: color-mix(in srgb, var(--green) 8%, var(--bg-elev));
+}
+.proposal-wa-schedule-chip.late {
+  color: var(--orange, #ff9f40);
+  border-color: color-mix(in srgb, var(--orange, #ff9f40) 50%, var(--border));
+  background: color-mix(in srgb, var(--orange, #ff9f40) 8%, var(--bg-elev));
+}
+.proposal-wa-schedule-chip.failed {
+  color: var(--red);
+  border-color: color-mix(in srgb, var(--red) 50%, var(--border));
+  background: color-mix(in srgb, var(--red) 8%, var(--bg-elev));
+}
+
+/* Compact icon-only ⏰ button. Same height as the other proposal-btn so
+   it lines up flush with [Enviar] / [Descartar]; padding is squeezed so
+   the icon doesn't look tiny in the middle of an extra-wide hit area. */
+.proposal-wa-clock-btn {
+  padding: 4px 8px;
+  font-size: 14px;
+  line-height: 1;
+}
+
+/* Inline popover — sits inside the card, below the actions row. Subtle
+   elevation against the card background so it reads as a nested sub-area
+   without being modal/overlay. */
+.proposal-wa-schedule-popover {
+  margin-top: 8px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.proposal-wa-schedule-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.proposal-wa-schedule-label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.proposal-wa-schedule-input {
+  padding: 6px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.4;
+  /* native datetime-local renders ugly on macOS Safari but is the
+     standard — leaving the look as-is per spec. Min-width keeps it from
+     collapsing on narrow cards. */
+  min-width: 200px;
+}
+.proposal-wa-schedule-input:focus {
+  outline: none;
+  border-color: var(--green);
+}
+/* iOS <16 fallback: cuando el datetime-local rompe el popover, Agent B
+   armó un wrapper con <input type="date"> + <input type="time"> inline.
+   Sin esto los inputs hijos heredan el estilo crudo del UA (border gris
+   medio random, padding mínimo) y rompen visualmente la armonía con el
+   resto del popover. Matcheamos border/padding/radius/font con
+   .proposal-wa-schedule-input de arriba; el .wa-resched-input-split es
+   el equivalente para el modal de reschedule (mismo split, otra clase). */
+.proposal-wa-schedule-input-split > input,
+.wa-resched-input-split > input {
+  padding: 6px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: inherit;
+  min-width: 100px;
+}
+.proposal-wa-schedule-err {
+  color: var(--red);
+  font-size: 12px;
+  min-height: 1em;
+}
+.proposal-wa-schedule-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* Quick-time preset chips. Wrap on narrow viewports so the row gracefully
+   degrades to two lines on iPhone SE-class devices. */
+.proposal-wa-quick-times {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.proposal-wa-quick-time {
+  padding: 4px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out);
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+.proposal-wa-quick-time:hover {
+  background: var(--border);
+  border-color: var(--border-strong);
+}
+.proposal-wa-quick-time:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 1px;
+}
+
+/* Mobile: 16px font on the datetime-local prevents the iOS auto-zoom
+   que se dispara al focusear inputs con font-size < 16px. También
+   bumpeamos tap-targets del ⏰ button + chips a 44px min-height por
+   Apple HIG / WCAG 2.5.5 (la regla global de .proposal-btn ya cubre los
+   send/cancel buttons en el mismo media query alrededor de la línea
+   ~2228). */
+@media (max-width: 480px), (pointer: coarse) {
+  .proposal-wa-schedule-input,
+  .proposal-wa-schedule-input-split > input,
+  .wa-resched-input-split > input {
+    font-size: 16px;
+  }
+  .proposal-wa-clock-btn,
+  .proposal-wa-quick-time,
+  .proposal-wa-change-time-btn {
+    min-height: 44px;
+  }
+}
+
+
+/* ── WhatsApp card · contexto de conversación ─────────────────────────
+   Bloque entre "Para: <contacto>" y la textarea del card. Reemplaza los
+   chips "seguir con ›" que aparecían debajo del proposal — esos pre-
+   guntaban sobre temas RAG y eran ruido cuando ya había una acción
+   concreta. Ahora el user ve la conversación reciente con esa persona
+   antes de mandar/programar (calibrar tono / saber si hace mucho que
+   no hablan).
+
+   Decidido con el user 2026-04-25.
+*/
+
+.proposal-wa-context {
+  margin: 6px 0 4px;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.proposal-wa-context.empty .proposal-wa-context-meta {
+  color: var(--text-faint);
+  font-style: italic;
+}
+
+/* El <details> mismo no tiene background — es solo el contenedor
+   colapsible del thread. El summary muestra el "Último contacto: ayer
+   18:30 · 4 mensajes" con un caret nativo. Click expande el thread. */
+.proposal-wa-context-details {
+  margin: 0;
+}
+
+.proposal-wa-context-summary {
+  cursor: pointer;
+  list-style: revert; /* mantenemos el ▶ default del browser para affordance */
+  user-select: none;
+  padding: 2px 0;
+  display: inline-flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px;
+  color: var(--text-dim);
+}
+
+.proposal-wa-context-summary:hover {
+  color: var(--text);
+}
+
+.proposal-wa-context-meta {
+  color: var(--text-dim);
+}
+
+.proposal-wa-context-count {
+  color: var(--text-faint);
+}
+
+/* Thread visual: cada mensaje es una mini burbuja inline. "yo" alineado
+   a la derecha (verde tenue), "them" a la izquierda (gris). Sin bordes
+   pesados — la idea es que se vea liviano, contexto secundario, no que
+   compita visualmente con la textarea ni con los botones de acción. */
+.proposal-wa-context-thread {
+  margin-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-left: 4px;
+  border-left: 2px solid var(--border);
+}
+
+.proposal-wa-context-msg {
+  padding: 4px 8px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--bg-elev) 70%, transparent);
+  max-width: 100%;
+}
+
+.proposal-wa-context-msg.me {
+  background: color-mix(in srgb, var(--green, #2f8f3d) 14%, var(--bg-elev) 86%);
+  align-self: flex-end;
+  text-align: left;
+}
+
+.proposal-wa-context-msg.them {
+  background: var(--bg-elev);
+  align-self: flex-start;
+}
+
+.proposal-wa-context-msg-head {
+  font-size: 10px;
+  color: var(--text-faint);
+  margin-bottom: 2px;
+}
+
+.proposal-wa-context-msg-who {
+  font-weight: 600;
+  color: var(--text-dim);
+}
+
+.proposal-wa-context-msg-ts {
+  /* sin estilo extra — hereda el color faint del head */
+}
+
+.proposal-wa-context-msg-text {
+  font-size: 11px;
+  color: var(--text);
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+  white-space: pre-wrap;
+}
+
+
+/* Auto-detección de fecha desde el message_text — el chip "Programado
+   para mañana 9:00" se sufija con "(detectado del mensaje)" en gris
+   suave para que el user vea de dónde salió la fecha (transparencia),
+   y un linklet "↩ no, mandalo ya" permite revertir si fue falso
+   positivo del detector heurístico. Sin este indicator + undo, el
+   user puede sentir que el agente "adivinó" la fecha y no se entera
+   por qué.
+
+   Decidido con el user 2026-04-25.
+*/
+
+.proposal-wa-schedule-detected {
+  color: var(--text-faint);
+  font-style: italic;
+  font-size: 10px;
+  margin-left: 6px;
+}
+
+.proposal-wa-schedule-undo {
+  background: none;
+  border: none;
+  padding: 0 0 0 8px;
+  margin-left: 6px;
+  font-size: 11px;
+  color: var(--cyan-dim, var(--cyan));
+  cursor: pointer;
+  font-family: inherit;
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+}
+
+.proposal-wa-schedule-undo:hover {
+  color: var(--cyan);
+  text-decoration-style: solid;
+}
+
+.proposal-wa-schedule-undo:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* ── Composer plus-button popover (Adjuntar imagen / Atajos) ──────────
+   Mini-menú que reemplazó el helpBtn-direct-open del botón `+` cuando
+   se sumó "Adjuntar imagen" (2026-04-25). Position fixed (anchored al
+   `+` via JS), aparece arriba por default — abajo si no entra arriba.
+   Width auto (suficiente para los labels) con min/max para mantener
+   shape consistente entre items de longitudes distintas. */
+.composer-plus-menu {
+  z-index: 100;
+  min-width: 200px;
+  max-width: 280px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  padding: 4px;
+  box-shadow: var(--shadow-md);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-family: inherit;
+  /* Animación de entrada — sutil slide-up cuando aparece arriba del `+`.
+     Cuando aparece abajo, el slide es invertido (data-placement="below"). */
+  animation: composer-plus-menu-in var(--dur-fast) var(--ease-out);
+}
+.composer-plus-menu[data-placement="below"] {
+  animation: composer-plus-menu-in-below var(--dur-fast) var(--ease-out);
+}
+
+@keyframes composer-plus-menu-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes composer-plus-menu-in-below {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.composer-plus-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  background: transparent;
+  border: none;
+  border-radius: 5px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease-out);
+}
+.composer-plus-menu-item:hover,
+.composer-plus-menu-item:focus-visible {
+  background: var(--bg-elev);
+  outline: none;
+}
+.composer-plus-menu-item:focus-visible {
+  box-shadow: var(--focus-ring);
+}
+.composer-plus-menu-icon {
+  font-size: 14px;
+  flex-shrink: 0;
+  width: 18px;
+  text-align: center;
+}
+.composer-plus-menu-label {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Mobile (touch): items 44×44 mínimo para tap-friendly. La heurística
+   `pointer: coarse` matchea iPhone/Android — no afecta desktop con
+   trackpad/mouse. */
+@media (pointer: coarse) {
+  .composer-plus-menu-item {
+    min-height: 44px;
+    padding: 10px 12px;
+    font-size: 14px;
+  }
+}
+
+/* ── Upload status card (loading / noop / err state al subir imagen) ──
+   Mini-card que aparece en el chat cuando el user sube una imagen.
+   Loading: thumb + filename + "procesando con OCR…" con cursor
+   parpadeante. En "created" o "needs_confirmation" el card se reemplaza
+   por el chip / proposal correspondiente — solo "noop" y errors lo
+   dejan visible como mensaje final. */
+.upload-card {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--bg-card);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  transition: opacity var(--dur-base) var(--ease-out),
+              border-color var(--dur-base) var(--ease-out);
+}
+
+.upload-card-thumb {
+  width: 64px;
+  height: 64px;
+  flex-shrink: 0;
+  object-fit: cover;
+  border-radius: 4px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+}
+
+.upload-card-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.upload-card-name {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 500;
+  word-break: break-all;
+  /* Truncar a 2 líneas — file names largos no deberían empujar el
+     status fuera del card. */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.upload-card-size {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.upload-card-status {
+  color: var(--text-dim);
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+/* Loading: cursor parpadeante después del status text para hint visual
+   de que algo está corriendo en background. */
+.upload-card.loading .upload-card-status::after {
+  content: " ▍";
+  animation: upload-card-blink 1s steps(1) infinite;
+  color: var(--cyan);
+}
+@keyframes upload-card-blink {
+  50% { opacity: 0; }
+}
+
+/* Noop: la imagen no produjo nada agendable. Border más sutil + ligera
+   dimming para indicar "no actionable" sin gritar error. */
+.upload-card.noop {
+  border-color: var(--border);
+  opacity: 0.85;
+}
+.upload-card.noop .upload-card-status {
+  color: var(--text-dim);
+}
+
+/* Err: errores reales (HTTP, red, OCR falló). Border y status en rojo. */
+.upload-card.err {
+  border-color: var(--red);
+}
+.upload-card.err .upload-card-status {
+  color: var(--red);
+}
+
+/* Mobile: thumb un poco más chico para que el card no domine el chat
+   en viewports angostos. */
+@media (max-width: 480px) {
+  .upload-card-thumb {
+    width: 52px;
+    height: 52px;
+  }
+  .upload-card {
+    padding: 8px 10px;
+    gap: 10px;
+  }
+}
+
+/* ── WhatsApp ACTION proposals (cancel/reschedule) ────────────────────
+ * Card más simple que el de send (kind="whatsapp_message"): no hay
+ * textarea editable porque el mensaje YA está programado y solo
+ * confirmamos cancelar o cambiar la hora. Visualmente reusa el verde
+ * WhatsApp del send-button para mantener el lenguaje, pero sin chip de
+ * programación (la card en sí es la acción de programación).
+ *
+ * Usamos `.proposal-whatsapp-action` como clase compartida entre los
+ * dos kinds — el frontend agrega además
+ * `.proposal-whatsapp_cancel_scheduled` /
+ * `.proposal-whatsapp_reschedule_scheduled` por si en algún momento
+ * queremos diferenciarlos visualmente. */
+.proposal-whatsapp-action .proposal-btn-create {
+  /* Mismo realce sutil que el send — confirmar también es destructivo
+     (cancelar borra estado, reschedule lo muta). */
+  background: rgba(126, 231, 135, 0.08);
+}
+.proposal-wa-action-meta {
+  /* Stack de pares label/value, muy compacto. Más denso que el de
+     send porque el contenido es read-only (no compite con un textarea). */
+  margin: 6px 0 4px 0;
+  font-size: 13px;
+  line-height: 1.4;
+}
+.proposal-wa-action-meta .proposal-meta-row {
+  display: flex;
+  gap: 6px;
+  margin: 2px 0;
+}
+.proposal-wa-action-meta .proposal-meta-label {
+  /* Labels alineados a un ancho fijo para que las values queden
+     justificadas verticalmente — más legible cuando hay 3-4 rows. */
+  flex: 0 0 auto;
+  min-width: 88px;
+  color: var(--text-faint, #9aa);
+  font-weight: 500;
+}
+.proposal-wa-action-meta .proposal-meta-val {
+  flex: 1 1 auto;
+  color: var(--text);
+  word-break: break-word;
+}
+
+/* Clarification path: el LLM encontró >1 pending para el contacto y
+ * pide al user que elija. Cada candidato es un sub-card vertical con
+ * su propio botón [✓ Cancelar/Reagendar N]. Click sobre uno → se
+ * confirma esa fila + dimmean los demás (visual feedback). */
+.proposal-wa-action-clarif-intro {
+  margin: 6px 0;
+  font-size: 13px;
+  color: var(--text);
+}
+.proposal-wa-action-candidates {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.proposal-wa-action-candidate {
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+  border-radius: 6px;
+  padding: 8px 10px;
+  background: var(--bg-soft, rgba(255, 255, 255, 0.02));
+  transition: opacity 0.2s;
+}
+.proposal-wa-action-candidate.dimmed {
+  opacity: 0.45;
+}
+.proposal-wa-action-candidate-head {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-faint, #9aa);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  margin-bottom: 2px;
+}
+
+
+/* Cards de proposals resueltos (sent / scheduled / cancelled / created):
+   feedback visual claro de que ya no son interactivas, para evitar el
+   patrón "user clickea botón disabled y no entiende qué pasa".
+
+   Aplica cuando el card tiene `data-resolved` seteado por el handler
+   correspondiente (sendBtn.addEventListener resuelve en "sending" →
+   "scheduled" / "sent" / "created" cuando completa). El selector
+   atributo cubre cualquier valor non-empty.
+
+   Decidido en el audit del 2026-04-25 (issue #3 "card zombi" — el
+   `disabled=true` ya estaba; faltaba feedback explícito). */
+.proposal[data-resolved] .proposal-btn,
+.proposal[data-resolved] .proposal-btn:disabled,
+.proposal[data-resolved] .proposal-wa-clock-btn,
+.proposal[data-resolved] .proposal-wa-change-time-btn,
+.proposal[data-resolved] .proposal-wa-schedule-undo {
+  cursor: not-allowed;
+  opacity: 0.5;
+  pointer-events: none;  /* ningún hover ni click — silenciador total */
+}
+
+/* Excepción: el botón [Volver] de los cards de cancel/reschedule debe
+   seguir clickeable incluso post-resuelto, para que el user pueda
+   colapsar visualmente. El handler ya tiene su propio guard contra
+   doble-click. */
+.proposal[data-resolved] .proposal-btn-cancel:not(.proposal-wa-action-back) {
+  /* hereda lo de arriba */
+}
+
+
+/* WhatsApp groups — indicador visual y candidates en card de proposal.
+   Cuando el resolver detecta un grupo (vs contacto 1:1), mostramos
+   "👥 Grupo: <nombre>" en lugar del wa.me link, y si hay ambigüedad
+   listamos los candidatos para que el user re-pida con nombre exacto.
+
+   Decidido en el audit del 2026-04-25 (TOP 1 — soporte de grupos
+   @g.us via fuzzy-match en bridge DB). */
+.proposal-wa-group-label {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.proposal-wa-group-candidates {
+  margin: 6px 0;
+  padding: 8px 10px;
+  background: var(--bg-elev);
+  border-left: 3px solid var(--orange, #ffa657);
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+.proposal-wa-group-candidates-label {
+  font-weight: 600;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+
+.proposal-wa-group-candidates-list {
+  margin: 4px 0 0 0;
+  padding-left: 20px;
+  list-style: disc;
+}
+
+.proposal-wa-group-candidates-list li {
+  padding: 2px 0;
+  color: var(--text);
+}
+
+
+/* upload-card.done: estado post-procesamiento. El card persiste arriba
+   del resultado (chip / proposal) para mantener contexto visual de qué
+   imagen generó qué acción. Decidido en el sprint UX 2026-04-25 (C.1):
+   antes el uploadCard se eliminaba y el user perdía la referencia. */
+.upload-card.done {
+  opacity: 0.85;
+  border-color: var(--green);
+}
+
+.upload-card.done .upload-card-status::after {
+  content: ""; /* sin cursor blink — ya terminó */
+  animation: none;
+}
+
+.upload-card.done .upload-card-status {
+  color: var(--green);
+  font-weight: 500;
+}
+
+/* Margen entre el thumb persistente y el card resultado debajo. */
+.upload-card.done + .proposal,
+.upload-card.done + .created-chip {
+  margin-top: 4px;
+}
+
+/* ── WhatsApp recipient resolution & auto-sent notice ─────────────────────
+ * Added 2026-04-26 per user request: visual color cues for resolved/failed
+ * contacts + compact "✓ Sent" card variant when the backend auto-sends.
+ *
+ * Verde: contacto resuelto limpio (jid + sin error + no group). Aplicado
+ *        tanto en el `proposal-whatsapp-sent` (auto-sent) como en cards
+ *        editables que igual quedan visibles (scheduled_for / group).
+ * Rojo:  error de resolución (`fields.error`: not_found / no_phone /
+ *        ambiguous / send_failed). El JS deshabilita [Enviar] hasta que
+ *        se clarifique.
+ *
+ * Variables: --green/--red del tema, fallback hex sensato si no están.
+ */
+.proposal-resolved-ok {
+  color: var(--green, #16a34a);
+}
+.proposal-resolved-ok-link {
+  color: var(--green, #16a34a) !important;
+}
+.proposal-resolved-error {
+  color: var(--red, #dc2626);
+}
+.proposal-whatsapp-sent {
+  border-left: 3px solid var(--green, #16a34a);
+  padding-left: 12px;
+}
+.proposal-whatsapp-sent .proposal-icon {
+  color: var(--green, #16a34a);
+}
+.proposal-sent-body {
+  color: var(--text);
+  margin-top: 6px;
+  padding: 8px 10px;
+  background: rgba(126, 231, 135, 0.08);
+  border-radius: 6px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+/* ── Contact match highlight overlay (added 2026-04-26) ────────────────────
+ * Mientras el user escribe en el textarea del chat, si detectamos un
+ * verbo de envío de WhatsApp + un nombre que resolvemos contra Apple
+ * Contacts / Related Names, el JS:
+ *
+ *   1. Pone un <mark class="contact-match-hit"> alrededor del nombre en
+ *      el overlay → se ve en VERDE NEGRITA encima del textarea.
+ *   2. Muestra un badge debajo con el nombre canónico del contacto
+ *      ("Mama" → "Para: Mamá").
+ *
+ * Técnica: overlay con posición absoluta, mismo font/padding que el
+ * textarea, color: transparent excepto el <mark>. El textarea tiene
+ * background: transparent así el overlay se ve "detrás" pero del
+ * mismo lado del z-index (usamos pointer-events:none para no robar
+ * los clicks).
+ */
+
+.composer-row {
+  position: relative;
+}
+
+.contact-match-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  pointer-events: none;
+  z-index: 1;
+  /* Replicar EXACTAMENTE los estilos del textarea para que el layout
+     (saltos de línea, kerning) coincida píxel a píxel. JS además fuerza
+     padding/border vía getComputedStyle al init para cubrir cualquier
+     override que hagan media queries (mobile #input). */
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1.55;
+  padding: 2px 0;
+  border: none;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  word-break: break-word;
+  color: transparent;
+  background: transparent;
+  overflow: hidden;
+  margin: 0;
+  /* Mismo box-sizing que el textarea (browser default = content-box,
+     pero los textareas usan border-box en muchos UAs — lo forzamos
+     explícito). */
+  box-sizing: border-box;
+}
+
+.contact-match-overlay .contact-match-hit {
+  background: transparent;
+  color: var(--green, #16a34a);
+  font-weight: 700;
+  /* Pequeño underline sutil para reforzar que el sistema lo detectó. */
+  text-decoration: underline;
+  text-decoration-color: var(--green, #16a34a);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+}
+
+#input {
+  /* Aseguramos que el textarea está sobre el overlay para que el caret
+     y el highlight de selección se vean — pero como ambos tienen
+     position:relative + z-index, el textarea se renderea encima. El
+     truco es que su background es transparent, así el <mark> del
+     overlay se ve a través. */
+  position: relative;
+  z-index: 0;
+}
+
+.contact-match-badge {
+  margin: 6px 12px 0 12px;
+  padding: 5px 10px;
+  font-size: 12px;
+  color: var(--text-dim);
+  background: rgba(126, 231, 135, 0.08);
+  border-left: 2px solid var(--green, #16a34a);
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-family: inherit;
+}
+
+.contact-match-badge[hidden] {
+  display: none;
+}
+
+.contact-match-badge .contact-match-name {
+  color: var(--green, #16a34a);
+  font-weight: 600;
+}
+
+.contact-match-badge .contact-match-phone {
+  color: var(--text-faint, #9ca3af);
+  margin-left: 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Per-source thumbs-up — atajo para marcar una fuente como correcta
+   sin pasar por el flow de 👎 → cards (2026-05-07). */
+.source-row .source-thumb {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-dim);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 0 6px;
+  border-radius: 4px;
+  opacity: 0;
+  transition: opacity 120ms ease, background 120ms ease, color 120ms ease;
+  line-height: 1;
+}
+.source-row:hover .source-thumb { opacity: 0.6; }
+.source-row .source-thumb:hover { opacity: 1; background: var(--bg-elev); color: var(--green); }
+.source-row .source-thumb.picked {
+  opacity: 1;
+  color: var(--green);
+  background: transparent;
+  border-color: var(--green);
+  cursor: default;
+}
+.source-row .source-thumb:disabled { cursor: default; }

@@ -1,0 +1,195 @@
+/* ── Quick-chips (2026-04-24) — claude.ai "From Gmail / From Drive"
+   pattern. Sólo visibles en empty state, debajo del composer hero.
+   Al click: llena #input con data-query y submitea.
+   Design: pill rounded-full, border sutil, icon + label 12-13px.
+   Hover: bg-elev + border-strong + color-text. */
+#quick-chips {
+  display: none;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+  margin: 20px auto 0;
+  /* `min(760px, 100%)` evita que en mobile (375px viewport) el container
+     fuerce al body a 760px de ancho, lo que rompía `position: fixed` del
+     modal de /help (terminaba renderado fuera de pantalla). En desktop
+     sigue siendo 760px, en mobile 100% del wrapper padre. */
+  max-width: min(760px, 100%);
+  /* `box-sizing: border-box` para que padding (24px en mobile) no infle
+     el max-width ni cause horizontal scroll secundario. */
+  box-sizing: border-box;
+}
+body.chat-empty #quick-chips {
+  display: flex;
+}
+
+.quick-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border-radius: 100px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background-color var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out),
+    transform var(--dur-fast) var(--ease-out);
+}
+.quick-chip:hover {
+  background: var(--bg-elev);
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+.quick-chip:active { transform: scale(0.97); }
+.quick-chip:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+.quick-chip-icon {
+  flex-shrink: 0;
+  opacity: 0.7;
+}
+.quick-chip:hover .quick-chip-icon {
+  opacity: 1;
+}
+
+/* Mobile: chips scrollean horizontal (row) en vez de wrap para caber
+   en pantallas angostas sin parecer una lista vertical apretada. */
+@media (max-width: 767px) {
+  #quick-chips {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    justify-content: flex-start;
+    padding: 0 16px 12px;
+    margin-top: 12px;
+    -webkit-overflow-scrolling: touch;
+    /* Scrollbar super sutil — apenas visible. */
+    scrollbar-width: none;
+  }
+  #quick-chips::-webkit-scrollbar { display: none; }
+  .quick-chip { flex-shrink: 0; }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   === a11y: skip-link, tap targets >=44px, focus-visible consistente ===
+   ═══════════════════════════════════════════════════════════════════
+   Bloque cross-cutting agregado 2026-04-24 (audit a11y LOTE 1).
+   - Skip-link: primer foco en cada page, oculto hasta `:focus`. Target
+     puede variar por page (#home / #chat / #main / #content) — cada
+     HTML apunta a su propio id y agrega `tabindex="-1"` al destino.
+   - Tap targets: >=44px en controles interactivos globales. Chips y
+     legend-dots inline siguen con su altura natural (excepciones).
+   - Focus-visible: outline cyan consistente para navegación por teclado.
+     `:focus` sin `-visible` queda a cargo de cada componente (si hace
+     `outline: none` para mouse, el :focus-visible lo restaura).
+   - Reduced-motion: ya cubierto por el bloque global a ~line 1967.
+   ═══════════════════════════════════════════════════════════════════ */
+
+.skip-link {
+  position: absolute;
+  top: 0;
+  left: 0;
+  padding: 8px 14px;
+  background: var(--bg-elev);
+  color: var(--cyan);
+  border: 2px solid var(--cyan);
+  border-radius: 0 0 4px 0;
+  font-size: 13px;
+  font-weight: 600;
+  text-decoration: none;
+  z-index: 10000;
+  /* Visualmente oculto pero accesible a screen-readers y keyboard. */
+  clip: rect(1px, 1px, 1px, 1px);
+  clip-path: inset(50%);
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.skip-link:focus,
+.skip-link:focus-visible {
+  clip: auto;
+  clip-path: none;
+  width: auto;
+  height: auto;
+  overflow: visible;
+  white-space: normal;
+  outline: 2px solid var(--cyan);
+  outline-offset: 2px;
+}
+
+/* Tap targets: 44px mínimo en mobile/touch (Apple HIG + WCAG 2.5.5 AAA).
+   Scoped a `(pointer: coarse), (max-width: 640px)` para preservar las
+   densidades compactas del desktop donde el usuario apunta con mouse
+   (botones inline chicos, sidebar icon-btns 36px, chat-mode-btn toggle,
+   etc.). En touch el padding aumentado evita mis-taps — el audit
+   identificó home-btn, dashboard window chips, status play/stop, y
+   chat icon-btn como los targets bajo 44px en mobile. */
+@media (pointer: coarse), (max-width: 640px) {
+  button,
+  [role="button"],
+  input[type="submit"],
+  input[type="button"],
+  a.btn,
+  .btn {
+    min-height: 44px;
+  }
+  /* Excepciones: elementos inline pequeños donde 44px rompe el layout
+     (chips, keycaps, legend dots, meta-pills, checkboxes compactos,
+     collapse toggles ocultos por default). */
+  .legend-dot,
+  .quick-chip,
+  .help-key,
+  .meta-pill,
+  .rem-check,
+  .add-reminder-btn,
+  .collapse-btn,
+  .narrative-refresh,
+  .bucket,
+  .tool-chip,
+  .created-chip,
+  .slash-item,
+  .history-item,
+  .fb-text-btn,
+  .msg-action,
+  .chat-mode-btn,
+  .sidebar-pin-btn {
+    min-height: unset;
+  }
+}
+
+/* Focus-visible global — keyboard users siempre ven el foco. */
+:focus-visible {
+  outline: 2px solid var(--cyan, #79c0ff);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+/* Main landmark con tabindex=-1 no debe mostrar outline al recibir
+   foco programático desde el skip-link (no es interactivo). */
+main:focus,
+main:focus-visible {
+  outline: none;
+}
+
+/* ── Home page overrides (LOTE 5 a11y) ─────────────────────────────
+   Scoped a `.home-*` para no chocar con dashboard/chat/status.
+   Mantenemos los overrides AL FINAL para que ganen specificity sin
+   tener que reescribir las reglas base. */
+
+/* `.home-btn` en mobile arrancaba en 12px — sub-óptimo para legibility
+   (WCAG 2.5.5 + Apple HIG sugieren ≥ 14px en touch). El tap-target de
+   44px ya lo cubre la regla global de pointer:coarse en este mismo
+   archivo (.home-btn NO está en la exclusion list), así que acá sólo
+   bumpeamos la tipografía para que el label no quede minúsculo al lado
+   del icon spinner. */
+@media (pointer: coarse), (max-width: 640px) {
+  .home-btn {
+    font-size: 14px;
+  }
+}

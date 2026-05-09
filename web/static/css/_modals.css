@@ -1,0 +1,243 @@
+/* ── Sheet (bottom-sheet modal) ────────────────────────────────────
+   Pattern inspirado en iOS action sheets: card al bottom, slide-up
+   animation, backdrop con blur leve. Usa las mismas tokens de motion
+   (--ease-out, --dur-slow) que el resto del chrome.
+   Se diseña mobile-first pero funciona fine en desktop también — si
+   alguien redimensiona chico la ventana. */
+.sheet {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: grid;
+  align-items: end;   /* bottom-sheet — card pegado al bottom */
+  pointer-events: auto;
+}
+.sheet[hidden] { display: none; }
+.sheet-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  -webkit-backdrop-filter: blur(2px);
+  backdrop-filter: blur(2px);
+  animation: sheetFadeIn var(--dur-base) var(--ease-out);
+}
+.sheet-card {
+  position: relative;
+  background: var(--bg-elev);
+  border-top: 1px solid var(--border-strong);
+  border-radius: 18px 18px 0 0;
+  padding: 16px 16px calc(16px + env(safe-area-inset-bottom, 0px));
+  box-shadow: var(--shadow-lg);
+  max-height: 80vh;
+  overflow-y: auto;
+  animation: sheetSlideUp var(--dur-slow) var(--ease-out);
+}
+.sheet-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 0 0 12px;
+}
+.sheet-head h2 {
+  font-size: 15px;
+  margin: 0;
+  color: var(--text);
+  font-weight: 600;
+}
+.sheet-close {
+  background: transparent;
+  border: 0;
+  color: var(--text-dim);
+  font-size: 24px;
+  line-height: 1;
+  cursor: pointer;
+  /* Touch target: 44×44 aunque el × visual sea chico. */
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0;
+}
+.sheet-close:hover { color: var(--text); }
+.sheet-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.sheet-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.sheet-row > label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-faint);
+}
+.sheet-row select {
+  /* Native select con polish mínimo — en iOS abre picker rueda nativa,
+     no queremos reinventar. El padding generoso asegura tap target. */
+  appearance: auto;
+  -webkit-appearance: auto;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 12px;
+  font-size: 16px;   /* 16px evita auto-zoom iOS al focusear */
+  font-family: inherit;
+  min-height: 44px;
+}
+.sheet-toggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 14px;
+  cursor: pointer;
+  min-height: 44px;
+  transition: border-color var(--dur-fast) var(--ease-out),
+              background-color var(--dur-fast) var(--ease-out);
+}
+.sheet-toggle .tts-icon {
+  /* Reutiliza el mismo icon del topbar toggle. Placeholder redondito si
+     el #tts-toggle original no está pintado (primer load antes de JS). */
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.4;
+  flex-shrink: 0;
+  transition: opacity var(--dur-fast) var(--ease-out);
+}
+.sheet-toggle[aria-pressed="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.sheet-toggle[aria-pressed="true"] .tts-icon { opacity: 1; }
+.sheet-toggle-label { flex: 1; text-align: left; }
+.sheet-toggle-state {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-faint);
+}
+.sheet-toggle[aria-pressed="true"] .sheet-toggle-state { color: var(--accent); }
+.sheet-toggle:active { transform: scale(0.98); }
+.sheet-nav {
+  display: flex;
+  gap: 12px;
+  margin-top: 8px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.sheet-nav a {
+  flex: 1;
+  text-align: center;
+  padding: 12px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text);
+  text-decoration: none;
+  font-size: 14px;
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: border-color var(--dur-fast) var(--ease-out);
+}
+.sheet-nav a:hover { border-color: var(--accent); color: var(--accent); }
+
+@keyframes sheetFadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes sheetSlideUp {
+  from { transform: translateY(100%); }
+  to   { transform: translateY(0); }
+}
+
+/* Reduced-motion users: sin slide, sólo fade. */
+@media (prefers-reduced-motion: reduce) {
+  .sheet-card { animation: sheetFadeIn var(--dur-base) var(--ease-out); }
+}
+
+
+@media (max-width: 480px) {
+  /* iPhone portrait. El anti-zoom fix + full-width bubbles. */
+  html, body {
+    font-size: 14px;
+  }
+  /* KEY: el input necesita ≥16px para que Safari iOS NO haga auto-zoom
+     al focusearlo. El resto del chat sigue a 14px (aesthetic desktop). */
+  #input {
+    font-size: 16px;
+    /* iOS añade un appearance default que el form de PWA toma — reset. */
+    -webkit-appearance: none;
+    appearance: none;
+  }
+  /* Bubbles: usen casi todo el viewport. */
+  .msg .bubble {
+    max-width: 100%;
+  }
+  /* Help button con padding mayor para ser touch-target (≥44×44).
+     NOTA: el breakpoint 640px arriba ya setea 44×44 para help-btn.
+     Esta regla antes decía 36×36 (legacy, pre-Mobile Tier 1) y pisaba
+     el valor del 640px por specificity igual + orden cascade. La
+     corrimos a 44×44 para mantener el mínimo HIG iOS en todos los
+     breakpoints mobile. */
+  #help-btn {
+    min-width: 44px;
+    min-height: 44px;
+    padding: 0 10px;
+  }
+  /* Topbar title más compact. */
+  .topbar-title {
+    font-size: 14px;
+  }
+  /* Sources table: stack en mobile en vez de grid horizontal. */
+  .sources-row {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+  }
+}
+
+
+/* Safe area soporte para iPhones con notch / Dynamic Island, incluso en
+   landscape (el resto del CSS puede heredar el padding del body). */
+@supports (padding: max(0px)) {
+  body {
+    padding-left: env(safe-area-inset-left, 0);
+    padding-right: env(safe-area-inset-right, 0);
+  }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * Sidebar (2026-04-24) — claude.ai-style
+ * ═══════════════════════════════════════════════════════════════════════
+ * Reemplaza al viejo #topbar en /chat. Layout:
+ *   · desktop ≥768px: fixed column izquierda, 260px (expanded) / 64px
+ *     (collapsed). #chat corre con margin-left matching. El #topbar
+ *     ya no se usa en esta página, pero sus rules siguen en el CSS por
+ *     compat (home/dashboard todavía lo usan — este layout es /chat-
+ *     only).
+ *   · mobile <768px: off-screen por default, slidea in como drawer
+ *     sobre la UI cuando #sidebar.data-state="open". El #mobile-header
+ *     (hamburger) reemplaza al viejo #menu-btn.
+ * ═══════════════════════════════════════════════════════════════════════*/
+
+:root {
+  --sidebar-w: 260px;
+  --sidebar-w-mini: 64px;
+  --sidebar-bg: #17171c;
+  --sidebar-border: #2a2a32;
+  --sidebar-hover: #23232a;
+  --sidebar-active: #2d2d36;
+}

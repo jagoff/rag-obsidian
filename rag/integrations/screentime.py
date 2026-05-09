@@ -177,7 +177,18 @@ def _collect_screentime(
             ).fetchall()
         finally:
             conn.close()
-    except Exception:
+    except Exception as exc:
+        # Bug Hunt 2026-05-08 (M Int screentime): pre-fix swallowing total
+        # de exceptions sin traza. Cuando macOS upgradeaba el schema o la
+        # DB quedaba locked >2s, el panel screentime devolvía empty sin
+        # razón visible en silent_errors_log → operador no podía
+        # diferenciar "no hay datos" de "schema cambió". Compat con lazy
+        # import del helper para evitar circular import al boot.
+        try:
+            from rag import _silent_log
+            _silent_log("screentime_collect_failed", exc)
+        except Exception:
+            pass
         return empty
 
     top: list[dict] = []

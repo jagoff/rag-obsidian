@@ -6655,3 +6655,7 @@ if (typeof syncSheetFromOriginals === "function"&&!window.syncSheetFromOriginals
 if (typeof updateSendBtnState === "function"   && !window.updateSendBtnState)   window.updateSendBtnState = updateSendBtnState;
 if (typeof isIOSVersionBelow16 === "function"  && !window.isIOSVersionBelow16)  window.isIOSVersionBelow16 = isIOSVersionBelow16;
 if (typeof smoothBehavior === "function"       && !window.smoothBehavior)       window.smoothBehavior = smoothBehavior;
+
+// ── helpers internos usados por módulos ES ─────────────────────────────
+// autoGrow no estaba expuesto antes — app.mjs lo necesita para appendFollowups.
+if (typeof autoGrow === "function"             && !window.autoGrow)             window.autoGrow = autoGrow;

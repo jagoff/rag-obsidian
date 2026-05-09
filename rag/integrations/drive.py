@@ -37,6 +37,7 @@ Tests don't patch the constant directly. Re-exported at the bottom of
 from __future__ import annotations
 
 import json
+import os
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -101,8 +102,17 @@ def _drive_service():
             stored["access_token"] = creds.token
             stored["token"] = creds.token
             tokens_path.write_text(json.dumps(stored), encoding="utf-8")
+            try:
+                os.chmod(tokens_path, 0o600)
+            except OSError:
+                pass
         return build("drive", "v3", credentials=creds, cache_discovery=False)
-    except Exception:
+    except Exception as exc:
+        try:
+            from rag import _silent_log
+            _silent_log("drive_service_auth", exc)
+        except Exception:
+            pass
         return None
 
 

@@ -728,12 +728,20 @@ if _allow_tunnel:
             r"|^" + re.escape(_tunnel_url) + r"$"
         )
     else:
-        # State file missing/empty: extend regex with wildcard pattern so the
-        # tunnel still works from the browser, but credentials=False prevents
-        # cookies from being forwarded on cross-origin requests.
-        _cors_regex = (
-            r"(?:" + _cors_regex + r")"
-            r"|^https://[a-z0-9-]+\.trycloudflare\.com$"
+        # Bug Hunt 2026-05-08 H-5: el comportamiento previo extendía el
+        # regex a `*.trycloudflare.com` cuando faltaba el state file, lo
+        # que permite a cualquier subdominio (incluido un attacker con
+        # otro tunnel registrado) hacer fetch a /api/* desde su página.
+        # `credentials=False` reduce el daño (no cookies) pero el contenido
+        # del vault sigue siendo sensible. NO abrimos wildcard silencioso
+        # — loguear WARNING prominente y NO extender el regex.
+        print(
+            "[CORS] WARNING: OBSIDIAN_RAG_ALLOW_TUNNEL=1 pero state file "
+            "ausente/vacío en ~/.local/share/obsidian-rag/cloudflared-url.txt. "
+            "El tunnel NO va a funcionar via PWA hasta que se popule. "
+            "Antes se extendía el regex a *.trycloudflare.com (wildcard) — "
+            "removido por seguridad (Bug Hunt H-5).",
+            file=sys.stderr,
         )
 
 app.add_middleware(
@@ -848,9 +856,17 @@ def admin_token(request: Request):
 
     Restringido a localhost — un device remoto en LAN/tunnel NO puede leer
     el token aunque acceda al frontend (el browser del LAN-user pegaría 403).
+
+    Rate limit (Bug Hunt 2026-05-08 H-1): aún siendo loopback-only, evita
+    polling agresivo desde una extensión maliciosa o bug del frontend que
+    podría exfiltrar el token via timing/fingerprint si el host está
+    comprometido. Reusa `_BEHAVIOR_BUCKETS` (120 req/60s).
     """
     if not _is_localhost_request(request):
         raise HTTPException(status_code=403, detail="solo accesible desde localhost")
+    client_ip = (request.client.host if request.client else "unknown")
+    _check_rate_limit(_BEHAVIOR_BUCKETS, client_ip,
+                      _BEHAVIOR_RATE_LIMIT, _BEHAVIOR_RATE_WINDOW)
     return {"token": _ADMIN_TOKEN}
 
 
@@ -1710,9 +1726,12 @@ class ChatRequest(BaseModel):
     def _check_vault_scope(cls, v: str | None) -> str | None:
         if v is None or v == "":
             return None
-        # Same character class as session_id but shorter — vault names are
-        # paths / identifiers registered via `rag vault add`.
-        if len(v) > 200 or not re.match(r"^[A-Za-z0-9_./\-]{1,200}$", v):
+        # Bug Hunt 2026-05-08 H-4: regex previo permitía `/` y `.`
+        # (`^[A-Za-z0-9_./\-]{1,200}$`), traversal-ready si algún caller
+        # futuro usaba el valor como path. Vault names registrados son
+        # slugs simples (`home`, `work-vault`, `team_a`); restringir a
+        # `[A-Za-z0-9_-]` cierra el vector sin romper setups reales.
+        if len(v) > 80 or not re.match(r"^[A-Za-z0-9_\-]{1,80}$", v):
             raise ValueError("invalid vault_scope format")
         return v
 
@@ -2774,7 +2793,7 @@ class ReminderCreateRequest(BaseModel):
 
 
 @app.post("/api/reminders/create")
-def create_reminder(req: ReminderCreateRequest) -> dict:
+def create_reminder(req: ReminderCreateRequest, request: Request) -> dict:
     """Create an Apple Reminder.
 
     Dual-use:
@@ -2788,7 +2807,13 @@ def create_reminder(req: ReminderCreateRequest) -> dict:
     accepts the property across macOS versions — the reminder is created
     regardless (silent-fail on recurrence), caller should advise the user
     to verify in Reminders.app.
+
+    Rate limit (Bug Hunt 2026-05-08 H-3): reusa `_BEHAVIOR_BUCKETS`
+    (120 req/60s/IP) para evitar spam de Reminders desde LAN/tunnel.
     """
+    client_ip = (request.client.host if request.client else "unknown")
+    _check_rate_limit(_BEHAVIOR_BUCKETS, client_ip,
+                      _BEHAVIOR_RATE_LIMIT, _BEHAVIOR_RATE_WINDOW)
     from datetime import datetime as _dt
 
     from rag import _create_reminder  # noqa: PLC0415
@@ -2838,7 +2863,7 @@ class CalendarCreateRequest(BaseModel):
 
 
 @app.post("/api/calendar/create")
-def create_calendar_event(req: CalendarCreateRequest) -> dict:
+def create_calendar_event(req: CalendarCreateRequest, request: Request) -> dict:
     """Create a Calendar.app event. Called from chat proposal cards after
     the user confirms. Returns the event UID so the UI can surface a
     deep-link or deletion path.
@@ -2847,7 +2872,12 @@ def create_calendar_event(req: CalendarCreateRequest) -> dict:
     (unlike the JXA EventKit read path which can't see them without
     entitlement). If `calendar` is omitted we write to the first writable
     calendar — usually iCloud's default.
+
+    Rate limit (Bug Hunt 2026-05-08 H-3): `_BEHAVIOR_BUCKETS`.
     """
+    client_ip = (request.client.host if request.client else "unknown")
+    _check_rate_limit(_BEHAVIOR_BUCKETS, client_ip,
+                      _BEHAVIOR_RATE_LIMIT, _BEHAVIOR_RATE_WINDOW)
     from datetime import datetime as _dt
 
     from rag import _create_calendar_event  # noqa: PLC0415
@@ -3607,10 +3637,13 @@ def _parse_scheduled_for_to_utc(raw: str) -> str:
 
 
 @app.post("/api/whatsapp/send")
-def whatsapp_send(req: WhatsAppSendRequest) -> dict:
+def whatsapp_send(req: WhatsAppSendRequest, request: Request) -> dict:
     """Execute a WhatsApp send after the user clicked [Enviar] (envío
     inmediato) o [Programar] (envío diferido) on a ``propose_whatsapp_send``
     / ``propose_whatsapp_reply`` proposal card.
+
+    Rate limit (Bug Hunt 2026-05-08 H-3): bucket más estricto (10/min/IP)
+    porque WhatsApp expone al user a spam directo a sus contactos.
 
     Flow:
       1. `propose_whatsapp_send` (chat tool) resolves contact → JID and
@@ -3642,9 +3675,12 @@ def whatsapp_send(req: WhatsAppSendRequest) -> dict:
 
     Returns ``{ok: true, jid}`` (immediate) or ``{ok: true, scheduled:
     true, id, scheduled_for_utc}`` (deferred). Raises 400 on shape
-    problems, 502 on bridge unreachable. Rate-limited by the same IP
-    bucket as ``/api/chat``.
+    problems, 502 on bridge unreachable. Rate-limited stricto (10/min/IP)
+    para evitar spam (Bug Hunt 2026-05-08 H-3).
     """
+    client_ip = (request.client.host if request.client else "unknown")
+    # Bucket dedicado conservador: 10 mensajes/min/IP para WhatsApp.
+    _check_rate_limit(_BEHAVIOR_BUCKETS, client_ip + ":wa-send", 10, 60.0)
     jid = (req.jid or "").strip()
     body = (req.message_text or "").strip()
     if not jid or "@" not in jid:
@@ -3982,9 +4018,11 @@ class MailSendRequest(BaseModel):
 
 
 @app.post("/api/mail/send")
-def mail_send(req: MailSendRequest) -> dict:
+def mail_send(req: MailSendRequest, request: Request) -> dict:
     """Execute a Gmail send after the user clicked [Enviar] on a
     ``propose_mail_send`` proposal card.
+
+    Rate limit (Bug Hunt 2026-05-08 H-3): `_BEHAVIOR_BUCKETS` 120/min.
 
     Flow idéntico al de WhatsApp:
       1. `propose_mail_send` (chat tool) genera la propuesta + emite SSE
@@ -4001,10 +4039,13 @@ def mail_send(req: MailSendRequest) -> dict:
       - 502 si Gmail API rechaza (creds revocadas, rate limit, etc.) —
         devolvemos el ``error`` del helper como detail.
 
-    Rate-limit implícito: mismo bucket que ``/api/chat`` porque reusa la
-    auth del mismo OAuth client. No se loggea el body (privacy) —
-    solo el event + to + proposal_id para correlacionar con el turno.
+    Rate-limit explícito (Bug Hunt 2026-05-08 H-3): `_BEHAVIOR_BUCKETS`
+    120 req/min/IP. No se loggea el body (privacy) — solo el event + to
+    + proposal_id para correlacionar con el turno.
     """
+    client_ip = (request.client.host if request.client else "unknown")
+    _check_rate_limit(_BEHAVIOR_BUCKETS, client_ip,
+                      _BEHAVIOR_RATE_LIMIT, _BEHAVIOR_RATE_WINDOW)
     to_clean = (req.to or "").strip()
     body_clean = (req.body or "").strip()
     if not to_clean or "@" not in to_clean:
@@ -4258,7 +4299,9 @@ def trigger_reindex() -> dict:
     except FileNotFoundError:
         raise HTTPException(status_code=500, detail="rag CLI no encontrado en PATH")
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        # Bug Hunt 2026-05-08 H-2: NO exponer `str(exc)` (paths, internals).
+        print(f"[reindex] failed: {exc}", file=sys.stderr)
+        raise HTTPException(status_code=500, detail="reindex failed")
     return {"ok": True, "message": "index lanzado en background"}
 
 
@@ -9069,7 +9112,9 @@ def _home_compute(
             raise HTTPException(status_code=500, detail="today_evidence timeout") from exc
         except Exception as exc:
             pool.shutdown(wait=False, cancel_futures=True)
-            raise HTTPException(status_code=500, detail=str(exc))
+            # Bug Hunt 2026-05-08 H-2: NO exponer str(exc).
+            print(f"[home-stream] today_evidence failed: {exc}", file=sys.stderr)
+            raise HTTPException(status_code=500, detail="today_evidence failed")
 
         # Pendientes itself fans out 9 fetchers; cold path measured ~25s.
         # Bump cap to 45s — the user never waits on this since pre-warmer

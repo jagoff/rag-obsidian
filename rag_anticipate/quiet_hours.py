@@ -35,6 +35,31 @@ import shutil
 import subprocess
 from datetime import datetime, time as dtime
 
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover — py < 3.9
+    ZoneInfo = None  # type: ignore[assignment]
+
+
+def _now_in_local_tz(now: datetime) -> datetime:
+    """Convert `now` to the user's local timezone (`RAG_TIMEZONE`,
+    default `America/Argentina/Buenos_Aires`) so `.hour` reflects the
+    user's wall clock, not UTC or a fallback system tz.
+
+    Naive datetimes (`tzinfo=None`) son interpretados como hora local
+    (la convención del codebase, ver `_AR_OFFSET_HOURS` en
+    `rag/__init__.py`); en ese caso retornamos `now` sin tocar para
+    preservar el comportamiento previo.
+    """
+    if now.tzinfo is None or ZoneInfo is None:
+        return now
+    tz_name = (os.environ.get("RAG_TIMEZONE", "").strip()
+               or "America/Argentina/Buenos_Aires")
+    try:
+        return now.astimezone(ZoneInfo(tz_name))
+    except Exception:
+        return now
+
 
 def _get_night_window() -> tuple[dtime, dtime]:
     """Ventana nocturna. Default 22:00 → 08:00. Override via env:
@@ -224,7 +249,10 @@ def _is_nighttime(now: datetime) -> bool:
     if band is None:
         band = (23, 7)
     start_h, end_h = band
-    h = now.hour
+    # Convert tz-aware `now` al wall clock del user antes de leer .hour.
+    # Sin esto, un `now=datetime.now(timezone.utc)` evalúa la ventana
+    # 23-7 contra UTC y dispara/no dispara en el horario equivocado.
+    h = _now_in_local_tz(now).hour
     if start_h < end_h:
         # Ventana intra-día (ej. 13-14): start ≤ h < end.
         return start_h <= h < end_h

@@ -40,6 +40,7 @@ imports run after `rag.__init__` finishes, so they always succeed.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from datetime import datetime
@@ -122,6 +123,10 @@ def _gmail_service():
             creds.refresh(Request())
             stored["access_token"] = creds.token
             creds_path.write_text(json.dumps(stored), encoding="utf-8")
+            try:
+                os.chmod(creds_path, 0o600)
+            except OSError:
+                pass
         return build("gmail", "v1", credentials=creds, cache_discovery=False)
     except Exception as exc:
         _silent_log("gmail_service_fallback", exc)
@@ -168,6 +173,10 @@ def _gmail_send_service():
             creds.refresh(Request())
             stored["access_token"] = creds.token
             creds_path.write_text(json.dumps(stored), encoding="utf-8")
+            try:
+                os.chmod(creds_path, 0o600)
+            except OSError:
+                pass
         return build("gmail", "v1", credentials=creds, cache_discovery=False)
     except Exception as exc:
         _silent_log("gmail_send_service", exc)

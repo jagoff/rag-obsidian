@@ -206,10 +206,14 @@ def apply_mmr(
         cosine retorna 0 contra cualquier otra cosa → no afecta el
         max_sim inicial pero sí participa de la selección por relevance.
     """
+    # Bug Hunt 2026-05-08 (M Retrieval mmr_aliasing): mismo fix que
+    # `apply_mmr_with_folder_penalty` — shortcuts devolvían el input
+    # directamente, contaminando snapshots `_before` del caller. SIEMPRE
+    # devolver lista nueva via `list(scored)`.
     if not scored:
-        return scored
+        return list(scored)
     if len(scored) <= 1:
-        return scored
+        return list(scored)
     lambda_ = max(0.0, min(1.0, float(lambda_)))
     # Pure relevance shortcut: no need to embed nor compute MMR.
     if lambda_ >= 1.0:
@@ -217,7 +221,7 @@ def apply_mmr(
 
     pool_size = min(int(top_k), len(scored))
     if pool_size <= 1:
-        return scored
+        return list(scored)
 
     pool = list(scored[:pool_size])
     tail = list(scored[pool_size:])
@@ -234,7 +238,7 @@ def apply_mmr(
         except Exception:
             if on_skip:
                 on_skip("embed_import_failed")
-            return scored
+            return list(scored)
         embed_fn = _embed
 
     # Batch embed de los textos del pool. Si toma más del budget, fallback.
@@ -245,16 +249,16 @@ def apply_mmr(
     except Exception:
         if on_skip:
             on_skip("embed_call_failed")
-        return scored
+        return list(scored)
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
     if elapsed_ms > budget_ms:
         if on_skip:
             on_skip(f"embed_over_budget:{elapsed_ms:.0f}ms")
-        return scored
+        return list(scored)
     if not embeddings or len(embeddings) != len(pool):
         if on_skip:
             on_skip("embed_shape_mismatch")
-        return scored
+        return list(scored)
 
     # ── Greedy selection ────────────────────────────────────────────────
     # Slot 0: top-1 fijo.
@@ -321,16 +325,24 @@ def apply_mmr_with_folder_penalty(
         no reciben penalty NI lo aplican a otros — quedan sólo bajo
         relevance pura. Es el comportamiento conservador esperado.
     """
+    # Bug Hunt 2026-05-08 (M Retrieval mmr_folder_aliasing): los shortcuts
+    # devolvían `scored` directamente (no `list(scored)`), creando aliasing
+    # entre el output y el input del caller. `retrieve()` en rag/__init__.py
+    # usa `_before = list(_mmr_wrapped)` para snapshot pre-MMR y compara
+    # con `_mmr_after` via `count_reordered`. Cuando esta función retornaba
+    # el mismo objeto que el caller pasó, MMR reordering bugs en otros paths
+    # podían contaminar el `_before` snapshot. Fix consistencia: SIEMPRE
+    # devolver una lista nueva (cheap — top_k es <=10 típico).
     if not scored:
-        return scored
+        return list(scored)
     if len(scored) <= 1:
-        return scored
+        return list(scored)
     if folder_penalty <= 0.0:
         return list(scored)
 
     pool_size = min(int(top_k), len(scored))
     if pool_size <= 1:
-        return scored
+        return list(scored)
 
     pool = list(scored[:pool_size])
     tail = list(scored[pool_size:])

@@ -761,113 +761,33 @@ app.add_middleware(
 )
 
 # ── Admin token — protege endpoints de pánico / destructivos ─────────────────
-# Los endpoints tipo /api/reindex, /api/ollama/restart, /api/auto-fix-devin, etc.
-# no tienen auth. Con LAN-expose encendido, cualquier device en el WiFi puede
-# dispararlos. Este helper requiere un Bearer token que vive en un archivo 0o600
-# generado automáticamente al primer startup.
+# La lógica vive ahora en `web/_admin.py` (refactor W3b 2026-05-09). Acá
+# re-exportamos los símbolos para preservar back-compat con tests externos
+# (`from web.server import _require_admin_token`, etc.) y aplicamos el
+# `@app.get` decorator sobre `admin_token` (la función está sin decorar
+# en `_admin.py` para evitar el circular import server↔_admin que se
+# dispara al import-time del decorator).
 #
-# Uso desde el cliente:
+# Detalle (admin_token contract): Bearer en archivo 0o600 generado al
+# primer boot, persistido en ~/.config/obsidian-rag/admin_token.txt.
+# Uso desde cliente:
 #   curl -X POST http://localhost:8765/api/reindex \
 #        -H "Authorization: Bearer <token>"
-#
-# El token se imprime UNA vez al stderr al startup para que el user lo copie.
-# También está en ~/.config/obsidian-rag/admin_token.txt (0o600).
+from web._admin import (  # noqa: E402, F401
+    _ADMIN_TOKEN,
+    _ADMIN_TOKEN_PATH,
+    _is_localhost_request,
+    _load_or_create_admin_token,
+    _require_admin_token,
+    admin_token,
+)
 
-_ADMIN_TOKEN_PATH = Path.home() / ".config" / "obsidian-rag" / "admin_token.txt"
-
-
-def _load_or_create_admin_token() -> str:
-    """Lee el token de _ADMIN_TOKEN_PATH o lo genera (write-once, chmod 600).
-
-    Se llama una vez al import — el resultado queda en _ADMIN_TOKEN.
-    """
-    try:
-        _ADMIN_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-        if _ADMIN_TOKEN_PATH.exists():
-            token = _ADMIN_TOKEN_PATH.read_text(encoding="utf-8").strip()
-            if token:
-                return token
-        # Generar token nuevo
-        token = secrets.token_urlsafe(32)
-        # Escribir con tmp+replace para atomicidad
-        tmp = _ADMIN_TOKEN_PATH.with_suffix(".tmp")
-        tmp.write_text(token + "\n", encoding="utf-8")
-        tmp.chmod(0o600)
-        tmp.replace(_ADMIN_TOKEN_PATH)
-        # Print al stderr UNA sola vez para que el user lo vea en el log
-        sys.stderr.write(
-            f"\n[obsidian-rag] Admin token generado: {token}\n"
-            f"  Guardado en: {_ADMIN_TOKEN_PATH}\n"
-            f"  Usar en: Authorization: Bearer {token}\n\n"
-        )
-        return token
-    except Exception as exc:
-        # Fallback: token en memoria (no persistido). Suficiente para la sesión.
-        sys.stderr.write(
-            f"[obsidian-rag] WARNING: no pude escribir admin_token ({exc}); "
-            "usando token efímero en memoria.\n"
-        )
-        return secrets.token_urlsafe(32)
-
-
-_ADMIN_TOKEN: str = _load_or_create_admin_token()
-
-
-def _require_admin_token(request: Request) -> None:
-    """FastAPI dependency — 401 si el request no trae el Bearer token correcto.
-
-    Usar como: `@app.post("/api/...", dependencies=[Depends(_require_admin_token)])`.
-    Compara con `secrets.compare_digest` para evitar timing attacks.
-    """
-    auth = request.headers.get("Authorization", "")
-    scheme, _, provided = auth.partition(" ")
-    if scheme.lower() != "bearer" or not secrets.compare_digest(
-        provided.encode(), _ADMIN_TOKEN.encode()
-    ):
-        raise HTTPException(
-            status_code=401,
-            detail=(
-                "Se requiere Authorization: Bearer <admin_token>. "
-                "El token está en ~/.config/obsidian-rag/admin_token.txt"
-            ),
-        )
-
-
-def _is_localhost_request(request: Request) -> bool:
-    """True si el request viene de loopback (127.0.0.1, ::1, localhost).
-
-    Endpoints que sirven el admin_token al frontend confían en esto: el browser
-    del user accede vía localhost o ra.ai (mapeado a 127.0.0.1 en /etc/hosts).
-    Cualquier otro origin (LAN expose, tunnel) NO recibe el token.
-    """
-    if not request.client:
-        return False
-    host = (request.client.host or "").strip().lower()
-    return host in {"127.0.0.1", "::1", "localhost"}
-
-
-@app.get("/api/admin/token")
-def admin_token(request: Request):
-    """Devuelve el admin_token al frontend SI el request es de loopback.
-
-    El frontend (`/static/*.js`) llama este endpoint una vez al boot,
-    cachea el token en memoria y lo manda como `Authorization: Bearer X`
-    en los 8 endpoints admin (auto-fix-devin, reindex, ollama/*, etc.).
-
-    Restringido a localhost — un device remoto en LAN/tunnel NO puede leer
-    el token aunque acceda al frontend (el browser del LAN-user pegaría 403).
-
-    Rate limit (Bug Hunt 2026-05-08 H-1): aún siendo loopback-only, evita
-    polling agresivo desde una extensión maliciosa o bug del frontend que
-    podría exfiltrar el token via timing/fingerprint si el host está
-    comprometido. Reusa `_BEHAVIOR_BUCKETS` (120 req/60s).
-    """
-    if not _is_localhost_request(request):
-        raise HTTPException(status_code=403, detail="solo accesible desde localhost")
-    client_ip = (request.client.host if request.client else "unknown")
-    _check_rate_limit(_BEHAVIOR_BUCKETS, client_ip,
-                      _BEHAVIOR_RATE_LIMIT, _BEHAVIOR_RATE_WINDOW)
-    return {"token": _ADMIN_TOKEN}
+# Aplicamos el decorator manual — equivalente a `@app.get("/api/admin/token")`
+# sobre la función importada arriba. La función hace lazy lookup de
+# `_is_localhost_request` y `_check_rate_limit` sobre `web.server` para
+# preservar el patrón `patch("web.server._is_localhost_request", ...)`
+# que usan los tests.
+app.get("/api/admin/token")(admin_token)
 
 
 # Chat model for /chat. Delegated to `resolve_chat_model()` so it tracks
@@ -1248,332 +1168,47 @@ def _build_propose_create_override(today: datetime | None = None) -> str:
     )
 
 
-# Idle sweeper — evict reranker from MPS tras inactividad. Antes vivía
-# inline dentro de `_warmup()`, lo extraje a top-level con stop event +
-# singleton check (mismo patrón que samplers) para que el lifespan
-# shutdown corte el daemon thread y los tests no acumulen zombies que
-# segfaultean al teardown del módulo.
-_IDLE_SWEEPER_THREAD: "threading.Thread | None" = None
-_IDLE_SWEEPER_STOP = threading.Event()
+# ── Lifecycle: idle sweeper + warmup ─────────────────────────────────────────
+# La lógica vive ahora en `web/_lifecycle.py` (refactor W3c 2026-05-09).
+# Acá re-importamos los símbolos para preservar back-compat con tests
+# externos y aplicamos los decoradores `@_on_startup` / `@_on_shutdown`
+# (que no se pueden mover a `_lifecycle.py` porque populan listas locales
+# del módulo `web.server` y porque hay 9+ otros call sites con decorador
+# en este mismo file).
+#
+# Cross-module dependencies: `_warmup` necesita 15+ helpers que viven en
+# `web.server` (`_load_home_cache`, `_ensure_*_prewarmer`, `_FOLLOWUP_AGING_CACHE`,
+# etc.). Para evitar circular import al import-time, esas refs están
+# resueltas via lazy lookup `from web import server as _ws` dentro del
+# cuerpo de `_warmup` en `_lifecycle.py`. Eso también respeta el
+# monkeypatch que hacen los tests sobre `web.server.*`.
+from web._lifecycle import (  # noqa: E402, F401
+    _IDLE_SWEEPER_STOP,
+    _IDLE_SWEEPER_THREAD,
+    _start_idle_sweeper,
+)
+from web._lifecycle import _stop_idle_sweeper as _lifecycle_stop_idle_sweeper  # noqa: E402
+from web._lifecycle import _warmup as _lifecycle_warmup  # noqa: E402
 
 
-def _start_idle_sweeper() -> None:
-    """Arranca el daemon thread del idle sweeper. Idempotente."""
-    global _IDLE_SWEEPER_THREAD
-    if _IDLE_SWEEPER_THREAD is not None and _IDLE_SWEEPER_THREAD.is_alive():
-        return
-    _IDLE_SWEEPER_STOP.clear()
-
-    def _idle_sweeper() -> None:
-        """Evict the reranker from MPS after `_RERANKER_IDLE_TTL` of no
-        activity. Keeps the Mac responsive when the user walks away from
-        chat — 2-3 GB of unified memory freed on idle.
-
-        After eviction, schedules a deferred pre-warm 60s later so the
-        reranker is hot again before the likely next request. The
-        pre-warm runs in its own daemon thread and MUST NOT block the
-        sweeper loop.
-
-        When `RAG_RERANKER_NEVER_UNLOAD=1` (env var) the sweeper loop
-        still runs but skips `maybe_unload_reranker()` entirely.
-        """
-        from rag import maybe_unload_reranker, get_reranker
-        _never_unload = os.environ.get(
-            "RAG_RERANKER_NEVER_UNLOAD", "",
-        ).strip() not in ("", "0", "false", "no")
-        if _never_unload:
-            print(
-                "[idle-sweep] RAG_RERANKER_NEVER_UNLOAD=1 — reranker pinned, "
-                "sweeper disabled",
-                flush=True,
-            )
-        while not _IDLE_SWEEPER_STOP.is_set():
-            try:
-                # `wait()` retorna True si el stop event se setea →
-                # exit limpio (vs `time.sleep(120)` que ataba el thread
-                # 2 minutos al shutdown).
-                if _IDLE_SWEEPER_STOP.wait(timeout=120):
-                    return
-                if _never_unload:
-                    continue
-                if maybe_unload_reranker():
-                    print("[idle-sweep] reranker unloaded from MPS", flush=True)
-
-                    def _deferred_rewarm() -> None:
-                        # Mismo trato: wait con stop event, exit limpio
-                        # si el server cae antes de los 60s.
-                        if _IDLE_SWEEPER_STOP.wait(timeout=60):
-                            return
-                        try:
-                            get_reranker()
-                            print(
-                                "[idle-sweep] reranker pre-warmed (deferred)",
-                                flush=True,
-                            )
-                        except Exception:
-                            pass
-
-                    threading.Thread(
-                        target=_deferred_rewarm,
-                        name="reranker-rewarm",
-                        daemon=True,
-                    ).start()
-            except Exception:
-                pass
-
-    _IDLE_SWEEPER_THREAD = threading.Thread(
-        target=_idle_sweeper, name="idle-sweeper", daemon=True,
-    )
-    _IDLE_SWEEPER_THREAD.start()
-
-
+# Decoradores aplicados acá (NO en `_lifecycle.py`) para registrar las
+# funciones en `_startup_callbacks` / `_shutdown_callbacks` de este módulo.
 @_on_shutdown
 def _stop_idle_sweeper() -> None:
-    """Señaliza al idle sweeper + join breve."""
-    _IDLE_SWEEPER_STOP.set()
-    if _IDLE_SWEEPER_THREAD is not None:
-        _IDLE_SWEEPER_THREAD.join(timeout=2.0)
+    """Wrapper local que delega en `_lifecycle._stop_idle_sweeper()`."""
+    _lifecycle_stop_idle_sweeper()
 
 
 @_on_startup
 def _warmup() -> None:
-    """Hydrate the home cache and kick the bg prewarmer; DO NOT pin the
-    chat model or reranker on boot.
+    """Wrapper local que delega en `_lifecycle._warmup()`.
 
-    The previous version called `ollama.chat(model=command-r, ...)` on
-    startup which pinned ~19 GB of unified memory even when the user was
-    only browsing /dashboard or /. On a 36 GB Mac that's enough wired
-    memory to starve the kernel and cause host freezes. Warmup of the
-    expensive bits (reranker MPS init, chat model load) now happens
-    on-demand from the first /api/chat request — 2-3s extra cost on one
-    query in exchange for not holding the machine hostage when idle.
-
-    Corpus/BM25/PageRank are cheap (RAM only, no VRAM), so we still
-    preload them so the first retrieve is fast.
+    El cuerpo real (15+ deps en `web.server`, 80+ líneas) vive en
+    `web/_lifecycle.py`. Este wrapper preserva el `web.server._warmup`
+    como atributo del módulo para que `monkeypatch.setattr(web_server,
+    "_warmup", lambda: None)` siga funcionando en tests.
     """
-    import threading
-
-    _load_home_cache()
-    _ensure_home_prewarmer()
-    _ensure_chat_model_prewarmer()
-    _ensure_reranker_prewarmer()
-    _ensure_corpus_prewarmer()
-
-    # Record this daemon startup in rag_ambient so restart count is queryable
-    # via SQL instead of grepping web.log.
-    try:
-        import importlib.metadata as _imeta
-        _rag_ver: str | None = _imeta.version("obsidian-rag")
-    except Exception:
-        _rag_ver = None
-    try:
-        _startup_payload: dict = {
-            "pid": os.getpid(),
-            "ts": datetime.now().isoformat(timespec="seconds"),
-        }
-        if _rag_ver:
-            _startup_payload["version"] = _rag_ver
-        with _ragvec_state_conn() as _sc:
-            _sql_append_event(_sc, "rag_ambient", {
-                "ts": datetime.now().isoformat(timespec="seconds"),
-                "cmd": "serve.startup",
-                "payload_json": _startup_payload,
-            })
-    except Exception as _exc:
-        print(f"[warmup] startup event skipped: {_exc}", flush=True)
-
-    # Memory-pressure watchdog — evita beachballs si el server + otras apps
-    # saturan los 36 GB unified memory. Fires keep_alive=0 sobre el chat
-    # model a los >85%, force-unload del reranker si sigue alto. Ver doc
-    # extensa en rag.py alrededor de `_system_memory_used_pct()`.
-    try:
-        from rag import start_memory_pressure_watchdog
-        start_memory_pressure_watchdog()
-    except Exception as _exc:
-        print(f"[warmup] memory-pressure watchdog skipped: {_exc}", flush=True)
-
-    # WAL checkpointer — libera páginas del WAL cada 30s para que los
-    # writers concurrentes (queries, behavior, cache) no peguen contra el
-    # busy_timeout bajo carga sostenida. Audit 2026-04-24.
-    try:
-        from rag import start_wal_checkpointer
-        start_wal_checkpointer()
-    except Exception as _exc:
-        print(f"[warmup] wal-checkpointer skipped: {_exc}", flush=True)
-
-    def _do_warmup() -> None:
-        try:
-            from rag import get_db_for
-            for _name, path in resolve_vault_paths(None):
-                try:
-                    col = get_db_for(path)
-                    if col.count():
-                        _load_corpus(col)
-                        get_pagerank(col)
-                except Exception:
-                    pass
-                break
-            # End-to-end warmup: load the expensive singletons that the
-            # first /api/chat would otherwise pay for (reranker on MPS +
-            # bge-m3 SentenceTransformer + one dummy embed pass). Only
-            # fires when the operator has opted into pinning them via the
-            # same flags that keep them resident.
-            if os.environ.get("RAG_RERANKER_NEVER_UNLOAD", "").strip() not in ("", "0", "false", "no"):
-                try:
-                    from rag import get_reranker as _get_rr
-                    _rr = _get_rr()
-                    _rr_device = getattr(getattr(_rr, "model", None), "device", "?")
-                    print(f"[warmup] reranker loaded on {_rr_device}", flush=True)
-                except Exception as _exc:
-                    print(f"[warmup] reranker skipped: {_exc}", flush=True)
-            # MLX chat-model prewarm (post-Ola-3 cutover, 2026-05-05): bajo
-            # RAG_LLM_BACKEND=mlx el primer /api/chat paga cold-load
-            # (~60-80s qwen2.5:7b 4-bit MPS). Cargar acá mueve la latencia
-            # fuera del path user-facing. Override: RAG_MLX_NO_PREWARM=1.
-            if (
-                os.environ.get("RAG_LLM_BACKEND", "mlx").strip().lower() == "mlx"
-                and os.environ.get("RAG_MLX_NO_PREWARM", "").strip() in ("", "0", "false", "no")
-            ):
-                try:
-                    from rag.llm_backend import get_backend as _get_bk
-                    _bk = _get_bk()
-                    if _bk.name == "mlx":
-                        _chat_model = _resolve_web_chat_model()
-                        _t0 = time.time()
-                        _bk._load(_chat_model)
-                        print(
-                            f"[warmup] mlx chat model {_chat_model} loaded in "
-                            f"{time.time()-_t0:.1f}s",
-                            flush=True,
-                        )
-                except Exception as _exc:
-                    print(f"[warmup] mlx chat prewarm skipped: {_exc}", flush=True)
-            if os.environ.get("RAG_LOCAL_EMBED", "").strip() not in ("", "0", "false", "no"):
-                try:
-                    # `_warmup_local_embedder()` es el único helper que, además
-                    # de cargar el modelo y hacer un dummy encode, setea el
-                    # `_local_embedder_ready.Event` que `query_embed_local()`
-                    # checkea como gate non-blocking. Antes del 2026-04-22
-                    # este startup llamaba `_get_local_embedder()` + `.encode`
-                    # directo, lo que cargaba el modelo pero NO seteaba el
-                    # Event → cada `/api/chat` caía al fallback ollama
-                    # (~140ms vs ~10-30ms local). Ver
-                    # test_web_local_embed_warmup.py para el contrato.
-                    from rag import _warmup_local_embedder
-                    if _warmup_local_embedder():
-                        print("[warmup] bge-m3 local embedder ready (event set)", flush=True)
-                    else:
-                        print("[warmup] bge-m3 local embedder skipped (load/encode failed)", flush=True)
-                except Exception as _exc:
-                    print(f"[warmup] local embed skipped: {_exc}", flush=True)
-            # Drain any conversation turns that failed to persist on previous
-            # runs (transient SQL busy / disk full / etc). Best-effort;
-            # survivors stay in the file for the next startup.
-            try:
-                _retried = _retry_pending_conversation_turns()
-                if _retried:
-                    print(f"[warmup] retried {_retried} pending conversation turn(s)",
-                          flush=True)
-            except Exception as _exc:
-                print(f"[warmup] conversation-turn retry failed: {_exc}", flush=True)
-            # Pre-warm followup_aging cache (2026-04-30 + 2026-05-01).
-            # Cold path real medido: ~9 min (find_followup_loops + LLM-judge
-            # por cada uno de ~95 open loops). Pagar ESO en cada restart del
-            # web server era inaceptable.
-            #
-            # Strategy en 2 fases:
-            #   1. Si hay un payload fresh (<24h) en disk, hidratá in-memory
-            #      desde ahí — instant. Cubre el caso "kickstart después de
-            #      sesión normal" donde el cache anterior sigue siendo válido.
-            #   2. Si no hay payload fresh en disk, dispará el cold compute
-            #      en bg (esto sigue tomando ~9min para vault grande). Hasta
-            #      que termine, el primer request al panel ve `None` — no
-            #      peor que pre-fix, pero ahora el resultado SE PERSISTE
-            #      al disk al terminar, así que el próximo restart ya
-            #      hidrata sin pagar el costo.
-            try:
-                hydrated = _followup_aging_hydrate_from_disk_if_needed()
-                if hydrated:
-                    print(
-                        f"[warmup] followup_aging hydrated from disk "
-                        f"(total={(_FOLLOWUP_AGING_CACHE['payload'] or {}).get('total', 0)}, "
-                        f"age={int(time.time() - _FOLLOWUP_AGING_CACHE['ts'])}s)",
-                        flush=True,
-                    )
-                else:
-                    t0_fw = time.time()
-                    _compute_followup_aging_result = _compute_followup_aging()
-                    if _compute_followup_aging_result is not None:
-                        now = time.time()
-                        _FOLLOWUP_AGING_CACHE["ts"] = now
-                        _FOLLOWUP_AGING_CACHE["payload"] = _compute_followup_aging_result
-                        _followup_aging_persist(
-                            now, _compute_followup_aging_result,
-                            elapsed_s=now - t0_fw,
-                        )
-                        print(
-                            f"[warmup] followup_aging cache pre-warmed in "
-                            f"{now - t0_fw:.1f}s "
-                            f"(total={_compute_followup_aging_result.get('total', 0)}) "
-                            f"+ persisted to disk",
-                            flush=True,
-                        )
-            except Exception as _exc:
-                print(f"[warmup] followup_aging pre-warm failed: {_exc}", flush=True)
-        except Exception:
-            pass
-
-    threading.Thread(target=_do_warmup, daemon=True).start()
-
-    # 2026-05-01 (afternoon): bloquear el startup hook hasta que
-    # `_local_embedder_ready` Event esté set (o un cap de 20s
-    # elapse) cuando RAG_LOCAL_EMBED=1. Pre-fix, los primeros 5-6
-    # /api/chat post-restart pagaban embed_ms = 4-7s porque el
-    # warmup async todavía no había seteado el Event y el path
-    # de retrieve esperaba 6s antes de fallback-ear a ollama
-    # (que ALSO arrancaba cold en algunos casos). El user veía
-    # las primeras búsquedas post-restart muy lentas.
-    #
-    # Trade-off: el daemon tarda 5-15s más en arrancar (el
-    # `_warmup_local_embedder()` carga bge-m3 SentenceTransformer
-    # + 1 dummy encode = ~5s en M3 Max warm disk). Acceptable —
-    # el daemon ya tiene `ThrottleInterval=30s` en el plist así
-    # que no rebota tan rápido. Skip via env si hace falta:
-    # `RAG_WEB_BLOCK_ON_EMBED_WARMUP=0` restaura el legacy
-    # non-blocking startup.
-    _block_embed_str = os.environ.get(
-        "RAG_WEB_BLOCK_ON_EMBED_WARMUP", "1"
-    ).strip().lower()
-    if (
-        _block_embed_str not in ("0", "false", "no")
-        and os.environ.get("RAG_LOCAL_EMBED", "").strip()
-            not in ("", "0", "false", "no")
-    ):
-        try:
-            from rag import _local_embedder_ready
-            _t0_embed_block = time.perf_counter()
-            _ready = _local_embedder_ready.wait(timeout=20.0)
-            _block_ms = int((time.perf_counter() - _t0_embed_block) * 1000)
-            if _ready:
-                print(
-                    f"[warmup] embedder ready in {_block_ms}ms — "
-                    f"first query will skip cold-load",
-                    flush=True,
-                )
-            else:
-                print(
-                    f"[warmup] embedder NOT ready after {_block_ms}ms — "
-                    f"continuing anyway, first queries may pay cold-load tax",
-                    flush=True,
-                )
-        except Exception as _exc:
-            print(
-                f"[warmup] embedder block-on-warmup skipped: "
-                f"{type(_exc).__name__}: {_exc}",
-                flush=True,
-            )
-
-    _start_idle_sweeper()
+    _lifecycle_warmup()
 
 
 @app.get("/")

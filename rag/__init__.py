@@ -45315,6 +45315,48 @@ def ambient_status():
             pass
 
 
+@ambient.command("enable")
+@click.option("--jid", required=True,
+              help="JID del chat WA destino (ej. '54911...@s.whatsapp.net' "
+                   "para DM, '...@g.us' para grupo).")
+@click.option("--force", is_flag=True,
+              help="Sobreescribir si ya existe config.")
+def ambient_enable(jid: str, force: bool):
+    """Habilitar ambient sin pasar por el bot WA.
+
+    Workaround del flow normal `/enable_ambient` desde el bot — útil cuando
+    el listener TS está caído, o cuando el user quiere setup manual del
+    archivo de config. El JID hay que conseguirlo aparte (ej. del listener
+    log, o del SQL bridge `whatsapp-bridge/store/messages.db`).
+
+    Sin esto, el path canónico es: mandar `/enable_ambient` al bot WA y el
+    listener escribe `~/.local/share/obsidian-rag/ambient.json` con el jid
+    del chat origen.
+    """
+    jid = jid.strip()
+    if not jid:
+        console.print("[red]JID vacío[/red]")
+        raise click.Abort()
+    if "@" not in jid:
+        console.print(f"[red]JID inválido[/red] — falta '@' en '{jid}'")
+        raise click.Abort()
+    if AMBIENT_CONFIG_PATH.is_file() and not force:
+        console.print(
+            f"[yellow]Ya existe config[/yellow] en {AMBIENT_CONFIG_PATH}. "
+            "Usá --force para sobreescribir o `rag ambient status` para verla."
+        )
+        raise click.Abort()
+    AMBIENT_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    AMBIENT_CONFIG_PATH.write_text(
+        json.dumps({"jid": jid, "enabled": True}, indent=2),
+        encoding="utf-8",
+    )
+    console.print(
+        f"[green]✓[/green] ambient habilitado · jid=[cyan]{jid}[/cyan]\n"
+        f"[dim]Config: {AMBIENT_CONFIG_PATH}[/dim]"
+    )
+
+
 @ambient.command("disable")
 def ambient_disable():
     """Deshabilitar ambient (deja el config pero con enabled=false)."""
@@ -53792,6 +53834,9 @@ from rag.cli.patterns import (  # noqa: E402, F401
     patterns_group,
 )
 cli.add_command(patterns_group, name="patterns")  # `rag patterns {...}` (Phase 2e 2026-05-09)
+
+from rag.cli.supervisor import supervisor_group  # noqa: E402, F401
+cli.add_command(supervisor_group, name="supervisor")  # `rag supervisor {run,status,trigger,...}` (F1 2026-05-09)
 
 # Sub-commands del feedback group (definido más arriba en este módulo).
 # Las funciones están en `rag/cli/feedback_judge.py` como `@click.command`

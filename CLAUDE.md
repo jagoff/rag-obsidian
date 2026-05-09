@@ -128,6 +128,22 @@ Hand-written en [`completions/_rag`](completions/_rag) con descriptions + sub-gr
 
 Instalación: `cp completions/_rag ~/.oh-my-zsh/custom/completions/_rag && rm -f ~/.zcompdump* && exec zsh`. Regenerar: `.venv/bin/python scripts/gen_zsh_completion.py > completions/_rag`.
 
+## Personal Mirror (`/mirror`)
+
+Vista única que combina vault + telemetry + integraciones cross-source en un "espejo" del estado del user. Aggregator en [`rag/mirror.py`](rag/mirror.py), endpoints `/mirror` (HTML), `/api/mirror` (JSON), `/api/mirror/insights` (LLM lazy) en [`web/server.py`](web/server.py). Frontend [`web/static/mirror.{html,css,js}`](web/static/).
+
+**8 sources paralelas** (ThreadPoolExecutor, timeout 3s c/u, falla aislada):
+1. `active_projects` — `01-Projects/<sub>/` con mtime últimos 30d (top 5).
+2. `top_entities` — `rag_entity_mentions` últimos 7d (top 8).
+3. `mood_today` — `rag_mood_score_daily` row de hoy.
+4. `mood_timeline` — últimos 30d para sparkline ASCII.
+5. `pendientes` — Apple Reminders due ≤72h + Calendar próximas 12h.
+6. `dormant_notes` — notas con mtime ≥30d en `01-Projects/`/`02-Areas/`/`03-Resources/`.
+7. `spotify_top` — `rag_spotify_log` top 5 artistas 7d.
+8. `observations` — eval_runs_7d, contradictions_open, anticipate_pushes_today, queries_today.
+
+Cache 30min in-process. `cache_invalidate()` se llama desde event handlers (`mood.signal.inserted`, `vault.note.changed`, `wa.message.inbound`). LLM insights via `qwen2.5:3b` helper, JSON estricto, cap 5×500 chars.
+
 ## PWA + LAN/HTTPS exposure
 
 PWA instalable iOS Safari → home screen. Wiring: [`web/static/manifest.webmanifest`](web/static/manifest.webmanifest), [`sw.js`](web/static/sw.js), [`pwa/register-sw.js`](web/static/pwa/register-sw.js) + [`scripts/gen_pwa_assets.py`](scripts/gen_pwa_assets.py).

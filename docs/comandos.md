@@ -429,6 +429,18 @@ Si además tenés el web server corriendo (`rag serve` o el servicio launchd `co
 
 Más sobre el ranker-vivo en [como-funciona.md](./como-funciona.md#el-ranker-vivo).
 
+### `/mirror` (Personal Mirror)
+
+Vista única en HTML que junta vault + telemetry + integraciones cross-source en un "espejo" de tu estado. Endpoint `GET /mirror` en el web server. Requiere `rag serve` o el daemon `com.fer.obsidian-rag-web` corriendo.
+
+```bash
+open http://127.0.0.1:8765/mirror
+```
+
+8 secciones renderizadas en paralelo (3s timeout c/u): proyectos activos, entidades top 7d, mood hoy, sparkline mood 30d, pendientes próximas 72h, notas dormidas, Spotify top 7d, observaciones del sistema. LLM insights (`qwen2.5:3b`) cargan lazy en background. Cache 30min con invalidación por eventos (`mood.signal.inserted`, `vault.note.changed`, `wa.message.inbound`).
+
+API JSON: `GET /api/mirror` (refresh forzado: `?refresh=1`), `GET /api/mirror/insights`. Implementación en [`rag/mirror.py`](../rag/mirror.py).
+
 ### `rag eval`
 Evalúa el retriever contra `queries.yaml` (golden set).
 

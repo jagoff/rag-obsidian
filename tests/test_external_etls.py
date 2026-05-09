@@ -305,7 +305,7 @@ def test_sync_claude_code_transcripts_writes_per_session(tmp_path, monkeypatch):
     monkeypatch.setattr(rag, "_CLAUDE_PROJECTS_ROOT", fake_root)
     stats = rag._sync_claude_code_transcripts(tmp_path)
     assert stats["files_written"] == 1
-    out = (tmp_path / "03-Resources/Claude/-Users-fer-repo/abc123.md").read_text()
+    out = (tmp_path / "99-obsidian/99-AI/external-ingest/Claude/-Users-fer-repo/abc123.md").read_text()
     assert "hola" in out and "qué necesitás" in out
     assert "session_id: abc123" in out
 

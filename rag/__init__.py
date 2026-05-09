@@ -2704,8 +2704,15 @@ def _load_cross_source_filters() -> dict:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             raw = {}
-    except Exception:
-        raw = {}
+    except Exception as exc:
+        # H-7 fix (2026-05-08): NO memoizar `{}` en falla transitoria.
+        # Pre-fix: un YAML parse error o read error one-shot deshabilitaba
+        # *todas* las reglas cross-source hasta el próximo restart, porque
+        # la rama de error caía al cache write final. Ahora: log + return
+        # `{}` SIN tocar el cache, así el próximo call reintenta el read.
+        _silent_log("cross_source_filters_load", exc)
+        return {}
+    # Cache solo en el success path — failure transient no envenena el slot.
     _CROSS_SOURCE_FILTERS_CACHE = raw
     _CROSS_SOURCE_FILTERS_MTIME = mtime
     return raw

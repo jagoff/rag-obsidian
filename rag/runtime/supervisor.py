@@ -139,6 +139,27 @@ _STARTED_AT = time.time()
 _SHUTDOWN_REQUESTED = threading.Event()
 
 
+# ── F3.4 — daemon-watchdog + wake-hook reemplazados por supervisor internals ─
+#
+# Los plists viejos:
+# - ``com.fer.obsidian-rag-daemon-watchdog`` (5min reconcile + retry de
+#   exit≠0) — su rol era retry-ear plists que crashearan. APScheduler
+#   maneja retry vía ``misfire_grace_time=60`` + ``max_instances=1``
+#   built-in. Si un job raisea, scheduler lo loggea y la próxima
+#   ventana sigue normal. Si excede ``misfire_grace_time``, reintenta.
+#
+# - ``com.fer.obsidian-rag-wake-hook`` (KeepAlive pmset poller →
+#   kickstart-overdue) — su rol era catchup post-Mac-wake porque
+#   launchd ``StartCalendarInterval`` NO dispara retroactivamente.
+#   APScheduler usa ``coalesce=True`` (ya seteado en ``Scheduler.__init__``)
+#   que junta todos los misfires en 1 sola corrida cuando el supervisor
+#   recobra control post-wake. Cubre el caso sin necesidad de
+#   pmset listener propio.
+#
+# F3.5 hará bootout de ambos plists. Hasta entonces siguen vivos y el
+# supervisor convive con ellos sin conflict.
+
+
 def _trigger_mlx_warmup() -> None:
     """Pre-load MLX models al startup del supervisor (F2.2).
 

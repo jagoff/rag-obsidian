@@ -11,7 +11,65 @@ from pathlib import Path
 
 from rag.plists._render import _logs, _render_plist, _repo_root
 
-__all__ = ["_watch_plist", "_web_plist"]
+__all__ = ["_supervisor_plist", "_watch_plist", "_web_plist"]
+
+
+def _supervisor_plist(rag_bin: str) -> str:
+    """Persistent supervisor — único daemon que orquesta scheduling
+    in-process para reemplazar 32 plists individuales (refactor F1+ 2026-
+    05-09). Ver ADR `99-obsidian/99-AI/system/daemon-refactor-2026-05-09/
+    supervisor-refactor-adr.md`.
+
+    Características:
+    - ``KeepAlive=true`` + ``RunAtLoad=true`` — supervisor es persistent.
+    - ``ProcessType=Adaptive`` — NO Background. Es supervisor de Background
+      workers. Adaptive le da prioridad estándar de scheduling pero no se
+      lo trata como ``Interactive`` (no es UI foreground del user).
+    - ``RAG_RERANKER_NEVER_UNLOAD=1`` — el reranker queda pinneado para que
+      jobs proactive lo reusen entre invocaciones (anti pattern del web).
+    - ``RAG_MLX_IDLE_TTL=7200`` — 2h. Más alto que el default (1800s) porque
+      supervisor vive eternamente y los modelos cargados se amortizan en
+      muchos jobs intra-día. El watchdog memory-pressure los unlodea si
+      hace falta.
+    - ``ExitTimeOut=20`` — 20s graceful shutdown (matchea el SIGTERM
+      handler del supervisor).
+    - Entrypoint via ``venv_python -m rag.runtime.supervisor`` (no via
+      ``rag supervisor run``) para garantizar que las env vars del plist
+      se setean ANTES de cualquier import de Python — análogo al pattern
+      del web plist donde HF_HUB_OFFLINE debe estar set antes de
+      sentence-transformers.
+
+    Working dir = repo root. Logs a ``~/.local/share/obsidian-rag/
+    supervisor.log`` (stdout) + ``supervisor.error.log`` (stderr).
+    """
+    repo_root = _repo_root()
+    venv_python = repo_root / ".venv" / "bin" / "python"
+    out, err = _logs("supervisor")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-supervisor",
+        "program_arguments": [
+            str(venv_python),
+            "-m", "rag.runtime.supervisor",
+        ],
+        "env": {
+            "PYTHONUNBUFFERED": "1",
+            "RAG_LLM_BACKEND": "mlx",
+            "RAG_LOCAL_EMBED": "1",
+            "RAG_RERANKER_NEVER_UNLOAD": "1",
+            "RAG_MLX_IDLE_TTL": "7200",
+            "RAG_STATE_SQL": "1",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+        },
+        "run_at_load": True,
+        "keep_alive": True,
+        "throttle_s": 30,
+        "exit_timeout_s": 20,
+        "process_type": "Adaptive",
+        "working_dir": str(repo_root),
+        "stdout_path": out,
+        "stderr_path": err,
+    })
 
 
 def _watch_plist(rag_bin: str) -> str:

@@ -375,13 +375,13 @@ def test_sync_spotify_writes_recently_played(tmp_path, monkeypatch):
     stats = rag._sync_spotify_notes(tmp_path)
     assert stats["ok"] and stats["recently_played"] == 1
     today = time.strftime("%Y-%m-%d")
-    body = (tmp_path / "03-Resources/Spotify" / f"{today}.md").read_text()
+    body = (tmp_path / "99-obsidian/99-AI/external-ingest/Spotify" / f"{today}.md").read_text()
     assert "Mi tema" in body and "Banda X" in body and "Disco Y" in body
 
 
 def test_sync_spotify_top_refresh_skipped_when_recent(tmp_path, monkeypatch):
     """_top.md exists with recent mtime → should not refresh."""
-    sp_dir = tmp_path / "03-Resources/Spotify"
+    sp_dir = tmp_path / "99-obsidian/99-AI/external-ingest/Spotify"
     sp_dir.mkdir(parents=True)
     top = sp_dir / "_top.md"
     top.write_text("---\n---\nstale top\n", encoding="utf-8")

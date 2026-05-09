@@ -30,9 +30,11 @@ Diseño:
   checkear en 2 semanas vía snooze).
 - Score: 0.5 en el threshold (5 pares), escala hasta 1.0 en 20+ pares.
 - dedup_key por semana ISO → máximo 1 emisión por semana del año.
-  Combinado con `snooze_hours=336` (2 semanas), la señal no spamea:
-  aunque el cron corra cada 10 min, sólo empujamos 1×/cada 2 semanas
-  efectivas.
+  Combinado con `snooze_hours=168` (1 semana, bajado de 336/2 semanas el
+  2026-05-09), la señal no spamea: aunque el cron corra cada 10 min,
+  empujamos ~1×/semana efectiva. Razón del bump: con 14d snooze y quiet
+  hours nighttime activas, los selected del primer fire fallaban el push
+  y la señal quedaba muerta 2 semanas.
 """
 
 from __future__ import annotations
@@ -153,7 +155,7 @@ def _find_title_similar_pairs(
     return pairs
 
 
-@register_signal(name="dupes_pressure", snooze_hours=336)
+@register_signal(name="dupes_pressure", snooze_hours=168)
 def dupes_pressure_signal(now: datetime) -> list:
     """Emite MÁXIMO 1 candidate cuando hay ≥5 pares candidatos a dupe.
 
@@ -188,7 +190,11 @@ def dupes_pressure_signal(now: datetime) -> list:
 
         # dedup_key por semana ISO → una sola emisión por semana del año
         # incluso si el cron corre cada 10 min. Combinado con snooze_hours
-        # =336 (2 semanas), nos da ~1×/cada 2 semanas efectivas.
+        # =168 (1 semana), nos da ~1×/semana efectiva.
+        # Bajado 336 → 168 (2026-05-09): el snooze de 14d era excesivo —
+        # dupes_pressure tenía 7 selected en 30d sin que ninguno se enviara
+        # (todos cayeron en quiet_hours nighttime). Con 7d snooze + dedup_key
+        # semanal + retry post-quiet-hours, el feedback al user llega 2x.
         iso_year, iso_week, _ = now.isocalendar()
         dedup_key = f"dupes_pressure:{iso_year}-W{iso_week:02d}"
 
@@ -199,7 +205,7 @@ def dupes_pressure_signal(now: datetime) -> list:
             score=score,
             message=message,
             dedup_key=dedup_key,
-            snooze_hours=336,
+            snooze_hours=168,
             reason=reason,
         )]
     except Exception:

@@ -2,10 +2,10 @@
 
 Cubre:
 - No inbox dir → []
-- <15 notas stale → []
-- Exactamente 15 notas stale → emit con score ~0.4
-- 35 notas stale → emit con score 1.0
-- 20 notas pero 19 son <24h → []
+- < THRESHOLD notas stale → []
+- Exactamente THRESHOLD notas stale → emit con score base
+- Score saturation con count alto
+- Notas más frescas que MIN_AGE_HOURS no cuentan
 - 00-Inbox/conversations/ con 50 archivos NO cuenta → []
 - dedup_key incluye fecha de hoy
 - Message incluye el count correcto
@@ -14,7 +14,9 @@ Cubre:
 
 El signal es filesystem-only (no retrieve, no DB). Aislamos el vault con
 `monkeypatch.setattr(rag, "_resolve_vault_path", ...)` a un tmp_path que
-construye cada test.
+construye cada test. Los thresholds (`_INBOX_EMIT_THRESHOLD`, `_INBOX_MIN_AGE_HOURS`,
+`_INBOX_SCORE_RAMP`) se importan del módulo para que el test no se rompa
+cuando se tunean los valores (ver bump 2026-05-09 que bajó threshold 15→10).
 """
 
 from __future__ import annotations
@@ -26,10 +28,20 @@ from pathlib import Path
 import pytest
 
 import rag
+from rag_anticipate.signals import inbox_pressure as _inbox_mod
 from rag_anticipate.signals.inbox_pressure import (
     _count_stale_inbox,
     inbox_pressure_signal,
 )
+
+_THRESHOLD = _inbox_mod._INBOX_EMIT_THRESHOLD
+_MIN_AGE_HOURS = _inbox_mod._INBOX_MIN_AGE_HOURS
+_SCORE_BASE = _inbox_mod._INBOX_SCORE_BASE
+_SCORE_RAMP = _inbox_mod._INBOX_SCORE_RAMP
+# Edad "fresca" garantizada por debajo del threshold (mitad).
+_FRESH_HOURS = max(1.0, _MIN_AGE_HOURS / 2.0)
+# Edad "stale" garantizada por encima del threshold (4× para evitar boundary).
+_STALE_HOURS = max(_MIN_AGE_HOURS * 2.0, 48.0)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -87,9 +99,9 @@ def test_no_inbox_dir_returns_empty(tmp_path, monkeypatch):
 
 
 def test_inbox_with_few_stale_notes_returns_empty(mock_vault):
-    """Inbox con <15 notas stale → no emit."""
+    """Inbox con <THRESHOLD notas stale → no emit."""
     _vault, inbox = mock_vault
-    _populate_inbox(inbox, count=10, age_hours=48.0)
+    _populate_inbox(inbox, count=max(1, _THRESHOLD - 1), age_hours=_STALE_HOURS)
     result = inbox_pressure_signal(datetime.now())
     assert result == []
 
@@ -101,47 +113,49 @@ def test_inbox_empty_returns_empty(mock_vault):
     assert result == []
 
 
-def test_inbox_with_exactly_15_stale_emits_score_0_4(mock_vault):
-    """Inbox con exactamente 15 notas stale → emit con score ~0.4."""
+def test_inbox_with_exactly_threshold_emits_score_base(mock_vault):
+    """Inbox con exactamente THRESHOLD notas stale → emit con score base."""
     _vault, inbox = mock_vault
-    _populate_inbox(inbox, count=15, age_hours=48.0)
+    _populate_inbox(inbox, count=_THRESHOLD, age_hours=_STALE_HOURS)
     result = inbox_pressure_signal(datetime.now())
     assert len(result) == 1
     c = result[0]
     assert c.kind == "anticipate-inbox_pressure"
-    # (15 - 15) / 20 + 0.4 = 0.4
-    assert c.score == pytest.approx(0.4, abs=0.01)
+    # (THRESHOLD - THRESHOLD) / RAMP + BASE = BASE
+    assert c.score == pytest.approx(_SCORE_BASE, abs=0.01)
     assert c.snooze_hours == 48
 
 
-def test_inbox_with_35_stale_emits_score_1_0(mock_vault):
-    """Inbox con 35 notas stale → score saturado a 1.0."""
+def test_inbox_with_full_ramp_emits_score_1_0(mock_vault):
+    """Inbox con THRESHOLD + RAMP - X notas → score saturado a 1.0."""
     _vault, inbox = mock_vault
-    _populate_inbox(inbox, count=35, age_hours=48.0)
-    result = inbox_pressure_signal(datetime.now())
-    assert len(result) == 1
-    c = result[0]
-    # (35 - 15) / 20 + 0.4 = 1.0 + 0.4 clamped → 1.0
-    assert c.score == pytest.approx(1.0, abs=0.01)
-
-
-def test_inbox_with_50_stale_score_clamped_to_1(mock_vault):
-    """Más allá de 35 el score sigue clampeado a 1.0."""
-    _vault, inbox = mock_vault
-    _populate_inbox(inbox, count=50, age_hours=48.0)
+    # Score = (count - THRESHOLD) / RAMP + BASE = 1.0 cuando count = THRESHOLD + RAMP * (1 - BASE)
+    full_count = int(_THRESHOLD + _SCORE_RAMP * (1.0 - _SCORE_BASE)) + 5
+    _populate_inbox(inbox, count=full_count, age_hours=_STALE_HOURS)
     result = inbox_pressure_signal(datetime.now())
     assert len(result) == 1
     assert result[0].score == pytest.approx(1.0, abs=0.01)
 
 
-def test_inbox_with_20_notes_but_19_fresh_no_emit(mock_vault):
-    """20 notas totales pero 19 son <24h → solo 1 stale → no emit."""
+def test_inbox_score_clamped_to_1(mock_vault):
+    """Más allá del ramp completo el score sigue clampeado a 1.0."""
     _vault, inbox = mock_vault
-    paths = _populate_inbox(inbox, count=20, age_hours=48.0)
-    # Re-agingar las primeras 19 a 12h (freshly captured).
-    for p in paths[:19]:
-        _age_note(p, 12.0)
-    # La 20va queda a 48h (stale). Total stale = 1 → <15 → no emit.
+    full_count = int(_THRESHOLD + _SCORE_RAMP * 3)
+    _populate_inbox(inbox, count=full_count, age_hours=_STALE_HOURS)
+    result = inbox_pressure_signal(datetime.now())
+    assert len(result) == 1
+    assert result[0].score == pytest.approx(1.0, abs=0.01)
+
+
+def test_inbox_with_only_one_stale_no_emit(mock_vault):
+    """Mayoría de notas frescas (<MIN_AGE_HOURS) + 1 stale → solo 1 stale → no emit."""
+    _vault, inbox = mock_vault
+    total = max(_THRESHOLD + 5, 20)
+    paths = _populate_inbox(inbox, count=total, age_hours=_STALE_HOURS)
+    # Re-agingar todas menos la última a edad fresca.
+    for p in paths[:-1]:
+        _age_note(p, _FRESH_HOURS)
+    # Solo la última queda stale. 1 < THRESHOLD → no emit.
     result = inbox_pressure_signal(datetime.now())
     assert result == []
 
@@ -168,8 +182,8 @@ def test_conversations_subfolder_not_counted(mock_vault):
 
 
 def test_conversations_subfolder_ignored_even_when_threshold_met_elsewhere(mock_vault):
-    """Conversations subfolder + inbox top-level ≥15 → emit con count=15,
-    NO 15+50=65.
+    """Conversations subfolder + inbox top-level ≥THRESHOLD → emit con count
+    sólo del top-level, NO suma de las 50 conversations + top-level.
 
     Verifica que el count del message es solo el top-level."""
     _vault, inbox = mock_vault
@@ -178,12 +192,12 @@ def test_conversations_subfolder_ignored_even_when_threshold_met_elsewhere(mock_
     for i in range(50):
         p = conv / f"conv-{i:03d}.md"
         p.write_text(f"# Conv {i}\n", encoding="utf-8")
-        _age_note(p, 48.0)
-    _populate_inbox(inbox, count=15, age_hours=48.0)
+        _age_note(p, _STALE_HOURS)
+    _populate_inbox(inbox, count=_THRESHOLD, age_hours=_STALE_HOURS)
     result = inbox_pressure_signal(datetime.now())
     assert len(result) == 1
-    # Count debe ser 15, no 65.
-    assert "15 notas" in result[0].message
+    # Count debe ser THRESHOLD, no THRESHOLD+50.
+    assert f"{_THRESHOLD} notas" in result[0].message
 
 
 def test_dedup_key_includes_today_date(mock_vault):
@@ -212,12 +226,13 @@ def test_dedup_key_differs_per_day(mock_vault):
 def test_message_includes_count(mock_vault):
     """El message contiene el count exacto de notas stale."""
     _vault, inbox = mock_vault
-    _populate_inbox(inbox, count=22, age_hours=48.0)
+    count_test = _THRESHOLD + 12
+    _populate_inbox(inbox, count=count_test, age_hours=_STALE_HOURS)
     result = inbox_pressure_signal(datetime.now())
     assert len(result) == 1
     msg = result[0].message
-    assert "22 notas" in msg
-    assert ">24h" in msg
+    assert f"{count_test} notas" in msg
+    assert f">{_MIN_AGE_HOURS}h" in msg
     assert "📥" in msg
     assert "rag inbox --apply" in msg
 
@@ -225,28 +240,29 @@ def test_message_includes_count(mock_vault):
 def test_non_md_files_not_counted(mock_vault):
     """Archivos no-.md en el inbox no cuentan."""
     _vault, inbox = mock_vault
-    # 10 archivos .md stale (bajo threshold).
-    _populate_inbox(inbox, count=10, age_hours=48.0)
+    # Bajo threshold de archivos .md stale.
+    _populate_inbox(inbox, count=max(1, _THRESHOLD - 1), age_hours=_STALE_HOURS)
     # 20 archivos .txt / .pdf stale (shouldn't count).
     for i in range(20):
         p = inbox / f"attachment-{i:03d}.pdf"
         p.write_text("binario", encoding="utf-8")
-        _age_note(p, 48.0)
+        _age_note(p, _STALE_HOURS)
     result = inbox_pressure_signal(datetime.now())
-    # Solo 10 .md stale → <15 → no emit.
+    # Solo .md stale (bajo threshold) → no emit.
     assert result == []
 
 
 def test_count_stale_inbox_helper_direct(mock_vault):
     """El helper `_count_stale_inbox` devuelve el count esperado."""
     vault, inbox = mock_vault
-    paths = _populate_inbox(inbox, count=20, age_hours=48.0)
+    total = 20
+    paths = _populate_inbox(inbox, count=total, age_hours=_STALE_HOURS)
     # Todas stale.
-    assert _count_stale_inbox(vault) == 20
-    # Fresh-ear 5 → quedan 15 stale.
+    assert _count_stale_inbox(vault) == total
+    # Fresh-ear 5 → quedan total-5 stale.
     for p in paths[:5]:
-        _age_note(p, 12.0)
-    assert _count_stale_inbox(vault) == 15
+        _age_note(p, _FRESH_HOURS)
+    assert _count_stale_inbox(vault) == total - 5
 
 
 def test_count_stale_inbox_respects_min_age_hours(mock_vault):

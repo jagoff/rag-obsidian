@@ -130,7 +130,7 @@ def test_six_pairs_from_four_variants_emits(mock_vault):
     assert c.kind == "anticipate-dupes_pressure"
     # score = (6 - 5) / 15 + 0.5 ≈ 0.567
     assert c.score == pytest.approx(0.5 + 1 / 15.0, abs=0.01)
-    assert c.snooze_hours == 336
+    assert c.snooze_hours == 168
     assert "6 pares" in c.message
     assert "rag dupes --threshold 0.85" in c.message
     assert "👥" in c.message
@@ -288,7 +288,7 @@ def test_max_one_candidate(mock_vault):
 
 def test_returns_anticipatory_candidate_shape(mock_vault):
     """Shape del dataclass: kind, score ∈ [0,1], message, dedup_key,
-    snooze_hours=336, reason."""
+    snooze_hours=168, reason."""
     _write_notes(mock_vault / "02-Areas", _SEVEN_COACHING_VARIANTS[:4])
     result = dupes_pressure_signal(datetime.now())
     assert len(result) == 1
@@ -297,7 +297,7 @@ def test_returns_anticipatory_candidate_shape(mock_vault):
     assert isinstance(c.score, float) and 0.0 <= c.score <= 1.0
     assert isinstance(c.message, str) and c.message
     assert isinstance(c.dedup_key, str) and c.dedup_key.startswith("dupes_pressure:")
-    assert c.snooze_hours == 336
+    assert c.snooze_hours == 168
     assert isinstance(c.reason, str) and "pairs=" in c.reason
 
 

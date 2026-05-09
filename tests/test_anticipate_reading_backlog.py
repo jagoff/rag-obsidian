@@ -24,12 +24,22 @@ from datetime import datetime, timedelta
 import pytest
 
 import rag
+from rag_anticipate.signals import reading_backlog as _backlog_mod
 from rag_anticipate.signals.reading_backlog import (
     _count_reading_backlog,
     _in_reading_folder,
     _is_to_read,
     reading_backlog_signal,
 )
+
+_THRESHOLD = _backlog_mod._BACKLOG_EMIT_THRESHOLD
+_MIN_AGE_DAYS = _backlog_mod._BACKLOG_MIN_AGE_DAYS
+_SCORE_BASE = _backlog_mod._BACKLOG_SCORE_BASE
+_SCORE_RAMP = _backlog_mod._BACKLOG_SCORE_RAMP
+# Edad "stale" garantizada por encima del threshold.
+_STALE_DAYS = max(_MIN_AGE_DAYS * 2, 10)
+# Edad "fresca" por debajo (mitad del min).
+_FRESH_DAYS = max(1, _MIN_AGE_DAYS // 2)
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -129,44 +139,47 @@ def test_empty_vault_returns_empty(mock_vault):
 
 
 def test_below_threshold_returns_empty(mock_vault):
-    """2. 5 notas to-read viejas (count <10) → []."""
-    for i in range(5):
-        _write_note_with_age(mock_vault, f"note-{i}.md", _to_read_fm(), age_days=10)
+    """2. <THRESHOLD notas to-read viejas → []."""
+    n = max(1, _THRESHOLD - 1)
+    for i in range(n):
+        _write_note_with_age(mock_vault, f"note-{i}.md", _to_read_fm(), age_days=_STALE_DAYS)
     out = reading_backlog_signal(datetime.now())
     assert out == []
 
 
-def test_exactly_threshold_emits_score_05(mock_vault):
-    """3. 10 notas to-read viejas → emit con score 0.5."""
-    for i in range(10):
-        _write_note_with_age(mock_vault, f"note-{i}.md", _to_read_fm(), age_days=10)
+def test_exactly_threshold_emits_score_base(mock_vault):
+    """3. THRESHOLD notas to-read viejas → emit con score base."""
+    for i in range(_THRESHOLD):
+        _write_note_with_age(mock_vault, f"note-{i}.md", _to_read_fm(), age_days=_STALE_DAYS)
     out = reading_backlog_signal(datetime.now())
     assert len(out) == 1
     c = out[0]
     assert c.kind == "anticipate-reading_backlog"
-    assert c.score == pytest.approx(0.5, abs=0.01)
-    assert "10 notas" in c.message
+    assert c.score == pytest.approx(_SCORE_BASE, abs=0.01)
+    assert f"{_THRESHOLD} notas" in c.message
     assert "backlog de lectura" in c.message
     assert c.snooze_hours == 168
     assert c.dedup_key.startswith("reading_backlog:")
 
 
 def test_well_above_threshold_saturates_at_1(mock_vault):
-    """4. 40 notas to-read viejas → score saturado a 1.0."""
-    for i in range(40):
-        _write_note_with_age(mock_vault, f"note-{i}.md", _to_read_fm(), age_days=10)
+    """4. count >> THRESHOLD → score saturado a 1.0."""
+    big = int(_THRESHOLD + _SCORE_RAMP * 2)
+    for i in range(big):
+        _write_note_with_age(mock_vault, f"note-{i}.md", _to_read_fm(), age_days=_STALE_DAYS)
     out = reading_backlog_signal(datetime.now())
     assert len(out) == 1
     c = out[0]
     assert c.score == pytest.approx(1.0, abs=0.001)
-    assert "40 notas" in c.message
+    assert f"{big} notas" in c.message
 
 
 def test_recent_notes_do_not_count(mock_vault):
-    """5. 15 notas to-read pero todas <7d → []. No molestar con capturas
+    """5. Notas to-read frescas (<MIN_AGE_DAYS) → []. No molestar con capturas
     recientes — el user todavía está en el ciclo de procesar lo nuevo."""
-    for i in range(15):
-        _write_note_with_age(mock_vault, f"note-{i}.md", _to_read_fm(), age_days=2)
+    n = _THRESHOLD + 5  # bien arriba del threshold para asegurar
+    for i in range(n):
+        _write_note_with_age(mock_vault, f"note-{i}.md", _to_read_fm(), age_days=_FRESH_DAYS)
     out = reading_backlog_signal(datetime.now())
     assert out == []
 
@@ -174,23 +187,24 @@ def test_recent_notes_do_not_count(mock_vault):
 def test_status_read_does_not_count(mock_vault):
     """6. Notas con `status: read` (ya leídas) no cuentan, aunque sean viejas.
     Mezclamos con suficientes to-read para verificar que solo se cuentan esas."""
-    # 8 notas ya leídas (no deben contar)
-    for i in range(8):
+    n_read = max(_THRESHOLD - 1, 3)
+    n_to_read = max(_THRESHOLD - 1, 1)  # debajo del threshold
+    for i in range(n_read):
         _write_note_with_age(
             mock_vault, f"read-{i}.md",
             "---\nstatus: read\n---\n\nya leído",
-            age_days=20,
+            age_days=_STALE_DAYS * 2,
         )
-    # 9 notas to-read (también debajo del threshold)
-    for i in range(9):
-        _write_note_with_age(mock_vault, f"to-read-{i}.md", _to_read_fm(), age_days=20)
-    # Total to-read = 9 < 10 → no emit aunque haya 8 "read" extras
+    for i in range(n_to_read):
+        _write_note_with_age(mock_vault, f"to-read-{i}.md", _to_read_fm(),
+                             age_days=_STALE_DAYS * 2)
+    # Total to-read < THRESHOLD → no emit aunque haya "read" extras
     out = reading_backlog_signal(datetime.now())
     assert out == []
 
-    # Verificamos vía counter directo que los 8 "read" no se contaron
-    n = _count_reading_backlog(mock_vault, min_age_days=7)
-    assert n == 9
+    # Verificamos vía counter directo que los "read" no se contaron
+    n = _count_reading_backlog(mock_vault, min_age_days=_MIN_AGE_DAYS)
+    assert n == n_to_read
 
 
 def test_inline_hashtag_and_frontmatter_both_count(mock_vault):

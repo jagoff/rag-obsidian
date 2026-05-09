@@ -26,6 +26,19 @@ htmlcov/
 # dominio y protocolo peer, son parte del workflow del repo.
 .claude/*
 !.claude/agents/
+# Pero NO los sub-paquetes genéricos que dropea `claude-flow init` /
+# similares (analysis, architecture, browser, consensus, core, custom,
+# data, development, devops, documentation, flow-nexus, github, goal,
+# optimization, payments, sona, sparc, specialized, sublinear, swarm,
+# templates, testing, v3). Esos son agent profiles genéricos del tool,
+# NO project-specific — pollutearían el registry rag-* del repo.
+.claude/agents/*/
+
+# Tooling runtime artifacts (claude-flow, ruvector, swarm telemetry).
+# Regenerables; no aportan al state del repo.
+.claude-flow/
+.swarm/
+ruvector.db
 
 # MCP server config — paths absolutos user-specific (sqlite-vec data-dir).
 # Migrar a ${HOME}/... y commitear en otra iteración si se quiere compartir.

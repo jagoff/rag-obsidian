@@ -28,10 +28,10 @@ _RAG_BIN = "/tmp/rag"  # rag_bin arg, no se invoca; sólo se interpola
 
 # Labels conocidos del spec manual (T2)
 # 2026-05-04 consolidation: cloudflare-tunnel, cloudflare-tunnel-watcher,
-# lgbm-train y paraphrases-train se removieron del manual spec; quedan 3.
+# lgbm-train, paraphrases-train y spotify-poll se removieron del manual
+# spec; quedan 2 (synth-refresh + log-rotate).
 _EXPECTED_MANUAL_LABELS = frozenset({
     "com.fer.obsidian-rag-synth-refresh",
-    "com.fer.obsidian-rag-spotify-poll",
     "com.fer.obsidian-rag-log-rotate",
 })
 
@@ -113,10 +113,14 @@ def test_calibration_plist_no_shell_comment_plutil(tmp_path: Path):
 
 
 def test_services_spec_manual_shape():
-    """`_services_spec_manual()` retorna 3 dicts con shape correcta."""
+    """`_services_spec_manual()` retorna 2 dicts con shape correcta.
+
+    Post limpieza 2026-05-04: synth-refresh + log-rotate son los únicos
+    manuales sobrevivientes (los 4 fantasmas + spotify-poll se removieron).
+    """
     spec = rag._services_spec_manual()
     assert isinstance(spec, list), "Debe retornar list"
-    assert len(spec) == 3, f"Esperado 3 manuales, got {len(spec)}"
+    assert len(spec) == 2, f"Esperado 2 manuales, got {len(spec)}"
     labels = set()
     for item in spec:
         assert isinstance(item, dict), f"Cada item debe ser dict, got {type(item)}"

@@ -74,25 +74,45 @@ def test_web_plist_paths_exist_on_disk():
     until the installed plist was hand-patched. Repo root is two levels up.
 
     These assertions only make sense when run from the actual checkout, so
-    skip when the venv is missing (e.g. pip-installed CI environments)."""
+    skip when the venv is missing (e.g. pip-installed CI environments).
+
+    Heurística vieja (`'/rag/.venv/' not in args[0]`) era frágil: cuando el
+    repo vive en `/Users/fer/repos/rag/` el path correcto contiene
+    `/rag/.venv/` y la heurística disparaba false-positive. Reemplazada
+    por replicación exacta del cómputo de ``rag/plists.py:_web_plist``
+    (mismo `Path(__file__).resolve().parent.parent` — `__file__` es
+    `rag/plists.py` ahí, `rag/__init__.py` acá; ambos colapsan al
+    repo_root) + asserción de equality contra `args[0]` / `args[-1]`."""
+    # Replica el cómputo de _web_plist: parent.parent desde el módulo `rag`
+    # llega al repo_root igual que parent.parent desde `rag/plists.py`.
     repo_root = Path(rag_module.__file__).resolve().parent.parent
     venv_python = repo_root / ".venv" / "bin" / "python"
+    web_server = repo_root / "web" / "server.py"
     if not venv_python.exists():
         pytest.skip("no local .venv — likely a pip-installed CI checkout")
     d = _parse(rag_module._web_plist(RAG_BIN))
     args = d["ProgramArguments"]
-    assert Path(args[0]).is_file(), \
-        f"plist python interpreter does not exist: {args[0]!r}"
-    assert Path(args[-1]).is_file(), \
-        f"plist web server.py does not exist: {args[-1]!r}"
+    # Exact-equality check: el plist tiene que apuntar al MISMO interpreter
+    # y MISMO server.py que computa _web_plist desde su propio __file__.
+    assert args[0] == str(venv_python), (
+        f"plist python interpreter mismatch:\n"
+        f"  expected: {venv_python}\n  got:      {args[0]}"
+    )
+    assert args[-1] == str(web_server), (
+        f"plist web server.py mismatch:\n"
+        f"  expected: {web_server}\n  got:      {args[-1]}"
+    )
+    # Y existencia real on-disk (cubre el bug 2026-04-26 directamente).
+    assert venv_python.is_file(), \
+        f"plist python interpreter does not exist on disk: {venv_python!r}"
+    assert web_server.is_file(), \
+        f"plist web server.py does not exist on disk: {web_server!r}"
     wd = Path(d["WorkingDirectory"])
     assert wd.is_dir(), f"plist WorkingDirectory does not exist: {wd!r}"
-    # The classic 2026-04-26 bug shape: a duplicated `/rag/` segment because
-    # the generator was 1 `.parent` short. Catch any future repeat.
-    assert "/rag/.venv/" not in args[0], \
-        f"venv path looks like the 2026-04-26 bug (extra /rag/): {args[0]!r}"
-    assert "/rag/web/server.py" not in args[-1], \
-        f"server path looks like the 2026-04-26 bug (extra /rag/): {args[-1]!r}"
+    assert wd == repo_root, (
+        f"plist WorkingDirectory mismatch:\n"
+        f"  expected: {repo_root}\n  got:      {wd}"
+    )
 
 
 def test_web_plist_has_hf_hub_offline():

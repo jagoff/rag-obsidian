@@ -730,7 +730,7 @@ def _is_cross_source_target(vault_path: Path) -> bool:
     Chrome, Drive, GitHub, Claude, YouTube, Spotify).
 
     Motivación del guard: los ETLs escriben `.md` files a
-    `vault_path/<folder>/` (ej MOZE → `04-Archive/99-obsidian-system/99-AI/external-ingest/Finanzas/MOZE/`)
+    `vault_path/<folder>/` (ej MOZE → `99-obsidian/99-AI/external-ingest/Finanzas/MOZE/`)
     para que el rglob post-sync los absorba. Pre-fix, cualquier invocación
     con `OBSIDIAN_RAG_VAULT=.../otro-vault rag index` (o post-fix con
     `rag index --vault otro`) disparaba los 12 syncs contra `otro-vault`,
@@ -2213,14 +2213,14 @@ def normalize_source(value: object, *, default: str = "vault") -> str:
 
 
 # Path-prefix discriminator: chunks whose vault-relative path starts with
-# `04-Archive/99-obsidian-system/99-AI/memory/` belong to the agent-curated
+# `99-obsidian/99-AI/memory/` belong to the agent-curated
 # mem-vault. They get `source="memory"` (weight=0.90) instead of
 # `source="vault"` (weight=1.00), so user-authored notes win ties on
 # overlapping queries. The carve-out exists because mem-vault entries
 # describe THE SYSTEM ITSELF (bug patterns, decisions, gotchas) and were
 # previously dominating retrieval at >50% of top-k for technical queries.
 # See `is_excluded()` for why memories stay indexed at all.
-_MEMORY_PATH_PREFIX = "04-Archive/99-obsidian-system/99-AI/memory/"
+_MEMORY_PATH_PREFIX = "99-obsidian/99-AI/memory/"
 
 
 def _infer_vault_source(rel_path: str) -> str:
@@ -3108,7 +3108,7 @@ def _conversations_indexable(rel_path: str) -> bool:
     Off por default. Para activar, setear la env var en los plists de
     ``com.fer.obsidian-rag-watch`` y reindexar.
     """
-    if not rel_path.startswith("04-Archive/99-obsidian-system/99-AI/conversations/"):
+    if not rel_path.startswith("99-obsidian/99-AI/conversations/"):
         return False
     return os.getenv("RAG_INDEX_CONVERSATIONS_BOT_ONLY", "0") == "1"
 
@@ -3141,7 +3141,7 @@ def is_excluded(rel_path: str) -> bool:
       Skill definitions/rules, not user notes — redundant with the broader
       99-obsidian-system rule below but kept as belt-and-suspenders for paths
       that may live outside 04-Archive via other symlink targets.
-    - 04-Archive/99-obsidian-system/*: Obsidian system folders (99-Attachments,
+    - 99-obsidian/*: Obsidian system folders (99-Attachments,
       99-Canvas, 99-AI, 99-Daily routine, 99-Forms, 99-Templates) — binary
       assets, template scaffolding, plugin data. Two exceptions stay indexed
       because they're high-signal user-curated content that enriches retrieval:
@@ -3160,7 +3160,7 @@ def is_excluded(rel_path: str) -> bool:
       notes at the TOP LEVEL of 03-Resources/Claude/ (Claude Peers prompts,
       command cheatsheets) stay indexed — only the generated subfolders are
       filtered.
-    - 04-Archive/99-obsidian-system/99-AI/conversations/: episodic chat
+    - 99-obsidian/99-AI/conversations/: episodic chat
       transcripts written by the web server after each `/api/chat` turn.
       Originally indexed so past turns were retrievable — but we observed a
       toxic feedback loop (2026-04-20): when the LLM gives a wrong answer,
@@ -3176,7 +3176,7 @@ def is_excluded(rel_path: str) -> bool:
         return True
     if "/99-AI/skills/" in f"/{rel_path}":
         return True
-    system_prefix = "04-Archive/99-obsidian-system/"
+    system_prefix = "99-obsidian/"
     if rel_path.startswith(system_prefix) and not (
         rel_path.startswith(system_prefix + "99-Mentions/")
         or rel_path.startswith(system_prefix + "99-AI/memory/")
@@ -3185,21 +3185,21 @@ def is_excluded(rel_path: str) -> bool:
         or _conversations_indexable(rel_path)
     ):
         return True
-    claude_prefix = "04-Archive/99-obsidian-system/99-AI/external-ingest/Claude/"
+    claude_prefix = "99-obsidian/99-AI/external-ingest/Claude/"
     if rel_path.startswith(claude_prefix) and "/" in rel_path[len(claude_prefix):]:
         return True
     # Legacy episodic-memory inbox (pre-2026-04-25). Las conversaciones
-    # nuevas viven bajo `04-Archive/99-obsidian-system/99-AI/conversations/`,
-    # que ya queda excluida por el prefix general `04-Archive/99-obsidian-system/`
+    # nuevas viven bajo `99-obsidian/99-AI/conversations/`,
+    # que ya queda excluida por el prefix general `99-obsidian/`
     # de arriba. Mantenemos este check específico para archivos legacy que
     # el user todavía no haya migrado/borrado de su `00-Inbox/conversations/`.
     if rel_path.startswith("00-Inbox/conversations/"):
         return True
     # Consolidated episodic-memory originals (Phase 2). The consolidator
     # moves files from the conversations folder to
-    # `04-Archive/99-obsidian-system/99-AI/_archive/conversations/YYYY-MM/`
+    # `99-obsidian/99-AI/_archive/conversations/YYYY-MM/`
     # after promoting a cluster to PARA. Esa ruta ya queda excluida por
-    # el prefix general `04-Archive/99-obsidian-system/` de arriba, pero
+    # el prefix general `99-obsidian/` de arriba, pero
     # mantenemos este check específico para archivos legacy que vivan
     # todavía en la ruta vieja `04-Archive/conversations/` (pre-2026-04-30,
     # cuando el archive estaba fuera del paraguas `99-obsidian-system/`
@@ -3231,7 +3231,7 @@ def is_excluded(rel_path: str) -> bool:
     # conversational context well enough and the bigger roll-up chunks
     # help. Not expected in practice because `scripts/ingest_whatsapp.py`
     # already chunks at natural conversation breaks.
-    if rel_path.startswith("04-Archive/99-obsidian-system/99-AI/external-ingest/WhatsApp/"):
+    if rel_path.startswith("99-obsidian/99-AI/external-ingest/WhatsApp/"):
         _wa_override = os.environ.get(
             "OBSIDIAN_RAG_INDEX_WA_MONTHLY", ""
         ).strip().lower()
@@ -3253,7 +3253,7 @@ def is_excluded(rel_path: str) -> bool:
     # vault indexing of any markdown left under 03-Resources/GoogleDrive/.
     # Only needed if `rag index --source drive` is broken and you need
     # to fall back to the old write-to-vault approach.
-    if rel_path.startswith("04-Archive/99-obsidian-system/99-AI/external-ingest/GoogleDrive/"):
+    if rel_path.startswith("99-obsidian/99-AI/external-ingest/GoogleDrive/"):
         _gd_override = os.environ.get(
             "OBSIDIAN_RAG_INDEX_GDRIVE_VAULT", ""
         ).strip().lower()
@@ -11525,7 +11525,7 @@ def _correct_typos_llm(query: str) -> str:
 # no network. The mention notes' format is documented in the folder's
 # `_template.md`: filename stem + frontmatter `aliases:` are matched tokens.
 
-_MENTIONS_FOLDER = "04-Archive/99-obsidian-system/99-Mentions"
+_MENTIONS_FOLDER = "99-obsidian/99-Mentions"
 _MENTIONS_BODY_CAP = 1500
 _MENTIONS_MAX_PER_QUERY = 2
 _MENTIONS_MIN_TOKEN_LEN = 3
@@ -16803,147 +16803,11 @@ def render_related(related: list[tuple[dict, int, str]]) -> None:
 
 
 # ── WIKILINK SUGGESTIONS ──────────────────────────────────────────────────────
-# Densifies the Obsidian graph by surfacing mentions of existing note titles
-# that aren't yet `[[wikilinked]]`. Pure regex-by-title scan against the
-# corpus' `title_to_paths` index — no LLM, no embeddings. Skips frontmatter,
-# code blocks, existing wikilinks, markdown links and HTML tags so we never
-# wrap text the user already linked elsewhere.
-
-_WIKILINK_SKIP_PATTERNS = [
-    re.compile(r"```.*?```", re.DOTALL),                  # fenced code
-    re.compile(r"`[^`\n]+`"),                              # inline code
-    re.compile(r"!?\[\[[^\]]+\]\]"),                       # existing wikilinks (incl. ![[embed]])
-    re.compile(r"\[[^\]\n]+\]\([^\)\n]+\)"),               # markdown links
-    re.compile(r"<!--.*?-->", re.DOTALL),                  # HTML comments (audit R2-Wikilinks #2)
-    re.compile(r"<[^>\n]+>"),                              # HTML tags
-]
-
-
-def _wikilink_skip_spans(text: str) -> list[tuple[int, int]]:
-    """Build the list of (start, end) char ranges to ignore when proposing
-    wikilinks. Includes frontmatter at top, code blocks, existing wikilinks,
-    markdown links and HTML tags.
-    """
-    spans: list[tuple[int, int]] = []
-    if text.startswith("---\n"):
-        end = text.find("\n---", 4)
-        if end != -1:
-            spans.append((0, end + 4))
-    for pat in _WIKILINK_SKIP_PATTERNS:
-        for m in pat.finditer(text):
-            spans.append(m.span())
-    return spans
-
-
-def _in_skip_span(pos: int, spans: list[tuple[int, int]]) -> bool:
-    return any(s <= pos < e for s, e in spans)
-
-
-def find_wikilink_suggestions(
-    col: SqliteVecCollection,
-    note_path: str,
-    min_title_len: int = 4,
-    max_per_note: int = 30,
-) -> list[dict]:
-    """Return wikilink suggestions for one note.
-
-    For each unique title in the corpus whose body matches inside `note_path`
-    AND that match isn't already covered by a wikilink/markdown link/code/HTML
-    span, propose `[[Title]]`. Case-sensitive, word-boundary anchored.
-
-    Returns [{title, target, line, char_offset, context}, ...].
-
-    Heuristics:
-     - `min_title_len`: skip very short titles (high collision risk; "TDD",
-       "AI", "X" trigger everywhere).
-     - Ambiguous titles (same string maps to multiple paths) are skipped —
-       can't know which to link to without user input.
-     - Self-links suppressed (target == note_path).
-     - Only the FIRST occurrence per title in the note is proposed (Obsidian
-       convention: one wikilink per page is enough for graph purposes).
-    """
-    full = (VAULT_PATH / note_path).resolve()
-    try:
-        full.relative_to(VAULT_PATH.resolve())
-    except ValueError:
-        return []
-    if not full.is_file():
-        return []
-    raw = full.read_text(encoding="utf-8", errors="ignore")
-    skip_spans = _wikilink_skip_spans(raw)
-
-    c = _load_corpus(col)
-    title_to_paths = c["title_to_paths"]
-    own_title = full.stem
-
-    suggestions: list[dict] = []
-    seen_titles: set[str] = set()
-    # Sort longest first — if "Claude Code" is a title and so is "Claude",
-    # prefer the longer phrase so we don't double-suggest overlapping spans.
-    titles_sorted = sorted(title_to_paths.items(), key=lambda kv: -len(kv[0]))
-    for title, paths in titles_sorted:
-        if len(title) < min_title_len or title in seen_titles:
-            continue
-        if title == own_title:
-            continue
-        if len(paths) != 1:
-            continue  # ambiguous — skip
-        target = next(iter(paths))
-        if target == note_path:
-            continue
-        try:
-            pat = re.compile(rf"\b{re.escape(title)}\b")
-        except re.error:
-            continue
-        for m in pat.finditer(raw):
-            if _in_skip_span(m.start(), skip_spans):
-                continue
-            line = raw[:m.start()].count("\n") + 1
-            ctx = raw[max(0, m.start() - 60):min(len(raw), m.end() + 60)]
-            suggestions.append({
-                "title": title,
-                "target": target,
-                "line": line,
-                "char_offset": m.start(),
-                "context": re.sub(r"\s+", " ", ctx).strip(),
-            })
-            seen_titles.add(title)
-            break  # one per title per note
-        if len(suggestions) >= max_per_note:
-            break
-    suggestions.sort(key=lambda s: s["char_offset"])
-    return suggestions
-
-
-def apply_wikilink_suggestions(note_path: str, suggestions: list[dict]) -> int:
-    """Wrap each proposed mention with `[[ ]]`. Returns (count, titles_applied).
-    Iterates from highest offset to lowest so earlier offsets stay valid.
-    Defensive: re-checks the literal text at offset before substituting
-    so a stale suggestion (file edited mid-flight) is silently skipped.
-    """
-    full = (VAULT_PATH / note_path).resolve()
-    try:
-        full.relative_to(VAULT_PATH.resolve())
-    except ValueError:
-        return 0, []
-    if not full.is_file() or not suggestions:
-        return 0, []
-    raw = full.read_text(encoding="utf-8", errors="ignore")
-    by_offset = sorted(suggestions, key=lambda s: s["char_offset"], reverse=True)
-    applied = 0
-    applied_titles: list[str] = []
-    for s in by_offset:
-        start = s["char_offset"]
-        title = s["title"]
-        end = start + len(title)
-        if raw[start:end] != title:
-            continue
-        raw = raw[:start] + f"[[{title}]]" + raw[end:]
-        applied += 1
-        applied_titles.append(title)
-    if applied:
-        full.write_text(raw, encoding="utf-8")
-    return applied, applied_titles
+# Phase 5 cont de modularización (audit perf 2026-05-08): el sub-sistema
+# (regex skip-spans + finder + apply) vive en `rag/_wikilink_suggest.py`.
+# Re-export shim preserva 100% compat con `rag.find_wikilink_suggestions`,
+# `rag.apply_wikilink_suggestions`.
+from rag._wikilink_suggest import *  # noqa: E402, F401, F403
 
 
 # ── DUPLICATE DETECTION ──────────────────────────────────────────────────────
@@ -26622,7 +26486,7 @@ def watch(debounce: float, all_vaults: bool):
     # OBSIDIAN_RAG_WATCH_EXCLUDE_FOLDERS="a,b,c" (relative to vault root).
     _exclude_env = os.environ.get(
         "OBSIDIAN_RAG_WATCH_EXCLUDE_FOLDERS",
-        "04-Archive/99-obsidian-system/99-AI/external-ingest/WhatsApp",
+        "99-obsidian/99-AI/external-ingest/WhatsApp",
     )
     exclude_folders = tuple(
         f.strip().rstrip("/") for f in _exclude_env.split(",") if f.strip()
@@ -29070,7 +28934,7 @@ USER_STATE_TTL_HOURS = 24
 # Perfil explícito del usuario — nota vault-relativa. Si existe, su contenido
 # se inyecta en el system prompt de query/chat como bloque "SOBRE EL USUARIO".
 # Contexto estable (familia, trabajo, áreas de expertise, preferencias de tono).
-USER_PROFILE_RELPATH = "04-Archive/99-obsidian-system/99-AI/perfil.md"
+USER_PROFILE_RELPATH = "99-obsidian/99-AI/perfil.md"
 
 
 def read_user_state() -> dict | None:
@@ -29201,7 +29065,7 @@ def ignore_clear():
 
 # ── voice routing classifier — bloque B del feature voice-classifier ──────
 # spec: ~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes/
-#       04-Archive/99-obsidian-system/99-AI/system/voice-classifier/spec.md
+#       99-obsidian/99-AI/system/voice-classifier/spec.md
 # Tabla rag_routing_decisions (logged por el listener TS) +
 # rag_routing_rules (extraídas por este CLI). El extract_rules cron las
 # promueve diario a las 3:30 AM, este grupo permite review/audit manual.
@@ -33948,14 +33812,14 @@ def _generate_digest_narrative(prompt: str) -> str:
         keep_alive=chat_keep_alive(),
     )
     # 2026-04-29: filter PT→ES post-gen — el digest semanal se guarda en
-    # `04-Archive/99-obsidian-system/99-AI/reviews/` y se le pushea al
+    # `99-obsidian/99-AI/reviews/` y se le pushea al
     # user. El prompt inline (línea 32400+) no incluye `language_es_AR.v1`
     # por ahora; el filter es safety net.
     from rag.iberian_leak_filter import replace_iberian_leaks
     return replace_iberian_leaks((resp.message.content or "").strip())
 
 
-DIGEST_FOLDER = "04-Archive/99-obsidian-system/99-AI/reviews"
+DIGEST_FOLDER = "99-obsidian/99-AI/reviews"
 
 
 @cli.command()
@@ -33971,7 +33835,7 @@ def digest(week_opt: str | None, days: int, dry_run: bool):
     Consume notas modificadas, frontmatter `contradicts:`, el sidecar log
     de contradicciones index-time, las contradicciones query-time y las
     queries low-confidence. Genera prosa narrativa con command-r y la
-    guarda en `04-Archive/99-obsidian-system/99-AI/reviews/YYYY-WNN.md` (auto-indexado).
+    guarda en `99-obsidian/99-AI/reviews/YYYY-WNN.md` (auto-indexado).
     """
     from datetime import timedelta as _td
     if week_opt:
@@ -34935,7 +34799,7 @@ def _agent_tool_record_contact_observation(
 ) -> str:
     """Anotar info relevante sobre un contacto en su nota del vault.
 
-    Las notas de `04-Archive/99-obsidian-system/99-Contacts/` son contactos
+    Las notas de `99-obsidian/99-Contacts/` son contactos
     VIVOS: cada vez que el user menciona algo relevante sobre alguien (una
     preferencia, un update de trabajo, un cumpleaños que olvidó, un tema
     sensible), usá este tool para que la próxima vez que el LLM lea esa
@@ -38792,10 +38656,10 @@ def read_cmd(url: str, save: bool, plain: bool):
 # ── MORNING BRIEF (rag morning) ──────────────────────────────────────────────
 # Proactive daily brief: what happened yesterday + what's pending + what to
 # focus today. Composes recent-notes / inbox / todo-frontmatter / new
-# contradictions / low-conf queries. Writes to 04-Archive/99-obsidian-system/99-AI/reviews/YYYY-MM-DD.md.
+# contradictions / low-conf queries. Writes to 99-obsidian/99-AI/reviews/YYYY-MM-DD.md.
 # Auto-fires via launchd weekday mornings.
 
-MORNING_FOLDER = "04-Archive/99-obsidian-system/99-AI/reviews"
+MORNING_FOLDER = "99-obsidian/99-AI/reviews"
 
 
 # ── Daemon-generated paths ─────────────────────────────────────────────────
@@ -38812,17 +38676,17 @@ MORNING_FOLDER = "04-Archive/99-obsidian-system/99-AI/reviews"
 # intacto (los daemons siguen siendo retrievable) y aplicamos esta lista
 # solo en `_collect_morning_evidence` y `_fetch_vault_activity`.
 _DAEMON_GENERATED_PREFIXES = (
-    "04-Archive/99-obsidian-system/99-AI/external-ingest/Calendar/",
-    "04-Archive/99-obsidian-system/99-AI/external-ingest/Chrome/",
-    "04-Archive/99-obsidian-system/99-AI/external-ingest/GitHub/",
-    "04-Archive/99-obsidian-system/99-AI/external-ingest/Gmail/",
-    "04-Archive/99-obsidian-system/99-AI/external-ingest/Reminders/",
-    "04-Archive/99-obsidian-system/99-AI/external-ingest/Screentime/",
-    "04-Archive/99-obsidian-system/99-AI/external-ingest/WhatsApp/",
-    "04-Archive/99-obsidian-system/99-AI/external-ingest/YouTube/",
-    "04-Archive/99-obsidian-system/99-AI/external-ingest/GoogleDrive/",
-    "04-Archive/99-obsidian-system/99-AI/external-ingest/Spotify/",
-    "04-Archive/99-obsidian-system/99-AI/external-ingest/Claude/",
+    "99-obsidian/99-AI/external-ingest/Calendar/",
+    "99-obsidian/99-AI/external-ingest/Chrome/",
+    "99-obsidian/99-AI/external-ingest/GitHub/",
+    "99-obsidian/99-AI/external-ingest/Gmail/",
+    "99-obsidian/99-AI/external-ingest/Reminders/",
+    "99-obsidian/99-AI/external-ingest/Screentime/",
+    "99-obsidian/99-AI/external-ingest/WhatsApp/",
+    "99-obsidian/99-AI/external-ingest/YouTube/",
+    "99-obsidian/99-AI/external-ingest/GoogleDrive/",
+    "99-obsidian/99-AI/external-ingest/Spotify/",
+    "99-obsidian/99-AI/external-ingest/Claude/",
     "00-Inbox/WA-",  # 00-Inbox/WA-YYYY-MM-DD.md (whatsapp listener daily)
     # mem-vault auto-saves: el agente escribe estas notas al cerrar tareas
     # no-triviales (decisions, bug patterns, gotchas). Se indexan para
@@ -38831,12 +38695,12 @@ _DAEMON_GENERATED_PREFIXES = (
     # sesión donde el agente guarda 5 memorias inflaba `recent_notes` con
     # 5 títulos "wa_draft_cjk_leak…", "feedback_runner…", etc. y
     # el LLM del brief intentaba narrar eso como "tu actividad".
-    "04-Archive/99-obsidian-system/99-AI/memory/",
+    "99-obsidian/99-AI/memory/",
     # MOZE finance ETL: dumps mensuales/diarios de gastos. Ya se surfacean
     # en su propio bucket (`💸 Finanzas`) con totales calculados — meterlas
     # también como "notas tocadas" duplica la señal y empuja al LLM a
     # mezclar nombres de categorías ("House", "Consumibles") en el recap.
-    "04-Archive/99-obsidian-system/99-AI/external-ingest/Finanzas/",
+    "99-obsidian/99-AI/external-ingest/Finanzas/",
 )
 
 
@@ -43779,7 +43643,7 @@ def _yesterday_evening_link(target: datetime, vault: Path) -> str:
     previous `rag today` left off.
     """
     yesterday = target - timedelta(days=1)
-    rel = f"04-Archive/99-obsidian-system/99-AI/reviews/{yesterday.strftime('%Y-%m-%d')}-evening.md"
+    rel = f"99-obsidian/99-AI/reviews/{yesterday.strftime('%Y-%m-%d')}-evening.md"
     if not (vault / rel).is_file():
         return ""
     title = f"{yesterday.strftime('%Y-%m-%d')}-evening"
@@ -44030,7 +43894,7 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int,
     Consume notas modificadas, 00-Inbox/ pending, todo/due frontmatter,
     contradicciones index-time del sidecar y queries low-confidence.
     command-r arma un brief de 120-280 palabras. Escribe a
-    `04-Archive/99-obsidian-system/99-AI/reviews/YYYY-MM-DD.md` (auto-indexado) salvo --dry-run.
+    `99-obsidian/99-AI/reviews/YYYY-MM-DD.md` (auto-indexado) salvo --dry-run.
 
     `--voice` (o env ``RAG_MORNING_VOICE=1``, configurable desde el plist):
     además del texto, sintetiza el brief a OGG/Opus via macOS ``say`` (voz
@@ -44243,7 +44107,7 @@ def voice_brief_generate(date_opt: str | None, text_override: str | None,
        Ideal para testing: ``rag voice-brief generate --text "hola mundo"``.
 
     2. ``--date YYYY-MM-DD`` (sin ``--text``) — busca el brief en disco
-       (``04-Archive/99-obsidian-system/99-AI/reviews/<date>.md`` para
+       (``99-obsidian/99-AI/reviews/<date>.md`` para
        morning, ``-evening.md`` para evening, etc.) y lo sintetiza.
 
     Por default solo guarda el ``.ogg`` en el cache. Con ``--apply``
@@ -44320,7 +44184,7 @@ def voice_brief_generate(date_opt: str | None, text_override: str | None,
 # ── EVENING BRIEF (rag today) ────────────────────────────────────────────────
 # End-of-day closure: mirrors morning's structure but looks BACK at the day
 # that just closed. Evidence window is [today 00:00 local, now]. Writes to
-# 04-Archive/99-obsidian-system/99-AI/reviews/YYYY-MM-DD-evening.md so it doesn't collide with morning's file.
+# 99-obsidian/99-AI/reviews/YYYY-MM-DD-evening.md so it doesn't collide with morning's file.
 
 
 def _today_window(now: datetime) -> tuple[datetime, datetime]:
@@ -44536,7 +44400,7 @@ def _render_today_prompt(
         "bloques de contexto. Si un dato no está, no lo menciones.",
         "",
         "4. **Dedupe ingester vs TODAY**. Cuando un dato aparezca tanto "
-        "en una nota `04-Archive/99-obsidian-system/99-AI/external-ingest/Gmail/<fecha>.md` como en un bucket "
+        "en una nota `99-obsidian/99-AI/external-ingest/Gmail/<fecha>.md` como en un bucket "
         "TODAY (`## Gmail — recibido HOY`), priorizá el bucket TODAY "
         "(tiene subject + remitente + snippet). NO cites las notas "
         "ingester como 'tocaste una nota'.",
@@ -46089,7 +45953,7 @@ def contact_note(contact_name: str, observation: str,
                  source_excerpt: str | None):
     """Anotar info viva sobre un contacto en su nota del vault.
 
-    Las notas de `04-Archive/99-obsidian-system/99-Contacts/` son contactos
+    Las notas de `99-obsidian/99-Contacts/` son contactos
     "vivos" — cada vez que el user (o el LLM) detecta info relevante sobre
     alguien, esta función la guarda ahí. Doble write:
 
@@ -46223,7 +46087,7 @@ def today(dry_run: bool, plain: bool, date_opt: str | None):
     Ventana: hoy 00:00 → ahora. Evidencia: notas modificadas hoy, capturas del
     día en 00-Inbox/, todos/due tocados, contradicciones nuevas, queries
     low-confidence. command-r arma un brief de 150-250 palabras. Escribe a
-    `04-Archive/99-obsidian-system/99-AI/reviews/YYYY-MM-DD-evening.md` (auto-indexado) salvo --dry-run. Si no
+    `99-obsidian/99-AI/reviews/YYYY-MM-DD-evening.md` (auto-indexado) salvo --dry-run. Si no
     hay actividad, imprime "sin actividad hoy" y termina.
     """
     _diff_brief_signal()  # compare yesterday's brief vs on-disk state → behavior events
@@ -46474,7 +46338,7 @@ def find_dead_notes(
 # Orquestador "todo en uno" pensado para correr via launchd a las 04:00:
 # cuando el user se despierta, todo está fresco — ETLs corridos, vault
 # reindexado, caches limpios, radares actualizados, brief matutino
-# pre-renderizado en 04-Archive/99-obsidian-system/99-AI/reviews/, y el chat model cargado en RAM con
+# pre-renderizado en 99-obsidian/99-AI/reviews/, y el chat model cargado en RAM con
 # keep_alive=-1 para que el primer `rag chat` responda sin cold-start.
 #
 # Cada paso es independiente: si `rag maintenance` falla, `rag morning`
@@ -46527,7 +46391,7 @@ def wake_up(ctx, dry_run: bool, skip_index: bool, skip_bookmarks: bool,
       4. `rag maintenance`     — WAL checkpoint, rotación de logs, cleanup.
       5. `rag patterns`        — radar de feedback dominante.
       6. `rag emergent`        — radar de temas emergentes en queries.
-      7. `rag morning`         — brief matutino pre-renderizado a 04-Archive/99-obsidian-system/99-AI/reviews/.
+      7. `rag morning`         — brief matutino pre-renderizado a 99-obsidian/99-AI/reviews/.
       8. LLM warmup            — carga el chat model con keep_alive=-1.
 
     Nota sobre bookmarks: `rag index` ya los sincroniza automáticamente
@@ -46690,7 +46554,7 @@ def wake_up(ctx, dry_run: bool, skip_index: bool, skip_bookmarks: bool,
 
 # ── EPISODIC MEMORY — PHASE 2 CONSOLIDATION (rag consolidate) ───────────────
 # Promotes recurring conversation clusters from
-# 04-Archive/99-obsidian-system/99-AI/conversations/ into PARA and
+# 99-obsidian/99-AI/conversations/ into PARA and
 # archives the originals. All heavy lifting lives in
 # scripts/consolidate_conversations.py — this is just the CLI shim so the
 # command shows up in `rag --help` + the weekly launchd service can invoke
@@ -46714,7 +46578,7 @@ def consolidate(window_days: int, threshold: float, min_cluster: int,
 
     Por default es dry-run — pasá --apply para escribir al vault.
 
-    Barre `04-Archive/99-obsidian-system/99-AI/conversations/` buscando clusters semánticamente similares
+    Barre `99-obsidian/99-AI/conversations/` buscando clusters semánticamente similares
     (embedding cosine ≥ --threshold, tamaño ≥ --min-cluster) en la ventana
     de --window-days. Cada cluster se sintetiza en una sola nota consolidada
     (qwen2.5:7b default) y se promueve a `01-Projects/` o `03-Resources/`
@@ -46762,7 +46626,7 @@ def consolidate(window_days: int, threshold: float, min_cluster: int,
 # ── VAULT TRANSIENT CLEANUP (rag vault-cleanup) ─────────────────────────────
 # El vault Obsidian acumula carpetas de "sistema" (outputs de scripts, chat
 # transcripts, drafts de commit msg, exports auto-regenerados) bajo
-# `04-Archive/99-obsidian-system/99-AI/`. `is_excluded()` ya filtra ese
+# `99-obsidian/99-AI/`. `is_excluded()` ya filtra ese
 # subtree del indexado del RAG, pero los archivos siguen ocupando espacio +
 # ensucian el graph view + las búsquedas full-text del Obsidian nativo.
 # Este command los purga moviéndolos al `.trash/` del vault (reversible).
@@ -46778,7 +46642,7 @@ def consolidate(window_days: int, threshold: float, min_cluster: int,
 def vault_cleanup_cmd(dry_run: bool, as_json: bool):
     """Mover archivos transitorios del vault al `.trash/`.
 
-    Carpetas bajo `04-Archive/99-obsidian-system/99-AI/` con TTLs por
+    Carpetas bajo `99-obsidian/99-AI/` con TTLs por
     política: `tmp/` 7d · `conversations/` 30d · `sessions/` 30d ·
     `Wiki/` wipe total · `plans/` 180d · `system/<slug>/` 180d ·
     `reviews/` 365d. `memory/` y `skills/` están en whitelist (intactos).
@@ -46887,7 +46751,7 @@ def distill_conversations_cmd(apply: bool, min_confidence: float,
                               limit: int | None, include_present: bool):
     """Destila respuestas de conversations cuyas fuentes ya no existen.
 
-    Walks `04-Archive/99-obsidian-system/99-AI/conversations/`, encuentra
+    Walks `99-obsidian/99-AI/conversations/`, encuentra
     conversations con `confidence_avg >= --min-confidence` y al menos una
     source missing, y reescribe los bot answers como notas runbook bajo
     `03-Resources/runbooks/from-conversations/<slug>.md`. Las notas
@@ -46955,7 +46819,7 @@ def distill_conversations_cmd(apply: bool, min_confidence: float,
 @click.option("--notify/--no-notify", default=True,
               help="Push a WhatsApp si ambient está configurado")
 @click.option("--report/--no-report", default=True,
-              help="Escribe reporte a 04-Archive/99-obsidian-system/99-AI/reviews/YYYY-MM-archive.md")
+              help="Escribe reporte a 99-obsidian/99-AI/reviews/YYYY-MM-archive.md")
 @click.option("--plain", is_flag=True, help="Salida plana (src\\tdst por línea)")
 def archive(min_age_days: int, query_window_days: int, folder: str | None,
             limit: int, gate: int, apply: bool, force: bool,
@@ -56221,7 +56085,7 @@ def _classify_source_from_path(path: str) -> str:
         if scheme in _CALIBRATION_SOURCES:
             return scheme
         return "vault"
-    if path.startswith("04-Archive/99-obsidian-system/99-AI/external-ingest/WhatsApp/"):
+    if path.startswith("99-obsidian/99-AI/external-ingest/WhatsApp/"):
         return "whatsapp"
     return "vault"
 

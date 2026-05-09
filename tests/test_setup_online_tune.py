@@ -173,12 +173,6 @@ def test_wa_tasks_plist_no_rag_explore():
     assert "RAG_EXPLORE" not in env
 
 
-def test_services_spec_includes_online_tune():
-    specs = rag_module._services_spec(RAG_BIN)
-    labels = [s[0] for s in specs]
-    assert "com.fer.obsidian-rag-online-tune" in labels
-
-
 def test_services_spec_excludes_serve_and_serve_watchdog():
     """rag serve y serve-watchdog DEPRECADOS desde 2026-05-01.
 
@@ -202,118 +196,20 @@ def test_services_spec_excludes_serve_and_serve_watchdog():
     assert "com.fer.obsidian-rag-serve-watchdog" not in labels
 
 
-def test_services_spec_total_count():
+def test_services_spec_total_count_post_supervisor():
+    """Post-supervisor refactor 2026-05-09: spec reducido a 3 plists
+    managed (supervisor + watch + web). Los 27 viejos están en
+    _DEPRECATED_LABELS. Ver
+    99-AI/system/daemon-refactor-2026-05-09/supervisor-refactor-adr.md.
+    """
     specs = rag_module._services_spec(RAG_BIN)
-    # Roster actualizado al 2026-05-01. Drift desde el last assert
-    # (35 → 33): se removieron `com.fer.obsidian-rag-serve` y
-    # `com.fer.obsidian-rag-serve-watchdog` por el split-brain con el
-    # FastAPI web server (ver test_services_spec_excludes_serve_and_
-    # serve_watchdog para el rationale).
-    # Bump 33 → 34 (T4, 2026-05-01): `daemon-watchdog` — self-healing
-    # loop cada 5min via `rag daemons reconcile --apply --gentle`.
-    # Bump 34 → 35 (2026-05-01): `wake-hook` — sidecar Python con
-    # KeepAlive=true que detecta wakes user-visible vía pmset y dispara
-    # `kickstart-overdue` para cubrir el lag post-Mac-wake del watchdog.
-    #
-    # Base infra (23):
-    #   watch, web (agregado 2026-04-22 — pre-fix estaba instalado
-    #   manualmente fuera de setup), digest, morning, today, wake-up
-    #   (2026-04-24 — orquestador nocturno 04:00), emergent, patterns,
-    #   archive, wa-tasks, reminder-wa-push (cron 5min para disparar
-    #   Apple Reminders via WhatsApp bridge antes de la due —
-    #   ver docstring en _services_spec), wa-scheduled-send (2026-04-25
-    #   — worker de mensajes WA programados, idempotente vía status enum),
-    #   auto-harvest (2026-04-23 — LLM-as-judge nocturno que labelea
-    #   queries low-conf sin feedback), active-learning-nudge (2026-04-29),
-    #   implicit-feedback (2026-04-26 — Sprint 1 del cierre del loop de
-    #   auto-aprendizaje), online-tune, calibrate (2026-04-23 —
-    #   per-source isotonic regression re-entrenada con feedback),
-    #   maintenance (2026-04-21 hardening), consolidate, vault-cleanup
-    #   (2026-04-27), anticipate (2026-04-24), brief-auto-tune
-    #   (2026-04-29 — Sunday 03:00 shift de morning/today/digest si el
-    #   user mutea consistentemente), daemon-watchdog (2026-05-01 T4
-    #   — self-healing).
-    #
-    # Cross-source ingesters (7):
-    #   ingest-whatsapp, ingest-gmail, ingest-reminders, ingest-calendar
-    #   (4 originales — calendar se skipea al install si ~/.calendar-mcp/
-    #   credentials.json no existe), ingest-calls (2026-04-30 — Apple
-    #   CallHistory), ingest-safari (2026-04-30 — bookmarks + history),
-    #   ingest-drive (2026-04-30 — Google Drive via OAuth).
-    #
-    # Helpers nuevos (4):
-    #   ingest-pillow (2026-04-30 — sleep tracker daily 09:30),
-    #   mood-poll (2026-04-30 — opt-in score diario cada 30min,
-    #   exit-early si state file mood_enabled missing), routing-rules
-    #   (2026-04-30 — detector de patrones cada 5min con --auto-promote
-    #   post 2026-05-01), whisper-vocab (2026-04-30 — extractor de
-    #   vocab nightly 03:15 con cmd `whisper vocab refresh` post
-    #   2026-05-01).
-    #
-    # 2026-05-04 consolidation: 8 cross-source ingesters → 1 ingest-cross-source
-    # + 2 WA workers (wa-scheduled-send, reminder-wa-push) → wa-fast.
-    # Net: 35 → 28 services.
-    # 2026-05-04 (PM): +1 distill-conversations weekly (semanal Sunday 02:00).
-    # Net: 28 → 29.
-    # 2026-05-06 (Ola 6): +1 spotify-poll.
-    # Net: 29 → 30.
-    # 2026-05-09 (audit ronda 2): +1 drift-watcher (cada 6h, alerta cuando
-    # hit@5 cae entre runs vs detección 13h-tardía via online-tune nightly).
-    # Net: 30 → 31.
-    # 2026-05-09 (active-learning bootstrap completo): +1
-    # active-learning-suggest-goldens (Lunes 11:00 weekly, push WA con
-    # candidates queries.yaml desde rag_feedback rating=+1). Net: 31 → 32.
-    assert len(specs) == 32
-
-
-def test_services_spec_includes_maintenance():
-    """Added 2026-04-21: daily `rag maintenance` at 04:00 compacts WAL +
-    rotates telemetry logs + conditional VACUUM. Without it the WAL grew
-    to 126 MB against a 206 MB main DB in production."""
-    specs = rag_module._services_spec(RAG_BIN)
+    assert len(specs) == 3
     labels = {s[0] for s in specs}
-    assert "com.fer.obsidian-rag-maintenance" in labels
-    # Plist content sanity: matches the 04:00 schedule + RunAtLoad=false.
-    plist = rag_module._maintenance_plist(RAG_BIN)
-    assert "<key>Hour</key><integer>4</integer>" in plist
-    assert "<key>RunAtLoad</key><false/>" in plist
-    assert "<string>maintenance</string>" in plist
-
-
-def test_services_spec_includes_vault_cleanup():
-    """Added 2026-04-27: daily `rag vault-cleanup` a las 02:00 mueve
-    archivos transitorios en `99-obsidian/99-AI/{tmp,
-    conversations, sessions, plans, system, reviews}/` (TTLs por carpeta)
-    + wipe completo de `Wiki/` al `.trash/` del vault. `memory/` y
-    `skills/` están en whitelist."""
-    specs = rag_module._services_spec(RAG_BIN)
-    labels = {s[0] for s in specs}
-    assert "com.fer.obsidian-rag-vault-cleanup" in labels
-    plist = rag_module._vault_cleanup_plist(RAG_BIN)
-    assert "<key>Hour</key><integer>2</integer>" in plist
-    assert "<key>RunAtLoad</key><false/>" in plist
-    assert "<string>vault-cleanup</string>" in plist
-    # No KeepAlive — es un cron diario, no un daemon long-running.
-    assert "<key>KeepAlive</key><false/>" in plist
-
-
-def test_services_spec_includes_anticipate():
-    """Added 2026-04-24 — game-changer: el RAG empuja info timely sin que
-    preguntes. Evalúa 3 señales (calendar proximity / temporal echo /
-    stale commitment) y empuja top-1 a WhatsApp vía proactive_push.
-
-    Cadencia 15min (ex 10min, audit 2026-05-09): el daily_cap=3 hace que
-    pollear más seguido no compre coverage adicional — el threshold más
-    sensible (calendar proximity) ya cubre eventos próximos en 15min.
-    Bajamos −33% LLM calls/día (96 vs 144)."""
-    specs = rag_module._services_spec(RAG_BIN)
-    labels = {s[0] for s in specs}
-    assert "com.fer.obsidian-rag-anticipate" in labels
-    plist = rag_module._anticipate_plist(RAG_BIN)
-    assert "<key>StartInterval</key><integer>900</integer>" in plist  # 15 min
-    assert "<key>RunAtLoad</key><false/>" in plist
-    assert "<string>anticipate</string>" in plist
-    assert "<string>run</string>" in plist
+    assert labels == {
+        "com.fer.obsidian-rag-supervisor",
+        "com.fer.obsidian-rag-watch",
+        "com.fer.obsidian-rag-web",
+    }
 
 
 @requires_plutil
@@ -337,18 +233,7 @@ def test_vault_cleanup_plist_valid_xml():
     assert result.returncode == 0, result.stderr.decode()
 
 
-# ── Cross-source ingesters (2026-04-21) ────────────────────────────────────
-
-def test_services_spec_includes_ingesters():
-    # 2026-05-04 consolidation: gmail/reminders/calendar merged into
-    # ingest-cross-source; whatsapp keeps its own plist.
-    specs = rag_module._services_spec(RAG_BIN)
-    labels = {s[0] for s in specs}
-    assert "com.fer.obsidian-rag-ingest-whatsapp" in labels
-    assert "com.fer.obsidian-rag-ingest-cross-source" in labels
-    assert "com.fer.obsidian-rag-ingest-gmail" not in labels
-    assert "com.fer.obsidian-rag-ingest-reminders" not in labels
-    assert "com.fer.obsidian-rag-ingest-calendar" not in labels
+# ── Cross-source ingesters (factories preservadas para potencial rollback) ─
 
 
 @pytest.mark.parametrize("fn_name,expected_source,expected_interval", [

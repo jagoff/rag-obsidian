@@ -156,9 +156,11 @@ def test_minimal_managed_labels_subset_of_spec():
         f"_MINIMAL_MANAGED_LABELS tiene labels fuera del spec: "
         f"{minimal - managed_labels}"
     )
-    # Mínimo viable per acuerdo 2026-05-08 con el user (rag start clean):
-    # watch + web + daemon-watchdog + wake-hook + maintenance.
-    assert len(minimal) == 5, f"Esperado 5 minimal labels, got {len(minimal)}"
+    # Post-supervisor refactor 2026-05-09: minimal == 3 (supervisor +
+    # watch + web). daemon-watchdog y wake-hook reemplazados por
+    # supervisor internals (APScheduler coalesce + misfire_grace_time).
+    # maintenance corre como cron job in-supervisor.
+    assert len(minimal) == 3, f"Esperado 3 minimal labels, got {len(minimal)}"
 
 
 def test_deprecated_plist_functions_are_gone():
@@ -220,120 +222,63 @@ def test_setup_install_only_labels_filter(tmp_path, monkeypatch):
     assert installed == only, f"Esperado solo {only}, got {installed}"
 
 
-# ── Resource-budget audit (2026-05-09) ─────────────────────────────────────
+# ── Post-supervisor refactor (2026-05-09): spec mínimo ─────────────────────
 #
-# Garantizan que la ronda de optimización mantiene los defaults:
-#   - Batch nocturnos: ProcessType=Background + LowPriorityIO=true.
-#   - daemon-watchdog: ExitTimeOut presente (evita hang en SQL locked).
-#   - Frecuencias largas: anticipate ≥ 900s, spotify-poll ≥ 300s.
-#   - Stagger: calibrate corre 05:00 (no 04:30, evita overlap online-tune).
-#   - HF_HUB_OFFLINE=1 explícito en plists que cargan modelos MLX.
+# Pre-refactor: 32 plists managed (audit 2026-05-09 con
+# ProcessType+LowPriorityIO+offline flags). Post-refactor: 27 daemons cron
+# fueron migrados al supervisor in-process; spec ahora es solo
+# supervisor + watch + web.
 #
-# Si se borra una de estas keys por accidente, este test grita.
+# Los tests del audit 2026-05-09 que validaban configs específicas de los
+# plists viejos (ProcessType=Background, anticipate cadence 15min,
+# calibrate stagger 5am, etc.) ya no aplican — esos plists no existen
+# como factories en _services_spec. Las configs equivalentes se preservan
+# en los jobs in-supervisor (rag/runtime/jobs/*.py) — testeadas por
+# test_runtime_jobs_*.py con assertions equivalentes en términos de
+# trigger_kind + trigger_args.
+#
+# Esos tests se removieron en el commit del bootout F2.4+F3.5. El audit
+# trail de cuáles configs se migraron está en el ADR
+# (99-AI/system/daemon-refactor-2026-05-09/supervisor-refactor-adr.md).
 
 
-_BATCH_NIGHTLY_LABELS = frozenset({
-    "com.fer.obsidian-rag-auto-harvest",
-    "com.fer.obsidian-rag-online-tune",
-    "com.fer.obsidian-rag-calibrate",
-    "com.fer.obsidian-rag-implicit-feedback",
-    "com.fer.obsidian-rag-whisper-vocab",
-    "com.fer.obsidian-rag-drift-watcher",
-    "com.fer.obsidian-rag-maintenance",
-    "com.fer.obsidian-rag-vault-cleanup",
-    "com.fer.obsidian-rag-consolidate",
-    "com.fer.obsidian-rag-archive",
-    "com.fer.obsidian-rag-distill",
-    "com.fer.obsidian-rag-emergent",
-    "com.fer.obsidian-rag-patterns",
-    "com.fer.obsidian-rag-active-learning-nudge",
-    "com.fer.obsidian-rag-active-learning-suggest-goldens",
-    "com.fer.obsidian-rag-brief-auto-tune",
-    "com.fer.obsidian-rag-wake-up",
-    "com.fer.obsidian-rag-routing-rules",
-    "com.fer.obsidian-rag-ingest-cross-source",
-})
-
-
-def _xml_for(label: str) -> str:
-    for lbl, _fname, xml_str in _iter_managed_factories():
-        if lbl == label:
-            return xml_str
-    raise AssertionError(f"Label {label} no está en _services_spec()")
-
-
-def test_batch_nightly_have_background_and_low_priority_io():
-    """Daemons batch nocturnos deben tener ProcessType=Background +
-    LowPriorityIO=true para no pisar chat/web del user en horarios
-    no programados (post-wake, user despierto temprano, etc)."""
-    failures = []
-    for label in _BATCH_NIGHTLY_LABELS:
-        xml_str = _xml_for(label)
-        if "<key>ProcessType</key><string>Background</string>" not in xml_str:
-            failures.append(f"{label}: falta ProcessType=Background")
-        if "<key>LowPriorityIO</key><true/>" not in xml_str:
-            failures.append(f"{label}: falta LowPriorityIO=true")
-    assert not failures, "\n".join(failures)
-
-
-def test_daemon_watchdog_has_exit_timeout():
-    """daemon-watchdog corre cada 5min. ExitTimeOut=10s evita hang
-    si SQL queda locked durante reconcile."""
-    xml_str = _xml_for("com.fer.obsidian-rag-daemon-watchdog")
-    assert "<key>ExitTimeOut</key><integer>10</integer>" in xml_str
-    assert "<key>ProcessType</key><string>Background</string>" in xml_str
-
-
-def test_anticipate_cadence_is_15min():
-    """anticipate baja 10min → 15min (audit 2026-05-09): daily_cap=3
-    hace que pollear más seguido no compre coverage."""
-    xml_str = _xml_for("com.fer.obsidian-rag-anticipate")
-    assert "<key>StartInterval</key><integer>900</integer>" in xml_str
-    assert "<key>StartInterval</key><integer>600</integer>" not in xml_str
-
-
-def test_spotify_poll_cadence_is_5min():
-    """spotify-poll baja 60s → 300s (audit 2026-05-09): track granular
-    no aporta a briefs ni mood scoring; -83% spawn overhead."""
-    xml_str = _xml_for("com.fer.obsidian-rag-spotify-poll")
-    assert "<key>StartInterval</key><integer>300</integer>" in xml_str
-    assert "<key>StartInterval</key><integer>60</integer>" not in xml_str
-
-
-def test_calibrate_staggered_to_5am():
-    """calibrate 04:30 → 05:00 (audit 2026-05-09): online-tune dura 24min
-    en mac M-chip, 04:30 se solapaba al final del tune."""
-    xml_str = _xml_for("com.fer.obsidian-rag-calibrate")
-    assert "<key>Hour</key><integer>5</integer>" in xml_str
-    sched = xml_str.split("StartCalendarInterval")[1].split("</dict>")[0]
-    assert "<integer>30</integer>" not in sched
-
-
-def test_frequent_workers_have_throttle():
-    """Plists con StartInterval ≤ 5min deben tener ThrottleInterval
-    para evitar spawn loops bajo backoff."""
-    targets = {
-        "com.fer.obsidian-rag-routing-rules",
-        "com.fer.obsidian-rag-wa-fast",
+def test_spec_post_refactor_has_three_managed_plists():
+    """Post-refactor: solo supervisor + watch + web."""
+    spec = rag._services_spec(_RAG_BIN)
+    labels = {s[0] for s in spec}
+    assert labels == {
+        "com.fer.obsidian-rag-supervisor",
+        "com.fer.obsidian-rag-watch",
+        "com.fer.obsidian-rag-web",
     }
-    failures = []
-    for label in targets:
-        xml_str = _xml_for(label)
-        if "ThrottleInterval" not in xml_str and "<key>Throttle</key>" not in xml_str:
-            failures.append(f"{label}: falta Throttle/ThrottleInterval")
-    assert not failures, "\n".join(failures)
 
 
-def test_mlx_plists_have_offline_flags():
-    """Plists con RAG_LLM_BACKEND=mlx deben tener HF_HUB_OFFLINE=1 +
-    TRANSFORMERS_OFFLINE=1 para que cold-start post-sleep no se cuelgue
-    si la red está caída + ahorrar HEAD requests a HuggingFace."""
-    failures = []
-    for label, _fname, xml_str in _iter_managed_factories():
-        if "<key>RAG_LLM_BACKEND</key><string>mlx</string>" not in xml_str:
-            continue
-        if "<key>HF_HUB_OFFLINE</key><string>1</string>" not in xml_str:
-            failures.append(f"{label}: tiene RAG_LLM_BACKEND=mlx pero falta HF_HUB_OFFLINE=1")
-        if "<key>TRANSFORMERS_OFFLINE</key><string>1</string>" not in xml_str:
-            failures.append(f"{label}: tiene RAG_LLM_BACKEND=mlx pero falta TRANSFORMERS_OFFLINE=1")
-    assert not failures, "\n".join(failures)
+def test_supervisor_plist_in_spec():
+    """El supervisor reemplaza 27 plists viejos."""
+    spec = rag._services_spec(_RAG_BIN)
+    labels = {s[0] for s in spec}
+    assert "com.fer.obsidian-rag-supervisor" in labels
+
+
+def test_deprecated_labels_includes_migrated_jobs():
+    """Los 27 labels migrados al supervisor deben estar en
+    _DEPRECATED_LABELS para que `rag setup` los bootouts en disco."""
+    expected_in_deprecated = {
+        "com.fer.obsidian-rag-auto-harvest",
+        "com.fer.obsidian-rag-anticipate",
+        "com.fer.obsidian-rag-online-tune",
+        "com.fer.obsidian-rag-calibrate",
+        "com.fer.obsidian-rag-maintenance",
+        "com.fer.obsidian-rag-mood-poll",
+        "com.fer.obsidian-rag-spotify-poll",
+        "com.fer.obsidian-rag-drift-watcher",
+        "com.fer.obsidian-rag-daemon-watchdog",
+        "com.fer.obsidian-rag-wake-hook",
+        "com.fer.obsidian-rag-morning",
+        "com.fer.obsidian-rag-today",
+        "com.fer.obsidian-rag-digest",
+    }
+    for label in expected_in_deprecated:
+        assert label in rag._DEPRECATED_LABELS, (
+            f"{label} debería estar en _DEPRECATED_LABELS post-bootout"
+        )

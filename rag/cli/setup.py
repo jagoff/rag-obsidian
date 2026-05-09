@@ -116,11 +116,13 @@ _QDRANT_LABELS: tuple[str, ...] = (
 # queden afuera reciben el mismo trato que `_DEPRECATED_LABELS` durante el
 # install (bootout + unlink). `rag start --full` instala los 30.
 _MINIMAL_MANAGED_LABELS: frozenset[str] = frozenset({
+    # Post-supervisor refactor 2026-05-09: minimal === all managed.
+    # `daemon-watchdog` + `wake-hook` reemplazados por supervisor
+    # internals (APScheduler coalesce + misfire_grace_time). `maintenance`
+    # corre adentro del supervisor como cron job (jobs/nightly.py).
+    "com.fer.obsidian-rag-supervisor",
     "com.fer.obsidian-rag-watch",
     "com.fer.obsidian-rag-web",
-    "com.fer.obsidian-rag-daemon-watchdog",
-    "com.fer.obsidian-rag-wake-hook",
-    "com.fer.obsidian-rag-maintenance",
 })
 
 

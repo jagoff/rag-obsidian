@@ -3467,7 +3467,13 @@ SEEN_TITLE_PENALTY = 0.1
 
 def _contradiction_penalty_enabled() -> bool:
     val = os.environ.get("RAG_CONTRADICTION_PENALTY", "1").strip().lower()
-    return val not in ("0", "false", "no", "off", "")
+    # Bug Hunt 2026-05-08 M7: blacklist previa incluía `""` (empty
+    # string), pero `RAG_CONTRADICTION_PENALTY=""` en bash típicamente
+    # significa "var unset / use default". El default del `os.environ.get`
+    # ya devuelve `"1"` cuando la var no existe — no hay razón para
+    # tratar `""` distinto del default. Quitarlo de la blacklist
+    # cierra el footgun.
+    return val not in ("0", "false", "no", "off")
 
 
 def _contradiction_penalty_magnitude() -> float:
@@ -19980,7 +19986,20 @@ def deep_retrieve(
     all_scores = list(result["scores"])
     all_graph_docs = list(result.get("graph_docs", []))
     all_graph_metas = list(result.get("graph_metas", []))
-    seen_chunks = {m.get("file", "") + "::" + d[:50] for d, m in zip(all_docs, all_metas)}
+    # Bug Hunt 2026-05-08 M4: usar `chunk_id` en vez de `d[:50]` para
+    # dedup. Si dos chunks de la misma nota tienen primer 50 chars
+    # idénticos (caso real con title prefix injection del reranker, o
+    # intros estandarizadas tipo `# Notas - 2026-...`), el segundo se
+    # consideraba dup y NO se agregaba — info se perdía silently.
+    # Fallback a `d[:50]` cuando no hay `chunk_id` (compat con metas
+    # legacy del corpus pre-bump).
+    def _dedup_key(d: str, m: dict) -> str:
+        cid = m.get("chunk_id")
+        if cid:
+            return f"{m.get('file', '')}::{cid}"
+        return f"{m.get('file', '')}::{d[:50]}"
+
+    seen_chunks = {_dedup_key(d, m) for d, m in zip(all_docs, all_metas)}
     seen_graph = {gm.get("file", "") for gm in all_graph_metas if gm.get("file")}
 
     # Wall-time anchor: aunque el loop tiene `_DEEP_MAX_ITERS` + `added==0`
@@ -20022,7 +20041,7 @@ def deep_retrieve(
         # Merge new results, dedup by chunk identity
         added = 0
         for d, m, s in zip(sub_result["docs"], sub_result["metas"], sub_result["scores"]):
-            key = m.get("file", "") + "::" + d[:50]
+            key = _dedup_key(d, m)
             if key not in seen_chunks:
                 seen_chunks.add(key)
                 all_docs.append(d)

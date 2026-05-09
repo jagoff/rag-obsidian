@@ -895,8 +895,32 @@ def run_parallel_post_process(
         result.full = repair_out["full"]
         result.citation_repaired = True
     elif critique_out.get("changed") and critique_out.get("full"):
-        result.full = critique_out["full"]
-        result.critique_changed = True
+        # Bug Hunt 2026-05-08 M8: critique-changed branch antes pisaba
+        # `result.full` con el output del critique sin re-validar las
+        # citations. Si critique reformula el answer pero deja las
+        # MISMAS bad citations del original, el user recibe un answer
+        # con paths que no existen. Fix: validar citations del critique
+        # antes de aceptar el merge; si tiene `bad`, descartar y
+        # mantener el original.
+        try:
+            critique_full = critique_out["full"]
+            critique_bad = _rag.verify_citations(critique_full, metas)
+            if not critique_bad:
+                result.full = critique_full
+                result.critique_changed = True
+            else:
+                result.critique_changed = False
+                _rag._silent_log(
+                    "postprocess_critique_bad_citations",
+                    RuntimeError(
+                        f"critique cambió pero introdujo {len(critique_bad)} "
+                        f"bad citations — descartado, mantengo original"
+                    ),
+                )
+        except Exception as _v_exc:
+            # Fallback safe: si verify_citations rompe, NO aceptar critique.
+            result.critique_changed = False
+            _rag._silent_log("postprocess_critique_verify_failed", _v_exc)
 
     if nli_out.get("ran"):
         result.nli_summary = nli_out.get("summary")

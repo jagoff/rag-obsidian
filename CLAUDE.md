@@ -1,34 +1,32 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guía para Claude Code en este repo.
 
-Local RAG sobre vault Obsidian. Layout post-split (2026-05-04): paquete `rag/` (`__init__.py` 64.4k LOC core + sub-módulos especializados) + `mcp_server.py` (thin wrapper) + `web/` (FastAPI `server.py` 23.9k LOC + static + dashboards) + `tests/` (8,103 tests, 453 archivos). Re-export pattern: `__init__.py` hace `from rag.X import *  # noqa: F401, F403` con `__all__` explícito en cada sub-módulo (preserva 100% compat con call sites históricos).
+Local RAG sobre vault Obsidian. Layout post-split (2026-05-04): paquete `rag/` (`__init__.py` 64.4k LOC core + sub-módulos) + `mcp_server.py` (thin wrapper) + `web/` (FastAPI `server.py` 23.9k LOC + static + dashboards) + `tests/` (8,103 tests, 453 archivos). Re-export pattern: `__init__.py` hace `from rag.X import *  # noqa: F401, F403` con `__all__` explícito en cada sub-módulo (preserva 100% compat con call sites históricos).
+
+Local-first sobre vault + corpus locales (sqlite-vec + MLX + sentence-transformers). Cross-source ingesters cloud (Gmail/Calendar/Drive) requieren creds OAuth en `~/.{gmail,calendar,gdrive}-mcp/`; sin creds silent-fail y corpus local sigue funcionando. WhatsApp + Reminders stay local.
+
+Python 3.13, `uv`. Runtime venv: `.venv/bin/python`. Global tool: `~/.local/share/uv/tools/obsidian-rag/`.
 
 ## Layout del paquete `rag/`
 
 **Sub-paquetes**:
 - `rag/cli/` — multi-vault commands (`vault.py` registra `rag vault {add|list|switch|...}`).
-- `rag/data/` — datos estáticos (`artist_mood.json` para mood detection).
-- `rag/integrations/` — 11 ingesters cross-source single-file (`apple_mail.py`, `calendar.py`, `chrome_bookmarks.py`, `drive.py`, `gmail.py`, `pillow_sleep.py`, `reminders.py`, `screentime.py`, `spotify_local.py`, `tally4_realm.py`, `weather.py`) + sub-paquete `whatsapp/` (12 módulos por responsabilidad post-split 2026-05-08: `_constants`, `send`, `contacts`, `observations`, `resolve`, `fetch`, `tasks_state`, `tasks_extract`, `tasks_writer`, `plist`, `scheduled` (ex `rag/wa_scheduled.py`), `cli` (ex `rag/wa_tasks.py`)). Owner: `rag-integrations` agent.
-- `rag/prompts/{intents,rules}/` — system prompts segmentados por intent (`chat.v2.md`, `lookup.v1.md`, `comparison.v3.md`, etc.) y rules atómicas (`chunk_as_data.v1.md`, `language_es_AR.v1.md`, `name_preservation.v1.md`).
+- `rag/data/` — datos estáticos (`artist_mood.json`).
+- `rag/integrations/` — 11 ingesters single-file (`apple_mail`, `calendar`, `chrome_bookmarks`, `drive`, `gmail`, `pillow_sleep`, `reminders`, `screentime`, `spotify_local`, `tally4_realm`, `weather`) + sub-paquete `whatsapp/` (12 módulos post-split 2026-05-08: `_constants`, `send`, `contacts`, `observations`, `resolve`, `fetch`, `tasks_state`, `tasks_extract`, `tasks_writer`, `plist`, `scheduled` (ex `rag/wa_scheduled.py`), `cli` (ex `rag/wa_tasks.py`)). Owner: `rag-integrations` agent.
+- `rag/prompts/{intents,rules}/` — system prompts segmentados por intent (`chat.v2.md`, `lookup.v1.md`, `comparison.v3.md`) y rules atómicas (`chunk_as_data.v1.md`, `language_es_AR.v1.md`, `name_preservation.v1.md`).
 
 **Módulos top-level relevantes** en `rag/`:
 - Core retrieval: `__init__.py`, `mlx_embed.py`, `mlx_reranker.py`, `mlx_tool_calls.py`, `llm_backend.py`, `llm_judge.py`, `contextual_retrieval.py`, `query_decompose.py`, `mmr_diversification.py`, `postprocess.py`, `iberian_leak_filter.py`, `contradictions_penalty.py`.
 - Cross-source: `cross_source_etls.py`, `cross_source_patterns.py`, `today_correlator.py`, `today_patterns.py`, `proactive.py`.
-- Productividad / briefs: `archive.py`, `anticipatory.py`, `brief_schedule.py`, `pendientes.py`, `vault_health.py`, `voice_brief.py`, `whisper.py`, `stale_source_detector.py`. (`wa_scheduled.py` + `wa_tasks.py` son shims `sys.modules` alias post-2026-05-08 — código real en `rag/integrations/whatsapp/{scheduled,cli}.py`.)
+- Productividad: `archive.py`, `anticipatory.py`, `brief_schedule.py`, `pendientes.py`, `vault_health.py`, `voice_brief.py`, `whisper.py`, `stale_source_detector.py`. (`wa_scheduled.py` + `wa_tasks.py` son shims `sys.modules` alias — código real en `rag/integrations/whatsapp/{scheduled,cli}.py`.)
 - Internos: `_constants.py`, `_shutdown.py`, `_tool_output_helpers.py`, `migrations.py`, `mood.py`, `conversation_distiller.py`, `ocr.py`, `plists.py`.
 
 **Entry points** (instalados via `uv tool install --reinstall --editable '.[entities,stt,mlx]'`):
 - `rag` — CLI indexing/querying/chat/productivity/automation.
 - `obsidian-rag-mcp` — MCP server (`rag_query`, `rag_read_note`, `rag_list_notes`, `rag_links`, `rag_stats`).
 
-**Extras default**: `entities` (gliner NER, **NO MLX-compat por design** — CPU only, opt-in via `RAG_EXTRACT_ENTITIES`), `stt` ([`mlx-whisper`](https://github.com/ml-explore/mlx-examples/tree/main/whisper) post-Ola 10), `mlx` (LLM + embedder backend activo). `spotify` queda opt-in puro: `'.[entities,stt,mlx,spotify]'`.
-
-**VLM**: granite vía [`mlx-vlm`](https://github.com/Blaizzy/mlx-vlm) en [`rag/ocr.py`](rag/ocr.py) (path opt-in para imágenes embebidas cuando `ocrmac` no alcanza). MLX-compat.
-
-Local-first sobre VAULT + corpus locales (sqlite-vec + MLX + sentence-transformers). Cross-source ingesters cloud (Gmail/Calendar/Drive) requieren creds OAuth en `~/.{gmail,calendar,gdrive}-mcp/`; sin esas creds silent-fail y corpus local sigue funcionando. WhatsApp + Reminders stay local.
-
-Python 3.13, `uv`. Runtime venv: `.venv/bin/python`. Global tool: `~/.local/share/uv/tools/obsidian-rag/`.
+**Extras default**: `entities` (gliner NER, **MLX-compat por design** — CPU only, opt-in via `RAG_EXTRACT_ENTITIES`), `stt` ([`mlx-whisper`](https://github.com/ml-explore/mlx-examples/tree/main/whisper)), `mlx` (LLM + embedder backend activo). `spotify` opt-in: `'.[entities,stt,mlx,spotify]'`. **VLM**: granite vía [`mlx-vlm`](https://github.com/Blaizzy/mlx-vlm) en [`rag/ocr.py`](rag/ocr.py) (opt-in para imágenes embebidas cuando `ocrmac` no alcanza).
 
 ## Docs detalle (cargar bajo demanda)
 
@@ -48,49 +46,42 @@ Python 3.13, `uv`. Runtime venv: `.venv/bin/python`. Global tool: `~/.local/shar
 | Cómo funciona end-to-end | [`docs/como-funciona.md`](docs/como-funciona.md) |
 | Recovery + problemas | [`docs/recovery.md`](docs/recovery.md), [`docs/problemas-comunes.md`](docs/problemas-comunes.md) |
 
-## MLX-first (regla invariable)
+## MLX-first (regla invariable + estado actual)
 
-**Todo el sistema es [MLX](https://github.com/ml-explore/mlx) first.** Al evaluar incorporar o modificar cualquier componente que toque inferencia / embedding / STT / VLM / NLI / reranking / tool-calling, la opción MLX-nativa es default y requisito; alternativas non-MLX (PyTorch / `sentence-transformers` / `faster-whisper` / Ollama / CrossEncoder / etc.) solo se aceptan como:
+**Todo el sistema es [MLX](https://github.com/ml-explore/mlx) first.** Para inferencia / embedding / STT / VLM / NLI / reranking / tool-calling, la opción MLX-nativa es default y requisito. Alternativas non-MLX (PyTorch / `sentence-transformers` / `faster-whisper` / Ollama / CrossEncoder) solo se aceptan como:
 
-1. **Rollback path explícito** detrás de env var (ej. `RAG_EMBED_BACKEND=pytorch`, `RAG_NLI_BACKEND=mdeberta`) cuando MLX tiene un bug abierto reproducible.
-2. **Path opt-in NO-MLX-compat por design** documentado (ej. `gliner` NER → CPU only, gated por `RAG_EXTRACT_ENTITIES`).
-3. **Dependency externa de un MCP / integración no-RAG** que el user usa por separado (ej. daemon Ollama corriendo para `mem-vault` u otros agentes — no para obsidian-rag).
+1. **Rollback path explícito** detrás de env var (ej. `RAG_EMBED_BACKEND=pytorch`, `RAG_NLI_BACKEND=mdeberta`) cuando MLX tiene bug abierto reproducible.
+2. **Path opt-in NO-MLX-compat por design** (ej. `gliner` NER → CPU only, gated por `RAG_EXTRACT_ENTITIES`).
+3. **Dependency externa de un MCP / integración no-RAG** que el user usa por separado (ej. daemon Ollama corriendo para `mem-vault` — no para obsidian-rag).
 
-**Antes de agregar una dep nueva** (modelo, librería de inferencia, runtime), validar:
-- ¿Hay versión [`mlx-community/...`](https://huggingface.co/mlx-community) del modelo? Si sí → usar esa.
-- ¿Hay equivalente MLX de la librería ([`mlx-lm`](https://github.com/ml-explore/mlx-lm), [`mlx-whisper`](https://github.com/ml-explore/mlx-examples/tree/main/whisper), [`mlx-vlm`](https://github.com/Blaizzy/mlx-vlm), [`mlx-embeddings`](https://github.com/Blaizzy/mlx-embeddings))? Si sí → priorizar esa.
-- Si NO hay MLX viable → flaggearlo en el plan (no asumir que está OK), proponer fallback con env-var de rollback al path MLX, y documentar en el commit por qué se aceptó la excepción.
+**Antes de agregar dep nueva** (modelo, librería, runtime):
+- ¿Hay versión [`mlx-community/...`](https://huggingface.co/mlx-community)? Si sí → usar esa.
+- ¿Hay equivalente MLX de la librería ([`mlx-lm`](https://github.com/ml-explore/mlx-lm), [`mlx-whisper`](https://github.com/ml-explore/mlx-examples/tree/main/whisper), [`mlx-vlm`](https://github.com/Blaizzy/mlx-vlm), [`mlx-embeddings`](https://github.com/Blaizzy/mlx-embeddings))? Si sí → priorizar.
+- Si NO hay MLX viable → flaggearlo en el plan, proponer fallback con env-var de rollback al path MLX, documentar excepción en commit.
 
-**Antes de modificar un path runtime existente** (chat, embed, rerank, STT, NLI), confirmar que el cambio respeta el branch MLX como primary y deja el branch non-MLX (si existe) solo como rollback. NO regresar default a non-MLX. NO introducir dep `ollama>=0.x` ni similares.
+NO regresar default a non-MLX. NO introducir dep `ollama>=0.x`.
 
-Olas 1-10 (2026-04 → 2026-05-07) ya completaron la migración; esta regla protege que no se erosione hacia atrás. Detalle de la migración debajo.
-
-## MLX migration (Ola 10 — 100% MLX, hot-path completo — 2026-05-07)
-
-**Estado actual: 100% MLX en todos los paths runtime — embedder + reranker MLX opt-in + STT + NLI**. Migración completada en 10 olas escalonadas (Olas 1-8: chat / embed / purga ollama, **Ola 9 (2026-05-06)**: embedder PyTorch → MLX, **Ola 10 (2026-05-07)**: STT [`faster-whisper`](https://github.com/SYSTRAN/faster-whisper) → [`mlx-whisper`](https://github.com/ml-explore/mlx-examples/tree/main/whisper) + NLI [`mDeBERTa`](https://huggingface.co/MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7) → LLM-as-judge ([`qwen2.5:3b`](https://huggingface.co/mlx-community/Qwen2.5-3B-Instruct-4bit) helper) + bug #4 fix iteration truncada en `_run_index`). Default `RAG_LLM_BACKEND=mlx`, `RAG_EMBED_BACKEND=mlx`, `RAG_NLI_BACKEND=llm`. Detalle completo en [`docs/mlx-migration.md`](docs/mlx-migration.md).
+**Estado actual: 100% MLX en todos los paths runtime** — embedder + reranker MLX + STT + NLI. Migración completada en 10 olas (2026-04 → 2026-05-07). Default: `RAG_LLM_BACKEND=mlx`, `RAG_EMBED_BACKEND=mlx`, `RAG_NLI_BACKEND=llm`. Detalle en [`docs/mlx-migration.md`](docs/mlx-migration.md).
 
 **Mapping**:
 - `qwen2.5:3b` (HELPER) → [`mlx-community/Qwen2.5-3B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-3B-Instruct-4bit)
 - `qwen2.5:7b` (CHAT default) → [`mlx-community/Qwen2.5-7B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-7B-Instruct-4bit)
 - `command-r` / `qwen2.5:14b` (HQ tier) → [`mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit`](https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit)
-- `qwen3-embedding:0.6b` (embedder) → [`mlx-community/Qwen3-Embedding-0.6B-8bit`](https://huggingface.co/mlx-community/Qwen3-Embedding-0.6B-8bit) via [`mlx-lm`](https://github.com/ml-explore/mlx-lm) in-process ([`rag/mlx_embed.py`](rag/mlx_embed.py), Ola 9). Cosine ≥0.9977 vs PyTorch fp16 — bit-equivalente funcional, NO requiere reindex (`_COLLECTION_BASE` queda en `obsidian_notes_v12`).
-- `whisper-small` (STT default) → [`mlx-community/whisper-small-mlx`](https://huggingface.co/mlx-community/whisper-small-mlx) via [`mlx-whisper`](https://github.com/ml-explore/mlx-examples/tree/main/whisper) (Ola 10). Toda la familia tiny/base/small/medium/large-v3/large-v3-turbo mapeada en `_WHISPER_NAME_TO_HF` ([`rag/whisper.py`](rag/whisper.py)). API-compat preservada via `_MLXWhisperModelWrapper.transcribe()` → `(segments_iter, info)`.
-- NLI grounding (default OFF, opt-in via `RAG_NLI_GROUNDING=1`) → LLM-as-judge con `qwen2.5:3b` helper ([`rag/postprocess.py`](rag/postprocess.py) `_ground_claims_via_llm`, Ola 10). Rollback al path histórico CrossEncoder + mDeBERTa via `RAG_NLI_BACKEND=mdeberta`.
-- VLM granite (opt-in image-in-note) → [`mlx-vlm`](https://github.com/Blaizzy/mlx-vlm) en [`rag/ocr.py`](rag/ocr.py).
+- `qwen3-embedding:0.6b` (embedder) → [`mlx-community/Qwen3-Embedding-0.6B-8bit`](https://huggingface.co/mlx-community/Qwen3-Embedding-0.6B-8bit) via [`mlx-lm`](https://github.com/ml-explore/mlx-lm) in-process ([`rag/mlx_embed.py`](rag/mlx_embed.py)). Cosine ≥0.9977 vs PyTorch fp16 — bit-equivalente funcional, NO requiere reindex.
+- `whisper-small` (STT) → [`mlx-community/whisper-small-mlx`](https://huggingface.co/mlx-community/whisper-small-mlx) via [`mlx-whisper`](https://github.com/ml-explore/mlx-examples/tree/main/whisper). Familia tiny/base/small/medium/large-v3/large-v3-turbo en `_WHISPER_NAME_TO_HF` ([`rag/whisper.py`](rag/whisper.py)).
+- NLI grounding (default OFF, opt-in `RAG_NLI_GROUNDING=1`) → LLM-as-judge con `qwen2.5:3b` ([`rag/postprocess.py`](rag/postprocess.py) `_ground_claims_via_llm`). Rollback `RAG_NLI_BACKEND=mdeberta` cae a CrossEncoder + mDeBERTa.
 
-**Tipos response** ([`rag/llm_backend.py`](rag/llm_backend.py)): `Message`, `ChatResponse`, `GenerateResponse` son pydantic `BaseModel` locales (ya no `from ollama._types import ...`). `Message.ToolCall.Function` preservado via assignment post-class para compat con `parse_tool_calls()`.
+**Tipos response** ([`rag/llm_backend.py`](rag/llm_backend.py)): `Message`, `ChatResponse`, `GenerateResponse` son pydantic `BaseModel` locales. `Message.ToolCall.Function` preservado via assignment post-class.
 
-**Tool-calling**: nativo MLX via [`rag/mlx_tool_calls.py`](rag/mlx_tool_calls.py) (Ola 5, commit `82d27d5`). Parser Qwen `<tool_call>{...}</tool_call>` → `Message.ToolCall`. Wireado en [`rag/llm_backend.py`](rag/llm_backend.py).
+**Tool-calling**: nativo MLX via [`rag/mlx_tool_calls.py`](rag/mlx_tool_calls.py). Parser Qwen `<tool_call>{...}</tool_call>` → `Message.ToolCall`.
 
-**Idle-unload watchdog** ([`rag/llm_backend.py`](rag/llm_backend.py)): evicta modelos con `now - last_used > RAG_MLX_IDLE_TTL` (default 1800s). Disable: `RAG_MLX_IDLE_TTL=0` o `RAG_MLX_IDLE_DISABLE=1`.
+**Idle-unload watchdog**: evicta modelos con `now - last_used > RAG_MLX_IDLE_TTL` (default 1800s). Disable: `RAG_MLX_IDLE_TTL=0` o `RAG_MLX_IDLE_DISABLE=1`.
 
-**Memory pressure watchdog** ([`rag/__init__.py`](rag/__init__.py) `_handle_memory_pressure`): MLX-only path. Llama `MLXBackend.unload(model)` (pop `_loaded` + `mx.clear_cache()`) cuando swap pressure ≥ threshold. Branch Ollama defensivo purgado en Ola 8.
+**Memory pressure watchdog** (`_handle_memory_pressure`): MLX-only path. Llama `MLXBackend.unload(model)` (pop `_loaded` + `mx.clear_cache()`) cuando swap pressure ≥ threshold.
 
-**Rollback emergencia**: requiere `git revert` de Ola 7+ commits + `uv pip install ollama>=0.6.1` + re-pull de modelos chat Ollama. NO se soporta vía env var — `RAG_LLM_BACKEND=ollama` ahora loguea warning + cae a MLX (`OllamaBackend` no existe más). Para el embedder, rollback al path PyTorch SentenceTransformer está disponible vía `RAG_EMBED_BACKEND=pytorch` (path histórico mantenido como contención mientras MLX se valida en runtime sostenido).
+**Rollback emergencia**: requiere `git revert` de Ola 7+ commits + `uv pip install ollama>=0.6.1` + re-pull modelos chat. NO se soporta vía env var — `RAG_LLM_BACKEND=ollama` loguea warning + cae a MLX. Para embedder, rollback PyTorch SentenceTransformer disponible vía `RAG_EMBED_BACKEND=pytorch`.
 
-**Tests**: `tests/conftest.py` fixture autouse `_reset_backend_singleton_per_test` resetea singleton entre tests + auto-stubea `_mlx_chat`/`_chat_stream_dispatch` para tests que NO mockean LLM (evita cargar modelos reales). Tests que MOCKEAN llm_chat hacen `monkeypatch.setattr(rag, "_mlx_chat", _fake)` — su patch gana sobre el auto-stub.
-
-**`ollama>=0.6.1` removido de `pyproject.toml`** (Ola 8). Ningún call site runtime lo usa. El daemon Ollama (`com.ollama.ollama`) puede seguir corriendo para integraciones externas (mem-vault, otros agentes), no para obsidian-rag.
+`ollama>=0.6.1` removido de `pyproject.toml`. Daemon Ollama (`com.ollama.ollama`) puede seguir corriendo para integraciones externas (mem-vault), no para obsidian-rag.
 
 ## Idioma
 
@@ -109,17 +100,13 @@ Skip PM cuando: edits mecánicos (rename, ruff, bump versión, typo fix), single
 
 Roster + ownership en [`.claude/agents/README.md`](.claude/agents/README.md).
 
-### Custom agent profiles requieren reload de la sesión
-
-Profiles en `.claude/agents/*.md` se cargan **una sola vez al iniciar la sesión**. Si creás un agent nuevo durante una sesión activa, esa sesión NO lo ve. Workaround: reabrir sesión, o inyectar el system prompt inline en `subagent_explore` / `subagent_general`. Mismo gotcha aplica a skills custom. Hooks en `.devin/config.json` SÍ se refrescan en runtime.
+**Custom agent profiles requieren reload de la sesión**. `.claude/agents/*.md` se cargan **una sola vez al iniciar sesión**. Si creás un agent durante una sesión activa, esa sesión NO lo ve. Workaround: reabrir sesión, o inyectar system prompt inline en `subagent_explore` / `subagent_general`. Mismo gotcha aplica a skills custom. Hooks en `.devin/config.json` SÍ se refrescan en runtime.
 
 ## Auto-pull + commit + push rule
 
 Cuando termino algo: `git pull → git commit → git push origin master`. Sin preguntar. Mensaje completo en español rioplatense (qué cambié, por qué, cómo medí si aplica, cómo revertir si rompe). Trailer estándar Devin al final. Si tests fallan o build rompe → NO commiteás. Excepciones: tareas exploratorias, cambios pedidos no commitear, trabajo a medio camino.
 
-### Gotcha: commits locales en `master` se pushean solos
-
-Cualquier commit en `master` aparece en `origin/master` en segundos por **otra sesión paralela** (claude-peers MCP). Implicaciones:
+**Gotcha: commits locales en `master` se pushean solos** por otra sesión paralela (claude-peers MCP). Implicaciones:
 
 1. `git commit` master = `git push` casi inmediato. Sin ventana para "commit experimental + reset si no me gusta".
 2. Para experimentar sin pushear → branch dedicada (`git checkout -b experimental/<slug>`).
@@ -133,9 +120,7 @@ Devin tiene 4 [permission modes](https://docs.devin.ai/reference/permissions). C
 1. `.devin/config.json` — ~80 allow rules (git, rag, uv, pytest, sqlite3, launchctl, observabilidad, writes en repo); 6 deny (sudo, `git reset --hard`, `git push --force`, `git branch -D`); ask (.env, ~/.ssh, ~/.aws, writes al vault iCloud, fetch a OpenAI/Anthropic). `rm -rf` allow desde 2026-04-28.
 2. Bypass mode (`devin --permission-mode bypass` o Shift+Tab): cero prompts salvo `deny`.
 
-Precedencia: org → session-grants → `.devin/config.local.json` → `.devin/config.json` → `~/.config/devin/config.json`.
-
-Rollback: `mv .devin/config.json{,.disabled}`.
+Precedencia: org → session-grants → `.devin/config.local.json` → `.devin/config.json` → `~/.config/devin/config.json`. Rollback: `mv .devin/config.json{,.disabled}`.
 
 ## Zsh tab-completion
 
@@ -147,13 +132,13 @@ Instalación: `cp completions/_rag ~/.oh-my-zsh/custom/completions/_rag && rm -f
 
 PWA instalable iOS Safari → home screen. Wiring: [`web/static/manifest.webmanifest`](web/static/manifest.webmanifest), [`sw.js`](web/static/sw.js), [`pwa/register-sw.js`](web/static/pwa/register-sw.js) + [`scripts/gen_pwa_assets.py`](scripts/gen_pwa_assets.py).
 
-**LAN exposure**: dos env vars en [`com.fer.obsidian-rag-web.plist`](~/Library/LaunchAgents/com.fer.obsidian-rag-web.plist):
+**LAN exposure** (env vars en [`com.fer.obsidian-rag-web.plist`](~/Library/LaunchAgents/com.fer.obsidian-rag-web.plist)):
 - `OBSIDIAN_RAG_BIND_HOST=0.0.0.0` — uvicorn bindea a todas las interfaces (default `127.0.0.1`).
 - `OBSIDIAN_RAG_ALLOW_LAN=1` — extiende CORS regex a [RFC1918](https://datatracker.ietf.org/doc/html/rfc1918) (10/8, 172.16/12, 192.168/16).
 
 **Tradeoff iOS**: SW solo registra en secure context (HTTPS o localhost). HTTP LAN da fullscreen + icon + splash, NO offline cache. Para SW completo via LAN: Caddy con `tls internal` + cert root al iPhone.
 
-**HTTPS público**: [`cloudflared tunnel --url http://localhost:8765`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/) genera URL random. CORS: `OBSIDIAN_RAG_ALLOW_TUNNEL=1`. URL cambia cada restart cloudflared — para estable: named tunnel + dominio. Dos plists: `cloudflare-tunnel` + `cloudflare-tunnel-watcher` (escribe URL a `~/.local/share/obsidian-rag/cloudflared-url.txt` + pbcopy + macOS notification). Aliases: `rag-url`, `rag-url-c`.
+**HTTPS público**: [`cloudflared tunnel --url http://localhost:8765`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/) genera URL random. CORS: `OBSIDIAN_RAG_ALLOW_TUNNEL=1`. URL cambia cada restart — para estable: named tunnel + dominio. Dos plists: `cloudflare-tunnel` + `cloudflare-tunnel-watcher` (escribe URL a `~/.local/share/obsidian-rag/cloudflared-url.txt` + pbcopy + macOS notification). Aliases: `rag-url`, `rag-url-c`.
 
 **Seguridad**: server NO tiene auth. Solo activar en WiFi privado.
 
@@ -164,42 +149,39 @@ PWA instalable iOS Safari → home screen. Wiring: [`web/static/manifest.webmani
 | `make install` | `uv tool install --reinstall --editable '.[entities,stt,mlx]'` | Después de cambios en código Python |
 | `make test` | `pytest -q -m "not slow" --tb=short` | Default loop iteración |
 | `make test-fast` | xdist `-n auto`, skip slow | Suite paralela cuando importan minutos |
-| `make test-all` | suite completa incluido `slow` | Pre-push, sequential (slow tests share state) |
+| `make test-all` | suite completa incluido `slow` | Pre-push, sequential |
 | `make lint` | `uvx ruff check` (paridad CI) | Antes de commit |
 | `make format` | `ruff --fix` + `ruff format` | Auto-fix safe + estilo |
 | `make eval` | `rag eval --latency --max-p95-ms 2500` | Validar floor + perf gate (~24min warm) |
-| `make eval-fast` | `rag eval` sin latency | Solo hit@k + MRR (más rápido) |
+| `make eval-fast` | `rag eval` sin latency | Solo hit@k + MRR |
 | `make tune` | dry-run `rag tune --samples 500` | Ver ranker.json winner sin persistir |
 | `make tune-apply` | `rag tune --apply --yes` | Persiste winner + backup |
-| `make silent-errors` | tail últimos 20 silent errors | Diagnóstico rápido `silent_errors.jsonl` |
+| `make silent-errors` | tail últimos 20 silent errors | Diagnóstico rápido |
 | `make silent-summary` | agrega por `(where, exc_type)` | Audit telemetry |
-| `make drift-watcher` | corre `scripts/drift_watcher.py` manual | Alerta si singles_hit5 cae >5pp run-over-run |
+| `make drift-watcher` | `scripts/drift_watcher.py` manual | Alerta singles_hit5 cae >5pp run-over-run |
 | `make coverage` | report term + HTML en `htmlcov/` | Audit cobertura |
 
-`.venv/bin/python` es el intérprete autoritativo para tests + eval; `uv tool install` solo afecta los entry points globales (`rag`, `obsidian-rag-mcp`).
+`.venv/bin/python` es el intérprete autoritativo para tests + eval; `uv tool install` solo afecta entry points globales (`rag`, `obsidian-rag-mcp`).
 
-### Web server dev loop
-
-Para iterar sobre [`web/server.py`](web/server.py) sin tocar el plist:
+**Web server dev loop** — iterar sobre [`web/server.py`](web/server.py) sin tocar el plist:
 
 ```bash
-launchctl bootout gui/$(id -u)/com.fer.obsidian-rag-web      # parar el daemon
+launchctl bootout gui/$(id -u)/com.fer.obsidian-rag-web      # parar daemon
 .venv/bin/python -m uvicorn web.server:app --reload --port 8765
-# al terminar:
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fer.obsidian-rag-web.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fer.obsidian-rag-web.plist  # al terminar
 ```
 
-### Tests — single file / marker / debug
+**Tests — single file / marker / debug**:
 
 ```bash
-.venv/bin/python -m pytest tests/test_foo.py -q                    # un archivo
-.venv/bin/python -m pytest tests/test_foo.py::test_bar -q          # un test
-.venv/bin/python -m pytest tests/test_foo.py -k "name_substring" -x -vv   # primer fail, verbose
-.venv/bin/python -m pytest -m "requires_mlx"                       # por marker
-.venv/bin/python -m pytest tests/test_foo.py -q --pdb              # drop a pdb on fail
+.venv/bin/python -m pytest tests/test_foo.py -q                          # un archivo
+.venv/bin/python -m pytest tests/test_foo.py::test_bar -q                # un test
+.venv/bin/python -m pytest tests/test_foo.py -k "name_substring" -x -vv  # primer fail, verbose
+.venv/bin/python -m pytest -m "requires_mlx"                             # por marker
+.venv/bin/python -m pytest tests/test_foo.py -q --pdb                    # drop a pdb on fail
 ```
 
-Conftest autouse fixture `_reset_backend_singleton_per_test` resetea el singleton entre tests + auto-stubea `_mlx_chat`/`_chat_stream_dispatch` (post-Ola 7). Tests que mockean LLM hacen `monkeypatch.setattr(rag, "_mlx_chat", _fake)` — su patch gana sobre el auto-stub.
+Conftest autouse fixture `_reset_backend_singleton_per_test` resetea singleton entre tests + auto-stubea `_mlx_chat`/`_chat_stream_dispatch` para tests que NO mockean LLM (evita cargar modelos reales). Tests que mockean hacen `monkeypatch.setattr(rag, "_mlx_chat", _fake)` — su patch gana sobre el auto-stub.
 
 ## Commands (canonical subset)
 
@@ -208,11 +190,11 @@ uv tool install --reinstall --editable '.[entities,stt,mlx]'
 
 # Bootstrap (idempotente)
 rag start                                                        # mínimo viable (5: watch/web/daemon-watchdog/wake-hook/maintenance) + RagNet + catch-up
-rag start --full                                                 # los 30 daemons del spec (briefs + learning loops + cross-source ingest)
+rag start --full                                                 # los 30 daemons del spec
 rag stop                                                         # frena todo
-rag health                                                       # snapshot unificado: corpus, latencia, feedback, calibration
+rag health                                                       # snapshot unificado
 
-# Core (NOTA: --full reemplaza al deprecated --reset desde commit 17973d2 — alias activo, warning)
+# Core (--full reemplaza al deprecated --reset desde commit 17973d2 — alias activo, warning)
 rag index [--full] [--no-contradict] [--vault NAME]
 rag index --source whatsapp|contacts|calls|safari|reminders|gmail|calendar|drive|pillow [--full --since ISO --dry-run]
 rag query "text" [--hyde --no-multi --raw --loose --force --counter --no-deep --plain --source S]
@@ -244,71 +226,65 @@ rag voice-brief generate, rag whisper {stats|vocab|patterns|export|import}
 rag maintenance, rag free, rag setup
 rag daemons {status|reconcile|doctor|retry|kickstart-overdue}
 python scripts/audit_telemetry_health.py --days 7  # PRIMER comando antes de "auditá el sistema"
-
-# Tests
-.venv/bin/python -m pytest tests/ -q
-.venv/bin/python -m pytest tests/test_foo.py::test_bar -q
 ```
 
 Set completo en [`docs/comandos.md`](docs/comandos.md).
 
 ## Env vars críticas (rollback paths)
 
-Catálogo completo (47+ vars adicionales) en [`docs/env-vars-catalog.md`](docs/env-vars-catalog.md). Esta sección cubre las críticas con rollback.
+Catálogo completo (47+ vars) en [`docs/env-vars-catalog.md`](docs/env-vars-catalog.md). Esta sección cubre las críticas con rollback.
 
 **Vault + ingest**:
 - `OBSIDIAN_RAG_VAULT` — override vault path. Cross-source ETLs gated por `_is_cross_source_target(vault_path)` — solo `_DEFAULT_VAULT` recibe los 11 ETLs salvo opt-in en `~/.config/obsidian-rag/vaults.json`.
 - `RAG_OCR=0` — desactiva OCR (default ON cuando `ocrmac` disponible).
-- `OBSIDIAN_RAG_MOZE_DIR`, `OBSIDIAN_RAG_FINANCE_DIR` — iCloud sources MOZE + xlsx/PDFs.
-- `OBSIDIAN_RAG_INDEX_WA_MONTHLY=1` — opt-in al double-indexing WA monthly rollups (default OFF post-2026-04-22).
+- `OBSIDIAN_RAG_MOZE_DIR`, `OBSIDIAN_RAG_FINANCE_DIR` — iCloud sources.
+- `OBSIDIAN_RAG_INDEX_WA_MONTHLY=1` — opt-in al double-indexing WA monthly rollups.
 
-**Backend LLM** (ver MLX section arriba):
-- `RAG_LLM_BACKEND` — único valor soportado: `mlx` (default). El valor `ollama` queda como compat alias: loguea warning + cae a MLX.
-- `RAG_MLX_IDLE_TTL` (default 1800s), `RAG_MLX_IDLE_DISABLE=1`.
+**Backend LLM/embed**:
+- `RAG_LLM_BACKEND=mlx` (único valor soportado; `ollama` loguea warning + cae a MLX).
+- `RAG_EMBED_BACKEND=mlx` (default). `=pytorch` activa rollback SentenceTransformer (`Qwen/Qwen3-Embedding-0.6B` en MPS).
+- `RAG_NLI_BACKEND={llm,mdeberta}` (default `llm`).
+- `RAG_MLX_IDLE_TTL=1800s`, `RAG_MLX_IDLE_DISABLE=1`.
 
 **Indexing**:
-- `RAG_INDEX_BATCH_EMBEDS` — gobierna el batched embed path en `_run_index_inner` (`_flush_batch`). **MLX-aware default desde 2026-05-08**: cuando `RAG_EMBED_BACKEND=mlx` (default Ola 9), default `0` (path no-batched). Cuando `RAG_EMBED_BACKEND=pytorch`, default `1` (batched, como antes). El batched path en MLX dispara `[METAL] Command buffer execution failed` reproducible; no-batched (un embed por nota) anda en 35s para vault de 681 archivos con 4 stale + 405 URLs. Override manual: `=1` fuerza batched aunque MLX (desaconsejado hasta patch real del flush_batch).
-- `RAG_INDEX_BATCH_SIZE` — solo aplica cuando batched ON. Default 16 chunks.
+- `RAG_INDEX_BATCH_EMBEDS` — gobierna batched embed path en `_run_index_inner` (`_flush_batch`). **MLX-aware default**: cuando `RAG_EMBED_BACKEND=mlx`, default `0` (no-batched). Cuando `=pytorch`, default `1`. Batched path en MLX dispara `[METAL] Command buffer execution failed` reproducible; no-batched anda en 35s para vault de 681 archivos. Override `=1` desaconsejado hasta patch real.
+- `RAG_INDEX_BATCH_SIZE=16` — solo aplica cuando batched ON.
 
 **Performance + memoria**:
-- `RAG_LLM_KEEP_ALIVE=-1` (default forever). Compat alias: `OLLAMA_KEEP_ALIVE` (legacy plists). MLX in-process — no-op pero el value se sigue propagando como kwarg al backend para preservar la firma con call sites históricos. El clamp por modelo grande (`_LARGE_CHAT_MODELS`) fue removido en Ola 8 — MLX maneja eviction propio (LRU + idle-unload watchdog).
+- `RAG_LLM_KEEP_ALIVE=-1` (default forever). Compat alias `OLLAMA_KEEP_ALIVE` (legacy plists). MLX in-process — no-op pero el value se sigue propagando.
 - `RAG_MEMORY_PRESSURE_DISABLE=1` — desactiva watchdog (default ON, threshold 85%, interval 60s). Bajo pressure: unload chat + force-unload reranker (bypassa `RAG_RERANKER_NEVER_UNLOAD`).
-- `RAG_RERANKER_NEVER_UNLOAD=1` — pina reranker en MPS VRAM. Cost ~2-3 GB.
-- `RAG_FORCE_MPS_EMPTY_CACHE=1` — fuerza `torch.mps.empty_cache()` aunque backend sea full-MLX. Default: skip cuando `RAG_EMBED_BACKEND=mlx` Y `RAG_LLM_BACKEND=mlx` para evitar invalidar command buffers MLX (bug 2026-05-08, GPU Hang Error reproducible). Activar solo si tenés reranker bge en MPS pinned y necesitás drop explícito.
+- `RAG_RERANKER_NEVER_UNLOAD=1` — pina reranker en MPS VRAM (~2-3 GB).
+- `RAG_FORCE_MPS_EMPTY_CACHE=1` — fuerza `torch.mps.empty_cache()`. Default skip cuando `RAG_EMBED_BACKEND=mlx` Y `RAG_LLM_BACKEND=mlx` para evitar invalidar command buffers MLX (bug 2026-05-08, GPU Hang reproducible).
 - `RAG_RERANKER_IDLE_TTL=900` — segundos idle-unload.
 - `RAG_LOCAL_EMBED=1` — in-process embedder (set en plists web + serve, auto-set en CLI query-like). NO en indexing/watch.
-- `RAG_LOCAL_EMBED_WAIT_MS=6000` — budget Event ready antes de raise (post-Ola 6: no hay fallback, solo el path local).
-- `RAG_EMBED_BACKEND=mlx` (default, post-Ola 9 2026-05-06) — backend del embedder local. `=pytorch` activa el rollback path SentenceTransformer (`Qwen/Qwen3-Embedding-0.6B` en MPS). MLX usa `mlx-community/Qwen3-Embedding-0.6B-8bit` via [`mlx-lm`](https://github.com/ml-explore/mlx-lm); cosine ≥0.9977 vs PyTorch fp16, sin reindex.
+- `RAG_LOCAL_EMBED_WAIT_MS=6000` — budget Event ready antes de raise.
 
-**Async writers** (default ON desde audit 2026-04-24):
-- Set `RAG_LOG_{QUERY,BEHAVIOR,FT_RATING,AMBIENT,CONTRADICTIONS,ARCHIVE,TUNE,SURFACE}_ASYNC=0` + `RAG_METRICS_ASYNC=0` para opt-out.
+**Async writers** (default ON desde audit 2026-04-24): set `RAG_LOG_{QUERY,BEHAVIOR,FT_RATING,AMBIENT,CONTRADICTIONS,ARCHIVE,TUNE,SURFACE}_ASYNC=0` + `RAG_METRICS_ASYNC=0` para opt-out.
 
 **Retrieval**:
 - `RAG_ADAPTIVE_ROUTING` (default ON) — skip helper reformulate intents metadata-only + fast-path.
 - `RAG_LOOKUP_NUM_CTX=4096` — fast-path ctx.
 - `RAG_FAST_PATH_KEEP_WITH_TOOLS=1` — rollback del downgrade fast-path con tools (default OFF).
-- `RAG_ENTITY_LOOKUP` / `RAG_EXTRACT_ENTITIES` (default ON post-2026-04-21).
+- `RAG_ENTITY_LOOKUP` / `RAG_EXTRACT_ENTITIES` (default ON).
 - `RAG_EXPLORE=1` — ε-exploration. **MUST unset durante `rag eval`** (comando lo `os.environ.pop`s).
 - `RAG_EXPAND_MIN_TOKENS=4` — threshold short-query gate.
 - `RAG_CITATION_REPAIR_MAX_BAD=2` (set 0 para disable).
 - `RAG_DEEP_MAX_SECONDS=30` — wall-time cap auto-deep.
-- `RAG_NLI_GROUNDING` (default OFF) — claim-level grounding post-citation-repair. `RAG_NLI_IDLE_TTL=900` (solo aplica al path mDeBERTa).
-- `RAG_NLI_BACKEND={llm,mdeberta}` (default `llm`) — backend del NLI grounding. `llm` usa `qwen2.5:3b` helper via [`rag/postprocess.py`](rag/postprocess.py) `_ground_claims_via_llm` (Ola 10, MLX-compat). `mdeberta` cae al path histórico CrossEncoder + mDeBERTa (rollback).
+- `RAG_NLI_GROUNDING` (default OFF) — claim-level grounding post-citation-repair. `RAG_NLI_IDLE_TTL=900` (solo path mDeBERTa).
 - `RAG_NLI_MODE={off,mark,strip}` (default off) — citation NLI verifier (distinto de NLI grounding). `RAG_NLI_THRESHOLD=0.5`.
 - `RAG_CONTRADICTION_PENALTY` (default ON, magnitude `RAG_CONTRADICTION_PENALTY_MAGNITUDE=0.05`).
 - `RAG_MMR` (default OFF, `RAG_MMR_LAMBDA=0.7`, `RAG_MMR_TOP_K=10`). Variante: `RAG_MMR_FOLDER_PENALTY=1` (mutex).
 - `RAG_LLM_JUDGE` (default OFF, prototipo) — score blend cuando top<0.5 AND len≥5. `RAG_LLM_JUDGE_THRESHOLD=0.5`, `RAG_LLM_JUDGE_MIN_CANDIDATES=5`, `RAG_LLM_JUDGE_ALPHA=0.5`.
 - `RAG_QUERY_DECOMPOSE` (default OFF, prototipo) — sub-retrieves + RRF. `RAG_QUERY_DECOMPOSE_LLM_FALLBACK=0`, `RAG_QUERY_DECOMPOSE_MAX_WORKERS=3`.
-- `RAG_INTENT_RECENCY` (default ON, Quick Win #3) — halflife per intent (recent ×0.3, historical ×3.0, neutral ×1.0).
-- `RAG_TYPO_CORRECTION` — default OFF (post-Ola 8: MLX-only path). qwen2.5:3b bajo MLX parafrasea agresivo (bug 2026-05-05). Override `=1` para forzar ON. `RAG_TYPO_JACCARD_MIN=0.7` solo multi-token.
-- `RAG_HISTORY_SUMMARY` (default ON, Quick Win #5).
-- `RAG_ANAPHORA_RESOLVER` (default ON, Quick Win #1).
+- `RAG_INTENT_RECENCY` (default ON) — halflife per intent (recent ×0.3, historical ×3.0, neutral ×1.0).
+- `RAG_TYPO_CORRECTION` — default OFF (qwen2.5:3b bajo MLX parafrasea agresivo, bug 2026-05-05). Override `=1`. `RAG_TYPO_JACCARD_MIN=0.7`.
+- `RAG_HISTORY_SUMMARY`, `RAG_ANAPHORA_RESOLVER` (default ON).
 - `RAG_CONTEXTUAL_RETRIEVAL=1` (default OFF, prototipo Anthropic).
 - `RAG_WA_FAST_PATH` / `RAG_WA_FAST_PATH_THRESHOLD=0.05` / `RAG_WA_SKIP_PARAPHRASE` (default ON).
 
 **Ranker + cache**:
 - `RAG_TRACK_OPENS=1` — switches OSC 8 a `x-rag-open://` para ranker-vivo signal.
-- `RAG_RERANKER_FT=1` — opt-in LoRA adapter (default OFF). Failure modes silent_fail con fallback a base.
+- `RAG_RERANKER_FT=1` — opt-in LoRA adapter (default OFF). Silent_fail con fallback a base.
 - `RAG_FINETUNE_MIN_CORRECTIVES=20` — abort `scripts/finetune_reranker.py` si insuficiente.
 - `RAG_DRAFT_VIA_RAGNET=1` — legacy override redirige ambient sends a RagNet.
 
@@ -326,7 +302,7 @@ Catálogo completo (47+ vars adicionales) en [`docs/env-vars-catalog.md`](docs/e
 
 ## Architecture invariants
 
-Detalle completo del pipeline en [`docs/retrieval-internals.md`](docs/retrieval-internals.md). Resumen invariantes críticos:
+Detalle pipeline en [`docs/retrieval-internals.md`](docs/retrieval-internals.md). Invariantes críticos:
 
 **Schema collection**: bump `_COLLECTION_BASE` (currently `obsidian_notes_v12`). Per-vault suffix sha256[:8] of resolved path.
 
@@ -334,13 +310,13 @@ Detalle completo del pipeline en [`docs/retrieval-internals.md`](docs/retrieval-
 
 **HELPER**: `qwen2.5:3b` con `HELPER_OPTIONS = {temperature: 0, seed: 42}` deterministic. Bound to `reformulate_query`, `expand_queries`, `_judge_sufficiency`. command-r como helper regresiona −11pp chains + 5× latencia.
 
-**Confidence gate**: `top_score < 0.015` (CONFIDENCE_RERANK_MIN) + no `--force` → refuse sin LLM call. Per-source override scaffolding existe (`CONFIDENCE_RERANK_MIN_PER_SOURCE`).
+**Confidence gate**: `top_score < 0.015` (`CONFIDENCE_RERANK_MIN`) + no `--force` → refuse sin LLM call. Per-source override scaffolding existe (`CONFIDENCE_RERANK_MIN_PER_SOURCE`).
 
-**`RERANK_POOL_MAX = 25`** (bumpeado de 15 el 2026-04-25): el golden set creció de n=42 a n=60 con queries cross-source (Phase 1.f) y pool=15 expulsaba candidatos correctos del top-15. Bump 15→25 para dar margen al reranker en queries difíciles. Historia: bump original 30→15 (2026-04-21) — pool=15 dominó vs 30 en el set anterior: hit@5 idéntico, MRR chains +5pp, P95 singles -66%. `rag tune` invoca con `k_pool=RERANK_POOL_MAX=25`. Path `retrieve_only` usa `RERANK_POOL_RETRIEVE_ONLY=10` (WhatsApp listener).
+**`RERANK_POOL_MAX = 25`** (bumpeado 15→25 el 2026-04-25): golden set creció n=42 → n=60 con queries cross-source y pool=15 expulsaba candidatos correctos. Historia: bump original 30→15 (2026-04-21) — pool=15 dominó vs 30: hit@5 idéntico, MRR chains +5pp, P95 singles -66%. `rag tune` invoca con `k_pool=RERANK_POOL_MAX=25`. Path `retrieve_only` usa `RERANK_POOL_RETRIEVE_ONLY=10` (WhatsApp listener).
 
 **Cache locks**: `_context_cache_lock`, `_synthetic_q_cache_lock`, `_mentions_cache_lock`, `_embed_cache_lock`, `_corpus_cache_lock` (RLock), `_contacts_cache_lock`. LLM calls **outside** lock.
 
-**Modular split shim pattern** (post-2026-05-08 — usado en `rag/wa_scheduled.py` + `rag/wa_tasks.py`): cuando partís un módulo top-level a un sub-paquete y querés preservar back-compat sin reescribir call sites, dejá un shim que aliasee via `sys.modules`:
+**Modular split shim pattern** (`rag/wa_scheduled.py` + `rag/wa_tasks.py`): cuando partís un módulo top-level a sub-paquete y querés preservar back-compat sin reescribir call sites, dejá un shim que aliasee via `sys.modules`:
 
 ```python
 # rag/wa_scheduled.py (shim, ~15 LOC)
@@ -349,7 +325,7 @@ from rag.integrations.whatsapp import scheduled as _real
 sys.modules[__name__] = _real
 ```
 
-Esto hace que `rag.wa_scheduled is rag.integrations.whatsapp.scheduled` → True. **Crítico** para que `monkeypatch.setattr(wa_scheduled, "_log_ambient", mock)` propague al call site interno (ej. `run_due_worker` que llama `_log_ambient(...)` con local binding). Sin el alias, los re-exports por nombre rompen tests con cross-module monkeypatches. Para cross-module calls dentro del package nuevo, usar deferred re-resolve `from rag.integrations.<pkg> import _foo` adentro del cuerpo de la función — patch del test gana sobre binding del sub-módulo.
+`rag.wa_scheduled is rag.integrations.whatsapp.scheduled` → True. **Crítico** para que `monkeypatch.setattr(wa_scheduled, "_log_ambient", mock)` propague al call site interno. Para cross-module calls dentro del package nuevo, usar deferred re-resolve `from rag.integrations.<pkg> import _foo` adentro del cuerpo de la función — patch del test gana sobre binding del sub-módulo.
 
 **Pipeline resumen**:
 ```
@@ -363,28 +339,27 @@ query → typo correct → anaphora resolve → classify_intent → infer_filter
       → top-k → LLM streamed → citation-repair → NLI verifier
 ```
 
-**Generation prompts**: `SYSTEM_RULES_STRICT` (default semantic), `SYSTEM_RULES` (`--loose`), `SYSTEM_RULES_LOOKUP` (count/list/recent/agenda), `SYSTEM_RULES_SYNTHESIS`, `SYSTEM_RULES_COMPARISON`. Routed via `system_prompt_for_intent(intent, loose)`. `_CHUNK_AS_DATA_RULE` (REGLA 0) + `_NAME_PRESERVATION_RULE` previenen prompt injection + name corruption. Versionados bajo [`rag/prompts/{intents,rules}/`](rag/prompts/) (e.g. `chat.v2.md`, `language_es_AR.v1.md`).
+**Generation prompts**: `SYSTEM_RULES_STRICT` (default semantic), `SYSTEM_RULES` (`--loose`), `SYSTEM_RULES_LOOKUP` (count/list/recent/agenda), `SYSTEM_RULES_SYNTHESIS`, `SYSTEM_RULES_COMPARISON`. Routed via `system_prompt_for_intent(intent, loose)`. `_CHUNK_AS_DATA_RULE` (REGLA 0) + `_NAME_PRESERVATION_RULE` previenen prompt injection + name corruption. Versionados bajo [`rag/prompts/{intents,rules}/`](rag/prompts/).
 
-**`_FILTER_VERSION`** ([`rag/__init__.py`](rag/__init__.py) — `grep -n '_FILTER_VERSION\s*=' rag/__init__.py` para ubicar; valor actual `wave12-2026-05-07`): bumpear cuando cambia regex que afecta tools_fired, `_WEB_SYSTEM_PROMPT`/REGLA N, traducción descriptions inyectada. Naming: `wave<N>-<YYYY-MM-DD>`. Detalle en [`docs/wave-8-gotchas.md`](docs/wave-8-gotchas.md).
+**`_FILTER_VERSION`** (`grep -n '_FILTER_VERSION\s*=' rag/__init__.py`; valor actual `wave12-2026-05-07`): bumpear cuando cambia regex que afecta tools_fired, `_WEB_SYSTEM_PROMPT`/REGLA N, traducción descriptions inyectada. Naming: `wave<N>-<YYYY-MM-DD>`. Detalle en [`docs/wave-8-gotchas.md`](docs/wave-8-gotchas.md).
+
+**Wave-8 patrones** (gotchas): (1) filtros definidos sin call site, (2) carry-over pre-router sobrescrito por `_detect_tool_intent` downstream, (3) bumpear `_FILTER_VERSION` es parte del fix cuando cambia filtro/prompt/regex.
 
 ## Eval baselines (floor MLX 2026-05-05)
 
-Floor actual (post-Ola 3 cutover, post-typo-corrector-fix `48ababf`):
 - Singles: `hit@5 56.60% [43.40, 69.81] · MRR 0.535 [0.403, 0.667] · n=53`
 - Chains: `hit@5 72.00% [56.00, 88.00] · MRR 0.617 [0.447, 0.773]`
 - **Lower-CI-bound gate** (nightly online-tune auto-rollback): singles < 43.40% OR chains < 56.00%
 
 Floor PRE-MLX (archivado): singles `53.70% [40.74, 66.67]`, chains `72.00% [52.00, 88.00]`. Post-cutover MLX supera ambos (+2.9pp singles, chains match con CI más estrecho).
 
-`rag eval --latency --max-p95-ms N` agrega P50/P95/P99 + CI gate. Bootstrap 1000 resamples seed=42.
-
-Helper LLM calls determinísticos via `HELPER_OPTIONS`. **HyDE drops singles ~5pp** — opt-in via `--hyde`. `seen_titles` post-rerank penalty `0.1`.
+`rag eval --latency --max-p95-ms N` agrega P50/P95/P99 + CI gate. Bootstrap 1000 resamples seed=42. **HyDE drops singles ~5pp** — opt-in via `--hyde`. `seen_titles` post-rerank penalty `0.1`.
 
 **Nunca claim improvement sin re-correr `rag eval`**.
 
 ## Telemetry stack
 
-Detalle completo: [`docs/telemetry-stack.md`](docs/telemetry-stack.md).
+Detalle: [`docs/telemetry-stack.md`](docs/telemetry-stack.md).
 
 Dos databases en `~/.local/share/obsidian-rag/ragvec/`:
 - `ragvec.db` (~104M) — sqlite-vec corpus + 10 state tables.
@@ -402,51 +377,35 @@ Dos databases en `~/.local/share/obsidian-rag/ragvec/`:
 
 ## Daemons
 
-Detalle completo + tabla plists + checklist: [`docs/daemons.md`](docs/daemons.md).
+Detalle: [`docs/daemons.md`](docs/daemons.md).
 
-Source de verdad: `_services_spec()` en [`rag/__init__.py`](rag/__init__.py). Manuales en `_services_spec_manual()`. Plists generados desde [`rag/plists.py`](rag/plists.py).
-
-Control plane `rag daemons {status|reconcile|doctor|retry|kickstart-overdue}` — acciones loggeadas a `rag_daemon_runs` (telemetry.db, retention 90d).
-
-**Anti-patrón** al cerrar feature con plist nuevo: dejar TODO "corré `rag setup`". Aprendido 2026-04-25 con `wa-scheduled-send` (commit `9740fa1` — plist nunca se copió, user programó msg, no llegó).
+Source de verdad: `_services_spec()` en [`rag/__init__.py`](rag/__init__.py). Manuales en `_services_spec_manual()`. Plists generados desde [`rag/plists.py`](rag/plists.py). Control plane: `rag daemons {status|reconcile|doctor|retry|kickstart-overdue}` — acciones loggeadas a `rag_daemon_runs` (telemetry.db, retention 90d).
 
 ## Feedback loops
 
-Detalle completo: [`docs/feedback-loops.md`](docs/feedback-loops.md).
+Detalle: [`docs/feedback-loops.md`](docs/feedback-loops.md).
 
 - **Anticipatory Agent** ([`rag/anticipatory.py`](rag/anticipatory.py)) — daemon 10min, 3 señales (calendar/echo/commitment).
-- **Bot WA draft loop** — listener TS genera bot_draft → user `/si`/`/no`/`/editar` → `rag_draft_decisions` (gold humano para fine-tunes).
+- **Bot WA draft loop** — listener TS genera bot_draft → user `/si`/`/no`/`/editar` → `rag_draft_decisions` (gold humano).
 - **Brief feedback + auto-tuning** ([`rag/brief_schedule.py`](rag/brief_schedule.py)) — reactions 👍/👎/🔇 → `rag_brief_feedback`. Mute consistent → shift schedule +30min iterativo.
-- **Voice brief** ([`rag/voice_brief.py`](rag/voice_brief.py)) — Phase 2.C: morning OGG/Opus via `say -v Mónica` + ffmpeg libopus.
+- **Voice brief** ([`rag/voice_brief.py`](rag/voice_brief.py)) — morning OGG/Opus via `say -v Mónica` + ffmpeg libopus.
 - **Whisper learning** ([`rag/whisper.py`](rag/whisper.py)) — daemon vocab refresh + `/fix` corrections + confidence-gated LLM correct.
 - **Implicit feedback** — `rag feedback classify-sessions` backpropaga outcome session → turn (weak negatives en abandons low-score, weight 0.3).
-
-## Wave-8 gotchas
-
-Detalle: [`docs/wave-8-gotchas.md`](docs/wave-8-gotchas.md).
-
-Tres patrones: (1) filtros definidos sin call site, (2) carry-over pre-router sobrescrito por `_detect_tool_intent` downstream, (3) bumpear `_FILTER_VERSION` es parte del fix cuando cambia filtro/prompt/regex (cache key invalidation).
 
 ## Vault path
 
 Default: `~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes`. Override: `OBSIDIAN_RAG_VAULT`. Collections namespaced per vault (sha256[:8]).
 
-**Estructura PARA del vault del user** (ver memoria `feedback_para_method_vault_organization.md`):
+**Estructura PARA del vault**:
 - `00-Inbox/` — captura suelta.
 - `01-Projects/<topic>/` — proyectos activos del user (ej. `Finances/`, `Album-Muros-Fractales/`, `RAG-Local/`).
 - `02-Areas/`, `03-Resources/`, `04-Archive/` — resto PARA.
-- `99-obsidian/99-AI/<feature>/` — **toda infra del sistema RAG / agentes / mis artefactos** (memory, external-ingest, system/<slug>, conversations, plans, etc.). Heurística: contenido user → `01-Projects/`; sistema/automation → `99-AI/`.
+- `99-obsidian/99-AI/<feature>/` — **toda infra del sistema RAG / agentes / mis artefactos** (memory, external-ingest, system/<slug>, conversations, plans). Heurística: contenido user → `01-Projects/`; sistema/automation → `99-AI/`.
 
-**Memorias del MCP [`mem-vault`](https://github.com/jagoff/mem-vault)** viven en `99-obsidian/99-AI/memory/`. Configurado via env vars del web server plist: `MEM_VAULT_PATH=Notes/`, `MEM_VAULT_MEMORY_SUBDIR=99-obsidian/99-AI/memory`. NO está excluido por `is_excluded()` (junto con `99-Mentions/`) — `rag index` lo scanea, los `.md` entran al index del vault `home`. MCP `mem-vault` es writer canónico, `rag` reader adicional.
-
-## Notification al cerrar tarea
-
-Hook `Stop` en [`~/.config/devin/config.json`](file:///Users/fer/.config/devin/config.json) dispara `osascript -e 'display notification ...'` (banner macOS) + `afplay -v 3 /System/Library/Sounds/Ping.aiff` (sonido suave, re-agregado 2026-05-06). NO ejecutar `afplay`/`osascript` manual — el hook se encarga. Permisos: System Settings > Notifications > "Script Editor".
+**Memorias del MCP [`mem-vault`](https://github.com/jagoff/mem-vault)** viven en `99-obsidian/99-AI/memory/`. Configurado via env vars del web server plist: `MEM_VAULT_PATH=Notes/`, `MEM_VAULT_MEMORY_SUBDIR=99-obsidian/99-AI/memory`. NO está excluido por `is_excluded()` — `rag index` lo scanea, los `.md` entran al index del vault `home`. MCP `mem-vault` es writer canónico, `rag` reader adicional.
 
 ## Referencias
 
-- Vault path: `~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes`
-- Memory dir: `99-obsidian/99-AI/memory/`
 - Listener TS: [`/Users/fer/whatsapp-listener`](file:///Users/fer/whatsapp-listener)
 - WhatsApp bridge: `~/repositories/whatsapp-mcp/whatsapp-bridge/store/messages.db`
 - Cloudflared URL: `~/.local/share/obsidian-rag/cloudflared-url.txt`

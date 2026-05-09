@@ -41,9 +41,12 @@ _ANNIV_WINDOW_MAX_DAYS = 370
 _ANNIV_TARGET_DAYS = 365
 
 # Mínimo de caracteres del body para considerar "nota sustantiva". Notas
-# de <500 chars (stub, capturas de un link, TODOs sueltos) no merecen
-# push proactivo de aniversario.
-_ANNIV_MIN_CHARS = 500
+# de <200 chars (stub real, capturas de un link, TODOs sueltos) no merecen
+# push proactivo de aniversario. Bajado 500 → 200 (2026-05-09 P3 audit):
+# muchas notas legítimas del user en 01-Projects/02-Areas son entre 200-500
+# chars (resúmenes, decisiones cortas, notas de meeting) y el cutoff de 500
+# las dejaba fuera del signal sin razón.
+_ANNIV_MIN_CHARS = 200
 
 
 def _anniv_parse_created_frontmatter(text: str) -> datetime | None:

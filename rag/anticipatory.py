@@ -267,7 +267,11 @@ def _anticipate_signal_calendar(now: datetime) -> list["AnticipatoryCandidate"]:
             continue
         scores = result.get("scores") or []
         metas = result.get("metas") or []
-        if not scores or scores[0] < 0.25:
+        # Bajado coverage threshold 0.25 → 0.15 (2026-05-09 P3 audit): el
+        # cutoff de 0.25 era muy alto y dejaba la mayoría de los eventos
+        # fuera (vault tiene cobertura semántica parcial — eventos sociales,
+        # médicos, calls 1:1 raramente matchean ≥0.25 en notas).
+        if not scores or scores[0] < 0.15:
             continue
         score = max(0.0, min(1.0, 1.0 - (delta_min / float(_ANTICIPATE_CALENDAR_MAX_MIN))))
         msg = _anticipate_format_calendar_brief(title, int(delta_min), metas[0], scores[0])

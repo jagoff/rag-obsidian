@@ -134,9 +134,16 @@ def person_reunion_signal(now: datetime) -> list:
         if not vault or not vault.is_dir():
             return []
 
-        gap_threshold_days = 30.0
+        # Bajado 30 → 14 (2026-05-09 P3 audit): el gap de 30d era muy alto
+        # para el patrón del user — sus contactos cercanos aparecen cada
+        # 2-3 semanas, no después de un mes. 14d captura "che, hace rato no
+        # lo veía" sin spamear con cada amigo que reaparece.
+        gap_threshold_days = 14.0
         within_hours = 6
-        min_chars = 300
+        # Bajado 300 → 150 (P3): 300 chars excluía notas cortas tipo
+        # captura inbox o checkpoint diario donde el user menciona personas
+        # de paso pero la mención sigue siendo válida para el signal.
+        min_chars = 150
         max_candidates = 2
         score_full_gap_days = 180.0
 

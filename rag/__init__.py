@@ -56,7 +56,6 @@ import contextvars
 import heapq
 import json
 import queue
-import random
 import re
 import secrets
 import subprocess
@@ -470,7 +469,7 @@ def convert_obsidian_links(text: str, vault_name: str | None = None) -> str:
     parts.sort()
     out: list[str] = []
     pos = 0
-    for start, end, repl in parts:
+    for start, end, repl in parts:  # noqa: F402  (loop var, no relación con import bottom-of-module)
         if start > pos:
             out.append(text[pos:start])
         out.append(repl)
@@ -532,7 +531,7 @@ def render_response(text: str) -> Text:
         bold_style = base_style or ""
 
         pos = 0
-        for start, end, kind, content in spans:
+        for start, end, kind, content in spans:  # noqa: F402
             if start > pos:
                 out.append(seg[pos:start], style=base_style)
             if kind == "code":
@@ -577,7 +576,7 @@ def render_response(text: str) -> Text:
         path_base = "cyan dim" if not base_style else "yellow dim"
         url_base = "blue" if not base_style else "yellow"
         url_dim = "blue dim" if not base_style else "yellow dim"
-        for start, end, label, target, kind in spans:
+        for start, end, label, target, kind in spans:  # noqa: F402
             if start > last:
                 emit_plain_or_inline(segment[last:start], base_style=base_style)
             if kind == "url-md":
@@ -27974,7 +27973,7 @@ def routing_stats():
     if total == 0:
         console.print("[dim]sin decisiones en los últimos 30 días[/dim]")
         return
-    console.print(f"[bold]Voice classifier — últimos 30 días[/bold]")
+    console.print("[bold]Voice classifier — últimos 30 días[/bold]")
     console.print(f"  total decisiones: {total}")
     pct = lambda n: f"{round(100 * n / total)}%" if total else "—"
     console.print(f"  user dijo 'sí': {confirmed} ({pct(confirmed)})")
@@ -28146,7 +28145,7 @@ def routing_review(min_count: int, min_ratio: float, days: int):
                 promoted += 1
                 console.print(f"  [green]✓[/green] promovida (#{rid})")
             else:
-                console.print(f"  [red]✗[/red] falló el insert")
+                console.print("  [red]✗[/red] falló el insert")
         else:
             skipped += 1
     console.print(f"\n[bold]review terminado:[/bold] {promoted} promovidas, "
@@ -28440,7 +28439,7 @@ def draft_stats(plain: bool):
         else:
             console.print(
                 "\n[dim]adapter:[/dim] not trained yet "
-                f"[dim](correr `rag draft finetune` cuando tengas ≥100 pares)[/dim]"
+                "[dim](correr `rag draft finetune` cuando tengas ≥100 pares)[/dim]"
             )
 
 
@@ -29048,797 +29047,7 @@ def migrations_bootstrap_cmd(plain: bool) -> None:
         conn.close()
 
 
-# ─── mood CLI group ─────────────────────────────────────────────────────────
-
-
-def _mood_score_color(score: float) -> str:
-    """Color Rich según signo + magnitud del score."""
-    if score <= -0.5:
-        return "bright_red"
-    if score <= -0.2:
-        return "yellow"
-    if score >= 0.5:
-        return "bright_green"
-    if score >= 0.2:
-        return "green"
-    return "white"
-
-
-def _mood_score_bar(score: float, *, width: int = 7) -> str:
-    """Glyph para sparkline de un día. Score → caracter Unicode block.
-    score ≈ 0 → ─, negativo → bloques inferiores, positivo → superiores."""
-    # 8-step scale from -1 to +1.
-    glyphs = "▁▂▃▄▅▆▇█"
-    if score == 0:
-        return "─"
-    # Map score [-1, 1] → idx [0, 7]. score=-1 → ▁ (más bajo).
-    idx = max(0, min(7, int(round((score + 1.0) * 3.5))))
-    return glyphs[idx]
-
-
-@cli.group("mood", invoke_without_command=False)
-def mood_group() -> None:
-    """Mood tracking — score diario sobre Spotify + journal + WA + queries
-    + calendar. Behind flag RAG_MOOD_ENABLED=1.
-
-    Subcomandos:
-
-    - rag mood show [--days N]    sparkline + score actual
-    - rag mood explain [--date D] señales del día con evidence
-    - rag mood compute [--date D] re-corre el agregador (UPSERT)
-    """
-
-
-@mood_group.command("show")
-@click.option("--days", default=14, type=int, help="Días para sparkline (default 14)")
-@click.option("--plain", is_flag=True, help="Output mínimo, sin Rich")
-def mood_show_cmd(days: int, plain: bool) -> None:
-    """Muestra sparkline ASCII + score actual + drift status."""
-    from rag import mood as _mood  # noqa: PLC0415
-    if not _mood._is_mood_enabled():
-        click.echo("mood feature off (set RAG_MOOD_ENABLED=1)")
-        return
-    rows = _mood.get_recent_scores(days=days)
-    drift = _mood.recent_drift(days=7)
-    today_row = _mood.get_score_for_date(_mood._today_local())
-
-    if plain:
-        if not rows:
-            click.echo("no_data")
-            return
-        for r in reversed(rows):
-            click.echo(f"{r['date']}\t{r['score']:+.2f}\tn={r['n_signals']}")
-        if today_row:
-            click.echo(f"today\tscore={today_row['score']:+.2f}\tn={today_row['n_signals']}\tsources={today_row['sources_used']}")
-        click.echo(f"drift\tdrifting={drift['drifting']}\tconsec={drift['n_consecutive']}\treason={drift.get('reason') or 'streak_active'}")
-        return
-
-    if not rows:
-        console.print("[dim]no hay scores todavía. Corré `rag mood compute` después de que el daemon junte señales.[/dim]")
-        return
-
-    # Sparkline cronológico (oldest → newest).
-    spark_chars: list[str] = []
-    spark_dates: list[str] = []
-    for r in reversed(rows):
-        if r["n_signals"] == 0:
-            spark_chars.append("·")
-        else:
-            color = _mood_score_color(r["score"])
-            spark_chars.append(f"[{color}]{_mood_score_bar(r['score'])}[/{color}]")
-        spark_dates.append(r["date"][-5:])  # MM-DD
-
-    console.print(f"\n[bold]mood — last {days} days[/bold]")
-    console.print(" ".join(spark_chars))
-    console.print("[dim]" + " ".join(spark_dates) + "[/dim]")
-
-    if today_row and today_row["n_signals"] > 0:
-        color = _mood_score_color(today_row["score"])
-        console.print(f"\nhoy: [{color}]{today_row['score']:+.2f}[/{color}] "
-                      f"({today_row['n_signals']} señales · sources: {', '.join(today_row['sources_used'])})")
-        for s in (today_row["top_evidence"] or [])[:3]:
-            ev = s.get("evidence", {})
-            ev_str = ", ".join(f"{k}={v}" for k, v in list(ev.items())[:3])
-            console.print(f"  [dim]· {s['source']}/{s['signal_kind']}[/] "
-                          f"[{_mood_score_color(s['value'])}]{s['value']:+.2f}[/] [dim]{ev_str}[/dim]")
-    else:
-        console.print("\n[dim]hoy: sin score computado todavía (corré `rag mood compute`)[/dim]")
-
-    # Drift status.
-    if drift["drifting"]:
-        console.print(f"\n[bright_red]⚠ drift detectado:[/bright_red] "
-                      f"{drift['n_consecutive']} días consecutivos con score ≤ -0.4 "
-                      f"(avg {drift['avg_score']:+.2f})")
-        console.print(f"[dim]  fechas: {', '.join(drift['dates'])}[/dim]")
-    else:
-        if drift["n_consecutive"] > 0:
-            console.print(f"\n[dim]racha actual: {drift['n_consecutive']} días bajo threshold "
-                          f"(reason: {drift.get('reason') or 'n/a'})[/dim]")
-        else:
-            console.print("\n[green]sin racha negativa activa[/green]")
-
-
-@mood_group.command("explain")
-@click.option("--date", default=None, help="YYYY-MM-DD (default: hoy)")
-@click.option("--plain", is_flag=True)
-def mood_explain_cmd(date: str | None, plain: bool) -> None:
-    """Lista las señales del día con evidence completa."""
-    from rag import mood as _mood  # noqa: PLC0415
-    if not _mood._is_mood_enabled():
-        click.echo("mood feature off (set RAG_MOOD_ENABLED=1)")
-        return
-    target = date or _mood._today_local()
-    signals = _mood._read_signals_for_date(target)
-    score_row = _mood.get_score_for_date(target)
-
-    if plain:
-        click.echo(f"date={target}")
-        if score_row:
-            click.echo(f"score={score_row['score']:+.3f} n={score_row['n_signals']} "
-                       f"sources={','.join(score_row['sources_used'])}")
-        else:
-            click.echo("score=none (run `rag mood compute`)")
-        for s in signals:
-            ev_short = json.dumps(s["evidence"], ensure_ascii=False)[:120]
-            click.echo(f"  {s['source']}/{s['signal_kind']}\tval={s['value']:+.2f}\tw={s['weight']:.1f}\tev={ev_short}")
-        return
-
-    console.print(f"\n[bold]mood signals — {target}[/bold]")
-    if score_row:
-        color = _mood_score_color(score_row["score"])
-        console.print(f"score: [{color}]{score_row['score']:+.3f}[/] "
-                      f"({score_row['n_signals']} señales · "
-                      f"sources: {', '.join(score_row['sources_used'])})\n")
-    else:
-        console.print("[yellow]score no computado todavía. Corré `rag mood compute --date " + target + "`[/yellow]\n")
-
-    if not signals:
-        console.print("[dim]no hay señales para esta fecha[/dim]")
-        return
-
-    for s in signals:
-        color = _mood_score_color(s["value"])
-        console.print(f"[bold]{s['source']}/{s['signal_kind']}[/]  "
-                      f"[{color}]{s['value']:+.2f}[/]  [dim]w={s['weight']:.1f}[/dim]")
-        ev = s.get("evidence") or {}
-        for k, v in ev.items():
-            v_str = json.dumps(v, ensure_ascii=False) if not isinstance(v, str) else v
-            if len(v_str) > 100:
-                v_str = v_str[:97] + "..."
-            console.print(f"  [dim]{k}:[/dim] {v_str}")
-        console.print()
-
-
-@mood_group.command("compute")
-@click.option("--date", default=None, help="YYYY-MM-DD (default: hoy)")
-@click.option("--plain", is_flag=True)
-def mood_compute_cmd(date: str | None, plain: bool) -> None:
-    """Re-computa el score diario (UPSERT en rag_mood_score_daily)."""
-    from rag import mood as _mood  # noqa: PLC0415
-    if not _mood._is_mood_enabled():
-        click.echo("mood feature off (set RAG_MOOD_ENABLED=1)")
-        return
-    result = _mood.compute_daily_score(date)
-    if plain:
-        click.echo(f"date={result['date']} score={result['score']:+.3f} "
-                   f"n={result['n_signals']} sources={','.join(result['sources_used'])}")
-        return
-    color = _mood_score_color(result["score"])
-    console.print(f"[bold]{result['date']}[/]  "
-                  f"score: [{color}]{result['score']:+.3f}[/]  "
-                  f"({result['n_signals']} señales)")
-    if result["sources_used"]:
-        console.print(f"sources: {', '.join(result['sources_used'])}")
-
-
-@mood_group.command("enable")
-@click.option("--plain", is_flag=True)
-def mood_enable_cmd(plain: bool) -> None:
-    """Activa el daemon mood-poll (crea el state file).
-
-    Después de esto, el plist `com.fer.obsidian-rag-mood-poll` (cargado
-    por `rag setup`) empieza a juntar señales cada 30min. Si el plist
-    no está cargado, ejecutar `rag setup` primero."""
-    from rag import mood as _mood  # noqa: PLC0415
-    was_enabled = _mood.is_daemon_enabled()
-    _mood.enable_daemon()
-    state_path = _mood._daemon_state_file()
-    if plain:
-        click.echo(f"daemon=enabled state_file={state_path} was_already_enabled={was_enabled}")
-        return
-    if was_enabled:
-        console.print(f"[dim]ya estaba enabled[/dim] · {state_path}")
-    else:
-        console.print(f"[green]✓ daemon mood-poll enabled[/green]")
-        console.print(f"[dim]state file: {state_path}[/dim]")
-        console.print("[dim]el próximo tick (≤30min) va a empezar a juntar señales.[/dim]")
-        console.print("[dim]forzar tick ahora: launchctl kickstart -k gui/$(id -u)/com.fer.obsidian-rag-mood-poll[/dim]")
-
-
-@mood_group.command("disable")
-@click.option("--plain", is_flag=True)
-def mood_disable_cmd(plain: bool) -> None:
-    """Desactiva el daemon mood-poll (borra el state file).
-
-    El plist sigue cargado pero los ticks de 30min hacen exit-early
-    (1 stat() syscall + return). Para des-cargar el plist completamente
-    usar `launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.fer.obsidian-rag-mood-poll.plist`."""
-    from rag import mood as _mood  # noqa: PLC0415
-    was_enabled = _mood.is_daemon_enabled()
-    _mood.disable_daemon()
-    if plain:
-        click.echo(f"daemon=disabled was_enabled={was_enabled}")
-        return
-    if was_enabled:
-        console.print("[yellow]daemon mood-poll disabled[/yellow]")
-        console.print("[dim]los datos ya recolectados quedan intactos en rag_mood_signals + rag_mood_score_daily.[/dim]")
-    else:
-        console.print("[dim]ya estaba disabled[/dim]")
-
-
-@mood_group.command("status")
-@click.option("--plain", is_flag=True)
-def mood_status_cmd(plain: bool) -> None:
-    """Muestra estado del feature: env flag + daemon state."""
-    from rag import mood as _mood  # noqa: PLC0415
-    flag_on = _mood._is_mood_enabled()
-    daemon_on = _mood.is_daemon_enabled()
-    state_path = _mood._daemon_state_file()
-    if plain:
-        click.echo(f"env_flag={'on' if flag_on else 'off'} "
-                   f"daemon={'enabled' if daemon_on else 'disabled'} "
-                   f"state_file={state_path} state_exists={state_path.exists()}")
-        return
-    flag_label = "[green]on[/green]" if flag_on else "[red]off[/red]"
-    daemon_label = "[green]enabled[/green]" if daemon_on else "[yellow]disabled[/yellow]"
-    console.print(f"env flag (RAG_MOOD_ENABLED): {flag_label}")
-    console.print(f"daemon state:                {daemon_label}")
-    console.print(f"[dim]state file: {state_path} (exists={state_path.exists()})[/dim]")
-    if not flag_on:
-        console.print("[dim]→ exportá RAG_MOOD_ENABLED=1 para usar la CLI[/dim]")
-    if not daemon_on:
-        console.print("[dim]→ corré `rag mood enable` para que el daemon junte señales[/dim]")
-
-
-@mood_group.command("poll")
-@click.option("--no-llm", is_flag=True, help="Saltea la rama LLM (journal sentiment) — barato")
-@click.option("--dry-run", is_flag=True, help="Corre los scorers pero NO persiste señales ni recompute")
-@click.option("--plain", is_flag=True)
-def mood_poll_cmd(no_llm: bool, dry_run: bool, plain: bool) -> None:
-    """Dispara un cycle del daemon manualmente (útil para debugging
-    sin esperar 30min).
-
-    Por defecto persiste señales en `rag_mood_signals` y recomputa el
-    score diario en `rag_mood_score_daily`. `--dry-run` los inhibe."""
-    from rag import mood as _mood  # noqa: PLC0415
-    if not _mood._is_mood_enabled():
-        click.echo("mood feature off (set RAG_MOOD_ENABLED=1)")
-        return
-    result = _mood.run_poll_cycle(use_llm=not no_llm, persist=not dry_run)
-    if plain:
-        click.echo(json.dumps(result, ensure_ascii=False))
-        return
-    if result.get("reason"):
-        console.print(f"[yellow]skipped:[/yellow] {result['reason']}")
-        return
-    console.print(f"[bold]mood poll cycle[/bold] · "
-                  f"{result['n_signals_emitted']} señales · "
-                  f"elapsed {result.get('elapsed_s', 0):.2f}s")
-    for source, n in result.get("scorers", {}).items():
-        if n == "error":
-            console.print(f"  [red]{source}: error[/red]")
-        else:
-            color = "green" if n > 0 else "dim"
-            console.print(f"  [{color}]{source}: {n} señal(es)[/{color}]")
-    score = result.get("score")
-    if isinstance(score, dict):
-        c = _mood_score_color(score["value"])
-        console.print(f"\nscore hoy: [{c}]{score['value']:+.3f}[/] "
-                      f"({score['n_signals']} señales · sources: {', '.join(score['sources_used'])})")
-
-
-@mood_group.command("predict")
-@click.option("--days", default=60, type=int, help="Histórico para entrenar (default 60)")
-@click.option("--plain", is_flag=True)
-def mood_predict_cmd(days: int, plain: bool) -> None:
-    """Predicción del mood de mañana via LinearRegression.
-
-    Entrena con features de los últimos N días (lag-1: features[t-1] →
-    mood[t]), aplica al estado de hoy, devuelve un valor en [-1, +1] +
-    confidence (R²) + top features que más contribuyen.
-
-    Importante: NO es verdad — es estimación basada en patrones
-    recientes que pueden cambiar. Si el R² es bajo (<0.3), el modelo
-    está adivinando — desconfiá del número y mirá las features."""
-    from rag import mood as _mood  # noqa: PLC0415
-    from rag.cross_source_patterns import predict_mood_tomorrow  # noqa: PLC0415
-    if not _mood._is_mood_enabled():
-        click.echo("mood feature off (set RAG_MOOD_ENABLED=1)")
-        return
-    days_clamped = max(21, min(int(days), 90))
-    result = predict_mood_tomorrow(days=days_clamped)
-
-    if result is None:
-        if plain:
-            click.echo(
-                f"prediction=none reason=insufficient_data "
-                f"min_required=21 days_tried={days_clamped}"
-            )
-            return
-        console.print(
-            "[yellow]sin data suficiente para predecir[/] "
-            f"[dim](mínimo 21 días con mood + features alineadas; "
-            f"intentamos {days_clamped})[/dim]"
-        )
-        return
-
-    pred = result.get("prediction")
-    conf = result.get("confidence", 0.0)
-    n = result.get("n_training_days", 0)
-    target = result.get("target_date")
-    top = result.get("top_features") or []
-
-    if pred is None:
-        # Modelo entrenado pero no podemos predecir hoy → mañana por
-        # missing features de hoy.
-        reason = result.get("reason", "missing_features_today")
-        if plain:
-            click.echo(f"prediction=none reason={reason} confidence={conf}")
-            return
-        console.print(f"[yellow]modelo entrenado (R²={conf:+.2f}, n={n}) "
-                      f"pero falta data de HOY para predecir mañana[/]")
-        console.print(f"[dim]reason: {reason}[/]")
-        return
-
-    model_name = result.get("model", "linear")
-    alpha = result.get("alpha")
-    cv_splits = result.get("cv_n_splits", 0)
-    conf_in = result.get("confidence_in_sample", conf)
-
-    if plain:
-        alpha_part = f" alpha={alpha:.2f}" if alpha is not None else ""
-        click.echo(
-            f"prediction={pred:+.3f} confidence={conf:.3f} "
-            f"confidence_in_sample={conf_in:.3f} "
-            f"model={model_name}{alpha_part} cv_splits={cv_splits} "
-            f"n_training={n} target_date={target}"
-        )
-        for f in top:
-            dev = f.get("deviation_contribution", f["contribution"])
-            baseline = f.get("value_baseline", 0.0)
-            click.echo(
-                f"  feature={f['feature']} coef={f['coef']:+.4f} "
-                f"value_today={f['value_today']:+.3f} "
-                f"baseline={baseline:+.3f} "
-                f"deviation_contribution={dev:+.3f} "
-                f"contribution={f['contribution']:+.3f}"
-            )
-        return
-
-    color = _mood_score_color(pred)
-    # CV R² puede ser negativo cuando el modelo es peor que predecir
-    # la media — eso es signal de "no aprendí nada" y la UI lo flaggea.
-    conf_color = (
-        "green" if conf >= 0.5 else "yellow" if conf >= 0.2 else "red"
-    )
-    sign = "+" if pred > 0 else ""
-    console.print(f"\n[bold]predicción mood mañana ({target})[/]")
-    console.print(f"  [{color}]{sign}{pred:.2f}[/]  "
-                  f"confianza CV R² [{conf_color}]{conf:+.2f}[/] "
-                  f"[dim](n={n} días, modelo={model_name}"
-                  + (f", α={alpha:.2f}" if alpha is not None else "")
-                  + f", in-sample R²={conf_in:+.2f})[/dim]")
-    if conf < 0.2:
-        console.print("[dim]⚠ CV R² bajo — el modelo no está aprendiendo "
-                      "del histórico. Mirá los features individuales más "
-                      "que el número.[/dim]")
-    if top:
-        console.print("\n[dim]top features (ordenadas por desviación vs "
-                      "tu promedio histórico):[/]")
-        for f in top:
-            # Usamos deviation_contribution como medida de "qué tan
-            # inusual es hoy esta feature, ponderado por su peso en
-            # el modelo". Más interpretable que contribution.
-            dev = f.get("deviation_contribution", f["contribution"])
-            c = "bright_red" if abs(dev) >= 0.3 else "yellow" if abs(dev) >= 0.1 else "white"
-            sign_c = "+" if dev > 0 else ""
-            baseline = f.get("value_baseline", 0.0)
-            console.print(
-                f"  [{c}]{f['feature']:<28}[/] "
-                f"[dim]hoy={f['value_today']:+.2f} vs base={baseline:+.2f}[/] "
-                f"[{c}]→ {sign_c}{dev:.2f}[/]"
-            )
-
-
-@cli.group("sleep", invoke_without_command=False)
-def sleep_group() -> None:
-    """Sleep tracking — métricas de Pillow (iOS) sincronizadas via iCloud.
-
-    Subcomandos:
-
-    - rag sleep show [--days N]    última noche + week vs hist
-    - rag sleep patterns           Pearson r sobre todo el histórico
-    - rag sleep ingest             corre el ingester (alias de `rag index --source pillow`)
-    """
-
-
-@sleep_group.command("show")
-@click.option("--days", default=7, type=int,
-              help="Días para sparkline + agregados (default 7)")
-@click.option("--plain", is_flag=True, help="Output mínimo, sin Rich")
-def sleep_show_cmd(days: int, plain: bool) -> None:
-    """Resumen de sueño: anoche + comparación con el histórico."""
-    from rag.integrations.pillow_sleep import last_night, weekly_stats  # noqa: PLC0415
-    ln = last_night()
-    if ln is None:
-        if plain:
-            click.echo("no_data")
-        else:
-            console.print("[dim]sin sesiones todavía. Corré `rag sleep ingest`.[/dim]")
-        return
-
-    ws = weekly_stats()
-    week = ws.get("week") or {}
-    hist = ws.get("hist") or {}
-    delta = ws.get("delta") or {}
-
-    total_h = ln.get("sleep_total_h") or 0
-    mins = round(total_h * 60)
-    h, m = divmod(mins, 60)
-    total_label = f"{h}h{m:02d}m"
-    quality = ln.get("quality")
-    deep_pct = ln.get("deep_pct")
-    rem_pct = ln.get("rem_pct")
-    awak = ln.get("awakenings", 0)
-
-    if plain:
-        click.echo(f"date\t{ln.get('date')}")
-        click.echo(f"duration\t{total_label}\t{total_h:.2f}h")
-        click.echo(f"bedtime\t{ln.get('bedtime_local')}\t→\t{ln.get('waketime_local')}")
-        if quality is not None:
-            click.echo(f"quality\t{quality:.3f}")
-        if deep_pct is not None:
-            click.echo(f"deep_pct\t{deep_pct:.1f}")
-        if rem_pct is not None:
-            click.echo(f"rem_pct\t{rem_pct:.1f}")
-        click.echo(f"awakenings\t{awak}")
-        if week.get("n"):
-            click.echo(
-                f"week_avg\tn={week['n']}\t"
-                f"dur={week.get('duration_h', 0):.2f}h\t"
-                f"q={week.get('quality', 0):.2f}\t"
-                f"deep={week.get('deep_pct', 0):.1f}%"
-            )
-        if hist.get("n"):
-            click.echo(
-                f"hist_avg\tn={hist['n']}\t"
-                f"dur={hist.get('duration_h', 0):.2f}h\t"
-                f"q={hist.get('quality', 0):.2f}\t"
-                f"deep={hist.get('deep_pct', 0):.1f}%"
-            )
-        return
-
-    # Rich output
-    console.print(f"\n[bold]sueño · anoche ({ln.get('date')})[/bold]")
-    q_str = f"Q {quality:.2f}" if quality is not None else "—"
-    console.print(
-        f"  {total_label}  [dim]{q_str}[/dim]  "
-        f"[dim]{ln.get('bedtime_local')} → {ln.get('waketime_local')}[/dim]"
-    )
-
-    # Stages con warn cues
-    deep_color = "yellow" if (deep_pct is not None and deep_pct < 15) else "default"
-    rem_color = "yellow" if (rem_pct is not None and rem_pct < 15) else "default"
-    awak_color = "red" if awak >= 5 else "yellow" if awak >= 3 else "default"
-    deep_str = f"{deep_pct:.0f}%" if deep_pct is not None else "—"
-    rem_str = f"{rem_pct:.0f}%" if rem_pct is not None else "—"
-    console.print(
-        f"  [dim]deep[/dim] [{deep_color}]{deep_str}[/{deep_color}]  "
-        f"[dim]rem[/dim] [{rem_color}]{rem_str}[/{rem_color}]  "
-        f"[dim]awk[/dim] [{awak_color}]{awak}[/{awak_color}]"
-    )
-
-    if week.get("n") and hist.get("n"):
-        console.print(f"\n[bold]vs histórico[/bold] (week n={week['n']} · hist n={hist['n']})")
-
-        def fmt_delta(val: float | None, suffix: str, decimals: int = 2) -> str:
-            if val is None:
-                return "—"
-            sign = "+" if val > 0 else ""
-            color = "green" if val > 0 else "red" if val < -0.01 else "dim"
-            return f"[{color}]{sign}{val:.{decimals}f}{suffix}[/{color}]"
-
-        console.print(
-            f"  duración: {week.get('duration_h', 0):.2f}h  "
-            f"hist {hist.get('duration_h', 0):.2f}h  "
-            f"Δ {fmt_delta(delta.get('duration_h'), 'h', 1)}"
-        )
-        console.print(
-            f"  quality:  {week.get('quality', 0):.2f}  "
-            f"hist {hist.get('quality', 0):.2f}  "
-            f"Δ {fmt_delta(delta.get('quality'), '', 2)}"
-        )
-        console.print(
-            f"  deep%:    {week.get('deep_pct', 0):.1f}%  "
-            f"hist {hist.get('deep_pct', 0):.1f}%  "
-            f"Δ {fmt_delta(delta.get('deep_pct'), 'pp', 1)}"
-        )
-        console.print(
-            f"  awk/n:    {week.get('awakenings', 0):.1f}  "
-            f"hist {hist.get('awakenings', 0):.1f}  "
-            f"Δ {fmt_delta(delta.get('awakenings'), '', 1)}"
-        )
-
-    # Sparkline ASCII de quality 7d
-    spark = ws.get("spark_quality_7d") or []
-    if spark:
-        bars = []
-        for v in spark:
-            if v is None:
-                bars.append("·")
-            elif v >= 0.85:
-                bars.append("[green]█[/green]")
-            elif v >= 0.7:
-                bars.append("[default]▆[/default]")
-            elif v >= 0.5:
-                bars.append("[yellow]▄[/yellow]")
-            else:
-                bars.append("[red]▂[/red]")
-        console.print(f"\n[dim]quality 7d:[/dim] {' '.join(bars)}")
-
-
-@sleep_group.command("patterns")
-@click.option("--min-r", default=0.3, type=float,
-              help="|r| mínimo para incluir un finding (default 0.3)")
-@click.option("--min-n", default=14, type=int,
-              help="N mínimo de pares para que el finding sea válido (default 14)")
-@click.option("--all", "show_all", is_flag=True,
-              help="Mostrar TODOS los candidatos (incluyendo los que no pasan threshold)")
-@click.option("--plain", is_flag=True, help="Output mínimo, sin Rich")
-def sleep_patterns_cmd(min_r: float, min_n: int, show_all: bool, plain: bool) -> None:
-    """Correlaciones Pearson r sobre el histórico de sueño + mood.
-
-    Surface findings ordenados por |r| descendente. Severity tiers:
-    weak (<0.4), moderate (<0.5), strong (≥0.5)."""
-    from rag.integrations.pillow_sleep import detect_patterns  # noqa: PLC0415
-    findings = detect_patterns(
-        min_n=min_n,
-        min_abs_r=0.0 if show_all else min_r,
-    )
-    if plain:
-        if not findings:
-            click.echo("no_findings")
-            return
-        for f in findings:
-            click.echo(
-                f"{f['kind']}\tr={f['r']:+.2f}\tn={f['n']}\t{f['severity']}\t{f['description']}"
-            )
-        return
-
-    if not findings:
-        console.print(
-            f"[dim]sin findings con |r| ≥ {min_r:.2f} y n ≥ {min_n}. "
-            f"Probá `rag sleep patterns --all` o subí los datos primero "
-            f"con `rag sleep ingest`.[/dim]"
-        )
-        return
-
-    console.print(f"\n[bold]sleep patterns · n={findings[0]['n']} sesiones[/bold]")
-    for f in findings:
-        if f["severity"] == "strong":
-            color = "yellow"
-        elif f["severity"] == "moderate":
-            color = "default"
-        else:
-            color = "dim"
-        sign = "+" if f["r"] > 0 else ""
-        console.print(
-            f"  [{color}]{f['kind']:30s}[/{color}]  "
-            f"r={sign}{f['r']:.2f}  "
-            f"[dim]{f['severity']:8s}[/dim]  "
-            f"[{color}]{f['description']}[/{color}]"
-        )
-
-
-@sleep_group.command("ingest")
-@click.option("--plain", is_flag=True, help="Output mínimo, sin Rich")
-def sleep_ingest_cmd(plain: bool) -> None:
-    """Corre el ingester de Pillow (alias de `rag index --source pillow`)."""
-    from rag.integrations.pillow_sleep import ingest as _ingest_pillow  # noqa: PLC0415
-    summary = _ingest_pillow()
-    if plain:
-        click.echo(json.dumps(summary, ensure_ascii=False, default=str))
-        return
-    if summary.get("skipped"):
-        console.print(
-            f"[dim]pillow: {summary.get('reason', 'skipped')} ({summary['file']})[/dim]"
-        )
-        return
-    console.print(
-        f"[green]pillow:[/green] {summary['total_parsed']} sesiones · "
-        f"{summary['ingested']} ingest · "
-        f"{summary['mood_signals']} mood signals · "
-        f"{summary['elapsed_ms']:.0f}ms"
-    )
-
-
-# ─── patterns CLI group ─────────────────────────────────────────────────────
-
-
-def _patterns_severity_color(severity: str) -> str:
-    if severity == "strong":
-        return "bright_red"
-    if severity == "moderate":
-        return "yellow"
-    return "white"
-
-
-def _patterns_lag_label(lag: int) -> str:
-    if lag == 0:
-        return "mismo día"
-    if lag == 1:
-        return "+1 día"
-    if lag == 7:
-        return "+1 semana"
-    return f"+{lag}d"
-
-
-@cli.group("patterns", invoke_without_command=False)
-def patterns_group() -> None:
-    """Cross-source pattern detection — Pearson sobre métricas diarias.
-
-    Subcomandos:
-      rag patterns show [--days N] [--lags 0,1,7]   → top correlaciones
-      rag patterns metrics                           → lista métricas + n_días
-      rag patterns explain --pair A,B [--lag N]     → detalle de un par
-    """
-
-
-@patterns_group.command("show")
-@click.option("--days", default=30, type=int, help="Rango histórico (7-90)")
-@click.option("--lags", default="0,1,7",
-              help="Lags a testear separados por coma (default 0,1,7)")
-@click.option("--top", default=10, type=int, help="Cuántas correlaciones mostrar")
-@click.option("--plain", is_flag=True, help="Output mínimo, sin Rich")
-def patterns_show_cmd(days: int, lags: str, top: int, plain: bool) -> None:
-    """Top correlaciones cross-source con severity + lag + p-value."""
-    from rag.cross_source_patterns import patterns_summary, metric_label  # noqa: PLC0415
-    days_clamped = max(7, min(int(days), 90))
-    try:
-        lag_list = tuple(sorted(set(
-            max(0, min(int(x.strip()), 14))
-            for x in lags.split(",") if x.strip()
-        ))) or (0,)
-    except ValueError:
-        lag_list = (0, 1, 7)
-
-    summary = patterns_summary(
-        days=days_clamped, top=int(top), lags=lag_list,
-    )
-
-    if plain:
-        click.echo(f"days={summary['days_range']} lags={summary['lags_tested']} "
-                   f"n_findings={summary['n_findings']} "
-                   f"strong={summary['by_severity'].get('strong', 0)} "
-                   f"moderate={summary['by_severity'].get('moderate', 0)}")
-        for f in summary["top"]:
-            a, b = f["pair"]
-            click.echo(f"  [{f['severity']}] {a} × {b} (lag {f['lag']}d) "
-                       f"r={f['r']:+.2f} n={f['n']} p={f['p']:.4f}")
-        return
-
-    console.print(f"\n[bold]cross-source patterns[/] · "
-                  f"{summary['days_range']} días · lags {summary['lags_tested']}")
-    if not summary["top"]:
-        console.print("[dim]sin findings — necesitás más data acumulada "
-                      "(min 21 días + |r|>=0.4)[/dim]")
-        if summary["metrics_with_data"]:
-            console.print("\n[dim]métricas con data:[/dim]")
-            for name, n in summary["metrics_with_data"]:
-                color = "green" if n >= 21 else "yellow" if n >= 7 else "red"
-                console.print(f"  [{color}]{name}: {n}d[/{color}]")
-        return
-
-    summary_line = (
-        f"[bright_red]{summary['by_severity'].get('strong', 0)} strong[/] · "
-        f"[yellow]{summary['by_severity'].get('moderate', 0)} moderate[/] · "
-        f"{summary['n_findings']} total"
-    )
-    console.print(summary_line + "\n")
-
-    for f in summary["top"]:
-        a, b = f["pair"]
-        sev_color = _patterns_severity_color(f["severity"])
-        lag_lbl = _patterns_lag_label(f["lag"])
-        r_sign = "+" if f["r"] > 0 else ""
-        console.print(
-            f"  [{sev_color}]●[/] [bold]{metric_label(a)}[/] × "
-            f"[bold]{metric_label(b)}[/] [dim]({lag_lbl})[/]"
-        )
-        console.print(
-            f"    [dim]r=[/]{r_sign}{f['r']:.2f} "
-            f"[dim]n=[/]{f['n']} [dim]p=[/]{f['p']:.4f} "
-            f"[dim]· {f['description']}[/]"
-        )
-
-
-@patterns_group.command("metrics")
-@click.option("--days", default=30, type=int)
-@click.option("--plain", is_flag=True)
-def patterns_metrics_cmd(days: int, plain: bool) -> None:
-    """Lista las métricas registradas + cuántos días tienen data."""
-    from rag.cross_source_patterns import (  # noqa: PLC0415
-        collect_daily_metrics, known_metrics, metric_label,
-    )
-    days_clamped = max(7, min(int(days), 90))
-    metrics = collect_daily_metrics(days=days_clamped)
-    rows = sorted(
-        ((name, len(metrics.get(name, {}))) for name in known_metrics()),
-        key=lambda x: -x[1],
-    )
-    if plain:
-        for name, n in rows:
-            click.echo(f"{name}\t{n}")
-        return
-    console.print(f"\n[bold]métricas registradas[/] ({days_clamped} días):")
-    for name, n in rows:
-        if n >= 21:
-            color, hint = "green", "ok para correlación"
-        elif n >= 7:
-            color, hint = "yellow", "no alcanza min_n=21"
-        else:
-            color, hint = "red", "casi sin data"
-        console.print(
-            f"  [{color}]{name:<28}[/] [dim]{metric_label(name):<32}[/] "
-            f"[{color}]{n:>3}d[/] [dim]({hint})[/]"
-        )
-
-
-@patterns_group.command("explain")
-@click.option("--pair", required=True,
-              help="Pair en formato 'a,b' (ej. mood_score,sleep_quality)")
-@click.option("--lag", default=0, type=int, help="Lag en días")
-@click.option("--days", default=30, type=int)
-@click.option("--plain", is_flag=True)
-def patterns_explain_cmd(pair: str, lag: int, days: int, plain: bool) -> None:
-    """Calcula Pearson explícito sobre un par + lag específico (debug)."""
-    from rag.cross_source_patterns import (  # noqa: PLC0415
-        collect_daily_metrics, _pearson, _align_series, metric_label,
-        _severity, _format_description,
-    )
-    parts = [p.strip() for p in pair.split(",")]
-    if len(parts) != 2:
-        click.echo("error: --pair debe ser 'a,b'", err=True)
-        return
-    a, b = parts
-    days_clamped = max(7, min(int(days), 90))
-    metrics = collect_daily_metrics(days=days_clamped, metrics=[a, b])
-    if a not in metrics or b not in metrics:
-        click.echo(f"error: métrica desconocida — usá `rag patterns metrics`", err=True)
-        return
-    xs, ys, dates = _align_series(metrics[a], metrics[b], lag=int(lag))
-    r, n, p = _pearson(xs, ys)
-    sev = _severity(r)
-    desc = _format_description(a, b, r, int(lag))
-    if plain:
-        click.echo(f"pair={a},{b} lag={lag} r={r:+.3f} n={n} p={p:.4f} "
-                   f"severity={sev}")
-        click.echo(f"description={desc}")
-        for d, x, y in zip(dates, xs, ys):
-            click.echo(f"  {d}\t{x:+.3f}\t{y:+.3f}")
-        return
-
-    sev_color = _patterns_severity_color(sev)
-    console.print(f"\n[bold]{metric_label(a)}[/] × [bold]{metric_label(b)}[/] "
-                  f"[dim](lag {lag}d)[/]")
-    console.print(f"  [{sev_color}]r={r:+.3f}[/] · n={n} · p={p:.4f} · {sev}")
-    console.print(f"  [dim]{desc}[/]\n")
-    if dates:
-        console.print(f"[dim]pares alineados ({len(dates)}):[/]")
-        for d, x, y in zip(dates[:10], xs[:10], ys[:10]):
-            console.print(f"  [dim]{d}[/]  {a}={x:+.3f}  {b}={y:+.3f}")
-        if len(dates) > 10:
-            console.print(f"  [dim]... +{len(dates) - 10} más[/]")
+# mood/sleep/patterns CLI groups extracted to rag/cli/{mood,sleep,patterns}.py — Phase 2e 2026-05-09
 
 
 @cli.command("state")
@@ -31418,7 +30627,7 @@ def tune(queries_file: str, k: int, samples: int, seed: int,
         ]
         if excluded:
             console.print(
-                f"  [dim]Clusters excluidos del gate (n<3): "
+                "  [dim]Clusters excluidos del gate (n<3): "
                 + ", ".join(f"{n}={c}" for n, c in excluded)
                 + "[/dim]"
             )
@@ -38337,7 +37546,7 @@ def _handle_spotify_command(q: str) -> dict | None:
             return {"ok": False, "action": action,
                     "message": "Spotify no está abierto."}
         return {"ok": False, "action": action,
-                "message": f"No pude saltar.",
+                "message": "No pude saltar.",
                 "error": str(res.get("error", ""))}
 
     if action == "play_search":
@@ -40916,7 +40125,7 @@ def _fetch_vault_activity(hours: int = 48, n_per_vault: int = 5) -> dict:
 
     cutoff = datetime.now() - _td(hours=hours)
     out: dict[str, list[dict]] = {}
-    for name, vault in vaults:
+    for name, vault in vaults:  # noqa: F402
         if not vault.is_dir():
             continue
         items: list[dict] = []
@@ -44024,7 +43233,7 @@ def _strip_empty_today_sections(narrative: str) -> str:
         lines = [
             ln.strip()
             for ln in body.splitlines()
-            if ln.strip() and not ln.strip() in ("-", "*")
+            if ln.strip() and ln.strip() not in ("-", "*")
         ]
         if not lines:
             return True
@@ -44593,11 +43802,11 @@ def bridge_status():
     console.print(f"  label:      [cyan]{_WA_BRIDGE_LAUNCHD_LABEL}[/cyan]")
     console.print(f"  binary:     [cyan]{_WA_BRIDGE_BINARY}[/cyan]")
     console.print(
-        f"  daemon:     "
+        "  daemon:     "
         + ("[green]✓ loaded[/green]" if is_loaded else "[red]✗ not loaded[/red]")
     )
     console.print(
-        f"  connection: "
+        "  connection: "
         + ("[green]✓ connected[/green]" if is_connected else "[red]✗ disconnected[/red]")
         + f"  [dim]({detail})[/dim]"
     )
@@ -54566,6 +53775,23 @@ from rag.cli.setup import (  # noqa: E402, F401
 cli.add_command(setup)  # `rag setup` (Phase 2d 2026-05-09)
 cli.add_command(start)  # `rag start` (Phase 2d 2026-05-09)
 cli.add_command(stop)   # `rag stop`  (Phase 2d 2026-05-09)
+
+from rag.cli.mood import (  # noqa: E402, F401
+    _mood_score_bar,
+    _mood_score_color,
+    mood_group,
+)
+cli.add_command(mood_group, name="mood")  # `rag mood {...}` (Phase 2e 2026-05-09)
+
+from rag.cli.sleep import sleep_group  # noqa: E402, F401
+cli.add_command(sleep_group, name="sleep")  # `rag sleep {...}` (Phase 2e 2026-05-09)
+
+from rag.cli.patterns import (  # noqa: E402, F401
+    _patterns_lag_label,
+    _patterns_severity_color,
+    patterns_group,
+)
+cli.add_command(patterns_group, name="patterns")  # `rag patterns {...}` (Phase 2e 2026-05-09)
 
 # Sub-commands del feedback group (definido más arriba en este módulo).
 # Las funciones están en `rag/cli/feedback_judge.py` como `@click.command`

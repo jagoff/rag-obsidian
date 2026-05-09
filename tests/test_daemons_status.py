@@ -40,8 +40,10 @@ def _isolate_db_path(tmp_path):
 
 def test_services_spec_manual_returns_7_entries():
     # 2026-05-04 consolidation: 7 → 3 manual entries.
+    # 2026-05-04 segunda limpieza: removido `spotify-poll` (no había plist real),
+    # quedan 2 manual_keep: synth-refresh + log-rotate.
     specs = rag._services_spec_manual()
-    assert len(specs) == 3
+    assert len(specs) == 2
 
 
 def test_services_spec_manual_shape():
@@ -56,11 +58,12 @@ def test_services_spec_manual_shape():
 def test_services_spec_manual_known_labels():
     # 2026-05-04 consolidation: cloudflare-tunnel*, lgbm-train, paraphrases-train
     # removidos del manual spec. Quedan 3.
+    # 2026-05-04 segunda limpieza: spotify-poll también removido (sin plist real),
+    # quedan 2 manual_keep.
     specs = rag._services_spec_manual()
     labels = {s["label"] for s in specs}
     expected = {
         "com.fer.obsidian-rag-synth-refresh",
-        "com.fer.obsidian-rag-spotify-poll",
         "com.fer.obsidian-rag-log-rotate",
     }
     assert labels == expected

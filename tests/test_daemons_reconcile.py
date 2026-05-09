@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -18,6 +19,18 @@ import pytest
 from click.testing import CliRunner
 
 import rag
+
+# `rag.cli` está shadowed por el Click group `cli` re-exportado desde rag/__init__.py
+# así que para los tests que necesitan patchear módulo-locales de daemons_control,
+# resolvemos el módulo real via sys.modules. Las funciones `_all_daemon_labels`,
+# `_compute_reconcile_actions`, `_plist_on_disk`, `_execute_reconcile_action` viven
+# ahí (post-split 2026-04-30). Patchear `rag._all_daemon_labels` solo cambia el
+# binding del namespace `rag`, NO el binding interno de daemons_control que es
+# el que usa `_compute_reconcile_actions` adentro. Por eso necesitamos el handle
+# directo al módulo.
+_dc = sys.modules.get("rag.cli.daemons_control")
+if _dc is None:  # pragma: no cover — defensive (rag import garantiza la carga)
+    import rag.cli.daemons_control as _dc  # type: ignore[no-redef]
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -77,17 +90,15 @@ def test_compute_reconcile_actions_bootstrap_missing_with_plist():
     """state=missing + plist en disco → acción bootstrap."""
     label = "com.fer.obsidian-rag-test-bootstrap"
 
+    from unittest.mock import patch as _patch
+
     with (
-        __import__("unittest.mock", fromlist=["patch"]).patch.object(
-            rag, "_all_daemon_labels", return_value=[(label, "managed")]
-        ),
-        __import__("unittest.mock", fromlist=["patch"]).patch.object(
+        _patch.object(_dc, "_all_daemon_labels", return_value=[(label, "managed")]),
+        _patch.object(
             rag, "_gather_daemon_status",
             return_value=_fake_status(label, state="missing", last_exit=None),
         ),
-        __import__("unittest.mock", fromlist=["patch"]).patch.object(
-            rag, "_plist_on_disk", return_value=True
-        ),
+        _patch.object(_dc, "_plist_on_disk", return_value=True),
     ):
         actions = rag._compute_reconcile_actions(gentle=False)
 
@@ -103,9 +114,9 @@ def test_compute_reconcile_actions_bootout_loaded_without_plist():
     label = "com.fer.obsidian-rag-test-bootout"
 
     with (
-        _patch.object(rag, "_all_daemon_labels", return_value=[(label, "managed")]),
+        _patch.object(_dc, "_all_daemon_labels", return_value=[(label, "managed")]),
         _patch.object(rag, "_gather_daemon_status", return_value=_fake_status(label, state="running")),
-        _patch.object(rag, "_plist_on_disk", return_value=False),
+        _patch.object(_dc, "_plist_on_disk", return_value=False),
     ):
         actions = rag._compute_reconcile_actions(gentle=False)
 
@@ -120,9 +131,9 @@ def test_compute_reconcile_actions_gentle_skips_bootout():
     label = "com.fer.obsidian-rag-test-gentle"
 
     with (
-        _patch.object(rag, "_all_daemon_labels", return_value=[(label, "managed")]),
+        _patch.object(_dc, "_all_daemon_labels", return_value=[(label, "managed")]),
         _patch.object(rag, "_gather_daemon_status", return_value=_fake_status(label, state="running")),
-        _patch.object(rag, "_plist_on_disk", return_value=False),
+        _patch.object(_dc, "_plist_on_disk", return_value=False),
     ):
         actions = rag._compute_reconcile_actions(gentle=True)
 
@@ -135,12 +146,12 @@ def test_compute_reconcile_actions_kickstart_on_failed_exit():
     label = "com.fer.obsidian-rag-test-kick"
 
     with (
-        _patch.object(rag, "_all_daemon_labels", return_value=[(label, "managed")]),
+        _patch.object(_dc, "_all_daemon_labels", return_value=[(label, "managed")]),
         _patch.object(
             rag, "_gather_daemon_status",
             return_value=_fake_status(label, state="running", runs=2, last_exit=1),
         ),
-        _patch.object(rag, "_plist_on_disk", return_value=True),
+        _patch.object(_dc, "_plist_on_disk", return_value=True),
     ):
         actions = rag._compute_reconcile_actions(gentle=False)
 
@@ -156,12 +167,12 @@ def test_compute_reconcile_actions_kickstart_on_overdue():
     label = "com.fer.obsidian-rag-test-overdue"
 
     with (
-        _patch.object(rag, "_all_daemon_labels", return_value=[(label, "managed")]),
+        _patch.object(_dc, "_all_daemon_labels", return_value=[(label, "managed")]),
         _patch.object(
             rag, "_gather_daemon_status",
             return_value=_fake_status(label, state="running", overdue=True),
         ),
-        _patch.object(rag, "_plist_on_disk", return_value=True),
+        _patch.object(_dc, "_plist_on_disk", return_value=True),
     ):
         actions = rag._compute_reconcile_actions(gentle=False)
 
@@ -238,15 +249,17 @@ def test_compute_regenerate_detects_drift(tmp_path, monkeypatch):
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     plist_path.write_text(fake_ondisk_xml, encoding="utf-8")
 
-    monkeypatch.setattr(rag, "Path", _PathRedirector(tmp_path, plist_path, label))
+    redirector = _PathRedirector(tmp_path, plist_path, label)
+    monkeypatch.setattr(rag, "Path", redirector)
+    monkeypatch.setattr(_dc, "Path", redirector)
 
     with (
-        _patch.object(rag, "_all_daemon_labels", return_value=[(label, "managed")]),
+        _patch.object(_dc, "_all_daemon_labels", return_value=[(label, "managed")]),
         _patch.object(
             rag, "_gather_daemon_status",
             return_value=_fake_status(label, state="running"),
         ),
-        _patch.object(rag, "_plist_on_disk", return_value=True),
+        _patch.object(_dc, "_plist_on_disk", return_value=True),
         _patch.object(
             rag, "_services_spec",
             return_value=[(label, f"{label}.plist", fake_factory_xml)],
@@ -270,15 +283,19 @@ def test_compute_regenerate_no_drift_when_xml_matches(tmp_path, monkeypatch):
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     plist_path.write_text(xml + "\n", encoding="utf-8")  # trailing newline
 
-    monkeypatch.setattr(rag, "Path", _PathRedirector(tmp_path, plist_path, label))
+    redirector = _PathRedirector(tmp_path, plist_path, label)
+    monkeypatch.setattr(rag, "Path", redirector)
+    # `_compute_reconcile_actions` corre dentro de `daemons_control.py` y referencia
+    # `Path` desde sus globals locales — el monkeypatch sobre `rag.Path` no alcanza.
+    monkeypatch.setattr(_dc, "Path", redirector)
 
     with (
-        _patch.object(rag, "_all_daemon_labels", return_value=[(label, "managed")]),
+        _patch.object(_dc, "_all_daemon_labels", return_value=[(label, "managed")]),
         _patch.object(
             rag, "_gather_daemon_status",
             return_value=_fake_status(label, state="running"),
         ),
-        _patch.object(rag, "_plist_on_disk", return_value=True),
+        _patch.object(_dc, "_plist_on_disk", return_value=True),
         _patch.object(
             rag, "_services_spec",
             return_value=[(label, f"{label}.plist", xml)],
@@ -299,15 +316,17 @@ def test_compute_regenerate_skips_manual_keep(tmp_path, monkeypatch):
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     plist_path.write_text(on_disk, encoding="utf-8")
 
-    monkeypatch.setattr(rag, "Path", _PathRedirector(tmp_path, plist_path, label))
+    redirector = _PathRedirector(tmp_path, plist_path, label)
+    monkeypatch.setattr(rag, "Path", redirector)
+    monkeypatch.setattr(_dc, "Path", redirector)
 
     with (
-        _patch.object(rag, "_all_daemon_labels", return_value=[(label, "manual_keep")]),
+        _patch.object(_dc, "_all_daemon_labels", return_value=[(label, "manual_keep")]),
         _patch.object(
             rag, "_gather_daemon_status",
             return_value=_fake_status(label, state="running"),
         ),
-        _patch.object(rag, "_plist_on_disk", return_value=True),
+        _patch.object(_dc, "_plist_on_disk", return_value=True),
         _patch.object(rag, "_services_spec", return_value=[]),  # manual no está en spec
     ):
         actions = rag._compute_reconcile_actions(regenerate=True)
@@ -408,7 +427,7 @@ def test_daemons_reconcile_defaults_to_dry_run(sql_env):
     }
 
     with (
-        _patch.object(rag, "_compute_reconcile_actions", return_value=[action]),
+        _patch.object(_dc, "_compute_reconcile_actions", return_value=[action]),
         _patch.object(subprocess, "run") as mock_run,
     ):
         result = runner.invoke(rag.daemons_reconcile, [])
@@ -443,7 +462,7 @@ def test_daemons_reconcile_apply_calls_subprocess_and_logs(sql_env):
         log_calls.append({"label": label, "action": action, **kwargs})
 
     with (
-        _patch.object(rag, "_compute_reconcile_actions", return_value=[action]),
+        _patch.object(_dc, "_compute_reconcile_actions", return_value=[action]),
         _patch.object(subprocess, "run", return_value=mock_proc),
         _patch.object(rag, "_gather_daemon_status", return_value=post_status),
         _patch.object(rag, "_log_daemon_run_event", side_effect=_capturing_log),
@@ -466,7 +485,7 @@ def test_daemons_doctor_all_healthy():
     healthy = _fake_status("com.fer.obsidian-rag-web", state="running", last_exit=0, overdue=False)
 
     with (
-        _patch.object(rag, "_all_daemon_labels", return_value=[("com.fer.obsidian-rag-web", "managed")]),
+        _patch.object(_dc, "_all_daemon_labels", return_value=[("com.fer.obsidian-rag-web", "managed")]),
         _patch.object(rag, "_gather_daemon_status", return_value=healthy),
     ):
         result = runner.invoke(rag.daemons_doctor, [])
@@ -484,7 +503,7 @@ def test_daemons_doctor_safari_lock():
     row = _fake_status(label, state="running", last_exit=1, overdue=False)
 
     with (
-        _patch.object(rag, "_all_daemon_labels", return_value=[(label, "managed")]),
+        _patch.object(_dc, "_all_daemon_labels", return_value=[(label, "managed")]),
         _patch.object(rag, "_gather_daemon_status", return_value=row),
     ):
         result = runner.invoke(rag.daemons_doctor, [])
@@ -519,7 +538,7 @@ def test_daemons_retry_calls_kickstart_and_logs(sql_env):
         return mock_proc
 
     with (
-        _patch.object(rag, "_all_daemon_labels", return_value=[(full_label, "managed")]),
+        _patch.object(_dc, "_all_daemon_labels", return_value=[(full_label, "managed")]),
         _patch.object(rag, "_gather_daemon_status", return_value=_fake_status(full_label)),
         _patch.object(subprocess, "run", side_effect=_mock_run),
         _patch.object(rag, "_log_daemon_run_event", side_effect=_capturing_log),
@@ -541,7 +560,7 @@ def test_daemons_retry_unknown_label_raises():
     from unittest.mock import patch as _patch
     runner = CliRunner()
 
-    with _patch.object(rag, "_all_daemon_labels", return_value=[("com.fer.obsidian-rag-web", "managed")]):
+    with _patch.object(_dc, "_all_daemon_labels", return_value=[("com.fer.obsidian-rag-web", "managed")]):
         result = runner.invoke(rag.daemons_retry, ["label-no-existe"])
 
     assert result.exit_code != 0
@@ -557,7 +576,7 @@ def test_daemons_kickstart_overdue_none():
     row = _fake_status("com.fer.obsidian-rag-web", overdue=False)
 
     with (
-        _patch.object(rag, "_all_daemon_labels", return_value=[("com.fer.obsidian-rag-web", "managed")]),
+        _patch.object(_dc, "_all_daemon_labels", return_value=[("com.fer.obsidian-rag-web", "managed")]),
         _patch.object(rag, "_gather_daemon_status", return_value=row),
     ):
         result = runner.invoke(rag.daemons_kickstart_overdue, [])
@@ -593,7 +612,7 @@ def test_daemons_kickstart_overdue_two(sql_env):
         return row_map[label]
 
     with (
-        _patch.object(rag, "_all_daemon_labels", return_value=[(l, "managed") for l in labels]),
+        _patch.object(_dc, "_all_daemon_labels", return_value=[(l, "managed") for l in labels]),
         _patch.object(rag, "_gather_daemon_status", side_effect=_fake_gather),
         _patch.object(subprocess, "run", return_value=mock_proc),
         _patch.object(rag, "_log_daemon_run_event", side_effect=_capturing_log),
@@ -645,7 +664,7 @@ def test_daemons_kickstart_overdue_timeout_continues(sql_env):
         return row_map[label]
 
     with (
-        _patch.object(rag, "_all_daemon_labels", return_value=[(l, "managed") for l in labels]),
+        _patch.object(_dc, "_all_daemon_labels", return_value=[(l, "managed") for l in labels]),
         _patch.object(rag, "_gather_daemon_status", side_effect=_fake_gather),
         _patch.object(subprocess, "run", side_effect=_flaky_run),
         _patch.object(rag, "_log_daemon_run_event", side_effect=_capturing_log),
@@ -684,7 +703,7 @@ def test_daemons_kickstart_overdue_oserror_continues(sql_env):
     log_calls: list[dict] = []
 
     with (
-        _patch.object(rag, "_all_daemon_labels", return_value=[(l, "managed") for l in labels]),
+        _patch.object(_dc, "_all_daemon_labels", return_value=[(l, "managed") for l in labels]),
         _patch.object(rag, "_gather_daemon_status", side_effect=lambda l, c: row_map[l]),
         _patch.object(subprocess, "run", side_effect=_flaky_run),
         _patch.object(rag, "_log_daemon_run_event",

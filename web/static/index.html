@@ -768,10 +768,11 @@
   <!-- Bundle legado — vanilla JS, global scope. Debe ir ANTES del módulo
        para que los globals (messagesEl, send, etc.) estén definidos cuando
        app.mjs y los módulos ES se evalúan. -->
-  <script src="/static/app.js?v=2026-05-09-esm-phase1"></script>
-  <!-- Entry point del módulo ES — carga utils/markdown/settings/voice/session.
+  <script src="/static/app.js?v=2026-05-09-esm-phase2"></script>
+  <!-- Entry point del módulo ES — carga utils/markdown/settings/voice/session
+       (phase 1) + chat-client/messages-render/sidebar/mobile-ui (phase 2).
        type="module" implica defer, así que corre tras el DOMContentLoaded
        y tras el bundle clásico de arriba. -->
-  <script type="module" src="/static/js/app.mjs?v=2026-05-09-esm-phase1"></script>
+  <script type="module" src="/static/js/app.mjs?v=2026-05-09-esm-phase2"></script>
 </body>
 </html>

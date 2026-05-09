@@ -6582,3 +6582,76 @@ if (document.readyState === "loading") {
 // ══════════════════════════════════════════════════════════════════════════
 // /Feature H
 // ══════════════════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════════════════
+// Phase W4-phase-2 — exponer funciones en window.* para módulos ES
+// ══════════════════════════════════════════════════════════════════════════
+// Los módulos ES (chat-client.mjs, messages-render.mjs, sidebar.mjs,
+// mobile-ui.mjs) delegan a window.* durante la transición progresiva.
+// app.js se carga ANTES que cualquier módulo, así que al evaluar acá
+// todos los símbolos del scope ya están definidos.
+//
+// NOTA: window.activeScope, setActiveScope, clearActiveScope,
+// getActiveScopePayload ya están en window.* (Feature H arriba).
+// Solo añadimos los que NO se setean explícitamente en otro lado.
+//
+// No-op si ya existiera un window.send (ej. hot-reload o doble carga) —
+// la guard `if (!window.X)` es para evitar sobrescribir con undefined.
+
+// ── chat-client ────────────────────────────────────────────────────────
+if (typeof send === "function" && !window.send)                   window.send = send;
+if (typeof handleSlashCommand === "function" && !window.handleSlashCommand)
+                                                                  window.handleSlashCommand = handleSlashCommand;
+if (typeof pushSystemMessage === "function" && !window.pushSystemMessage)
+                                                                  window.pushSystemMessage = pushSystemMessage;
+if (typeof abortSideFetches === "function" && !window.abortSideFetches)
+                                                                  window.abortSideFetches = abortSideFetches;
+if (typeof cancelPendingAutoRetry === "function" && !window.cancelPendingAutoRetry)
+                                                                  window.cancelPendingAutoRetry = cancelPendingAutoRetry;
+
+// ── messages-render ────────────────────────────────────────────────────
+// Función interna appendTurn se expone con alias _ para no colisionar con
+// posibles globals de otros scripts (aunque en la práctica no hay conflicto).
+if (typeof appendTurn === "function"           && !window._appendTurn)          window._appendTurn = appendTurn;
+if (typeof appendLine === "function"           && !window.appendLine)           window.appendLine = appendLine;
+if (typeof appendMeta === "function"           && !window.appendMeta)           window.appendMeta = appendMeta;
+if (typeof appendFeedback === "function"       && !window.appendFeedback)       window.appendFeedback = appendFeedback;
+if (typeof appendSources === "function"        && !window.appendSources)        window.appendSources = appendSources;
+if (typeof appendProposal === "function"       && !window.appendProposal)       window.appendProposal = appendProposal;
+if (typeof appendCreatedChip === "function"    && !window.appendCreatedChip)    window.appendCreatedChip = appendCreatedChip;
+if (typeof appendEnrich === "function"         && !window.appendEnrich)         window.appendEnrich = appendEnrich;
+if (typeof renderGrounding === "function"      && !window.renderGrounding)      window.renderGrounding = renderGrounding;
+if (typeof appendRelated === "function"        && !window.appendRelated)        window.appendRelated = appendRelated;
+if (typeof appendWebSearch === "function"      && !window.appendWebSearch)      window.appendWebSearch = appendWebSearch;
+if (typeof appendFallbackCluster === "function"&& !window.appendFallbackCluster) window.appendFallbackCluster = appendFallbackCluster;
+if (typeof appendFollowups === "function"      && !window.appendFollowups)      window.appendFollowups = appendFollowups;
+if (typeof appendCopyButton === "function"     && !window.appendCopyButton)     window.appendCopyButton = appendCopyButton;
+if (typeof buildMarkdownExport === "function"  && !window.buildMarkdownExport)  window.buildMarkdownExport = buildMarkdownExport;
+if (typeof showToast === "function"            && !window.showToast)            window.showToast = showToast;
+if (typeof confidenceBadge === "function"      && !window.confidenceBadge)      window.confidenceBadge = confidenceBadge;
+if (typeof hydrateTurns === "function"         && !window.hydrateTurns)         window.hydrateTurns = hydrateTurns;
+if (typeof scrollBottom === "function"         && !window.scrollBottom)         window.scrollBottom = scrollBottom;
+
+// ── sidebar ─────────────────────────────────────────────────────────────
+if (typeof refreshSessions === "function"      && !window.refreshSessions)      window.refreshSessions = refreshSessions;
+if (typeof loadSession === "function"          && !window.loadSession)          window.loadSession = loadSession;
+if (typeof triggerNewChat === "function"       && !window.triggerNewChat)       window.triggerNewChat = triggerNewChat;
+if (typeof openSidebarMobile === "function"    && !window.openSidebarMobile)    window.openSidebarMobile = openSidebarMobile;
+if (typeof closeSidebarMobile === "function"   && !window.closeSidebarMobile)   window.closeSidebarMobile = closeSidebarMobile;
+if (typeof applySidebarCollapsed === "function"&& !window.applySidebarCollapsed) window.applySidebarCollapsed = applySidebarCollapsed;
+if (typeof getFilterText === "function"        && !window.getFilterText)        window.getFilterText = getFilterText;
+if (typeof renderSessions === "function"       && !window.renderSessions)       window.renderSessions = renderSessions;
+if (typeof formatSessionMeta === "function"    && !window.formatSessionMeta)    window.formatSessionMeta = formatSessionMeta;
+if (typeof initSidebarCollapse === "function"  && !window.initSidebarCollapse)  window.initSidebarCollapse = initSidebarCollapse;
+if (typeof initSidebarMobile === "function"    && !window.initSidebarMobile)    window.initSidebarMobile = initSidebarMobile;
+if (typeof initNewChatButtons === "function"   && !window.initNewChatButtons)   window.initNewChatButtons = initNewChatButtons;
+if (typeof initSessionsSearch === "function"   && !window.initSessionsSearch)   window.initSessionsSearch = initSessionsSearch;
+if (typeof initSidebarShortcut === "function"  && !window.initSidebarShortcut)  window.initSidebarShortcut = initSidebarShortcut;
+
+// ── mobile-ui ───────────────────────────────────────────────────────────
+if (typeof openSheet === "function"            && !window.openSheet)            window.openSheet = openSheet;
+if (typeof closeSheet === "function"           && !window.closeSheet)           window.closeSheet = closeSheet;
+if (typeof syncSheetFromOriginals === "function"&&!window.syncSheetFromOriginals) window.syncSheetFromOriginals = syncSheetFromOriginals;
+if (typeof updateSendBtnState === "function"   && !window.updateSendBtnState)   window.updateSendBtnState = updateSendBtnState;
+if (typeof isIOSVersionBelow16 === "function"  && !window.isIOSVersionBelow16)  window.isIOSVersionBelow16 = isIOSVersionBelow16;
+if (typeof smoothBehavior === "function"       && !window.smoothBehavior)       window.smoothBehavior = smoothBehavior;

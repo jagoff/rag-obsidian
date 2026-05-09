@@ -15,19 +15,17 @@ from pathlib import Path
 
 from rag._constants import _GOOGLE_TOKEN_PATH
 from rag.plists._legacy import (
-    _consolidate_plist,
     _daemon_watchdog_plist,
-    _ingest_cross_source_plist,
-    _ingest_whatsapp_plist,
-    _maintenance_plist,
     _mood_poll_plist,
     _spotify_poll_plist,
-    _vault_cleanup_plist,
-    _wa_fast_plist,
     _wake_hook_plist,
     _wake_up_plist,
 )
 from rag.plists.briefs import _digest_plist, _morning_plist, _today_plist
+from rag.plists.ingest import (
+    _ingest_cross_source_plist,
+    _ingest_whatsapp_plist,
+)
 from rag.plists.learning import (
     _auto_harvest_plist,
     _calibration_plist,
@@ -35,6 +33,11 @@ from rag.plists.learning import (
     _online_tune_plist,
     _routing_rules_plist,
     _whisper_vocab_plist,
+)
+from rag.plists.maintenance import (
+    _consolidate_plist,
+    _maintenance_plist,
+    _vault_cleanup_plist,
 )
 from rag.plists.persistent import _watch_plist, _web_plist
 from rag.plists.proactive import (
@@ -46,6 +49,7 @@ from rag.plists.proactive import (
     _emergent_plist,
     _patterns_plist,
 )
+from rag.plists.wa import _wa_fast_plist
 
 __all__ = [
     "_DEPRECATED_LABELS",

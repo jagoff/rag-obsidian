@@ -56,6 +56,15 @@ from rag.plists.learning import (  # noqa: F401
     _routing_rules_plist,
     _whisper_vocab_plist,
 )
+from rag.plists.ingest import (  # noqa: F401
+    _ingest_cross_source_plist,
+    _ingest_whatsapp_plist,
+)
+from rag.plists.maintenance import (  # noqa: F401
+    _consolidate_plist,
+    _maintenance_plist,
+    _vault_cleanup_plist,
+)
 from rag.plists.persistent import _watch_plist, _web_plist  # noqa: F401
 from rag.plists.proactive import (  # noqa: F401
     _active_learning_nudge_plist,
@@ -66,18 +75,13 @@ from rag.plists.proactive import (  # noqa: F401
     _emergent_plist,
     _patterns_plist,
 )
+from rag.plists.wa import _wa_fast_plist  # noqa: F401
 
-# Factories TEMPORALMENTE en _legacy.py (se splittean en commits 3-4)
+# Factories TEMPORALMENTE en _legacy.py (se splittean en commit 4)
 from rag.plists._legacy import (  # noqa: F401
-    _consolidate_plist,
     _daemon_watchdog_plist,
-    _ingest_cross_source_plist,
-    _ingest_whatsapp_plist,
-    _maintenance_plist,
     _mood_poll_plist,
     _spotify_poll_plist,
-    _vault_cleanup_plist,
-    _wa_fast_plist,
     _wake_hook_plist,
     _wake_up_plist,
 )

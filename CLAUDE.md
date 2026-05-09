@@ -48,6 +48,23 @@ Python 3.13, `uv`. Runtime venv: `.venv/bin/python`. Global tool: `~/.local/shar
 | Cómo funciona end-to-end | [`docs/como-funciona.md`](docs/como-funciona.md) |
 | Recovery + problemas | [`docs/recovery.md`](docs/recovery.md), [`docs/problemas-comunes.md`](docs/problemas-comunes.md) |
 
+## MLX-first (regla invariable)
+
+**Todo el sistema es [MLX](https://github.com/ml-explore/mlx) first.** Al evaluar incorporar o modificar cualquier componente que toque inferencia / embedding / STT / VLM / NLI / reranking / tool-calling, la opción MLX-nativa es default y requisito; alternativas non-MLX (PyTorch / `sentence-transformers` / `faster-whisper` / Ollama / CrossEncoder / etc.) solo se aceptan como:
+
+1. **Rollback path explícito** detrás de env var (ej. `RAG_EMBED_BACKEND=pytorch`, `RAG_NLI_BACKEND=mdeberta`) cuando MLX tiene un bug abierto reproducible.
+2. **Path opt-in NO-MLX-compat por design** documentado (ej. `gliner` NER → CPU only, gated por `RAG_EXTRACT_ENTITIES`).
+3. **Dependency externa de un MCP / integración no-RAG** que el user usa por separado (ej. daemon Ollama corriendo para `mem-vault` u otros agentes — no para obsidian-rag).
+
+**Antes de agregar una dep nueva** (modelo, librería de inferencia, runtime), validar:
+- ¿Hay versión [`mlx-community/...`](https://huggingface.co/mlx-community) del modelo? Si sí → usar esa.
+- ¿Hay equivalente MLX de la librería ([`mlx-lm`](https://github.com/ml-explore/mlx-lm), [`mlx-whisper`](https://github.com/ml-explore/mlx-examples/tree/main/whisper), [`mlx-vlm`](https://github.com/Blaizzy/mlx-vlm), [`mlx-embeddings`](https://github.com/Blaizzy/mlx-embeddings))? Si sí → priorizar esa.
+- Si NO hay MLX viable → flaggearlo en el plan (no asumir que está OK), proponer fallback con env-var de rollback al path MLX, y documentar en el commit por qué se aceptó la excepción.
+
+**Antes de modificar un path runtime existente** (chat, embed, rerank, STT, NLI), confirmar que el cambio respeta el branch MLX como primary y deja el branch non-MLX (si existe) solo como rollback. NO regresar default a non-MLX. NO introducir dep `ollama>=0.x` ni similares.
+
+Olas 1-10 (2026-04 → 2026-05-07) ya completaron la migración; esta regla protege que no se erosione hacia atrás. Detalle de la migración debajo.
+
 ## MLX migration (Ola 10 — 100% MLX, hot-path completo — 2026-05-07)
 
 **Estado actual: 100% MLX en todos los paths runtime — embedder + reranker MLX opt-in + STT + NLI**. Migración completada en 10 olas escalonadas (Olas 1-8: chat / embed / purga ollama, **Ola 9 (2026-05-06)**: embedder PyTorch → MLX, **Ola 10 (2026-05-07)**: STT [`faster-whisper`](https://github.com/SYSTRAN/faster-whisper) → [`mlx-whisper`](https://github.com/ml-explore/mlx-examples/tree/main/whisper) + NLI [`mDeBERTa`](https://huggingface.co/MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7) → LLM-as-judge ([`qwen2.5:3b`](https://huggingface.co/mlx-community/Qwen2.5-3B-Instruct-4bit) helper) + bug #4 fix iteration truncada en `_run_index`). Default `RAG_LLM_BACKEND=mlx`, `RAG_EMBED_BACKEND=mlx`, `RAG_NLI_BACKEND=llm`. Detalle completo en [`docs/mlx-migration.md`](docs/mlx-migration.md).

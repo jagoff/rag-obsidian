@@ -3772,6 +3772,92 @@ class MailSendRequest(BaseModel):
     proposal_id: str | None = None  # for audit — id of the draft the UI confirmed
 
 
+class MailSummaryRequest(BaseModel):
+    """Body para POST /api/mail/summary — Game Changer GC3.3 (2026-05-09)."""
+    query: str = ""           # Gmail search query (ej. "from:juan", "subject:reunión")
+    max_items: int = 10        # cap del fetch
+    days_back: int = 7         # ventana temporal default 7d
+
+
+@app.post("/api/mail/summary")
+def mail_summary(req: MailSummaryRequest) -> dict:
+    """Fetch + LLM-summarize de mails matching `query` en los últimos N días.
+
+    Game Changer GC3.3 (2026-05-09): tool nueva del Mac CLI universal por
+    WhatsApp. El user dice "resumime mails de juan última semana" → bot
+    fetcha + resume + responde.
+
+    Read-only sobre Gmail (no manda nada). Sin auth — read paths abiertos
+    por design (CLAUDE.md). Rate-limit estándar de chat bucket.
+    """
+    try:
+        from rag.integrations.gmail import _gmail_service
+        from rag import _gmail_thread_last_meta, _summary_client, HELPER_MODEL, HELPER_OPTIONS, LLM_KEEP_ALIVE
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"gmail integration unavailable: {e}") from e
+
+    svc = _gmail_service()
+    if svc is None:
+        raise HTTPException(status_code=503, detail="Gmail no autenticado (falta ~/.gmail-mcp/credentials.json o token caducado)")
+
+    # Build query — combinar el filtro user con time window.
+    days = max(1, min(int(req.days_back), 30))
+    user_q = (req.query or "").strip()
+    full_q = f"in:inbox newer_than:{days}d"
+    if user_q:
+        full_q = f"({user_q}) {full_q}"
+
+    try:
+        r = svc.users().threads().list(
+            userId="me", q=full_q, maxResults=max(1, min(int(req.max_items), 30)),
+        ).execute()
+        threads = r.get("threads", []) or []
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"gmail API failed: {str(e)[:200]}") from e
+
+    items: list[dict] = []
+    for th in threads:
+        meta = _gmail_thread_last_meta(svc, th.get("id") or "")
+        if meta:
+            items.append({
+                "subject": meta["subject"],
+                "from": meta["from"],
+                "snippet": meta["snippet"],
+                "thread_id": th.get("id"),
+            })
+
+    if not items:
+        return {"summary": "No encontré mails que matcheen.", "count": 0, "items": []}
+
+    # LLM summary — bullets cortos, español rioplatense.
+    prompt = (
+        "Sos un asistente argentino. Resumí estos mails en español rioplatense "
+        "(voseo). Bullets cortos, máx 1 línea por mail. Indicá remitente y "
+        "tema clave. Si hay algo que requiere acción del user, marcalo con ⚠️.\n\n"
+    )
+    mails_block = "\n".join(
+        f"- De: {it['from']} | Asunto: {it['subject']} | Snippet: {it['snippet']}"
+        for it in items
+    )
+    try:
+        resp = _summary_client().chat(
+            model=HELPER_MODEL,
+            messages=[{"role": "user", "content": prompt + mails_block}],
+            options={**HELPER_OPTIONS, "num_predict": 600, "num_ctx": 4096},
+            keep_alive=LLM_KEEP_ALIVE,
+        )
+        summary = (resp.message.content or "").strip()
+    except Exception as e:
+        summary = f"(no se pudo resumir, mails crudos abajo)\n{mails_block[:1000]}"
+
+    return {
+        "summary": summary,
+        "count": len(items),
+        "query": full_q,
+        "items": items[:10],
+    }
+
+
 @app.post("/api/mail/send")
 def mail_send(req: MailSendRequest, request: Request) -> dict:
     """Execute a Gmail send after the user clicked [Enviar] on a

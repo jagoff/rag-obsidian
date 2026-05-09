@@ -1,6 +1,6 @@
-"""Launchd plist factories — sub-paquete post-split 2026-05-09.
+"""Launchd plist factories — sub-paquete post-split definitivo 2026-05-09.
 
-Layout por dominio (target post-Fase 3):
+Layout por dominio (post-Fase 3, todas las factories en su módulo final):
 
   persistent.py    → _watch_plist + _web_plist (KeepAlive=true, hot path)
   briefs.py        → _digest_plist + _morning_plist + _today_plist
@@ -16,11 +16,6 @@ Layout por dominio (target post-Fase 3):
   _render.py       → _render_plist + helpers + constantes + _repo_root()
   _spec.py         → _services_spec + _services_spec_manual + gates +
                       _DEPRECATED_LABELS + _INSTALL_GATES
-
-Estado actual (post-commit-1, bootstrap):
-  - persistent.py + briefs.py ya viven en su sub-módulo final.
-  - proactive / learning / maintenance / ingest / wa / poll / control
-    siguen TEMPORALMENTE en `_legacy.py` — se splittean en commits 2-4.
 
 Back-compat: `from rag.plists import *` re-exporta los 38 nombres del
 `__all__` original (el viejo `rag/plists.py` pre-split). `rag._watch_plist`,
@@ -42,11 +37,20 @@ from rag.plists._render import (  # noqa: F401
     _repo_root,
 )
 
-# Factories ya migradas a sub-módulos finales
+# Factories por dominio (orden alfabético post-helpers)
 from rag.plists.briefs import (  # noqa: F401
     _digest_plist,
     _morning_plist,
     _today_plist,
+)
+from rag.plists.control import (  # noqa: F401
+    _daemon_watchdog_plist,
+    _wake_hook_plist,
+    _wake_up_plist,
+)
+from rag.plists.ingest import (  # noqa: F401
+    _ingest_cross_source_plist,
+    _ingest_whatsapp_plist,
 )
 from rag.plists.learning import (  # noqa: F401
     _auto_harvest_plist,
@@ -56,16 +60,16 @@ from rag.plists.learning import (  # noqa: F401
     _routing_rules_plist,
     _whisper_vocab_plist,
 )
-from rag.plists.ingest import (  # noqa: F401
-    _ingest_cross_source_plist,
-    _ingest_whatsapp_plist,
-)
 from rag.plists.maintenance import (  # noqa: F401
     _consolidate_plist,
     _maintenance_plist,
     _vault_cleanup_plist,
 )
 from rag.plists.persistent import _watch_plist, _web_plist  # noqa: F401
+from rag.plists.poll import (  # noqa: F401
+    _mood_poll_plist,
+    _spotify_poll_plist,
+)
 from rag.plists.proactive import (  # noqa: F401
     _active_learning_nudge_plist,
     _anticipate_plist,
@@ -76,15 +80,6 @@ from rag.plists.proactive import (  # noqa: F401
     _patterns_plist,
 )
 from rag.plists.wa import _wa_fast_plist  # noqa: F401
-
-# Factories TEMPORALMENTE en _legacy.py (se splittean en commit 4)
-from rag.plists._legacy import (  # noqa: F401
-    _daemon_watchdog_plist,
-    _mood_poll_plist,
-    _spotify_poll_plist,
-    _wake_hook_plist,
-    _wake_up_plist,
-)
 
 # Spec orquestación + gates + deprecated
 from rag.plists._spec import (  # noqa: F401

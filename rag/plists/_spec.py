@@ -14,14 +14,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from rag._constants import _GOOGLE_TOKEN_PATH
-from rag.plists._legacy import (
+from rag.plists.briefs import _digest_plist, _morning_plist, _today_plist
+from rag.plists.control import (
     _daemon_watchdog_plist,
-    _mood_poll_plist,
-    _spotify_poll_plist,
     _wake_hook_plist,
     _wake_up_plist,
 )
-from rag.plists.briefs import _digest_plist, _morning_plist, _today_plist
 from rag.plists.ingest import (
     _ingest_cross_source_plist,
     _ingest_whatsapp_plist,
@@ -40,6 +38,10 @@ from rag.plists.maintenance import (
     _vault_cleanup_plist,
 )
 from rag.plists.persistent import _watch_plist, _web_plist
+from rag.plists.poll import (
+    _mood_poll_plist,
+    _spotify_poll_plist,
+)
 from rag.plists.proactive import (
     _active_learning_nudge_plist,
     _anticipate_plist,

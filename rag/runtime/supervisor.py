@@ -139,6 +139,41 @@ _STARTED_AT = time.time()
 _SHUTDOWN_REQUESTED = threading.Event()
 
 
+def _trigger_mlx_warmup() -> None:
+    """Pre-load MLX models al startup del supervisor (F2.2).
+
+    Reusa ``rag.warmup_async()`` — la misma función que el CLI usa cuando
+    ``RAG_NO_WARMUP=0``. Carga 5 targets en threads paralelos (~5s pico):
+    reranker MPS, in-process embedder, corpus BM25 + pagerank, chat
+    qwen2.5:7b warmup, helper qwen2.5:3b.
+
+    Beneficio post-F2: cualquier job in-process (drift_watcher hoy, los
+    F3 jobs después) que necesite LLM/embed/rerank lo tiene caché en
+    process. Hot-path queries del web NO se benefician (proceso aparte).
+
+    Opt-out: ``RAG_SUPERVISOR_MLX_WARMUP=0`` en el plist para arranque
+    rápido sin warmup (útil si el supervisor solo corre subprocess
+    jobs, F2.1 actual). Default ON desde F2.2.
+    """
+    import os  # noqa: PLC0415
+
+    if os.environ.get("RAG_SUPERVISOR_MLX_WARMUP", "1") != "1":
+        logger.info("supervisor: MLX warmup OFF (RAG_SUPERVISOR_MLX_WARMUP=0)")
+        return
+
+    try:
+        from rag import warmup_async  # noqa: PLC0415
+    except ImportError as exc:
+        logger.warning("supervisor: warmup_async no importable: %s", exc)
+        return
+
+    try:
+        warmup_async()
+        logger.info("supervisor: MLX warmup dispatched (paralelo, ~5s pico)")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("supervisor: warmup_async raised: %s", exc)
+
+
 class Supervisor:
     """Orquestador principal. Tests pueden instanciar y controlar el
     lifecycle manualmente."""
@@ -169,6 +204,11 @@ class Supervisor:
         self._ipc_thread.start()
 
         Scheduler.global_instance().start()
+
+        # MLX warmup async (F2.2) — paraleliza con el resto del startup
+        # para no bloquear. Si fallan los modelos, el supervisor sigue
+        # funcionando para subprocess jobs (F2.1 path).
+        _trigger_mlx_warmup()
 
         logger.info(
             "supervisor: started — %d jobs, ipc=%s",

@@ -1,0 +1,185 @@
+"""Tests F2 — nightly batch jobs migrados al supervisor.
+
+Cubren:
+- Los 6 jobs se registran al import.
+- Cada job tiene el cron schedule esperado (matchea el plist viejo).
+- ``_run_subprocess`` captura stdout/stderr en formato esperable por
+  ``rag_supervisor_jobs.signals``.
+- ``implicit_feedback`` corre los 3 sub-jobs en serie con worst exit_code.
+- Timeout config (online_tune más generoso que default).
+
+NO testeamos la invocación real del binario ``rag`` — eso es shadow A/B
+en producción. Acá solo validamos el wiring + el wrapper subprocess.
+"""
+from __future__ import annotations
+
+import sys
+
+import pytest
+
+from rag.runtime.scheduler import Scheduler
+
+
+@pytest.fixture(autouse=True)
+def _reset():
+    Scheduler.reset_global()
+    sys.modules.pop("rag.runtime.jobs.nightly", None)
+    yield
+    Scheduler.reset_global()
+    sys.modules.pop("rag.runtime.jobs.nightly", None)
+
+
+def _import_nightly():
+    import rag.runtime.jobs.nightly as mod
+    return mod
+
+
+def test_six_jobs_registered():
+    _import_nightly()
+    sched = Scheduler.global_instance()
+    expected = {
+        "auto_harvest",
+        "whisper_vocab",
+        "implicit_feedback",
+        "online_tune",
+        "maintenance",
+        "calibrate",
+    }
+    actual = set(sched.jobs())
+    assert expected.issubset(actual), (
+        f"missing jobs: {expected - actual}"
+    )
+
+
+def test_schedules_match_plists():
+    """Cada job tiene cron schedule equivalente al plist viejo."""
+    _import_nightly()
+    sched = Scheduler.global_instance()
+    expected_schedules = {
+        "auto_harvest": {"hour": 3, "minute": 0},
+        "whisper_vocab": {"hour": 3, "minute": 15},
+        "implicit_feedback": {"hour": 3, "minute": 25},
+        "online_tune": {"hour": 3, "minute": 30},
+        "maintenance": {"hour": 4, "minute": 0},
+        "calibrate": {"hour": 5, "minute": 0},
+    }
+    for label, expected_args in expected_schedules.items():
+        job = sched.get_job(label)
+        assert job is not None, f"job {label} no registrado"
+        assert job.trigger_kind == "cron"
+        for k, v in expected_args.items():
+            assert job.trigger_args.get(k) == v, (
+                f"{label}: trigger_args[{k}]={job.trigger_args.get(k)} "
+                f"esperado {v}"
+            )
+
+
+def test_run_subprocess_captures_signals(monkeypatch):
+    """``_run_subprocess`` retorna dict con stdout_lines/stderr_lines."""
+    mod = _import_nightly()
+    import subprocess as sp
+
+    class _Result:
+        def __init__(self):
+            self.returncode = 0
+            self.stdout = "line1\nline2\nline3\n"
+            self.stderr = ""
+
+    monkeypatch.setattr(sp, "run", lambda *a, **kw: _Result())
+    out = mod._run_subprocess(["echo", "test"])
+    assert out["exit_code"] == 0
+    assert out["stdout_lines"] == 3
+    assert out["stderr_lines"] == 0
+    assert out["last_stderr"] is None
+
+
+def test_run_subprocess_captures_failure(monkeypatch):
+    mod = _import_nightly()
+    import subprocess as sp
+
+    class _Result:
+        def __init__(self):
+            self.returncode = 2
+            self.stdout = ""
+            self.stderr = "Error: db locked\nstack...\nfinal: aborted\n"
+
+    monkeypatch.setattr(sp, "run", lambda *a, **kw: _Result())
+    out = mod._run_subprocess(["false"])
+    assert out["exit_code"] == 2
+    assert out["last_stderr"] is not None
+    assert "aborted" in out["last_stderr"]
+
+
+def test_run_subprocess_handles_timeout(monkeypatch):
+    mod = _import_nightly()
+    import subprocess as sp
+
+    def _raise_timeout(*args, **kwargs):
+        raise sp.TimeoutExpired(cmd=args[0], timeout=10)
+
+    monkeypatch.setattr(sp, "run", _raise_timeout)
+    out = mod._run_subprocess(["sleep", "999"], timeout=10)
+    assert out["exit_code"] == -1
+    assert "timeout" in (out["last_stderr"] or "")
+
+
+def test_implicit_feedback_runs_three_subs_in_series(monkeypatch):
+    mod = _import_nightly()
+    calls = []
+
+    def _fake_run(args, *, timeout=None, extra_env=None):
+        calls.append(list(args))
+        return {
+            "exit_code": 0,
+            "stdout_lines": 1,
+            "stderr_lines": 0,
+            "last_stderr": None,
+        }
+
+    monkeypatch.setattr(mod, "_run_subprocess", _fake_run)
+    result = mod.implicit_feedback_job()
+    # Debería haber llamado 3 veces (infer-implicit, detect-requery, classify-sessions).
+    assert len(calls) == 3
+    subs = [c[2] for c in calls]  # rag_bin, "feedback", <sub>
+    assert subs == ["infer-implicit", "detect-requery", "classify-sessions"]
+    assert result["exit_code"] == 0
+    assert result["n_subs_ok"] == 3
+
+
+def test_implicit_feedback_worst_exit_propagates(monkeypatch):
+    mod = _import_nightly()
+    n = {"i": 0}
+
+    def _fake_run(args, *, timeout=None, extra_env=None):
+        n["i"] += 1
+        return {
+            "exit_code": 0 if n["i"] != 2 else 5,
+            "stdout_lines": 0,
+            "stderr_lines": 0,
+            "last_stderr": None,
+        }
+
+    monkeypatch.setattr(mod, "_run_subprocess", _fake_run)
+    result = mod.implicit_feedback_job()
+    # 3 subs corrieron igual aunque el 2do falló — los 3 son idempotentes.
+    assert n["i"] == 3
+    assert result["exit_code"] == 5
+    assert result["n_subs_ok"] == 2
+
+
+def test_online_tune_uses_extended_timeout(monkeypatch):
+    mod = _import_nightly()
+    captured = {}
+
+    def _fake_run(args, *, timeout=None, extra_env=None):
+        captured["timeout"] = timeout
+        captured["args"] = args
+        return {"exit_code": 0, "stdout_lines": 0, "stderr_lines": 0,
+                "last_stderr": None}
+
+    monkeypatch.setattr(mod, "_run_subprocess", _fake_run)
+    mod.online_tune_job()
+    # online-tune tarda 24min warm en M-chip, le dimos 45min de timeout.
+    assert captured["timeout"] == 2700
+    assert "tune" in captured["args"]
+    assert "--online" in captured["args"]

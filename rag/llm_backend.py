@@ -77,13 +77,17 @@ MLX_MODEL_ALIAS: dict[str, str] = {
     "qwen2.5:3b": "mlx-community/Qwen2.5-3B-Instruct-4bit",
     # Chat default
     "qwen2.5:7b": "mlx-community/Qwen2.5-7B-Instruct-4bit",
-    # High-quality tier (contradictions, brief JSON, `rag do`, HyDE re-test)
-    "command-r:latest": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
-    "command-r": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
-    "qwen2.5:14b": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
-    "qwen3:30b-a3b": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
-    # Experimental (A/B vs the 3B helper, NOT default until eval CIs OK)
-    "qwen3:4b": "mlx-community/Qwen3-4B-Instruct-2507-4bit",
+    # High-quality tier (contradictions, brief JSON, `rag do`, HyDE re-test).
+    # DWQ (Dynamic Weight Quantization) recupera ~1-2pp de calidad vs 4bit
+    # estándar al mismo costo de memoria/latencia. Rollback: cambiar suffix
+    # `-DWQ` por `` (vacío) para volver al 4bit estándar.
+    "command-r:latest": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit-DWQ",
+    "command-r": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit-DWQ",
+    "qwen2.5:14b": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit-DWQ",
+    "qwen3:30b-a3b": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit-DWQ",
+    # Experimental (A/B vs the 3B helper, NOT default until eval CIs OK).
+    # DWQ-2510 = revision Oct 2025 con mejor recall en tasks JSON-structured.
+    "qwen3:4b": "mlx-community/Qwen3-4B-Instruct-2507-4bit-DWQ-2510",
     # Embedder — active path is MLX in-process via MLXEmbedder
     # (`rag.mlx_embed`). 8-bit quant elegida porque cosine ≥0.9977 vs
     # PyTorch fp16 reference (~bit-equivalente, NO requiere reindex);
@@ -331,6 +335,7 @@ class MLXBackend(LLMBackend):
     _BIG_MODELS = frozenset(
         {
             "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
+            "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit-DWQ",
         }
     )
 

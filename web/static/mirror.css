@@ -1,0 +1,277 @@
+/* Personal Mirror — terminal-OS-personal aesthetic.
+   Dark mode only. Monospace primary. Generous spacing. */
+
+:root {
+  --bg: #0a0a0a;
+  --bg-card: #131313;
+  --bg-card-hover: #181818;
+  --border: #222;
+  --border-soft: #1a1a1a;
+  --text: #e8e8e8;
+  --text-dim: #888;
+  --text-muted: #555;
+  --accent: #5fb3a1;
+  --accent-warm: #d9a866;
+  --accent-cool: #6c9bd1;
+  --bad: #d96666;
+  --good: #5fb3a1;
+  --neutral: #999;
+  --font-mono: "SF Mono", "JetBrains Mono", "Fira Code", Menlo, monospace;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.55;
+  min-height: 100vh;
+}
+
+body {
+  padding: env(safe-area-inset-top) env(safe-area-inset-right)
+           env(safe-area-inset-bottom) env(safe-area-inset-left);
+}
+
+#app {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 24px 16px 64px;
+}
+
+#app.loading main { opacity: 0.4; pointer-events: none; }
+
+/* ── header ──────────────────────────────────────────── */
+
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 10px;
+  margin-bottom: 24px;
+}
+
+header .title {
+  font-size: 18px;
+  font-weight: 600;
+}
+header .hash { color: var(--text-muted); margin-right: 4px; }
+header .dot { color: var(--text-muted); margin: 0 6px; }
+header #user-name { color: var(--accent); }
+header #header-date { color: var(--text-dim); font-weight: 400; }
+
+header .meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+header #refresh-btn {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  padding: 4px 10px;
+  cursor: pointer;
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+header #refresh-btn:hover { background: var(--bg-card-hover); color: var(--text); }
+header #refresh-btn.spinning { animation: spin 1s linear infinite; }
+@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
+#cache-indicator.cached { color: var(--accent-cool); }
+#cache-indicator.fresh { color: var(--good); }
+#cache-indicator.stale { color: var(--accent-warm); }
+
+/* ── blocks ─────────────────────────────────────────── */
+
+.block {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-bottom: 12px;
+  padding: 16px 18px;
+  transition: border-color 0.2s;
+}
+.block:hover { border-color: #2a2a2a; }
+
+.block h2 {
+  margin: 0 0 12px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  border-left: 2px solid var(--accent);
+  padding-left: 10px;
+}
+
+.block .content {
+  color: var(--text);
+}
+
+.empty {
+  color: var(--text-muted);
+  font-style: italic;
+  padding: 8px 0;
+}
+
+/* ── tables ─────────────────────────────────────────── */
+
+.row {
+  display: flex;
+  justify-content: space-between;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border-soft);
+  gap: 12px;
+}
+.row:last-child { border-bottom: none; }
+.row .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row .meta { color: var(--text-dim); font-size: 11px; flex-shrink: 0; }
+.row .badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-size: 10px;
+  color: var(--text-dim);
+  margin-left: 6px;
+}
+
+/* ── mood block ─────────────────────────────────────── */
+
+#mood .score-line {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  font-size: 28px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+#mood .score-line .score-value { font-variant-numeric: tabular-nums; }
+#mood .score-line .score-label {
+  font-size: 12px;
+  color: var(--text-dim);
+  font-weight: 400;
+}
+#mood .score-pos { color: var(--good); }
+#mood .score-neg { color: var(--bad); }
+#mood .score-zero { color: var(--neutral); }
+
+#mood .sources { color: var(--text-dim); font-size: 11px; }
+
+/* ── timeline sparkline ──────────────────────────────── */
+
+.sparkline {
+  font-family: var(--font-mono);
+  font-size: 16px;
+  letter-spacing: 0;
+  line-height: 1;
+  color: var(--accent);
+  white-space: pre;
+  user-select: none;
+}
+.sparkline-meta {
+  color: var(--text-dim);
+  font-size: 11px;
+  margin-top: 4px;
+  display: flex;
+  justify-content: space-between;
+}
+
+/* ── insights ────────────────────────────────────────── */
+
+#insights .insight {
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border-soft);
+  position: relative;
+  padding-left: 16px;
+}
+#insights .insight::before {
+  content: "·";
+  color: var(--accent);
+  position: absolute;
+  left: 4px;
+  top: 8px;
+  font-weight: 700;
+}
+#insights .insight:last-child { border-bottom: none; }
+
+.insights-loading {
+  color: var(--text-muted);
+  padding: 20px 8px;
+}
+.dots {
+  display: inline-block;
+  margin-right: 8px;
+}
+.dots span {
+  display: inline-block;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  margin: 0 1px;
+  animation: blink 1.4s infinite both;
+}
+.dots span:nth-child(2) { animation-delay: 0.2s; }
+.dots span:nth-child(3) { animation-delay: 0.4s; }
+@keyframes blink {
+  0%, 80%, 100% { opacity: 0.2; }
+  40% { opacity: 1; }
+}
+
+/* ── observations stats ──────────────────────────────── */
+
+.stats .content {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 16px;
+}
+.stats .stat {
+  display: flex;
+  flex-direction: column;
+}
+.stats .stat .num {
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.stats .stat .lbl {
+  font-size: 10px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-top: 2px;
+}
+
+/* ── footer ──────────────────────────────────────────── */
+
+footer {
+  margin-top: 32px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-soft);
+  font-size: 10px;
+  color: var(--text-muted);
+  display: flex;
+  justify-content: space-between;
+}
+
+/* ── responsive ─────────────────────────────────────── */
+
+@media (max-width: 560px) {
+  body { font-size: 12px; }
+  #app { padding: 16px 10px 48px; }
+  header .title { font-size: 16px; }
+  .block { padding: 14px 12px; }
+  .stats .content { grid-template-columns: repeat(2, 1fr); }
+}

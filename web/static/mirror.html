@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#0a0a0a" />
+  <title>Mirror · obsidian-rag</title>
+  <link rel="stylesheet" href="/static/mirror.css" />
+</head>
+<body>
+  <div id="app" class="loading">
+    <header>
+      <div class="title">
+        <span class="hash">#</span>
+        <span id="user-name">Fer</span>
+        <span class="dot">·</span>
+        <span id="header-date">—</span>
+      </div>
+      <div class="meta">
+        <button id="refresh-btn" title="Refresh">↻</button>
+        <span id="cache-indicator">—</span>
+      </div>
+    </header>
+
+    <main>
+      <section id="active_projects" class="block">
+        <h2>En qué estás metido</h2>
+        <div class="content"></div>
+      </section>
+
+      <section id="top_entities" class="block">
+        <h2>Quién está en tu cabeza</h2>
+        <div class="content"></div>
+      </section>
+
+      <section id="mood" class="block">
+        <h2>Cómo estás</h2>
+        <div class="content"></div>
+      </section>
+
+      <section id="pendientes" class="block">
+        <h2>Tiene que pasar</h2>
+        <div class="content"></div>
+      </section>
+
+      <section id="insights" class="block">
+        <h2>Lo que el sistema notó por vos</h2>
+        <div class="content insights-loading">
+          <div class="loading-text">
+            <span class="dots"><span></span><span></span><span></span></span>
+            generando insights …
+          </div>
+        </div>
+      </section>
+
+      <section id="mood_timeline" class="block">
+        <h2>Timeline emocional · 30d</h2>
+        <div class="content"></div>
+      </section>
+
+      <section id="dormant_notes" class="block">
+        <h2>Memoria · para no olvidar</h2>
+        <div class="content"></div>
+      </section>
+
+      <section id="spotify_top" class="block">
+        <h2>Banda sonora</h2>
+        <div class="content"></div>
+      </section>
+
+      <section id="observations" class="block stats">
+        <h2>El sistema en números</h2>
+        <div class="content"></div>
+      </section>
+    </main>
+
+    <footer>
+      <span id="status-text">cargando …</span>
+    </footer>
+  </div>
+
+  <script type="module" src="/static/mirror.js"></script>
+</body>
+</html>

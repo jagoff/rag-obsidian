@@ -52434,17 +52434,30 @@ def _sql_rotate_log_tables(*, dry_run: bool = False,
             out["vacuum_ran"] = True
             out["vacuum_after_bytes"] = new_bytes
             # Persist sentinel so we don't VACUUM again until another delta.
+            # Bug Hunt 2026-05-08 M Tel 6: en autocommit (`isolation_level=None`),
+            # cada INSERT auto-commitea individualmente. Si el proceso muere
+            # entre los dos INSERTs, queda solo uno escrito y el próximo
+            # rotate puede VACUUM prematuramente. Switch a transacción
+            # explícita (BEGIN/COMMIT) para que ambos INSERT sean atómicos.
             if "rag_feedback_golden_meta" in existing:
                 now_iso = _dt.fromtimestamp(now).isoformat(timespec="seconds")
-                conn.execute(
-                    "INSERT OR REPLACE INTO rag_feedback_golden_meta (k, v) VALUES (?, ?)",
-                    (_VACUUM_META_KEY_BYTES, str(new_bytes)),
-                )
-                conn.execute(
-                    "INSERT OR REPLACE INTO rag_feedback_golden_meta (k, v) VALUES (?, ?)",
-                    (_VACUUM_META_KEY_TS, now_iso),
-                )
-                conn.commit()
+                conn.execute("BEGIN")
+                try:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO rag_feedback_golden_meta (k, v) VALUES (?, ?)",
+                        (_VACUUM_META_KEY_BYTES, str(new_bytes)),
+                    )
+                    conn.execute(
+                        "INSERT OR REPLACE INTO rag_feedback_golden_meta (k, v) VALUES (?, ?)",
+                        (_VACUUM_META_KEY_TS, now_iso),
+                    )
+                    conn.execute("COMMIT")
+                except Exception:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                    raise
         elif should_vacuum and dry_run:
             out["vacuum_ran"] = False
             out["vacuum_would_run"] = True

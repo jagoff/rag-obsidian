@@ -39672,17 +39672,48 @@ def _create_reminder(
     # newline literal y rompía el script, o peor inyectaba un newline
     # estructural que cambiaba la AS evaluación. Mismo orden ya usado en
     # `notes` (línea 35220).
-    safe_name = nm.replace("\\", "\\\\").replace('"', '\\"')
+    #
+    # Bug H-4 (security 2026-05-08): el escapeo backslash+quote NO cubre
+    # newline injection. Un nombre LLM-generado tipo
+    # `foo\nend tell\ndo shell script "rm -rf ~"\ntell application "Reminders"`
+    # cierra el `tell` y mete un `do shell script` arbitrario. Reusamos
+    # `_sanitize_applescript_string` (allowlist `_APPLESCRIPT_SAFE_RE`) que
+    # ya guardia el path de búsqueda de contactos. Si el input trae `\n`,
+    # `\r`, backtick u otros chars peligrosos retorna None → abortamos sin
+    # ejecutar osascript.
+    safe_name = _sanitize_applescript_string(nm)
+    if safe_name is None:
+        _silent_log(
+            "applescript_injection_blocked",
+            {"field": "reminder_name", "value_preview": nm[:40]},
+        )
+        return False, "nombre contiene caracteres no permitidos"
     list_selector = ""
     if list_name:
-        safe_list = list_name.replace("\\", "\\\\").replace('"', '\\"')
+        safe_list = _sanitize_applescript_string(list_name)
+        if safe_list is None:
+            _silent_log(
+                "applescript_injection_blocked",
+                {"field": "reminder_list_name", "value_preview": list_name[:40]},
+            )
+            return False, "list_name contiene caracteres no permitidos"
         list_selector = f' of list "{safe_list}"'
 
     # Build properties block. `name` always goes in the with-properties.
     # `body` too if notes present, since it's cleaner than a follow-up set.
     props = [f'name:"{safe_name}"']
     if notes:
-        safe_notes = notes.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+        # `notes` es free-form multi-línea (URLs, párrafos) — la allowlist del
+        # sanitizer es demasiado restrictiva. Mantenemos escapeo manual pero
+        # neutralizamos `\r`/`\n` (newlines AS estructurales) y filtramos
+        # backtick (defensivo ante `do shell script`).
+        safe_notes = (
+            notes.replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\r", " ")
+            .replace("\n", "\\n")
+            .replace("`", "")
+        )
         props.append(f'body:"{safe_notes}"')
     props_str = ", ".join(props)
 
@@ -58033,6 +58064,9 @@ from rag.cli.config_cli import (  # noqa: E402, F401
     config_cli,
 )
 cli.add_command(config_cli)  # `rag config` (Phase 3 cont)
+
+from rag.cli.ask import ask_cli  # noqa: E402, F401
+cli.add_command(ask_cli)  # `rag ask` (Phase 3 cont)
 
 from rag.cli.daemons_control import (  # noqa: E402, F401
     _all_daemon_labels,

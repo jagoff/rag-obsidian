@@ -91,6 +91,25 @@ header #refresh-btn.spinning { animation: spin 1s linear infinite; }
 #cache-indicator.fresh { color: var(--good); }
 #cache-indicator.stale { color: var(--accent-warm); }
 
+/* ── nav (links a las otras páginas del sistema) ────── */
+
+.mirror-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  padding: 8px 0 16px;
+  margin-bottom: 16px;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 11px;
+}
+.mirror-nav a {
+  color: var(--text-dim);
+  text-decoration: none;
+  letter-spacing: 0.04em;
+  transition: color 0.15s;
+}
+.mirror-nav a:hover { color: var(--accent); }
+
 /* ── blocks ─────────────────────────────────────────── */
 
 .block {

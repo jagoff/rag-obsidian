@@ -15,13 +15,12 @@ Defaults:
 from __future__ import annotations
 
 import os
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
 from rag.query_decompose import (
     DECOMPOSE_CACHE_MAX,
-    RRF_K_DEFAULT,
     cache_size,
     clear_cache,
     decompose_query,
@@ -499,7 +498,6 @@ def test_integration_compara_x_vs_y_dispatches_two_retrieves(monkeypatch):
     No invocamos el `retrieve()` real — mockeamos a nivel de la wire-up
     para verificar el flow.
     """
-    import rag
 
     os.environ["RAG_QUERY_DECOMPOSE"] = "1"
 

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
 
 from rag._tool_output_helpers import (
     _DEFAULT_CAPS,

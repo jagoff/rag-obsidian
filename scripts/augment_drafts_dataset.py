@@ -344,8 +344,8 @@ def main() -> None:
     print(f"  Skipped (ya existían): {n_skipped}", file=sys.stderr)
     if args.reset_synthetic:
         print(f"  Reset previo: {n_reset}", file=sys.stderr)
-    print(f"\nNext: re-correr `uv run --extra finetune python "
-          f"scripts/finetune_drafts.py` con threshold ≥ 100", file=sys.stderr)
+    print("\nNext: re-correr `uv run --extra finetune python "
+          "scripts/finetune_drafts.py` con threshold ≥ 100", file=sys.stderr)
 
 
 if __name__ == "__main__":

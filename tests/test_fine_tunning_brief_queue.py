@@ -2,7 +2,7 @@
 
 import sqlite3
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime
 import pytest
 
 from web.fine_tunning_queries import brief_queue

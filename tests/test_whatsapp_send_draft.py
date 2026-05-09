@@ -1112,7 +1112,6 @@ def test_tool_decision_uses_mlx_chat_via_backend():
     y que el streaming client todavía tiene su budget definido.
     """
     import rag as _rag
-    import web.server as srv
     assert callable(getattr(_rag, "_mlx_chat_via_backend", None)), (
         "rag._mlx_chat_via_backend debe existir y ser callable (tool-decision post-MLX)"
     )

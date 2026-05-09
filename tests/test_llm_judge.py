@@ -1,5 +1,4 @@
 """Tests para rag/llm_judge.py — LLM-as-judge condicional post-rerank."""
-import os
 
 import pytest
 

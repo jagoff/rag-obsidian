@@ -7,7 +7,6 @@ Tests con LLM mockeado — no llaman a ollama real.
 
 from __future__ import annotations
 
-from typing import Any
 
 import pytest
 

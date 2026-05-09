@@ -32,7 +32,6 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import pytest
 
 from rag.integrations import chrome_bookmarks as cb_mod
 

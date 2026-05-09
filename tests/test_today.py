@@ -303,7 +303,7 @@ def test_render_today_prompt_no_extras_backward_compatible():
     """Sin extras, sigue funcionando como antes — 4 secciones obligatorias."""
     prompt = rag._render_today_prompt("2026-04-21", _ev_minimal())
     for h in ("Lo que pasó hoy", "Sin procesar", "Preguntas abiertas", "Para mañana"):
-        assert f"## " in prompt and h in prompt
+        assert "## " in prompt and h in prompt
     # Sin extras, no aparecen los buckets DATA — chequeamos los headers
     # de bucket específicos (no la palabra suelta "Gmail" que aparece en
     # el preámbulo explicativo).

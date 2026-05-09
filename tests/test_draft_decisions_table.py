@@ -9,7 +9,6 @@ están correctos antes de que llegue el primer write desde producción.
 from __future__ import annotations
 
 import sqlite3
-from pathlib import Path
 
 import pytest
 

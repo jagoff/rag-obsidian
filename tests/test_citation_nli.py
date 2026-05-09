@@ -12,9 +12,7 @@ Cubre:
 9. Web wire-up — nli_verified_count / nli_unverified_count en done event (modo off).
 10. Web wire-up — modo mark modifica full + emite nli_correction SSE event.
 """
-import os
 import warnings
-from dataclasses import dataclass
 
 import pytest
 
@@ -96,7 +94,7 @@ class TestSplitSentences:
 
 class TestVerifyAnswerNli:
     def test_verified_sentence_above_threshold(self):
-        from rag.postprocess import verify_answer_nli, VerificationResult
+        from rag.postprocess import verify_answer_nli
 
         # Una sola oración, un solo chunk, score alto
         model = _make_mock_model_3class([0.8], n_pairs=1)
@@ -390,7 +388,6 @@ class TestWebWireupModeOff:
         monkeypatch.delenv("RAG_NLI_MODE", raising=False)
 
         # Importar el helper de SSE para validar el shape de los eventos
-        import json
         from rag.postprocess import _nli_mode
         assert _nli_mode() == "off"
 
@@ -400,7 +397,7 @@ class TestWebWireupModeOff:
         _nli_unverified_count = 0
         _nli_unverified_sentences: list = []
 
-        from rag.postprocess import _nli_mode, verify_answer_nli, apply_nli_mode
+        from rag.postprocess import _nli_mode, verify_answer_nli
 
         _nli_mode_val = _nli_mode()
         full = "Respuesta de prueba."

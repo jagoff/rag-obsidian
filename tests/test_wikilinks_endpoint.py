@@ -163,7 +163,6 @@ def test_http_extracts_real_match(http_client, monkeypatch, tmp_path):
 
     # Stub mínimo del corpus — find_wikilink_suggestions usa _load_corpus()
     # → c["title_to_paths"]. Devolvemos una mock simple.
-    import types
     fake_corpus = {
         "title_to_paths": {
             "Otra nota": {"02-Areas/Otra nota.md"},

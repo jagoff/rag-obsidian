@@ -18,7 +18,6 @@ import threading
 import pytest
 
 from rag import (
-    INDEX_PROCESS_LOCK,
     _index_process_lock,
     _peek_index_lock_holder,
 )

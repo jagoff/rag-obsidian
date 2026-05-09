@@ -320,7 +320,8 @@ class TestBugV2_CalendarYearlyValidator:
 
     def test_propose_calendar_event_accepts_original_query(self):
         """La firma debe aceptar el kwarg para que el wiring funcione."""
-        import inspect, rag
+        import inspect
+        import rag
         sig = inspect.signature(rag.propose_calendar_event)
         assert "_original_query" in sig.parameters
 

@@ -274,7 +274,6 @@ def test_tunnel_literal_regex_rejects_other_cloudflare_slug():
 def test_tunnel_no_state_file_falls_back_to_wildcard(tmp_path, monkeypatch):
     """Sin state file → el server usa wildcard pattern (regex permisivo)
     pero credentials=False — verifica la lógica de fallback."""
-    import web.server as srv
     # Apuntar el state file a un path que no existe
     missing = tmp_path / "no-such-file.txt"
     # La lógica de fallback: la variable _tunnel_credentials debe ser False
@@ -341,7 +340,7 @@ def test_chat_sse_response_has_anti_buffer_headers():
     # Instead, verify at the source-code level that the module builds the
     # StreamingResponse with the expected header dict.
     from web import server as srv
-    import inspect, ast
+    import inspect
 
     src = inspect.getsource(srv.chat)
     # The fix adds a headers dict to the StreamingResponse(guarded(), ...) call.

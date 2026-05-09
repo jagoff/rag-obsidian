@@ -3,7 +3,7 @@ sources se evaporaron, escribiéndolos como notas runbook indexables.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import pytest

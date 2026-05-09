@@ -15,7 +15,6 @@ from __future__ import annotations
 import re
 import sqlite3
 
-import pytest
 
 import rag
 

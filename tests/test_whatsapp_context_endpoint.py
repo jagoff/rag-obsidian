@@ -11,7 +11,6 @@ funciona — el código resuelve el símbolo en cada call.
 """
 from __future__ import annotations
 
-import pytest
 from fastapi.testclient import TestClient
 
 import web.server as _server

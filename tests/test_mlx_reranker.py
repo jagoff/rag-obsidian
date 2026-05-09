@@ -12,7 +12,6 @@ bge-reranker (P near 0.0 or near 1.0; bge-reranker is gentler in the
 """
 from __future__ import annotations
 
-import os
 
 import pytest
 

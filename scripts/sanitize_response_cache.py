@@ -53,7 +53,7 @@ def main():
 
         conn.commit()
 
-    print(f"Sanitización del rag_response_cache:")
+    print("Sanitización del rag_response_cache:")
     print(f"  Entries totales: {n_total}")
     print(f"  Entries modificadas: {n_changed}")
     print(f"  Chars before: {chars_before}")

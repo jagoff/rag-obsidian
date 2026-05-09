@@ -42,7 +42,7 @@ import sqlite3
 import sys
 import urllib.error
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 
 # ── Constants ────────────────────────────────────────────────────────────────

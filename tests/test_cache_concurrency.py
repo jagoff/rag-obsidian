@@ -261,7 +261,6 @@ class _FakeCol:
 def test_corpus_cache_has_rlock():
     """Guard: _corpus_cache_lock must be an RLock (allows recursive acquisition
     from within the same thread, needed for the single-flight pattern)."""
-    import _thread
 
     assert isinstance(rag._corpus_cache_lock, type(threading.RLock()))
 

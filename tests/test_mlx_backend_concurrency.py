@@ -258,7 +258,7 @@ def test_lock_is_reentrant():
     with _patch_mlx_load(fake_load):
         # Llenar el cap _MAX_SMALL_LOADED para que _evict_for haga trabajo real
         for i in range(backend._MAX_SMALL_LOADED + 1):
-            backend._load(f"qwen2.5:3b" if i == 0 else f"unknown-{i}:tag")
+            backend._load("qwen2.5:3b" if i == 0 else f"unknown-{i}:tag")
 
     # Si llegamos acá, no hubo deadlock — fix funciona.
     assert len(backend._loaded) <= backend._MAX_SMALL_LOADED

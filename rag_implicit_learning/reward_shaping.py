@@ -42,7 +42,6 @@ from datetime import datetime
 from typing import Any
 
 from rag_implicit_learning.session_outcome import (
-    SessionAnalysis,
     classify_recent_sessions,
 )
 

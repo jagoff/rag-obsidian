@@ -15,7 +15,7 @@ los tests a ~10 líneas de DDL + INSERTs.
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from scripts.audit_telemetry_health import (
     _audit_feedback_corrective_gap,

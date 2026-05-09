@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import io
 import socket
-import socketserver
 import sys
 import threading
 from contextlib import redirect_stderr

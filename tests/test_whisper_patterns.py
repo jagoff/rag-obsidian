@@ -8,13 +8,11 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from unittest.mock import patch
 
 import pytest
 
 import rag
 from rag_whisper_learning.patterns import (
-    CorrectionPattern,
     _are_similar,
     find_correction_patterns,
 )

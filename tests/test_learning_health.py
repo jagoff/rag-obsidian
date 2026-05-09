@@ -13,11 +13,7 @@ SQLite DB with `_RAG_STATE_PATH` monkeypatched. Subprocess-touching helper
 """
 from __future__ import annotations
 
-import os
-import sqlite3
 import subprocess
-from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 

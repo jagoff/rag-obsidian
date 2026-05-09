@@ -9,7 +9,6 @@ Migrado de rag/plists/_legacy.py en Phase 3 commit 2 (2026-05-09).
 """
 from __future__ import annotations
 
-from pathlib import Path
 
 from rag.plists._render import _logs, _render_plist, _repo_root
 

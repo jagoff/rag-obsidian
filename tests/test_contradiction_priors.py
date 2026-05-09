@@ -20,7 +20,6 @@ import datetime as _dt
 import math
 import sqlite3
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 

@@ -13,7 +13,6 @@ Coverage de los contratos:
   - llm_judge_* desde los campos del dataclass
   - silent-fail ante excepciones (nunca lanza, devuelve {})
 """
-import pytest
 
 from rag import RetrieveResult, retrieve_result_to_log_extras
 

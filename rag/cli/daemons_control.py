@@ -662,17 +662,17 @@ def _doctor_diagnose(row: dict) -> str:
 
     if state == "missing":
         lines.append(
-            f"  Síntoma: plist no bootstrappeado (state=missing).\n"
-            f"  Remediación: `rag daemons reconcile --apply` (si plist en disco) "
-            f"o `rag setup` (si plist faltante)."
+            "  Síntoma: plist no bootstrappeado (state=missing).\n"
+            "  Remediación: `rag daemons reconcile --apply` (si plist en disco) "
+            "o `rag setup` (si plist faltante)."
         )
         return "\n".join(lines)
 
     if label.endswith("ingest-safari") and isinstance(last_exit, int) and last_exit == 1:
         lines.append(
-            f"  Síntoma: exit=1 (database lock conocido de Safari History.db).\n"
-            f"  Remediación: `rag daemons retry ingest-safari` para reintentar; "
-            f"si persiste, ver `~/.local/share/obsidian-rag/ingest-safari.error.log`."
+            "  Síntoma: exit=1 (database lock conocido de Safari History.db).\n"
+            "  Remediación: `rag daemons retry ingest-safari` para reintentar; "
+            "si persiste, ver `~/.local/share/obsidian-rag/ingest-safari.error.log`."
         )
         return "\n".join(lines)
 

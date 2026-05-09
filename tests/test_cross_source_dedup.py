@@ -11,7 +11,6 @@ cross-source con Jaccard >= 0.7 sobre los primeros 600 chars.
 """
 from __future__ import annotations
 
-import pytest
 
 import rag
 

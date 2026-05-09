@@ -28,7 +28,6 @@ sys.path.insert(0, str(ROOT))
 
 from rag import _ragvec_state_conn  # noqa: E402
 from rag.iberian_leak_filter import (  # noqa: E402
-    _IBERIAN_LEAK_REPLACEMENTS,
     replace_iberian_leaks,
 )
 
@@ -140,7 +139,7 @@ def main():
         print("⚠  Palabras pt que SOBREVIVEN al filter (post-fix):")
         for word, cnt in post_leak_count.most_common(10):
             print(f"  {cnt:4d}  {word}")
-        print(f"\n  ↳ Considerá agregar reglas para estas palabras al filter.")
+        print("\n  ↳ Considerá agregar reglas para estas palabras al filter.")
         print()
 
     if args.json:

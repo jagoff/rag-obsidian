@@ -22,7 +22,6 @@ exit-2 path.
 from __future__ import annotations
 
 import io
-import json
 from unittest import mock
 
 import pytest

@@ -215,10 +215,10 @@ def main() -> None:
     print()
     if winner:
         print(f"🏆 GANADOR: {winner}")
-        print(f"\nPara hacer cutover manual, en `rag/mlx_reranker.py`:")
+        print("\nPara hacer cutover manual, en `rag/mlx_reranker.py`:")
         print(f"  DEFAULT_MLX_RERANKER = MLX_RERANKER_ALIASES[\"{winner}\"]")
-        print(f"\nY en `is_mlx_reranker_enabled()` cambiar default `torch` → `mlx`.")
-        print(f"\nNo olvidar bumpear `_FILTER_VERSION` por cache invalidation.")
+        print("\nY en `is_mlx_reranker_enabled()` cambiar default `torch` → `mlx`.")
+        print("\nNo olvidar bumpear `_FILTER_VERSION` por cache invalidation.")
     else:
         print("⚠️  NINGÚN TIER PASA FLOOR.")
         print("\nOpciones:")

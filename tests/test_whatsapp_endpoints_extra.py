@@ -32,7 +32,6 @@ la telemetry.db real.
 """
 from __future__ import annotations
 
-import pytest
 from fastapi.testclient import TestClient
 
 import web.server as _server

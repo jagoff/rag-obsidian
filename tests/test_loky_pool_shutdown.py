@@ -185,7 +185,6 @@ def test_tqdm_lock_preset_at_import_time():
     debe ser un threading lock, NO el `TqdmDefaultWriteLock` con su
     `mp_lock` POSIX.
     """
-    import threading
     import tqdm as _tqdm
     import web.server  # noqa: F401  (force the module-level set_lock)
 

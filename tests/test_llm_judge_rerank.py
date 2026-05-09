@@ -14,7 +14,6 @@ NO se hacen llamadas reales a ollama — todo monkey-patched.
 
 from __future__ import annotations
 
-import os
 from unittest.mock import MagicMock
 
 import pytest

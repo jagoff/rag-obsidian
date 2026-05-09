@@ -88,8 +88,7 @@ import argparse
 import json
 import sqlite3
 import sys
-import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 # Allow running as a script without installing the package.
@@ -261,13 +260,13 @@ def _print_summary(summary: dict) -> None:
     print(f"  count: {summary['count']:,}")
     if not summary["count"]:
         return
-    print(f"  top paths:")
+    print("  top paths:")
     for p, n in summary["top_paths"]:
         print(f"    {n:>6,}  {p[:80]}")
-    print(f"  top queries:")
+    print("  top queries:")
     for q, n in summary["top_queries"]:
         print(f"    {n:>6,}  {q[:80]}")
-    print(f"  sample (10):")
+    print("  sample (10):")
     for s in summary["sample"]:
         print(f"    [{s['ts']}] {s['query'][:60]:<60}  → {s['path'][:50]}")
 
@@ -371,11 +370,11 @@ def main() -> int:
         print(f"[cleanup] rows que sobreviven: {total - delete_count:,}")
 
         if not args.apply:
-            print(f"\n[cleanup] DRY-RUN — re-correr con --apply para ejecutar")
+            print("\n[cleanup] DRY-RUN — re-correr con --apply para ejecutar")
             return 0
 
         if not all_ids:
-            print(f"\n[cleanup] nada para borrar")
+            print("\n[cleanup] nada para borrar")
             return 0
 
         if not args.yes:
@@ -405,7 +404,7 @@ def main() -> int:
         conn.commit()
         print(f"[cleanup] DELETE completo: {deleted:,} rows")
 
-    print(f"[cleanup] done")
+    print("[cleanup] done")
     return 0
 
 

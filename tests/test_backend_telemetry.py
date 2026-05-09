@@ -8,7 +8,6 @@ de fallback ollama->mlx siguen midiendo el ContextVar manualmente
 schema operativo (telemetría histórica + futuras versiones de backend).
 """
 import json
-import os
 
 import pytest
 

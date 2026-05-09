@@ -233,4 +233,11 @@ src = ["rag", "mcp_server.py", "web", "scripts"]
 # F821: undefined-name — two string-quoted forward references ("sqlite3.Connection",
 #       "OrderedDict") that resolve at runtime via local imports; ruff can't see
 #       through the quoted annotations.
-extend-ignore = ["E402", "E701", "E702", "E731", "E741", "F811", "F821", "F841"]
+# F405: undefined-local-with-import-star-usage — falso positivo del re-export
+#       pattern (`from rag.X import *` con `__all__` explícito en cada
+#       sub-módulo). Architectural decision documentada en CLAUDE.md: split
+#       2026-05-04+ usa star-import shims para preservar 100% compat con call
+#       sites históricos (`from rag import _foo`). Si un símbolo no existe en
+#       runtime, el ImportError se manifiesta al primer call — F405 estático
+#       no aporta señal.
+extend-ignore = ["E402", "E701", "E702", "E731", "E741", "F405", "F811", "F821", "F841"]

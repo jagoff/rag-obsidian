@@ -11,7 +11,6 @@ import pytest
 
 from rag.llm_backend import (
     MLX_MODEL_ALIAS,
-    SHORT_NAME_ALIAS,
     ChatOptions,
     MLXBackend,
     get_backend,

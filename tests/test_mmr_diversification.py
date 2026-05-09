@@ -25,9 +25,7 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
-from typing import Any
 
-import pytest
 
 from rag.mmr_diversification import (
     apply_mmr,

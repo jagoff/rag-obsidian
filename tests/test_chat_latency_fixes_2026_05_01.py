@@ -34,11 +34,8 @@ CONTEXTO entero con el output de los tools.
 """
 from __future__ import annotations
 
-import os
-import time
-from datetime import datetime, timedelta
+from datetime import datetime
 
-import pytest
 
 
 # ── Fix 4: time_range normalization a 24h ─────────────────────────────────
@@ -308,7 +305,6 @@ def test_long_query_not_autonomous_even_without_pronoun():
     """Queries de >3 palabras NO se consideran autonomous aunque no
     tengan pronombres — pueden necesitar reform si caen en banda
     borderline (e.g. "tenés más sobre la cumbre del jueves")."""
-    from rag import _TOPIC_SHIFT_FOLLOWUP_RE
 
     q = "tenés más sobre la cumbre del jueves"
     # 7 palabras > 3 → no se considera autonomous por el guard de q_words

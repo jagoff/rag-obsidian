@@ -345,6 +345,48 @@ from web.tools import (  # noqa: E402
     TOOL_FNS,
     _WEB_TOOL_ADDENDUM,
 )
+import inspect as _inspect_for_tools  # noqa: E402
+
+# Bug Hunt 2026-05-08 M-3: el LLM puede halucinar argumentos extra al
+# llamar tools (`read_note(path="x", _internal_flag=True)`). Python pasa
+# todo via `**kwargs` lo que dispara `TypeError` (atrapado abajo y
+# loggeado como `Error: ...`). No hay RCE, pero el comportamiento es
+# impredecible y leak-sensitive. Filtramos `args` a las keys que la
+# firma del tool acepta antes del dispatch.
+_TOOL_SIG_CACHE: dict[str, set[str]] = {}
+
+
+def _filter_tool_args(name: str, args: dict) -> dict:
+    """Return only keys present in `TOOL_FNS[name]`'s signature.
+
+    Cache the inspected param-name set per tool — `inspect.signature` is
+    not cheap and TOOL_FNS is fixed at import time. Tools that accept
+    `**kwargs` (any tool with a `VAR_KEYWORD` param) get a pass-through.
+    """
+    if not isinstance(args, dict):
+        return {}
+    keys = _TOOL_SIG_CACHE.get(name)
+    if keys is None:
+        fn = TOOL_FNS.get(name)
+        if fn is None:
+            keys = set()
+        else:
+            try:
+                sig = _inspect_for_tools.signature(fn)
+                accepts_kwargs = any(
+                    p.kind == _inspect_for_tools.Parameter.VAR_KEYWORD
+                    for p in sig.parameters.values()
+                )
+                keys = (
+                    set(["__all__"]) if accepts_kwargs
+                    else {n for n in sig.parameters.keys()}
+                )
+            except (TypeError, ValueError):
+                keys = set(["__all__"])
+        _TOOL_SIG_CACHE[name] = keys
+    if "__all__" in keys:
+        return args
+    return {k: v for k, v in args.items() if k in keys}
 
 
 # Pre-router: keyword → tool forced execution. Detalle + reglas + helpers
@@ -8055,15 +8097,28 @@ async def home_stream(request: Request, regenerate: bool = False) -> StreamingRe
     from contextlib import suppress
 
     _ensure_home_prewarmer()
-    q: _queue.Queue = _queue.Queue()
+    # Bug Hunt 2026-05-08 M-2: queue cap. Si el cliente desconecta
+    # mid-stream y `cancel_event` no llega a los fetchers a tiempo (el
+    # `HARD_CAP_S=60` es el ceiling), el worker sigue empujando eventos
+    # a una queue que nadie consume. Cap a 200 con `put_nowait` +
+    # catch — bajo carga normal el progress emite ~10-20 events por
+    # compute, así que 200 es safety net sin truncar runs reales.
+    q: _queue.Queue = _queue.Queue(maxsize=200)
     SENTINEL = object()
     cancel_event = threading.Event()
+
+    def _q_put_safe(item: tuple) -> None:
+        """put_nowait con drop si queue lleno (ej. cliente abandonó)."""
+        try:
+            q.put_nowait(item)
+        except _queue.Full:
+            pass
 
     def _on_progress(stage: str, status: str, elapsed_ms: float, err: str | None) -> None:
         evt = {"stage": stage, "status": status, "elapsed_ms": round(elapsed_ms, 1)}
         if err:
             evt["error"] = err
-        q.put(("stage", evt))
+        _q_put_safe(("stage", evt))
 
     def _runner() -> None:
         try:
@@ -8072,13 +8127,28 @@ async def home_stream(request: Request, regenerate: bool = False) -> StreamingRe
                 progress=_on_progress,
                 cancel_event=cancel_event,
             )
-            q.put(("done", payload))
+            _q_put_safe(("done", payload))
         except HTTPException as exc:
-            q.put(("error", {"message": str(exc.detail)}))
+            _q_put_safe(("error", {"message": str(exc.detail)}))
         except Exception as exc:
-            q.put(("error", {"message": str(exc)}))
+            # Bug Hunt H-2: NO leak `str(exc)` al cliente — sólo log.
+            print(f"[home-stream] runner exc: {exc}", file=sys.stderr)
+            _q_put_safe(("error", {"message": "home compute failed"}))
         finally:
-            q.put((SENTINEL, None))
+            # SENTINEL siempre debe llegar, aunque el queue esté lleno.
+            # Force-drain una entry y reintentar para garantizar shutdown
+            # del generator.
+            try:
+                q.put_nowait((SENTINEL, None))
+            except _queue.Full:
+                try:
+                    q.get_nowait()
+                except _queue.Empty:
+                    pass
+                try:
+                    q.put_nowait((SENTINEL, None))
+                except _queue.Full:
+                    pass
 
     async def _gen():
         # Heartbeat so reverse-proxies / Safari don't kill the connection
@@ -12208,7 +12278,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     if _n in ("propose_calendar_event", "propose_reminder") and "_original_query" not in _a:
                         _a["_original_query"] = question
                     try:
-                        _res = TOOL_FNS[_n](**_a)
+                        _res = TOOL_FNS[_n](**_filter_tool_args(_n, _a))
                     except Exception as _exc:
                         _res = f"Error: {_exc}"
                     _ms = int((time.perf_counter() - _t0) * 1000)
@@ -12227,7 +12297,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                         if name in ("propose_calendar_event", "propose_reminder") and "_original_query" not in args:
                             args["_original_query"] = question
                         try:
-                            _r = TOOL_FNS[name](**args)
+                            _r = TOOL_FNS[name](**_filter_tool_args(name, args))
                         except Exception as _exc:
                             _r = f"Error: {_exc}"
                         return name, str(_r), int((time.perf_counter() - _t0) * 1000)
@@ -12643,7 +12713,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                         if _fn is None:
                             _out = f"Error: tool '{_name}' no existe"
                         else:
-                            _ret = _fn(**_args)
+                            _ret = _fn(**_filter_tool_args(_name, _args))
                             _out = _ret if isinstance(_ret, str) else json.dumps(_ret, ensure_ascii=False)
                     except Exception as _exc:
                         _out = f"Error: {_exc}"
@@ -12678,7 +12748,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                             if _fn is None:
                                 _out = f"Error: tool '{_name}' no existe"
                             else:
-                                _ret = _fn(**_args)
+                                _ret = _fn(**_filter_tool_args(_name, _args))
                                 _out = _ret if isinstance(_ret, str) else json.dumps(_ret, ensure_ascii=False)
                         except Exception as _exc:
                             _out = f"Error: {_exc}"

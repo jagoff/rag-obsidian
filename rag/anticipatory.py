@@ -595,7 +595,63 @@ def anticipate_run_impl(
     from rag import _silent_log
     if os.environ.get("RAG_ANTICIPATE_DISABLED", "").strip() in ("1", "true", "yes"):
         return {"selected": None, "sent": False, "all": [], "disabled": True}
+    # Bug Hunt 2026-05-08 M Brief 2: lockfile PID-based para evitar
+    # ejecuciones concurrentes. El daemon `com.fer.obsidian-rag-anticipate`
+    # corre cada 10min via launchd. Si una corrida tarda >10min (calendar
+    # fetch hangs, network hiccup), launchd dispara la siguiente
+    # mientras la primera sigue → ambas pueden seleccionar el mismo
+    # candidate y pushear duplicado a WhatsApp. Un fcntl flock en
+    # un archivo bajo `~/.local/share/obsidian-rag/anticipate.lock`
+    # serializa los runs sin bloquear (LOCK_NB → skip si ocupado).
+    import fcntl as _fcntl
+    from pathlib import Path as _Path
+    _lock_dir = _Path.home() / ".local/share/obsidian-rag"
+    try:
+        _lock_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    _lock_path = _lock_dir / "anticipate.lock"
+    _lock_fh = None
+    if not force:
+        # Sólo serializar runs scheduled. `--force` (manual) bypassa
+        # también el lockfile para no bloquear debug.
+        try:
+            _lock_fh = open(_lock_path, "w")
+            _fcntl.flock(_lock_fh.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            _lock_fh.write(str(os.getpid()))
+            _lock_fh.flush()
+        except (BlockingIOError, OSError) as _le:
+            # Otra instancia ya está corriendo. Skip silencioso (el
+            # próximo tick toma el relevo cuando libere).
+            try:
+                if _lock_fh is not None:
+                    _lock_fh.close()
+            except Exception:
+                pass
+            _silent_log(
+                "anticipate_run_lockfile_busy",
+                RuntimeError(f"otra instancia activa, skip ({_le})"),
+            )
+            return {
+                "selected": None, "sent": False, "all": [],
+                "skip_reason": "lockfile_busy",
+            }
     now = now or datetime.now()
+    # Helper: close lockfile (idempotente). Llamado en cada return.
+    def _release_lock() -> None:
+        nonlocal _lock_fh
+        if _lock_fh is None:
+            return
+        try:
+            _fcntl.flock(_lock_fh.fileno(), _fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            _lock_fh.close()
+        except Exception:
+            pass
+        _lock_fh = None
+
     all_candidates: list[AnticipatoryCandidate] = []
     for label, fn in _rag._ANTICIPATE_SIGNALS:
         try:
@@ -631,6 +687,7 @@ def anticipate_run_impl(
             _silent_log("anticipate_log_initial", exc)
 
     if not all_candidates:
+        _release_lock()
         return {"selected": None, "sent": False, "all": []}
 
     # Phase 2.A: el threshold ya no es global; sube/baja per-kind según
@@ -693,6 +750,7 @@ def anticipate_run_impl(
             # Fallback: mantener `viable` sin modificar
 
     if not viable:
+        _release_lock()
         return {
             "selected": None, "sent": False,
             "all": [_anticipate_candidate_to_dict(c) for c in all_candidates],
@@ -717,6 +775,7 @@ def anticipate_run_impl(
                 _anticipate_log_candidate(top, selected=True, sent=False)
             except Exception as exc:
                 _silent_log("anticipate_log_selected", exc)
+            _release_lock()
             return {
                 "selected": _anticipate_candidate_to_dict(top),
                 "sent": False,
@@ -747,6 +806,7 @@ def anticipate_run_impl(
     except Exception as exc:
         _silent_log("anticipate_log_selected", exc)
 
+    _release_lock()
     return {
         "selected": _anticipate_candidate_to_dict(top),
         "sent": sent,

@@ -235,9 +235,21 @@ def set_brief_schedule_pref(
                 (brief_kind, int(hour), int(minute), now, reason),
             )
             conn.commit()
-        return True
     except Exception:
         return False
+    # Bug Hunt 2026-05-08 M Brief 4: la SQL pref se escribió OK, pero
+    # el plist en `~/Library/LaunchAgents/` todavía tiene el schedule
+    # viejo. Sin re-bootstrap, el daemon dispara a la hora vieja.
+    # Re-bootstrap del plist afectado para que el cambio aplique YA
+    # (sin esperar al siguiente `rag setup` manual).
+    try:
+        from rag import _bootstrap_brief_plist  # lazy
+        _bootstrap_brief_plist(brief_kind)
+    except Exception:
+        # No queremos romper la pref si el bootstrap falla — la SQL
+        # ya está. El próximo `rag setup` la propaga.
+        pass
+    return True
 
 
 def reset_brief_schedule_pref(brief_kind: str) -> bool:

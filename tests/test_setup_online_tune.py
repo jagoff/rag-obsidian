@@ -260,7 +260,10 @@ def test_services_spec_total_count():
     # 2026-05-09 (audit ronda 2): +1 drift-watcher (cada 6h, alerta cuando
     # hit@5 cae entre runs vs detección 13h-tardía via online-tune nightly).
     # Net: 30 → 31.
-    assert len(specs) == 31
+    # 2026-05-09 (active-learning bootstrap completo): +1
+    # active-learning-suggest-goldens (Lunes 11:00 weekly, push WA con
+    # candidates queries.yaml desde rag_feedback rating=+1). Net: 31 → 32.
+    assert len(specs) == 32
 
 
 def test_services_spec_includes_maintenance():

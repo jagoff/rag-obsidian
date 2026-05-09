@@ -12,6 +12,7 @@ from rag.plists._render import _logs, _render_plist
 
 __all__ = [
     "_active_learning_nudge_plist",
+    "_active_learning_suggest_goldens_plist",
     "_anticipate_plist",
     "_archive_plist",
     "_brief_auto_tune_plist",
@@ -174,6 +175,43 @@ def _active_learning_nudge_plist(rag_bin: str) -> str:
         },
         "schedule": {
             "calendar": {"Weekday": 1, "Hour": 10, "Minute": 0},
+        },
+        "run_at_load": False,
+        "keep_alive": False,
+        "stdout_path": out,
+        "stderr_path": err,
+    })
+
+
+def _active_learning_suggest_goldens_plist(rag_bin: str) -> str:
+    """Lunes 11:00 — sugiere entries para queries.yaml desde feedback +1.
+
+    Complementa el `active-learning-nudge` (Lunes 10:00, queries low-conf
+    sin label). Este corre 1h después y empuja la otra dirección del loop:
+    cuando el user marcó thumbs-up sobre query+top_path, esa señal es oro
+    para el golden set y debería terminar en queries.yaml — pero hoy hay
+    que recordar a mano correr el script. El plist cierra el loop.
+
+    Threshold default 3 candidates accionables — debajo de eso no vale
+    interrumpir al user con un push (los candidates ya estaban en el
+    golden set, o el path no existe en el vault, etc).
+    """
+    out, err = _logs("active-learning-suggest-goldens")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-active-learning-suggest-goldens",
+        "program_arguments": [
+            rag_bin, "active-learning", "suggest-goldens",
+            "--days", "7", "--limit", "10", "--threshold", "3",
+            "--json",
+        ],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "RAG_STATE_SQL": "1",
+            "RAG_LLM_BACKEND": "mlx",
+        },
+        "schedule": {
+            "calendar": {"Weekday": 1, "Hour": 11, "Minute": 0},
         },
         "run_at_load": False,
         "keep_alive": False,

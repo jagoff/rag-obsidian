@@ -90,6 +90,9 @@ __all__ = [
     "active_learning_nudge",
     "active_learning",
     "active_learning_nudge_cli",
+    "active_learning_suggest_goldens_cli",
+    "_run_suggest_goldens",
+    "_send_suggest_goldens_wa",
     "feedback_infer_implicit",
     "feedback_detect_requery",
     "feedback_classify_sessions",
@@ -688,6 +691,170 @@ def active_learning_nudge_cli(
     else:
         console.print(f"  [yellow]Push failed[/yellow] -> "
                       f"channel={result['channel_used']}")
+    console.print()
+
+
+# ─── suggest-goldens (active-learning bootstrap, 2026-05-09) ─────────────
+
+
+def _run_suggest_goldens(days: int, limit: int) -> dict:
+    """Invoca scripts/suggest_goldens.py --json y devuelve el dict parseado.
+
+    Subprocess en lugar de import directo porque el script es del path
+    `scripts/` (no parte del paquete `rag/`); evita acoplar el CLI a su
+    layout interno y mantiene un solo writer de la lógica de filtrado.
+    """
+    import subprocess  # noqa: PLC0415
+
+    from rag import _silent_log  # noqa: PLC0415
+
+    repo = Path(__file__).resolve().parent.parent.parent
+    script = repo / "scripts" / "suggest_goldens.py"
+    venv_py = repo / ".venv" / "bin" / "python"
+    py_bin = str(venv_py) if venv_py.is_file() else "python3"
+    if not script.is_file():
+        return {"error": "script-missing", "candidates": []}
+    try:
+        out = subprocess.run(
+            [py_bin, str(script), "--days", str(days), "--limit", str(limit),
+             "--json"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except Exception as exc:
+        try:
+            _silent_log("active_learning.suggest_goldens.subprocess", exc)
+        except Exception:
+            pass
+        return {"error": "subprocess-failed", "candidates": []}
+    if out.returncode != 0:
+        return {"error": f"exit-{out.returncode}", "candidates": [],
+                "stderr": (out.stderr or "")[:200]}
+    try:
+        return json.loads(out.stdout)
+    except (TypeError, ValueError) as exc:
+        try:
+            _silent_log("active_learning.suggest_goldens.parse", exc)
+        except Exception:
+            pass
+        return {"error": "parse-failed", "candidates": []}
+
+
+def _send_suggest_goldens_wa(payload: dict, days: int) -> bool:
+    """Push WA al user con count + top 3 candidates como preview."""
+    try:
+        from rag.integrations.whatsapp import (  # noqa: PLC0415
+            WHATSAPP_BOT_JID,
+            _ambient_whatsapp_send,
+        )
+    except Exception:
+        return False
+
+    candidates = payload.get("candidates") or []
+    n_keep = int(payload.get("n_keep") or len(candidates))
+    if not candidates:
+        return False
+
+    today_iso = datetime.now().strftime("%Y-%m-%d")
+    preview_lines = []
+    for c in candidates[:3]:
+        q = (c.get("q") or "")[:60]
+        path = c.get("expected") or ""
+        preview_lines.append(f"  • _{q}_  →  `{path}`")
+
+    msg = (
+        "*Active learning · golden set*\n\n"
+        f"Tenes *{n_keep} queries* con thumbs-up estos ultimos {days} dias "
+        "que podrian sumar al golden set (eval baseline).\n\n"
+        + "\n".join(preview_lines)
+        + "\n\nReview + paste:\n"
+        "`.venv/bin/python scripts/suggest_goldens.py "
+        f"--days {days} --limit 10`\n\n"
+        f"_active-learning-suggest-goldens:{today_iso}_"
+    )
+    return _ambient_whatsapp_send(WHATSAPP_BOT_JID, msg)
+
+
+@active_learning.command("suggest-goldens")
+@click.option("--days", default=7, show_default=True, type=int,
+              help="Ventana en dias sobre rag_feedback rating=+1.")
+@click.option("--limit", default=10, show_default=True, type=int,
+              help="Maximo de candidates a emitir.")
+@click.option("--threshold", default=3, show_default=True, type=int,
+              help="Minimo de candidates accionables para disparar push.")
+@click.option("--channel", type=click.Choice(["auto", "wa", "stdout"]),
+              default="auto", show_default=True,
+              help="Canal del nudge. 'stdout' = solo print (testing).")
+@click.option("--dry-run", is_flag=True,
+              help="Contar candidates sin disparar push.")
+@click.option("--json", "as_json", is_flag=True,
+              help="Output JSON (para launchd logs).")
+def active_learning_suggest_goldens_cli(
+    days: int, limit: int, threshold: int,
+    channel: str, dry_run: bool, as_json: bool,
+) -> None:
+    """Sugerir entries para queries.yaml desde feedback +1 reciente."""
+    from rag import console  # noqa: PLC0415
+
+    payload = _run_suggest_goldens(days=days, limit=limit)
+    n_keep = int(payload.get("n_keep") or 0)
+    candidates = payload.get("candidates") or []
+    fired = False
+    channel_used: str | None = None
+
+    if n_keep >= threshold and not dry_run and channel != "stdout":
+        if channel in ("auto", "wa"):
+            if _send_suggest_goldens_wa(payload, days=days):
+                fired = True
+                channel_used = "wa"
+            elif channel == "auto":
+                channel_used = "wa-failed"
+
+    result = {
+        "days": days,
+        "limit": limit,
+        "threshold": threshold,
+        "n_keep": n_keep,
+        "n_candidates_raw": int(payload.get("n_candidates_raw") or 0),
+        "n_drop_dup_q": int(payload.get("n_drop_dup_q") or 0),
+        "n_drop_path_missing": int(payload.get("n_drop_path_missing") or 0),
+        "fired": fired,
+        "channel_used": channel_used,
+        "dry_run": dry_run,
+        "error": payload.get("error"),
+    }
+
+    if as_json:
+        click.echo(json.dumps(result))
+        return
+
+    console.print()
+    console.print("[bold]rag active-learning suggest-goldens[/bold]")
+    console.print(f"  Window: ultimos {days}d  ·  threshold: {threshold}")
+    console.print(f"  Candidates accionables: [cyan]{n_keep}[/cyan] "
+                  f"(raw: {result['n_candidates_raw']}, "
+                  f"dup_q: {result['n_drop_dup_q']}, "
+                  f"path_missing: {result['n_drop_path_missing']})")
+    if result.get("error"):
+        console.print(f"  [yellow]error: {result['error']}[/yellow]")
+        return
+    if not candidates:
+        console.print("  [dim]Sin candidates nuevos.[/dim]")
+        return
+    if fired:
+        console.print(f"  [green]Push fired[/green] -> {channel_used}")
+    elif channel == "stdout" or n_keep < threshold:
+        console.print(f"  [dim]Below threshold "
+                      f"({n_keep} < {threshold}) o channel=stdout.[/dim]")
+    elif dry_run:
+        console.print("  [dim]dry-run (no push).[/dim]")
+    else:
+        console.print(f"  [yellow]Push failed[/yellow] -> {channel_used}")
+    console.print()
+    console.print("[dim]Top candidates:[/dim]")
+    for c in candidates[:5]:
+        q = (c.get("q") or "")[:80]
+        path = c.get("expected") or ""
+        console.print(f"  • {q} → [cyan]{path}[/cyan]")
     console.print()
 
 

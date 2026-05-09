@@ -45,6 +45,7 @@ from rag.plists.poll import (
 )
 from rag.plists.proactive import (
     _active_learning_nudge_plist,
+    _active_learning_suggest_goldens_plist,
     _anticipate_plist,
     _archive_plist,
     _brief_auto_tune_plist,
@@ -155,6 +156,13 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
         ("com.fer.obsidian-rag-active-learning-nudge",
          "com.fer.obsidian-rag-active-learning-nudge.plist",
          _active_learning_nudge_plist(rag_bin)),
+        # Active-learning suggest-goldens (2026-05-09) — Lunes 11:00,
+        # complementa el nudge: empuja la otra direccion del loop sugiriendo
+        # entries para queries.yaml desde rag_feedback rating=+1 reciente.
+        # Threshold 3 candidates accionables — debajo no vale interrumpir.
+        ("com.fer.obsidian-rag-active-learning-suggest-goldens",
+         "com.fer.obsidian-rag-active-learning-suggest-goldens.plist",
+         _active_learning_suggest_goldens_plist(rag_bin)),
         # Implicit corrective_path inference — corre 03:25, 5 min antes
         # del online-tune. Pre-popula corrective_paths desde behavior
         # post-👎 sin pedir input al user. Sprint 1 del cierre del loop

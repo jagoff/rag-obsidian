@@ -9,11 +9,14 @@ Migrado de rag/plists/_legacy.py en Phase 3 commit 2 (2026-05-09).
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 from rag.plists._render import _logs, _render_plist, _repo_root
 
 __all__ = [
     "_auto_harvest_plist",
     "_calibration_plist",
+    "_drift_watcher_plist",
     "_implicit_feedback_plist",
     "_online_tune_plist",
     "_routing_rules_plist",
@@ -216,6 +219,57 @@ def _routing_rules_plist(rag_bin: str) -> str:
         },
         "schedule": {"interval_s": 300},
         "run_at_load": False,
+        "stdout_path": out,
+        "stderr_path": err,
+    })
+
+
+def _drift_watcher_plist(rag_bin: str) -> str:
+    """Drift watcher — every 6h, alerta si singles_hit5/chains_hit5 cae
+    entre runs de `rag eval`.
+
+    Motivación (audit ronda 2 2026-05-09): el gate de auto-rollback solo
+    corre nightly (`com.fer.obsidian-rag-online-tune` 03:30). Una regresión
+    a las 14:00 se detecta recién 13h después. Para captura rápida de
+    drift silencioso, este daemon polea `rag_eval_runs` cada 6h y dispara:
+      1. JSONL append a `~/.local/share/obsidian-rag/drift_alerts.jsonl`
+         (source of truth offline).
+      2. WhatsApp push best-effort vía bridge local — si el bridge está
+         caído, JSONL queda como rastro.
+
+    Thresholds:
+      - `delta_singles < -0.05` (-5pp) — n grande, señal real.
+      - `delta_chains < -0.07` (-7pp) — n más chico, threshold relajado.
+
+    Idempotente: dedup window 12h por (kind, current_run_ts) leyendo las
+    últimas 5 líneas del JSONL antes de escribir.
+
+    Schedule cada 6h: balance entre detección rápida (<6h lag) y costo
+    nulo (script termina en <1s lecturas SQL puras). RunAtLoad=true para
+    que el primer tick post-bootstrap dé un baseline check.
+
+    Working dir: el script usa Path.home() para todos los reads (DB +
+    JSONL + ambient.json), así que cwd no importa. Usamos el repo root
+    de todos modos para consistencia con online-tune.
+
+    Lógica completa en `scripts/drift_watcher.py`. Para auditar manual:
+    `make drift-watcher` en el repo.
+    """
+    repo = _repo_root()
+    venv_python = repo / ".venv" / "bin" / "python"
+    script = repo / "scripts" / "drift_watcher.py"
+    out, err = _logs("drift-watcher")
+    return _render_plist({
+        "label": "com.fer.obsidian-rag-drift-watcher",
+        "program_arguments": [str(venv_python), str(script)],
+        "env": {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+        },
+        "schedule": {"interval_s": 21600},  # 6h
+        "run_at_load": True,
+        "keep_alive": False,
+        "working_dir": str(repo),
         "stdout_path": out,
         "stderr_path": err,
     })

@@ -27,6 +27,7 @@ from rag.plists.ingest import (
 from rag.plists.learning import (
     _auto_harvest_plist,
     _calibration_plist,
+    _drift_watcher_plist,
     _implicit_feedback_plist,
     _online_tune_plist,
     _routing_rules_plist,
@@ -165,6 +166,13 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
          _online_tune_plist(rag_bin)),
         ("com.fer.obsidian-rag-calibrate", "com.fer.obsidian-rag-calibrate.plist",
          _calibration_plist(rag_bin)),
+        # Drift watcher (audit ronda 2 2026-05-09) — cada 6h compara rag_eval_runs
+        # consecutivos. Si singles_hit5 cae >5pp o chains_hit5 cae >7pp, dispara
+        # WhatsApp push + JSONL append. Cierra el lag entre regresión silenciosa
+        # y detección (pre-fix: hasta 13h via online-tune nightly).
+        ("com.fer.obsidian-rag-drift-watcher",
+         "com.fer.obsidian-rag-drift-watcher.plist",
+         _drift_watcher_plist(rag_bin)),
         ("com.fer.obsidian-rag-maintenance", "com.fer.obsidian-rag-maintenance.plist",
          _maintenance_plist(rag_bin)),
         ("com.fer.obsidian-rag-consolidate", "com.fer.obsidian-rag-consolidate.plist",

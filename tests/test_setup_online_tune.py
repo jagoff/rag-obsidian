@@ -257,7 +257,10 @@ def test_services_spec_total_count():
     # Net: 28 → 29.
     # 2026-05-06 (Ola 6): +1 spotify-poll.
     # Net: 29 → 30.
-    assert len(specs) == 30
+    # 2026-05-09 (audit ronda 2): +1 drift-watcher (cada 6h, alerta cuando
+    # hit@5 cae entre runs vs detección 13h-tardía via online-tune nightly).
+    # Net: 30 → 31.
+    assert len(specs) == 31
 
 
 def test_services_spec_includes_maintenance():

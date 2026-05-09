@@ -179,11 +179,27 @@ def _fetch_youtube_today(now: datetime, n: int = 5) -> list[dict]:
     with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=True) as tmp:
         try:
             shutil.copyfile(src, tmp.name)
-        except OSError:
+        except OSError as exc:
+            # Bug Hunt 2026-05-08 (M Int chrome_bookmarks): pre-fix los
+            # 3 except branches swallowing total sin traza. Cuando Chrome
+            # tenía la History DB locked (browser corriendo + WAL mode), el
+            # panel YouTube/bookmarks devolvía empty sin razón visible
+            # → operador no podía diferenciar "user no usó YT hoy" de
+            # "Chrome bloqueando la copy". Compat lazy import.
+            try:
+                from rag import _silent_log
+                _silent_log("chrome_youtube_copy_failed", exc)
+            except Exception:
+                pass
             return []
         try:
             conn = sqlite3.connect(f"file:{tmp.name}?mode=ro", uri=True)
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
+            try:
+                from rag import _silent_log
+                _silent_log("chrome_youtube_connect_failed", exc)
+            except Exception:
+                pass
             return []
         try:
             conn.row_factory = sqlite3.Row
@@ -207,7 +223,12 @@ def _fetch_youtube_today(now: datetime, n: int = 5) -> list[dict]:
                 """,
                 (window_start_chrome,),
             ).fetchall()
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
+            try:
+                from rag import _silent_log
+                _silent_log("chrome_youtube_query_failed", exc)
+            except Exception:
+                pass
             return []
         finally:
             conn.close()

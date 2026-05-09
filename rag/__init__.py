@@ -17947,6 +17947,17 @@ def run_chat_turn(req: ChatTurnRequest) -> ChatTurnResult:
     _cache_emb = None
     _cache_hash = ""
     _cache_probe: dict | None = None
+    # Bug Hunt 2026-05-08 (M Tel corpus_hash): mismo fix que el path query()
+    # — compute corpus_hash siempre para que `rag_queries.extra_json.corpus_hash`
+    # quede consistente cuando el lookup se skipea (cache disabled, flags,
+    # multi-vault). `len(req.vaults) >= 1` es invariante (web rejects empty);
+    # tomamos el primero como anchor del bucket.
+    if req.vaults:
+        try:
+            _ch_col = get_db_for(req.vaults[0][1])
+            _cache_hash = _corpus_hash_cached(_ch_col)
+        except Exception as _ch_exc:
+            _silent_log("corpus_hash_compute", _ch_exc)
     if not req.cache_lookup:
         _cache_probe = {
             "result": "skipped",
@@ -17972,7 +17983,7 @@ def run_chat_turn(req: ChatTurnRequest) -> ChatTurnResult:
         try:
             _col = get_db_for(req.vaults[0][1])
             _cache_emb = embed([req.question])[0]
-            _cache_hash = _corpus_hash_cached(_col)
+            # corpus_hash ya computado arriba — no re-compute (memoizado igual).
             _hit, _cache_probe = semantic_cache_lookup(
                 _cache_emb, _cache_hash, return_probe=True,
             )
@@ -26263,6 +26274,18 @@ def query(
     _cache_emb = None
     _cache_hash = ""
     _cache_probe: dict | None = None
+    # Bug Hunt 2026-05-08 (M Tel corpus_hash): el corpus_hash se persiste
+    # en `rag_queries.extra_json` para bucketing pre/post-reindex en SQL
+    # analytics. Pre-fix sólo se computaba dentro del else (cache enabled
+    # + no flags skip), así que queries con --force / --counter / --raw /
+    # cache disabled persistían `corpus_hash=""` → analytics SQL como
+    # `GROUP BY json_extract(extra_json,'$.corpus_hash')` mezclaba pre y
+    # post-reindex. Fix: compute always (es barato — `_corpus_hash_cached`
+    # memoiza por chunk_count + bucketed top-mtimes).
+    try:
+        _cache_hash = _corpus_hash_cached(col)
+    except Exception as _ch_exc:
+        _silent_log("corpus_hash_compute", _ch_exc)
     if _cache_skippable:
         _cache_probe = {
             "result": "skipped",
@@ -26280,7 +26303,6 @@ def query(
     else:
         try:
             _cache_emb = embed([question])[0]
-            _cache_hash = _corpus_hash_cached(col)
             # return_probe=True → tuple (hit_or_None, probe_dict). Probe
             # is always populated so extra_json can explain misses.
             hit, _cache_probe = semantic_cache_lookup(

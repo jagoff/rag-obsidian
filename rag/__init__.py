@@ -20877,6 +20877,11 @@ AMBIENT_WHATSAPP_BRIDGE_URL = f"http://localhost:{_WA_BRIDGE_PORT}/api/send"
 # ignora mensajes que arrancan con U+200B para no procesar sus propios
 # outputs como queries entrantes.
 _AMBIENT_ANTILOOP_MARKER = "\u200b"
+# **Cross-language contract**: el listener TypeScript define el MISMO valor
+# en `whatsapp-listener/listener.ts:BOT_MARKER`. Si cambia uno, cambiar
+# el otro \u2014 no hay shared file porque corren en procesos separados (Bun
+# vs Python). U+200B es estable forever (Unicode est\u00e1ndar), riesgo de
+# drift m\u00ednimo.
 
 
 # ── Phase 4a: proactive nudges moved to `rag.proactive` (2026-04-25) ──────

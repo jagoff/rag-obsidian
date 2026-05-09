@@ -3382,13 +3382,13 @@ def whatsapp_send(req: WhatsAppSendRequest, request: Request) -> dict:
            scheduled_for_utc}``.
 
     Replies (``reply_to`` present):
-      - The bridge today (`whatsapp-mcp/whatsapp-bridge/main.go:707`)
-        does NOT support `ContextInfo`/`QuotedMessage` — the message
-        ships as plain text without WhatsApp's native boxed-quote UI.
-        We still pass the field forward so when the bridge adds quote
-        support it works without client changes.
-      - The audit log records ``reply_to_id`` so we can correlate the
-        outbound message with the original incoming message later.
+      - El bridge soporta ContextInfo nativo desde 2026-05-09 (commit
+        ``bd5ca9d`` en ``whatsapp-mcp/whatsapp-bridge/main.go``). Cuando
+        se envía con ``reply_to``, el receptor ve la cita boxed nativa
+        de WhatsApp ("respondiendo a..."). Para grupos ``sender_jid`` es
+        required; para 1:1 puede ser el chat_jid mismo.
+      - El audit log persiste ``reply_to_id`` independientemente para
+        correlacionar el outbound con el incoming original.
 
     Returns ``{ok: true, jid}`` (immediate) or ``{ok: true, scheduled:
     true, id, scheduled_for_utc}`` (deferred). Raises 400 on shape

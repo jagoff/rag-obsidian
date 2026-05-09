@@ -7807,12 +7807,18 @@ def _sql_query_window(
     until_ts: str | None = None,
     where: str | None = None,
     params: tuple = (),
+    max_rows: int | None = None,
 ) -> list:
     """SELECT * FROM `table` WHERE ts >= since_ts [AND ts < until_ts] [AND <where>].
 
     Returns a list of sqlite3.Row. Caller controls the window; the index on
     `ts` keeps this fast up to ~millions of rows per table. `where` is raw
     SQL appended with AND — only used from trusted internal call sites.
+
+    Bug Hunt 2026-05-08 M Brief pendientes LIMIT: added `max_rows` kwarg (default
+    None = no limit, backward-compat). When set, appends LIMIT to SQL to avoid
+    RAM spike when fetchall() hits a huge time window (e.g. `days=365` on old
+    telemetry table). Caller responsible for setting sensible bounds.
     """
     clauses = ["ts >= ?"]
     args: list = [since_ts]
@@ -7823,6 +7829,8 @@ def _sql_query_window(
         clauses.append(f"({where})")
         args.extend(params)
     sql = f"SELECT * FROM {table} WHERE {' AND '.join(clauses)} ORDER BY ts"
+    if max_rows is not None and max_rows > 0:
+        sql += f" LIMIT {max_rows}"
     # Row factory is set per-query so callers upstream don't need to manage
     # connection-level config. Restore to whatever was in place after.
     prev_row_factory = conn.row_factory

@@ -222,7 +222,10 @@ def _pendientes_recent_contradictions(
 
     def _do_read():
         with _ragvec_state_conn() as conn:
-            return _sql_query_window(conn, "rag_contradictions", cutoff_iso)
+            # Bug Hunt 2026-05-08 M Brief pendientes LIMIT: cap at 100 rows
+            # (we only use max_items=5, so 100 is 20× buffer for dedup/filter).
+            # Prevents RAM spike if rag_contradictions table has 100k+ rows.
+            return _sql_query_window(conn, "rag_contradictions", cutoff_iso, max_rows=100)
 
     rows = _sql_read_with_retry(
         _do_read,
@@ -256,6 +259,11 @@ def _pendientes_low_conf_queries(
 ) -> list[dict]:
     """Queries below `CONFIDENCE_RERANK_MIN` in last `days`. Dedup by q
     (keep lowest score). Sorted ascending.
+
+    Reads the log file streaming (no early-exit): all lines are processed
+    to ensure the lowest-score per-query invariant. However, files larger
+    than 100MB trigger a warning (disk read bottleneck, not a data problem).
+    Bug Hunt 2026-05-08 M Brief whisper+pendientes: added explicit bounds.
     """
     from rag import CONFIDENCE_RERANK_MIN
     if not log_path.is_file():
@@ -263,33 +271,39 @@ def _pendientes_low_conf_queries(
     cutoff = now - timedelta(days=days)
     best: dict[str, float] = {}
     try:
-        lines = log_path.read_text(encoding="utf-8").splitlines()
+        # Stream file to avoid loading entire log into RAM when it's huge.
+        # For large files (>100MB), this is O(N) but doesn't spike memory.
+        file_size = log_path.stat().st_size
+        if file_size > 100 * 1024 * 1024:
+            from rag import _silent_log
+            _silent_log("low_conf_queries_file_size_large", {"size_mb": file_size // 1024 // 1024})
+        with open(log_path, encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                if e.get("cmd") != "query":
+                    continue
+                try:
+                    ts = datetime.fromisoformat(e.get("ts", ""))
+                except Exception:
+                    continue
+                if ts < cutoff:
+                    continue
+                score = e.get("top_score")
+                if not isinstance(score, (int, float)) or score > CONFIDENCE_RERANK_MIN:
+                    continue
+                q = (e.get("q") or "").strip()
+                if not q:
+                    continue
+                if q not in best or score < best[q]:
+                    best[q] = float(score)
     except OSError:
         return []
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            e = json.loads(line)
-        except Exception:
-            continue
-        if e.get("cmd") != "query":
-            continue
-        try:
-            ts = datetime.fromisoformat(e.get("ts", ""))
-        except Exception:
-            continue
-        if ts < cutoff:
-            continue
-        score = e.get("top_score")
-        if not isinstance(score, (int, float)) or score > CONFIDENCE_RERANK_MIN:
-            continue
-        q = (e.get("q") or "").strip()
-        if not q:
-            continue
-        if q not in best or score < best[q]:
-            best[q] = float(score)
     ranked = sorted(best.items(), key=lambda x: x[1])[:max_items]
     return [{"q": q, "top_score": s} for q, s in ranked]
 

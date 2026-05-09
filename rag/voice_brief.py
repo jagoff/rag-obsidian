@@ -343,9 +343,26 @@ def send_audio_to_whatsapp(jid: str, audio_path: Path) -> bool:
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            return 200 <= resp.status < 300
+            ok = 200 <= resp.status < 300
+            if not ok:
+                _silent_log("voice_brief_send_audio_http", RuntimeError(
+                    f"bridge returned HTTP {resp.status} for jid={jid} "
+                    f"path={audio_path}",
+                ))
+            return ok
     except Exception as exc:
-        _silent_log("voice_brief_send_audio", exc)
+        # M9 fix 2026-05-09: incluir path + tipo de error para que el debug
+        # sea posible. Antes solo loggeaba el `exc` repr — perdíamos qué
+        # archivo falló y por qué (timeout vs permission vs ENOENT).
+        try:
+            stat_info = audio_path.stat() if audio_path.is_file() else None
+            size = stat_info.st_size if stat_info else None
+        except Exception:
+            size = None
+        _silent_log("voice_brief_send_audio", RuntimeError(
+            f"jid={jid} path={audio_path} size={size} "
+            f"err_type={type(exc).__name__} err={exc!r}",
+        ))
         return False
 
 

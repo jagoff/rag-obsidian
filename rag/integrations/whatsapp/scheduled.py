@@ -502,6 +502,12 @@ def cancel(
     `reason` queda guardado en `last_error` como `cancelled:<reason>` para
     que el dashboard pueda mostrar por qué se canceló (ej. 'user_cancel',
     'rescheduled', 'replaced_by_X').
+
+    Eleva `RuntimeError` si el commit del UPDATE falla (DB lockeada, disk
+    full, etc.). Antes el commit failure se silenciaba y el caller creía
+    que canceló pero el row seguía pending — data inconsistency real.
+    El caller HTTP traduce el RuntimeError a 500 y el user ve el error
+    explícito.
     """
     sid = int(scheduled_id)
     with _resolve_conn(conn) as c:
@@ -512,8 +518,17 @@ def cancel(
         )
         try:
             c.commit()
-        except Exception:
-            pass
+        except Exception as exc:
+            # Loguear + raise — silenciar acá causaba data loss invisible.
+            # isolation_level=None (autocommit) → commit es no-op y este
+            # except rara vez fires; con isolation_level normal, sí matter.
+            logger.exception("wa_scheduled_cancel_commit_failed id=%s: %r", sid, exc)
+            _log_ambient("whatsapp_scheduled_cancel_commit_failed", {
+                "scheduled_id": sid,
+                "reason": reason,
+                "error": repr(exc),
+            })
+            raise RuntimeError(f"cancel commit failed for id={sid}: {exc}") from exc
         changed = (cur.rowcount or 0) > 0
 
     if changed:
@@ -565,7 +580,14 @@ def list_scheduled(
         if status == "pending"
         else "created_at DESC"
     )
-    lim = max(1, min(int(limit), 5000))
+    # L4 fix 2026-05-09: silently truncar `limit` a 5000 escondía el bug
+    # del caller que esperaba más rows. Eleva ValueError explícito en
+    # exceso. El caller HTTP traduce a 400.
+    if int(limit) > 5000:
+        raise ValueError(
+            f"limit {limit} excede cap de 5000 — paginá con `since_iso`"
+        )
+    lim = max(1, int(limit))
 
     sql = (
         f"SELECT {_SELECT_COLS_SQL} FROM {_TABLE}"
@@ -690,8 +712,22 @@ def reschedule(
         )
         try:
             c.commit()
-        except Exception:
-            pass
+        except Exception as exc:
+            # Mismo argumento que en cancel(): silenciar el commit failure
+            # crea data inconsistency invisible. El user pensaría que el
+            # mensaje quedó programado para otra hora pero seguiría con la
+            # hora original.
+            logger.exception(
+                "wa_scheduled_reschedule_commit_failed id=%s: %r", sid, exc,
+            )
+            _log_ambient("whatsapp_scheduled_reschedule_commit_failed", {
+                "scheduled_id": sid,
+                "new_scheduled_for_utc": new_iso,
+                "error": repr(exc),
+            })
+            raise RuntimeError(
+                f"reschedule commit failed for id={sid}: {exc}",
+            ) from exc
         changed = (cur.rowcount or 0) > 0
 
     if changed:

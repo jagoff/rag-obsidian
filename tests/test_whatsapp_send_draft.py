@@ -1030,9 +1030,20 @@ def test_whatsapp_send_endpoint_happy_path(monkeypatch):
         captured["anti_loop"] = anti_loop
         captured["reply_to"] = reply_to
         return True
+    # 2026-05-09: el endpoint pasó a usar `_whatsapp_send_to_jid_detailed`
+    # (devuelve `(ok, error_kind)`) para distinguir bridge unreachable vs
+    # rejected. Mockeamos AMBAS — la vieja por compat con tests que la
+    # patcheen, la nueva porque es la que el endpoint realmente llama.
+    def _fake_send_detailed(jid, text, anti_loop=True, reply_to=None):
+        captured["jid"] = jid
+        captured["text"] = text
+        captured["anti_loop"] = anti_loop
+        captured["reply_to"] = reply_to
+        return (True, "sent")
     monkeypatch.setattr(_server, "_whatsapp_send_to_jid", _fake_send, raising=False)
-    # Also patch the attr on the rag module (endpoint imports it lazily).
     monkeypatch.setattr(rag, "_whatsapp_send_to_jid", _fake_send)
+    import rag.integrations.whatsapp as _waint
+    monkeypatch.setattr(_waint, "_whatsapp_send_to_jid_detailed", _fake_send_detailed)
 
     resp = _client.post("/api/whatsapp/send", json={
         "jid": "5491155555555@s.whatsapp.net",

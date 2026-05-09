@@ -3279,11 +3279,15 @@ async def upload_chat_image(file: UploadFile = File(...)) -> dict:
 
 class WhatsAppReplyTarget(BaseModel):
     """Optional reply context for `/api/whatsapp/send` — when the user
-    clicked [Enviar] on a `propose_whatsapp_reply` card, the UI ships
-    the resolved original message so the bridge can wire a native quote
-    when it gains support (currently the bridge ignores these fields,
-    see ``rag._whatsapp_send_to_jid`` docstring; the audit log keeps
-    `message_id` regardless so we can correlate later)."""
+    clicked [Enviar] on a `propose_whatsapp_reply` card, la UI envía el
+    mensaje original resuelto para que el bridge construya un quote
+    nativo (cita boxed visible al destinatario).
+
+    Soporte nativo desde 2026-05-09: el bridge Go ahora acepta `reply_to`
+    en `/api/send` y arma `ExtendedTextMessage` con `ContextInfo`
+    (StanzaID + Participant + QuotedMessage). Para grupos `sender_jid`
+    es required; para 1:1 puede ser el chat_jid mismo. El audit log
+    sigue persistiendo `message_id` independientemente."""
     message_id: str
     original_text: str | None = ""
     sender_jid: str | None = ""
@@ -3434,18 +3438,44 @@ def whatsapp_send(req: WhatsAppSendRequest, request: Request) -> dict:
         return {"ok": True, "scheduled": True, **row}
 
     # ── Immediate path: legacy (sin cambios de comportamiento). ───────
-    from rag import _whatsapp_send_to_jid  # noqa: PLC0415
-    ok = _whatsapp_send_to_jid(
+    from rag.integrations.whatsapp import _whatsapp_send_to_jid_detailed  # noqa: PLC0415
+    ok, error_kind = _whatsapp_send_to_jid_detailed(
         jid, body,
         anti_loop=False,
         reply_to=reply_to_payload,
     )
     if not ok:
-        # Can't distinguish "bridge down" from "bridge rejected" cheaply
-        # — the helper swallows the HTTP code. Return 502 (bad gateway)
-        # to signal an upstream issue vs 400 (client-side) for shape
-        # problems caught above.
-        raise HTTPException(status_code=502, detail="bridge WhatsApp no respondió (localhost:8088 no disponible o rechazó el mensaje)")
+        # M2 fix 2026-05-09: distinguir bridge unreachable vs rejected vs
+        # timeout para que el user sepa si reintentar (timeout) o no
+        # (rejected). El helper detailed devuelve `error_kind` accionable.
+        detail_map = {
+            "unreachable": (
+                "bridge WhatsApp no disponible (proceso caído o puerto bloqueado). "
+                "Verificá `rag bridge status` o `launchctl list | grep whatsapp-bridge`."
+            ),
+            "timeout": (
+                "bridge WhatsApp no respondió en 3s (puede haberse entregado igual). "
+                "Reintentar después de ~10s; si persiste, mirá los logs del bridge."
+            ),
+            "rejected": (
+                "bridge WhatsApp rechazó el envío (JID inválido, sesión caducada, "
+                "etc.). Revisá el formato del JID o ejecutá `rag bridge reauth`."
+            ),
+            "disabled": (
+                "envío de WhatsApp deshabilitado por env (RAG_DISABLE_WHATSAPP_SEND "
+                "o RAG_TESTING)."
+            ),
+        }
+        msg = detail_map.get(error_kind, f"bridge WhatsApp falló ({error_kind})")
+        # 503 cuando es claramente unreachable (transient), 502 cuando
+        # rejected (no reintentar), 500 cuando es ambiguous.
+        if error_kind == "unreachable":
+            status = 503
+        elif error_kind == "rejected":
+            status = 502
+        else:
+            status = 502
+        raise HTTPException(status_code=status, detail=msg)
     # Log minimal audit trail — we don't persist the message body for
     # privacy, just the event + jid + proposal_id so we can correlate
     # with the chat transcript later if needed.
@@ -3676,11 +3706,18 @@ def whatsapp_scheduled_list(
         raise HTTPException(status_code=500, detail=f"error listando scheduled: {e}") from e
 
 
-@app.post("/api/whatsapp/scheduled/{scheduled_id}/cancel")
+@app.post(
+    "/api/whatsapp/scheduled/{scheduled_id}/cancel",
+    dependencies=[Depends(_require_admin_token)],
+)
 def whatsapp_scheduled_cancel(scheduled_id: int) -> dict:
     """Cancela un mensaje pending. Idempotente: si ya está en otro
     estado, devuelve ``{ok: false, reason}`` sin error 4xx/5xx (el
     dashboard puede simplemente refrescar la fila).
+
+    Auth desde 2026-05-09: requiere admin token (CLAUDE.md exige auth
+    en acciones destructivas — antes cualquiera en la LAN podía cancelar
+    scheduled adivinando el id ascending 1..N).
     """
     try:
         from rag import wa_scheduled  # noqa: PLC0415
@@ -3696,7 +3733,10 @@ class WhatsAppRescheduleRequest(BaseModel):
     scheduled_for: str  # mismo formato que WhatsAppSendRequest
 
 
-@app.post("/api/whatsapp/scheduled/{scheduled_id}/reschedule")
+@app.post(
+    "/api/whatsapp/scheduled/{scheduled_id}/reschedule",
+    dependencies=[Depends(_require_admin_token)],
+)
 def whatsapp_scheduled_reschedule(
     scheduled_id: int,
     req: WhatsAppRescheduleRequest,
@@ -3704,6 +3744,8 @@ def whatsapp_scheduled_reschedule(
     """Reprograma un mensaje pending para una nueva fecha/hora. Solo
     funciona si el row está en ``status='pending'`` (mismo guard que
     cancel — no rescheduleamos `sent`/`failed`/`cancelled`).
+
+    Auth desde 2026-05-09: requiere admin token, mismo motivo que cancel.
     """
     try:
         scheduled_for_utc = _parse_scheduled_for_to_utc(req.scheduled_for)

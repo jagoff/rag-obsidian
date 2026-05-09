@@ -46372,7 +46372,13 @@ def _enrich_wa(entities: dict, days: int = 7, max_hits: int = 2) -> list[dict]:
     if not terms or not WHATSAPP_DB_PATH.is_file():
         return []
     import sqlite3
-    cutoff = (datetime.now() - timedelta(days=days)).isoformat(sep=" ", timespec="seconds")
+    # 2026-05-09: usar `_bridge_ts_bound` para que el bound matchee el formato
+    # `YYYY-MM-DD HH:MM:SS-03:00` que guarda el bridge. Antes pasábamos
+    # `isoformat(sep=" ")` sin offset → comparar lex con la columna que SÍ
+    # tiene offset daba WRONG (el char `-` < cualquier digit, así que `>` lex
+    # rompía y este enrich devolvía 0 hits silently).
+    from rag.integrations.whatsapp.fetch import _bridge_ts_bound  # noqa: PLC0415
+    cutoff = _bridge_ts_bound(datetime.now() - timedelta(days=days))
     like_clauses = " OR ".join(["LOWER(content) LIKE ?"] * len(terms))
     params: list = [cutoff] + [f"%{t.lower()}%" for t in terms]
     sql = f"""

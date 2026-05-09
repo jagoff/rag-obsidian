@@ -68,6 +68,7 @@ from rag.integrations.whatsapp._constants import (  # noqa: F401
 from rag.integrations.whatsapp.send import (  # noqa: F401
     _ambient_whatsapp_send,
     _whatsapp_send_to_jid,
+    _whatsapp_send_to_jid_detailed,
 )
 
 # ── Contacts (vault + Apple My Card) ────────────────────────────────────────
@@ -227,6 +228,7 @@ __all__ = [
     # Send
     "_ambient_whatsapp_send",
     "_whatsapp_send_to_jid",
+    "_whatsapp_send_to_jid_detailed",
     # Contacts
     "_normalize_hint",
     "_strip_emoji_and_symbols",

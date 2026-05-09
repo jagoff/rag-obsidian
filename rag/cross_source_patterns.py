@@ -526,10 +526,19 @@ def _c_wa_outbound_chars(start: str, end: str) -> dict[str, float]:
     """Promedio de chars/mensaje outbound por día desde el bridge SQLite."""
     try:
         from rag.integrations.whatsapp import WHATSAPP_BRIDGE_DB_PATH  # noqa: PLC0415
+        from rag.integrations.whatsapp.fetch import _bridge_ts_bound  # noqa: PLC0415
         db = Path(WHATSAPP_BRIDGE_DB_PATH)
         if not db.exists():
             return {}
         import sqlite3 as _sql  # noqa: PLC0415
+        # 2026-05-09: bounds con offset matching bridge format. Antes pasábamos
+        # `f"{start}T00:00:00"` con `T` → lex compare contra `... HH:MM:SS-03:00`
+        # con espacio → `T` (84) > ` ` (32), así que ALL rows quedaban excluídas
+        # por el `>= ?` upper bound. Métrica devolvía dict vacío permanente.
+        start_dt = datetime.strptime(start, "%Y-%m-%d")
+        end_dt = datetime.strptime(end, "%Y-%m-%d") + timedelta(days=1)
+        start_bound = _bridge_ts_bound(start_dt)
+        end_bound = _bridge_ts_bound(end_dt)
         conn = _sql.connect(f"file:{db}?mode=ro", uri=True, timeout=5.0)
         try:
             rows = conn.execute(
@@ -538,7 +547,7 @@ def _c_wa_outbound_chars(start: str, end: str) -> dict[str, float]:
                 "WHERE is_from_me=1 AND content IS NOT NULL "
                 "AND timestamp >= ? AND timestamp < ? "
                 "GROUP BY d",
-                (f"{start}T00:00:00", f"{end}T23:59:59"),
+                (start_bound, end_bound),
             ).fetchall()
             return {r[0]: float(r[1]) for r in rows if r[1] is not None}
         finally:

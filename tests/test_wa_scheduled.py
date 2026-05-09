@@ -785,6 +785,17 @@ def test_endpoint_list_scheduled_pending(http_client, isolated_state_db):
     assert [r["id"] for r in body["items"]] == [sid_a, sid_b]
 
 
+def _admin_headers() -> dict:
+    """Auth headers para endpoints destructivos (cancel/reschedule).
+
+    Lee el admin token actual del web server (creado on first boot).
+    Pre-2026-05-09 estos endpoints NO requerían auth — los tests pegaban
+    sin headers. Ahora sí — agregamos Bearer header.
+    """
+    from web.server import _ADMIN_TOKEN
+    return {"Authorization": f"Bearer {_ADMIN_TOKEN}"}
+
+
 def test_endpoint_cancel_flow(http_client, isolated_state_db):
     """POST /api/whatsapp/scheduled/{id}/cancel — primer call cancela,
     segundo idempotente con `ok: false, reason: ...`."""
@@ -793,13 +804,14 @@ def test_endpoint_cancel_flow(http_client, isolated_state_db):
         scheduled_for_utc=_future_iso(60),
     )
     sid = out["id"]
-    r1 = http_client.post(f"/api/whatsapp/scheduled/{sid}/cancel")
+    headers = _admin_headers()
+    r1 = http_client.post(f"/api/whatsapp/scheduled/{sid}/cancel", headers=headers)
     assert r1.status_code == 200
     body1 = r1.json()
     assert body1["ok"] is True
     assert body1["status"] == "cancelled"
     # Segundo intento — idempotente.
-    r2 = http_client.post(f"/api/whatsapp/scheduled/{sid}/cancel")
+    r2 = http_client.post(f"/api/whatsapp/scheduled/{sid}/cancel", headers=headers)
     assert r2.status_code == 200
     body2 = r2.json()
     assert body2["ok"] is False
@@ -818,6 +830,7 @@ def test_endpoint_reschedule_changes_date(http_client, isolated_state_db):
     resp = http_client.post(
         f"/api/whatsapp/scheduled/{sid}/reschedule",
         json={"scheduled_for": new_iso},
+        headers=_admin_headers(),
     )
     assert resp.status_code == 200
     body = resp.json()

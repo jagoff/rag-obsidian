@@ -15,9 +15,10 @@ Tres surfaces:
 Invariantes:
 - Silent-fail: cualquier excepción → False, nunca raise out.
 - Anti-loop marker U+200B se prefixa SOLO cuando ``anti_loop=True``.
-- Bridge HTTP NO soporta ``ContextInfo``/quoted messages todavía. Pasamos
-  ``reply_to`` forward-compatible para que cuando el bridge agregue soporte,
-  no haya cambio de cliente.
+- Bridge HTTP soporta ``ContextInfo``/quoted messages desde 2026-05-09.
+  ``reply_to`` se propaga al payload y el bridge construye el
+  ``ExtendedTextMessage`` con ContextInfo (cita boxed nativa de WhatsApp
+  visible al destinatario).
 
 Why deferred imports (`from rag import ...` adentro del cuerpo):
 ``AMBIENT_WHATSAPP_BRIDGE_URL`` y ``_AMBIENT_ANTILOOP_MARKER`` viven en
@@ -71,6 +72,76 @@ def _ambient_whatsapp_send(jid: str, text: str) -> bool:
     # propagate to the call site.
     from rag.integrations.whatsapp import _whatsapp_send_to_jid
     return _whatsapp_send_to_jid(jid, text, anti_loop=True)
+
+
+def _whatsapp_send_to_jid_detailed(
+    jid: str,
+    text: str,
+    *,
+    anti_loop: bool = True,
+    reply_to: dict | None = None,
+) -> tuple[bool, str]:
+    """Variante de `_whatsapp_send_to_jid` que devuelve `(ok, error_kind)`
+    en lugar de solo bool. `error_kind` es uno de:
+
+      - `"sent"` — 2xx del bridge.
+      - `"disabled"` — RAG_DISABLE_WHATSAPP_SEND / RAG_TESTING activo.
+      - `"unreachable"` — bridge no responde (connection refused, timeout
+        a nivel TCP). El daemon probablemente está caído o el puerto cambió.
+      - `"rejected"` — bridge devolvió 4xx/5xx (e.g., JID inválido, jurar
+        inactiva). Reintentar no va a ayudar sin intervención.
+      - `"timeout"` — request fue aceptada pero excedió 3s. Puede haber
+        sido entregada o no — ambiguo.
+      - `"error:<repr>"` — cualquier otra excepción no catalogada.
+
+    Endpoints HTTP usan esto para devolver un detail más útil al user
+    (e.g., 502 con detail "bridge unreachable" vs 502 con detail "bridge
+    rejected" → distinto remediation).
+    """
+    from rag import AMBIENT_WHATSAPP_BRIDGE_URL, _AMBIENT_ANTILOOP_MARKER
+    import urllib.request
+    import urllib.error
+    if (os.environ.get("RAG_DISABLE_WHATSAPP_SEND", "").lower() in ("1", "true", "yes")
+        or os.environ.get("RAG_TESTING", "").lower() in ("1", "true", "yes")):
+        return False, "disabled"
+    payload_text = text
+    if anti_loop and not text.startswith(_AMBIENT_ANTILOOP_MARKER):
+        payload_text = _AMBIENT_ANTILOOP_MARKER + text
+    body: dict = {
+        "recipient": jid,
+        "message": payload_text,
+    }
+    if reply_to and isinstance(reply_to, dict):
+        rt_id = reply_to.get("message_id") or reply_to.get("id")
+        if rt_id:
+            body["reply_to"] = {
+                "message_id": str(rt_id),
+                "original_text": str(reply_to.get("original_text") or reply_to.get("text") or "")[:1024],
+                "sender_jid": str(reply_to.get("sender_jid") or reply_to.get("from_jid") or ""),
+            }
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        AMBIENT_WHATSAPP_BRIDGE_URL, data=data,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            if 200 <= resp.status < 300:
+                return True, "sent"
+            return False, "rejected"
+    except urllib.error.HTTPError:
+        return False, "rejected"
+    except urllib.error.URLError as exc:
+        # Differential: TimeoutError es timeout-after-connect; otros URLError
+        # tipo ConnectionRefusedError son unreachable.
+        reason = getattr(exc, "reason", exc)
+        if isinstance(reason, TimeoutError):
+            return False, "timeout"
+        return False, "unreachable"
+    except TimeoutError:
+        return False, "timeout"
+    except Exception as exc:
+        return False, f"error:{exc!r}"[:120]
 
 
 def _whatsapp_send_to_jid(
@@ -135,9 +206,9 @@ def _whatsapp_send_to_jid(
         "message": payload_text,
     }
     if reply_to and isinstance(reply_to, dict):
-        # Forward-compatible: el bridge actual ignora estos campos pero
-        # cuando agreguen ContextInfo los va a leer sin necesidad de
-        # tocar el cliente. Ver docstring arriba.
+        # Bridge ContextInfo desde 2026-05-09: estos campos disparan la
+        # construcción de ExtendedTextMessage con cita boxed nativa.
+        # Ver docstring arriba.
         rt_id = reply_to.get("message_id") or reply_to.get("id")
         if rt_id:
             body["reply_to"] = {
@@ -164,4 +235,5 @@ def _whatsapp_send_to_jid(
 __all__ = [
     "_ambient_whatsapp_send",
     "_whatsapp_send_to_jid",
+    "_whatsapp_send_to_jid_detailed",
 ]

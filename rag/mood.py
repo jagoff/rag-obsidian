@@ -718,8 +718,13 @@ def _wa_fetch_outbound_chars(
     `len(content)` de mensajes con `is_from_me=1` entre los dos
     timestamps. Silent-fail → []."""
     import sqlite3  # noqa: PLC0415
-    since_iso = datetime.fromtimestamp(since_ts).isoformat()
-    until_iso = datetime.fromtimestamp(until_ts).isoformat()
+    # 2026-05-09: bounds matcheando el formato `YYYY-MM-DD HH:MM:SS-03:00`
+    # del bridge para que la comparación lex contra `messages.timestamp`
+    # use el índice `idx_messages_ts`. Antes `isoformat()` daba `T` separator
+    # y sin offset → lex compare WRONG, mood scoring devolvía [] siempre.
+    from rag.integrations.whatsapp.fetch import _bridge_ts_bound  # noqa: PLC0415
+    since_bound = _bridge_ts_bound(datetime.fromtimestamp(since_ts))
+    until_bound = _bridge_ts_bound(datetime.fromtimestamp(until_ts))
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
     except Exception as exc:
@@ -729,7 +734,7 @@ def _wa_fetch_outbound_chars(
         rows = conn.execute(
             "SELECT content FROM messages "
             "WHERE is_from_me=1 AND timestamp >= ? AND timestamp < ?",
-            (since_iso, until_iso),
+            (since_bound, until_bound),
         ).fetchall()
     except Exception as exc:
         _silent_log_safe("mood_wa_query_failed", exc)

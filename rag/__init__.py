@@ -46050,74 +46050,8 @@ def wake_up(ctx, dry_run: bool, skip_index: bool, skip_bookmarks: bool,
 
 
 # ── EPISODIC MEMORY — PHASE 2 CONSOLIDATION (rag consolidate) ───────────────
-# Promotes recurring conversation clusters from
-# 99-obsidian/99-AI/conversations/ into PARA and
-# archives the originals. All heavy lifting lives in
-# scripts/consolidate_conversations.py — this is just the CLI shim so the
-# command shows up in `rag --help` + the weekly launchd service can invoke
-# it as `rag consolidate`. See plans/episodic-memory.md for rationale.
-
-
-@cli.command()
-@click.option("--window-days", default=14, show_default=True,
-              help="Conversaciones a considerar (por mtime)")
-@click.option("--threshold", default=0.75, show_default=True,
-              help="Cosine mínimo para agrupar (0.0–1.0)")
-@click.option("--min-cluster", default=3, show_default=True,
-              help="Tamaño mínimo de cluster para promover")
-@click.option("--apply", is_flag=True,
-              help="Escribir cambios al vault (default: dry-run)")
-@click.option("--json", "as_json", is_flag=True,
-              help="Emitir summary como JSON (para servicios / scripts)")
-def consolidate(window_days: int, threshold: float, min_cluster: int,
-                apply: bool, as_json: bool):
-    """Agrupar conversaciones relacionadas y promover a PARA (Phase 2).
-
-    Por default es dry-run — pasá --apply para escribir al vault.
-
-    Barre `99-obsidian/99-AI/conversations/` buscando clusters semánticamente similares
-    (embedding cosine ≥ --threshold, tamaño ≥ --min-cluster) en la ventana
-    de --window-days. Cada cluster se sintetiza en una sola nota consolidada
-    (qwen2.5:7b default) y se promueve a `01-Projects/` o `03-Resources/`
-    según un clasificador de intención (verbos de acción + fechas → project,
-    resto → resource). Los originales se archivan en
-    `04-Archive/conversations/YYYY-MM/` (excluido del índice).
-
-    Corre semanalmente via launchd (Lunes 06:00) — instalable con `rag setup`.
-    El plist generado incluye --apply; re-corré `rag setup` si actualizaste.
-    """
-    dry_run = not apply  # invertimos: --apply activa, default es dry-run
-    from scripts.consolidate_conversations import run as _run
-    summary = _run(
-        window_days=window_days,
-        threshold=threshold,
-        min_cluster=min_cluster,
-        dry_run=dry_run,
-    )
-    if as_json:
-        click.echo(json.dumps(summary, ensure_ascii=False, indent=2))
-        return
-    prefix = "[dry-run] " if dry_run else ""
-    console.print(
-        f"{prefix}{summary['n_conversations']} conversaciones en ventana · "
-        f"{summary['n_clusters']} clusters · "
-        f"[green]{summary['n_promoted']}[/green] promovidos · "
-        f"{summary['n_archived']} archivados · "
-        f"[dim]{summary['duration_s']}s[/dim]"
-    )
-    for c in summary["clusters"]:
-        size = c.get("size", 0)
-        target = c.get("target", "?")
-        title = c.get("title", "(sin título)")
-        if "error" in c:
-            console.print(
-                f"  [red]✗[/red] [{size}] {target}: {title} — "
-                f"[dim]{c['error']}[/dim]"
-            )
-        elif dry_run:
-            console.print(f"  [yellow]→[/yellow] [{size}] {target}: {title}")
-        else:
-            console.print(f"  [green]✓[/green] [{size}] {target}: {title}")
+# Phase 3 cont de modularizacion: el CLI command vive en
+# `rag/cli/consolidate.py`. Registro al final del modulo.
 
 
 # ── VAULT TRANSIENT CLEANUP (rag vault-cleanup) ─────────────────────────────
@@ -57926,6 +57860,9 @@ cli.add_command(config_cli)  # `rag config` (Phase 3 cont)
 
 from rag.cli.ask import ask_cli  # noqa: E402, F401
 cli.add_command(ask_cli)  # `rag ask` (Phase 3 cont)
+
+from rag.cli.consolidate import consolidate  # noqa: E402, F401
+cli.add_command(consolidate)  # `rag consolidate` (Phase 3 cont)
 
 from rag.cli.daemons_control import (  # noqa: E402, F401
     _all_daemon_labels,

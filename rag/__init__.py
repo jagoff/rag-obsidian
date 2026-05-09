@@ -6900,6 +6900,25 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
     (
+        # VLM receipt parser cache (VLM #10, 2026-05-09) — JSON estructurado
+        # extraído de recibos / facturas / tickets via mlx-vlm con
+        # `_VLM_RECEIPT_PROMPT`. `parsed_json` guarda el dict serializado
+        # (`{merchant, date, total, currency, items, category}`) o "" si
+        # el VLM detectó que NO es un recibo. Misma invariante que
+        # `rag_vlm_captions`: clave = path absoluto, mtime invalidador.
+        # Sin TTL — el contenido del recibo no envejece.
+        "rag_vlm_receipts",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_vlm_receipts ("
+            " image_path TEXT PRIMARY KEY,"
+            " mtime REAL NOT NULL,"
+            " parsed_json TEXT NOT NULL,"
+            " model TEXT NOT NULL,"
+            " parsed_at REAL NOT NULL"
+            ")",
+        ),
+    ),
+    (
         # Entity extraction (Improvement #2) — canonical entity store
         # populated by GLiNER (or qwen2.5:3b fallback) during indexing.
         # Discriminador: (normalized, entity_type) — "juan" como person es
@@ -20209,7 +20228,7 @@ _HIGHLIGHTED_COMMANDS = {"chat"}
 # agregar aquí o caen automáticamente en "Otros".
 _COMMAND_GROUPS: list[tuple[str, list[str]]] = [
     ("Chat & búsqueda", ["chat", "query", "do", "links"]),
-    ("Captura & ingesta", ["capture", "read", "bookmarks", "wa-tasks"]),
+    ("Captura & ingesta", ["capture", "read", "bookmarks", "wa-tasks", "receipt", "chart"]),
     ("Inbox & filing", ["inbox", "file", "autotag", "fix"]),
     ("Grafo & exploración", ["wikilinks", "graph", "surface", "dupes", "timeline", "prep"]),
     ("Briefs & cabos sueltos", ["morning", "today", "digest", "pendientes", "followup"]),
@@ -53370,6 +53389,111 @@ def _extract_and_index_entities_for_chunks(
 # tests that monkey-patch them.
 
 
+@cli.command()
+@click.argument("image_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--json", "as_json", is_flag=True,
+              help="Output JSON estructurado (para subprocess parse / pipes).")
+@click.option("--no-cache", is_flag=True,
+              help="Forzar re-parse aunque haya cache hit (debug / re-runs).")
+def receipt(image_path: Path, as_json: bool, no_cache: bool):
+    """Parsear recibo / factura / ticket → JSON estructurado.
+
+    Usa granite-vision (mlx-vlm) con prompt especializado. Devuelve
+    dict con `merchant`, `date`, `total`, `currency`, `items`,
+    `category`. Cachea en `rag_vlm_receipts` por `(path, mtime)`.
+
+    Si la imagen NO es un recibo, sale con exit code 2.
+
+    Exit codes:
+      0 = parseado OK
+      1 = VLM falló / JSON inválido / imagen no accesible
+      2 = imagen no es recibo
+    """
+    if no_cache:
+        # Invalidate cache — escribe mtime falso para forzar miss
+        try:
+            with _ragvec_state_conn() as conn:
+                conn.execute(
+                    "DELETE FROM rag_vlm_receipts WHERE image_path = ?",
+                    (str(image_path.resolve()),),
+                )
+        except Exception:
+            pass
+
+    parsed = _vlm_parse_receipt(image_path)
+    if parsed is None:
+        msg = {"ok": False, "error": "not_a_receipt_or_vlm_failed"}
+        if as_json:
+            click.echo(json.dumps(msg, ensure_ascii=False))
+        else:
+            console.print(
+                f"[yellow]✗[/yellow] no se pudo parsear como recibo: "
+                f"[dim]{image_path.name}[/dim]"
+            )
+        raise SystemExit(2)
+
+    if as_json:
+        click.echo(json.dumps(parsed, ensure_ascii=False))
+    else:
+        merchant = parsed.get("merchant") or "?"
+        date_s = parsed.get("date") or "?"
+        total = parsed.get("total")
+        currency = parsed.get("currency") or ""
+        category = parsed.get("category") or "other"
+        items = parsed.get("items") or []
+        console.print(f"[bold cyan]{merchant}[/bold cyan] · {date_s} · "
+                      f"[bold]{total} {currency}[/bold] · "
+                      f"[dim]{category}[/dim]")
+        if items:
+            console.print(f"[dim]{len(items)} items:[/dim]")
+            for it in items[:10]:
+                if not isinstance(it, dict):
+                    continue
+                desc = it.get("description") or "?"
+                qty = it.get("quantity") or "?"
+                price = it.get("price") or "?"
+                console.print(f"  · {desc} ×{qty} @ {price}")
+            if len(items) > 10:
+                console.print(f"  [dim]... +{len(items) - 10} más[/dim]")
+
+
+@cli.command()
+@click.argument("image_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--json", "as_json", is_flag=True,
+              help="Output JSON con caption + image_path (para subprocess parse).")
+def chart(image_path: Path, as_json: bool):
+    """Describir gráfico / chart / dashboard via VLM con prompt chart-aware.
+
+    Útil para screenshots de Grafana, dashboards, gráficos en papers/blogs.
+    Devuelve caption específico (tipo + ejes + valores clave) en lugar
+    del caption genérico de `_caption_image`.
+
+    Exit codes:
+      0 = caption generado OK
+      1 = VLM falló o detectó que NO es un gráfico
+    """
+    caption = _vlm_describe_chart(image_path)
+    if not caption:
+        msg = {"ok": False, "error": "not_a_chart_or_vlm_failed"}
+        if as_json:
+            click.echo(json.dumps(msg, ensure_ascii=False))
+        else:
+            console.print(
+                f"[yellow]✗[/yellow] no parece un gráfico: "
+                f"[dim]{image_path.name}[/dim]"
+            )
+        raise SystemExit(1)
+
+    if as_json:
+        click.echo(json.dumps({
+            "ok": True,
+            "image_path": str(image_path.resolve()),
+            "caption": caption,
+        }, ensure_ascii=False))
+    else:
+        console.print(caption)
+
+
 @cli.command(name="send-mail")
 @click.option("--to", required=True, help="Email destinatario (ej. juan@ejemplo.com)")
 @click.option("--subject", default="", help="Asunto. Default: '(sin asunto)'.")
@@ -53596,9 +53720,14 @@ from rag.ocr import (  # noqa: E402, F401
     _VLM_CAPTION_MAX_CHARS,
     _VLM_CAPTION_MAX_PER_RUN,
     _VLM_CAPTION_PROMPT,
+    _VLM_CHART_PROMPT,
     _VLM_FALLBACK_MIN_OCR,
+    _VLM_RECEIPT_PROMPT,
     VLM_MODEL,
     _caption_image,
+    _extract_json_object,
+    _vlm_describe_chart,
+    _vlm_parse_receipt,
     _cita_detect_enabled,
     _cita_result,
     _detect_cita_from_ocr,

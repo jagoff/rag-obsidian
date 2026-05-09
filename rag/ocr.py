@@ -521,6 +521,50 @@ _VLM_CAPTION_PROMPT = (
 )
 
 
+# Prompt especializado para recibos / facturas / tickets (VLM #10 task).
+# El VLM emite JSON estructurado parseable. Formato fijo para que el caller
+# extraiga total/merchant/date programáticamente sin LLM judge encima.
+# El prompt acepta cualquier formato (papel, PDF screenshot, app móvil) y
+# devuelve "null" en campos que no encuentre — evita hallucination por
+# campo obligatorio. El parser tolera JSON con prefijos/sufijos no-JSON
+# (markdown fences, prosa de "acá tenés:" delante) — recortar por la 1ra `{`.
+_VLM_RECEIPT_PROMPT = (
+    "Extraé los datos de este recibo / factura / ticket como JSON. "
+    "Campos obligatorios:\n"
+    '  - merchant: nombre del comercio (string)\n'
+    '  - date: fecha en formato YYYY-MM-DD (string)\n'
+    '  - total: monto total como número (number, sin símbolo)\n'
+    '  - currency: moneda ISO 4217 ("ARS", "USD", "EUR", etc.) (string)\n'
+    '  - items: lista de items con {description, quantity, price} (array)\n'
+    '  - category: una de "food", "transport", "shopping", "services", '
+    '"entertainment", "health", "other" (string)\n\n'
+    "Devolvé SOLO el JSON, sin markdown fences, sin prosa antes ni después. "
+    "Si un campo no se ve claramente, usá null. NO inventes datos. "
+    "Si la imagen NO es un recibo, devolvé exactamente: "
+    '{"error": "not_a_receipt"}'
+)
+
+
+# Prompt especializado para gráficos / charts / dashboards. Caption-style
+# (no JSON) pero chart-aware: identifica tipo (bar, line, pie, scatter),
+# ejes, rango de valores, y la métrica principal con su valor. Útil para
+# screenshots de Grafana/dashboards/papers/blogs que el caption genérico
+# describe muy alto-nivel. Output: prosa española corta optimizada para
+# grep ("max 25K en marzo", "tendencia descendente Q4 2026").
+_VLM_CHART_PROMPT = (
+    "Esta imagen es un gráfico, chart o dashboard. Describilo en 2-3 "
+    "oraciones (≤120 palabras) cubriendo:\n"
+    "  - Tipo: bar / line / pie / scatter / area / heatmap / dashboard.\n"
+    "  - Qué representa (título o métrica principal si está visible).\n"
+    "  - Eje X y eje Y (qué dimensiones / unidades / rango).\n"
+    "  - Valores clave: máximo, mínimo, tendencia, el data point más "
+    "    notable. Transcribí los números literales que veas.\n"
+    "  - Si hay múltiples series, nombrarlas.\n\n"
+    "Sé específico con números y nombres. Si NO es un gráfico, devolvé: "
+    "'no es un gráfico'. Sin markdown, sin preámbulos. Español."
+)
+
+
 def _caption_image(image_path: Path) -> str:
     """VLM caption de `image_path` — fallback cuando el OCR devolvió poco.
 
@@ -589,6 +633,169 @@ def _caption_image(image_path: Path) -> str:
         _silent_log(f"vlm_caption_cache_write:{abs_key}", exc)
 
     return caption
+
+
+# ── VLM #10: Receipt parser + Chart describer ────────────────────────────────
+
+
+def _extract_json_object(text: str) -> str | None:
+    """Recorta un objeto JSON balanceado del primer `{` al `}` que cierra.
+    Tolera markdown fences (```json ... ```), prosa antes/después, comillas
+    escapadas dentro de strings. Devuelve None si no hay JSON parseable.
+    """
+    if not text:
+        return None
+    s = text.strip()
+    # Strip markdown code fences si están
+    if s.startswith("```"):
+        # ```json\n...\n``` o ```\n...\n```
+        first_nl = s.find("\n")
+        if first_nl > 0:
+            s = s[first_nl + 1:]
+        if s.endswith("```"):
+            s = s[:-3].rstrip()
+    start = s.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_str = False
+    escape = False
+    for i in range(start, len(s)):
+        ch = s[i]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return s[start:i + 1]
+    return None
+
+
+def _vlm_parse_receipt(image_path: "str | Path") -> dict | None:
+    """Parse recibo / factura / ticket via VLM → dict estructurado.
+
+    Devuelve dict con shape `{merchant, date, total, currency, items, category}`
+    o `None` si:
+      - VLM falla / vacío.
+      - JSON no parseable.
+      - VLM detectó que NO es recibo (`{"error": "not_a_receipt"}` se
+        normaliza a `None` con flag interno).
+      - cualquier excepción.
+
+    Silent-fail siempre. NO eleva. Para debugging: `RAG_DEBUG=1`.
+
+    Cache: `rag_vlm_receipts` con key `(abs_path, mtime)`. Re-correr sobre
+    la misma imagen es O(1) SQL lookup. Cache invalidates cuando mtime
+    cambia (re-foto del recibo, edit, rotate).
+    """
+    import json as _json
+    from rag import _silent_log, _ragvec_state_conn  # noqa: PLC0415
+    import rag as _rag  # noqa: PLC0415
+
+    if not _vlm_caption_enabled():
+        return None
+    p = Path(str(image_path))
+    try:
+        mtime = p.stat().st_mtime
+    except OSError:
+        return None
+    abs_key = str(p.resolve())
+
+    # Cache read.
+    try:
+        with _ragvec_state_conn() as conn:
+            row = conn.execute(
+                "SELECT mtime, parsed_json FROM rag_vlm_receipts WHERE image_path = ?",
+                (abs_key,),
+            ).fetchone()
+            if row is not None and abs(row[0] - mtime) < 1e-6:
+                cached = row[1] or ""
+                if not cached:
+                    return None
+                try:
+                    obj = _json.loads(cached)
+                    return obj if isinstance(obj, dict) else None
+                except Exception:
+                    return None
+    except Exception as exc:
+        _silent_log("vlm_receipt_cache_read", exc)
+
+    if not _vlm_caption_budget_available():
+        return None
+
+    raw = _rag._vlm_describe(abs_key, prompt=_VLM_RECEIPT_PROMPT)
+    _vlm_caption_budget_consume()
+
+    parsed: dict | None = None
+    json_blob = _extract_json_object(raw or "")
+    if json_blob:
+        try:
+            obj = _json.loads(json_blob)
+            if isinstance(obj, dict):
+                if obj.get("error") == "not_a_receipt":
+                    parsed = None
+                else:
+                    parsed = obj
+        except Exception as exc:
+            _silent_log(f"vlm_receipt_json_parse:{abs_key}", exc)
+
+    # Cache write — siempre (incluso None) para no re-llamar al modelo.
+    cached_value = _json.dumps(parsed, ensure_ascii=False) if parsed else ""
+    model_id = _rag.VLM_MODEL
+    try:
+        with _ragvec_state_conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO rag_vlm_receipts "
+                "(image_path, mtime, parsed_json, model, parsed_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (abs_key, float(mtime), cached_value, model_id, time.time()),
+            )
+    except Exception as exc:
+        _silent_log(f"vlm_receipt_cache_write:{abs_key}", exc)
+
+    return parsed
+
+
+def _vlm_describe_chart(image_path: "str | Path") -> str:
+    """Caption chart-aware via VLM. Prompt especializado pide tipo + ejes +
+    valores clave. Uso: screenshots de Grafana, dashboards, gráficos en
+    papers/blogs. Devuelve string normalizado o "" si VLM falla / detectó
+    que no es chart.
+
+    NO usa cache propio — reusa `rag_vlm_captions` con un marker en el
+    caption mismo (`[chart]` prefix) para diferenciar de captions genéricos
+    si el caller reusa la misma imagen para ambos. Idempotente.
+
+    Silent-fail siempre.
+    """
+    from rag import _silent_log  # noqa: PLC0415
+    import rag as _rag  # noqa: PLC0415
+    if not _vlm_caption_enabled():
+        return ""
+    if not _vlm_caption_budget_available():
+        return ""
+    try:
+        raw = _rag._vlm_describe(str(image_path), prompt=_VLM_CHART_PROMPT)
+    except Exception as exc:
+        _silent_log(f"vlm_chart:{image_path}", exc)
+        return ""
+    _vlm_caption_budget_consume()
+    cap = (raw or "").strip()
+    cap = cap.strip("`\"' \n\r\t").replace("\n\n", " ").replace("\n", " ")
+    if cap.lower() in ("no es un gráfico", "no es un grafico", "no es chart"):
+        return ""
+    return cap[:_VLM_CAPTION_MAX_CHARS]
 
 
 def _image_text_or_caption(image_path: Path) -> tuple[str, str]:

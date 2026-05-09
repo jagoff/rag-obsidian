@@ -1123,6 +1123,19 @@ def _bump_silent_log_counter() -> None:
             pass
 
 
+# L-1 fix (2026-05-08): redacción de tokens OAuth para sinks de Google APIs.
+# `RefreshError` / `HttpError` de google-auth a veces embeben fragmentos de
+# token ("Bad Request: invalid_grant: token <abc123>...") en el message del
+# exc. Sin redact, los tokens leakean a `silent_errors.jsonl` (chmod 0o600
+# pero igual está en disco). El regex matchea key=value y key:"value" con
+# sufijo alfanumérico ≥6 chars — suficiente para token frags reales sin
+# chocar con strings inofensivos tipo "token: missing".
+_TOKEN_REDACT_RE = re.compile(
+    r'(?i)(token|access_token|refresh_token|client_secret)["\':=]\s*[A-Za-z0-9._\-]{6,}'
+)
+_TOKEN_REDACT_PREFIXES = ("gmail_", "drive_", "calendar_")
+
+
 def _silent_log(where: str, exc: BaseException, *, with_traceback: bool = False) -> None:
     """Record a swallowed exception without raising or blocking.
 
@@ -1167,6 +1180,10 @@ def _silent_log(where: str, exc: BaseException, *, with_traceback: bool = False)
             except Exception:
                 pass
         line = json.dumps(record, ensure_ascii=False) + "\n"
+        # L-1 (2026-05-08): redact OAuth token frags antes del write. Gated
+        # por prefix para no pagar el regex en cada call site.
+        if where.startswith(_TOKEN_REDACT_PREFIXES):
+            line = _TOKEN_REDACT_RE.sub(r"\1=<REDACTED>", line)
         _LOG_QUEUE.put_nowait((SILENT_ERRORS_LOG_PATH, line))
     except Exception:
         pass
@@ -2704,8 +2721,15 @@ def _load_cross_source_filters() -> dict:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             raw = {}
-    except Exception:
-        raw = {}
+    except Exception as exc:
+        # H-7 fix (2026-05-08): NO memoizar `{}` en falla transitoria.
+        # Pre-fix: un YAML parse error o read error one-shot deshabilitaba
+        # *todas* las reglas cross-source hasta el próximo restart, porque
+        # la rama de error caía al cache write final. Ahora: log + return
+        # `{}` SIN tocar el cache, así el próximo call reintenta el read.
+        _silent_log("cross_source_filters_load", exc)
+        return {}
+    # Cache solo en el success path — failure transient no envenena el slot.
     _CROSS_SOURCE_FILTERS_CACHE = raw
     _CROSS_SOURCE_FILTERS_MTIME = mtime
     return raw
@@ -10637,6 +10661,10 @@ def _get_local_embedder():
         except Exception as _exc:
             if os.environ.get("RAG_DEBUG"):
                 print(f"[local-embed:{backend}] unavailable ({_exc}) — raising (no fallback)", flush=True)
+            # H-6 fix (2026-05-08): _silent_log para que la falla del loader
+            # no quede invisible. Pre-fix: HF cache missing → callers wait
+            # 6s en `_local_embedder_ready.wait()` y degradan silenciosamente.
+            _silent_log("local_embedder_load_failed", _exc)
             _local_embedder = None  # stays None; callers raise (no fallback)
     return _local_embedder
 
@@ -14588,7 +14616,11 @@ def _classify_intent_llm(
         )
         raw = resp.message.content.strip()
         data = json.loads(raw)
-    except Exception:
+    except Exception as exc:
+        # H-9 fix (2026-05-08): _silent_log para que las fallas del judge
+        # LLM (timeout, JSON parse, backend caído) tengan rastro en
+        # silent_errors.jsonl. Caller sigue tolerando None → fallback regex.
+        _silent_log("intent_llm_judge", exc)
         return None
     if not isinstance(data, dict):
         return None
@@ -25111,6 +25143,19 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
         _batch_target = 16
     if _batch_target < 1:
         _batch_target = 1
+    # M-5 fix (2026-05-08): warning explícito si user/operator forzó
+    # batched ON con MLX backend. El default ya cae a 0 cuando MLX, pero
+    # un override (`RAG_INDEX_BATCH_EMBEDS=1`) puede pasar inadvertido y
+    # el operator se topa con `[METAL] Command buffer execution failed`
+    # sin rastro de por qué. Con esto, queda registrado en stderr antes
+    # de la primera embed call.
+    if _batch_enabled and _embed_backend == "mlx":
+        print(
+            "[WARN] RAG_INDEX_BATCH_EMBEDS=1 with MLX embedder is known to "
+            "trigger METAL command buffer failures. Consider RAG_INDEX_BATCH_EMBEDS=0.",
+            file=sys.stderr,
+            flush=True,
+        )
 
     # `pending_files`: lista de dicts con todo lo necesario para hacer
     # `col.add` + entities + url-index UNA VEZ que tenemos los embeddings.

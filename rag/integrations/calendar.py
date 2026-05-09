@@ -161,6 +161,13 @@ def _fetch_calendar_ahead(days_ahead: int, max_events: int = 40) -> list[dict]:
     icb = _icalbuddy_path()
     if not icb:
         return []
+    # Bug Hunt 2026-05-08 M Int 12: validar `days_ahead` antes de
+    # interpolar al string del query. Cualquier int negativo o > 365
+    # no tiene sentido para una mirada calendar — clamp [0, 365].
+    try:
+        days_ahead = max(0, min(int(days_ahead), 365))
+    except (TypeError, ValueError):
+        days_ahead = 0
     import subprocess as _sp
     query = "eventsToday" if days_ahead == 0 else f"eventsToday+{days_ahead}"
     try:

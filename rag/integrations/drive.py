@@ -150,7 +150,15 @@ def _fetch_drive_evidence(now: datetime, days: int = 5, max_items: int = 5) -> d
             # Drive returns `2026-04-14T18:23:00.000Z`
             mtime_dt = datetime.fromisoformat(mtime_iso.replace("Z", "+00:00"))
             days_ago = max(0.0, (now.astimezone(mtime_dt.tzinfo) - mtime_dt).total_seconds() / 86400.0)
-        except Exception:
+        except Exception as exc:
+            # Bug Hunt 2026-05-08 M Int 13: parse failure ⇒ days_ago=0.0
+            # silenciosamente leakea como "modificado hoy" en el brief.
+            # Loguear para detectar formatos inesperados de Drive API.
+            try:
+                from rag import _silent_log
+                _silent_log("drive_modified_time_parse", exc)
+            except Exception:
+                pass
             days_ago = 0.0
         mime = f.get("mimeType") or ""
         label = _GDRIVE_MIME_LABEL.get(mime, "archivo")

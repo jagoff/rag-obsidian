@@ -121,12 +121,19 @@ def _gmail_service():
         )
         if creds.expired and creds.refresh_token:
             creds.refresh(Request())
-            stored["access_token"] = creds.token
-            creds_path.write_text(json.dumps(stored), encoding="utf-8")
-            try:
-                os.chmod(creds_path, 0o600)
-            except OSError:
-                pass
+            # Bug Hunt 2026-05-08 M Int 9: validate post-refresh.
+            if not creds.token:
+                _silent_log(
+                    "gmail_refresh_no_token",
+                    RuntimeError("creds.refresh() OK but creds.token empty"),
+                )
+            else:
+                stored["access_token"] = creds.token
+                creds_path.write_text(json.dumps(stored), encoding="utf-8")
+                try:
+                    os.chmod(creds_path, 0o600)
+                except OSError:
+                    pass
         return build("gmail", "v1", credentials=creds, cache_discovery=False)
     except Exception as exc:
         _silent_log("gmail_service_fallback", exc)
@@ -171,12 +178,19 @@ def _gmail_send_service():
         )
         if creds.expired and creds.refresh_token:
             creds.refresh(Request())
-            stored["access_token"] = creds.token
-            creds_path.write_text(json.dumps(stored), encoding="utf-8")
-            try:
-                os.chmod(creds_path, 0o600)
-            except OSError:
-                pass
+            # Bug Hunt 2026-05-08 M Int 9: validate post-refresh.
+            if not creds.token:
+                _silent_log(
+                    "gmail_refresh_no_token",
+                    RuntimeError("creds.refresh() OK but creds.token empty"),
+                )
+            else:
+                stored["access_token"] = creds.token
+                creds_path.write_text(json.dumps(stored), encoding="utf-8")
+                try:
+                    os.chmod(creds_path, 0o600)
+                except OSError:
+                    pass
         return build("gmail", "v1", credentials=creds, cache_discovery=False)
     except Exception as exc:
         _silent_log("gmail_send_service", exc)

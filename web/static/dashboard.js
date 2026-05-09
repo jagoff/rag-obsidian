@@ -282,7 +282,7 @@ async function load(showSkeleton) {
     if (!state.built) {
       // role=alert + aria-live=assertive so SR users get the error even
       // if they were on another part of the page when the fetch failed.
-      el.content.innerHTML = `<div class="loading" style="color:var(--red)" role="alert" aria-live="assertive">error: ${err.message}</div>`;
+      el.content.innerHTML = `<div class="loading" style="color:var(--red)" role="alert" aria-live="assertive">error: ${escapeHtml(err.message)}</div>`;
     } else {
       el.metaUpdated.textContent = `error ${err.message}`;
     }
@@ -750,11 +750,15 @@ function refresh(d) {
       if (subEl && subEl.textContent !== kpi.sub) subEl.textContent = kpi.sub;
     }
   } else {
+    // kpi.key/label/cls son literales hardcoded en este file (safe);
+    // kpi.value y kpi.sub interpolan strings del backend (idx.*, k.*) →
+    // escapamos en defense-in-depth por si un campo del backend retorna
+    // texto con HTML embebido.
     kpiContainer.innerHTML = kpis.map(kpi => `
       <div class="kpi" data-key="${kpi.key}">
         <span class="kpi-label">${kpi.label}</span>
-        <span class="kpi-value ${kpi.cls}" data-kpi="${kpi.key}">${kpi.value}</span>
-        <span class="kpi-sub">${kpi.sub}</span>
+        <span class="kpi-value ${kpi.cls}" data-kpi="${kpi.key}">${escapeHtml(kpi.value)}</span>
+        <span class="kpi-sub">${escapeHtml(kpi.sub)}</span>
       </div>
     `).join("");
   }
@@ -1108,11 +1112,15 @@ function renderSignalsPanel(signals) {
       .sort((a, b) => b[1] - a[1])
       .map(([k, v]) => `${k} ${v}`)
       .join(" · ");
+    // s.desc/label/cls vienen del literal SIGNAL_LABELS hardcoded (safe);
+    // srcBits viene de bySource[s.key] (backend response) → escapar tanto
+    // en atributo title como en innerHTML para evitar XSS si el backend
+    // mete un source name con HTML.
     return `
-      <div class="signal-cell" title="${s.desc}${srcBits ? '\n\n' + srcBits : ''}">
+      <div class="signal-cell" title="${escapeHtml(s.desc + (srcBits ? '\n\n' + srcBits : ''))}">
         <span class="signal-label">${s.label}</span>
         <span class="signal-value ${s.cls}">${n}</span>
-        ${srcBits ? `<span class="signal-sub">${srcBits}</span>` : ""}
+        ${srcBits ? `<span class="signal-sub">${escapeHtml(srcBits)}</span>` : ""}
       </div>
     `;
   }).join("");

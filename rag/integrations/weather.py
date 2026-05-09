@@ -106,7 +106,15 @@ def _fetch_wttr_raw(location: str) -> dict | None:
         with _req.urlopen(url, timeout=8.0) as resp:
             raw = resp.read()
         parsed = json.loads(raw)
-    except Exception:
+    except Exception as exc:
+        # Bug Hunt 2026-05-08 M Int 6: errores de wttr.in (network /
+        # 429 / parse) eran swallowed sin traza. Loguear via _silent_log
+        # para que el operador detecte degradación de la integración.
+        try:
+            from rag import _silent_log
+            _silent_log("weather_wttr_fetch", exc)
+        except Exception:
+            pass
         parsed = None
     with _WTTR_CACHE_LOCK:
         _WTTR_CACHE[location] = (now, parsed)

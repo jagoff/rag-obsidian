@@ -8892,7 +8892,7 @@ _CHAT_CACHE = ThreadSafeCacheMultiKey(
 
 def _chat_cache_key(question: str, vault_scope: str, model: str, vault_chunks: int) -> str:
     raw = f"{question.strip().lower()}|{vault_scope}|{model}|{vault_chunks}"
-    return __import__("hashlib").sha256(raw.encode()).hexdigest()[:16]
+    return __import__("hashlib").sha256(raw.encode()).hexdigest()[:32]
 
 
 def _collect_today_evidence_multi(
@@ -14820,21 +14820,19 @@ def _status_probe_self() -> dict:
             "status": "ok", "detail": f"pid {os.getpid()}"}
 
 
-def _status_probe_ollama() -> dict:
-    """Check MLX backend is reachable — used only for embeddings post-MLX cutover."""
-    import urllib.request
+def _status_probe_mlx_backend() -> dict:
+    """Post-Ola-10: Ollama runtime ya no es dep — el LLM/embedder corre in-process via mlx-lm.
+    Probar = import del módulo backend (cubre extra `mlx` instalado + MLXBackend constructible)."""
     t0 = time.monotonic()
     try:
-        with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=2.0) as r:
-            ok = r.status == 200
-    except Exception:
-        ok = False
-    ms = int((time.monotonic() - t0) * 1000)
-    if ok:
-        return {"id": "ollama", "name": "Ollama (embedder)", "kind": "probe",
-                "status": "ok", "detail": f"/api/tags {ms}ms"}
-    return {"id": "ollama", "name": "Ollama (embedder)", "kind": "probe",
-            "status": "down", "detail": f"no responde /api/tags ({ms}ms)"}
+        from rag import llm_backend as _llm_backend  # noqa: PLC0415, F401
+        ms = int((time.monotonic() - t0) * 1000)
+        return {"id": "mlx-backend", "name": "MLX backend", "kind": "probe",
+                "status": "ok", "detail": f"running · import {ms}ms"}
+    except Exception as e:
+        ms = int((time.monotonic() - t0) * 1000)
+        return {"id": "mlx-backend", "name": "MLX backend", "kind": "probe",
+                "status": "down", "detail": f"{type(e).__name__}: {e} ({ms}ms)"}
 
 
 def _status_probe_rag_db() -> dict:
@@ -14928,7 +14926,7 @@ def _status_probe_tunnel_url() -> dict:
 _STATUS_CATALOG: list[dict] = [
     # Core: sin esto no hay sistema.
     {"category": "core", "category_label": "Core", "kind": "self", "id": "web-self"},
-    {"category": "core", "category_label": "Core", "kind": "ollama", "id": "ollama"},
+    {"category": "core", "category_label": "Core", "kind": "mlx_backend", "id": "mlx-backend"},
     {"category": "core", "category_label": "Core", "kind": "rag_db", "id": "rag-db"},
     {"category": "core", "category_label": "Core", "kind": "telemetry_db", "id": "telemetry-db"},
     {"category": "core", "category_label": "Core", "kind": "vault", "id": "vault"},
@@ -15016,8 +15014,8 @@ def _status_dispatch_one(entry: dict) -> dict:
     kind = entry["kind"]
     if kind == "self":
         r = _status_probe_self()
-    elif kind == "ollama":
-        r = _status_probe_ollama()
+    elif kind == "mlx_backend":
+        r = _status_probe_mlx_backend()
     elif kind == "rag_db":
         r = _status_probe_rag_db()
     elif kind == "telemetry_db":

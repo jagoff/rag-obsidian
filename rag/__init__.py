@@ -53992,6 +53992,9 @@ cli.add_command(auto_tag_cli)  # `rag auto-tag` (Phase 3 cont 2026-05-09)
 
 from rag.cli.maintenance import maintenance_cmd  # noqa: E402, F401
 cli.add_command(maintenance_cmd, name="maintenance")  # `rag maintenance` (Phase 3 cont 2026-05-09)
+
+from rag.cli.style import style_cli  # noqa: E402, F401
+cli.add_command(style_cli)  # `rag style {refresh,show}` (2026-05-09)
 maintenance = maintenance_cmd  # back-compat con tests que importen rag.maintenance
 
 from rag.cli.daemons_control import (  # noqa: E402, F401

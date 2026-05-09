@@ -361,13 +361,24 @@ query → typo correct → anaphora resolve → classify_intent → infer_filter
 
 **Wave-8 patrones** (gotchas): (1) filtros definidos sin call site, (2) carry-over pre-router sobrescrito por `_detect_tool_intent` downstream, (3) bumpear `_FILTER_VERSION` es parte del fix cuando cambia filtro/prompt/regex.
 
-## Eval baselines (floor MLX 2026-05-05)
+## Eval baselines (floor MLX 2026-05-09)
 
-- Singles: `hit@5 56.60% [43.40, 69.81] · MRR 0.535 [0.403, 0.667] · n=53`
-- Chains: `hit@5 72.00% [56.00, 88.00] · MRR 0.617 [0.447, 0.773]`
+- Singles: `hit@5 56.60% [43.40, 69.81] · MRR 0.519 [0.396, 0.651] · n=53`
+- Chains: `hit@5 76.00% [56.00, 92.00] · MRR 0.623 [0.437, 0.783]`
 - **Lower-CI-bound gate** (nightly online-tune auto-rollback): singles < 43.40% OR chains < 56.00%
 
-Floor PRE-MLX (archivado): singles `53.70% [40.74, 66.67]`, chains `72.00% [52.00, 88.00]`. Post-cutover MLX supera ambos (+2.9pp singles, chains match con CI más estrecho).
+Bumped 2026-05-09 (era `0.535 / 0.617 / chains 72%` el 2026-05-05). Drift natural por nuevas notas + signals + entity extraction. hit@5 idem; chains hit@5 +4pp; MRR singles -1.6pp; MRR chains +0.6pp.
+
+Floor PRE-MLX (archivado): singles `53.70% [40.74, 66.67]`, chains `72.00% [52.00, 88.00]`.
+
+**Prototypes evaluados 2026-05-09 (todos KEEP OFF)** — Floor wins:
+- `RAG_LLM_JUDGE=1`: singles MRR -4.1pp REGRESS, chains tie. Reject.
+- `RAG_NLI_GROUNDING=1`: NO-OP en métricas retrieval (afecta solo response post-citation-repair). Reject.
+- `RAG_QUERY_DECOMPOSE=1`: NO-OP en este golden (no multi-sub queries). Reject hasta golden expand.
+- `RAG_CONTEXTUAL_RETRIEVAL=1`: NO-OP sin re-index del corpus. Reject sin `rag index --full` previo.
+- `RAG_MMR=1`: singles MRR -0.6pp + chains MRR -0.2pp REGRESS marginal. Reject.
+
+Doc consolidado: [`99-obsidian/99-AI/system/prototypes-eval-2026-05-09/result.md`](file:///Users/fer/Library/Mobile%20Documents/iCloud~md~obsidian/Documents/Notes/99-obsidian/99-AI/system/prototypes-eval-2026-05-09/result.md).
 
 `rag eval --latency --max-p95-ms N` agrega P50/P95/P99 + CI gate. Bootstrap 1000 resamples seed=42. **HyDE drops singles ~5pp** — opt-in via `--hyde`. `seen_titles` post-rerank penalty `0.1`.
 

@@ -3074,10 +3074,17 @@ _CHAT_MODEL_RESOLVED: str | None = None
 
 
 def resolve_chat_model() -> str:
-    """Pick the first available model from CHAT_MODEL_PREFERENCE.
+    """Resolver el modelo activo de chat.
 
-    Cached per-process so the model-list lookup runs at most once. If none
-    are installed, raise a clear error pointing at `huggingface-cli download`.
+    Orden:
+      1. `RAG_CHAT_MODEL` env var explícito (gana siempre).
+      2. Cache `_CHAT_MODEL_RESOLVED` (per-process, lookup costoso).
+      3. Iterar `CHAT_MODEL_PREFERENCE` y elegir el primero disponible
+         localmente (MLX cache).
+
+    Cache invalidation: `models.swap("chat", X)` o `models.set_env("chat", X)`
+    disparan el reload hook que setea `_CHAT_MODEL_RESOLVED = None`. La
+    próxima call vuelve a resolver — pickea el override env si está set.
 
     MLX backend (único soportado post-Ola 7): consulta la cache MLX via
     `MLXBackend.list_available()`. Match por alias short-name
@@ -3086,11 +3093,15 @@ def resolve_chat_model() -> str:
     `~/.cache/huggingface/hub/`.
     """
     global _CHAT_MODEL_RESOLVED
+    # 1. Env override gana siempre — `models.swap("chat", X)` setea esto.
+    explicit = os.environ.get("RAG_CHAT_MODEL", "").strip()
+    if explicit:
+        _CHAT_MODEL_RESOLVED = explicit
+        return explicit
     if _CHAT_MODEL_RESOLVED is not None:
         return _CHAT_MODEL_RESOLVED
     from rag.llm_backend import get_backend, MLX_MODEL_ALIAS, MLXBackend  # local import
     backend = get_backend().name  # singleton — 1 env lookup al startup, cached
-    # MLXBackend único (sin alternativa).
     try:
         mlx_ids = set(MLXBackend().list_available())
         available = {alias for alias, hf_id in MLX_MODEL_ALIAS.items() if hf_id in mlx_ids}
@@ -61159,9 +61170,28 @@ from rag.cli.vault import (  # noqa: E402, F401
     vault_remove,
     vault_use,
 )
+from rag.cli.model import (  # noqa: E402, F401
+    model,
+    model_current,
+    model_list,
+    model_reset,
+    model_set,
+    model_show,
+)
 cli = _cli_group_root  # restaurar attribute (sub-package quedó en sys.modules)
 del _cli_group_root
 cli.add_command(vault)  # registrar el grupo extraído manualmente
+cli.add_command(model)  # `rag model {list,set,reset,show,current}`
+
+
+# ── Model registry reload hooks ──────────────────────────────────────────────
+# Registrar callbacks que invalidan caches in-process + unloadean modelos
+# viejos del backend MLX cuando hacés `rag model set <tier> <X>` o
+# `rag.models.swap(...)`. Importado acá para que las constantes
+# (HELPER_MODEL, EMBED_MODEL, RERANKER_MODEL) ya estén bound antes de que
+# los hooks intenten mutarlas.
+from rag._model_hooks import install_hooks as _install_model_hooks  # noqa: E402
+_install_model_hooks()
 
 
 # ── Allowlist opcional de CLI commands (RAG_CLI_KEEP) ─────────────────────────

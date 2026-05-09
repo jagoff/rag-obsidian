@@ -647,6 +647,15 @@ _DEFAULT_VAULT = Path.home() / "Library/Mobile Documents/iCloud~md~obsidian/Docu
 # cada vault tiene su propio índice automáticamente. Cero contaminación.
 VAULTS_CONFIG_PATH = Path.home() / ".config/obsidian-rag/vaults.json"
 
+# Memo de `_load_vaults_config` (audit perf 2026-05-08): la función se llama
+# desde 9+ call sites — varios en hot paths CLI (`rag vault switch`, prefix
+# de cada comando). Costo por call: ~0.1-0.5ms (file read + json.loads).
+# Cache invalida en `_save_vaults_config` o cuando cambia el mtime del file
+# (otro proceso puede editar `vaults.json` directamente). Devolvemos
+# `copy.deepcopy` porque varios callers mutan el dict antes de re-grabarlo.
+_VAULTS_CFG_MEMO: dict = {"mtime_ns": 0, "data": None}
+_VAULTS_CFG_LOCK = threading.Lock()
+
 
 def _load_vaults_config() -> dict:
     """Lee el registry de vaults. Estructura:
@@ -654,8 +663,20 @@ def _load_vaults_config() -> dict:
     Si no existe o está corrupto, devuelve estructura vacía — el caller
     decide qué hacer (typicamente: caer al default).
     """
+    import copy as _copy_mod
+
     if not VAULTS_CONFIG_PATH.is_file():
         return {"vaults": {}, "current": None}
+    try:
+        mtime_ns = VAULTS_CONFIG_PATH.stat().st_mtime_ns
+    except Exception:
+        mtime_ns = 0
+    with _VAULTS_CFG_LOCK:
+        if (
+            _VAULTS_CFG_MEMO["data"] is not None
+            and _VAULTS_CFG_MEMO["mtime_ns"] == mtime_ns
+        ):
+            return _copy_mod.deepcopy(_VAULTS_CFG_MEMO["data"])
     try:
         cfg = json.loads(VAULTS_CONFIG_PATH.read_text(encoding="utf-8"))
     except Exception:
@@ -664,6 +685,9 @@ def _load_vaults_config() -> dict:
         return {"vaults": {}, "current": None}
     cfg.setdefault("vaults", {})
     cfg.setdefault("current", None)
+    with _VAULTS_CFG_LOCK:
+        _VAULTS_CFG_MEMO["data"] = _copy_mod.deepcopy(cfg)
+        _VAULTS_CFG_MEMO["mtime_ns"] = mtime_ns
     return cfg
 
 
@@ -681,6 +705,10 @@ def _save_vaults_config(cfg: dict) -> None:
         json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8",
     )
     tmp.replace(VAULTS_CONFIG_PATH)
+    # Invalidar memo: el próximo `_load_vaults_config` re-leerá de disco.
+    with _VAULTS_CFG_LOCK:
+        _VAULTS_CFG_MEMO["data"] = None
+        _VAULTS_CFG_MEMO["mtime_ns"] = 0
 
 
 def _resolve_vault_path() -> Path:
@@ -5951,7 +5979,7 @@ def _compute_corpus_hash(col) -> str:
     return _hash_chunk_count(chunk_count)
 
 
-def _corpus_hash_cached(col) -> str:
+def _corpus_hash_cached(col, *, hint_count: int | None = None) -> str:
     """Cached version of _compute_corpus_hash — re-computes only when chunk
     count changes bucket (same trigger as _load_corpus invalidation).
 
@@ -5959,14 +5987,18 @@ def _corpus_hash_cached(col) -> str:
     directo; si miss, computamos hash desde el cnt ya leído (sin re-llamar
     col.count() dentro de _compute_corpus_hash).
 
-    # 2026-04-30: LOW — retrieve() ya llamó col.count() para hint_count; si
-    # en el futuro se pasa hint_count como arg podría evitar el col.count()
-    # acá (tercer count por retrieve()). Opcional, no crítico.
+    `hint_count` (audit perf 2026-05-08, fix #10): cuando el caller ya
+    tiene el `col.count()` (ej. `retrieve()` lo lee al inicio para
+    `_load_corpus(hint_count=...)`) puede pasarlo acá para evitar el
+    round-trip SQL redundante (~1-2ms ahorrados por retrieve).
     """
-    try:
-        cnt = int(col.count())
-    except Exception:
-        return ""
+    if hint_count is not None:
+        cnt = int(hint_count)
+    else:
+        try:
+            cnt = int(col.count())
+        except Exception:
+            return ""
     with _corpus_hash_lock:
         if _corpus_hash_memo["hash"] and _corpus_hash_memo["chunk_count"] == cnt:
             return _corpus_hash_memo["hash"]
@@ -8874,25 +8906,24 @@ def _read_feedback_map_for_log(
     an IN clause. The caller always knows which turn_ids it fetched from
     `rag_queries`, so passing them avoids a full-table scan when feedback
     has accumulated thousands of rows.
+
+    Audit perf 2026-05-08: si `turn_ids` es `None` o vacío, devolvemos
+    `{}` directo. El renderer de `rag log` solo necesita los ratings de
+    los turn_ids que ya fetcheó de `rag_queries`; no tiene caso pagar
+    un full-table scan a `rag_feedback` (45k+ rows en instancias activas)
+    para data que el caller no va a usar.
     """
+    if not turn_ids:
+        return {}
     try:
         with _ragvec_state_conn() as conn:
-            if turn_ids:
-                placeholders = ",".join("?" * len(turn_ids))
-                cursor = conn.execute(
-                    "SELECT turn_id, rating FROM rag_feedback "
-                    f"WHERE turn_id IN ({placeholders}) "
-                    "ORDER BY ts ASC",
-                    tuple(turn_ids),
-                )
-            else:
-                # ORDER BY ts ASC so the dict-build loop overwrites older
-                # ratings with newer ones per turn_id (latest wins).
-                cursor = conn.execute(
-                    "SELECT turn_id, rating FROM rag_feedback "
-                    "WHERE turn_id IS NOT NULL AND turn_id != '' "
-                    "ORDER BY ts ASC"
-                )
+            placeholders = ",".join("?" * len(turn_ids))
+            cursor = conn.execute(
+                "SELECT turn_id, rating FROM rag_feedback "
+                f"WHERE turn_id IN ({placeholders}) "
+                "ORDER BY ts ASC",
+                tuple(turn_ids),
+            )
             out: dict[str, int] = {}
             for tid, rating in cursor.fetchall():
                 try:
@@ -10097,21 +10128,50 @@ def _collection_name_for_vault(vault_path: Path) -> str:
     return f"{_COLLECTION_BASE}_{slug}"
 
 
+_db_for_cache: dict[str, "SqliteVecCollection"] = {}
+_db_for_cache_created_at: dict[str, float] = {}
+_db_for_cache_lock = threading.Lock()
+
+
 def get_db_for(vault_path: Path) -> SqliteVecCollection:
     """Abre la colección sqlite-vec correspondiente a un vault arbitrario.
     Todos los vaults viven en la misma DB (DB_PATH) — la separación es por
     nombre de colección, namespaced por hash del path del vault.
-    No hay singleton aquí: cada llamada abre un cliente fresco, así que el
-    sentinel de reset no aplica — `index --reset` invalida el singleton de
-    get_db() y siempre llama a get_or_create_collection que devuelve el UUID
-    vigente.
+
+    Audit perf 2026-05-08 (fix #7): cache de la colección por nombre. Pre-fix
+    cada llamada abría una conexión SQLite nueva + 5 PRAGMAs + `sqlite_vec.load()`
+    + `CREATE TABLE IF NOT EXISTS` (~2-8ms por call, frío más). Cross-source
+    ETLs llaman esto por vault por ciclo, sumando latencia evitable.
+
+    Invalidación via `COLLECTION_RESET_SENTINEL`: igual que `get_db()`, si
+    `index --reset` corre después de cachear, el sentinel mtime supera al
+    `created_at` cacheado y forzamos rebuild. La invariante de schema-bump
+    (`_COLLECTION_BASE`) se preserva porque el `name` es función de
+    `_collection_name_for_vault(vault_path)`.
     """
     DB_PATH.mkdir(parents=True, exist_ok=True)
-    client = SqliteVecClient(path=str(DB_PATH))
-    return client.get_or_create_collection(
-        name=_collection_name_for_vault(vault_path),
-        metadata={"hnsw:space": "cosine"},
-    )
+    name = _collection_name_for_vault(vault_path)
+    with _db_for_cache_lock:
+        cached = _db_for_cache.get(name)
+        if cached is not None:
+            try:
+                sentinel_mtime = os.stat(COLLECTION_RESET_SENTINEL).st_mtime
+                if sentinel_mtime > _db_for_cache_created_at.get(name, 0.0):
+                    cached = None
+                    _db_for_cache.pop(name, None)
+                    _db_for_cache_created_at.pop(name, None)
+            except FileNotFoundError:
+                pass
+        if cached is not None:
+            return cached
+        client = SqliteVecClient(path=str(DB_PATH))
+        col = client.get_or_create_collection(
+            name=name,
+            metadata={"hnsw:space": "cosine"},
+        )
+        _db_for_cache[name] = col
+        _db_for_cache_created_at[name] = time.time()
+        return col
 
 
 def _urls_collection_name_for_vault(vault_path: Path) -> str:
@@ -12376,6 +12436,22 @@ _corpus_cache: dict | None = None
 # around cache reads/writes — the expensive BM25 / graph / PageRank
 # build happens outside the critical section in local vars.
 _corpus_cache_lock = threading.RLock()
+# Single-flight de _load_corpus (audit perf 2026-05-08, fix #5): pre-fix
+# el lock cubría TODO el rebuild (incluido BM25 + dedup en Python puro,
+# ~50-300ms con corpus de 8k chunks). Bajo cache miss concurrente — típico
+# tras `_invalidate_corpus_cache()` triggered por el watchdog post-`rag
+# index` — N requests paralelos serializaban totalmente. Single-flight: el
+# primer thread que detecta miss pre-fetcha la data SQL (under lock, por
+# safety con `check_same_thread=False`), y deja el target registrado; los
+# threads siguientes hacen `Event.wait()` y re-checkean el cache cuando
+# despierta (hit). El BM25 + dedup corre OUT of lock para no serializar.
+_corpus_rebuild_inflight: dict[tuple[int, str], threading.Event] = {}
+# Lock-order invariant (audit perf 2026-05-08, fix #11): cuando un caller
+# adquiere ambos `_bm25_inflight_lock` y `_corpus_cache_lock`, el orden
+# es SIEMPRE `_bm25_inflight_lock` → `_corpus_cache_lock` (ej. `bm25_search`
+# que adquiere `_bm25_inflight_lock` y luego llama `_load_corpus()` que
+# adquiere `_corpus_cache_lock`). Invertir el orden desde otro path
+# produce deadlock silencioso.
 # BM25 concurrency guard — see CLAUDE.md invariant "BM25 GIL-serialised — do NOT
 # parallelise" (measured 3× slower when wrapped in ThreadPoolExecutor on M3 Max).
 # Lock() (not RLock) is intentional: even nested calls from the same thread must
@@ -12413,39 +12489,60 @@ def _load_corpus(col: SqliteVecCollection, *, hint_count: int | None = None) -> 
     retrieve compound).
     """
     global _corpus_cache
-    # Single-flight pattern: el lock cubre TODO el rebuild + las queries
-    # de invalidation (col.count() / col.id) que comparten el connection
-    # SQLite con todo el resto del web server. Pre-fix (2026-04-30): los
-    # `n = col.count()` y `cid = col.id` corrían FUERA del lock,
-    # exponiendo la connection compartida (`check_same_thread=False`) a
-    # una race condition en el statement-prepare. Resultado observado en
-    # producción 2026-05-01: 26 fallos `InterfaceError: bad parameter
-    # or other API misuse` al día desde graph_expand.outer + IndexError
-    # en `col.count()` cuando dos threads concurrentes corrupted el
-    # statement-state en simultaneo. Mover ambas dentro del lock cuesta
-    # ~2-4ms en cache hit (el lock acquire es rápido) y elimina el race.
-    # Pre-fix: el lock se soltaba tras el check de hit y el rebuild
-    # ocurría fuera — el segundo thread overwriteaba al primero, y si
-    # un tercer thread llamaba `_invalidate_corpus_cache()` entre el
-    # release y el write-back, la invalidación se perdía.
-    # RLock permite recursión segura si algún path del rebuild vuelve
-    # a llamar `_load_corpus` (no debería, pero es defensivo).
-    # Costo: queries paralelas serializan en cache miss (~50-300ms una
-    # vez); el cache hit subsequent es libre (check al inicio del lock).
-    with _corpus_cache_lock:
-        n = int(hint_count) if hint_count is not None else col.count()
-        cid = str(getattr(col, "id", "") or "")
-        cached = _corpus_cache
-        if (
-            cached is not None
-            and cached["count"] == n
-            and cached.get("collection_id") == cid
-        ):
-            record_cache_event("corpus", hits=1)
-            return cached
+    # Single-flight pattern (audit perf 2026-05-08, fix #5): pre-fix el
+    # lock cubría TODO — incluido BM25 + dedup, que son CPU-puro en Python
+    # y tomaban 50-300ms con un corpus de 8k chunks. Bajo cache-miss
+    # concurrente (típico tras `_invalidate_corpus_cache()` post-`rag
+    # index`), N requests paralelos serializaban totalmente.
+    #
+    # Decisión de scope del lock:
+    # - Las SQL ops (`col.count()`, `col.id`, `col.get(...)`) corren BAJO
+    #   `_corpus_cache_lock` por la race fix de 2026-04-30: la connection
+    #   sqlite-vec compartida (`check_same_thread=False`) sufría
+    #   statement-prepare corruption cuando dos threads disparaban SQL
+    #   simultáneo, generando 26 `InterfaceError`/día en producción.
+    # - El BM25 + dedup (Python puro, sin SQL) corre FUERA del lock.
+    #   Es la porción más cara del rebuild y donde se queda el ahorro.
+    # - Single-flight Event evita rebuild duplicado: si thread B arriba
+    #   mientras A está en BM25, B ve el target inflight, hace `wait()`
+    #   sobre el Event de A, y al despertar re-checkea el cache (hit).
+    rebuild_event: threading.Event | None = None
+    target: tuple[int, str] | None = None
+    data: dict | None = None
+    while True:
+        with _corpus_cache_lock:
+            n = int(hint_count) if hint_count is not None else col.count()
+            cid = str(getattr(col, "id", "") or "")
+            cached = _corpus_cache
+            if (
+                cached is not None
+                and cached["count"] == n
+                and cached.get("collection_id") == cid
+            ):
+                record_cache_event("corpus", hits=1)
+                return cached
 
-        record_cache_event("corpus", misses=1)
-        data = col.get(include=["documents", "metadatas"])
+            target = (n, cid)
+            existing = _corpus_rebuild_inflight.get(target)
+            if existing is not None:
+                # Otro thread ya está construyendo el mismo target — esperá.
+                wait_event = existing
+            else:
+                # Claim el rebuild + pre-fetch la data SQL bajo el lock.
+                rebuild_event = threading.Event()
+                _corpus_rebuild_inflight[target] = rebuild_event
+                record_cache_event("corpus", misses=1)
+                data = col.get(include=["documents", "metadatas"])
+                wait_event = None
+        if wait_event is None:
+            break  # claimed: salir del loop con `data` ya fetcheada
+        # Esperá al thread que claimed, después re-check cache (likely hit).
+        wait_event.wait(timeout=60.0)
+        # loop continue → re-acquire lock + re-check.
+
+    assert data is not None and rebuild_event is not None and target is not None
+
+    try:
         docs, ids, metas = data["documents"], data["ids"], data["metadatas"]
 
         bm25 = None
@@ -12504,7 +12601,7 @@ def _load_corpus(col: SqliteVecCollection, *, hint_count: int | None = None) -> 
                     folders_deduped.add(prefix)
 
         new_cache = {
-            "count": n, "collection_id": cid,
+            "count": target[0], "collection_id": target[1],
             "ids": ids, "docs": docs, "metas": metas,
             "bm25": bm25, "tags": tags, "folders": folders,
             "title_to_paths": title_to_paths,
@@ -12513,8 +12610,15 @@ def _load_corpus(col: SqliteVecCollection, *, hint_count: int | None = None) -> 
             "paths_deduped": paths_deduped,
             "folders_deduped": folders_deduped,
         }
-        _corpus_cache = new_cache
+        with _corpus_cache_lock:
+            _corpus_cache = new_cache
         return new_cache
+    finally:
+        # Cleanup del inflight registry — incluso si el build raised, para
+        # no dejar threads esperando indefinidamente.
+        with _corpus_cache_lock:
+            _corpus_rebuild_inflight.pop(target, None)
+        rebuild_event.set()
 
 
 def _invalidate_corpus_cache() -> None:
@@ -14013,6 +14117,13 @@ def bm25_search(
     secuenciales con apenas overlap. El user veía "No pude buscar en
     el vault" en cada reintento (logs 2026-05-01 ~15:14, líneas 37643-
     37645 de web.log). Ver stack en `[chat-error-sanitized]`.
+
+    Lock-order invariant (audit perf 2026-05-08, fix #11): adquirimos
+    `_bm25_inflight_lock` PRIMERO, luego `_load_corpus()` adquiere
+    `_corpus_cache_lock` adentro. Cualquier caller futuro que adquiera
+    `_corpus_cache_lock` y después `_bm25_inflight_lock` produciría un
+    deadlock silencioso. Mantener el orden `_bm25_inflight_lock` →
+    `_corpus_cache_lock`.
     """
     if not _bm25_inflight_lock.acquire(timeout=30.0):
         raise RuntimeError(

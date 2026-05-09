@@ -138,27 +138,86 @@ class MLXReranker:
             enable_thinking=False,
         )
 
-    def _score_pair(self, query: str, doc: str) -> float:
-        import mlx.core as mx
+    def _tokenize_truncated(self, query: str, doc: str) -> list[int]:
+        """Build prompt + tokenize + right-truncate al `max_length`.
+
+        Right-truncation: si el prompt excede `max_length`, conservamos
+        los últimos N tokens. Esto preserva el sufijo del assistant
+        prompt (la "cue" que el modelo usa para saber dónde predecir
+        yes/no) a costa de perder el head del Document body. Instruct +
+        Query viven al frente y son cortos vs. el body — se asume que
+        sobrevive todo lo crítico.
+        """
         prompt = self._build_prompt(query, doc)
         ids = self._tokenizer.encode(prompt, add_special_tokens=False)
-        # Truncate from the right end of the document if the prompt exceeds
-        # max_length. Right-truncation preserves the trailing assistant
-        # prompt suffix that the model uses to know where to predict.
         if len(ids) > self.max_length:
-            # Keep the last `max_length` tokens — preserves Instruct/Query
-            # framing because they are short relative to the body and live
-            # at the *front*. With Qwen3-Reranker we accept losing the head
-            # of the doc body before losing the response cue at the tail.
-            # An alternative would be to truncate the doc string before
-            # template formatting, but that requires re-tokenising the
-            # assistant suffix and is harder to keep correct.
             ids = ids[-self.max_length :]
+        return ids
+
+    def _score_pair(self, query: str, doc: str) -> float:
+        """Score a single (query, doc) pair. Path single-call kept for
+        tests / smoke. Production usa el batched path en `predict()`.
+
+        Adquiere `_MLX_FORWARD_LOCK` (rag.llm_backend) para serializar el
+        Metal forward con embedder/chat — sin esto, dispatch concurrente
+        crashea con `Command buffer execution failed` (mismo bug que
+        motivó el lock global en commit `b56ad50`).
+        """
+        import mlx.core as mx
+
+        from rag.llm_backend import _MLX_FORWARD_LOCK
+
+        ids = self._tokenize_truncated(query, doc)
         arr = mx.array([ids])
-        logits = self._model(arr)[0, -1, :]
-        yes = float(logits[self._yes_id])
-        no = float(logits[self._no_id])
+        with _MLX_FORWARD_LOCK:
+            logits = self._model(arr)[0, -1, :]
+            yes = float(logits[self._yes_id])
+            no = float(logits[self._no_id])
+            mx.eval(logits)
         return 1.0 / (1.0 + math.exp(-(yes - no)))
+
+    def _score_batch(self, pairs: list[tuple[str, str]]) -> list[float]:
+        """Batched forward único sobre `pairs` con padding RIGHT al
+        max_len del batch. Devuelve `list[float]` de probabilidades.
+
+        Patrón idéntico al embedder MLX (`mlx_embed.py:_encode_batch`):
+        un solo Metal forward por batch en vez de N forwards seriales.
+        Para `RERANK_POOL_MAX=25` esto colapsa 25 dispatches a 1 (saving
+        24 × ~2-5ms de overhead Metal + 24 lock acquisitions).
+
+        Padding RIGHT (no LEFT) porque los logits que nos importan están
+        en `lengths[i] - 1` (el último token NO-pad de cada fila); con
+        padding RIGHT el modelo ve el cue de respuesta al final de los
+        tokens reales y los pads no influyen en esa posición.
+        """
+        import mlx.core as mx
+
+        from rag.llm_backend import _MLX_FORWARD_LOCK
+
+        if not pairs:
+            return []
+        ids_list = [self._tokenize_truncated(q, d) for q, d in pairs]
+        lengths = [len(ids) for ids in ids_list]
+        max_len = max(lengths)
+        pad_id = getattr(self._tokenizer, "pad_token_id", None)
+        if pad_id is None:
+            pad_id = getattr(self._tokenizer, "eos_token_id", None) or 0
+        padded = [ids + [int(pad_id)] * (max_len - len(ids)) for ids in ids_list]
+        arr = mx.array(padded)
+        b = len(pairs)
+        with _MLX_FORWARD_LOCK:
+            logits = self._model(arr)  # (B, T, V)
+            batch_idx = mx.arange(b)
+            last_idx = mx.array([L - 1 for L in lengths])
+            last = logits[batch_idx, last_idx, :]  # (B, V)
+            yes_col = last[:, self._yes_id]
+            no_col = last[:, self._no_id]
+            diff = yes_col - no_col
+            mx.eval(diff)
+        # sigmoid en CPU (es escalar/vector chico) — preferimos no hacer
+        # otro forward MLX solo para sigmoid.
+        diffs = [float(d) for d in diff]
+        return [1.0 / (1.0 + math.exp(-x)) for x in diffs]
 
     # -- public -------------------------------------------------------------
 
@@ -166,7 +225,7 @@ class MLXReranker:
         self,
         pairs: Iterable[tuple[str, str]],
         show_progress_bar: bool = False,  # noqa: ARG002 — API parity with CrossEncoder
-        batch_size: int | None = None,    # noqa: ARG002
+        batch_size: int | None = None,
         **kwargs: Any,                     # noqa: ARG002
     ) -> list[float]:
         """Score each (query, document) pair. Returns a list of probabilities.
@@ -175,10 +234,28 @@ class MLXReranker:
         forcing a numpy dependency on call sites that consume the result —
         the existing call sites in `rag/__init__.py` iterate the result and
         cast each score to `float()` already.
+
+        Batched path por default (audit perf 2026-05-08): consolida los N
+        forwards en mini-batches de `batch_size` (default 8). Override
+        via env `RAG_MLX_RERANKER_BATCH_SIZE`.
         """
+        pairs_list = list(pairs)
         self._ensure_loaded()
         self._last_use = time.time()
-        return [self._score_pair(q, d) for q, d in pairs]
+        if not pairs_list:
+            return []
+        bs = batch_size
+        if bs is None:
+            try:
+                bs = int(os.environ.get("RAG_MLX_RERANKER_BATCH_SIZE", "8"))
+            except ValueError:
+                bs = 8
+        bs = max(1, bs)
+        scores: list[float] = []
+        for i in range(0, len(pairs_list), bs):
+            chunk = pairs_list[i : i + bs]
+            scores.extend(self._score_batch(chunk))
+        return scores
 
     def unload(self) -> None:
         """Drop the model from memory + clear MLX cache. Idempotent."""

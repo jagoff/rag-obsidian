@@ -695,7 +695,9 @@ def whisper_doctor():
               help="Path al archivo JSON de salida. Default: stdout.")
 @click.option("--source", default=None,
               help="Filtrar por source ('explicit'/'llm'/'vault_diff'). Default: todas.")
-def whisper_export(output: str | None, source: str | None):
+@click.option("--limit", type=int, default=10000, show_default=True,
+              help="Máximo número de rows a exportar. Bug Hunt 2026-05-08 M Brief whisper.")
+def whisper_export(output: str | None, source: str | None, limit: int):
     """Exportar correcciones a JSON para backup o migración entre máquinas.
 
     Cada row de `rag_audio_corrections` se serializa con todas sus columnas.
@@ -706,6 +708,7 @@ def whisper_export(output: str | None, source: str | None):
 
         rag whisper export -o ~/Backups/corrections-2026-04-25.json
         rag whisper export --source explicit  # solo correcciones manuales /fix
+        rag whisper export --limit 1000       # últimas 1K (LIMIT sirve en tabla antigua)
     """
     from rag import _ragvec_state_conn
     sql = (
@@ -720,6 +723,11 @@ def whisper_export(output: str | None, source: str | None):
         sql += " WHERE source = ?"
         params = (source,)
     sql += " ORDER BY ts ASC"
+    # Bug Hunt 2026-05-08 M Brief whisper: LIMIT para evitar RAM spike en tabla antigua.
+    # Default 10000 es sensato para un backup (export típico ≤1000 rows).
+    # User puede override con --limit si necesita más o menos.
+    if limit > 0:
+        sql += f" LIMIT {limit}"
     try:
         with _ragvec_state_conn() as conn:
             rows = conn.execute(sql, params).fetchall()

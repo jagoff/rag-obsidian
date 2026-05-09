@@ -56,49 +56,97 @@ _PROMISE_REGEX_HINTS: tuple[re.Pattern, ...] = tuple(
 )
 
 
-def _wa_extract_actions(chat_label: str, is_group: bool, messages: list[dict]) -> dict:
-    """LLM-extract action items from a chat window.
+def _wa_extract_combined(
+    chat_label: str,
+    is_group: bool,
+    messages: list[dict],
+) -> dict:
+    """LLM-extract en UNA sola call: tasks + questions + commitments + promises.
 
-    Conservative prompt: only flag items a human would genuinely action.
-    Returns ``{"tasks": [str], "questions": [str], "commitments": [str]}``
-    (empty lists on LLM failure — callers treat as "nothing to extract",
-    not as an error). Deterministic via HELPER_OPTIONS.
+    Pre-2026-05-09 había 2 calls separadas (`_wa_extract_actions` para
+    tasks/questions/commitments + `_wa_extract_promises` para promises). Cada
+    chat con activity disparaba 2 LLM calls — 12 chats = 24 calls/tick.
+    Fusionado: 1 call/chat, ~50% latencia + tokens.
 
-    `commitments` are things the user (yo) promised to do; `tasks` are
-    asks directed at the user; `questions` are open questions addressed
-    to the user that still need an answer.
+    Returns:
+        ``{"tasks": [str], "questions": [str], "commitments": [str],
+            "promises": [{text, when_text, direction, msg_id, msg_ts, speaker}]}``
+
+    Silent-fail: empty dict default si LLM falla.
     """
     from rag import HELPER_MODEL, HELPER_OPTIONS, LLM_KEEP_ALIVE, _summary_client
-    empty = {"tasks": [], "questions": [], "commitments": []}
+    # Re-resolve via package namespace para tests con monkeypatch.
+    from rag.integrations.whatsapp import _has_promise_hint
+
+    empty = {"tasks": [], "questions": [], "commitments": [], "promises": []}
     if not messages:
         return empty
+
+    # Anti-loop drop U+200B
+    candidates = [m for m in messages if not (m.get("text") or "").startswith("​")]
+    if not candidates:
+        return empty
+
+    # Si NINGÚN msg matchea regex de promesa, igual hacemos la call (porque
+    # tasks/questions/commitments no requieren ese gate). El LLM va a devolver
+    # `promises: []` y listo. Mantener el gate solo para promesas era una
+    # micro-optimización irrelevante post-fusión.
+    has_any_promise_hint = any(_has_promise_hint(m.get("text") or "") for m in candidates)
+
     convo_lines: list[str] = []
-    for m in messages:
-        ts = (m["ts"] or "")[:16].replace("T", " ")
-        convo_lines.append(f"[{ts}] {m['who']}: {m['text']}")
+    for m in candidates:
+        ts = (m.get("ts") or "")[:16].replace("T", " ")
+        mid = m.get("id") or m.get("msg_id") or "?"
+        who = m.get("who") or "?"
+        text = m.get("text") or ""
+        # Para que el LLM pueda referenciar el msg_id en promises:
+        convo_lines.append(f"[{ts}] [id:{mid}] {who}: {text}")
     convo = "\n".join(convo_lines)
     if len(convo) > 6000:
         convo = convo[-6000:]
+
     kind = "grupo" if is_group else "chat directo"
+    promise_section = (
+        "- promises: SOLO promesas — frases donde alguien se compromete a hacer "
+        "algo en el futuro pero todavía NO lo hizo (\"te aviso\", \"te llamo "
+        "mañana\", \"lo reviso en un rato\"). Para cada una: text, when_text "
+        "(\"mañana\", \"en 2hs\", o \"\" si no especifica), direction (\"out\" "
+        "si yo prometo a otro; \"in\" si otro promete a mí), msg_id (el id que "
+        "aparece entre [id:XXX]). Si no hay promesas reales, lista vacía.\n"
+    ) if has_any_promise_hint else (
+        "- promises: lista vacía (no hay candidatos en esta ventana).\n"
+    )
+
     prompt = (
+        "IDIOMA: respondé SIEMPRE en español rioplatense (voseo argentino). "
+        "Nunca uses portugués (\"você\", \"obrigado\", \"essa\"). Nunca uses tuteo "
+        "peninsular. Si el chat tiene contexto BR, los items se destilan igual "
+        "en español rioplatense.\n\n"
         f"Conversación de WhatsApp ({kind}): {chat_label}\n\n"
         f"{convo}\n\n"
-        "Extraé solo items accionables reales para \"yo\" (el usuario). "
-        "Sé conservador: si no está claro que sea una acción, omitilo. "
-        "Ignorá saludos, small talk, memes, reacciones.\n\n"
-        "- tasks: cosas que alguien le pidió a yo (hacer X, mandar Y, revisar Z).\n"
+        "Extraé items accionables reales y promesas para \"yo\" (el usuario). "
+        "Sé conservador: si no está claro, omitilo. Ignorá saludos, memes, "
+        "reacciones.\n\n"
+        "- tasks: cosas que alguien le pidió a yo (hacer X, mandar Y).\n"
         "- questions: preguntas dirigidas a yo que aún no respondió.\n"
-        "- commitments: cosas que yo prometió hacer (\"te mando…\", \"mañana te paso…\").\n\n"
-        "Cada item: frase corta en español, 1 línea, sin nombre del chat ni timestamps. "
-        "Si no hay nada en una categoría, lista vacía. "
-        "Formato estricto JSON: "
-        "{\"tasks\": [\"...\"], \"questions\": [\"...\"], \"commitments\": [\"...\"]}"
+        "- commitments: cosas que yo prometió hacer en general.\n"
+        + promise_section +
+        "\nCada item de tasks/questions/commitments: frase corta en español "
+        "rioplatense, 1 línea, sin nombre del chat ni timestamps. "
+        "Si una categoría está vacía, lista vacía. Formato JSON estricto:\n"
+        '{"tasks": ["..."], "questions": ["..."], "commitments": ["..."], '
+        '"promises": [{"text": "...", "when_text": "...", "direction": "out", '
+        '"msg_id": "..."}]}'
     )
+
     try:
         resp = _summary_client().chat(
             model=HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            options={**HELPER_OPTIONS, "num_predict": 320, "num_ctx": 4096},
+            # num_predict bumpeado: antes 320 (actions) + 480 (promises) = 800.
+            # Ahora 1 call combinada — bump a 720 para no truncar JSON con
+            # ambas secciones llenas.
+            options={**HELPER_OPTIONS, "num_predict": 720, "num_ctx": 4096},
             keep_alive=LLM_KEEP_ALIVE,
             format="json",
         )
@@ -108,8 +156,11 @@ def _wa_extract_actions(chat_label: str, is_group: bool, messages: list[dict]) -
         return empty
     if not isinstance(data, dict):
         return empty
-    out = {"tasks": [], "questions": [], "commitments": []}
-    for key in out:
+
+    out = {"tasks": [], "questions": [], "commitments": [], "promises": []}
+
+    # tasks/questions/commitments — same dedup + cap como pre-fusión
+    for key in ("tasks", "questions", "commitments"):
         items = data.get(key) or []
         if not isinstance(items, list):
             continue
@@ -125,7 +176,76 @@ def _wa_extract_actions(chat_label: str, is_group: bool, messages: list[dict]) -
                 continue
             seen.add(key_norm)
             out[key].append(clean)
+
+    # promises — validate + cross-check direction vs is_from_me real (Q10).
+    msg_by_id: dict[str, dict] = {}
+    for m in candidates:
+        mid = m.get("id") or m.get("msg_id")
+        if mid:
+            msg_by_id[str(mid)] = m
+
+    promises = data.get("promises") or []
+    if isinstance(promises, list):
+        seen_p: set[tuple[str, str]] = set()
+        for p in promises[:20]:
+            if not isinstance(p, dict):
+                continue
+            text = (p.get("text") or "").strip()
+            if not (4 <= len(text) <= 240):
+                continue
+            direction = (p.get("direction") or "").strip().lower()
+            if direction not in ("in", "out"):
+                continue
+            when_text = (p.get("when_text") or "").strip()
+            msg_id = str(p.get("msg_id") or "")
+            src = msg_by_id.get(msg_id) or {}
+
+            # Q10: cross-check direction. Si el msg cited es is_from_me=True
+            # y el LLM dijo direction="in", o vice-versa → el LLM hallucinó.
+            # Auto-corregimos basándonos en is_from_me (verdad ground-truth
+            # del bridge SQLite) en lugar de descartar la promesa entera.
+            #
+            # CAVEAT: solo aplicamos el cross-check si `is_from_me` está
+            # presente en el src dict. En producción siempre viene del
+            # bridge SQL. Tests pre-fusión usan _msg helper que no setea
+            # is_from_me — confiamos en el LLM en ese caso para no romper
+            # contratos históricos.
+            if src and "is_from_me" in src:
+                actual_is_from_me = bool(src.get("is_from_me"))
+                inferred_direction = "out" if actual_is_from_me else "in"
+                if direction != inferred_direction:
+                    direction = inferred_direction
+
+            dedup_key = (text.lower(), direction)
+            if dedup_key in seen_p:
+                continue
+            seen_p.add(dedup_key)
+            out["promises"].append({
+                "text": text,
+                "when_text": when_text,
+                "direction": direction,
+                "msg_id": msg_id,
+                "msg_ts": src.get("ts") or "",
+                "speaker": src.get("who") or ("yo" if direction == "out" else ""),
+            })
+
     return out
+
+
+def _wa_extract_actions(chat_label: str, is_group: bool, messages: list[dict]) -> dict:
+    """Back-compat wrapper. Devuelve solo {tasks, questions, commitments}.
+
+    A partir de 2026-05-09 el camino interno es ``_wa_extract_combined`` que
+    extrae las 4 cosas en una sola LLM call. Este wrapper preserva la firma
+    histórica para los call sites que solo querían action items (test code,
+    etc.).
+    """
+    combined = _wa_extract_combined(chat_label, is_group, messages)
+    return {
+        "tasks": combined.get("tasks", []),
+        "questions": combined.get("questions", []),
+        "commitments": combined.get("commitments", []),
+    }
 
 
 # --- WhatsApp promise tracking (feat 2026-04-25) ---
@@ -190,115 +310,31 @@ def _wa_extract_promises(
     is_group: bool,
     messages: list[dict],
 ) -> list[dict]:
-    """LLM-extract promises from a chat window.
+    """Back-compat wrapper. Devuelve solo `promises` desde la combined call.
 
-    Devuelve lista de promesas estructuradas:
-        [{"text": "...", "when_text": "...", "direction": "out|in",
-          "msg_id": "...", "msg_ts": "...", "speaker": "..."}, ...]
+    A partir de 2026-05-09 el camino interno es ``_wa_extract_combined``.
+    Preservado para tests / call sites históricos que solo quieren promesas.
 
-    Pipeline: anti-loop drop U+200B → regex pre-filter (skip LLM si
-    nada matchea) → LLM con prompt determinista format=json → validate
-    + dedup por (text, direction). Silent-fail por contrato: empty
-    list on cualquier error (LLM, JSON inválido, etc).
+    Para mantener back-compat exact con la versión pre-fusión: respeta el
+    promise-hint regex gate. Si NO hay candidato con hint, return [] sin
+    invocar el LLM. Esto preserva el contrato "no spendear LLM call si no
+    hay nada que extraer" para callers que solo querían promesas.
     """
-    from rag import HELPER_MODEL, HELPER_OPTIONS, LLM_KEEP_ALIVE, _summary_client
-    # Re-resolve `_has_promise_hint` via package namespace para que
-    # tests con `monkeypatch.setattr(_waint, "_has_promise_hint", ...)`
-    # propaguen.
-    from rag.integrations.whatsapp import _has_promise_hint
     if not messages:
         return []
     candidates = [m for m in messages if not (m.get("text") or "").startswith("​")]
     if not candidates:
         return []
+    # Re-resolve via package namespace para tests con monkeypatch.
+    from rag.integrations.whatsapp import _has_promise_hint
     if not any(_has_promise_hint(m.get("text") or "") for m in candidates):
         return []
-    convo_lines: list[str] = []
-    for m in candidates:
-        ts = (m.get("ts") or "")[:16].replace("T", " ")
-        mid = m.get("msg_id") or "?"
-        who = m.get("who") or "?"
-        text = m.get("text") or ""
-        convo_lines.append(f"[{ts}] [id:{mid}] {who}: {text}")
-    convo = "\n".join(convo_lines)
-    if len(convo) > 6000:
-        convo = convo[-6000:]
-    kind = "grupo" if is_group else "chat directo"
-    prompt = (
-        f"Conversación de WhatsApp ({kind}): {chat_label}\n\n"
-        f"{convo}\n\n"
-        "Extraé SOLO las PROMESAS — frases donde alguien se compromete a "
-        "hacer algo en el futuro pero todavía NO lo hizo.\n\n"
-        "Ejemplos:\n"
-        "  ✓ \"después te aviso\" → promesa, when_text=\"\"\n"
-        "  ✓ \"te llamo mañana 10am\" → promesa, when_text=\"mañana 10am\"\n"
-        "  ✓ \"en un rato lo reviso\" → promesa, when_text=\"en un rato\"\n"
-        "  ✗ \"te avisé ayer\" → ya pasó, NO es promesa\n"
-        "  ✗ \"siempre te aviso\" → general, NO es promesa concreta\n"
-        "  ✗ \"buenas\" / \"jaja\" / fotos → small talk, NO\n\n"
-        "Para cada promesa devolvé:\n"
-        "  - text: la frase exacta (1 línea, sin nombres ni timestamps)\n"
-        "  - when_text: el \"cuándo\" si lo dice (\"mañana\", \"en 2hs\", "
-        "\"esta tarde\"). Vacío \"\" si no especifica.\n"
-        "  - direction: \"out\" si YO (el usuario) prometo a otro;\n"
-        "               \"in\" si OTRO promete a mí (el usuario)\n"
-        "  - msg_id: el id que aparece en [id:XXX] en la línea original\n\n"
-        "Si no hay promesas reales, devolvé lista vacía. Formato JSON estricto:\n"
-        '{"promises": [{"text": "...", "when_text": "...", "direction": "out", "msg_id": "..."}]}'
-    )
-    try:
-        resp = _summary_client().chat(
-            model=HELPER_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            options={**HELPER_OPTIONS, "num_predict": 480, "num_ctx": 4096},
-            keep_alive=LLM_KEEP_ALIVE,
-            format="json",
-        )
-        raw = (resp.message.content or "").strip()
-        data = json.loads(raw)
-    except Exception:
-        return []
-    if not isinstance(data, dict):
-        return []
-    promises = data.get("promises") or []
-    if not isinstance(promises, list):
-        return []
-    msg_by_id: dict[str, dict] = {}
-    for m in candidates:
-        mid = m.get("msg_id")
-        if mid:
-            msg_by_id[str(mid)] = m
-    out: list[dict] = []
-    seen: set[tuple[str, str]] = set()
-    for p in promises[:20]:
-        if not isinstance(p, dict):
-            continue
-        text = (p.get("text") or "").strip()
-        if not (4 <= len(text) <= 240):
-            continue
-        direction = (p.get("direction") or "").strip().lower()
-        if direction not in ("in", "out"):
-            continue
-        when_text = (p.get("when_text") or "").strip()
-        msg_id = str(p.get("msg_id") or "")
-        dedup_key = (text.lower(), direction)
-        if dedup_key in seen:
-            continue
-        seen.add(dedup_key)
-        src = msg_by_id.get(msg_id) or {}
-        out.append({
-            "text": text,
-            "when_text": when_text,
-            "direction": direction,
-            "msg_id": msg_id,
-            "msg_ts": src.get("ts") or "",
-            "speaker": src.get("who") or ("yo" if direction == "out" else ""),
-        })
-    return out
+    return _wa_extract_combined(chat_label, is_group, messages).get("promises", [])
 
 
 __all__ = [
     "_PROMISE_REGEX_HINTS",
+    "_wa_extract_combined",
     "_wa_extract_actions",
     "_has_promise_hint",
     "_parse_promise_when",

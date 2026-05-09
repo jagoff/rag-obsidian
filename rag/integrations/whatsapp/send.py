@@ -95,19 +95,12 @@ def _whatsapp_send_to_jid(
     mensaje específico con quote nativo de WhatsApp. Shape esperado:
     ``{"message_id": str, "original_text": str, "sender_jid": str?}``.
 
-    Estado actual: el bridge local (whatsapp-mcp/whatsapp-bridge,
-    `main.go:707-771`) **NO soporta ``ContextInfo``/``QuotedMessage``**
-    out of the box — `SendMessageRequest` solo acepta
-    ``{recipient, message, media_path}`` y construye `msg.Conversation`
-    plano. Por eso pasamos el ``reply_to`` al payload pero el bridge lo
-    ignora silenciosamente; el mensaje sale como reply normal sin la
-    cita boxed que ves en la UI nativa de WhatsApp. La info igualmente
-    se loguea via el caller (auditoría + traceability) y la UI del
-    chat web muestra el contexto del mensaje original al user.
-
-    Cuando el bridge agregue soporte de quote, este helper ya pasa el
-    campo — bumpean el bridge y empiezan a salir las citas nativas sin
-    cambiar el cliente.
+    Soporte nativo desde 2026-05-09: el bridge Go (main.go) acepta
+    ``reply_to`` en el payload y construye ``ExtendedTextMessage`` con
+    ``ContextInfo`` (StanzaID + Participant + QuotedMessage). El receptor
+    ve la cita boxed nativa de WhatsApp ("respondiendo a..."). Para
+    grupos el ``sender_jid`` es required (el JID full del autor del
+    quoted msg); para 1:1 puede ser el chat_jid mismo.
 
     Retorna True en 2xx del bridge, False en cualquier otra cosa
     (unreachable, 4xx, 5xx, timeout 10s).

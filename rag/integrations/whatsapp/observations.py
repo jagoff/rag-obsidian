@@ -27,7 +27,9 @@ Silent-fail: si el LLM rebota → None → caller va solo a `## Observaciones`.
 
 from __future__ import annotations
 
+import hashlib
 import re
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -35,6 +37,46 @@ from rag.integrations.whatsapp._constants import (
     _CONTACT_OBS_STANDARD_CATEGORIES,
     _OBSERVATIONS_HEADING,
 )
+
+
+# ── Cache + obvious-pattern fast-path ───────────────────────────────────────
+# Cache LRU manual: (obs_hash, body_hash) → category. Cap conservador (256
+# entries) — el universo de observations × cuerpos de nota distintos es
+# pequeño y si se llena, FIFO eviction. Lock para thread-safety (web server
+# corre en thread pool de uvicorn; CLI single-thread).
+_OBS_CATEGORY_CACHE: dict[tuple[str, str], str | None] = {}
+_OBS_CATEGORY_CACHE_LOCK = threading.Lock()
+_OBS_CATEGORY_CACHE_MAX = 256
+
+# Patrones que matchean categorías OBVIAS sin necesidad de LLM. Cada entry:
+# (compiled_regex, category_name). Lista CONSERVADORA — si el regex no
+# matchea, caemos al LLM (no degradamos calidad). False-positive rate aceptado:
+# cero — solo agregamos patrones donde "X → categoría Y" es 100% determinista.
+_OBVIOUS_OBS_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
+    # Preferencias — "le gusta X", "prefiere X", "le encanta X"
+    (re.compile(r"^\s*(le\s+gust\w+|prefiere|le\s+encanta|adora)\b", re.IGNORECASE), "Preferencias"),
+    # Cumpleaños — fecha + cumple
+    (re.compile(r"\b(cumple\w*|cumplea[ñn]os|nacimiento|nac[ií]o)\b", re.IGNORECASE), "Cumpleaños"),
+    # Trabajo — "trabaja en X", "labura en", "se mudó a [trabajo]"
+    (re.compile(r"\b(trabaja|labura|se\s+jubil|jubilad[oa]|empez[oó]\s+en|cambi[oó]\s+de\s+trabajo)\b", re.IGNORECASE), "Trabajo / contexto"),
+    # Eventos — "viaje a X", "se casa", "tuvo un hijo"
+    (re.compile(r"\b(viaje\s+a|se\s+cas\w+|tuvo\s+(un|una)\s+(hij\w+|beb)|se\s+mud\w+\s+a|operaci[oó]n)\b", re.IGNORECASE), "Eventos importantes"),
+)
+
+
+def _hash_short(s: str) -> str:
+    """sha1[:16] — cheap, suficiente para cache key (no security-sensitive)."""
+    return hashlib.sha1(s.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _match_obvious_category(observation: str) -> str | None:
+    """Pre-filter: si la observation matchea un patrón OBVIO, devuelve la
+    categoría sin LLM call. Si no matchea, devuelve None (caller cae al LLM).
+    """
+    for pattern, category in _OBVIOUS_OBS_PATTERNS:
+        if pattern.search(observation):
+            return category
+    return None
 
 
 def _infer_observation_category(
@@ -65,9 +107,32 @@ def _infer_observation_category(
     - Timeout corto (heredado del helper client = 30s).
     - Idempotente: prompt es determinístico (temperature=0, seed=42).
     - No imprime nada — los callers silencian errores.
+
+    Optimizaciones (2026-05-09):
+    - Fast-path regex obvio (`_match_obvious_category`) skipea LLM para
+      patrones comunes ("le gusta", "trabaja en", "cumpleaños").
+    - Cache LRU `(obs_hash, body_hash) → category` evita LLM call repetida
+      cuando la misma observation se procesa 2 veces (e.g., el watchdog del
+      ambient agent dispara dos veces seguidas).
     """
     if not observation or not observation.strip():
         return None
+
+    obs_clean = observation.strip()
+
+    # Fast-path 1: regex obvios. Matchea ~30-40% de las observations comunes
+    # ("le gusta X" → Preferencias) sin gastar LLM call (~200-500ms ahorrados).
+    obvious = _match_obvious_category(obs_clean)
+    if obvious:
+        return obvious
+
+    # Fast-path 2: cache (obs_hash, body_hash) → category. Mismo prompt + mismo
+    # body siempre da misma respuesta determinística (HELPER_OPTIONS
+    # temperature=0 + seed=42), entonces es seguro cachear.
+    cache_key = (_hash_short(obs_clean), _hash_short(note_body or ""))
+    with _OBS_CATEGORY_CACHE_LOCK:
+        if cache_key in _OBS_CATEGORY_CACHE:
+            return _OBS_CATEGORY_CACHE[cache_key]
 
     # Categorías candidatas = existentes en la nota + estándar del template.
     # Priorizamos las existentes (orden preservado) para que el LLM prefiera
@@ -102,8 +167,9 @@ def _infer_observation_category(
     # Evitamos dar demasiados ejemplos (cost) pero los suficientes para
     # que el modelo entienda el shape esperado.
     prompt = (
-        "Sos un asistente que clasifica observaciones sobre personas "
-        "en una de estas categorías de su ficha de contacto:\n\n"
+        "Sos un asistente argentino que clasifica observaciones sobre personas "
+        "en una de estas categorías de su ficha de contacto. Respondé SIEMPRE "
+        "en español rioplatense (voseo). Nunca portugués.\n\n"
         + "\n".join(f"- {c}" for c in candidates)
         + '\n- (ninguna)\n\n'
         "Regla: respondé con EXACTAMENTE una línea, solo el nombre de "
@@ -135,6 +201,19 @@ def _infer_observation_category(
             pass
         return None
 
+    def _store_cache(value: str | None) -> str | None:
+        """Helper: persiste resultado en cache LRU con FIFO eviction."""
+        with _OBS_CATEGORY_CACHE_LOCK:
+            if len(_OBS_CATEGORY_CACHE) >= _OBS_CATEGORY_CACHE_MAX:
+                # FIFO: drop la entrada más vieja (CPython 3.7+ dict preserva insertion order)
+                try:
+                    oldest = next(iter(_OBS_CATEGORY_CACHE))
+                    del _OBS_CATEGORY_CACHE[oldest]
+                except StopIteration:
+                    pass
+            _OBS_CATEGORY_CACHE[cache_key] = value
+        return value
+
     # Parseo tolerante: el modelo a veces devuelve "Categoría: Notas" o
     # "→ Notas" o la palabra con un sufijo ("Notas (default)"). Tomamos
     # la primera línea no vacía y matcheamos contra candidates.
@@ -143,7 +222,7 @@ def _infer_observation_category(
         "",
     )
     if not first_line:
-        return None
+        return _store_cache(None)
 
     # Limpieza común (prefijos tipo "→", "-", "*", "Categoría:").
     cleaned = re.sub(
@@ -155,22 +234,22 @@ def _infer_observation_category(
 
     lower = cleaned.lower()
     if lower in {"(ninguna)", "ninguna", "none", "null"}:
-        return None
+        return _store_cache(None)
 
     # Match exacto (case-insensitive) con cualquier candidate.
     for cand in candidates:
         if cand.lower() == lower:
-            return cand
+            return _store_cache(cand)
     # Match por prefijo — cubrir "Notas (default)" → "Notas".
     for cand in candidates:
         if lower.startswith(cand.lower()):
-            return cand
+            return _store_cache(cand)
     # Si el LLM devolvió algo libre fuera de la lista, lo aceptamos igual
     # SIEMPRE que sea corto (< 40 chars) y no tenga chars raros. Permite
     # que el LLM invente categorías útiles ("Salud", "Hobbies", etc).
     if 2 <= len(cleaned) <= 40 and re.match(r"^[\w\s/áéíóúñÁÉÍÓÚÑ]+$", cleaned):
-        return cleaned
-    return None
+        return _store_cache(cleaned)
+    return _store_cache(None)
 
 
 def _append_contact_observation(

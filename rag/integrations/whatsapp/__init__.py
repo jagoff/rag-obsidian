@@ -123,6 +123,7 @@ from rag.integrations.whatsapp.tasks_extract import (  # noqa: F401
     _has_promise_hint,
     _parse_promise_when,
     _wa_extract_actions,
+    _wa_extract_combined,
     _wa_extract_promises,
 )
 
@@ -257,6 +258,7 @@ __all__ = [
     "_wa_tasks_save_state",
     # Tasks extract
     "_wa_extract_actions",
+    "_wa_extract_combined",
     "_has_promise_hint",
     "_parse_promise_when",
     "_wa_extract_promises",

@@ -15,11 +15,15 @@ from pathlib import Path
 
 # ── Paths del bridge SQLite + state files ───────────────────────────────────
 WHATSAPP_NOTE_MAX_CHARS = 4096  # WA hard limit per message
+# Path corregido 2026-05-09: el repo del bridge vive en ~/repos/, no
+# ~/repositories/. El path viejo silent-faileaba todos los fetch (today/
+# unread/window/recent_with_jid devolvían [] porque is_file()=False) lo
+# que vaciaba la sección WhatsApp del morning brief y dejaba sin extraer
+# wa-tasks por días.
 WHATSAPP_BRIDGE_DB_PATH = (
-    Path.home()
-    / "repositories" / "whatsapp-mcp" / "whatsapp-bridge" / "store" / "messages.db"
+    Path.home() / "repos" / "whatsapp-mcp" / "whatsapp-bridge" / "store" / "messages.db"
 )
-WHATSAPP_DB_PATH = Path.home() / "repositories/whatsapp-mcp/whatsapp-bridge/store/messages.db"
+WHATSAPP_DB_PATH = WHATSAPP_BRIDGE_DB_PATH  # alias back-compat
 WHATSAPP_BOT_JID = "120363426178035051@g.us"  # RagNet — bot's own group, skip
 
 WA_TASKS_STATE_PATH = Path.home() / ".local/share/obsidian-rag/wa_tasks_state.json"

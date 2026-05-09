@@ -1283,6 +1283,43 @@ def chat_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
 
 
+@app.get("/mirror")
+def mirror_page() -> FileResponse:
+    """Personal Mirror — game changer 2026-05-09. Ver `rag/mirror.py`
+    + ADR `99-AI/system/daemon-refactor-2026-05-09/personal-mirror-spec.md`.
+    """
+    return FileResponse(STATIC_DIR / "mirror.html")
+
+
+@app.get("/api/mirror")
+def api_mirror(date: str | None = None, refresh: int = 0) -> dict:
+    """JSON con el estado completo del mirror.
+
+    Query params:
+    - ``date``: ``YYYY-MM-DD``, default hoy.
+    - ``refresh=1``: bypass cache, recompute fresh.
+
+    Performance: <500ms cache hit, <2s cache miss.
+    Insights LLM NO se calculan acá — pedirlos a ``/api/mirror/insights``
+    lazy desde el frontend.
+    """
+    from rag.mirror import assemble_mirror  # noqa: PLC0415
+    return assemble_mirror(date=date, use_cache=(refresh != 1))
+
+
+@app.get("/api/mirror/insights")
+def api_mirror_insights(date: str | None = None) -> dict:
+    """Insights LLM-generated. Se calcula sync (timeout ~8s); el
+    frontend lo llama LAZY después del render principal."""
+    from rag.mirror import assemble_mirror, generate_insights  # noqa: PLC0415
+    mirror = assemble_mirror(date=date, use_cache=True)
+    insights = generate_insights(mirror)
+    return {
+        "date": mirror.get("date"),
+        **insights,
+    }
+
+
 # ── PWA endpoints ─────────────────────────────────────────────────────
 # El manifest y el service worker DEBEN servirse desde la raíz para que
 # el SW pueda controlar el scope "/" (home + /chat + /dashboard). Un SW
@@ -3408,7 +3445,7 @@ def whatsapp_send(req: WhatsAppSendRequest, request: Request) -> dict:
         # — the helper swallows the HTTP code. Return 502 (bad gateway)
         # to signal an upstream issue vs 400 (client-side) for shape
         # problems caught above.
-        raise HTTPException(status_code=502, detail="bridge WhatsApp no respondió (localhost:8080 no disponible o rechazó el mensaje)")
+        raise HTTPException(status_code=502, detail="bridge WhatsApp no respondió (localhost:8088 no disponible o rechazó el mensaje)")
     # Log minimal audit trail — we don't persist the message body for
     # privacy, just the event + jid + proposal_id so we can correlate
     # with the chat transcript later if needed.

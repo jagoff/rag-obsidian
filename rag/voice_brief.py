@@ -332,7 +332,7 @@ def send_audio_to_whatsapp(jid: str, audio_path: Path) -> bool:
     try:
         from rag import AMBIENT_WHATSAPP_BRIDGE_URL  # noqa: PLC0415
     except Exception:
-        AMBIENT_WHATSAPP_BRIDGE_URL = "http://localhost:8080/api/send"
+        AMBIENT_WHATSAPP_BRIDGE_URL = "http://localhost:8088/api/send"
     body = json.dumps({
         "recipient": jid,
         "media_path": str(audio_path),

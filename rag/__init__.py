@@ -20867,7 +20867,12 @@ AMBIENT_STATE_PATH = Path.home() / ".local/share/obsidian-rag/ambient_state.json
 AMBIENT_DEDUP_WINDOW_SEC = 300   # 5 min
 AMBIENT_LOG_PATH = Path.home() / ".local/share/obsidian-rag/ambient.jsonl"
 # WhatsApp bridge local HTTP endpoint (whatsapp-mcp/whatsapp-bridge).
-AMBIENT_WHATSAPP_BRIDGE_URL = "http://localhost:8080/api/send"
+# Default :8088 desde 2026-05-07 — Caddy holds :8080 como redirector HTTP
+# (pfctl 80→8080). El bridge Go lee `WHATSAPP_BRIDGE_PORT` env, default
+# 8088. Override acá via `OBSIDIAN_RAG_WA_BRIDGE_PORT` para mantener
+# simetría con el listener TS (que usa `BRIDGE_URL`).
+_WA_BRIDGE_PORT = int(os.environ.get("OBSIDIAN_RAG_WA_BRIDGE_PORT", "8088"))
+AMBIENT_WHATSAPP_BRIDGE_URL = f"http://localhost:{_WA_BRIDGE_PORT}/api/send"
 # Zero-width space prefix — el listener.ts del bot usa esto como anti-loop:
 # ignora mensajes que arrancan con U+200B para no procesar sus propios
 # outputs como queries entrantes.
@@ -43654,13 +43659,16 @@ def wa_fast(ctx: click.Context, dry_run: bool):
 # que sea un problema real (multi-host setup, etc.).
 _WA_BRIDGE_LAUNCHD_LABEL = "com.fer.whatsapp-bridge"
 _WA_BRIDGE_PLIST = Path.home() / "Library/LaunchAgents/com.fer.whatsapp-bridge.plist"
-_WA_BRIDGE_BINARY = Path.home() / ".local/bin/whatsapp-bridge"
-_WA_BRIDGE_REPO = Path("/Users/fer/repositories/whatsapp-mcp/whatsapp-bridge")
+# Path actualizado 2026-05-09: el repo se movió de ~/repositories/ a ~/repos/.
+# El binario compilado vive in-tree (no en ~/.local/bin/) — el plist usa el
+# path absoluto del repo para evitar copias intermedias.
+_WA_BRIDGE_REPO = Path.home() / "repos/whatsapp-mcp/whatsapp-bridge"
+_WA_BRIDGE_BINARY = _WA_BRIDGE_REPO / "whatsapp-bridge"
 _WA_BRIDGE_SESSION_DB = _WA_BRIDGE_REPO / "store/whatsapp.db"
 _WA_BRIDGE_MESSAGES_DB = _WA_BRIDGE_REPO / "store/messages.db"
 _WA_BRIDGE_SENTINEL = _WA_BRIDGE_REPO / "store/.needs-reauth"
 _WA_BRIDGE_LOG = Path.home() / ".local/share/whatsapp-bridge/bridge.log"
-_WA_BRIDGE_HEALTH_URL = "http://localhost:8080/api/health"
+_WA_BRIDGE_HEALTH_URL = f"http://localhost:{_WA_BRIDGE_PORT}/api/health"
 
 
 def _wa_bridge_uid() -> int:
@@ -43733,7 +43741,7 @@ def _wa_bridge_http_probe() -> tuple[bool, str]:
             return False, "logged_in but socket dropped (auto-reconnect pending)"
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
-            return False, "no_health_endpoint (old bridge binary — `cd ~/repositories/whatsapp-mcp/whatsapp-bridge && go build -o ~/.local/bin/whatsapp-bridge .`)"
+            return False, "no_health_endpoint (old bridge binary — `cd ~/repos/whatsapp-mcp/whatsapp-bridge && go build -o whatsapp-bridge .`)"
         return False, f"HTTP {exc.code}"
     except (ConnectionRefusedError, urllib.error.URLError) as exc:
         return False, f"unreachable: {exc!r}"

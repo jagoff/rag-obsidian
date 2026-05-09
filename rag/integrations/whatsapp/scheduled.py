@@ -79,6 +79,25 @@ _VALID_STATUSES: tuple[str, ...] = (
 # debe ser > timeout máximo del bridge (10s) + margen — 5min cubre con
 # holgura el caso plist tick + manual run solapados.
 _STALE_PROCESSING_MINUTES = 5
+# Backoff exponencial entre retries del worker. attempt=1 → 0min cooldown
+# (retry inmediato en próximo tick), attempt=2 → 5min, attempt=3 → 15min,
+# attempt=4 → 30min, attempt=5 → 60min cap. Sin esto, cada attempt fallido
+# se reintenta cada 5min (cron tick), y un bridge caído por 1h dispara 12
+# attempts ruidosos. Con backoff: 5 attempts cubren ~110min de outage en
+# vez de 25min.
+#
+# Default OFF para preservar contracts existentes (incluido test
+# `test_run_due_worker_retries_on_failure_until_max` que asume retries
+# inmediatos sin avanzar tiempo). Activá con
+# `RAG_WA_SCHEDULED_BACKOFF=1` cuando querés el comportamiento robusto.
+_RETRY_BACKOFF_MINUTES: tuple[int, ...] = (0, 5, 15, 30, 60)
+
+import os as _os  # noqa: E402
+
+def _backoff_enabled() -> bool:
+    return _os.environ.get("RAG_WA_SCHEDULED_BACKOFF", "").lower() in ("1", "true", "yes")
+
+
 _VALID_SOURCES: tuple[str, ...] = ("chat", "dashboard", "nl")
 # Margen para clock skew: rechazamos pasado solo si está más de 60s atrás.
 _PAST_TOLERANCE_SECONDS = 60
@@ -760,6 +779,30 @@ def run_due_worker(
                 f"ORDER BY scheduled_for_utc ASC LIMIT ?",
                 (now_iso, max(1, int(max_per_run))),
             ).fetchall()
+
+            # Backoff exponencial (opt-in via RAG_WA_SCHEDULED_BACKOFF=1):
+            # filtrar rows cuyo último intento fue más reciente que el
+            # cooldown correspondiente al attempt_count. Sin esto, un bridge
+            # caído por 1h dispara retries cada 5min (12 attempts ruidosos).
+            if _backoff_enabled():
+                def _eligible_for_retry(row: tuple) -> bool:
+                    rd = _row_to_dict(row)
+                    attempt = int(rd.get("attempt_count") or 0)
+                    if attempt <= 0:
+                        return True  # primer intento, sin cooldown
+                    idx = min(attempt, len(_RETRY_BACKOFF_MINUTES) - 1)
+                    cooldown_min = _RETRY_BACKOFF_MINUTES[idx]
+                    last_iso = rd.get("last_attempt_at")
+                    if not last_iso:
+                        return True
+                    try:
+                        last_dt = _to_utc_dt(last_iso)
+                    except Exception:
+                        return True
+                    elapsed = (now_dt - last_dt).total_seconds() / 60.0
+                    return elapsed >= cooldown_min
+
+                rows = [r for r in rows if _eligible_for_retry(r)]
 
             # Lazy import del send path: viene de `rag.integrations.whatsapp`
             # que a su vez hace late-import de `rag` — para evitar ciclos al

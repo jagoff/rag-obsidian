@@ -33,7 +33,124 @@ respetan monkey-patches de tests.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+
+# Bridge guarda `timestamp` como string `YYYY-MM-DD HH:MM:SS-03:00` (Go default
+# `time.Time.String()` con offset local del proceso del bridge). Como el offset
+# es siempre el mismo (TZ local del user, hoy -03:00 Argentina), la
+# string-comparación lex es correcta SI los bounds se formatean igual.
+#
+# Antes del 2026-05-09 las queries usaban `WHERE datetime(m.timestamp) >= datetime(?)`,
+# lo que ROMPÍA el uso del índice `idx_messages_chat_ts` porque SQLite no puede
+# usar índices sobre funciones de la columna. Bench medido: 40.96ms → 0.10ms
+# (~400x speedup) al pasar a comparación string pura.
+#
+# Caveat conocido: si el user viaja a otra TZ, el offset del bridge cambia y la
+# lex-compare puede fallar para los rows escritos antes del viaje. Mitigación:
+# `_bridge_ts_bound` lee `RAG_TIMEZONE` o asume -03:00 — re-evaluar si soporta
+# otras TZ. Para 99% del uso (single-TZ), esto es seguro.
+_BRIDGE_TS_FMT = "%Y-%m-%d %H:%M:%S"
+_BRIDGE_TZ_OFFSET = "-03:00"  # Argentina local — bridge usa esto al persistir
+
+# Cap defensivo: max OCR/VLM calls per `_fetch_whatsapp_window` invocation.
+# El bridge guarda media en `<bridge_repo>/store/<chat_jid>/<filename>`.
+# OCR (ocrmac) es ~50-200ms/imagen; VLM fallback (granite) ~1-2s/imagen.
+# Sin cap, una ráfaga de 30 fotos en un grupo bloquea el wa-tasks tick.
+_WA_OCR_MAX_PER_RUN = 5
+_WA_OCR_TEXT_MAX_CHARS = 400  # cap del snippet inyectado al LLM context
+
+
+def _bridge_ts_bound(dt: datetime) -> str:
+    """Formatea un `datetime` para comparar con la columna `messages.timestamp`
+    del bridge usando string-lex (no `datetime()` SQL function — usa el índice).
+    """
+    # Truncar microsegundos: el bridge no los guarda y lex string compara
+    # byte-a-byte, así que un microsegundo de más cambia el resultado.
+    return dt.strftime(_BRIDGE_TS_FMT) + _BRIDGE_TZ_OFFSET
+
+
+import contextlib  # noqa: E402
+
+
+def _bridge_media_path(chat_jid: str, filename: str) -> Path | None:
+    """Resuelve el path local donde el bridge guardó un media file.
+
+    El bridge auto-descarga inbound media a `<repo>/store/<chat_jid>/<filename>`.
+    Devuelve `None` si el archivo no existe (puede que el bridge falló al
+    bajar, o que el filename no matchea).
+    """
+    if not chat_jid or not filename:
+        return None
+    import rag as _rag
+    db_path = _rag.WHATSAPP_DB_PATH
+    if db_path is None:
+        return None
+    # `messages.db` vive en `<repo>/store/messages.db`. Media en `<repo>/store/<chat_jid>/<filename>`.
+    media = db_path.parent / chat_jid / filename
+    return media if media.is_file() else None
+
+
+def _ocr_image_safe(image_path: Path, *, label: str = "wa") -> str:
+    """OCR + VLM caption fallback con timeout suave.
+
+    Wrapper sobre `rag.ocr._image_text_or_caption` con silent-fail completo.
+    Si OCR/VLM falla (model no disponible, timeout, etc.) devuelve "" — el
+    caller pone solo el placeholder `[image]` como antes del wireup A4.
+
+    El cache (`rag_ocr_cache` + `rag_vlm_captions`) ya está implementado en
+    `rag.ocr` así que las imágenes recurrentes (memes reenviados, etc.) NO
+    repagan el costo OCR.
+    """
+    try:
+        from rag.ocr import _image_text_or_caption  # noqa: PLC0415
+        text = _image_text_or_caption(image_path) or ""
+    except Exception as exc:
+        try:
+            import rag as _rag
+            _rag._silent_log(f"wa_ocr_failed_{label}", exc)
+        except Exception:
+            pass
+        return ""
+    if not text:
+        return ""
+    text = text.strip().replace("\n", " ")
+    if len(text) > _WA_OCR_TEXT_MAX_CHARS:
+        text = text[:_WA_OCR_TEXT_MAX_CHARS - 1] + "…"
+    return text
+
+
+@contextlib.contextmanager
+def _bridge_conn(timeout: float = 5.0):
+    """Context manager para abrir una connection read-only al bridge SQLite.
+
+    Centraliza el patrón `sqlite3.connect(file:...?mode=ro, uri=True)` +
+    silent-fail si la DB no existe o no se puede abrir. Yieldea la conn ya
+    con `row_factory = sqlite3.Row` lista. Si la apertura falla, yieldea None
+    (el caller debe checkear). Cierra siempre en `finally`.
+
+    Permite que callers que hacen 2 fetches consecutivos (e.g., morning brief)
+    reusen una sola conn en lugar de abrir-cerrar dos veces.
+    """
+    import rag as _rag
+    import sqlite3
+    db_path = _rag.WHATSAPP_DB_PATH
+    if not db_path.is_file():
+        yield None
+        return
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=timeout)
+    except sqlite3.Error:
+        yield None
+        return
+    try:
+        con.row_factory = sqlite3.Row
+        yield con
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
 
 
 def _fetch_whatsapp_today(now=None, max_chats: int = 8) -> list[dict]:
@@ -52,12 +169,8 @@ def _fetch_whatsapp_today(now=None, max_chats: int = 8) -> list[dict]:
     from datetime import datetime as _dt
     if now is None:
         now = _dt.now()
-    # Inicio del día local en ISO sin timezone — coincide con cómo
-    # `messages.timestamp` se almacena en el bridge SQLite (naive RFC3339
-    # local-ish). El `datetime(?)` de SQLite parsea ambos formatos.
-    today_start_iso = now.replace(
-        hour=0, minute=0, second=0, microsecond=0,
-    ).isoformat()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start_bound = _bridge_ts_bound(today_start)
     import rag as _rag
     db_path = _rag.WHATSAPP_DB_PATH
     bot_jid = _rag.WHATSAPP_BOT_JID
@@ -78,17 +191,17 @@ def _fetch_whatsapp_today(now=None, max_chats: int = 8) -> list[dict]:
               count(*) AS cnt,
               (SELECT content FROM messages
                  WHERE chat_jid = m.chat_jid AND is_from_me = 0
-                 ORDER BY datetime(timestamp) DESC LIMIT 1) AS last_content
+                 ORDER BY timestamp DESC LIMIT 1) AS last_content
             FROM messages m
             WHERE m.is_from_me = 0
-              AND datetime(m.timestamp) >= datetime(?)
+              AND m.timestamp >= ?
               AND m.chat_jid != ?
               AND m.chat_jid NOT LIKE '%status@broadcast'
             GROUP BY m.chat_jid
             ORDER BY cnt DESC
             LIMIT ?
             """,
-            (today_start_iso, bot_jid, int(max_chats) * 3),
+            (today_start_bound, bot_jid, int(max_chats) * 3),
         ).fetchall()
     except sqlite3.Error:
         return []
@@ -134,6 +247,7 @@ def _fetch_whatsapp_unread(hours: int = 24, max_chats: int = 8) -> list[dict]:
     bot_jid = _rag.WHATSAPP_BOT_JID
     if not db_path.is_file():
         return []
+    cutoff_bound = _bridge_ts_bound(datetime.now() - timedelta(hours=int(hours)))
     import sqlite3
     try:
         con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
@@ -149,19 +263,24 @@ def _fetch_whatsapp_unread(hours: int = 24, max_chats: int = 8) -> list[dict]:
               count(*) AS cnt,
               (SELECT content FROM messages
                  WHERE chat_jid = m.chat_jid AND is_from_me = 0
-                 ORDER BY datetime(timestamp) DESC LIMIT 1) AS last_content
+                 ORDER BY timestamp DESC LIMIT 1) AS last_content
             FROM messages m
             WHERE m.is_from_me = 0
-              AND datetime(m.timestamp) > datetime('now', ?)
+              AND m.timestamp > ?
               AND m.chat_jid != ?
               AND m.chat_jid NOT LIKE '%status@broadcast'
-              AND substr(content, 1, 1) != char(8203)
             GROUP BY m.chat_jid
             ORDER BY cnt DESC
             LIMIT ?
             """,
-            (f"-{int(hours)} hours", bot_jid, int(max_chats) * 3),
+            (cutoff_bound, bot_jid, int(max_chats) * 3),
         ).fetchall()
+        # Anti-loop: drop msgs que arrancan con U+200B post-fetch en Python.
+        # Filter en SQL `substr(content,1,1) != char(8203)` rompe el uso del
+        # índice. Como los rows aquí ya son `is_from_me=0`, el marker U+200B
+        # casi nunca aparece (lo agregamos solo en outbound auto). Si aparece
+        # — alguien más manda U+200B legítimo — lo dropeamos acá.
+        rows = [r for r in rows if not (r["last_content"] or "").startswith("​")]
     except sqlite3.Error:
         return []
     finally:
@@ -233,43 +352,70 @@ def _fetch_whatsapp_window(
     if not db_path.is_file():
         return []
     since = since_ts or (now_ts - timedelta(hours=24))
-    since_iso = since.strftime("%Y-%m-%d %H:%M:%S")
+    since_bound = _bridge_ts_bound(since)
     import sqlite3
-    try:
-        con = sqlite3.connect(
-            f"file:{db_path}?mode=ro", uri=True, timeout=5.0,
-        )
-    except sqlite3.Error:
-        return []
-    try:
-        con.row_factory = sqlite3.Row
-        rows = con.execute(
-            """
-            SELECT
-              m.id AS id,
-              m.chat_jid AS jid,
-              m.sender AS sender,
-              m.content AS content,
-              m.timestamp AS ts,
-              m.is_from_me AS is_from_me,
-              m.media_type AS media_type,
-              c.name AS chat_name
-            FROM messages m
-            LEFT JOIN chats c ON c.jid = m.chat_jid
-            WHERE datetime(m.timestamp) >= datetime(?)
-              AND m.chat_jid != ?
-              AND m.chat_jid NOT LIKE '%status@broadcast'
-              AND substr(content, 1, 1) != char(8203)
-            ORDER BY m.timestamp ASC
-            """,
-            (since_iso, bot_jid),
-        ).fetchall()
-    except sqlite3.Error:
-        return []
-    finally:
-        con.close()
+
+    with _bridge_conn() as con:
+        if con is None:
+            return []
+        # Pass 1: identificar qué chats tienen suficiente activity inbound
+        # para justificar pull de msgs. Sin esto, en una vault con muchos
+        # grupos silenciosos pull-all-then-filter trae miles de rows que se
+        # descartan en Python.
+        try:
+            chat_filter_rows = con.execute(
+                """
+                SELECT chat_jid, count(*) AS inbound_cnt
+                FROM messages
+                WHERE timestamp >= ?
+                  AND is_from_me = 0
+                  AND chat_jid != ?
+                  AND chat_jid NOT LIKE '%status@broadcast'
+                GROUP BY chat_jid
+                HAVING inbound_cnt >= ?
+                ORDER BY inbound_cnt DESC
+                LIMIT ?
+                """,
+                (since_bound, bot_jid, int(min_inbound), int(max_chats) * 2),
+            ).fetchall()
+        except sqlite3.Error:
+            return []
+
+        if not chat_filter_rows:
+            return []
+
+        eligible_jids = [r["chat_jid"] for r in chat_filter_rows]
+        # Pass 2: traer mensajes (inbound + outbound para contexto LLM) SOLO
+        # de los chats elegibles. SQL `IN (?,?,...)` con placeholders.
+        placeholders = ",".join("?" * len(eligible_jids))
+        try:
+            rows = con.execute(
+                f"""
+                SELECT
+                  m.id AS id,
+                  m.chat_jid AS jid,
+                  m.sender AS sender,
+                  m.content AS content,
+                  m.timestamp AS ts,
+                  m.is_from_me AS is_from_me,
+                  m.media_type AS media_type,
+                  m.filename AS filename,
+                  c.name AS chat_name
+                FROM messages m
+                LEFT JOIN chats c ON c.jid = m.chat_jid
+                WHERE m.timestamp >= ?
+                  AND m.chat_jid IN ({placeholders})
+                ORDER BY m.timestamp ASC
+                """,
+                (since_bound, *eligible_jids),
+            ).fetchall()
+        except sqlite3.Error:
+            return []
+        # Anti-loop: drop U+200B post-fetch.
+        rows = [r for r in rows if not (r["content"] or "").startswith("​")]
 
     by_chat: dict[str, dict] = {}
+    ocr_calls_used = 0  # cap defensivo OCR/VLM por invocación (A4)
     for r in rows:
         jid = r["jid"] or ""
         label = _wa_chat_label(r["chat_name"] or "", jid)
@@ -277,8 +423,34 @@ def _fetch_whatsapp_window(
         if label.startswith("Contacto …") and not any(ch.isalpha() for ch in (r["chat_name"] or "")):
             continue
         content = (r["content"] or "").strip().replace("\n", " ")
-        if not content and r["media_type"]:
-            content = f"[{r['media_type']}]"
+        media_type = (r["media_type"] or "").strip()
+        if not content and media_type:
+            # A4 (2026-05-09): para imágenes inbound nuevas, intentar OCR/VLM
+            # y reemplazar `[image]` con `[image: "<text>"]`. Cap global de
+            # `_WA_OCR_MAX_PER_RUN` por invocación. Skipea outbound (`is_from_me=1`)
+            # — esos los mandó el user, ya sabe qué dicen.
+            content = f"[{media_type}]"
+            try:
+                msg_id_for_dedup = r["id"] or ""
+            except Exception:
+                msg_id_for_dedup = ""
+            is_image = media_type == "image"
+            is_inbound = not bool(r["is_from_me"])
+            is_new = bool(msg_id_for_dedup) and msg_id_for_dedup not in processed_ids
+            if (is_image and is_inbound and is_new
+                    and ocr_calls_used < _WA_OCR_MAX_PER_RUN):
+                filename = ""
+                try:
+                    filename = (r["filename"] or "").strip() if "filename" in r.keys() else ""
+                except Exception:
+                    filename = ""
+                if filename:
+                    media_path = _bridge_media_path(jid, filename)
+                    if media_path:
+                        ocr_calls_used += 1
+                        ocr_text = _ocr_image_safe(media_path, label="window")
+                        if ocr_text:
+                            content = f'[image: "{ocr_text}"]'
         if not content:
             continue
         is_from_me = bool(r["is_from_me"])

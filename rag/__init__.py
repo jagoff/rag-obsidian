@@ -261,7 +261,17 @@ def _nli_max_claims() -> int:
 # el intent clasificado. Default OFF = pipeline legacy bit-identical.
 # Ver docs/improvement-3-adaptive-routing-design.md.
 _LOOKUP_THRESHOLD = float(os.environ.get("RAG_LOOKUP_THRESHOLD", "0.6"))
-_LOOKUP_MODEL = os.environ.get("RAG_LOOKUP_MODEL", "qwen2.5:3b")
+# `_LOOKUP_MODEL` queda como módulo-global mutable. Source of truth:
+#   1. `RAG_LOOKUP_MODEL` env var (override por-feature, gana siempre)
+#   2. `helper` tier del registry (`rag.models.get("helper")`)
+# El reload hook del tier `helper` (registrado en `rag._model_hooks`) muta
+# este atributo cuando hacés `rag model set helper X` — call sites internos
+# leen `_LOOKUP_MODEL` cada call (lookup en `globals()`), así propagan
+# automáticamente sin restart.
+_LOOKUP_MODEL = (
+    os.environ.get("RAG_LOOKUP_MODEL", "").strip()
+    or "qwen2.5:3b"  # placeholder; se sobreescribe abajo cuando models import-ea
+)
 # num_ctx para el fast-path lookup. Default 4096 tras medición 2026-04-22
 # que detectó refuses falsos con 2048: queries de alta confianza (top_score
 # 1.18) respondían "No tengo esa información" aunque el chunk relevante
@@ -2078,15 +2088,26 @@ def _diff_brief_signal() -> None:
 from rag._sessions import *  # noqa: E402, F401, F403
 
 
-EMBED_MODEL = "qwen3-embedding:0.6b"  # multilingual (ES/EN), 1024-dim, in-process MLX/SentenceTransformer
-# Chat model preference: first available wins.
-# Orden tras bench 2026-04-18 (ver scripts/bench_chat.py, 5 queries × 2 runs
-# warm sobre vault work, rerank_pool default, num_ctx=4096):
+# Source of truth: `rag/models.py` registry (env vars + defaults). Estos
+# nombres quedan como atributos mutables — el reload hook del tier muta
+# `rag.HELPER_MODEL` cuando hacés `rag model set helper X` (sin restart).
+# Call sites internos (`model=HELPER_MODEL`) leen `globals()` cada call.
+from rag import models as _models  # noqa: E402
+
+EMBED_MODEL = _models.get("embed")        # qwen3-embedding:0.6b, 1024d, MLX
+HELPER_MODEL = _models.get("helper")      # qwen2.5:3b, HELPER_OPTIONS deterministic
+RERANKER_MODEL = _models.get("rerank")    # BAAI/bge-reranker-v2-m3 (PT) o Qwen3 (MLX)
+
+# Sync `_LOOKUP_MODEL` placeholder al helper tier si no había env override.
+if not os.environ.get("RAG_LOOKUP_MODEL", "").strip():
+    _LOOKUP_MODEL = HELPER_MODEL
+
+# Chat model preference: first available wins. `RAG_CHAT_MODEL` override
+# tiene prioridad — ver `resolve_chat_model()`. Orden tras bench 2026-04-18
+# (5 queries × 2 runs warm, rerank_pool default, num_ctx=4096):
 #   qwen2.5:7b     — total P50 5.9s, best 3.2s (dense, Q4_K_M, 4.7 GB)
 #   qwen3:30b-a3b  — total P50 7.6s (MoE 3B activos, buena quality, 18 GB)
 #   command-r:35b  — total P50 37s (RAG-trained pero prefill+decode 10x slower)
-# qwen2.5:7b gana latencia sin sacrificar quality notable en queries en ES
-# con citaciones simples. Dejo command-r y qwen3 como fallback high-quality.
 CHAT_MODEL_PREFERENCE = (
     "qwen2.5:7b",
     "qwen3:30b-a3b",
@@ -2094,8 +2115,6 @@ CHAT_MODEL_PREFERENCE = (
     "qwen2.5:14b",
     "phi4:latest",
 )
-HELPER_MODEL = "qwen2.5:3b"      # fast, for internal rewrites (multi-query, HyDE, reformulate)
-RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"  # cross-encoder, multilingual, MPS-friendly
 _COLLECTION_BASE = "obsidian_notes_v12"  # v12: 1024-dim, qwen3-embedding:0.6b + pre-split chunker (2026-05-06): líneas >1500 chars se splittean antes del embed → invalida cache v11 (chunks con shape distinta post-split)
 
 # ── Cross-source corpus (Phase 1, 2026-04-20 user decisions §10) ──────────

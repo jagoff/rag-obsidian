@@ -14,36 +14,57 @@ Phase 3 feedback_judge) a `rag/cli/daemons_control.py`.
   retry <label>       — kickstart -k de un daemon específico
   kickstart-overdue   — kickstart de TODOS los daemons overdue (post-wake)
 
-## Helpers
+## Helpers (CLI-side, definidos aca)
 
   _all_daemon_labels()              — managed + manual labels
   _plist_on_disk(label)             — Path check
   _compute_reconcile_actions()      — diff state vs spec
   _execute_reconcile_action(action) — launchctl invocation con timeouts
-  _doctor_diagnose(row)             — paragraph diagnóstico
+  _doctor_diagnose(row)             — paragraph diagnostico
 
-## Patrón CLI sub-package
+## Helpers stdlib-only (Phase 2c.2, 2026-05-09)
+
+Movidos de rag/__init__.py para eliminar `from rag import X` lazy
+indirection en este modulo. Stdlib puro (subprocess + re + pathlib).
+Re-export shim en rag/__init__.py preserva `rag._foo` paths usados
+por tests (monkeypatch.setattr(rag, "_bootstrap_label", ...)).
+
+  _parse_launchctl_print(stdout)    — regex parser de `launchctl print`
+  _daemon_log_path(label)           — heuristica path de log
+  _plist_cadence_seconds(label)     — extrae StartInterval del plist
+  _gather_daemon_status(label, cat) — orquesta los 3 anteriores
+  _loaded_launchd_labels(timeout)   — set de labels cargados via list
+  _bootout_label(label)             — wrapper de `launchctl bootout`
+  _bootstrap_label(label)           — wrapper de `launchctl bootstrap`
+
+## Patron CLI sub-package
 
 `@click.group("daemons")` standalone (NO `@cli.group(...)`). Los
 sub-commands usan `@daemons_group.command(...)` ya que el group y
-sus commands viven en el mismo módulo. Wiring en `rag/__init__.py`:
+sus commands viven en el mismo modulo. Wiring en `rag/__init__.py`:
   cli.add_command(daemons_group, name="daemons")
 
 ## Lazy imports
 
 Deps en `rag/__init__.py`: `_rag_binary`, `_services_spec`,
-`_services_spec_manual`, `_gather_daemon_status`,
-`_log_daemon_run_event`, `console`. Lazy adentro de cada función.
-`rich.table.Table` se importa lazy adentro de los CLI commands.
+`_services_spec_manual`, `_log_daemon_run_event`, `console`. Lazy
+adentro de cada funcion. `rich.table.Table` se importa lazy adentro
+de los CLI commands. `_gather_daemon_status` ahora local pero los
+callers Click commands lo siguen importando lazy via `from rag import
+_gather_daemon_status` (re-export shim) para que tests existentes con
+`patch.object(rag, "_gather_daemon_status", ...)` sigan funcionando.
 """
 
 from __future__ import annotations
 
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 
 import click
+
+from rag.plists import _LAUNCH_AGENTS_DIR, _RAG_LOG_DIR
 
 __all__ = [
     "daemons_group",
@@ -57,7 +78,279 @@ __all__ = [
     "_compute_reconcile_actions",
     "_execute_reconcile_action",
     "_doctor_diagnose",
+    # Helpers stdlib-only movidos de rag/__init__.py (Phase 2c.2, 2026-05-09):
+    "_parse_launchctl_print",
+    "_daemon_log_path",
+    "_plist_cadence_seconds",
+    "_gather_daemon_status",
+    "_loaded_launchd_labels",
+    "_bootout_label",
+    "_bootstrap_label",
 ]
+
+
+# ── Helpers launchd (stdlib-only) ───────────────────────────────────
+# Movidos de rag/__init__.py el 2026-05-09 (Phase 2c.2 modularización).
+# Stdlib puro: `subprocess` / `re` / `pathlib.Path`. Cero deps cross-module
+# salvo `_LAUNCH_AGENTS_DIR` y `_RAG_LOG_DIR` que vienen de `rag.plists`.
+# Re-export shim en `rag/__init__.py` preserva `rag._foo` paths que usan
+# los tests (monkeypatch.setattr(rag, "_bootstrap_label", ...)).
+
+
+def _parse_launchctl_print(stdout: str) -> dict:
+    """Parse output de `launchctl print gui/<uid>/<label>`.
+
+    Extrae state, runs y last_exit. Devuelve un dict con las 3 claves;
+    valores no encontrados quedan None.
+
+    Nota: el output de `launchctl print` puede tener sub-secciones con
+    `state = active` para procesos hijos. Capturamos solo la PRIMERA
+    ocurrencia de cada clave para evitar sobreescribir con sub-estados.
+    """
+    import re
+    result: dict = {"state": None, "runs": None, "last_exit": None}
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        if result["state"] is None:
+            m = re.match(r"state\s*=\s*(.+)", stripped)
+            if m:
+                result["state"] = m.group(1).strip()
+                continue
+        if result["runs"] is None:
+            m = re.match(r"runs\s*=\s*(\d+)", stripped)
+            if m:
+                result["runs"] = int(m.group(1))
+                continue
+        if result["last_exit"] is None:
+            m = re.match(r"last exit code\s*=\s*(.+)", stripped)
+            if m:
+                raw = m.group(1).strip()
+                try:
+                    result["last_exit"] = int(raw)
+                except ValueError:
+                    result["last_exit"] = raw
+        # Early exit when all 3 fields are filled
+        if all(v is not None for v in result.values()):
+            break
+    return result
+
+
+def _plist_cadence_seconds(label: str) -> int | None:
+    """Lee el plist en ~/Library/LaunchAgents/<label>.plist y extrae la
+    cadencia esperada en segundos.
+
+    - StartInterval → el valor directamente (segundos).
+    - StartCalendarInterval → 86400 (24h como aproximación).
+    - KeepAlive sin StartInterval → None (no aplica overdue).
+    - Archivo no existe → None.
+    """
+    import re
+    plist_path = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+    if not plist_path.exists():
+        return None
+    try:
+        content = plist_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    # StartInterval
+    m = re.search(
+        r"<key>StartInterval</key>\s*<integer>(\d+)</integer>",
+        content,
+    )
+    if m:
+        return int(m.group(1))
+    # StartCalendarInterval → tratar como 24h
+    if "<key>StartCalendarInterval</key>" in content:
+        return 86400
+    return None
+
+
+def _daemon_log_path(label: str) -> Path:
+    """Heurística: ~/.local/share/obsidian-rag/<slug>.log."""
+    slug = label.replace("com.fer.obsidian-rag-", "")
+    return _RAG_LOG_DIR / f"{slug}.log"
+
+
+def _gather_daemon_status(label: str, category: str) -> dict:
+    """Recolecta estado de un daemon: launchctl print + mtime log + overdue."""
+    import subprocess
+
+    # Deferred re-resolve via `rag` para que los tests existentes
+    # (`patch.object(rag, "_daemon_log_path", ...)` /
+    # `patch.object(rag, "_plist_cadence_seconds", ...)` /
+    # `patch.object(rag, "_parse_launchctl_print", ...)`) sigan ganando
+    # sobre el binding del sub-modulo. Patron documentado en CLAUDE.md
+    # ("Modular split shim pattern", seccion Architecture invariants).
+    from rag import (  # noqa: PLC0415
+        _daemon_log_path as _rag_daemon_log_path,
+        _parse_launchctl_print as _rag_parse_launchctl_print,
+        _plist_cadence_seconds as _rag_plist_cadence_seconds,
+    )
+
+    uid = os.getuid()
+    try:
+        proc = subprocess.run(
+            ["launchctl", "print", f"gui/{uid}/{label}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        proc = None  # type: ignore[assignment]
+
+    if proc is None or (proc.returncode != 0 and (
+        "Could not find service" in (proc.stderr or "")
+        or proc.returncode == 113
+    )):
+        parsed = {"state": "missing", "runs": None, "last_exit": None}
+    elif proc.returncode != 0:
+        parsed = {"state": "unknown", "runs": None, "last_exit": None}
+    else:
+        parsed = _rag_parse_launchctl_print(proc.stdout)
+        if parsed["state"] is None:
+            parsed["state"] = "unknown"
+
+    # Last tick via logfile mtime
+    log_path = _rag_daemon_log_path(label)
+    last_tick_iso: str | None = None
+    if log_path.exists():
+        try:
+            ts = datetime.fromtimestamp(log_path.stat().st_mtime)
+            last_tick_iso = ts.isoformat(timespec="seconds")
+        except OSError:
+            pass
+
+    # Overdue check
+    expected_cadence_s = _rag_plist_cadence_seconds(label)
+    overdue = False
+    if expected_cadence_s and last_tick_iso:
+        try:
+            last_dt = datetime.fromisoformat(last_tick_iso)
+            age_s = (datetime.now() - last_dt).total_seconds()
+            overdue = age_s > 2 * expected_cadence_s
+        except Exception:
+            pass
+
+    return {
+        "label": label,
+        "category": category,
+        "state": parsed["state"],
+        "runs": parsed["runs"],
+        "last_exit": parsed["last_exit"],
+        "last_tick_iso": last_tick_iso,
+        "overdue": overdue,
+        "expected_cadence_s": expected_cadence_s,
+    }
+
+
+def _loaded_launchd_labels(timeout: int = 5) -> set[str]:
+    """Set de labels actualmente cargados en `gui/$UID` via `launchctl list`.
+
+    Una sola llamada para evitar N forks (un `launchctl print` por label es
+    lento). Si falla, devuelve set vacío — el caller debe asumir "no sé" y
+    no usarlo para gating destructivo.
+    """
+    import subprocess
+    try:
+        proc = subprocess.run(
+            ["launchctl", "list"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return set()
+    if proc.returncode != 0:
+        return set()
+    out: set[str] = set()
+    for line in (proc.stdout or "").splitlines()[1:]:  # skip header
+        parts = line.split("\t")
+        if len(parts) >= 3 and parts[2]:
+            out.add(parts[2].strip())
+    return out
+
+
+def _bootout_label(label: str, *, dry_run: bool = False, timeout: int = 15) -> dict:
+    """`launchctl bootout gui/$UID/<label>` con timeout + manejo de exit codes.
+
+    Devuelve {"ok": bool, "exit_code": int, "stderr": str, "skipped": bool}.
+
+    Códigos tratados como "OK" (no error, ya estaba parado o no existía):
+        exit=3   → service not loaded (ya bootouted)
+        exit=113 → "Could not find service" (mismo escenario)
+    """
+    import subprocess
+    if dry_run:
+        return {"ok": True, "exit_code": 0, "stderr": "", "skipped": True}
+    uid = os.getuid()
+    try:
+        proc = subprocess.run(
+            ["launchctl", "bootout", f"gui/{uid}/{label}"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        rc = proc.returncode
+        stderr = (proc.stderr or "").strip()
+        # 0 = bootouted; 3 / 113 = ya estaba parado (no es error real).
+        ok = rc in (0, 3, 113)
+        return {"ok": ok, "exit_code": rc, "stderr": stderr, "skipped": False}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "exit_code": 124, "stderr": f"timeout {timeout}s", "skipped": False}
+    except OSError as exc:
+        return {"ok": False, "exit_code": -1, "stderr": f"OSError: {exc}", "skipped": False}
+
+
+def _bootstrap_label(label: str, *, dry_run: bool = False, timeout: int = 30) -> dict:
+    """`launchctl bootstrap gui/$UID <plist>` con timeout + manejo de exit codes.
+
+    Simétrico a `_bootout_label` — usado por `rag start` para levantar daemons
+    EXTERNOS (RagNet whatsapp-*, qdrant) cuyos plists viven en
+    `~/Library/LaunchAgents/` pero NO están managed por `_services_spec`.
+    Para los managed (`obsidian-rag-*`) seguimos por `setup.callback()` que
+    los regenera desde código y los carga vía `launchctl load`.
+
+    Devuelve {"ok": bool, "exit_code": int, "stderr": str, "skipped": bool,
+              "missing_plist": bool}.
+
+    Códigos / casos tratados como OK:
+        exit=0                                → loaded (success)
+        exit=37                               → "Operation already in progress"
+        stderr contiene "already loaded" /
+            "already bootstrapped"            → ya estaba cargado (no error real)
+    """
+    import subprocess
+    if dry_run:
+        return {"ok": True, "exit_code": 0, "stderr": "",
+                "skipped": True, "missing_plist": False}
+    plist = _LAUNCH_AGENTS_DIR / f"{label}.plist"
+    if not plist.is_file():
+        return {"ok": False, "exit_code": -1,
+                "stderr": "plist no existe en disco",
+                "skipped": False, "missing_plist": True}
+    uid = os.getuid()
+    try:
+        proc = subprocess.run(
+            ["launchctl", "bootstrap", f"gui/{uid}", str(plist)],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        rc = proc.returncode
+        stderr = (proc.stderr or "").strip()
+        stderr_lc = stderr.lower()
+        # 0 = loaded; 37 = ya en progreso; "already loaded/bootstrapped" en
+        # stderr = ya estaba cargado (rc varía por versión de launchctl).
+        ok = (
+            rc in (0, 37)
+            or "already loaded" in stderr_lc
+            or "already bootstrapped" in stderr_lc
+            or "service is disabled" in stderr_lc  # opt-in necesario, no es error fatal
+        )
+        return {"ok": ok, "exit_code": rc, "stderr": stderr,
+                "skipped": False, "missing_plist": False}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "exit_code": 124,
+                "stderr": f"timeout {timeout}s",
+                "skipped": False, "missing_plist": False}
+    except OSError as exc:
+        return {"ok": False, "exit_code": -1,
+                "stderr": f"OSError: {exc}",
+                "skipped": False, "missing_plist": False}
 
 
 @click.group("daemons")

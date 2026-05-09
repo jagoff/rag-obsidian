@@ -140,7 +140,7 @@ PWA instalable iOS Safari → home screen. Wiring: [`web/static/manifest.webmani
 
 **HTTPS público**: [`cloudflared tunnel --url http://localhost:8765`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/) genera URL random. CORS: `OBSIDIAN_RAG_ALLOW_TUNNEL=1`. URL cambia cada restart — para estable: named tunnel + dominio. Dos plists: `cloudflare-tunnel` + `cloudflare-tunnel-watcher` (escribe URL a `~/.local/share/obsidian-rag/cloudflared-url.txt` + pbcopy + macOS notification). Aliases: `rag-url`, `rag-url-c`.
 
-**Seguridad**: server NO tiene auth. Solo activar en WiFi privado.
+**Seguridad — local-only por design**: el server NO tiene auth para read paths (`/api/chat`, `/api/query`, listing de notas, lectura) **y no es un gap a cerrar**. Sistema corre 100% local-first sobre vault del user; el threat model asume operación en redes confiables (loopback, WiFi privado del user, túnel cloudflare ad-hoc). Las acciones destructivas SÍ están protegidas (`_require_admin_token` en [`web/server.py`](web/server.py): `/api/reindex`, `/api/ollama/{restart,unload}`, `/api/auto-fix*`, `/api/status/action`, `/api/diagnose-error/execute`, `/api/chat/model` — Bearer 0o600 en `~/.config/obsidian-rag/admin_token.txt`, endpoint `/api/admin/token` solo loopback). NO proponer agregar auth al chat/query como "fix de seguridad" — es decisión consciente, no oversight. Si en el futuro se expone públicamente con dominio estable (no Quick Tunnel ad-hoc), revisar; hasta entonces, skip.
 
 ## Make targets (dev loop)
 

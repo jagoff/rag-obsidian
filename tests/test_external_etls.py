@@ -239,7 +239,7 @@ def test_sync_github_writes_activity(tmp_path):
     assert stats["ok"] and stats["files_written"] == 1
     assert stats["events"] == 1 and stats["open_prs"] == 1
     today = datetime.now().strftime("%Y-%m-%d")
-    body = (tmp_path / "03-Resources/GitHub" / f"{today}.md").read_text()
+    body = (tmp_path / "99-obsidian/99-AI/external-ingest/GitHub" / f"{today}.md").read_text()
     assert "fer/repo" in body and "fix bug" in body
     assert "feat X" in body and "Open PRs" in body
 

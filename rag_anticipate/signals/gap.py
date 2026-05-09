@@ -1,7 +1,7 @@
 """Gap signal — detecta query clusters recurrentes en los últimos 14 días
 que NO tienen cobertura en el vault.
 
-Señal "me preguntaste lo mismo 3+ veces y no hay nota que lo responda".
+Señal "me preguntaste lo mismo 2+ veces y no hay nota que lo responda".
 Es una proyección anticipatoria del comando CLI `rag emergent` (ese es
 interactivo y reportado; esta signal corre en el loop del anticipatory
 agent y propone UN gap por pasada, sin imprimir ni pushear).
@@ -10,10 +10,13 @@ Heurística:
 
 - Ventana fija de 14 días sobre `rag_queries` (vía `_scan_queries_log`).
 - Clustering greedy por cosine de embeddings (vía `_cluster_queries`,
-  threshold 0.75 = default histórico de `emergent`).
-- Solo clusters con ≥3 miembros pasan el filtro (el umbral de `emergent`
-  es ≥5 para push WA visible; acá somos más permisivos porque el
-  orchestrator después filtra por score y dedupea por 168h).
+  threshold 0.65 — bajado de 0.75 el 2026-05-09 por audit signals: con
+  query volume bajo del user, 0.75 era demasiado estricto y nunca formaba
+  clusters de ≥3).
+- Solo clusters con ≥2 miembros pasan el filtro (bajado de 3 el 2026-05-09
+  por mismo audit). El umbral de `emergent` (push WA visible) se mantiene
+  en 5; acá somos más permisivos porque el orchestrator después filtra
+  por score y dedupea por 168h.
 - Representante del cluster = query más corta (proxy de forma canónica,
   mismo truco que `emergent`).
 - Coverage = `retrieve(col, rep, 3, …)`. Si `scores[0] < 0.30` → gap real:
@@ -72,8 +75,8 @@ def gap_signal(now: datetime) -> list:
         if not queries:
             return []
 
-        clusters = _cluster_queries(queries, threshold=0.75)
-        big = [c for c in clusters if len(c) >= 3]
+        clusters = _cluster_queries(queries, threshold=0.65)
+        big = [c for c in clusters if len(c) >= 2]
         if not big:
             return []
         # Más grandes primero; empates conservan orden de aparición.

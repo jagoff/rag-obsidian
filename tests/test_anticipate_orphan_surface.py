@@ -148,12 +148,18 @@ def test_old_note_out_of_window_no_emit(mock_vault):
 
 
 def test_very_recent_note_in_grace_period_no_emit(mock_vault):
-    """Nota con mtime <2h → dentro del grace period, no emit."""
+    """Nota con mtime <_ORPHAN_MIN_AGE_HOURS → dentro del grace period, no emit.
+
+    Threshold bajado a 0.5h el 2026-05-09 (audit signals showed que el user
+    linkea inmediatamente al crear y la ventana [2h, 24h] perdía la mayoría
+    de las notas). Usamos 0.1h para garantizar quedar dentro del grace
+    period sin acoplar al valor exacto.
+    """
     _make_note(
         mock_vault,
         "02-Areas/recien-guardada.md",
         _body(600),
-        hours_old=0.5,
+        hours_old=0.1,
     )
     result = orphan_surface_signal(_REF_NOW)
     assert result == []

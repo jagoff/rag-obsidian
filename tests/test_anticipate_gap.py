@@ -76,14 +76,16 @@ def test_gap_queries_all_too_short_returns_empty(monkeypatch, state_db):
     assert called["clustered"] is False
 
 
-# ── 2. Cluster <3 → []  ──────────────────────────────────────────────────────
+# ── 2. Cluster <min_size → []  ───────────────────────────────────────────────
 
 def test_gap_cluster_below_min_size_returns_empty(monkeypatch, state_db):
-    queries = ["como deployo a fly io", "fly io setup"]
+    """Threshold actual es ≥2 miembros (bajado el 2026-05-09 de 3). Un
+    cluster de 1 no debe pasar el filtro."""
+    queries = ["como deployo a fly io"]
     monkeypatch.setattr(rag, "_scan_queries_log",
                         lambda **kw: _mk_events(queries))
-    # Un único cluster con 2 elementos → no cumple ≥3.
-    monkeypatch.setattr(rag, "_cluster_queries", lambda qs, **kw: [[0, 1]])
+    # Un único cluster con 1 elemento → no cumple ≥2.
+    monkeypatch.setattr(rag, "_cluster_queries", lambda qs, **kw: [[0]])
     monkeypatch.setattr(rag, "get_db", lambda: state_db)
     retrieve_called = {"n": 0}
 

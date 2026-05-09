@@ -65,10 +65,13 @@ _ORPHAN_EXCLUDE_SUBPREFIXES: tuple[str, ...] = (
     "03-Resources/Contacts/",
 )
 
-# Grace period inferior: no pushear dentro de las primeras 2h tras el save.
-# El user todavía tiene la nota abierta/fresca, preguntarle "¿querés
+# Grace period inferior: no pushear dentro de la primera media hora tras
+# el save. El user todavía tiene la nota abierta/fresca, preguntarle "¿querés
 # agregarle links?" mientras está escribiendo es interruptivo.
-_ORPHAN_MIN_AGE_HOURS = 2
+# Bajado 2 → 0.5h (2026-05-09): audit signals showed que orphan_surface
+# nunca disparó porque el user linkea inmediatamente al crear o ya pasaron
+# >24h cuando el daemon ve la nota — la ventana [2h, 24h] era muy chica.
+_ORPHAN_MIN_AGE_HOURS = 0.5
 
 # Ventana superior: pasadas 24h asumimos que la nota "se enfrió" y el push
 # es menos útil (además lo cubre el snooze de 24h: si re-aparece al día
@@ -78,7 +81,9 @@ _ORPHAN_MAX_AGE_HOURS = 24
 # Mínimo de caracteres para considerar la nota "sustantiva" y flaggear la
 # ausencia de wikilinks como señal. Por debajo de esto son typically
 # stubs/TODOs que no van a tener red de links de todas formas.
-_ORPHAN_MIN_CHARS = 200
+# Bajado 200 → 100 (2026-05-09): notas de tipo daily / inbox capture
+# regularmente caen entre 100-200 chars y son blanco legítimo del nudge.
+_ORPHAN_MIN_CHARS = 100
 
 # Fallback regex por si `_extract_wikilinks_from_markdown` de rag.py no
 # está disponible. Match laxo — captura `[[algo]]` sin resolver alias ni

@@ -393,6 +393,67 @@ def test_rotation_no_abort_on_custom_time_col(sql_env):
     assert out["rows_deleted"].get("rag_synthetic_queries") == 1
 
 
+def test_rotation_epoch_ts_uses_numeric_compare(sql_env):
+    """rag_entity_mentions usa ts REAL (Unix epoch). El loop debe comparar
+    como número, no como string.
+
+    Bug latente pre-fix: cutoff se generaba como ISO string ("2026-02-08T...")
+    y la columna es REAL. SQLite hace string-compare → "1762700000.0" < "2026..."
+    siempre True → mass-delete de TODAS las filas.
+
+    Este test verifica que el path "epoch" en time_format compara numérico.
+    """
+    import sqlite3 as _sqlite
+    db_path = sql_env["db_path"]
+    conn = _sqlite.connect(str(db_path))
+    now = time.time()
+    try:
+        # Schema real de rag_entity_mentions (DDL en _TELEMETRY_DDL).
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS rag_entity_mentions ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  entity_id INTEGER NOT NULL,"
+            "  chunk_id TEXT NOT NULL,"
+            "  source TEXT,"
+            "  ts REAL,"
+            "  snippet TEXT,"
+            "  confidence REAL,"
+            "  UNIQUE(entity_id, chunk_id)"
+            ")"
+        )
+        old_epoch = now - 100 * 86400  # 100d viejo (cae con retention=90d)
+        new_epoch = now - 30 * 86400   # 30d viejo (sobrevive)
+        conn.execute(
+            "INSERT INTO rag_entity_mentions (entity_id, chunk_id, ts) VALUES (?, ?, ?)",
+            (1, "old", old_epoch),
+        )
+        conn.execute(
+            "INSERT INTO rag_entity_mentions (entity_id, chunk_id, ts) VALUES (?, ?, ?)",
+            (2, "new", new_epoch),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    out = rag._sql_rotate_log_tables(dry_run=False, now_ts=now)
+    # Solo el row viejo (100d > 90d retention) debe borrarse.
+    assert out["rows_deleted"].get("rag_entity_mentions") == 1, (
+        f"Esperaba 1 row deletada, got {out['rows_deleted'].get('rag_entity_mentions')}. "
+        "Si got > 1 (ej. 2), el path epoch está roto y triggereó mass-delete."
+    )
+    conn = _sqlite.connect(str(db_path))
+    try:
+        survivors = conn.execute(
+            "SELECT chunk_id FROM rag_entity_mentions"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert len(survivors) == 1, f"Esperaba 1 sobreviviente, got {len(survivors)}"
+    assert survivors[0][0] == "new", (
+        f"Esperaba que sobreviva 'new' (30d), got {survivors[0][0]}"
+    )
+
+
 # ── .bak cleanup ────────────────────────────────────────────────────────────
 
 def test_bak_cleanup_purges_old(sql_env):

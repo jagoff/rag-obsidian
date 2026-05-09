@@ -50846,10 +50846,14 @@ def _telemetry_wal_checkpoint(dry_run: bool = False) -> dict:
 #        history feeds `rag dashboard`, contradictions are audit).
 #
 # Tables explicitly NOT rotated (empty tuple): retained forever.
-# Each entry is (table_name, retention_days[, time_col]).
-# time_col defaults to "ts" when omitted — matches the log-style DDL convention.
-# Tables with a non-standard timestamp column (e.g. `created_at`) must list it
-# explicitly to avoid aborting the loop mid-run with "no such column: ts".
+# Each entry is (table_name, retention_days[, time_col[, time_format]]).
+# - time_col defaults to "ts" when omitted — matches log-style DDL convention.
+# - time_format defaults to "iso" (ISO-8601 string). Use "epoch" para columnas
+#   REAL/INTEGER que guardan Unix epoch (ej. rag_entity_mentions.ts REAL).
+#   Sin esto, comparar epoch float con cutoff_iso vía string-compare borraría
+#   TODAS las filas (`"1762700000.0" < "2026-02-08T..."` siempre True).
+# Tables con time_col distinto de "ts" deben declararlo explícito o el loop
+# aborta con "no such column: ts".
 _SQL_ROTATION_POLICY: tuple[tuple, ...] = (
     ("rag_queries", 90),
     ("rag_behavior", 90),
@@ -50893,6 +50897,14 @@ _SQL_ROTATION_POLICY: tuple[tuple, ...] = (
     ("rag_brief_feedback", 60),
     ("rag_draft_decisions", 90),
     ("rag_ft_panel_ratings", 90),
+    # Audit ronda 2 2026-05-09: rag_entity_mentions es la tabla más pesada
+    # de telemetry.db (~1MB de 3.4MB). Append-only desde el extractor de
+    # entidades (gliner NER) por cada mention en un chunk. Crece con cada
+    # `rag index --full`. ts es REAL (Unix epoch) — requiere time_format
+    # "epoch" para no triggerar el bug de string-compare. 90d alinea con
+    # el bucket de queries/behavior — el feed de relevancia entity sirve
+    # rerank-vivo + auto-tune.
+    ("rag_entity_mentions", 90, "ts", "epoch"),
 )
 
 # Tables that upsert on a PK instead of appending log rows. Listed here both
@@ -51056,20 +51068,27 @@ def _sql_rotate_log_tables(*, dry_run: bool = False,
         for entry in _SQL_ROTATION_POLICY:
             table, days = entry[0], entry[1]
             time_col = entry[2] if len(entry) > 2 else "ts"
+            time_format = entry[3] if len(entry) > 3 else "iso"
             if table not in existing:
                 continue
-            cutoff_iso = _dt.fromtimestamp(now - days * 86400).isoformat(
-                timespec="seconds"
-            )
+            cutoff_epoch = now - days * 86400
+            if time_format == "epoch":
+                # Columna REAL/INTEGER con Unix epoch — comparar como número.
+                cutoff_value: float | str = cutoff_epoch
+            else:
+                # Columna TEXT con ISO-8601 — comparar como string ordenable.
+                cutoff_value = _dt.fromtimestamp(cutoff_epoch).isoformat(
+                    timespec="seconds"
+                )
             if dry_run:
                 row = conn.execute(
                     f"SELECT COUNT(*) FROM {table} WHERE {time_col} < ?",
-                    (cutoff_iso,),
+                    (cutoff_value,),
                 ).fetchone()
                 out["rows_deleted"][table] = int(row[0] if row else 0)
             else:
                 cur = conn.execute(
-                    f"DELETE FROM {table} WHERE {time_col} < ?", (cutoff_iso,)
+                    f"DELETE FROM {table} WHERE {time_col} < ?", (cutoff_value,)
                 )
                 out["rows_deleted"][table] = cur.rowcount or 0
 

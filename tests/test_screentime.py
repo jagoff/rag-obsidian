@@ -215,7 +215,7 @@ class TestSyncScreentime:
         assert out["days_total"] >= 3  # build_multi_day_db creates 4 days
         assert out["files_written"] >= 4  # at least 3 dailies + 1 monthly + 1 index
 
-        target = vault / "03-Resources/Screentime"
+        target = vault / "99-obsidian/99-AI/external-ingest/Screentime"
         assert target.is_dir()
         # At least one daily YYYY-MM-DD.md
         dailies = list(target.glob("2*-*-*.md"))
@@ -264,7 +264,7 @@ class TestSyncScreentime:
         _build_multi_day_db(db, days=2)
 
         rag._sync_screentime_notes(vault, days=3, db_path=db)
-        idx = (vault / "03-Resources/Screentime/_index.md").read_text()
+        idx = (vault / "99-obsidian/99-AI/external-ingest/Screentime/_index.md").read_text()
         assert "type: screentime-index" in idx
         assert "Pantalla — índice mensual" in idx
         # Wikilink format al mes actual

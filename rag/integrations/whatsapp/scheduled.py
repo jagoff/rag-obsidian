@@ -539,6 +539,104 @@ def cancel(
     return changed
 
 
+def mark_status_by_proposal(
+    proposal_id: str,
+    new_status: str,
+    *,
+    sent_at: str | None = None,
+    last_error: str | None = None,
+    conn: Optional[sqlite3.Connection] = None,
+) -> bool:
+    """Actualiza el status de un scheduled identificado por `proposal_id`
+    (el id estable que el listener TS usa en su JSONL local — distinto del
+    `scheduled_id` INTEGER autoincrement de SQL).
+
+    A2 SQL parity (2026-05-09): el listener manda/cancela/falla scheduled
+    msgs y antes solo lo loggeaba a `~/.local/share/whatsapp-listener/
+    scheduled.jsonl`. Esto cierra el loop propagando el status final
+    (sent | cancelled | failed) a `rag_whatsapp_scheduled` para que el
+    dashboard del web vea la verdad post-send, no solo el snapshot
+    pending del CREATE.
+
+    Args:
+        proposal_id: `proposal_id` del row (= event.id en el listener TS).
+            La tabla tiene índice por status pero NO por proposal_id —
+            como queries son <100/día este endpoint, full scan acceptable.
+        new_status: `sent`, `cancelled`, `failed`, `sent_late`. Otros
+            valores se rechazan.
+        sent_at: ISO timestamp UTC del send real. Solo aplica para
+            `new_status='sent'` o `'sent_late'`.
+        last_error: descripción del fallo. Solo aplica para `'failed'` o
+            `'cancelled'` (donde se prefijia con "cancelled:" como hace
+            cancel()).
+        conn: opcional, mismo patrón que las otras fns.
+
+    Returns:
+        True si cambió un row, False si proposal_id no existe o ya estaba
+        en estado terminal (no se hace transition cancelled→sent etc.).
+
+    Raises:
+        ValueError: si new_status no es válido.
+        RuntimeError: si el commit falla (mismo patrón que cancel).
+    """
+    valid_statuses = {"sent", "cancelled", "failed", "sent_late"}
+    if new_status not in valid_statuses:
+        raise ValueError(
+            f"new_status must be one of {sorted(valid_statuses)}, got {new_status!r}"
+        )
+    pid = str(proposal_id).strip()
+    if not pid:
+        raise ValueError("proposal_id required")
+
+    # Construir UPDATE dinámico — solo seteamos campos provistos.
+    set_parts = ["status=?"]
+    params: list[Any] = [new_status]
+    if sent_at is not None and new_status in ("sent", "sent_late"):
+        set_parts.append("sent_at=?")
+        params.append(sent_at)
+    if last_error is not None:
+        set_parts.append("last_error=?")
+        params.append(last_error)
+    # Siempre incrementar attempt_count para reflejar que hubo un intento
+    # más (sirve para diagnostic histórico de retries).
+    set_parts.append("attempt_count=COALESCE(attempt_count,0)+1")
+    set_parts.append("last_attempt_at=?")
+    params.append(_iso_utc(_now_utc()))
+    params.append(pid)
+
+    set_sql = ", ".join(set_parts)
+    # Solo transicionamos desde pending — no overrides terminal states.
+    # Match por proposal_id (string en SQL).
+    sql = f"UPDATE {_TABLE} SET {set_sql} WHERE proposal_id=? AND status='pending'"
+
+    with _resolve_conn(conn) as c:
+        cur = c.execute(sql, params)
+        try:
+            c.commit()
+        except Exception as exc:
+            logger.exception(
+                "wa_scheduled_mark_status_commit_failed pid=%s status=%s: %r",
+                pid, new_status, exc,
+            )
+            _log_ambient("whatsapp_scheduled_mark_status_commit_failed", {
+                "proposal_id": pid,
+                "new_status": new_status,
+                "error": repr(exc),
+            })
+            raise RuntimeError(
+                f"mark_status commit failed for proposal_id={pid}: {exc}"
+            ) from exc
+        changed = (cur.rowcount or 0) > 0
+
+    if changed:
+        _log_ambient("whatsapp_scheduled_status_marked", {
+            "proposal_id": pid,
+            "new_status": new_status,
+            "sent_at": sent_at,
+        })
+    return changed
+
+
 def list_scheduled(
     *,
     status: str | None = None,

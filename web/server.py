@@ -3729,6 +3729,160 @@ def whatsapp_scheduled_cancel(scheduled_id: int) -> dict:
     return {"ok": True, "id": int(scheduled_id), "status": "cancelled"}
 
 
+class WhatsAppScheduledCreateRequest(BaseModel):
+    """Body para POST /api/whatsapp/scheduled — A1 SQL parity (2026-05-09).
+
+    El listener TS llama acá cuando agenda un msg nuevo via NL ("avisame
+    a las 9 que..."). Antes el listener solo escribía a JSONL local — el
+    dashboard no veía el row hasta que migración full corriera. Este
+    endpoint cierra el A1 del SQL parity loop.
+    """
+    jid: str
+    message_text: str
+    scheduled_for: str  # ISO format, idealmente con tz
+    contact_name: str | None = None
+    proposal_id: str | None = None
+    source: str = "nl"
+    reply_to_id: str | None = None
+    reply_to_text: str | None = None
+    reply_to_sender_jid: str | None = None
+
+
+@app.post("/api/whatsapp/scheduled")
+def whatsapp_scheduled_create(req: WhatsAppScheduledCreateRequest) -> dict:
+    """Crea un scheduled msg en `rag_whatsapp_scheduled` (status=pending).
+
+    A1 SQL parity (2026-05-09): el listener TS hace fire-and-forget POST
+    acá cuando agenda un msg nuevo. El dashboard del web va a verlo
+    inmediatamente en `/api/whatsapp/scheduled?status=pending`.
+
+    Sin admin auth — es CREATE de status pending, no destructivo. El
+    listener controla source de verdad (su JSONL local sigue siendo
+    autoritativo para el flushDueScheduled del listener mismo).
+
+    Idempotency: si ya existe un row con mismo proposal_id + status=pending,
+    devuelve ese mismo row sin duplicar (chequeo defensive — el listener
+    solo manda CREATE una vez por evento, pero retries de network pueden
+    duplicar).
+
+    Retorna `{ok, scheduled_id, status}`. El listener no usa el
+    `scheduled_id` (sigue identificando por proposal_id en sus updates),
+    pero es útil para correlation con cancel/reschedule del dashboard.
+    """
+    try:
+        scheduled_for_utc = _parse_scheduled_for_to_utc(req.scheduled_for)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    try:
+        from rag import wa_scheduled  # noqa: PLC0415
+        # Defensive idempotency check: si proposal_id ya existe pending,
+        # devolver el row existente (no insertar duplicado).
+        if req.proposal_id:
+            existing = wa_scheduled.list_scheduled(status="pending", limit=1000)
+            for row in existing:
+                if row.get("proposal_id") == req.proposal_id:
+                    return {
+                        "ok": True,
+                        "scheduled_id": row.get("id"),
+                        "status": "pending",
+                        "deduped": True,
+                    }
+        # `schedule()` toma reply_to como dict (no campos sueltos), construir
+        # cuando alguno de los 3 reply_to_* viene en la request.
+        reply_to_dict: dict | None = None
+        if req.reply_to_id or req.reply_to_text or req.reply_to_sender_jid:
+            reply_to_dict = {
+                "id": req.reply_to_id,
+                "text": req.reply_to_text,
+                "sender_jid": req.reply_to_sender_jid,
+            }
+        result = wa_scheduled.schedule(
+            jid=req.jid,
+            message_text=req.message_text,
+            scheduled_for_utc=scheduled_for_utc,
+            contact_name=req.contact_name,
+            reply_to=reply_to_dict,
+            proposal_id=req.proposal_id,
+            source=req.source,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"schedule failed: {e}") from e
+    return {
+        "ok": True,
+        "scheduled_id": result.get("id"),
+        "scheduled_for_utc": result.get("scheduled_for_utc"),
+        "status": result.get("status", "pending"),
+    }
+
+
+class WhatsAppMarkStatusRequest(BaseModel):
+    """Body para PATCH del status post-send/cancel/fail.
+
+    A2 SQL parity (2026-05-09): el listener TS llama acá cuando termina
+    de mandar / cancela / falla un scheduled msg, identificándolo por
+    `proposal_id` (id estable del listener, distinto del INTEGER PK SQL).
+    """
+    new_status: str  # 'sent' | 'cancelled' | 'failed' | 'sent_late'
+    sent_at: str | None = None
+    last_error: str | None = None
+
+
+@app.post("/api/whatsapp/scheduled/by-proposal/{proposal_id}/status")
+def whatsapp_scheduled_mark_status(
+    proposal_id: str,
+    req: WhatsAppMarkStatusRequest,
+) -> dict:
+    """Marca el status final de un scheduled identificado por proposal_id.
+
+    A2 SQL parity (2026-05-09): cierra el loop entre listener TS y SQL.
+    Antes el listener solo loggeaba sent/cancelled/failed al JSONL local
+    `~/.local/share/whatsapp-listener/scheduled.jsonl` — el dashboard del
+    web (`/api/whatsapp/scheduled`) veía solo el snapshot pending del
+    CREATE inicial. Este endpoint propaga el status terminal a
+    `rag_whatsapp_scheduled` para parity total.
+
+    Sin admin auth — es status update no destructivo (el row YA existe,
+    solo cambiamos status). Idempotente: si proposal_id no existe o ya
+    está en estado terminal devuelve `{ok: false}` sin error 4xx.
+
+    Idempotency notes:
+      - Listener puede reintentar el PATCH si el primero timeouts. La fn
+        SQL solo acepta transition desde 'pending', así que el segundo
+        call devuelve False (no hace harm).
+
+    Status transitions válidas (todas desde pending):
+      - sent / sent_late: con sent_at requerido idealmente.
+      - cancelled: con last_error opcional (motivo).
+      - failed: con last_error explicando el fallo del bridge.
+    """
+    try:
+        from rag import wa_scheduled  # noqa: PLC0415
+        changed = wa_scheduled.mark_status_by_proposal(
+            proposal_id=proposal_id,
+            new_status=req.new_status,
+            sent_at=req.sent_at,
+            last_error=req.last_error,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"mark_status failed: {e}") from e
+    if not changed:
+        return {
+            "ok": False,
+            "reason": "not_found_or_not_pending",
+            "proposal_id": proposal_id,
+        }
+    return {
+        "ok": True,
+        "proposal_id": proposal_id,
+        "new_status": req.new_status,
+    }
+
+
 class WhatsAppRescheduleRequest(BaseModel):
     scheduled_for: str  # mismo formato que WhatsAppSendRequest
 

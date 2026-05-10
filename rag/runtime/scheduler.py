@@ -181,7 +181,20 @@ class Scheduler:
         return self._jobs.get(label)
 
     def start(self) -> None:
-        """Arranca el scheduler real (no-op en headless)."""
+        """Arranca el scheduler real (no-op en headless).
+
+        On-boot dispatch (U14, audit 2026-05-10): después de agregar los
+        jobs al APScheduler pero ANTES de start(), revisamos qué cron jobs
+        debieron haber corrido entre su last_run_ts persistente (de
+        `rag_supervisor_jobs`) y `now`. Para cada uno con missed trigger,
+        encolamos un run inmediato vía `add_job(run_date=now, id="missed_...")`.
+        Esto cubre el caso "supervisor murió durante Mac sleep o jetsam".
+        APScheduler's `coalesce=True` garantiza no storm — si hay múltiples
+        misses por label, solo se ejecuta una vez al boot.
+
+        Desactivable con `RAG_SCHEDULER_NO_BOOT_DISPATCH=1` para tests o
+        diagnóstico.
+        """
         if self._started:
             return
         if self.headless:
@@ -197,9 +210,119 @@ class Scheduler:
                 id=job.label,
                 replace_existing=True,
             )
+        # U14: dispatch missed cron triggers detected via SQL last_run_ts.
+        if os.environ.get("RAG_SCHEDULER_NO_BOOT_DISPATCH", "").strip().lower() not in ("1", "true", "yes"):
+            try:
+                self._dispatch_missed_triggers()
+            except Exception as exc:  # noqa: BLE001 — defensive
+                logger.warning("scheduler: boot-dispatch failed: %s", exc)
         self._aps.start()
         self._started = True
         logger.info("scheduler: started, %d jobs", len(self._jobs))
+
+    def _dispatch_missed_triggers(self) -> int:
+        """Detecta y encola cron jobs que debieron correr entre su último
+        run persistente y `now`. Llamado desde `start()` antes de
+        `_aps.start()`.
+
+        Algoritmo:
+          1. Para cada cron/at job registrado, lee `MAX(ts_start)` de
+             `rag_supervisor_jobs` filtrado por `job_label`. Eso es el
+             `last_run`. Si no hay rows, skip (no podemos saber si era
+             nuevo o pre-existente).
+          2. Construye un `CronTrigger` con los args del job + tz scheduler.
+          3. `get_next_fire_time(previous_fire_time=last_run, now=now)`:
+             si el resultado cae en `(last_run, now]`, hay un missed
+             trigger.
+          4. Encola `add_job(run_date=now)` con id único `missed_<label>_<epoch>`.
+
+        Retorna count de jobs dispatched. NO arroja — silent_fail-friendly.
+        """
+        if CronTrigger is None or self._aps is None:
+            return 0
+        import sqlite3  # noqa: PLC0415
+        from datetime import datetime, timezone  # noqa: PLC0415
+        from pathlib import Path  # noqa: PLC0415
+
+        # Path matchea `_persist_run()` (in _telemetry.py — usa la misma DB).
+        db_path = Path.home() / ".local" / "share" / "obsidian-rag" / "ragvec" / "telemetry.db"
+        if not db_path.is_file():
+            return 0
+
+        tz_name = os.environ.get("RAG_TIMEZONE", "America/Argentina/Buenos_Aires")
+        try:
+            from zoneinfo import ZoneInfo  # noqa: PLC0415
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            tz = timezone.utc
+
+        now = datetime.now(tz)
+        dispatched = 0
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+        except sqlite3.Error as exc:
+            logger.warning("scheduler: boot-dispatch SQL connect failed: %s", exc)
+            return 0
+        try:
+            for label, job in self._jobs.items():
+                # Solo cron/at (calendar) qualify — interval jobs corren
+                # frecuente y APScheduler con coalesce=True ya las maneja.
+                if job.trigger_kind not in ("cron", "calendar"):
+                    continue
+                try:
+                    row = conn.execute(
+                        "SELECT MAX(ts_start) FROM rag_supervisor_jobs WHERE job_label = ?",
+                        (label,),
+                    ).fetchone()
+                except sqlite3.Error:
+                    continue
+                if not row or not row[0]:
+                    continue
+                try:
+                    # ISO format con tz offset (ej. "2026-05-10T04:30:00+00:00")
+                    last_run = datetime.fromisoformat(row[0])
+                    if last_run.tzinfo is None:
+                        last_run = last_run.replace(tzinfo=timezone.utc)
+                    last_run_local = last_run.astimezone(tz)
+                except (ValueError, TypeError):
+                    continue
+                try:
+                    trigger = CronTrigger(timezone=tz, **job.trigger_args)
+                    next_fire = trigger.get_next_fire_time(last_run_local, last_run_local)
+                except Exception:
+                    continue
+                if next_fire is None:
+                    continue
+                if last_run_local < next_fire <= now:
+                    # Missed: encolar run inmediato. id único para no chocar
+                    # con el cron real del job (que sigue scheduled normal).
+                    missed_id = f"missed_{label}_{int(now.timestamp())}"
+                    try:
+                        self._aps.add_job(
+                            self._make_runner(job),
+                            trigger="date",
+                            run_date=now,
+                            id=missed_id,
+                            replace_existing=False,
+                            misfire_grace_time=600,
+                        )
+                        dispatched += 1
+                        logger.info(
+                            "scheduler: boot-dispatch %s — missed at %s (last_run=%s)",
+                            label, next_fire.isoformat(), last_run_local.isoformat(),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "scheduler: failed to enqueue missed %s: %s", label, exc,
+                        )
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        if dispatched > 0:
+            logger.info("scheduler: boot-dispatched %d missed cron triggers", dispatched)
+        return dispatched
 
     def shutdown(self, *, wait: bool = True) -> None:
         if not self._started:

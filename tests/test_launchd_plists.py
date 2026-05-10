@@ -27,13 +27,12 @@ _HAS_PLUTIL = shutil.which("plutil") is not None
 _RAG_BIN = "/tmp/rag"  # rag_bin arg, no se invoca; sólo se interpola
 
 # Labels conocidos del spec manual (T2)
-# 2026-05-04 consolidation: cloudflare-tunnel, cloudflare-tunnel-watcher,
-# lgbm-train, paraphrases-train y spotify-poll se removieron del manual
-# spec; quedan 2 (synth-refresh + log-rotate).
-_EXPECTED_MANUAL_LABELS = frozenset({
-    "com.fer.obsidian-rag-synth-refresh",
-    "com.fer.obsidian-rag-log-rotate",
-})
+# 2026-05-04: cloudflare-tunnel, cloudflare-tunnel-watcher, lgbm-train,
+# paraphrases-train y spotify-poll se removieron (eran fantasmas).
+# 2026-05-10: synth-refresh + log-rotate también removidos — ya no
+# tienen plist en disco ni logs recientes (último 2026-04/05). El set
+# manual quedó vacío hasta que vuelva a haber un caso legítimo.
+_EXPECTED_MANUAL_LABELS: frozenset[str] = frozenset()
 
 
 def _iter_managed_factories():
@@ -113,14 +112,15 @@ def test_calibration_plist_no_shell_comment_plutil(tmp_path: Path):
 
 
 def test_services_spec_manual_shape():
-    """`_services_spec_manual()` retorna 2 dicts con shape correcta.
+    """`_services_spec_manual()` retorna list con shape correcta.
 
-    Post limpieza 2026-05-04: synth-refresh + log-rotate son los únicos
-    manuales sobrevivientes (los 4 fantasmas + spotify-poll se removieron).
+    Post limpieza 2026-05-10: synth-refresh + log-rotate removidos. La
+    lista quedó vacía hasta que vuelva a haber un manual_keep legítimo.
+    Mantengo el shape check (cada item debe ser dict con keys label +
+    category=='manual_keep') para cuando se vuelva a poblar.
     """
     spec = rag._services_spec_manual()
     assert isinstance(spec, list), "Debe retornar list"
-    assert len(spec) == 2, f"Esperado 2 manuales, got {len(spec)}"
     labels = set()
     for item in spec:
         assert isinstance(item, dict), f"Cada item debe ser dict, got {type(item)}"

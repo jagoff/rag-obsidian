@@ -8,637 +8,280 @@
 # Add more queries over time. Keep them representative of real usage.
 #
 # ─────────────────────────────────────────────────────────────────────────
-# When + how to add queries (expansion protocol — read before editing)
-# ─────────────────────────────────────────────────────────────────────────
-# The `rag tune` + nightly online-tune + auto-rollback gate all live on
-# the hit@5 / MRR / chain_success numbers from THIS file. A query that
-# measures nothing meaningful makes tuning noisier. Follow the
-# protocol below to keep this golden set useful.
-#
-# 1. COVERAGE GAP first. Before adding a query, check which folders are
-#    under-represented:
-#      cd <repo> && .venv/bin/python - <<'PY'
-#      import yaml; d = yaml.safe_load(open("queries.yaml"))
-#      from collections import Counter
-#      f = Counter(p.split("/",1)[0]
-#                  for q in d["queries"]
-#                  for p in q["expected"])
-#      print(f.most_common())
-#      PY
-#    Under-represented folder (<5 queries) → prioritise that folder.
-#    Otherwise expansion just inflates the singles count without widening
-#    coverage.
-#
-# 2. SINGLES template — atomic question, 1-3 expected paths:
-#      - question: "<natural user phrasing, lowercase, no trailing ?>"
-#        expected:
-#          - 03-Resources/<folder>/<note>.md
-#          - 03-Resources/<folder>/<related>.md  # optional 2nd hit
-#        note: "<1-line intent; why this is a real query>"  # optional
-#    Guidelines:
-#      • Use the exact wording you'd type yourself — don't sanitise.
-#      • Avoid leaking note titles into the question literally (that's
-#        a BM25 freebie; real queries paraphrase).
-#      • 1-2 expected paths ideal. More = weaker signal (harder to
-#        diagnose regressions per-query).
-#
-# 3. CHAINS template — multi-turn, tests session_id + seen_titles gate:
-#      - turns:
-#          - question: "<opening question>"
-#            expected:
-#              - path/to/note1.md
-#          - question: "<follow-up — should resolve a different chunk>"
-#            expected:
-#              - path/to/note2.md
-#            note: "must surface DIFFERENT note than turn 1"
-#    Guidelines:
-#      • Chains measure chain_success = BOTH turns hit. The second turn's
-#        expected MUST differ from the first's — otherwise you're just
-#        testing memoisation.
-#      • Keep chains to 2-3 turns. Longer chains amplify noise.
-#
-# 4. VERIFY every expected path exists in the vault:
-#      .venv/bin/python -m pytest tests/test_eval_bootstrap.py::test_queries_yaml_all_paths_exist_or_placeholder -q
-#    This test runs in CI and will fail the build on a typo.
-#
-# 5. AFTER adding, re-run `rag eval` and compare the hit@5 + MRR with CI
-#    bounds. If the baseline floor drops outside the prior CI, the new
-#    queries are either too hard (fix paths) or measuring something
-#    real. Document the new floor in CLAUDE.md.
-# ─────────────────────────────────────────────────────────────────────────
 
 queries:
-  # RAG system itself
-  # (2026-04-27: vault reorg moved 01-Projects/RAG-Local/* to .trash/
-  # "qué modelo de embeddings uso en mi RAG" dropped — Obsidian RAG Local.md trashed,
-  #   no live note covers current stack (bge-m3 / sqlite-vec) with enough depth.
-  # "cómo se indexan las notas en el vault" dropped — same reason.
-
-  - question: "qué reranker tiene el sistema"
-    expected:
-      - 99-obsidian/99-AI/memory/reference_obsidian_rag.md
-
-  # Coaching
-  - question: "charla sobre ansiedad y estrés laboral"
-    expected:
-      - 01-Projects/Charla-Ansiedad-Laboral/Coaching - Charla sobre Ansiedad y Estres en el ambito Laboral.md
-
-  - question: "curso de liderazgo estratégico"
-    expected:
-      - 01-Projects/Curso-Liderazgo-Estrategico/Coaching - Curso de liderazgo estratégico.md
-
-  - question: "qué es ikigai"
-    expected:
-      - 02-Areas/Coaching/Ikigai.md
-
-  - question: "comunicación no violenta"
-    expected:
-      - 02-Areas/Coaching/Comunicacion no violenta.md
-
-  - question: "mis referentes en coaching"
-    expected:
-      - 02-Areas/Coaching/Coaching - Referentes.md
-
-  - question: "bio de fer coach"
-    expected:
-      - 02-Areas/Coaching/Fer coach - Bio.md
-
-  - question: "podcast primer episodio coaching"
-    expected:
-      - 01-Projects/Podcast-Coaching-Ep01/Podcast - Episodio 01 - Coaching.md
-
-  # Música
-  - question: "letra de muros fractales"
-    expected:
-      - "01-Projects/Album-Muros-Fractales/Muros Fractales 1.1 (AI).md"
-
-  - question: "canción miro la lluvia"
-    expected:
-      - 02-Areas/Musica/Miro la lluvia/Miro la lluvia.md
-
-  - question: "toma tres tema"
-    expected:
-      - 02-Areas/Musica/Toma tres.md
-
-  # (2026-04-24) Removidos queries de Claude Code CLI/Interactivos/Peers:
-  # las notas `03-Resources/Claude/Claude*.md` fueron movidas a .trash/
-  # por el user — los paths dejaron de existir en el vault y el test
-  # `test_queries_yaml_all_paths_exist_or_placeholder` fallaba. Si se
-  # reponen las notas se pueden re-agregar estos queries.
-
-  - question: "equipamiento amps guitarra"
-    expected:
-      - 02-Areas/Musica/Equipamiento - Amps.md
-
-  # Hard: sin tildes (testing accent normalization)
-  - question: "que es el ikigai"
-    expected:
-      - 02-Areas/Coaching/Ikigai.md
-
-  - question: "comunicacion no violenta"
-    expected:
-      - 02-Areas/Coaching/Comunicacion no violenta.md
-
-  # Hard: question ABOUT content (not title keyword)
-  - question: "cómo manejar el estrés en el trabajo"
-    expected:
-      - 01-Projects/Charla-Ansiedad-Laboral/Coaching - Charla sobre Ansiedad y Estres en el ambito Laboral.md
-
-  # Hard: metaphorical / topic-level query
-  - question: "herramientas para grabar podcast"
-    expected:
-      - 02-Areas/Coaching/Coaching - Grabacion y herramientas.md
-
-  # Hard: typo
-  - question: "liderasgo estrategico"
-    expected:
-      - 01-Projects/Curso-Liderazgo-Estrategico/Coaching - Curso de liderazgo estratégico.md
-
-  # === Expansión 2026-04-17: carpetas sub-representadas ===
-  # 03-Resources/Agile
-  - question: "objetivos SMART"
-    expected:
-      - 03-Resources/Agile/Objetivos SMART.md
-
-  - question: "retrospectiva del barco"
-    expected:
-      - 03-Resources/Agile/Retrospectiva del barco.md
-
-  - question: "liberating structures facilitación"
-    expected:
-      - 03-Resources/Agile/Liberating structures.md
-
-  - question: "consejos para equipos remotos"
-    expected:
-      - 03-Resources/Agile/Consejos para equipos con trabajo remoto.md
-
-  # 03-Resources/Tech
-  - question: "shortcuts de macos"
-    expected:
-      - 03-Resources/Tech/MacOS - Shorcuts.md
-
-  - question: "prompts para chatgpt"
-    expected:
-      - 03-Resources/Tech/Chat GPT prompts.md
-
-  - question: "sincronizar dos cuentas de dropbox en la misma mac"
-    expected:
-      - 03-Resources/Tech/Dropbox - Sync 2 accounts on the same SO.md
-
-  # 02-Areas/Personal — Guitar
-  - question: "axe fx 3 configuración"
-    expected:
-      - 02-Areas/Personal/Guitar/Guitar - AXE FX 3.md
-
-  - question: "equipo de guitarra que tengo"
-    expected:
-      - 02-Areas/Personal/Guitar/Guitar - Gear.md
-      - 02-Areas/Musica/Equipamiento - Amps.md
-
-  # 02-Areas/Musica (non-Coaching)
-  - question: "letra de sal"
-    expected:
-      - 01-Projects/Album-Muros-Fractales/Letra - Sal.md
-      - 01-Projects/Album-Muros-Fractales/Letra - Sal AI.md
-
-  - question: "letra de apagado"
-    expected:
-      - 02-Areas/Personal/Letras - Escritos/Apagado.md
-
-  # 01-Projects (non-RAG-Local)
-  # (2026-04-27) "arquitectura de obsidian-rag" dropped — obsidian-rag - Arquitectura.md trashed.
-  # (2026-04-27) "pipelines de obsidian-rag" dropped — obsidian-rag - Pipelines.md trashed.
-  # (2026-05-05) "bots y automatización del rag" dropped — obsidian-rag - Automatización y bots.md trashed.
-
-  # 04-Archive — memorias PARA
-  - question: "feedback sobre stack local free"
-    expected:
-      - 99-obsidian/99-AI/memory/feedback_local_free_stack.md
-
-  - question: "por qué hyde falla con modelos chicos"
-    expected:
-      - 99-obsidian/99-AI/memory/feedback_hyde_small_models.md
-
-  - question: "estructura PARA del vault"
-    expected:
-      - 99-obsidian/99-AI/memory/feedback_obsidian_para.md
-
-  # 03-Resources/Personal-ref/Info — queries diagnósticas
-  - question: "info del banco santander"
-    expected:
-      - 02-Areas/Personal/Info/Info - Banco Santander.md
-
-  - question: "info del banco icbc"
-    expected:
-      - 02-Areas/Personal/Info/Info - Banco ICBC.md
-
-  - question: "dónde está guardado el cbu del alquiler"
-    expected:
-      - 02-Areas/Personal/Info/Info - CBU Alquiler.md
-
-  # Hard: acronym / techy phrasing
-  - question: "cómo grabé un podcast"
-    expected:
-      - 02-Areas/Coaching/Coaching - Grabacion y herramientas.md
-
-  # Comparison intent — fires _INTENT_COMPARISON_RE → SYSTEM_RULES_COMPARISON.
-  # Expect BOTH contrasted notes in top-k (OR-any hit still counts, but the
-  # prompt forces "X dice A / Y dice B / Diferencia clave" structure — if
-  # retrieval only brings one side, synthesis loses grounding).
-  # (2026-04-24) Removido query "diferencia entre comandos CLI y interactivos
-  # de claude code" — las notas fuente fueron movidas a .trash/.
-
-  - question: "comparame el curso de liderazgo estratégico con el otro curso de liderazgo"
-    expected:
-      - 01-Projects/Curso-Liderazgo-Estrategico/Coaching - Curso de liderazgo estratégico.md
-      - 01-Projects/Curso-Liderazgo-Estrategico/Coaching - Curso de liderazgo.md
-    note: "comparison intent: dos cursos distintos sobre el mismo tópico"
-
-  # (2026-04-27) "arquitectura vs pipelines del rag" dropped — both source notes trashed.
-  # (2026-04-27) "qué diferencia hay entre el chat model y el helper model" dropped — Modelos y
-  #   performance.md + Arquitectura.md trashed; no live note covers the distinction.
-  # (2026-04-27) "comparame los modelos chat y helper que uso" dropped — same reason.
-
-  # Synthesis intent — fires _INTENT_SYNTHESIS_RE → SYSTEM_RULES_SYNTHESIS.
-  # Cross-reference aggregation: expect ≥2 notes del mismo dominio en top-k.
-  # (2026-04-27) "sintetizame todo lo que hay sobre obsidian-rag en mi vault" dropped —
-  #   all 3 expected paths (Obsidian RAG Local.md, Arquitectura.md, Pipelines.md) trashed.
-
-  - question: "resumime todo lo que tengo sobre coaching"
-    expected:
-      - 02-Areas/Coaching/Coaching - Referentes.md
-      - 02-Areas/Coaching/Fer coach - Bio.md
-      - 02-Areas/Coaching/Comunicacion no violenta.md
-    note: "synthesis intent: cross-ref aggregation sobre coaching"
-
-  # === Expansión 2026-04-25: cobertura synthesis (gap audit, 2/+5) ===
-  # Cada query toca 3-5 notas del mismo dominio. "ANY expected en top-k = hit"
-  # según rag.eval, pero el síntoma de health real es N>=2 expected en top-k.
-  - question: "cuál es mi stack de IA local"
-    expected:
-      - 99-obsidian/99-AI/memory/feedback_local_free_stack.md
-      - 99-obsidian/99-AI/memory/reference_ollama.md
-      - 99-obsidian/99-AI/memory/reference_obsidian_rag.md
-      - 99-obsidian/99-AI/memory/reference_obsidian_rag_services.md
-    note: "synthesis intent: stack local IA — cross-ref ollama + rag local + servicios + feedback. (2026-04-27: removed obsidian-rag - Modelos y performance.md, trashed)"
-
-  - question: "qué temas de coaching trabajé este año"
-    expected:
-      - 01-Projects/Charla-Ansiedad-Laboral/Coaching - Charla sobre Ansiedad y Estres en el ambito Laboral.md
-      - 01-Projects/Curso-Liderazgo-Estrategico/Coaching - Curso de liderazgo estratégico.md
-      - 01-Projects/Curso-Liderazgo-Estrategico/Coaching - Curso de liderazgo.md
-      - 02-Areas/Coaching/Comunicacion no violenta.md
-      - 02-Areas/Coaching/Ikigai.md
-    note: "synthesis intent: temas de coaching — multi-nota cross-folder (02-Areas + 03-Resources + 04-Archive)"
-
-  # (2026-04-27) "cómo está armado el pipeline de retrieval del rag" dropped —
-  #   all 5 expected paths trashed (Pipelines, Arquitectura, Obsidian RAG Local,
-  #   Modelos y performance, Roadmap 2026-04-22).
-
-  - question: "de qué hablan las canciones de muros fractales"
-    expected:
-      - "01-Projects/Album-Muros-Fractales/Muros Fractales 1.1 (AI).md"
-      - 01-Projects/Album-Muros-Fractales/Letras - Astio.md
-      - 01-Projects/Album-Muros-Fractales/Letra - La herrumbre - AI 1.0.md
-      - 01-Projects/Album-Muros-Fractales/Letra - La herrumbre - AI - 2.0.md
-      - 01-Projects/Album-Muros-Fractales/Letra - La herrumbre - AI - 2.1.md
-    note: "synthesis intent: temas líricos del album muros fractales — N letras de la misma carpeta"
-
-  - question: "qué decisiones de diseño tomé sobre el reranker"
-    expected:
-      - 99-obsidian/99-AI/memory/feedback_hyde_small_models.md
-    note: "synthesis intent: decisiones técnicas sobre reranking. (2026-04-27: removed 4 dead paths trashed in vault reorg)"
-
-  # (2026-04-24) Removido query "todo lo que hay sobre claude peers" —
-  # las notas fuente (`03-Resources/Claude/Claude*.md`) fueron movidas
-  # a .trash/. Si se repone el dominio, re-agregar con paths frescos.
-
-  # ─────────────────────────────────────────────────────────────────────────
-  # Cross-source queries (Phase 1.f — baselined 2026-04-21)
-  # ─────────────────────────────────────────────────────────────────────────
-  #
-  # Gold paths use native-id scheme per docs/design-cross-source-corpus.md §2.7:
-  #   gmail://thread/<id>::<chunk_idx>
-  #   whatsapp://<chat_jid>/<first_msg_id>::<chunk_idx>
-  #   reminders://<reminder_id>::<chunk_idx>
-  #   calendar://event:<id>::<chunk_idx>  (aún no populated — gated en OAuth setup)
-  #
-  # Estas queries arrancaron con el corpus activo post-ingest de 2026-04-21:
-  # 20 chunks gmail + 36 chunks reminders + 4070 chunks WhatsApp.
-  # Cualquier regresión grande acá indica que el scoring/weighting/threshold
-  # está mal calibrado para el mix cross-source (precisamente lo que Phase 1.f
-  # existe para detectar).
-
-  # Reminders — concrete pendings
-  - question: "cuándo tengo que buscar inglés para astor"
-    expected:
-      - reminders://x-apple-reminder://501459A1-CC70-4E9B-B275-87C7AB99A327
-    note: "reminders source — pending literal match por subject"
-
-  - question: "comprar entradas para el en vivo de demos"
-    expected:
-      - reminders://x-apple-reminder://AB6A3BB2-AAE1-460A-B3D2-2FCE7E6A799F
-    note: "reminders — event-specific reminder"
-
-  - question: "trámite libre deuda de expensas para la mudanza"
-    expected:
-      - reminders://x-apple-reminder://4E4F3FAE-3951-4582-950A-B8B57BC00797
-    note: "reminders — multi-word match con folder-mudanza prefix"
-
-  - question: "recordatorio sobre el sistema RAG con claude"
-    expected:
-      - reminders://x-apple-reminder://BB6A5430-5269-435F-8256-C5AF86A173DD
-    note: "reminders — technical topic"
-
-  # Gmail — thread-level
-  - question: "resumen bancario BICA enero 2026"
-    expected:
-      - gmail://thread/19dafe6845b154d2
-    note: "gmail — subject-literal match"
-
-  - question: "completación del curso claude 101"
-    expected:
-      - gmail://thread/19d9c320046e0753
-    note: "gmail — paraphrase del subject inglés"
-
-  # Cross-source: mismo tema, distintas fuentes
-  - question: "fallas de CI en el repo obsidian-rag"
-    expected:
-      - gmail://thread/19db04ea6ec97f1f
-      - gmail://thread/19db03d8d3949f83
-      - gmail://thread/19db035184e265b8
-    note: "gmail — multi-doc sobre el mismo topic (synthesis implícito)"
-
-  # Calendar — event-specific lookups (populated 2026-04-21 post-Calendar API
-  # enable). 368 chunks indexados del calendar `fernandoferrari@gmail.com`.
-  # Se usan event IDs reales del corpus actual; si el evento se edita / borra
-  # la query va a fallar — actualizar contra `sqlite3 ragvec.db "SELECT file
-  # FROM meta_obsidian_notes_v11 WHERE source='calendar' AND document LIKE
-  # '%<subject>%'"`.
-  - question: "turno con el psicólogo martín segal"
-    expected:
-      - calendar://fernandoferrari@gmail.com/77gam5n17pld1tc2i3anlonqi5
-    note: "calendar — turno profesional recurrente, subject-literal"
-
-  - question: "workshop de AI Engineer sobre sistemas RAG"
-    expected:
-      - calendar://fernandoferrari@gmail.com/0vqo081rthdblder0qnpvi5o9j
-    note: "calendar — workshop técnico, paraphrase del subject"
-
-  - question: "despedida de jardín de astor"
-    expected:
-      - calendar://fernandoferrari@gmail.com/_60ojed268d2k6b9l6cp3eb9k70okcba271246b9p68rjiha48ksk2ha26o
-    note: "calendar — evento familiar puntual"
-
-  - question: "reunión con Max de brightscout sobre ops"
-    expected:
-      - calendar://fernandoferrari@gmail.com/2u4a0vkqls67bq9dee4g40f3gi
-    note: "calendar — reunión de trabajo recurrente con atendee resolution"
-
-  - question: "turno con erica franzen"
-    expected:
-      - calendar://fernandoferrari@gmail.com/369o0b149snreaiip2ul95emmb
-    note: "calendar — turno profesional one-off, subject-literal"
-
-# Multi-turn chains: each chain is an independent conversation where later
-# turns may contain pronouns or ellipsis that only resolve against the
-# prior user/assistant exchange. Eval builds `history` progressively per
-# chain; from turn 2 onward, `reformulate_query` rewrites the question as
-# a standalone query before retrieve.
+- question: charla sobre ansiedad y estrés laboral
+  expected:
+  - 01-Projects/Charla-Ansiedad-Laboral/Coaching - Charla sobre Ansiedad y Estres en el ambito Laboral.md
+- question: curso de liderazgo estratégico
+  expected:
+  - 01-Projects/Curso-Liderazgo-Estrategico/Coaching - Curso de liderazgo estratégico.md
+- question: qué es ikigai
+  expected:
+  - 02-Areas/Coaching/Ikigai.md
+- question: comunicación no violenta
+  expected:
+  - 02-Areas/Coaching/Comunicacion no violenta.md
+- question: mis referentes en coaching
+  expected:
+  - 02-Areas/Coaching/Coaching - Referentes.md
+- question: bio de fer coach
+  expected:
+  - 02-Areas/Coaching/Fer coach - Bio.md
+- question: podcast primer episodio coaching
+  expected:
+  - 01-Projects/Podcast-Coaching-Ep01/Podcast - Episodio 01 - Coaching.md
+- question: letra de muros fractales
+  expected:
+  - 01-Projects/Album-Muros-Fractales/Muros Fractales 1.1 (AI).md
+- question: canción miro la lluvia
+  expected:
+  - 02-Areas/Musica/Miro la lluvia/Miro la lluvia.md
+- question: toma tres tema
+  expected:
+  - 02-Areas/Musica/Toma tres.md
+- question: equipamiento amps guitarra
+  expected:
+  - 02-Areas/Musica/Equipamiento - Amps.md
+- question: que es el ikigai
+  expected:
+  - 02-Areas/Coaching/Ikigai.md
+- question: comunicacion no violenta
+  expected:
+  - 02-Areas/Coaching/Comunicacion no violenta.md
+- question: cómo manejar el estrés en el trabajo
+  expected:
+  - 01-Projects/Charla-Ansiedad-Laboral/Coaching - Charla sobre Ansiedad y Estres en el ambito Laboral.md
+- question: herramientas para grabar podcast
+  expected:
+  - 02-Areas/Coaching/Coaching - Grabacion y herramientas.md
+- question: liderasgo estrategico
+  expected:
+  - 01-Projects/Curso-Liderazgo-Estrategico/Coaching - Curso de liderazgo estratégico.md
+- question: objetivos SMART
+  expected:
+  - 03-Resources/Agile/Objetivos SMART.md
+- question: retrospectiva del barco
+  expected:
+  - 03-Resources/Agile/Retrospectiva del barco.md
+- question: liberating structures facilitación
+  expected:
+  - 03-Resources/Agile/Liberating structures.md
+- question: consejos para equipos remotos
+  expected:
+  - 03-Resources/Agile/Consejos para equipos con trabajo remoto.md
+- question: shortcuts de macos
+  expected:
+  - 03-Resources/Tech/MacOS - Shorcuts.md
+- question: prompts para chatgpt
+  expected:
+  - 03-Resources/Tech/Chat GPT prompts.md
+- question: sincronizar dos cuentas de dropbox en la misma mac
+  expected:
+  - 03-Resources/Tech/Dropbox - Sync 2 accounts on the same SO.md
+- question: axe fx 3 configuración
+  expected:
+  - 02-Areas/Personal/Guitar/Guitar - AXE FX 3.md
+- question: equipo de guitarra que tengo
+  expected:
+  - 02-Areas/Personal/Guitar/Guitar - Gear.md
+  - 02-Areas/Musica/Equipamiento - Amps.md
+- question: letra de sal
+  expected:
+  - 01-Projects/Album-Muros-Fractales/Letra - Sal.md
+  - 01-Projects/Album-Muros-Fractales/Letra - Sal AI.md
+- question: letra de apagado
+  expected:
+  - 02-Areas/Personal/Letras - Escritos/Apagado.md
+- question: cómo grabé un podcast
+  expected:
+  - 02-Areas/Coaching/Coaching - Grabacion y herramientas.md
+- question: comparame el curso de liderazgo estratégico con el otro curso de liderazgo
+  expected:
+  - 01-Projects/Curso-Liderazgo-Estrategico/Coaching - Curso de liderazgo estratégico.md
+  - 01-Projects/Curso-Liderazgo-Estrategico/Coaching - Curso de liderazgo.md
+  note: 'comparison intent: dos cursos distintos sobre el mismo tópico'
+- question: resumime todo lo que tengo sobre coaching
+  expected:
+  - 02-Areas/Coaching/Coaching - Referentes.md
+  - 02-Areas/Coaching/Fer coach - Bio.md
+  - 02-Areas/Coaching/Comunicacion no violenta.md
+  note: 'synthesis intent: cross-ref aggregation sobre coaching'
+- question: qué temas de coaching trabajé este año
+  expected:
+  - 01-Projects/Charla-Ansiedad-Laboral/Coaching - Charla sobre Ansiedad y Estres en el ambito Laboral.md
+  - 01-Projects/Curso-Liderazgo-Estrategico/Coaching - Curso de liderazgo estratégico.md
+  - 01-Projects/Curso-Liderazgo-Estrategico/Coaching - Curso de liderazgo.md
+  - 02-Areas/Coaching/Comunicacion no violenta.md
+  - 02-Areas/Coaching/Ikigai.md
+  note: 'synthesis intent: temas de coaching — multi-nota cross-folder (02-Areas + 03-Resources + 04-Archive)'
+- question: de qué hablan las canciones de muros fractales
+  expected:
+  - 01-Projects/Album-Muros-Fractales/Muros Fractales 1.1 (AI).md
+  - 01-Projects/Album-Muros-Fractales/Letras - Astio.md
+  - 01-Projects/Album-Muros-Fractales/Letra - La herrumbre - AI 1.0.md
+  - 01-Projects/Album-Muros-Fractales/Letra - La herrumbre - AI - 2.0.md
+  - 01-Projects/Album-Muros-Fractales/Letra - La herrumbre - AI - 2.1.md
+  note: 'synthesis intent: temas líricos del album muros fractales — N letras de la misma carpeta'
+- question: cuándo tengo que buscar inglés para astor
+  expected:
+  - reminders://x-apple-reminder://501459A1-CC70-4E9B-B275-87C7AB99A327
+  note: reminders source — pending literal match por subject
+- question: comprar entradas para el en vivo de demos
+  expected:
+  - reminders://x-apple-reminder://AB6A3BB2-AAE1-460A-B3D2-2FCE7E6A799F
+  note: reminders — event-specific reminder
+- question: trámite libre deuda de expensas para la mudanza
+  expected:
+  - reminders://x-apple-reminder://4E4F3FAE-3951-4582-950A-B8B57BC00797
+  note: reminders — multi-word match con folder-mudanza prefix
+- question: recordatorio sobre el sistema RAG con claude
+  expected:
+  - reminders://x-apple-reminder://BB6A5430-5269-435F-8256-C5AF86A173DD
+  note: reminders — technical topic
+- question: resumen bancario BICA enero 2026
+  expected:
+  - gmail://thread/19dafe6845b154d2
+  note: gmail — subject-literal match
+- question: completación del curso claude 101
+  expected:
+  - gmail://thread/19d9c320046e0753
+  note: gmail — paraphrase del subject inglés
+- question: fallas de CI en el repo obsidian-rag
+  expected:
+  - gmail://thread/19db04ea6ec97f1f
+  - gmail://thread/19db03d8d3949f83
+  - gmail://thread/19db035184e265b8
+  note: gmail — multi-doc sobre el mismo topic (synthesis implícito)
+- question: turno con el psicólogo martín segal
+  expected:
+  - calendar://fernandoferrari@gmail.com/77gam5n17pld1tc2i3anlonqi5
+  note: calendar — turno profesional recurrente, subject-literal
+- question: workshop de AI Engineer sobre sistemas RAG
+  expected:
+  - calendar://fernandoferrari@gmail.com/0vqo081rthdblder0qnpvi5o9j
+  note: calendar — workshop técnico, paraphrase del subject
+- question: despedida de jardín de astor
+  expected:
+  - calendar://fernandoferrari@gmail.com/_60ojed268d2k6b9l6cp3eb9k70okcba271246b9p68rjiha48ksk2ha26o
+  note: calendar — evento familiar puntual
+- question: reunión con Max de brightscout sobre ops
+  expected:
+  - calendar://fernandoferrari@gmail.com/2u4a0vkqls67bq9dee4g40f3gi
+  note: calendar — reunión de trabajo recurrente con atendee resolution
+- question: turno con erica franzen
+  expected:
+  - calendar://fernandoferrari@gmail.com/369o0b149snreaiip2ul95emmb
+  note: calendar — turno profesional one-off, subject-literal
+- question: qué decisión hubo sobre el reranker pinned en VRAM
+  expected:
+  - 99-obsidian/99-AI/memory/2026-05-09-reranker-necesita-vram-adicional.md
+  - 99-obsidian/99-AI/memory/2026-05-10-reranker-pinned.md
+  note: 'memory recall: VRAM optimization decisions for reranker (2026-05-10 prune)'
+- question: registry de modelos LLM en RAG
+  expected:
+  - 99-obsidian/99-AI/memory/2026-05-08-obsidian-rag-rag-model-cli-con-registry-de-6-tiers-hot-reload-sin-restart.md
+  note: 'memory recall: model registry CLI (2026-05-10 prune)'
+- question: cleanup del vault PARA
+  expected:
+  - 99-obsidian/99-AI/memory/2026-05-08-vault-para-cleanup-2026-05-08-completado.md
+  note: 'memory recall: PARA cleanup task (2026-05-10 prune)'
+- question: supervisor scheduler misfire grace
+  expected:
+  - 99-obsidian/99-AI/memory/2026-05-10-obsidian-rag-4-learning-loops-dormidos-por-bugs-silenciosos-audit-fix-completo.md
+  note: 'memory recall: supervisor scheduler tuning (2026-05-10 prune)'
 chains:
-  - id: coaching-ikigai
-    turns:
-      - question: "qué es ikigai"
-        expected:
-          - 02-Areas/Coaching/Ikigai.md
-      - question: "profundizá en el concepto"
-        expected:
-          - 02-Areas/Coaching/Ikigai.md
-      - question: "y cómo se relaciona eso con mi perfil de coach"
-        expected:
-          - 02-Areas/Coaching/Fer coach - Bio.md
-          - 02-Areas/Coaching/Fer Coach.md
-
-  - id: coaching-liderazgo
-    turns:
-      - question: "curso de liderazgo estratégico"
-        expected:
-          - 01-Projects/Curso-Liderazgo-Estrategico/Coaching - Curso de liderazgo estratégico.md
-      - question: "y el otro curso que tenía"
-        expected:
-          - 01-Projects/Curso-Liderazgo-Estrategico/Coaching - Curso de liderazgo.md
-      - question: "quiénes son mis referentes en esto"
-        expected:
-          - 02-Areas/Coaching/Coaching - Referentes.md
-
-  - id: musica-muros-fractales
-    turns:
-      - question: "letra de muros fractales"
-        expected:
-          - "01-Projects/Album-Muros-Fractales/Muros Fractales 1.1 (AI).md"
-      - question: "qué otras letras tengo en esa misma carpeta"
-        expected:
-          - 01-Projects/Album-Muros-Fractales/Letras - Astio.md
-          - 01-Projects/Album-Muros-Fractales/Letra - La herrumbre - AI 1.0.md
-          - 01-Projects/Album-Muros-Fractales/Letra - La herrumbre - AI - 2.0.md
-          - 01-Projects/Album-Muros-Fractales/Letra - La herrumbre - AI - 2.1.md
-
-  # (2026-04-24) Removida chain `tech-claude-code` — las notas Claude
-  # Code CLI / Interactivos fueron movidas a .trash/.
-
-  # (2026-04-27) Removida chain `rag-system` — todas las turns apuntaban a
-  # Obsidian RAG Local.md, movida a .trash/ en el vault reorg.
-
-  # Failure mode: folder semantics ("esa carpeta") + ambiguous pronoun "los"
-  # (los acordes vs los temas). Also cascada: t2 depende de t1 anclar en Sal.
-  - id: musica-sal-carpeta
-    turns:
-      - question: "letra de sal"
-        expected:
-          - 01-Projects/Album-Muros-Fractales/Letra - Sal.md
-          - 01-Projects/Album-Muros-Fractales/Letra - Sal AI.md
-      - question: "y los acordes de esa"
-        expected:
-          - 01-Projects/Album-Muros-Fractales/Letra - Sal - Acordes.md
-      - question: "qué otras versiones tengo en esa carpeta"
-        expected:
-          - 01-Projects/Album-Muros-Fractales/Letra - Sal2.md
-          - 01-Projects/Album-Muros-Fractales/Letra - Sal AI.md
-
-  # Failure mode: "contame más de eso" / "profundizá" con anclaje a nota
-  # específica, y luego cascada cross-note (herramientas de grabación).
-  - id: coaching-ansiedad-profundiza
-    turns:
-      - question: "charla sobre ansiedad y estrés laboral"
-        expected:
-          - 01-Projects/Charla-Ansiedad-Laboral/Coaching - Charla sobre Ansiedad y Estres en el ambito Laboral.md
-      - question: "contame más de eso"
-        expected:
-          - 01-Projects/Charla-Ansiedad-Laboral/Coaching - Charla sobre Ansiedad y Estres en el ambito Laboral.md
-      - question: "qué herramientas uso para grabar ese tipo de charla"
-        expected:
-          - 02-Areas/Coaching/Coaching - Grabacion y herramientas.md
-
-  # Failure mode: "profundizá en X" donde X es otra nota de la misma carpeta
-  # (no self-reference trivial), luego "y las versiones de Y" que también
-  # está en la carpeta. Exercises folder affinity + named-entity anchoring.
-  - id: musica-muros-profundiza
-    turns:
-      - question: "letra de muros fractales"
-        expected:
-          - "01-Projects/Album-Muros-Fractales/Muros Fractales 1.1 (AI).md"
-      - question: "profundizá en la de astio"
-        expected:
-          - 01-Projects/Album-Muros-Fractales/Letras - Astio.md
-      - question: "y las versiones de la herrumbre que tengo"
-        expected:
-          - 01-Projects/Album-Muros-Fractales/Letra - La herrumbre - AI 1.0.md
-          - 01-Projects/Album-Muros-Fractales/Letra - La herrumbre - AI - 2.0.md
-          - 01-Projects/Album-Muros-Fractales/Letra - La herrumbre - AI - 2.1.md
-
-  # === Chains 2026-04-17: cross-folder + acronym follow-up ===
-  # Agile: entidad concreta → pronombre "y la otra" → otra nota del mismo folder
-  - id: agile-smart-retro
-    turns:
-      - question: "objetivos SMART"
-        expected:
-          - 03-Resources/Agile/Objetivos SMART.md
-      - question: "y la retrospectiva del barco"
-        expected:
-          - 03-Resources/Agile/Retrospectiva del barco.md
-      - question: "qué otras dinámicas tengo en esa carpeta"
-        expected:
-          - 03-Resources/Agile/Dinamicas grupales.md
-          - 03-Resources/Agile/Liberating structures.md
-
-  # Guitar: axe fx → "y mi equipo" → cross-folder (Amps en 03-Resources)
-  - id: guitar-gear
-    turns:
-      - question: "axe fx 3 configuración"
-        expected:
-          - 02-Areas/Personal/Guitar/Guitar - AXE FX 3.md
-      - question: "y qué equipo de guitarra tengo"
-        expected:
-          - 02-Areas/Personal/Guitar/Guitar - Gear.md
-      - question: "qué amplificadores uso"
-        expected:
-          - 02-Areas/Musica/Equipamiento - Amps.md
-
-  # Info bancaria: pronombre "y el otro" cross-banco
-  - id: info-bancos
-    turns:
-      - question: "info del banco santander"
-        expected:
-          - 02-Areas/Personal/Info/Info - Banco Santander.md
-      - question: "y el icbc"
-        expected:
-          - 02-Areas/Personal/Info/Info - Banco ICBC.md
-
-  # === Cross-source chains 2026-04-25: gap audit (synthesis/comparison/cross) ===
-  # Patrón: t1 = question vault-only (siempre evaluable) + t2 = follow-up
-  # cross-source (depende del ingester correspondiente).
-  # TODO: requires cross-source ingester active — al 2026-04-25 sólo `vault`
-  # está cargado en ragvec.db; estos t2 fallan hasta que reminders/calendar/
-  # gmail vuelvan a indexarse. El chain hit@5 cae proporcional pero la t1
-  # mantiene la chain como evaluable (no es 0/2 puro).
-
-  # (2026-04-27) Removida chain `rag-pendientes-cross` — la turn 0 apuntaba a
-  # Obsidian RAG Local.md, Sistema.md y Arquitectura.md, todos movidos a .trash/.
-  # Re-agregar cuando haya una nota vault activa sobre obsidian-rag que resuelva
-  # el anchor del t1, para que la cross-source turn 2 tenga grounding válido.
-
-  # (2026-04-27) Removida chain `rag-workshops-cross` — la turn 0 apuntaba a
-  # obsidian-rag - Pipelines.md, movida a .trash/. Sin anchor vault en t1
-  # la chain no mide nada útil.
-
-  # NOTA 2026-04-25: dos chains adicionales se postergaron tras eval seco
-  # (sólo `vault` cargado) porque el chain hit@5 caía fuera del budget de 3pp.
-  # Re-agregar cuando los ingesters cross-source (gmail, reminders) estén
-  # online y el corpus de calendar tenga reformulation-friendly subjects:
-  #
-  # 1. rag-emails-ci-cross (vault→gmail): el t2 sólo hitea con gmail ingester
-  #    activo. IDs de threads de CI ya validados por singles existentes (líneas
-  #    344-349). Formato:
-  #      - id: rag-emails-ci-cross
-  #        turns:
-  #          - question: "arquitectura de obsidian-rag"
-  #            expected: [01-Projects/RAG-Local/obsidian-rag - Arquitectura.md]
-  #          - question: "y los emails sobre fallas de CI del repo"
-  #            expected:
-  #              - gmail://thread/19db04ea6ec97f1f
-  #              - gmail://thread/19db03d8d3949f83
-  #              - gmail://thread/19db035184e265b8
-  #
-  # 2. coaching-turnos-cross (vault→calendar erica/martin): los IDs existen
-  #    en el corpus (singles "turno con erica franzen" + "psicólogo martín
-  #    segal" hitean) pero la reformulation del t2 trae OTROS calendar events,
-  #    no los esperados. Hay que afinar el wording del t2 para que el rewrite
-  #    incluya el name/profession explícito. Re-intentar con:
-  #      - id: coaching-turnos-cross
-  #        turns:
-  #          - question: "mis referentes en coaching"
-  #            expected: [02-Areas/Coaching/Coaching - Referentes.md]
-  #          - question: "y mis próximos turnos con erica franzen y martín"
-  #            expected:
-  #              - calendar://fernandoferrari@gmail.com/369o0b149snreaiip2ul95emmb
-  #              - calendar://fernandoferrari@gmail.com/77gam5n17pld1tc2i3anlonqi5
-
-# ─────────────────────────────────────────────────────────────────────────
-# Cross-source template (Phase 1.f scaffolding — NOT consumed by `rag eval` yet)
-# ─────────────────────────────────────────────────────────────────────────
-# Once the cross-source corpus has production data (WhatsApp + Calendar +
-# Gmail + Reminders all indexed with real volume), move queries from this
-# template into the `queries:` / `chains:` sections above and extend the
-# eval harness to accept non-vault `expected` paths (source-prefixed
-# pseudo-URIs like `whatsapp://<chat_jid>/<msg_id>`). Until then the
-# eval gate is vault-only and these entries are documentation.
-#
-# Format per source:
-#
-#   # WhatsApp — expected uses the doc_id scheme from
-#   # scripts/ingest_whatsapp.py: `whatsapp://<chat_jid>/<first_msg_id>`.
-#   - question: "el wa donde juan cerró la fecha del viernes"
-#     expected:
-#       - whatsapp://120363...@g.us/ABC123
-#     source_hint: whatsapp   # feeds --source whatsapp filter
-#
-#   # Calendar — doc_id: `calendar://<calendar_id>/<event_id>`.
-#   - question: "la reunión con Juan del martes"
-#     expected:
-#       - calendar://work@x.com/abc123
-#     source_hint: calendar
-#
-#   # Gmail — doc_id: `gmail://<thread_id>`.
-#   - question: "el email de Juan sobre la migración"
-#     expected:
-#       - gmail://thread:1890f3abcd
-#     source_hint: gmail
-#
-#   # Reminders — doc_id: `reminders://<id>`.
-#   - question: "la tarea de llamar al banco"
-#     expected:
-#       - reminders://x-apple-reminderkit://REMCDReminder/UUID-HERE
-#     source_hint: reminders
-#
-# Chain example (cross-source — first vault, then gmail):
-#
-#   - id: cross-decisiones-DB
-#     turns:
-#       - question: "qué decidimos sobre la migración de DB"
-#         expected:
-#           - 02-Areas/Tech/Decisiones-DB.md
-#       - question: "dónde está el thread donde juan mandó los requerimientos"
-#         expected:
-#           - gmail://thread:XXXX
-#         source_hint: gmail
-#
-# Calibration checklist for Phase 1.f (run once production data exists):
-#   1. Add 5-10 cross-source singles per source (total ~25-40 new).
-#   2. Add 3-5 cross-source chains spanning 2+ sources.
-#   3. Run `rag eval` with the extended set. Singles hit@5 + chains
-#      hit@5 MUST sit inside the pre-expansion CI (or document new floor).
-#   4. Tune `CONFIDENCE_RERANK_MIN_PER_SOURCE` (rag.py) — use gap queries
-#      (`rag log --low-confidence`) per source to find the optimal gate.
-#   5. Re-validate `SOURCE_WEIGHTS` — start with the §10.3 defaults
-#      (vault 1.00 → messages 0.75), compare against an A/B where all
-#      weights = 1.00. If scoring parity is better, drop the weights.
+- id: coaching-ikigai
+  turns:
+  - question: qué es ikigai
+    expected:
+    - 02-Areas/Coaching/Ikigai.md
+  - question: profundizá en el concepto
+    expected:
+    - 02-Areas/Coaching/Ikigai.md
+  - question: y cómo se relaciona eso con mi perfil de coach
+    expected:
+    - 02-Areas/Coaching/Fer coach - Bio.md
+    - 02-Areas/Coaching/Fer Coach.md
+- id: coaching-liderazgo
+  turns:
+  - question: curso de liderazgo estratégico
+    expected:
+    - 01-Projects/Curso-Liderazgo-Estrategico/Coaching - Curso de liderazgo estratégico.md
+  - question: y el otro curso que tenía
+    expected:
+    - 01-Projects/Curso-Liderazgo-Estrategico/Coaching - Curso de liderazgo.md
+  - question: quiénes son mis referentes en esto
+    expected:
+    - 02-Areas/Coaching/Coaching - Referentes.md
+- id: musica-muros-fractales
+  turns:
+  - question: letra de muros fractales
+    expected:
+    - 01-Projects/Album-Muros-Fractales/Muros Fractales 1.1 (AI).md
+  - question: qué otras letras tengo en esa misma carpeta
+    expected:
+    - 01-Projects/Album-Muros-Fractales/Letras - Astio.md
+    - 01-Projects/Album-Muros-Fractales/Letra - La herrumbre - AI 1.0.md
+    - 01-Projects/Album-Muros-Fractales/Letra - La herrumbre - AI - 2.0.md
+    - 01-Projects/Album-Muros-Fractales/Letra - La herrumbre - AI - 2.1.md
+- id: musica-sal-carpeta
+  turns:
+  - question: letra de sal
+    expected:
+    - 01-Projects/Album-Muros-Fractales/Letra - Sal.md
+    - 01-Projects/Album-Muros-Fractales/Letra - Sal AI.md
+  - question: y los acordes de esa
+    expected:
+    - 01-Projects/Album-Muros-Fractales/Letra - Sal - Acordes.md
+  - question: qué otras versiones tengo en esa carpeta
+    expected:
+    - 01-Projects/Album-Muros-Fractales/Letra - Sal2.md
+    - 01-Projects/Album-Muros-Fractales/Letra - Sal AI.md
+- id: coaching-ansiedad-profundiza
+  turns:
+  - question: charla sobre ansiedad y estrés laboral
+    expected:
+    - 01-Projects/Charla-Ansiedad-Laboral/Coaching - Charla sobre Ansiedad y Estres en el ambito Laboral.md
+  - question: contame más de eso
+    expected:
+    - 01-Projects/Charla-Ansiedad-Laboral/Coaching - Charla sobre Ansiedad y Estres en el ambito Laboral.md
+  - question: qué herramientas uso para grabar ese tipo de charla
+    expected:
+    - 02-Areas/Coaching/Coaching - Grabacion y herramientas.md
+- id: musica-muros-profundiza
+  turns:
+  - question: letra de muros fractales
+    expected:
+    - 01-Projects/Album-Muros-Fractales/Muros Fractales 1.1 (AI).md
+  - question: profundizá en la de astio
+    expected:
+    - 01-Projects/Album-Muros-Fractales/Letras - Astio.md
+  - question: y las versiones de la herrumbre que tengo
+    expected:
+    - 01-Projects/Album-Muros-Fractales/Letra - La herrumbre - AI 1.0.md
+    - 01-Projects/Album-Muros-Fractales/Letra - La herrumbre - AI - 2.0.md
+    - 01-Projects/Album-Muros-Fractales/Letra - La herrumbre - AI - 2.1.md
+- id: agile-smart-retro
+  turns:
+  - question: objetivos SMART
+    expected:
+    - 03-Resources/Agile/Objetivos SMART.md
+  - question: y la retrospectiva del barco
+    expected:
+    - 03-Resources/Agile/Retrospectiva del barco.md
+  - question: qué otras dinámicas tengo en esa carpeta
+    expected:
+    - 03-Resources/Agile/Dinamicas grupales.md
+    - 03-Resources/Agile/Liberating structures.md
+- id: guitar-gear
+  turns:
+  - question: axe fx 3 configuración
+    expected:
+    - 02-Areas/Personal/Guitar/Guitar - AXE FX 3.md
+  - question: y qué equipo de guitarra tengo
+    expected:
+    - 02-Areas/Personal/Guitar/Guitar - Gear.md
+  - question: qué amplificadores uso
+    expected:
+    - 02-Areas/Musica/Equipamiento - Amps.md

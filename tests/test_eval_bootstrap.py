@@ -150,10 +150,19 @@ def test_bootstrap_ci_basic_shape():
             "docs": [""], "scores": [0.1],
         }
 
-    # Create a temp queries file with 6 queries → CI should compute
+    # Create a temp queries file with 6 queries → CI should compute.
+    #
+    # Importante: el writer de `rag_eval_runs` (rag/__init__.py:28326) sólo
+    # escribe cuando el archivo se llama exactamente `queries.yaml` Y vive
+    # en el CWD. Esto es por design — el trend log gobierna el floor del
+    # nightly auto-rollback y queries adversariales no deben contaminarlo.
+    # Para que el test ejercite el writer, chdir al tmpdir + nombrar el
+    # archivo `queries.yaml`. También hay que asegurarse que `db_dir` exista
+    # antes que el writer intente abrir telemetry.db (sino sqlite3.connect
+    # falla con OperationalError).
     import tempfile
     with tempfile.TemporaryDirectory() as td:
-        qfile = Path(td) / "q.yaml"
+        qfile = Path(td) / "queries.yaml"
         qfile.write_text(
             "queries:\n"
             + "".join(
@@ -165,6 +174,7 @@ def test_bootstrap_ci_basic_shape():
         )
         eval_log = Path(td) / "eval.jsonl"
         db_dir = Path(td) / "ragvec"
+        db_dir.mkdir(parents=True, exist_ok=True)
 
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(rag, "get_db", lambda: _FakeCol())
@@ -172,7 +182,8 @@ def test_bootstrap_ci_basic_shape():
             mp.setattr(rag, "EVAL_LOG_PATH", eval_log)
             # Post-T10: eval log lives in rag_eval_runs (SQL).
             mp.setattr(rag, "DB_PATH", db_dir)
-            res = runner.invoke(rag.eval, ["--file", str(qfile)])
+            mp.chdir(td)
+            res = runner.invoke(rag.eval, ["--file", "queries.yaml"])
             assert res.exit_code == 0, res.output
 
         import sqlite3

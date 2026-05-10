@@ -639,7 +639,20 @@ def test_consolidate_plist_renders_valid_schedule():
     assert "<key>RunAtLoad</key><false/>" in p
 
 
-def test_consolidate_service_registered_in_setup():
+def test_consolidate_migrated_to_supervisor():
+    """Post-supervisor refactor (2026-05-09): los 27 plists cron viejos
+    fueron migrados al supervisor in-process. `consolidate` ya no es un
+    plist standalone — corre como job adentro del supervisor (ver
+    `rag/runtime/jobs/`). El factory `_consolidate_plist()` sigue
+    existiendo para rollback emergencia, pero el label NO debe estar en
+    `_services_spec` (sino el control plane lo querría tener cargado).
+    """
     spec = rag._services_spec("/usr/local/bin/rag")
     labels = [label for label, _, _ in spec]
-    assert "com.fer.obsidian-rag-consolidate" in labels
+    assert "com.fer.obsidian-rag-consolidate" not in labels, (
+        "consolidate fue migrado al supervisor — no debería estar en spec"
+    )
+    # Y debe estar en _DEPRECATED_LABELS para que `rag setup` haga
+    # bootout + unlink del plist viejo si existe en disco.
+    from rag.plists._spec import _DEPRECATED_LABELS  # noqa: PLC0415
+    assert "com.fer.obsidian-rag-consolidate" in _DEPRECATED_LABELS

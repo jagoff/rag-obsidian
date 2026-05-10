@@ -166,25 +166,19 @@ def _services_spec_manual() -> list[dict]:
     regenera. Si alguno se rompe, el fix es manual (re-copiar plist desde
     backup o regenerarlo en su repo origen).
 
-    Limpieza 2026-05-04: se removieron 4 entries que llevaban meses como
-    "fantasmas" — sin plist en disco, sin log, con tick `-` en cada
-    `daemons status`:
+    Limpieza 2026-05-04: se removieron 4 entries fantasma (cloudflare-tunnel*,
+    lgbm-train, paraphrases-train).
 
-      - `cloudflare-tunnel` + `cloudflare-tunnel-watcher`: se instalan
-        aparte cuando el user decide exponer web vía `cloudflared`. Si
-        están corriendo, aparecen en `daemons status` por launchctl;
-        no hace falta el registry para eso.
-      - `lgbm-train`, `paraphrases-train`: jobs de fine-tuning que se
-        corren a mano (`rag tune …`), no tienen plist automatizado.
-        Dejarlos en el registry les asignaba un slot en el dashboard
-        que solo decía "missing".
+    Limpieza 2026-05-10: se removieron `synth-refresh` y `log-rotate` —
+    ya no tienen plist en disco ni logs (los .log archivados últimos en
+    2026-04/05 ya fueron rotados/borrados). Eran "drift" permanente en
+    `rag daemons status` sin nada que el user pueda hacer al respecto.
+    Si en el futuro se vuelven a necesitar, re-añadir acá + regenerar
+    el plist desde el repo origen del user.
 
-    Los 3 restantes SÍ tienen histórico de ejecución (logs en
-    `~/.local/share/obsidian-rag/{log-rotate,spotify-poll,synth-refresh}.log`
-    de 2026-04/05) — se mantienen mientras el user decida si los usa
-    o los archiva.
+    Lista actualmente vacía — todos los daemons activos viven en
+    `_services_spec()` (los 3 managed) o en `_RAG_NET_LABELS` (externos).
+    Mantengo la función como contract API por si en el futuro vuelve a
+    haber un manual_keep legítimo.
     """
-    return [
-        {"label": "com.fer.obsidian-rag-synth-refresh", "category": "manual_keep"},
-        {"label": "com.fer.obsidian-rag-log-rotate", "category": "manual_keep"},
-    ]
+    return []

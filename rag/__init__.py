@@ -22965,10 +22965,13 @@ def _run_cross_source_etls(vault_path: Path) -> None:
                     f"{stats['target']}/ ({detail}, {_ms}ms)[/dim]"
                 )
             elif stats.get("ok"):
-                # Hash-skip path: nothing changed. Print compact line so the
-                # user sees the ETL ran (otherwise looks like nothing happened).
+                # Hash-skip path: nothing changed. Print compact line con la
+                # razón explícita ("sin cambios" o equivalente del stats) para
+                # que el user no se pregunte por qué skipeó (antes: solo
+                # mostraba el ms sin contexto).
+                _reason = stats.get("reason") or "sin cambios"
                 console.print(
-                    f"[dim]{label} sync: skip ({_ms}ms)[/dim]"
+                    f"[dim]{label} sync: skip ({_reason}, {_ms}ms)[/dim]"
                 )
             elif (
                 not stats.get("ok")

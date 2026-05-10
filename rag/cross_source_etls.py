@@ -179,7 +179,8 @@ from rag._constants import _EXTERNAL_INGEST_BASE  # noqa: E402, F401
 # returns a stats dict for logging. Triggered from `_run_index` after the
 # WhatsApp sync, before the vault scan.
 
-_REMINDERS_VAULT_SUBPATH = f"{_EXTERNAL_INGEST_BASE}/Reminders"
+# `_REMINDERS_VAULT_SUBPATH` definido en `rag/integrations/apple_reminders.py`
+# — re-exportado al final del módulo.
 _CALENDAR_VAULT_SUBPATH = f"{_EXTERNAL_INGEST_BASE}/Calendar"
 # `_CHROME_VAULT_SUBPATH` definido en `rag/integrations/chrome_history.py` —
 # re-exportado al final del módulo.
@@ -249,64 +250,10 @@ def _atomic_write_if_changed(target: Path, body: str) -> bool:
     return True
 
 
-def _sync_reminders_notes(vault_root: Path) -> dict:
-    """Snapshot Apple Reminders to a daily note. Pending only, horizon 180 days
-    + undated. Completed-reminders fetch is intentionally NOT included.
-    """
-    from rag import _apple_enabled, _fetch_reminders_due  # lazy
-    if not _apple_enabled():
-        return {"ok": False, "reason": "apple_disabled"}
-    now = datetime.now()
-    pending = _fetch_reminders_due(now, horizon_days=180, max_items=500)
-    if not pending:
-        return {"ok": True, "files_written": 0, "reason": "no_data"}
-
-    by_bucket: dict[str, list[dict]] = {}
-    for item in pending:
-        by_bucket.setdefault(item["bucket"], []).append(item)
-
-    today = now.strftime("%Y-%m-%d")
-    fm_lines = [
-        "---",
-        "source: apple-reminders",
-        f"snapshot_at: {now.isoformat(timespec='seconds')}",
-        f"pending_count: {len(pending)}",
-        "tags:",
-        "- apple-reminders",
-        "- system-snapshot",
-        "---",
-        "",
-        f"# Apple Reminders — {today}",
-        "",
-    ]
-    body_lines: list[str] = list(fm_lines)
-    for bucket_key, label in (
-        ("overdue", "Overdue"),
-        ("today", "Hoy"),
-        ("upcoming", "Próximos"),
-        ("undated", "Sin fecha"),
-    ):
-        items = by_bucket.get(bucket_key) or []
-        if not items:
-            continue
-        body_lines.append(f"## {label} ({len(items)})")
-        body_lines.append("")
-        for it in items:
-            due = it["due"] or "—"
-            list_tag = f" `[{it['list']}]`" if it.get("list") else ""
-            body_lines.append(f"- **{it['name']}** · {due}{list_tag}")
-        body_lines.append("")
-    body = "\n".join(body_lines)
-
-    target = vault_root / _REMINDERS_VAULT_SUBPATH / f"{today}.md"
-    written = _atomic_write_if_changed(target, body)
-    return {
-        "ok": True,
-        "files_written": 1 if written else 0,
-        "pending": len(pending),
-        "completed": 0,
-        "target": _REMINDERS_VAULT_SUBPATH,
-    }
+# ── Apple Reminders ──────────────────────────────────────────────────────────
+# Movido a `rag/integrations/apple_reminders.py` (2026-05-09). Re-export al
+# final del módulo preserva back-compat con
+# `from rag.cross_source_etls import _sync_reminders_notes`.
 
 
 def _sync_apple_calendar_notes(vault_root: Path, days_ahead: int = 90) -> dict:
@@ -552,4 +499,12 @@ from rag.integrations.whatsapp_etl import (  # noqa: F401, E402
     _WHATSAPP_ETL_RE,
     _WHATSAPP_ETL_SCRIPT,
     _sync_whatsapp_notes,
+)
+
+# ── Apple Reminders (re-export) ──────────────────────────────────────────────
+# Movido a `rag/integrations/apple_reminders.py` (2026-05-09). Re-exportado
+# para preservar `from rag.cross_source_etls import _sync_reminders_notes`.
+from rag.integrations.apple_reminders import (  # noqa: F401, E402
+    _REMINDERS_VAULT_SUBPATH,
+    _sync_reminders_notes,
 )

@@ -109,7 +109,7 @@ def test_sync_reminders_notes_with_mocked_pending(tmp_path):
     assert stats["files_written"] == 1
     assert stats["pending"] == 2
     today = time.strftime("%Y-%m-%d")
-    body = (tmp_path / "03-Resources/Reminders" / f"{today}.md").read_text()
+    body = (tmp_path / "99-obsidian/99-AI/external-ingest/Reminders" / f"{today}.md").read_text()
     assert "Pagar luz" in body and "Llamar dentista" in body
     assert "## Próximos" in body and "## Sin fecha" in body
     assert "completed_count" not in body  # we dropped completed

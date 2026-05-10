@@ -5,6 +5,34 @@ from the initial `code-review` branch audit (19 commits) have now been
 addressed. Kept as documentation of the rationale + the false-positive
 triage from the subagent review.
 
+## Re-verification 2026-05-10
+
+Triggered por una segunda opinión sobre un audit shallow externo que
+reclamaba "no critical issues" sin file:line evidence. La re-verificación
+encontró UN bug real (rate limiter usaba lock efímero — fixed en
+`e3f5a98`) y confirmó las decisiones históricas del audit original:
+
+- **Lock audit**: 13 locks módulo-level en `web/server.py` (incluyendo
+  los 2 nuevos `_TOOL_SIG_CACHE_LOCK` + `_RATE_LIMIT_LOCK`). Cero
+  nested-acquires, cero LLM/HTTP-inside-lock, cero deadlock paths.
+  Críticos como `_HOME_LOCK` (Condition variable) usan `wait_for`
+  correctamente; `_DAEMONS_CACHE_LOCK` libera durante el call pesado
+  como dice el comentario; los samplers (`_MEMORY_LOCK`, `_CPU_LOCK`)
+  hacen persist OUTSIDE del lock.
+- **Silent-fail audit**: 25 bare-pass sites en `web/server.py` sampleados.
+  100% caen en categorías intencionales documentadas más abajo
+  (telemetry write failure, defensive double-try, cleanup en `finally`,
+  `_queue.Full` drop, cache invalidation, optional enrichment, background
+  refresh, per-row JSON parse, override file read). Cero leaks nuevos.
+  La invariante "TODO silent-error sink llama `_bump_silent_log_counter`"
+  está sostenida — `_silent_log` (rag/__init__.py:1125) llama el counter
+  en línea 1172.
+
+Conclusión: la disciplina del audit original sigue honrada en código
+nuevo post-split (paquete `rag/` + `web/server.py`). Los bare-pass que
+quedan son explícitamente best-effort. NO migrar mecánicamente en futuras
+re-verificaciones.
+
 ## Resolved — previously deferred
 
 ### 1. `except Exception: pass` audit  — resolved

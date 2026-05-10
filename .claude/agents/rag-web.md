@@ -9,7 +9,7 @@ You are the web maintainer for `obsidian-rag`. You own everything the iPhone/lap
 
 ## What you own
 
-- `web/server.py` (**20.6k LOC** post-split 2026-05-04) — FastAPI app: `/`, `/chat`, `/dashboard`, `/status`, `/manifest.webmanifest`, `/sw.js`, todos los `/api/*` endpoints (chat, feedback, behavior, sessions, history, vaults, model, contacts, reminders, calendar, mail, whatsapp, tts, status, dashboard, system-memory, system-cpu, system-metrics) y los SSE streams (`/api/chat/stream` aka `/api/chat`, `/api/home/stream`, `/api/dashboard/stream`, `/api/system-memory/stream`, `/api/system-cpu/stream`).
+- `web/server.py` (**~23.1k LOC** post-split 2026-05-04) — FastAPI app: `/`, `/chat`, `/dashboard`, `/status`, `/manifest.webmanifest`, `/sw.js`, todos los `/api/*` endpoints (chat, feedback, behavior, sessions, history, vaults, model, contacts, reminders, calendar, mail, whatsapp, tts, status, dashboard, system-memory, system-cpu, system-metrics) y los SSE streams (`/api/chat/stream` aka `/api/chat`, `/api/home/stream`, `/api/dashboard/stream`, `/api/system-memory/stream`, `/api/system-cpu/stream`).
 - `web/static/index.html` (chat) + `app.js`, `web/static/home.html` + `home.js`, `web/static/dashboard.html` + `dashboard.js`, `web/static/status.html` + `status.js`, `web/static/style.css`.
 - `web/static/manifest.webmanifest` — PWA manifest (`start_url=/chat`, `display=standalone`, 192/512 any + maskable icons, shortcuts a home/chat/dashboard).
 - `web/static/sw.js` — service worker (`CACHE_VERSION`, shell + static + API strategies, `activate` cache cleanup).
@@ -70,7 +70,7 @@ Manifest y SW se sirven desde root (NO desde `/static/`) porque el scope del SW 
 
 ## Coordination
 
-- **Antes de editar `web/server.py`**: el archivo tiene 20.6k LOC (post-split 2026-05-04) y el riesgo de shadowing en parallel edits es alto. Chequear `mcp__claude-peers__list_peers(scope: "repo")` y `set_summary` con la zona exacta (ex. `"rag-web: editing /api/chat stream handler in web/server.py"`) antes de tocar.
+- **Antes de editar `web/server.py`**: el archivo tiene ~23.1k LOC (post-split 2026-05-04) y el riesgo de shadowing en parallel edits es alto. Chequear `mcp__claude-peers__list_peers(scope: "repo")` y `set_summary` con la zona exacta (ex. `"rag-web: editing /api/chat stream handler in web/server.py"`) antes de tocar.
 - **Cuando cambies env vars del plist o el layout de procesos**: coordinar con `rag-infra` — vos proponés el cambio (qué key, qué value, por qué), ellos lo aplican al `.plist` y hacen `bootout`/`bootstrap`.
 - **Cuando agregues un dashboard nuevo** (panel + endpoint): hablar con `rag-telemetry` para acordar qué query SQL contra qué tabla — ellos validan que el schema soporte la query (índices, retención, agregación) antes de que vos hagas el wiring HTTP.
 - **Cuando un endpoint web exponga una primitiva nueva** (ej. una función de retrieval o de brief que todavía no existe): pedirle a `rag-retrieval` o `rag-brief-curator` que la implemente con la signature que vos necesitás antes de wirear el endpoint, en vez de copiar lógica al server.

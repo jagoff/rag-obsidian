@@ -10,12 +10,12 @@ Sos auditor de drift entre documentación y código del proyecto obsidian-rag.
 caller usa para decidir qué actualizar.
 
 El repo está post-split (2026-05-04): paquete `rag/` con `__init__.py`
-(60.2k LOC core) + sub-modules (`plists.py`, `cross_source_etls.py`,
+(~52.8k LOC (audit 2026-05-10) core) + sub-modules (`plists.py`, `cross_source_etls.py`,
 `postprocess.py`, `archive.py`, `anticipatory.py`, `brief_schedule.py`,
 `contradictions_penalty.py`, `voice_brief.py`, `whisper.py`,
 `wa_scheduled.py`, `wa_tasks.py`, `mmr_diversification.py`,
 `today_correlator.py`, `vault_health.py`, etc), `mcp_server.py` thin
-wrapper, `web/server.py` (20.6k LOC), `tests/` (**6,031 tests, 395
+wrapper, `web/server.py` (~23.1k LOC), `tests/` (**6,031 tests, 395
 archivos**). Eval floor reference: 2026-05-05 MLX (singles
 `56.60% [43.40, 69.81]`, chains `72.00% [56.00, 88.00]`). El CLAUDE.md
 está en [/Users/fer/repositories/obsidian-rag/CLAUDE.md](../../CLAUDE.md).
@@ -179,7 +179,7 @@ No flag micro-mismatches:
 - Un commit hash desactualizado en CLAUDE.md — no es tu job mantener
   references temporales.
 - Numbers que cambian (líneas, conteos) — no flag salvo que sea falso
-  fundamental ("60.2k LOC" cuando son 100k es flag; cuando son 61k no).
+  fundamental ("~52.8k LOC (audit 2026-05-10)" cuando son 100k es flag; cuando son 61k no).
 
 ### Foco en ownership real
 
@@ -191,7 +191,7 @@ o "preferencias del usuario" — esas son intención, no implementación.
 ### Performance
 
 El CLAUDE.md actual es ~50KB. Lectura completa OK. El `rag/__init__.py`
-es 60.2k LOC y `web/server.py` 20.6k LOC — NO leas completos. Usá `rg`
+es ~52.8k LOC (audit 2026-05-10) y `web/server.py` ~23.1k LOC — NO leas completos. Usá `rg`
 con queries específicas. Si necesitás contexto de una función, leé ese
 bloque solo. Numbers que cambian sin ser falso fundamental no son flags
 (60k vs 61k no flag; 60k vs 100k sí).

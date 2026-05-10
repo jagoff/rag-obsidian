@@ -22,12 +22,20 @@ Agents especializados por dominio. Claude Code los detecta automáticamente al b
 | Doc curator | `rag-doc-curator` | Detecta drift entre `CLAUDE.md` / `AGENTS.md` / `README.md` y el código real (`rag/`, `web/server.py`). Read-only — devuelve diff estructurado (commands no expuestos, surface no documentado, invariantes contradichos). |
 | Telemetry | `rag-telemetry` | SQL state telemetry (`rag_queries` / `rag_behavior` / `rag_feedback` / `system_memory_metrics` y demás tablas de `telemetry.db`), DDL ensure-once, `corpus_hash` bucketing, query layer del `/dashboard`, rotation lifecycle (SQL + `behavior.jsonl`). |
 | Web | `rag-web` | `web/server.py` (FastAPI: chat, dashboard, SSE, `/api/*`), static frontend (`web/static/*.{js,html,css}`), PWA wiring (manifest + service worker + iOS splash), LAN-exposure env vars (`OBSIDIAN_RAG_BIND_HOST`/`OBSIDIAN_RAG_ALLOW_LAN`), Cloudflare Quick Tunnel publishing. |
+| Anticipatory | `rag-anticipatory` | `rag_anticipate/signals/`, threshold tuning, feedback tuning, kind weights, quiet hours, lockfile. Proactive push system "talks to you first". |
+| Cross-source ETL | `rag-cross-source-etl` | Coordinación ETL externos — MOZE, credit cards, WhatsApp, Gmail, Calendar, Chrome, YouTube, GitHub, Claude, Spotify, Drive. |
+| Mood + wellness | `rag-mood-wellness` | `rag/mood.py`, `rag/integrations/pillow_sleep.py`, `rag/integrations/screentime.py`, cross-source correlations. |
+| Negotiations | `rag-negotiations` | `rag_negotiations` package, state transitions, CRUD, WhatsApp follow-ups. |
+| Error analyst | `rag-error-analyst` | Read-only forensics — race conditions, deadlocks, memory leaks, silent-fail patterns, lock ordering. |
+| **MLX lifecycle** ⭐ | `rag-mlx-lifecycle` | **NUEVO 2026-05-10**: idle-unload watchdog, memory-pressure handler, `_MLX_FORWARD_LOCK` global, reranker pin/unpin, OOM debugging, command-buffer interactions. |
+| **Entities + overrides** ⭐ | `rag-entities` | **NUEVO 2026-05-10**: `_extract_entities_*`, 3 JSON files canonical (`known_places.json`, `entity_overrides.json`, `known_places_extra.json`), atlas display layer. |
+| **Test harness** ⭐ | `rag-test-harness` | **NUEVO 2026-05-10**: `tests/conftest.py` autouse fixtures, pytest markers, `_mlx_chat` auto-stub, mock isolation, xdist races, DB_PATH per-file isolation. |
 
 Para tareas ambiciosas o cross-dominio, arrancar por `pm`: devuelve un plan de dispatch que el caller ejecuta.
 
 ## Por qué hay 3 slots de developer idénticos
 
-Layout post-split 2026-05-04: `rag/` paquete (`__init__.py` 60.2k LOC core + sub-modules como `plists.py`, `cross_source_etls.py`, `postprocess.py`, `archive.py`, `anticipatory.py`, `brief_schedule.py`, `voice_brief.py`, `whisper.py`, `wa_scheduled.py`, etc.) + `mcp_server.py` thin wrapper + `web/` + `tests/` (6,031 tests, 395 archivos). Las escrituras siguen serializándose sobre `rag/__init__.py` 60.2k LOC (es el core que casi todos los specialists tocan), así que la presión de paralelismo es la misma que con el single-file viejo. Tres slots `developer-{1,2,3}` con cuerpo idéntico permiten:
+Layout post-split 2026-05-04 (LOC re-medido audit 2026-05-10): `rag/` paquete (`__init__.py` **~52.8k LOC** core + sub-modules como `plists/` package, `cross_source_etls.py`, `cross_source_collectors.py`, `postprocess.py`, `archive.py`, `anticipatory.py`, `brief_schedule.py`, `voice_brief.py`, `whisper.py`, `wa_scheduled.py` (shim → `rag/integrations/whatsapp/scheduled.py`), `_memory_pressure_watchdog.py`, `mlx_embed.py`, etc.) + `mcp_server.py` thin wrapper + `web/` (`server.py` ~23.1k LOC) + `tests/` (8,103 tests, 453 archivos). Las escrituras siguen serializándose sobre `rag/__init__.py` 52.8k LOC (es el core que casi todos los specialists tocan), así que la presión de paralelismo es la misma que con el single-file viejo. Tres slots `developer-{1,2,3}` con cuerpo idéntico permiten:
 
 1. **Claim por slot**: cada peer Claude reclama el slug libre más bajo (`developer-1`, después `-2`, después `-3`). Slugs distintos = no shadowing en el registry de subagents.
 2. **Paralelismo real**: 3 generalistas pueden trabajar en sub-zonas distintas simultáneamente, coordinados por `mcp__claude-peers__set_summary`.

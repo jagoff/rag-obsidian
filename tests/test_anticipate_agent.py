@@ -59,7 +59,10 @@ def test_anticipatory_candidate_required_fields():
     d = asdict(c)
     assert set(d.keys()) == {
         "kind", "score", "message", "dedup_key", "snooze_hours", "reason",
+        # Proactive draft fields (Fase 2): opcionales, default None.
+        "target_jid", "target_name", "draft", "draft_meta",
     }
+    assert c.target_jid is None and c.draft is None
 
 
 # ── Dedup helper ─────────────────────────────────────────────────────────────

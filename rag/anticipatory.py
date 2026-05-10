@@ -140,6 +140,11 @@ class AnticipatoryCandidate:
     dedup_key: str       # estable cross-runs (ej. event_uid, source_path)
     snooze_hours: int    # default por kind: cal=2, echo=72, commit=168
     reason: str          # debug — por qué este candidate (mostrado en --explain)
+    # Proactive draft (Fase 2 — solo signals con target identificable):
+    target_jid: str | None = None       # WA jid resuelto desde el signal
+    target_name: str | None = None      # display name (para logs human-friendly)
+    draft: str | None = None            # texto listo para mandar al target
+    draft_meta: dict | None = None      # {confidence, style_snapshot_hash, reason}
 
 
 def _anticipate_dedup_seen(dedup_key: str,
@@ -463,6 +468,93 @@ def _anticipate_format_commitment_brief(loop: dict) -> str:
     )
 
 
+# Wikilink-style mention: `@Persona` o `@Persona Apellido` (max 2 palabras
+# cap-iniciales). Match el primero — promesas suelen tener un único target.
+# Anti-FP: requiere word boundary previo (no matchea emails como `foo@bar`).
+_LOOP_TARGET_MENTION = re.compile(
+    r"(?:^|[\s(\[])@([A-ZÁÉÍÓÚÑ][\wáéíóúñ]+(?:\s[A-ZÁÉÍÓÚÑ][\wáéíóúñ]+)?)"
+)
+
+
+def _extract_target_from_loop(loop: dict) -> str | None:
+    """Extrae nombre de contacto del loop_text vía wikilink `@Persona`.
+
+    Returns nombre crudo (ej. "Ma", "Seba", "Maria") o None si no hay match.
+    Resolución a JID + display normalizado se hace upstream con
+    `_whatsapp_jid_from_contact`.
+    """
+    text = (loop.get("loop_text") or "")
+    if not text:
+        return None
+    match = _LOOP_TARGET_MENTION.search(text)
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def _enrich_commitment_with_draft(
+    candidate: "AnticipatoryCandidate", loop: dict
+) -> "AnticipatoryCandidate":
+    """Si el loop tiene `@Persona` extraíble + jid resoluble + draft compose-able,
+    devuelve nuevo candidate con `target_jid`/`target_name`/`draft`/`draft_meta`
+    seteados. Cualquier fallo silent → devuelve el candidate original sin enriquecer.
+    """
+    name = _extract_target_from_loop(loop)
+    if not name:
+        return candidate
+    try:
+        from rag.integrations.whatsapp.resolve import _whatsapp_jid_from_contact
+    except Exception:
+        return candidate
+    try:
+        resolved = _whatsapp_jid_from_contact(name)
+    except Exception as exc:
+        from rag import _silent_log
+        _silent_log("anticipate_commit_resolve_jid", exc)
+        return candidate
+    jid = (resolved or {}).get("jid")
+    err = (resolved or {}).get("error")
+    if not jid or err:
+        return candidate
+    full_name = (resolved or {}).get("full_name") or name
+    try:
+        from rag.proactive_draft import compose_draft
+    except Exception:
+        return candidate
+    age_days = float(loop.get("age_days") or 0)
+    # Promise text = loop_text limpio del wikilink trigger.
+    promise = re.sub(r"@[A-ZÁÉÍÓÚÑ][\wáéíóúñ\s]*", name, loop.get("loop_text") or "")
+    try:
+        result = compose_draft(
+            target_jid=jid,
+            target_name=name,  # forma corta familiar (regla CLAUDE.md saludos)
+            promise_text=promise,
+            days_until_due=-age_days,  # ya está vencido
+        )
+    except Exception as exc:
+        from rag import _silent_log
+        _silent_log("anticipate_commit_compose_draft", exc)
+        return candidate
+    if not result:
+        return candidate
+    return AnticipatoryCandidate(
+        kind=candidate.kind,
+        score=candidate.score,
+        message=candidate.message,
+        dedup_key=candidate.dedup_key,
+        snooze_hours=candidate.snooze_hours,
+        reason=candidate.reason,
+        target_jid=jid,
+        target_name=full_name,
+        draft=result["draft"],
+        draft_meta={
+            "confidence": result.get("confidence"),
+            "style_snapshot_hash": result.get("style_snapshot_hash"),
+            "compose_reason": result.get("reason"),
+        },
+    )
+
+
 def _anticipate_signal_commitment(now: datetime) -> list["AnticipatoryCandidate"]:
     """Open loops stale ≥7d. Reusa `find_followup_loops()`. Push 1 por run."""
     from rag import _resolve_vault_path, _silent_log, find_followup_loops, get_db
@@ -496,14 +588,15 @@ def _anticipate_signal_commitment(now: datetime) -> list["AnticipatoryCandidate"
         .encode("utf-8")
     ).hexdigest()[:12]
     msg = _anticipate_format_commitment_brief(top)
-    return [AnticipatoryCandidate(
+    base = AnticipatoryCandidate(
         kind="anticipate-commitment",
         score=score,
         message=msg,
         dedup_key=f"commit:{h}",
         snooze_hours=168,
         reason=f"age={int(age)}d, kind={top.get('kind')}",
-    )]
+    )
+    return [_enrich_commitment_with_draft(base, top)]
 
 
 # ── Orchestrator ─────────────────────────────────────────────────────────────
@@ -789,22 +882,61 @@ def anticipate_run_impl(
             }
 
     if not dry_run:
-        try:
-            # Pasamos `dedup_key` para que `proactive_push` sufije el body
-            # con `_anticipate:<key>_` — el listener TS lo lee al detectar
-            # un reply 👍/👎/🔇 y lo postea a /api/anticipate/feedback.
-            # Sin esto, el feedback loop quedaría desconectado (no hay
-            # otra forma de mapear "el user reaccionó a este push" →
-            # "qué dedup_key era").
-            sent, skip_reason = _rag.proactive_push(
-                top.kind, top.message,
-                snooze_hours=top.snooze_hours,
-                dedup_key=top.dedup_key,
-            )
-        except Exception as exc:
-            _silent_log("anticipate_proactive_push", exc)
-            sent = False
-            skip_reason = f"exception: {exc}"
+        # Fase 3 wiring: si el candidate trae draft, intentar push al listener
+        # primero. Si OK, el listener postea su propio mensaje a RagNet con
+        # buttons /si /no /editar (formato estándar del bot WA draft loop).
+        # Si falla (listener caído / endpoint missing), fall back a legacy:
+        # proactive_push contextual sin draft.
+        draft_pushed = False
+        if top.draft and top.target_jid:
+            try:
+                from rag.proactive_draft import (
+                    log_proactive_draft, push_draft_to_listener, _new_draft_id,
+                )
+                _draft_id = _new_draft_id()
+                draft_pushed = push_draft_to_listener(
+                    draft_id=_draft_id,
+                    target_jid=top.target_jid,
+                    target_name=top.target_name or "",
+                    draft_text=top.draft,
+                    signal_kind=top.kind,
+                )
+                log_proactive_draft(
+                    draft_id=_draft_id,
+                    signal_kind=top.kind,
+                    signal_dedup_key=top.dedup_key,
+                    target_jid=top.target_jid,
+                    target_name=top.target_name,
+                    draft_text=top.draft,
+                    draft_meta=top.draft_meta,
+                    status="pushed" if draft_pushed else "skipped",
+                )
+            except Exception as exc:
+                _silent_log("anticipate_proactive_draft_push", exc)
+                draft_pushed = False
+
+        if draft_pushed:
+            # Listener tomó el draft y va a postear su propio mensaje a RagNet.
+            # Skipeamos el proactive_push contextual para evitar doble notificación.
+            sent = True
+            skip_reason = "draft_pushed_to_listener"
+        else:
+            try:
+                # Pasamos `dedup_key` para que `proactive_push` sufije el body
+                # con `_anticipate:<key>_` — el listener TS lo lee al detectar
+                # un reply 👍/👎/🔇 y lo postea a /api/anticipate/feedback.
+                # Sin esto, el feedback loop quedaría desconectado (no hay
+                # otra forma de mapear "el user reaccionó a este push" →
+                # "qué dedup_key era").
+                sent, skip_reason = _rag.proactive_push(
+                    top.kind, top.message,
+                    snooze_hours=top.snooze_hours,
+                    dedup_key=top.dedup_key,
+                )
+            except Exception as exc:
+                _silent_log("anticipate_proactive_push", exc)
+                sent = False
+                skip_reason = f"exception: {exc}"
 
     try:
         _anticipate_log_candidate(top, selected=True, sent=sent)

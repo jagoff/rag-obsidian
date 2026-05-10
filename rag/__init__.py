@@ -7614,6 +7614,38 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             ")",
         ),
     ),
+    (
+        # Proactive drafts (Fase 3 — anticipatory agentic loop bidireccional).
+        # Side-state del lado rag para drafts compuestos por compose_draft()
+        # cuando una signal con target identificable los produce. El draft se
+        # PUSHEA al listener TS via POST http://127.0.0.1:8766/push-pending-draft;
+        # el feedback humano (/si /no /editar) cae en rag_draft_decisions con
+        # extra_json.decision_source='proactive' linkeando back vía signal_dedup_key.
+        # Esta tabla solo trackea la mitad rag-side: pushed (entregado al
+        # listener) o skipped (compose ok pero push http falló). Status finales
+        # (sent/dismissed) los infiere agregando rag_draft_decisions.
+        "rag_proactive_drafts",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_proactive_drafts ("
+            " id TEXT PRIMARY KEY,"
+            " ts TEXT NOT NULL,"
+            " signal_kind TEXT NOT NULL,"
+            " signal_dedup_key TEXT NOT NULL,"
+            " target_jid TEXT NOT NULL,"
+            " target_name TEXT,"
+            " draft_text TEXT NOT NULL,"
+            " draft_meta_json TEXT,"
+            " status TEXT NOT NULL CHECK("
+            "status IN ('pushed', 'skipped'))"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_proactive_drafts_ts"
+            " ON rag_proactive_drafts(ts)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_proactive_drafts_dedup"
+            " ON rag_proactive_drafts(signal_dedup_key)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_proactive_drafts_jid"
+            " ON rag_proactive_drafts(target_jid)",
+        ),
+    ),
 )
 
 

@@ -78,7 +78,12 @@ def _correlate_mood(today_ev: dict, extras: dict) -> dict | None:
             return None
         recent = _mood.get_recent_scores(days=7)
         drift = _mood.recent_drift(days=7)
-    except Exception:
+    except Exception as exc:
+        try:
+            from rag import _silent_log as _slog  # noqa: PLC0415
+            _slog("today_personal_signals.correlate_mood", exc)
+        except Exception:
+            pass
         return None
 
     # week_avg de los últimos 7 días con n_signals > 0 (excluye hoy si querés
@@ -162,13 +167,23 @@ def _correlate_sleep(today_ev: dict, extras: dict) -> dict | None:
         return None
     try:
         ln = last_night()
-    except Exception:
+    except Exception as exc:
+        try:
+            from rag import _silent_log as _slog  # noqa: PLC0415
+            _slog("today_personal_signals.correlate_sleep.last_night", exc)
+        except Exception:
+            pass
         ln = None
     if not ln:
         return None
     try:
         ws = weekly_stats()
-    except Exception:
+    except Exception as exc:
+        try:
+            from rag import _silent_log as _slog  # noqa: PLC0415
+            _slog("today_personal_signals.correlate_sleep.weekly_stats", exc)
+        except Exception:
+            pass
         ws = {}
 
     delta = ws.get("delta") or {}
@@ -249,7 +264,12 @@ def _correlate_cross_patterns(today_ev: dict, extras: dict) -> dict | None:
 
     try:
         summary = patterns_summary(days=30, top=10, lags=(0, 1, 7))
-    except Exception:
+    except Exception as exc:
+        try:
+            from rag import _silent_log as _slog  # noqa: PLC0415
+            _slog("today_personal_signals.cross_patterns.summary", exc)
+        except Exception:
+            pass
         summary = None
 
     top_findings: list[dict] = []
@@ -272,7 +292,12 @@ def _correlate_cross_patterns(today_ev: dict, extras: dict) -> dict | None:
 
     try:
         prediction = predict_mood_tomorrow(days=60)
-    except Exception:
+    except Exception as exc:
+        try:
+            from rag import _silent_log as _slog  # noqa: PLC0415
+            _slog("today_personal_signals.cross_patterns.predict", exc)
+        except Exception:
+            pass
         prediction = None
 
     if not top_findings and prediction is None:

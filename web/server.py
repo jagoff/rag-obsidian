@@ -20038,9 +20038,17 @@ def logs_queue_config(req: _WorkerConfigRequest) -> dict:
     }
 
 
-@app.delete("/api/logs/queue/{error_id}")
+@app.delete(
+    "/api/logs/queue/{error_id}",
+    dependencies=[Depends(_require_admin_token)],
+)
 def logs_queue_delete(error_id: int) -> dict:
-    """Borrar un entry del queue. Útil para limpiar falsos positivos."""
+    """Borrar un entry del queue. Útil para limpiar falsos positivos.
+
+    Auth: Bearer admin token (loopback exempt vía `_require_admin_token`).
+    Audit 2026-05-10 (U3): el endpoint era mutate-público sin protección —
+    rompía el invariante CLAUDE.md "destructive endpoints SÍ están protegidos".
+    """
     _ensure_error_queue_table()
     try:
         with _ragvec_state_conn() as conn:

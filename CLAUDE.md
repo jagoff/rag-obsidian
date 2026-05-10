@@ -2,7 +2,7 @@
 
 Guía para Claude Code en este repo.
 
-Local RAG sobre vault Obsidian. Layout post-split (2026-05-04): paquete `rag/` (`__init__.py` 64.4k LOC core + sub-módulos) + `mcp_server.py` (thin wrapper) + `web/` (FastAPI `server.py` 23.9k LOC + static + dashboards) + `tests/` (8,103 tests, 453 archivos). Re-export pattern: `__init__.py` hace `from rag.X import *  # noqa: F401, F403` con `__all__` explícito en cada sub-módulo (preserva 100% compat con call sites históricos).
+Local RAG sobre vault Obsidian. Layout post-split (2026-05-04, LOC re-medido 2026-05-10): paquete `rag/` (`__init__.py` ~52.8k LOC core + sub-módulos) + `mcp_server.py` (thin wrapper) + `web/` (FastAPI `server.py` ~23.1k LOC + static + dashboards) + `tests/` (8,103 tests, 453 archivos). Re-export pattern: `__init__.py` hace `from rag.X import *  # noqa: F401, F403` con `__all__` explícito en cada sub-módulo (preserva 100% compat con call sites históricos).
 
 Local-first sobre vault + corpus locales (sqlite-vec + MLX + sentence-transformers). Cross-source ingesters cloud (Gmail/Calendar/Drive) requieren creds OAuth en `~/.{gmail,calendar,gdrive}-mcp/`; sin creds silent-fail y corpus local sigue funcionando. WhatsApp + Reminders stay local.
 
@@ -61,7 +61,21 @@ Python 3.13, `uv`. Runtime venv: `.venv/bin/python`. Global tool: `~/.local/shar
 
 NO regresar default a non-MLX. NO introducir dep `ollama>=0.x`.
 
-**Estado actual: 100% MLX en todos los paths runtime** — embedder + reranker MLX + STT + NLI. Migración completada en 10 olas (2026-04 → 2026-05-07). Default: `RAG_LLM_BACKEND=mlx`, `RAG_EMBED_BACKEND=mlx`, `RAG_NLI_BACKEND=llm`. Detalle en [`docs/mlx-migration.md`](docs/mlx-migration.md).
+**Estado actual (audit 2026-05-10)** — Migración MLX completada en 10 olas (2026-04 → 2026-05-07), pero NO 100% en todos los paths runtime. Distribución real:
+
+| Path | Default | Rollback |
+|---|---|---|
+| LLM chat | **MLX** (`RAG_LLM_BACKEND=mlx`, único soportado; `ollama` loguea warning + cae a MLX) | `git revert` Ola 7+ |
+| Embedder | **MLX** (`RAG_EMBED_BACKEND=mlx`) | `RAG_EMBED_BACKEND=pytorch` (SentenceTransformer MPS) |
+| STT (Whisper) | **MLX** ([`mlx-whisper`](https://github.com/ml-explore/mlx-examples/tree/main/whisper)) | n/a |
+| Reranker | **PyTorch+MPS+fp32** (`BAAI/bge-reranker-v2-m3`, default `RAG_RERANKER_BACKEND=torch` por invariante A/B documentado) | `RAG_RERANKER_BACKEND=mlx` activa MLX (opt-in, no default) |
+| NLI grounding | **LLM-as-judge** (`qwen2.5:3b` MLX, default `RAG_NLI_BACKEND=llm`) | `RAG_NLI_BACKEND=mdeberta` cae a CrossEncoder + mDeBERTa (requiere PyTorch) |
+| VLM (OCR) | **MLX** ([`mlx-vlm`](https://github.com/Blaizzy/mlx-vlm)) opt-in cuando `ocrmac` no alcanza | n/a |
+| NER (entities) | **CPU only** (`gliner`, MLX-incompat por design, gated por `RAG_EXTRACT_ENTITIES`) | n/a |
+
+**Por qué reranker NO es MLX default**: 2 A/Bs failed (collapse 2026-04-13 con fp16, overhead 2x con calidad equivalente 2026-04-22). Invariante: `device="mps"+float32` forced. MLX reranker existe (`mlx-community/Qwen3-Reranker-*`) y se activa con `RAG_RERANKER_BACKEND=mlx`, pero NO es default hasta nuevo A/B win. Documentado en [`rag/mlx_reranker.py:285-292`](rag/mlx_reranker.py).
+
+Detalle migración en [`docs/mlx-migration.md`](docs/mlx-migration.md).
 
 **Mapping**:
 - `qwen2.5:3b` (HELPER) → [`mlx-community/Qwen2.5-3B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-3B-Instruct-4bit)
@@ -259,7 +273,8 @@ Catálogo completo (47+ vars) en [`docs/env-vars-catalog.md`](docs/env-vars-cata
 **Backend LLM/embed**:
 - `RAG_LLM_BACKEND=mlx` (único valor soportado; `ollama` loguea warning + cae a MLX).
 - `RAG_EMBED_BACKEND=mlx` (default). `=pytorch` activa rollback SentenceTransformer (`Qwen/Qwen3-Embedding-0.6B` en MPS).
-- `RAG_NLI_BACKEND={llm,mdeberta}` (default `llm`).
+- `RAG_RERANKER_BACKEND={torch,mlx}` — **default `torch`** (BAAI/bge-reranker-v2-m3, MPS+fp32, invariante A/B-validado). `=mlx` activa MLX reranker (`mlx-community/Qwen3-Reranker-*`, ~600MB mxfp8) — opt-in, NO default hasta nuevo A/B win.
+- `RAG_NLI_BACKEND={llm,mdeberta}` (default `llm` → LLM-as-judge; `mdeberta` requiere PyTorch + CrossEncoder).
 - `RAG_MLX_IDLE_TTL=1800s`, `RAG_MLX_IDLE_DISABLE=1`.
 
 **Indexing**:

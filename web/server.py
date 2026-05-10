@@ -596,7 +596,13 @@ async def _lifespan(_app) -> "AsyncIterator[None]":
     try:
         import anyio.to_thread as _att
         _tp_target = int(os.environ.get("RAG_WEB_THREADPOOL_TOKENS", "100"))
-        _limiter = await _att.current_default_thread_limiter()
+        # `current_default_thread_limiter` es sync desde anyio 4.x (devuelve
+        # `CapacityLimiter` directo). El `await` previo tiraba
+        # `TypeError: object CapacityLimiter can't be used in 'await' expression`
+        # cada arranque y silenciaba el bump → threadpool quedaba en 40
+        # tokens default, saturando bajo carga SSE sostenida (cada streaming
+        # request bloquea 1 worker durante el decode del MLX in-process).
+        _limiter = _att.current_default_thread_limiter()
         _limiter.total_tokens = _tp_target
         print(f"[lifespan] anyio threadpool → {_tp_target} tokens", flush=True)
     except Exception as _exc:
@@ -1260,6 +1266,18 @@ def _warmup() -> None:
     "_warmup", lambda: None)` siga funcionando en tests.
     """
     _lifecycle_warmup()
+
+
+@app.get("/health")
+@app.get("/api/health")
+def health_check() -> dict:
+    """Liveness probe — usado por `rag start` post-bootstrap y por
+    monitoreo externo (tunneles, oncall). Devuelve 200 + JSON estático
+    sin tocar MLX, sqlite-vec ni el embedder, así no se ve afectado
+    por warmup en curso. Para health más profundo: `rag daemons status`
+    o `rag health`.
+    """
+    return {"status": "ok", "service": "obsidian-rag-web"}
 
 
 @app.get("/")

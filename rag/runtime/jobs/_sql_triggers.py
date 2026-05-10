@@ -44,7 +44,7 @@ _TELEMETRY_DB = (
          or str(Path.home() / ".local/share/obsidian-rag/ragvec"))
     / "telemetry.db"
 )
-_BRIDGE_DB = Path.home() / "repositories/whatsapp-mcp/whatsapp-bridge/store/messages.db"
+_BRIDGE_DB = Path.home() / "repos/whatsapp-mcp/whatsapp-bridge/store/messages.db"
 
 
 # ── F4.1 — routing-rules trigger ────────────────────────────────────────────

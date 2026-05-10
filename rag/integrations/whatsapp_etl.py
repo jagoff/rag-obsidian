@@ -2,7 +2,7 @@
 
 Thin wrapper around the external ``~/.local/bin/whatsapp-to-vault`` script
 (written in TypeScript, lives in `~/whatsapp-listener`), which reads the
-WhatsApp bridge SQLite (`~/repositories/whatsapp-mcp/whatsapp-bridge/store/messages.db`)
+WhatsApp bridge SQLite (`~/repos/whatsapp-mcp/whatsapp-bridge/store/messages.db`)
 and emits per-chat-per-month markdown buckets at
 ``99-obsidian/99-AI/external-ingest/WhatsApp/<chat>/<YYYY-MM>.md``.
 

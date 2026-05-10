@@ -67,10 +67,12 @@ class TestHealthProbeWeb:
             assert latency >= 0
 
     def test_returns_false_on_error(self):
-        """Retorna (False, 0) si conexión falla."""
+        """Retorna (False, 0) si conexión falla en TODOS los retries."""
         import urllib.error
         with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("connection refused")):
-            ok, latency = health_probe_web()
+            # retries=1 + retry_delay=0 para no esperar el budget completo
+            # (~21s default). El test sólo valida la branch de fallo.
+            ok, latency = health_probe_web(retries=1, retry_delay=0)
             assert ok is False
             assert latency == 0
 

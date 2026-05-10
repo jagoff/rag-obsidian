@@ -54,25 +54,41 @@ def get_cloudflared_url() -> str | None:
 
 
 def health_probe_web(
-    host: str = "127.0.0.1", port: int = 8765, timeout: float = 2.0
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    timeout: float = 2.0,
+    retries: int = 6,
+    retry_delay: float = 1.5,
 ) -> tuple[bool, int]:
-    """Probe rápido a /health del web server. Retorna (ok, latency_ms).
+    """Probe a /health del web server. Retorna (ok, latency_ms).
 
-    ok=True si responde 200; False si falla/timeout.
-    latency_ms=0 si no se pudo conectar.
+    Retry budget total: `retries * retry_delay + retries * timeout` ≈ 21s
+    (default 6 × 1.5s sleep + 6 × 2s timeout). Cubre el warmup MLX típico
+    del web (~3-5s carga chat + embedder + reranker) post-bootstrap. Si
+    el web realmente está down el probe gasta ~21s antes de declararlo
+    muerto — costo aceptable comparado con falso negativo "no respondió"
+    cuando el server está perfectamente vivo en warmup.
+
+    ok=True si responde 200 dentro del budget; False si todos los intentos
+    fallan. latency_ms=0 si nunca conectó.
     """
     import urllib.request
     import urllib.error
 
     url = f"http://{host}:{port}/health"
-    t0 = time.time()
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
-            if resp.status == 200:
-                latency_ms = int((time.time() - t0) * 1000)
-                return True, latency_ms
-    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
-        pass
+    last_exc: Exception | None = None
+    for attempt in range(retries):
+        t0 = time.time()
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as resp:
+                if resp.status == 200:
+                    latency_ms = int((time.time() - t0) * 1000)
+                    return True, latency_ms
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
+            last_exc = exc
+        if attempt < retries - 1:
+            time.sleep(retry_delay)
+    _ = last_exc  # silencioso — el caller solo necesita el bool
     return False, 0
 
 

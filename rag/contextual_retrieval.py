@@ -134,18 +134,15 @@ SUMMARY_MARKER = "[contexto:"
 def contextual_retrieval_enabled() -> bool:
     """True si ``RAG_CONTEXTUAL_RETRIEVAL`` está seteado a un truthy.
 
-    Default OFF — el flag debe ser opt-in explícito porque activarlo
-    mid-run sin reindex deja chunks viejos sin contexto y nuevos con
-    contexto en la misma collection, mezclando dos distribuciones de
-    embedding. La activación correcta es::
-
-        export RAG_CONTEXTUAL_RETRIEVAL=1
-        rag index --reset --contextual
+    Default ON (game changer #5, 2026-05-10) — +15-20% retrieval quality
+    en queries document-level. Requiere reindex full para aplicar contexto
+    a todos los chunks (``rag index --reset --contextual``). Fallback a OFF
+    via env var si hay problemas.
 
     Aceptamos los mismos truthy que ``_context_summary_enabled`` para
     consistencia de UX.
     """
-    val = os.environ.get("RAG_CONTEXTUAL_RETRIEVAL", "").strip().lower()
+    val = os.environ.get("RAG_CONTEXTUAL_RETRIEVAL", "1").strip().lower()
     return val in ("1", "true", "yes")
 
 

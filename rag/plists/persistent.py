@@ -207,17 +207,14 @@ def _web_plist(rag_bin: str) -> str:
             "RAG_AUTO_FIX_WORKER": "1",
             "RAG_AUTO_FIX_HOURLY_CAP": "12",
             "RAG_LLM_BACKEND": "mlx",
-            # Tier S quality flags (2026-05-09): activan features que
-            # estaban en código pero default OFF. NLI grounding verifica
-            # claims post-citation (menos hallucinations). MMR diversifica
-            # top-k. LLM_JUDGE rescata queries borderline (top<0.5).
-            # QUERY_DECOMPOSE rompe queries multi-aspect en sub-retrieves
-            # con RRF merge — específicamente sube MRR de chains.
-            # Rollback: setear var a "0" o quitarla del plist.
-            "RAG_NLI_GROUNDING": "1",
-            "RAG_MMR": "1",
-            "RAG_LLM_JUDGE": "1",
-            "RAG_QUERY_DECOMPOSE": "1",
+            # Removidos 2026-05-10: 4 prototypes (NLI_GROUNDING, MMR,
+            # LLM_JUDGE, QUERY_DECOMPOSE) que el eval del 2026-05-09
+            # rechazó (REGRESS o NO-OP, ver CLAUDE.md "Eval baselines").
+            # Estaban activos en plist pese al reject → 28 restarts de
+            # web por Metal GPU OOM (kIOGPUCommandBufferCallbackError-
+            # OutOfMemory) por saturar unified memory con 4 modelos
+            # extra simultáneos. Rollback opt-in via env override
+            # explícito si alguien quiere re-evaluar uno por uno.
         },
         "extra_env_xml": yt_xml,
         "run_at_load": True,

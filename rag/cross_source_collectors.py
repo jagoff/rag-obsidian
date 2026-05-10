@@ -237,24 +237,37 @@ def _c_queries_total(start: str, end: str) -> dict[str, float]:
 
 @register_metric("queries_existential", "queries · patrón existencial")
 def _c_queries_existential(start: str, end: str) -> dict[str, float]:
-    """Cuenta de queries con regex existencial (ver `mood._QUERIES_EXISTENTIAL_RE`)."""
+    """Cuenta de queries con regex existencial (ver `mood._QUERIES_EXISTENTIAL_RE`).
+
+    Audit 2026-05-10 (U5): único collector del módulo que materializa filas
+    SIN agregación SQL (el regex existencial se aplica en Python). Con vault
+    de uso intensivo + rango grande (90d), `rag_queries` puede contener
+    decenas de miles de filas y `fetchall()` ahogaba la RAM. Mitigación:
+
+    1. Iterar el cursor (no fetchall) → memoria O(1) por fila.
+    2. `LIMIT` defensivo (50k filas) para acotar peores casos; el regex
+       en Python es lo barato, lo caro es materializar todo en lista.
+    3. Filtro por `cmd` ya selectivo en SQL — la query promedio devuelve
+       ~10-30k filas para 90d en uso real.
+    """
     try:
         from rag import _ragvec_state_conn  # noqa: PLC0415
         from rag.mood import _QUERIES_EXISTENTIAL_RE  # noqa: PLC0415
+        out: dict[str, int] = {}
         with _ragvec_state_conn() as conn:
-            rows = conn.execute(
+            cursor = conn.execute(
                 "SELECT substr(ts, 1, 10) AS d, q "
                 "FROM rag_queries "
                 "WHERE ts >= ? AND ts < ? "
-                "AND COALESCE(cmd,'') IN ('', 'query', 'chat', 'ask')",
+                "AND COALESCE(cmd,'') IN ('', 'query', 'chat', 'ask') "
+                "LIMIT 50000",
                 (f"{start}T00:00:00", f"{end}T23:59:59"),
-            ).fetchall()
-        out: dict[str, int] = {}
-        for date, q in rows:
-            if not q:
-                continue
-            if _QUERIES_EXISTENTIAL_RE.search(q):
-                out[date] = out.get(date, 0) + 1
+            )
+            for date, q in cursor:
+                if not q:
+                    continue
+                if _QUERIES_EXISTENTIAL_RE.search(q):
+                    out[date] = out.get(date, 0) + 1
         return {d: float(c) for d, c in out.items()}
     except Exception as exc:
         _silent_log_safe("xspat_queries_existential_failed", exc)

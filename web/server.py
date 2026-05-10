@@ -2753,11 +2753,18 @@ class ReminderDeleteRequest(BaseModel):
     reminder_id: str
 
 
-@app.post("/api/reminders/delete")
+@app.post(
+    "/api/reminders/delete",
+    dependencies=[Depends(_require_admin_token)],
+)
 def delete_reminder(req: ReminderDeleteRequest) -> dict:
     """Permanently delete an Apple Reminder. Called from the chat's
     auto-create toast Deshacer button — the user just saw a reminder
     land in Reminders.app and wants to undo it within the 10s window.
+
+    Auth: admin token (audit 2026-05-10 U15 — endpoint era mutate-público
+    sin protección, rompía invariante CLAUDE.md "destructive endpoints SÍ
+    están protegidos"). Loopback exempt vía `_require_admin_token` helper.
 
     POST (not DELETE verb) because the reminder_id is an
     `x-apple-reminderkit://` URI which is painful to URL-encode.
@@ -2781,10 +2788,16 @@ class CalendarDeleteRequest(BaseModel):
     event_uid: str
 
 
-@app.post("/api/calendar/delete")
+@app.post(
+    "/api/calendar/delete",
+    dependencies=[Depends(_require_admin_token)],
+)
 def delete_calendar_event(req: CalendarDeleteRequest) -> dict:
     """Permanently delete a Calendar.app event by its UID. Companion
     to the chat's auto-create toast Deshacer button for events.
+
+    Auth: admin token (audit 2026-05-10 U15). Mismo rationale que
+    `/api/reminders/delete` — destructive sin auth rompía invariante.
     """
     from rag import _delete_calendar_event  # noqa: PLC0415
     ok, msg = _delete_calendar_event(req.event_uid)
@@ -20056,10 +20069,17 @@ def logs_queue_get(error_id: int) -> dict:
     }
 
 
-@app.post("/api/logs/queue/process-next")
+@app.post(
+    "/api/logs/queue/process-next",
+    dependencies=[Depends(_require_admin_token)],
+)
 def logs_queue_process_next() -> dict:
     """Procesar manualmente el siguiente pending. Útil para testing y
-    para cuando el worker está desactivado."""
+    para cuando el worker está desactivado.
+
+    Auth: admin token (audit 2026-05-10 U15) — invoca Devin → ejecuta
+    código que reescribe archivos del repo. Sin auth = RCE remoto si LAN.
+    """
     can, reason = _worker_can_invoke_devin()
     if not can:
         raise HTTPException(status_code=429, detail=reason)
@@ -20070,10 +20090,18 @@ def logs_queue_process_next() -> dict:
     return {"status": "processed", **result}
 
 
-@app.post("/api/logs/queue/scan-now")
+@app.post(
+    "/api/logs/queue/scan-now",
+    dependencies=[Depends(_require_admin_token)],
+)
 def logs_queue_scan_now() -> dict:
     """Forzar un scan manual de los logs + enqueue. Útil después de que
-    un daemon empezó a fallar y querés ver los errores en la queue ya."""
+    un daemon empezó a fallar y querés ver los errores en la queue ya.
+
+    Auth: admin token (audit 2026-05-10 U15) — enqueue puede disparar
+    auto-fix worker downstream que invoca Devin. Misma threat surface
+    que `/api/logs/queue/process-next`.
+    """
     try:
         payload = _build_global_errors_payload(3600, "error")
         enqueued = 0
@@ -20100,9 +20128,18 @@ class _WorkerConfigRequest(BaseModel):
     hourly_cap: int | None = Field(None, description="Cap de invocaciones/hora")
 
 
-@app.post("/api/logs/queue/config")
+@app.post(
+    "/api/logs/queue/config",
+    dependencies=[Depends(_require_admin_token)],
+)
 def logs_queue_config(req: _WorkerConfigRequest) -> dict:
-    """Toggle del worker automático + ajuste del rate limit."""
+    """Toggle del worker automático + ajuste del rate limit.
+
+    Auth: admin token (audit 2026-05-10 U15) — muta globals
+    `_WORKER_AUTO_ENABLED` + `_AUTO_FIX_WORKER_HOURLY_CAP`. Adversario
+    podría deshabilitar el worker (quiebra monitoreo) o elevar hourly_cap
+    al máximo (50) para forzar consumption.
+    """
     global _WORKER_AUTO_ENABLED, _AUTO_FIX_WORKER_HOURLY_CAP
     _WORKER_AUTO_ENABLED = bool(req.enabled)
     if req.hourly_cap is not None:

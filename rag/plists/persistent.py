@@ -25,12 +25,21 @@ def _supervisor_plist(rag_bin: str) -> str:
     - ``ProcessType=Adaptive`` — NO Background. Es supervisor de Background
       workers. Adaptive le da prioridad estándar de scheduling pero no se
       lo trata como ``Interactive`` (no es UI foreground del user).
-    - ``RAG_RERANKER_NEVER_UNLOAD=1`` — el reranker queda pinneado para que
-      jobs proactive lo reusen entre invocaciones (anti pattern del web).
-    - ``RAG_MLX_IDLE_TTL=7200`` — 2h. Más alto que el default (1800s) porque
-      supervisor vive eternamente y los modelos cargados se amortizan en
-      muchos jobs intra-día. El watchdog memory-pressure los unlodea si
-      hace falta.
+    - ``RAG_SUPERVISOR_MLX_WARMUP=0`` — NO carga 5 modelos en paralelo al
+      startup (fix 2026-05-10). El warmup eager metía 7 GB residentes solo
+      en el supervisor, sumado al web (~5 GB) → swap a 2.8 GB / OOM /
+      reinicio. Jobs in-process lazy-loadean cuando los necesitan; idle-TTL
+      los evicta. Override para volver al comportamiento previo: ``=1``.
+    - ``RAG_MLX_IDLE_TTL=1800`` — 30min idle-evict. Antes era 7200 (2h),
+      pero supervisor solo corre jobs batch sparse (drift_watcher, briefs,
+      housekeeping) — keepar modelos 2h cargados sin uso era waste.
+    - ``RAG_MEMORY_PRESSURE_*`` — watchdog activo (75%, 4 GB swap, 30s).
+      Antes solo el web reaccionaba; el supervisor mantenía modelos
+      pinneados aunque la Mac estuviera swappeando.
+    - **Removido** ``RAG_RERANKER_NEVER_UNLOAD=1`` — pineaba reranker en
+      MPS (~2-3 GB) para jobs batch que NO son hot-path. Sin pin, idle-TTL
+      lo libera. La var sigue activa en el web plist (queries del user sí
+      son hot-path).
     - ``ExitTimeOut=20`` — 20s graceful shutdown (matchea el SIGTERM
       handler del supervisor).
     - Entrypoint via ``venv_python -m rag.runtime.supervisor`` (no via
@@ -55,8 +64,12 @@ def _supervisor_plist(rag_bin: str) -> str:
             "PYTHONUNBUFFERED": "1",
             "RAG_LLM_BACKEND": "mlx",
             "RAG_LOCAL_EMBED": "1",
-            "RAG_RERANKER_NEVER_UNLOAD": "1",
-            "RAG_MLX_IDLE_TTL": "7200",
+            "RAG_SUPERVISOR_MLX_WARMUP": "0",
+            "RAG_MLX_IDLE_TTL": "1800",
+            "RAG_MEMORY_PRESSURE_DISABLE": "0",
+            "RAG_MEMORY_PRESSURE_THRESHOLD": "75",
+            "RAG_MEMORY_PRESSURE_SWAP_GB": "4.0",
+            "RAG_MEMORY_PRESSURE_INTERVAL": "30",
             "RAG_STATE_SQL": "1",
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
@@ -82,6 +95,15 @@ def _watch_plist(rag_bin: str) -> str:
     watchdog observer monitors every registered vault in one process
     (sqlite-vec + sentence-transformers imported once, not per vault), so
     ~3-4 GB of RAM savings vs. running a second watch service.
+
+    Memory shaping (fix 2026-05-10): el embedder MLX in-process pesaba
+    ~2.7 GB pinneados forever. Sin idle-TTL ni memory pressure watchdog
+    el watch contribuía al OOM/restart de la Mac. Ahora:
+    - ``RAG_MLX_IDLE_TTL=600`` — 10min sin file changes evicta el embedder.
+      Vault edits son sparse; primer save tras evict re-carga en ~1-2s
+      (imperceptible).
+    - ``RAG_MEMORY_PRESSURE_*`` — watchdog reacciona si el sistema entra
+      en pressure por otro proceso (ej. web cargado).
     """
     out, err = _logs("watch")
     return _render_plist({
@@ -89,6 +111,11 @@ def _watch_plist(rag_bin: str) -> str:
         "program_arguments": [rag_bin, "watch", "--all-vaults"],
         "env": {
             "RAG_INDEX_LOCAL_EMBED": "1",
+            "RAG_MLX_IDLE_TTL": "600",
+            "RAG_MEMORY_PRESSURE_DISABLE": "0",
+            "RAG_MEMORY_PRESSURE_THRESHOLD": "75",
+            "RAG_MEMORY_PRESSURE_SWAP_GB": "4.0",
+            "RAG_MEMORY_PRESSURE_INTERVAL": "30",
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
         },

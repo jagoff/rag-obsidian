@@ -62,7 +62,8 @@ def wa_tasks(dry_run: bool, hours: int | None, force: bool):
         _ragvec_state_conn,
         _sql_append_event,
         _sql_write_with_retry,
-        _wa_extract_actions,
+        _wa_extract_combined,
+        _wa_promises_persist,
         _wa_tasks_load_state,
         _wa_tasks_save_state,
         _wa_tasks_write_note,
@@ -94,17 +95,22 @@ def wa_tasks(dry_run: bool, hours: int | None, force: bool):
     )
     extractions: list[dict] = []
     for chat in by_chat:
-        ext = _wa_extract_actions(chat["label"], chat["is_group"], chat["messages"])
+        ext = _wa_extract_combined(chat["label"], chat["is_group"], chat["messages"])
         extractions.append(ext)
         n = len(ext["tasks"]) + len(ext["questions"]) + len(ext["commitments"])
-        tag = "[green]✓[/green]" if n else "[dim]·[/dim]"
-        console.print(f"  {tag} [cyan]{chat['label']}[/cyan] · {chat['inbound']} inbound → {n} items")
+        n_p = len(ext.get("promises") or [])
+        tag = "[green]✓[/green]" if n or n_p else "[dim]·[/dim]"
+        promise_tag = f" + {n_p} promesa(s)" if n_p else ""
+        console.print(
+            f"  {tag} [cyan]{chat['label']}[/cyan] · {chat['inbound']} inbound → {n} items{promise_tag}"
+        )
 
     total = sum(
         len(e["tasks"]) + len(e["questions"]) + len(e["commitments"])
         for e in extractions
     )
-    if total == 0:
+    total_promises = sum(len(e.get("promises") or []) for e in extractions)
+    if total == 0 and total_promises == 0:
         console.print("[yellow]sin items accionables extraídos[/yellow]")
         if not dry_run:
             state["last_run_ts"] = now.isoformat(timespec="seconds")
@@ -116,9 +122,10 @@ def wa_tasks(dry_run: bool, hours: int | None, force: bool):
         return
 
     if dry_run:
-        console.print(f"\n[bold]{total} items extraídos (dry-run — no se escribe)[/bold]")
+        header = f"\n[bold]{total} items + {total_promises} promesa(s) extraídas (dry-run — no se escribe)[/bold]"
+        console.print(header)
         for chat, ext in zip(by_chat, extractions):
-            if not any(ext[k] for k in ("tasks", "questions", "commitments")):
+            if not any(ext[k] for k in ("tasks", "questions", "commitments")) and not (ext.get("promises") or []):
                 continue
             console.print(f"\n[cyan]{chat['label']}[/cyan]")
             for t in ext["tasks"]:
@@ -127,11 +134,20 @@ def wa_tasks(dry_run: bool, hours: int | None, force: bool):
                 console.print(f"  ❓ {q}")
             for c in ext["commitments"]:
                 console.print(f"  📌 {c}")
+            for p in ext.get("promises") or []:
+                arrow = "→" if (p.get("direction") or "").lower() == "out" else "←"
+                when = f" [{p['when_text']}]" if p.get("when_text") else ""
+                console.print(f"  🤝 {arrow} {p.get('text','')}{when}")
         return
 
     note_path, created, n_new = _wa_tasks_write_note(
         VAULT_PATH, now, by_chat, extractions,
     )
+    # Persistir promesas (status='pending') a `rag_promises`. La signal
+    # `commitment_deadline` (rag_anticipate/signals/) las lee y emite push
+    # WA cuando overdue / vence pronto. Silent-fail completo — si rompe,
+    # el resto del flow (Inbox note + state save) sigue.
+    n_promises_persisted = _wa_promises_persist(by_chat, extractions, now)
     # Update state with ALL fetched new ids (including ones from chats that
     # produced no extractions — we don't want to reprocess them).
     for chat in by_chat:
@@ -154,8 +170,19 @@ def wa_tasks(dry_run: bool, hours: int | None, force: bool):
                                _map_wa_tasks_row(_wa_log_event))
     _sql_write_with_retry(_do_wa_log, "wa_tasks_sql_write_failed")
 
-    rel = note_path.relative_to(VAULT_PATH)
-    verb = "creado" if created else "actualizado"
-    console.print(
-        f"\n[green]✓[/green] {verb}: [cyan]{rel}[/cyan] · {n_new} items"
+    promises_tag = (
+        f" · [magenta]{n_promises_persisted} promesa(s) → rag_promises[/magenta]"
+        if n_promises_persisted else ""
     )
+    if n_new > 0:
+        rel = note_path.relative_to(VAULT_PATH)
+        verb = "creado" if created else "actualizado"
+        console.print(
+            f"\n[green]✓[/green] {verb}: [cyan]{rel}[/cyan] · {n_new} items{promises_tag}"
+        )
+    elif n_promises_persisted:
+        console.print(
+            f"\n[green]✓[/green] sin items para Inbox{promises_tag}"
+        )
+    else:
+        console.print("[yellow]sin items accionables extraídos[/yellow]")

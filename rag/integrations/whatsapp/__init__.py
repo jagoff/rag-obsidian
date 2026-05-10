@@ -131,6 +131,7 @@ from rag.integrations.whatsapp.tasks_extract import (  # noqa: F401
 # ── Tasks writer ────────────────────────────────────────────────────────────
 from rag.integrations.whatsapp.tasks_writer import (  # noqa: F401
     _wa_chat_month_link,
+    _wa_promises_persist,
     _wa_tasks_write_note,
 )
 
@@ -266,6 +267,7 @@ __all__ = [
     "_wa_extract_promises",
     # Tasks writer
     "_wa_chat_month_link",
+    "_wa_promises_persist",
     "_wa_tasks_write_note",
     # Plist
     "_wa_tasks_plist",

@@ -52613,6 +52613,9 @@ from rag.cli.config_cli import (  # noqa: E402, F401
 )
 cli.add_command(config_cli)  # `rag config` (Phase 3 cont)
 
+from rag.cli.wa_contacts import wa_contacts  # noqa: E402, F401
+cli.add_command(wa_contacts)  # `rag wa-contacts {backfill,stats}` (2026-05-10)
+
 from rag.cli.ask import ask_cli  # noqa: E402, F401
 cli.add_command(ask_cli)  # `rag ask` (Phase 3 cont)
 

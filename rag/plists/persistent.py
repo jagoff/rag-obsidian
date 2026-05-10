@@ -22,9 +22,13 @@ def _supervisor_plist(rag_bin: str) -> str:
 
     Características:
     - ``KeepAlive=true`` + ``RunAtLoad=true`` — supervisor es persistent.
-    - ``ProcessType=Adaptive`` — NO Background. Es supervisor de Background
-      workers. Adaptive le da prioridad estándar de scheduling pero no se
-      lo trata como ``Interactive`` (no es UI foreground del user).
+    - ``ProcessType=Background`` — audit 2026-05-10 bumpó de Adaptive →
+      Background. Adaptive era el default genérico pero permitía que el
+      supervisor fuera killed por jetsam macOS bajo memory pressure
+      (gaps 216-218min en ``rag_supervisor_jobs.routing_rules`` coinciden
+      con Mac sleep + posible jetsam durante wake transitorio). Background
+      da prioridad persistente similar a Apple system daemons. NO ``Standard``
+      porque bloquea suspend del Mac.
     - ``RAG_SUPERVISOR_MLX_WARMUP=0`` — NO carga 5 modelos en paralelo al
       startup (fix 2026-05-10). El warmup eager metía 7 GB residentes solo
       en el supervisor, sumado al web (~5 GB) → swap a 2.8 GB / OOM /
@@ -78,7 +82,7 @@ def _supervisor_plist(rag_bin: str) -> str:
         "keep_alive": True,
         "throttle_s": 30,
         "exit_timeout_s": 20,
-        "process_type": "Adaptive",
+        "process_type": "Background",
         "working_dir": str(repo_root),
         "stdout_path": out,
         "stderr_path": err,

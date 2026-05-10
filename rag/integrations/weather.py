@@ -196,6 +196,26 @@ def _translate_weather_desc(en: str) -> str:
     return _WEATHER_DESC_ES.get(key, en)
 
 
+def _format_extras(feels_like: str, humidity: str, rain_today: str) -> str:
+    """Construye " (sensación 19°C, humedad 65%, lluvia 30%)" omitiendo
+    los campos vacíos. Si los tres están vacíos devuelve "" — el caller
+    concatena directo al text_summary sin paréntesis colgando.
+
+    Razón: durante outages de sensor, wttr.in / Open-Meteo emiten null o
+    string vacío para humidity/feels-like. Mostrar "0°C" / "0%" sería
+    misleading; preferimos omitir el campo y dejar que el LLM use lo que
+    haya.
+    """
+    parts: list[str] = []
+    if feels_like:
+        parts.append(f"sensación {feels_like}°C")
+    if humidity:
+        parts.append(f"humedad {humidity}%")
+    if rain_today and rain_today != "0":
+        parts.append(f"lluvia {rain_today}%")
+    return f" ({', '.join(parts)})" if parts else ""
+
+
 def _fetch_weather_rain(location: str = WEATHER_LOCATION) -> dict | None:
     """Query wttr.in. Returns a summary dict ONLY if rain is in the forecast
     for today (chance ≥ WEATHER_RAIN_THRESHOLD in any upcoming 3h block, or
@@ -308,7 +328,10 @@ def _fetch_weather_openmeteo(location: str = WEATHER_LOCATION) -> dict | None:
 
     wx_url = (
         f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
-        "&current=temperature_2m,weather_code"
+        # Pedir feels-like + humedad + prob lluvia para que el LLM tenga
+        # contexto al responder "como va a estar el clima hoy" — sin esto
+        # solo veía temp + desc y respondía corto (regresión 2026-05-10).
+        "&current=temperature_2m,apparent_temperature,relative_humidity_2m,precipitation_probability,weather_code"
         "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code"
         "&timezone=auto&forecast_days=3"
     )
@@ -327,6 +350,15 @@ def _fetch_weather_openmeteo(location: str = WEATHER_LOCATION) -> dict | None:
     cur_code = cur.get("weather_code") or 0
     cur_desc = _WMO_WEATHER_CODES.get(cur_code, f"Código {cur_code}")
     cur_temp = str(round(cur.get("temperature_2m") or 0))
+    # Sensación + humedad + prob lluvia: si la API devuelve null (sensor
+    # outage), `or` lo cae a "" — el text_summary los omite cuando vacíos
+    # en vez de mostrar "0°C" / "0%" misleading.
+    feels_raw = cur.get("apparent_temperature")
+    feels_like = str(round(feels_raw)) if feels_raw is not None else ""
+    hum_raw = cur.get("relative_humidity_2m")
+    humidity = str(round(hum_raw)) if hum_raw is not None else ""
+    rain_prob_raw = cur.get("precipitation_probability")
+    rain_today = str(round(rain_prob_raw)) if rain_prob_raw is not None else ""
 
     daily = data.get("daily", {}) or {}
     dates = daily.get("time", []) or []
@@ -357,14 +389,22 @@ def _fetch_weather_openmeteo(location: str = WEATHER_LOCATION) -> dict | None:
     # Eval 2026-04-28 BUG-2a: text_summary prominente para que el LLM lo
     # eche en la síntesis. Sin este campo, el LLM solo extraía
     # current.description + temp_C y omitía la ciudad.
+    # 2026-05-10: agregado sensación + humedad + prob lluvia para que el
+    # LLM tenga material y la respuesta no quede en "Soleado 11°C".
     text_summary = (
-        f"{loc_str}: {cur_desc} ({cur_temp}°C)"
+        f"{loc_str}: {cur_desc} {cur_temp}°C{_format_extras(feels_like, humidity, rain_today)}"
         if loc_str and cur_desc
         else "Sin datos del clima"
     )
     return {
         "location": loc_str,
-        "current": {"description": cur_desc, "temp_C": cur_temp},
+        "current": {
+            "description": cur_desc,
+            "temp_C": cur_temp,
+            "feels_like_C": feels_like,
+            "humidity_pct": humidity,
+            "rain_probability_pct": rain_today,
+        },
         "days": days,
         "text_summary": text_summary,
     }
@@ -388,12 +428,18 @@ def _fetch_weather_forecast(location: str = WEATHER_LOCATION) -> dict | None:
     # Current conditions
     current = ""
     temp_c = ""
+    feels_like = ""
+    humidity = ""
     try:
         cc = data.get("current_condition") or []
         if cc:
             desc = (cc[0].get("weatherDesc") or [{}])[0].get("value", "")
             current = _translate_weather_desc(desc.strip())
             temp_c = cc[0].get("temp_C", "")
+            # wttr.in expone FeelsLikeC + humidity como strings ("19", "65")
+            # — pasarlos crudos para evitar NaN si vienen vacíos.
+            feels_like = (cc[0].get("FeelsLikeC") or "").strip()
+            humidity = (cc[0].get("humidity") or "").strip()
     except Exception:
         pass
 
@@ -430,15 +476,24 @@ def _fetch_weather_forecast(location: str = WEATHER_LOCATION) -> dict | None:
     # Eval 2026-04-28 BUG-2a: text_summary prominente para que el LLM
     # lo eche en la síntesis. Sin este campo, el LLM solo extraía
     # current.description + temp_C y omitía la ciudad.
+    # 2026-05-10: sensación + humedad + prob lluvia hoy (max chance del
+    # primer día) para que la respuesta sea más rica que "Soleado 11°C".
     loc_display = location.replace("+", " ").strip()
+    rain_today = str(days[0].get("chanceofrain") or 0) if days else ""
     text_summary = (
-        f"{loc_display}: {current} ({temp_c}°C)"
+        f"{loc_display}: {current} {temp_c}°C{_format_extras(feels_like, humidity, rain_today)}"
         if loc_display and current
         else "Sin datos del clima"
     )
     return {
         "location": loc_display,
-        "current": {"description": current, "temp_C": temp_c},
+        "current": {
+            "description": current,
+            "temp_C": temp_c,
+            "feels_like_C": feels_like,
+            "humidity_pct": humidity,
+            "rain_probability_pct": rain_today,
+        },
         "days": days,
         "text_summary": text_summary,
     }

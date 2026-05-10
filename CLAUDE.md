@@ -361,6 +361,16 @@ query → typo correct → anaphora resolve → classify_intent → infer_filter
 
 **Wave-8 patrones** (gotchas): (1) filtros definidos sin call site, (2) carry-over pre-router sobrescrito por `_detect_tool_intent` downstream, (3) bumpear `_FILTER_VERSION` es parte del fix cuando cambia filtro/prompt/regex.
 
+**Personal entity overrides + known-places allowlist** (2026-05-10): el extractor GLiNER tiene falsos positivos sistémicos en chat slang ("oka"), common nouns ("casa", "comedor", "centro"), productos ("Mac"), AWS regions, adverbios ("acá"). Tres archivos JSON gobiernan el filtrado:
+
+- [`rag/data/known_places.json`](rag/data/known_places.json) — allowlist canonical de 640+ países/provincias/ciudades. NO editar (los upgrades del paquete lo pisan). Si una entity sale como `location` y NO está acá ni hay override, el extractor la **skipea** (ni aparece como location ni como otro tipo).
+- `~/.config/obsidian-rag/entity_overrides.json` — re-classify nombres específicos del user. Format `{"nombre_lowercase": "person|location|organization|event"}`. Override actual: `{"grecia": "person"}`. Aplicado write-time en `_extract_entities_*` (futuras menciones) Y display-time en [`web/atlas_dashboard.py::_apply_entity_overrides`](web/atlas_dashboard.py) (re-classify + dedupe filas existentes en `/atlas`).
+- `~/.config/obsidian-rag/known_places_extra.json` — extension del user para places legítimos no incluidos en el canonical (country clubs, barrios chicos, lugares específicos). Mismo schema `{"places": [...]}`. Merged at load time, NO se pisa con upgrades.
+
+Stopwords adicionales en `_ENTITY_STOPWORDS_GLOBAL` (rag/__init__.py) — frozenset de chat slang aplicada a TODOS los tipos (oka, dale, che, jajaja, Bueno, hola, etc.). Distinto a `_ENTITY_STOPWORDS_PERSON` que es type-específico (pronombres, artículos).
+
+Doc canónica de la regla en [`~/.claude/CLAUDE.md`](file:///Users/fer/.claude/CLAUDE.md) sección "Nombres propios del user" — global (todos los proyectos, no solo obsidian-rag) para que cualquier agente futuro respete el principio "contrastá la creación de lugares contra un mapa o una lista previa".
+
 ## Eval baselines (floor MLX 2026-05-09)
 
 - Singles: `hit@5 56.60% [43.40, 69.81] · MRR 0.519 [0.396, 0.651] · n=53`

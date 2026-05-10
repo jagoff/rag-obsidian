@@ -360,8 +360,15 @@ def test_collect_mood_score_reads_daily_table(tmp_telemetry):
 
 def test_collect_gmail_received_parses_frontmatter(tmp_path, monkeypatch):
     """gmail_received parsea `message_count: N` del frontmatter de las
-    notas YYYY-MM-DD.md bajo `<vault>/03-Resources/Gmail/`."""
-    folder = tmp_path / "03-Resources" / "Gmail"
+    notas YYYY-MM-DD.md bajo `<vault>/99-obsidian/99-AI/external-ingest/Gmail/`.
+
+    Path updated 2026-05-10 (audit U11): el ingester movió los snapshots
+    de `03-Resources/Gmail/` → `99-obsidian/99-AI/external-ingest/Gmail/`
+    por la regla user-global "Artefactos del sistema → vault Obsidian"
+    en `~/.claude/CLAUDE.md` (sección "Artefactos del sistema"). El test
+    estaba referenciando el path viejo.
+    """
+    folder = tmp_path / "99-obsidian" / "99-AI" / "external-ingest" / "Gmail"
     folder.mkdir(parents=True)
     (folder / "2026-04-28.md").write_text(
         "---\nsource: gmail\nmessage_count: 6\nwindow_hours: 48\n---\n\n# Body\n",

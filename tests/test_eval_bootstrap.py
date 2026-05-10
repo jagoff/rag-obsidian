@@ -56,7 +56,7 @@ def test_queries_yaml_all_paths_exist_or_placeholder():
     CROSS_SOURCE_PREFIXES = ("gmail://", "whatsapp://", "calendar://",
                              "reminders://", "messages://",
                              "contacts://", "calls://", "safari://",
-                             "drive://")
+                             "drive://", "pillow://")
 
     def _path_ok(p: str) -> bool:
         if p.startswith(CROSS_SOURCE_PREFIXES):
@@ -85,7 +85,7 @@ def test_queries_yaml_cross_source_prefixes_cover_all_valid_sources():
     CROSS_SOURCE_PREFIXES = {"gmail://", "whatsapp://", "calendar://",
                              "reminders://", "messages://",
                              "contacts://", "calls://", "safari://",
-                             "drive://"}
+                             "drive://", "pillow://"}
     # vault + memory are file-backed (memory lives at
     # 99-obsidian/99-AI/memory/<slug>.md inside the vault) →
     # neither uses a `<source>://` prefix.

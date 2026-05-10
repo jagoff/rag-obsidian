@@ -701,18 +701,26 @@ def test_today_cli_does_not_collide_with_morning_file(tmp_vault, monkeypatch):
     assert (vault / "99-obsidian/99-AI/reviews" / f"{date_label}-evening.md").is_file()
 
 
-def test_today_plist_registered_in_services(tmp_path):
-    spec = rag._services_spec("/tmp/fake-rag")
-    labels = [s[0] for s in spec]
-    assert "com.fer.obsidian-rag-today" in labels
-    today_entry = next(s for s in spec if s[0] == "com.fer.obsidian-rag-today")
-    plist_xml = today_entry[2]
-    assert "<string>today</string>" in plist_xml
-    for wd in (1, 2, 3, 4, 5):
-        assert f"<integer>{wd}</integer>" in plist_xml
-    assert "<key>Hour</key><integer>22</integer>" in plist_xml
-    assert "today.log" in plist_xml
-    assert "today.error.log" in plist_xml
+def test_today_job_registered_in_supervisor():
+    """Today brief job — Mon-Fri 22:00. Post daemon-refactor 2026-05-09
+    el plist standalone `com.fer.obsidian-rag-today` fue eliminado y el job
+    se consolidó en el supervisor (`rag/runtime/jobs/briefs.py::today_job`).
+    Este test verifica el contrato nuevo (audit U13, 2026-05-10).
+    """
+    from rag.runtime.scheduler import Scheduler
+    from rag.runtime.supervisor import _import_jobs
+
+    # Reset singleton + re-import para test idempotente
+    Scheduler.reset_global()
+    sched = Scheduler.global_instance()
+    _import_jobs()
+    job = sched.jobs().get("today")
+    assert job is not None, "today job no registrado en supervisor"
+    assert job.trigger_kind == "cron"
+    args = job.trigger_args
+    assert args.get("day_of_week") == "mon-fri"
+    assert args.get("hour") == 22
+    assert args.get("minute") == 0
 
 
 # ── _strip_empty_today_sections ─────────────────────────────────────────────

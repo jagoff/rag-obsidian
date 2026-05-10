@@ -70,6 +70,117 @@ _VAULT_CONTACTS_CACHE: dict | None = None
 _VAULT_CONTACTS_TTL_S = 60
 
 
+# ── Kinship inference ─────────────────────────────────────────────────────
+# Map de keyword → kinship enum. Aplicado al `relation_label` libre del
+# contact note cuando el frontmatter no declara `kinship` explícito. El
+# matching es por substring (lowercase, accent-stripped) — chequea palabras
+# completas via word-boundary mental, pero acá usamos `in` simple porque las
+# keywords son discriminantes (no se solapan con nombres comunes).
+#
+# Por qué este map: el draft prompt necesita un signal categórico para ajustar
+# registro (cariñoso vs formal). El text libre "hija" / "psiquiatra" /
+# "amigo de la facu" es bueno para humanos pero el LLM no consistentemente
+# infiere el registro correcto. Inyectarle el enum + descripción del registro
+# fuerza el alineamiento.
+#
+# Orden de chequeo importa: el primero que matchee gana. Family-immediate va
+# primero porque "mamá" / "papá" / "hijo" son los casos más críticos para
+# evitar tono frío.
+_KINSHIP_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("family-immediate", (
+        "hija", "hijo", "madre", "padre", "mama", "mamá", "papa", "papá",
+        "hermana", "hermano", "esposa", "esposo", "marido", "mujer",
+    )),
+    ("romantic-partner", (
+        "pareja", "novia", "novio", "compañera", "compañero",
+    )),
+    ("family-extended", (
+        "tia", "tía", "tio", "tío", "prima", "primo", "abuela", "abuelo",
+        "sobrina", "sobrino", "cuñada", "cuñado", "suegra", "suegro",
+        "nieta", "nieto", "madrina", "padrino", "ahijada", "ahijado",
+    )),
+    ("professional-formal", (
+        "cliente", "paciente", "psiquiatra", "psicologa", "psicólogo",
+        "psicólogа", "medica", "médica", "medico", "médico", "abogada",
+        "abogado", "contadora", "contador", "doctor", "doctora",
+        "proveedor", "proveedora",
+    )),
+    ("professional-close", (
+        "colega", "socia", "socio", "jefa", "jefe", "ex jefa", "ex jefe",
+    )),
+    ("friend-close", (
+        "amigo cercano", "amiga cercana", "mejor amigo", "mejor amiga",
+        "best friend",
+    )),
+    ("friend-known", (
+        "amiga", "amigo", "conocido", "conocida",
+    )),
+)
+
+
+def _infer_kinship(relation_label: str) -> str:
+    """Devolver enum kinship a partir del label libre.
+
+    Default `unknown` si no matchea nada (incl. label vacío).
+    """
+    if not relation_label:
+        return "unknown"
+    norm = _normalize_hint(relation_label)
+    for kinship, keywords in _KINSHIP_KEYWORDS:
+        for kw in keywords:
+            kw_norm = _normalize_hint(kw)
+            # Palabra completa o frase compuesta → substring contains.
+            if kw_norm in norm:
+                return kinship
+    return "unknown"
+
+
+# ── Short-name (apodo familiar) ───────────────────────────────────────────
+# Aliases que NO son short_name reales — son labels del template o headers
+# wikilink genéricos. Se filtran del fallback "primer alias".
+_SHORT_NAME_TEMPLATE_BLOCKLIST: frozenset[str] = frozenset({
+    "apodo", "nombre completo", "otra forma de llamarlo", "nombre corto",
+    "short name", "shortname",
+})
+
+
+def _infer_short_name(
+    explicit: str,
+    aliases: list[str],
+    full_name: str,
+    path_stem: str,
+) -> str:
+    """Resolver el nombre corto familiar con fallback chain.
+
+    Prioridad:
+      1. `explicit` — campo `Apodo` / `Nombre corto` / `Short name` del body.
+      2. Primer alias del frontmatter que NO sea template-placeholder NI sea
+         igual al full_name (sería redundante).
+      3. Primer token del `full_name` si tiene 2+ palabras (ej. "Grecia
+         Ferrari" → "Grecia").
+      4. `path_stem` (nombre del archivo sin extensión).
+
+    Es heurística — el user puede override agregando `- **Apodo**: <X>` al
+    body de la nota.
+    """
+    if explicit and explicit.strip():
+        return explicit.strip()
+    full_name_norm = _normalize_hint(full_name) if full_name else ""
+    for alias in aliases:
+        a = (alias or "").strip()
+        if not a:
+            continue
+        a_norm = _normalize_hint(a)
+        if a_norm in _SHORT_NAME_TEMPLATE_BLOCKLIST:
+            continue
+        if a_norm == full_name_norm:
+            continue
+        return a
+    if full_name and " " in full_name.strip():
+        return full_name.strip().split()[0]
+    return path_stem or full_name or ""
+
+
 def _normalize_hint(s: str) -> str:
     """Lowercase + strip accents → match keys in `_RELATIONSHIP_HINT_MAP`."""
     import unicodedata
@@ -221,7 +332,14 @@ def _parse_vault_contact(path: Path, text: str | None = None) -> dict:
     """Parsear una nota de contact del vault.
 
     Devuelve `{full_name, phones, emails, birthday, source: "vault",
-    aliases, relation_label}`. Campos vacíos default a "" o [].
+    aliases, relation_label, kinship, short_name}`. Campos vacíos default
+    a "" o [].
+
+    `kinship` es enum derivado de `relation_label` (ver `_infer_kinship`)
+    salvo que el frontmatter declare `kinship: <enum>` explícito.
+
+    `short_name` es el apodo familiar — fallback chain en `_infer_short_name`.
+    User puede override agregando `- **Apodo**: <X>` al body.
     """
     if text is None:
         try:
@@ -302,6 +420,36 @@ def _parse_vault_contact(path: Path, text: str | None = None) -> dict:
         if _normalize_hint(a) not in _TEMPLATE_ALIASES
     ]
 
+    # Kinship — frontmatter explícito gana sobre infer del relation_label.
+    explicit_kinship = ""
+    if fm_match:
+        for line in fm_match.group(1).splitlines():
+            stripped = line.strip()
+            if stripped.lower().startswith("kinship:"):
+                explicit_kinship = stripped.split(":", 1)[1].strip().strip('"\'')
+                break
+    kinship = explicit_kinship if explicit_kinship else _infer_kinship(relation)
+
+    # Short name — body field "Apodo" / "Nombre corto" / "Short name" o
+    # frontmatter `short_name`. Si nada explícito, fallback chain.
+    explicit_short = (
+        _extract_field(r"Apodo")
+        or _extract_field(r"Nombre[\s-]?corto")
+        or _extract_field(r"Short[\s-]?name")
+    )
+    if not explicit_short and fm_match:
+        for line in fm_match.group(1).splitlines():
+            stripped = line.strip()
+            if stripped.lower().startswith(("short_name:", "short-name:", "shortname:")):
+                explicit_short = stripped.split(":", 1)[1].strip().strip('"\'')
+                break
+    short_name = _infer_short_name(
+        explicit_short,
+        aliases,
+        full_name or path.stem,
+        path.stem,
+    )
+
     return {
         "full_name": full_name or path.stem,
         "phones": phones,
@@ -310,6 +458,8 @@ def _parse_vault_contact(path: Path, text: str | None = None) -> dict:
         "source": "vault",
         "aliases": aliases,
         "relation_label": relation,
+        "kinship": kinship,
+        "short_name": short_name,
     }
 
 

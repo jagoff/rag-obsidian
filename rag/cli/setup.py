@@ -384,11 +384,33 @@ def _setup_install(
         try:
             # Bug Hunt H Tel 3: `bootstrap` reemplaza `load`. Exit 37
             # = ya estaba cargado (no es error real, idempotencia OK).
-            res = subprocess.run(
-                ["launchctl", "bootstrap", _domain, str(plist_path)],
-                check=False,
-                capture_output=True,
-            )
+            #
+            # Race "bootout-then-bootstrap" (2026-05-10): launchctl bootout
+            # devuelve sync, pero el teardown interno de launchd queda en
+            # flight. El bootstrap inmediato puede caer con EIO 5
+            # ("Input/output error"). Recovery: si exit≠0/37 y el label NO
+            # aparece cargado todavía, retry una vez tras 0.5s.
+            from rag.cli.daemons_control import _loaded_launchd_labels  # noqa: PLC0415
+            import time  # noqa: PLC0415
+
+            def _bootstrap_once() -> subprocess.CompletedProcess:
+                return subprocess.run(
+                    ["launchctl", "bootstrap", _domain, str(plist_path)],
+                    check=False,
+                    capture_output=True,
+                )
+
+            res = _bootstrap_once()
+            if res.returncode not in (0, 37):
+                if label in _loaded_launchd_labels():
+                    # EIO 5 silencioso == "already loaded".
+                    res.returncode = 0
+                else:
+                    time.sleep(0.5)
+                    res = _bootstrap_once()
+                    if res.returncode not in (0, 37) and label in _loaded_launchd_labels():
+                        res.returncode = 0
+
             if res.returncode in (0, 37):
                 console.print(f"[green]✓[/green] cargado: [bold]{label}[/bold]")
             else:
@@ -829,15 +851,22 @@ def _run_catch_up_index(ctx: click.Context) -> None:
     console.print()
     console.print("[bold cyan]▸ catch-up index (incremental)[/bold cyan]")
     try:
+        # Click param names — `--full` binds a `full_flag`, `--reset` (alias
+        # legacy) a `reset_legacy`. Pasarle `reset=False` revienta con
+        # `TypeError: index() got an unexpected keyword argument 'reset'`.
+        # `contextual` y `fast` son options nuevas — defaults explícitos.
         ctx.invoke(
             index,
-            reset=False,
+            full_flag=False,
+            reset_legacy=False,
             no_contradict=False,
             source_opt=None,
             since_opt=None,
             dry_run=False,
             max_chats=None,
             vault_scope=None,
+            contextual=False,
+            fast=False,
         )
     except SystemExit as e:
         if e.code != 0:

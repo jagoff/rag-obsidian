@@ -314,8 +314,18 @@ def _bootstrap_label(label: str, *, dry_run: bool = False, timeout: int = 30) ->
         exit=37                               → "Operation already in progress"
         stderr contiene "already loaded" /
             "already bootstrapped"            → ya estaba cargado (no error real)
+        exit=5 ("Input/output error") +
+            label visible en `launchctl list` → ya estaba cargado (launchctl
+            <= macOS 15 devuelve EIO en vez del más limpio "already loaded"
+            cuando el target ya existe en el domain).
+
+    Recovery: si exit≠0/37 Y label NO aparece cargado, retry una vez tras
+    0.5s. Cubre la race "bootout-then-bootstrap" donde el teardown de
+    launchd está aún en flight cuando lanzamos el bootstrap (síntoma
+    típico: EIO 5 en primera tentativa, OK en la segunda).
     """
     import subprocess
+    import time
     if dry_run:
         return {"ok": True, "exit_code": 0, "stderr": "",
                 "skipped": True, "missing_plist": False}
@@ -325,32 +335,51 @@ def _bootstrap_label(label: str, *, dry_run: bool = False, timeout: int = 30) ->
                 "stderr": "plist no existe en disco",
                 "skipped": False, "missing_plist": True}
     uid = os.getuid()
-    try:
-        proc = subprocess.run(
-            ["launchctl", "bootstrap", f"gui/{uid}", str(plist)],
-            capture_output=True, text=True, timeout=timeout,
-        )
-        rc = proc.returncode
-        stderr = (proc.stderr or "").strip()
+
+    def _attempt() -> tuple[int, str]:
+        try:
+            proc = subprocess.run(
+                ["launchctl", "bootstrap", f"gui/{uid}", str(plist)],
+                capture_output=True, text=True, timeout=timeout,
+            )
+            return proc.returncode, (proc.stderr or "").strip()
+        except subprocess.TimeoutExpired:
+            return 124, f"timeout {timeout}s"
+        except OSError as exc:
+            return -1, f"OSError: {exc}"
+
+    rc, stderr = _attempt()
+    stderr_lc = stderr.lower()
+    ok = (
+        rc in (0, 37)
+        or "already loaded" in stderr_lc
+        or "already bootstrapped" in stderr_lc
+        or "service is disabled" in stderr_lc  # opt-in necesario, no es error fatal
+    )
+
+    if not ok:
+        # ¿Está cargado igual? Si sí, EIO 5 == "already loaded" tácito.
+        loaded = _loaded_launchd_labels()
+        if label in loaded:
+            return {"ok": True, "exit_code": rc,
+                    "stderr": stderr or "already loaded (detected via list)",
+                    "skipped": False, "missing_plist": False}
+        # Race bootout→bootstrap: retry una vez después de un beat.
+        time.sleep(0.5)
+        rc, stderr = _attempt()
         stderr_lc = stderr.lower()
-        # 0 = loaded; 37 = ya en progreso; "already loaded/bootstrapped" en
-        # stderr = ya estaba cargado (rc varía por versión de launchctl).
         ok = (
             rc in (0, 37)
             or "already loaded" in stderr_lc
             or "already bootstrapped" in stderr_lc
-            or "service is disabled" in stderr_lc  # opt-in necesario, no es error fatal
+            or "service is disabled" in stderr_lc
         )
-        return {"ok": ok, "exit_code": rc, "stderr": stderr,
-                "skipped": False, "missing_plist": False}
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "exit_code": 124,
-                "stderr": f"timeout {timeout}s",
-                "skipped": False, "missing_plist": False}
-    except OSError as exc:
-        return {"ok": False, "exit_code": -1,
-                "stderr": f"OSError: {exc}",
-                "skipped": False, "missing_plist": False}
+        if not ok and label in _loaded_launchd_labels():
+            ok = True
+            stderr = stderr or "loaded after retry"
+
+    return {"ok": ok, "exit_code": rc, "stderr": stderr,
+            "skipped": False, "missing_plist": False}
 
 
 @click.group("daemons")

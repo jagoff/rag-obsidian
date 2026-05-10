@@ -55,8 +55,12 @@ def test_morning_brief_appends_footer(brief_env):
     # Header + body + footer, en ese orden.
     assert body.startswith("📓 *Morning 2026-04-29*")
     assert body.endswith("_brief:02-Areas/Briefs/2026-04-29-morning.md_")
-    # Separación por doble newline (renderiza como párrafo aparte).
-    assert "\n\n_brief:02-Areas/Briefs/2026-04-29-morning.md_" in body
+    # 2026-05-10: affordance hint sumado en línea italic ANTES del
+    # footer (👍 útil · 👎 nada · 🔇 silenciar) — sin esto el
+    # feedback loop estaba muerto. El listener regex sigue matcheando
+    # solo la última línea.
+    assert "_👍 útil · 👎 nada · 🔇 silenciar_" in body
+    assert body.endswith("\n_brief:02-Areas/Briefs/2026-04-29-morning.md_")
 
 
 def test_evening_brief_appends_footer(brief_env):

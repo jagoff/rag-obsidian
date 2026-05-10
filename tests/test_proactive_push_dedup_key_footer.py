@@ -52,8 +52,13 @@ def test_dedup_key_appends_footer(proactive_env):
     # El body original sigue al frente, el footer va al final.
     assert body.startswith("📅 En 30 min: call con Juan")
     assert body.endswith("_anticipate:cal:event-uuid-123_")
-    # Separación por doble newline (renderiza como párrafo aparte).
-    assert "\n\n_anticipate:cal:event-uuid-123_" in body
+    # 2026-05-10: affordance hint sumado en línea italic ANTES del
+    # footer (👍 útil · 👎 noutil · 🔇 silenciar) — sin esto el
+    # feedback loop estaba muerto porque el user no sabía qué tokens
+    # podía usar para reaccionar. El listener regex sigue matcheando
+    # solo la última línea.
+    assert "_👍 útil · 👎 noutil · 🔇 silenciar_" in body
+    assert body.endswith("\n_anticipate:cal:event-uuid-123_")
 
 
 def test_dedup_key_with_complex_chars(proactive_env):

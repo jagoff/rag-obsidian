@@ -206,9 +206,21 @@ def proactive_push(
     # Sufijar el footer ANTES de mandar al bridge. Markdown italic
     # discreto pero visible para audit; el listener parsea
     # `_anticipate:<key>_` con un regex simple en el reply.
+    #
+    # 2026-05-10: agregado hint de afford. ARRIBA del footer para que
+    # el user sepa cómo dar feedback (👍 útil / 👎 noutil / 🔇 silenciar).
+    # Antes el feedback loop estaba muerto (483 candidatos pushed → 0
+    # feedback recorded en 14d) porque la convención de tokens no era
+    # discoverable. El listener regex sigue matcheando solo la última
+    # línea (`extractAnticipateDedupKey`), así que el hint NO rompe el
+    # parser — va en una línea separada italica antes del dedup tag.
     body = message
     if dedup_key:
-        body = f"{message}\n\n_anticipate:{dedup_key}_"
+        body = (
+            f"{message}"
+            f"\n\n_👍 útil · 👎 noutil · 🔇 silenciar_"
+            f"\n_anticipate:{dedup_key}_"
+        )
     sent = _ambient_whatsapp_send(cfg["jid"], body)
     state = _proactive_load_state()
     if sent:

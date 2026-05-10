@@ -22401,10 +22401,16 @@ def _brief_push_to_whatsapp(
             _silent_log("brief_push_audio", exc)
             audio_sent = False
     audio_marker = "\n\n(audio arriba ↑)" if audio_sent else ""
+    # 2026-05-10: hint de afford. ARRIBA del footer. Mismo patrón que
+    # `proactive_push` — sin esto el feedback loop está muerto porque
+    # el user no sabe cómo dar 👍/👎/🔇 al brief. La regex del listener
+    # `extractBriefDedupKey` matchea solo la última línea, así que el
+    # hint en una línea italica separada no rompe el parser.
     msg = (
         f"📓 *{title}* — `{vault_relpath}`\n\n{body}"
         f"{audio_marker}"
-        f"\n\n_brief:{vault_relpath}_"
+        f"\n\n_👍 útil · 👎 nada · 🔇 silenciar_"
+        f"\n_brief:{vault_relpath}_"
     )
     sent = _ambient_whatsapp_send(cfg["jid"], msg)
     _ambient_log_event({

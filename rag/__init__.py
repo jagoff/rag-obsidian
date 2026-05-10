@@ -51308,6 +51308,169 @@ _ENTITY_STOPWORDS_PERSON = frozenset({
 # casi siempre identificadores, no nombres propios.
 _ENTITY_PHONE_ID_RE = re.compile(r"^\d{7,}$")
 
+# Stopwords globales — chat slang / interjecciones que GLiNER puede clasificar
+# como cualquier tipo (location/person/org/event). Aplica a TODAS las labels,
+# no solo person. Casos típicos del corpus WhatsApp del user: "oka" / "okey" /
+# "dale" / "che" / "ufa" / "jaja". Distinto a `_ENTITY_STOPWORDS_PERSON` que
+# es solo para pronombres y artículos que el modelo confunde con `person`.
+_ENTITY_STOPWORDS_GLOBAL = frozenset({
+    # Spanish chat interjections / affirmations
+    "oka", "okey", "okay", "ok", "dale", "che", "ufa", "ay", "uy", "eh",
+    "hola", "chau", "buenas", "buena", "bueno",
+    # Risas / onomatopeyas
+    "jaja", "jajaja", "jajajaja", "jeje", "jejeje", "jiji", "haha", "hahaha", "hehe", "lol",
+    # Inglés chat
+    "hi", "hello", "bye", "yes", "no", "yeah", "yep", "nope", "wow", "cool",
+    # Generic common nouns que GLiNER a veces tagea como `location`/`organization`
+    "casa", "comedor", "centro", "parque", "sala", "cocina", "jardín", "jardin",
+    "living", "puente", "plaza", "terminal", "piscina", "local", "country",
+    "the", "a", "an",
+    # Adverbios espaciales
+    "acá", "aca", "allá", "alla", "aquí", "aqui", "ahí", "ahi",
+})
+
+# ── Personal entity overrides (write-time NER fix) ─────────────────────────
+# Para nombres propios personales que GLiNER clasifica mal de forma
+# sistemática (ej. "Grecia" → location, pero en el vault del user es
+# nombre de persona). El override se aplica acá, ANTES de upsertar a
+# rag_entities, para que las menciones nuevas entren con el entity_type
+# correcto. Mismo archivo + formato que en `web/atlas_dashboard.py`:
+#
+#   ~/.config/obsidian-rag/entity_overrides.json
+#   {"grecia": "person"}
+#
+# Tipos válidos = `_ENTITY_LABELS`. Reload por mtime — editás el JSON
+# y el próximo chunk usa el nuevo override sin restart.
+_ENTITY_OVERRIDE_FILE = Path.home() / ".config" / "obsidian-rag" / "entity_overrides.json"
+_ENTITY_OVERRIDE_CACHE: dict = {"mtime": 0.0, "data": {}}
+
+
+def _load_entity_overrides() -> dict[str, str]:
+    """Read personal entity overrides JSON. mtime-cached. Silent fail."""
+    try:
+        mtime = _ENTITY_OVERRIDE_FILE.stat().st_mtime
+    except OSError:
+        if _ENTITY_OVERRIDE_CACHE["mtime"] != 0.0:
+            _ENTITY_OVERRIDE_CACHE["mtime"] = 0.0
+            _ENTITY_OVERRIDE_CACHE["data"] = {}
+        return {}
+    if mtime == _ENTITY_OVERRIDE_CACHE["mtime"]:
+        return _ENTITY_OVERRIDE_CACHE["data"]
+    try:
+        raw = json.loads(_ENTITY_OVERRIDE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return _ENTITY_OVERRIDE_CACHE["data"]
+    if not isinstance(raw, dict):
+        return {}
+    parsed: dict[str, str] = {}
+    for k, v in raw.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            continue
+        norm = k.strip().lower()
+        target = v.strip().lower()
+        if not norm or target not in _ENTITY_LABELS:
+            continue
+        parsed[norm] = target
+    _ENTITY_OVERRIDE_CACHE["mtime"] = mtime
+    _ENTITY_OVERRIDE_CACHE["data"] = parsed
+    return parsed
+
+
+def _override_entity_label(etext: str, elabel: str) -> str:
+    """Apply personal overrides — return correct elabel or original."""
+    overrides = _load_entity_overrides()
+    if not overrides:
+        return elabel
+    target = overrides.get((etext or "").strip().lower())
+    if target and target in _ENTITY_LABELS:
+        return target
+    return elabel
+
+
+# ── Known places allowlist (location validator) ─────────────────────────────
+# GLiNER tiene falsos positivos sistémicos cuando el corpus tiene chat
+# slang ("oka" = okay), common nouns ("casa", "comedor", "centro"),
+# productos ("Mac"), AWS regions ("us-east-1") o adverbios ("acá") — todos
+# clasificados como `location` con confidence > 0.70. Sin filtro, el atlas
+# muestra "Mac · location · 16 menciones" que no aporta nada al user.
+#
+# Principio (asentado el 2026-05-10): contrastá la creación de lugares
+# contra un mapa / lista previa. Si una entity sale como `location` pero
+# no matchea el allowlist (countries + provincias AR + ciudades mundiales)
+# Y no tiene override personal explícito, la skipeamos.
+#
+# Allowlist canonical: `rag/data/known_places.json` shipped con el repo.
+# Extension del user (no pisada por upgrades): `~/.config/obsidian-rag/
+# known_places_extra.json` (mismo schema {"places": [...]}).
+_KNOWN_PLACES_FILE = Path(__file__).parent / "data" / "known_places.json"
+_KNOWN_PLACES_EXTRA_FILE = Path.home() / ".config" / "obsidian-rag" / "known_places_extra.json"
+_KNOWN_PLACES_CACHE: dict = {"mtimes": (0.0, 0.0), "data": frozenset()}
+
+
+def _load_known_places() -> frozenset[str]:
+    """Lazy-load + mtime-cache the allowlist of canonical place names."""
+    try:
+        m_canonical = _KNOWN_PLACES_FILE.stat().st_mtime if _KNOWN_PLACES_FILE.exists() else 0.0
+    except OSError:
+        m_canonical = 0.0
+    try:
+        m_extra = _KNOWN_PLACES_EXTRA_FILE.stat().st_mtime if _KNOWN_PLACES_EXTRA_FILE.exists() else 0.0
+    except OSError:
+        m_extra = 0.0
+    if (m_canonical, m_extra) == _KNOWN_PLACES_CACHE["mtimes"]:
+        return _KNOWN_PLACES_CACHE["data"]
+
+    places: set[str] = set()
+    for path in (_KNOWN_PLACES_FILE, _KNOWN_PLACES_EXTRA_FILE):
+        if not path.exists():
+            continue
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        items = raw.get("places") if isinstance(raw, dict) else raw
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if isinstance(item, str):
+                norm = item.strip().lower()
+                if norm:
+                    places.add(norm)
+    _KNOWN_PLACES_CACHE["mtimes"] = (m_canonical, m_extra)
+    _KNOWN_PLACES_CACHE["data"] = frozenset(places)
+    return _KNOWN_PLACES_CACHE["data"]
+
+
+def _validate_location_or_demote(etext: str, elabel: str) -> str | None:
+    """Aplica el filtro de lugares a una entity ya stop-worded.
+
+    - Si NO es `location`, devuelve elabel sin cambios (la responsabilidad
+      de re-classify por override la maneja `_override_entity_label`
+      antes en el pipeline).
+    - Si es `location` Y el `etext` matchea el allowlist (countries,
+      provinces, ciudades) → devuelve `"location"`.
+    - Si NO matchea → devuelve `None`. Caller debe SKIPpear la entity
+      (no agregarla a ningún tipo). Se loguea via `_silent_log` para que
+      el user pueda ampliar el allowlist si descubre un real-place que
+      esté quedando filtrado.
+
+    El override `_override_entity_label` corre ANTES en el pipeline, así
+    que si el user mapea explícitamente "mac → organization", entra
+    como organization y este validator solo ve elabel != location → pasa
+    sin filtrar.
+    """
+    if elabel != "location":
+        return elabel
+    norm = (etext or "").strip().lower()
+    places = _load_known_places()
+    if norm in places:
+        return "location"
+    try:
+        _silent_log("entity_location_skipped", ValueError(f"not in known_places: {etext!r}"))
+    except Exception:
+        pass
+    return None
+
 _gliner_model = None
 _gliner_lock = threading.Lock()
 _gliner_load_failed = False
@@ -51516,8 +51679,10 @@ def _extract_entities_single(text: str) -> list:
         # `_ENTITY_STOPWORDS_PERSON` y `_ENTITY_PHONE_ID_RE` arriba para
         # la motivación empírica (2666 yo / 1279 Maria → Maria legítima
         # quedaba enterrada).
+        etext_lower = etext.lower()
+        if etext_lower in _ENTITY_STOPWORDS_GLOBAL:
+            continue
         if elabel == "person":
-            etext_lower = etext.lower()
             if etext_lower in _ENTITY_STOPWORDS_PERSON:
                 continue
             if _ENTITY_PHONE_ID_RE.match(etext):
@@ -51526,6 +51691,15 @@ def _extract_entities_single(text: str) -> list:
         # "pc", "PO", "sr", "Ex", "la" — ruido consistente en el corpus.
         if len(etext) < 3:
             continue
+        # Personal override: re-classify nombres conocidos del user
+        # antes de admitirlos al upsert.
+        elabel = _override_entity_label(etext, elabel)
+        # Location validator: si quedó como `location` pero no está en
+        # el allowlist (chat slang / common nouns / productos), skipeamos.
+        validated = _validate_location_or_demote(etext, elabel)
+        if validated is None:
+            continue
+        elabel = validated
         out.append((etext, elabel, score))
     return out
 
@@ -51570,14 +51744,21 @@ def _extract_entities_batch(texts: list) -> list:
             elabel = (e.get("label") or "").lower().strip()
             if not etext or elabel not in _ENTITY_LABELS:
                 continue
+            etext_lower = etext.lower()
+            if etext_lower in _ENTITY_STOPWORDS_GLOBAL:
+                continue
             if elabel == "person":
-                etext_lower = etext.lower()
                 if etext_lower in _ENTITY_STOPWORDS_PERSON:
                     continue
                 if _ENTITY_PHONE_ID_RE.match(etext):
                     continue
             if len(etext) < 3:
                 continue
+            elabel = _override_entity_label(etext, elabel)
+            validated = _validate_location_or_demote(etext, elabel)
+            if validated is None:
+                continue
+            elabel = validated
             candidates.append((etext, elabel, score))
         results.append(_cluster_entities(candidates))
     return results

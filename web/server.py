@@ -14085,7 +14085,11 @@ def atlas_api(window_days: int = 30, top_entities: int = 50, graph_top_notes: in
     key = str((window_days, top_entities, graph_top_notes))
     cached = _ATLAS_DASH_CACHE.get(key)
     if cached:
-        return cached
+        # `ThreadSafeCacheMultiKey.get` retorna (ts, payload). Sin unpack,
+        # FastAPI levantaba ResponseValidationError en cache-hit (response
+        # debería ser dict, no tuple). Bug preexistente — fix de paso.
+        _, payload = cached
+        return payload
     from web.atlas_dashboard import snapshot
     payload = snapshot(
         window_days=window_days,

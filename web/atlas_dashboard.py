@@ -40,6 +40,146 @@ _DASHBOARD_CACHE: dict = {"key": None, "payload": None}
 _DASHBOARD_CACHE_LOCK = threading.Lock()
 
 
+# ── Personal entity overrides ─────────────────────────────────────────────────
+# GLiNER tiene falsos positivos sistémicos cuando un nombre propio personal
+# colisiona con un topónimo conocido (ej. "Grecia" = nombre de hija del user
+# pero gliner lo clasifica como `location` el ~99% de las veces porque
+# "Grecia" como país es estadísticamente más frecuente en su corpus de
+# pre-train). Sin override, el atlas muestra "Grecia · location · 105
+# menciones" cuando la verdad es que esas 105 menciones son de la persona.
+#
+# El override es opt-in via JSON personal:
+#   ~/.config/obsidian-rag/entity_overrides.json
+#   {"grecia": "person", "barcelona": "person"}
+#
+# Aplicado post-query en `_apply_entity_overrides`: las filas en el tipo
+# equivocado se MUEVEN al tipo correcto, y si ya existe una fila con ese
+# nombre en el tipo target (caso típico: gliner detectó Grecia/person UNA
+# vez con confianza alta), se DEDUPE por nombre sumando mention_count +
+# sparkline + recent/prev counts + uniones de aliases.
+#
+# NO toca DB (rag_entities + rag_entity_mentions quedan como están —
+# para no perder data raw en caso que el user revise el override).
+_OVERRIDE_FILE = Path.home() / ".config" / "obsidian-rag" / "entity_overrides.json"
+_OVERRIDE_CACHE: dict = {"mtime": 0.0, "data": {}}
+_OVERRIDE_VALID_TYPES = ("person", "location", "organization", "event")
+
+
+def _load_entity_overrides() -> dict[str, str]:
+    """Read the personal entity overrides JSON file. Cached by mtime.
+
+    Returns a dict `{normalized_name_lower: target_type}`. Silent fail
+    on missing/malformed file (returns empty dict).
+    """
+    try:
+        mtime = _OVERRIDE_FILE.stat().st_mtime
+    except OSError:
+        if _OVERRIDE_CACHE["mtime"] != 0.0:
+            _OVERRIDE_CACHE["mtime"] = 0.0
+            _OVERRIDE_CACHE["data"] = {}
+        return {}
+    if mtime == _OVERRIDE_CACHE["mtime"]:
+        return _OVERRIDE_CACHE["data"]
+    try:
+        raw = json.loads(_OVERRIDE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return _OVERRIDE_CACHE["data"]  # keep last good
+    if not isinstance(raw, dict):
+        return {}
+    parsed: dict[str, str] = {}
+    for k, v in raw.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            continue
+        norm = k.strip().lower()
+        target = v.strip().lower()
+        if not norm or target not in _OVERRIDE_VALID_TYPES:
+            continue
+        parsed[norm] = target
+    _OVERRIDE_CACHE["mtime"] = mtime
+    _OVERRIDE_CACHE["data"] = parsed
+    return parsed
+
+
+def _merge_entities(a: dict, b: dict) -> dict:
+    """Fold b into a in-place: sum counts, union aliases, max last_seen,
+    min first_seen, element-wise sparkline sum."""
+    a["mention_count"] = (a.get("mention_count") or 0) + (b.get("mention_count") or 0)
+    a["recent_mentions"] = (a.get("recent_mentions") or 0) + (b.get("recent_mentions") or 0)
+    a["prev_mentions"] = (a.get("prev_mentions") or 0) + (b.get("prev_mentions") or 0)
+    spark_a = a.get("sparkline") or []
+    spark_b = b.get("sparkline") or []
+    n = max(len(spark_a), len(spark_b))
+    a["sparkline"] = [
+        (spark_a[i] if i < len(spark_a) else 0) + (spark_b[i] if i < len(spark_b) else 0)
+        for i in range(n)
+    ]
+    a_last = a.get("last_seen_ts") or 0
+    b_last = b.get("last_seen_ts") or 0
+    if b_last > a_last:
+        a["last_seen_ts"] = b_last
+    a_first = a.get("first_seen_ts") or 0
+    b_first = b.get("first_seen_ts") or 0
+    if a_first == 0 or (b_first > 0 and b_first < a_first):
+        a["first_seen_ts"] = b_first
+    aliases = list(a.get("aliases") or [])
+    for x in (b.get("aliases") or []):
+        if x not in aliases:
+            aliases.append(x)
+    a["aliases"] = aliases[:5]
+    return a
+
+
+def _apply_entity_overrides(
+    result: dict[str, list[dict]],
+    full: dict[int, dict],
+    overrides: dict[str, str],
+    top_per_type: int,
+) -> tuple[dict[str, list[dict]], dict[int, dict]]:
+    """Re-classify entities según overrides personales + dedupe por nombre."""
+    types = list(result.keys())
+    moved: dict[str, list[dict]] = {t: [] for t in types}
+    for src_type in types:
+        kept: list[dict] = []
+        for ent in result[src_type]:
+            name = (ent.get("name") or "").strip().lower()
+            target = overrides.get(name)
+            if target and target != src_type and target in types:
+                ent_copy = dict(ent)
+                ent_copy["type"] = target
+                ent_copy["override_from"] = src_type  # for /api/atlas debugging
+                moved[target].append(ent_copy)
+                ent_id = ent.get("id")
+                if ent_id is not None:
+                    full.pop(ent_id, None)
+            else:
+                kept.append(ent)
+        result[src_type] = kept
+
+    for target in types:
+        if not moved[target]:
+            continue
+        by_name: dict[str, dict] = {}
+        for ent in result[target] + moved[target]:
+            key = (ent.get("name") or "").strip().lower()
+            existing = by_name.get(key)
+            if existing:
+                _merge_entities(existing, ent)
+            else:
+                by_name[key] = dict(ent)
+        merged = sorted(
+            by_name.values(),
+            key=lambda e: e.get("mention_count", 0),
+            reverse=True,
+        )[:top_per_type]
+        result[target] = merged
+        for ent in merged:
+            ent_id = ent.get("id")
+            if ent_id is not None:
+                full[ent_id] = ent
+
+    return result, full
+
+
 # ── Junk entity filter ────────────────────────────────────────────────────────
 # GLiNER (el extractor que puebla rag_entities) a veces clasifica como
 # `person` strings que en realidad son números de teléfono internacionales
@@ -218,6 +358,10 @@ def _query_entities_by_type(
             }
             result[entity_type].append(ent)
             full[ent_id] = ent
+
+    overrides = _load_entity_overrides()
+    if overrides:
+        result, full = _apply_entity_overrides(result, full, overrides, top_per_type)
 
     return result, full
 

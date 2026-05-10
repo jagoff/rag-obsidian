@@ -3975,6 +3975,39 @@ def get_dossier(name: str, days: int = 30, max_messages: int = 30) -> dict:
     return {"ok": True, "name": name, "dossier": result}
 
 
+@app.get("/api/calendar/upcoming")
+def calendar_upcoming(limit: int = 5, days: int = 1) -> dict:
+    """Próximos eventos del calendario.
+
+    Game Changer GC7 (2026-05-09): wireup HTTP de `_fetch_calendar_ahead()`.
+    Trigger desde el listener WA: `/next 3` → este endpoint → formatear.
+
+    Read-only sobre Calendar.app via icalBuddy. Sin auth.
+
+    Query params:
+        limit: máx events a devolver (1-30, default 5).
+        days: ventana ahead (0=hoy, 1=hoy+mañana, hasta 7).
+
+    Response:
+        {"ok": True, "events": [{"title", "date_label", "time_range"}, ...]}
+        Cada event tiene `time_range` "HH:MM-HH:MM" o vacío para all-day.
+    """
+    limit = max(1, min(int(limit), 30))
+    days = max(0, min(int(days), 7))
+    try:
+        from rag.integrations.calendar import _fetch_calendar_ahead
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"calendar module unavailable: {e}") from e
+
+    try:
+        events = _fetch_calendar_ahead(days_ahead=days, max_events=limit * 3) or []
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"calendar fetch failed: {str(e)[:200]}") from e
+
+    # Cap a `limit` final.
+    return {"ok": True, "count": len(events[:limit]), "events": events[:limit]}
+
+
 @app.get("/api/contacts")
 def list_contacts(q: str = "", kind: str = "any", limit: int = 20) -> dict:
     """Contact picker para el popover de ``/wzp`` y ``/mail`` del web chat.

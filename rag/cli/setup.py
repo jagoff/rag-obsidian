@@ -104,9 +104,7 @@ _RAG_NET_LABELS: tuple[str, ...] = (
     "com.fer.whatsapp-listener-healthcheck",
     "com.fer.whatsapp-vault-sync",
 )
-_QDRANT_LABELS: tuple[str, ...] = (
-    "com.fer.qdrant",
-)
+_QDRANT_LABELS: tuple[str, ...] = ("com.fer.qdrant",)
 
 # Set mínimo viable que `rag start --minimal` (default ON desde 2026-05-08)
 # instala. Sin briefs, sin learning loops, sin productividad pasiva — solo
@@ -115,15 +113,17 @@ _QDRANT_LABELS: tuple[str, ...] = (
 # maintenance para WAL checkpoint y rotación de logs. Los managed que
 # queden afuera reciben el mismo trato que `_DEPRECATED_LABELS` durante el
 # install (bootout + unlink). `rag start --full` instala los 30.
-_MINIMAL_MANAGED_LABELS: frozenset[str] = frozenset({
-    # Post-supervisor refactor 2026-05-09: minimal === all managed.
-    # `daemon-watchdog` + `wake-hook` reemplazados por supervisor
-    # internals (APScheduler coalesce + misfire_grace_time). `maintenance`
-    # corre adentro del supervisor como cron job (jobs/nightly.py).
-    "com.fer.obsidian-rag-supervisor",
-    "com.fer.obsidian-rag-watch",
-    "com.fer.obsidian-rag-web",
-})
+_MINIMAL_MANAGED_LABELS: frozenset[str] = frozenset(
+    {
+        # Post-supervisor refactor 2026-05-09: minimal === all managed.
+        # `daemon-watchdog` + `wake-hook` reemplazados por supervisor
+        # internals (APScheduler coalesce + misfire_grace_time). `maintenance`
+        # corre adentro del supervisor como cron job (jobs/nightly.py).
+        "com.fer.obsidian-rag-supervisor",
+        "com.fer.obsidian-rag-watch",
+        "com.fer.obsidian-rag-web",
+    }
+)
 
 
 # _loaded_launchd_labels, _bootout_label, _bootstrap_label viven en
@@ -133,6 +133,142 @@ _MINIMAL_MANAGED_LABELS: frozenset[str] = frozenset({
 
 
 import os  # noqa: E402  (local symbol; el código abajo lo usa)
+
+
+def _find_cloudflare_tunnel_labels() -> tuple[str, ...]:
+    """Buscar dinámicamente plists de cloudflare en ~/Library/LaunchAgents/.
+
+    Glob: com.fer.obsidian-rag-cloudflare-*.plist
+    Retorna tuple de labels (sin .plist).
+    """
+    from rag import _LAUNCH_AGENTS_DIR  # noqa: PLC0415
+
+    labels = []
+    for plist_path in _LAUNCH_AGENTS_DIR.glob("com.fer.obsidian-rag-cloudflare-*.plist"):
+        label = plist_path.stem  # Remove .plist
+        labels.append(label)
+    return tuple(sorted(labels))
+
+
+def _cleanup_staled_locks() -> None:
+    """Limpiar lock files estaled después de bootout de daemons.
+
+    Verifica si el PID del owner del lock sigue vivo. Si no, borra el lock.
+    Archivos: anticipate.lock, reindex.lock, supervisor.sock, supervisor.pid.
+    """
+    lock_files = [
+        Path.home() / ".local" / "share" / "obsidian-rag" / "anticipate.lock",
+        Path.home() / ".local" / "share" / "obsidian-rag" / "reindex.lock",
+        Path.home() / ".local" / "share" / "obsidian-rag" / "supervisor.sock",
+        Path.home() / ".local" / "share" / "obsidian-rag" / "supervisor.pid",
+    ]
+
+    for lock_path in lock_files:
+        if not lock_path.exists():
+            continue
+        try:
+            # Para .pid, leer el PID
+            if lock_path.name.endswith(".pid"):
+                pid_str = lock_path.read_text().strip()
+                if pid_str.isdigit():
+                    pid = int(pid_str)
+                    # Verificar si el proceso sigue vivo (kill 0 = no-op, solo checkea permisos)
+                    os.kill(pid, 0)
+                    # Si no levantó excepción, el proceso está vivo — no borrar
+                    continue
+                # Si el contenido no es un PID válido, borrar el lock
+            # Para .lock y .sock, simplemente borrar si están viejos o si la info es corrupta
+            lock_path.unlink()
+        except ProcessLookupError:
+            # PID no existe — borrar el lock
+            try:
+                lock_path.unlink()
+            except OSError:
+                pass
+        except (OSError, ValueError):
+            # Error de permisos o parsing — dejar el lock (seguro)
+            pass
+
+
+def _print_access_urls() -> None:
+    """Mostrar URLs accesibles, health status y endpoints del web server."""
+    from rag import console  # noqa: PLC0415
+    from rag.cli._start_helpers import (  # noqa: PLC0415
+        get_cloudflared_url,
+        get_lan_ip,
+        health_probe_web,
+        read_plist_env_var,
+    )
+
+    console.print("[bold cyan]▸ acceso[/bold cyan]")
+
+    # ── Health probe ─────────────────────────────────────────────────────
+    ok, latency_ms = health_probe_web()
+    if ok:
+        console.print(f"  [green]✓[/green] web respondió en {latency_ms} ms")
+    else:
+        console.print(
+            "[yellow]![/yellow] web no respondió todavía (puede estar en warmup MLX, esperá ~30s)"
+        )
+
+    # ── URLs base ────────────────────────────────────────────────────────
+    port = 8765
+    localhost_base = f"http://127.0.0.1:{port}"
+
+    # Detectar si OBSIDIAN_RAG_BIND_HOST=0.0.0.0 para agregar LAN IP
+    lan_ip = None
+    bind_host = read_plist_env_var("com.fer.obsidian-rag-web", "OBSIDIAN_RAG_BIND_HOST")
+    if bind_host == "0.0.0.0":
+        lan_ip = get_lan_ip()
+
+    # ── Endpoints ────────────────────────────────────────────────────────
+    endpoints = [
+        ("chat", "/chat"),
+        ("dashboard", "/dashboard"),
+        ("atlas", "/atlas"),
+        ("mirror", "/mirror"),
+        ("memory", "/memory"),
+    ]
+
+    for name, path in endpoints:
+        url_localhost = f"{localhost_base}{path}"
+        console.print(f"  [dim]·[/dim] [cyan]{name:<12}[/cyan] : {url_localhost}", end="")
+        if lan_ip:
+            url_lan = f"http://{lan_ip}:{port}{path}"
+            console.print(f"  ([dim]LAN[/dim]: {url_lan})")
+        else:
+            console.print()
+
+    # ── Tunnel URL (si existe) ───────────────────────────────────────────
+    tunnel_url = get_cloudflared_url()
+    if tunnel_url:
+        console.print(f"  [dim]·[/dim] [cyan]{'tunnel':<12}[/cyan] : {tunnel_url}")
+
+    # ── Admin token ──────────────────────────────────────────────────────
+    admin_token_path = Path.home() / ".config" / "obsidian-rag" / "admin_token.txt"
+    admin_status = (
+        "[green]existente[/green]"
+        if admin_token_path.exists()
+        else "[yellow]se genera al primer hit admin[/yellow]"
+    )
+    console.print(
+        f"  [dim]·[/dim] [cyan]{'admin token':<12}[/cyan] : {admin_token_path} ({admin_status})"
+    )
+
+    # ── MCP endpoint ─────────────────────────────────────────────────────
+    console.print("[bold cyan]▸ herramientas[/bold cyan]")
+    console.print(
+        "  [dim]·[/dim] MCP server  : [cyan]obsidian-rag-mcp[/cyan] (entry point para Claude Code / Devin)"
+    )
+
+    # ── Verificación recomendada ────────────────────────────────────────
+    console.print()
+    console.print("[dim]Verificar:[/dim]")
+    console.print("  [dim]·[/dim] [cyan]rag daemons status[/cyan]    — health del control plane")
+    console.print(
+        "  [dim]·[/dim] [cyan]tail -f ~/.local/share/obsidian-rag/web.log[/cyan]  — FastAPI server"
+    )
+    console.print("  [dim]·[/dim] [cyan]curl -s http://127.0.0.1:8765/health | jq[/cyan]")
 
 
 def _setup_install(
@@ -182,7 +318,8 @@ def _setup_install(
         try:
             subprocess.run(
                 ["launchctl", "bootout", f"{_domain}/{label}"],
-                check=False, capture_output=True,
+                check=False,
+                capture_output=True,
             )
         except Exception:
             pass
@@ -193,8 +330,7 @@ def _setup_install(
             _bootout(dep_plist, deprecated)
             dep_plist.unlink()
             console.print(
-                f"[dim]·[/dim] deprecated: {deprecated} "
-                f"[dim](bootouted + removido del disco)[/dim]"
+                f"[dim]·[/dim] deprecated: {deprecated} [dim](bootouted + removido del disco)[/dim]"
             )
 
     for label, fname, content in _services_spec(rag_bin):
@@ -242,9 +378,7 @@ def _setup_install(
                         f"[dim](plist viejo removido del disco)[/dim]"
                     )
                 else:
-                    console.print(
-                        f"[yellow]·[/yellow] skip {label}: {hint}"
-                    )
+                    console.print(f"[yellow]·[/yellow] skip {label}: {hint}")
                 continue
         plist_path.write_text(content, encoding="utf-8")
         try:
@@ -252,23 +386,22 @@ def _setup_install(
             # = ya estaba cargado (no es error real, idempotencia OK).
             res = subprocess.run(
                 ["launchctl", "bootstrap", _domain, str(plist_path)],
-                check=False, capture_output=True,
+                check=False,
+                capture_output=True,
             )
             if res.returncode in (0, 37):
                 console.print(f"[green]✓[/green] cargado: [bold]{label}[/bold]")
             else:
                 stderr = res.stderr.decode(errors="ignore") if res.stderr else ""
                 console.print(
-                    f"[red]✗[/red] falló cargar {label} (exit={res.returncode}): "
-                    f"{stderr.strip()}"
+                    f"[red]✗[/red] falló cargar {label} (exit={res.returncode}): {stderr.strip()}"
                 )
         except Exception as exc:
             console.print(f"[red]✗[/red] falló cargar {label}: {exc}")
 
 
 @click.command("setup")
-@click.option("--remove", is_flag=True,
-              help="Desinstalar los servicios en lugar de instalarlos")
+@click.option("--remove", is_flag=True, help="Desinstalar los servicios en lugar de instalarlos")
 def setup(remove: bool):
     """Instalar (o desinstalar) los servicios launchd que mantienen el RAG vivo
     sin intervención: `rag watch` (auto-reindex) y `rag digest` (semanal).
@@ -296,7 +429,9 @@ def setup(remove: bool):
         # nadie lo notara. Si querés MUY mínimo (e.g. CI sin GPU/MPS),
         # corré `uv tool install --reinstall --editable .` (sin extra) y
         # exportá `RAG_EXTRACT_ENTITIES=0` para silenciar.
-        console.print("[dim]Instalá primero: uv tool install --reinstall --editable '.[entities]'[/dim]")
+        console.print(
+            "[dim]Instalá primero: uv tool install --reinstall --editable '.[entities]'[/dim]"
+        )
         return
     _setup_install(rag_bin, remove=remove, only_labels=None)
 
@@ -321,15 +456,14 @@ def setup(remove: bool):
             if cache_stale:
                 console.print()
                 console.print(
-                    "[dim]Pre-building Apple Contacts phone index "
-                    "(primer run, ~1-2min)…[/dim]"
+                    "[dim]Pre-building Apple Contacts phone index (primer run, ~1-2min)…[/dim]"
                 )
                 t0 = time.time()
                 idx = _load_contacts_phone_index()
                 if idx:
                     console.print(
                         f"[green]✓[/green] contacts cache: "
-                        f"{len(idx)} phones indexados en {time.time()-t0:.1f}s"
+                        f"{len(idx)} phones indexados en {time.time() - t0:.1f}s"
                     )
                 else:
                     console.print(
@@ -339,9 +473,7 @@ def setup(remove: bool):
                     )
         except Exception as exc:
             _silent_log("setup_contacts_warmup", exc)
-            console.print(
-                "[yellow]·[/yellow] contacts cache warmup falló — continuá sin ello"
-            )
+            console.print("[yellow]·[/yellow] contacts cache warmup falló — continuá sin ello")
 
         console.print()
         console.print(
@@ -353,24 +485,34 @@ def setup(remove: bool):
 
 @click.command("stop")
 @click.option(
-    "--with-rag-net/--without-rag-net", default=True,
+    "--with-rag-net/--without-rag-net",
+    default=True,
     help="Incluir daemons de RagNet/WhatsApp (whatsapp-bridge/listener/"
-         "healthcheck/vault-sync). Default: sí.",
+    "healthcheck/vault-sync). Default: sí.",
 )
 @click.option(
-    "--with-qdrant", is_flag=True, default=False,
-    help="Detener también qdrant (com.fer.qdrant). Default OFF: compartido "
-         "con mem-vault.",
+    "--with-qdrant",
+    is_flag=True,
+    default=False,
+    help="Detener también qdrant (com.fer.qdrant). Default OFF: compartido con mem-vault.",
 )
 @click.option(
-    "--all", "stop_all", is_flag=True, default=False,
+    "--all",
+    "stop_all",
+    is_flag=True,
+    default=False,
     help="Atajo para --with-qdrant + --with-rag-net.",
 )
 @click.option(
-    "--yes", "-y", is_flag=True, help="No pedir confirmación.",
+    "--yes",
+    "-y",
+    is_flag=True,
+    help="No pedir confirmación.",
 )
 @click.option(
-    "--dry-run", is_flag=True, help="Mostrar qué pararía pero no ejecutar.",
+    "--dry-run",
+    is_flag=True,
+    help="Mostrar qué pararía pero no ejecutar.",
 )
 def stop(
     with_rag_net: bool,
@@ -410,12 +552,17 @@ def stop(
         _bootout_label,
         _loaded_launchd_labels,
         _log_daemon_run_event,
+        _silent_log,
         console,
     )
 
     if stop_all:
         with_qdrant = True
         with_rag_net = True
+
+    # ── Detectar cloudflare tunnel plists dinámicamente ──────────────────
+    # Si el user arrancó tunnels a mano, bootoutearlos junto con el resto.
+    cloudflare_labels = _find_cloudflare_tunnel_labels()
 
     # ── Construir la lista ordenada de labels a bootoutear ──────────────
     # 1. Watchdog + wake-hook PRIMERO (para que no rebootstrap-een lo demás)
@@ -435,6 +582,11 @@ def stop(
         if lbl in all_obsidian_rag:
             targets.append((lbl, "watchdog"))
     targets.extend((lbl, "obsidian-rag") for lbl in rest_obsidian_rag)
+
+    # 3. Cloudflare tunnels (dinámico)
+    if cloudflare_labels:
+        targets.extend((lbl, "cloudflare") for lbl in cloudflare_labels)
+
     if with_rag_net:
         targets.extend((lbl, "rag-net") for lbl in _RAG_NET_LABELS)
     if with_qdrant:
@@ -461,10 +613,11 @@ def stop(
 
     a_watch, p_watch = _split("watchdog")
     a_obs, p_obs = _split("obsidian-rag")
+    a_cf, p_cf = _split("cloudflare")
     a_rn, p_rn = _split("rag-net")
     a_qd, p_qd = _split("qdrant")
-    n_active = a_watch + a_obs + a_rn + a_qd
-    n_stopped = p_watch + p_obs + p_rn + p_qd
+    n_active = a_watch + a_obs + a_cf + a_rn + a_qd
+    n_stopped = p_watch + p_obs + p_cf + p_rn + p_qd
     n_total = n_active + n_stopped
 
     def _fmt(active: int, stopped: int) -> str:
@@ -489,14 +642,20 @@ def stop(
         )
     console.print(f"  [dim]·[/dim] watchdog/wake-hook : {_fmt(a_watch, p_watch)}")
     console.print(f"  [dim]·[/dim] obsidian-rag-*     : {_fmt(a_obs, p_obs)}")
+    if cloudflare_labels:
+        console.print(f"  [dim]·[/dim] cloudflare tunnels : {_fmt(a_cf, p_cf)}")
     if with_rag_net:
         console.print(f"  [dim]·[/dim] RagNet (whatsapp-*): {_fmt(a_rn, p_rn)}")
     else:
-        console.print("  [dim]·[/dim] RagNet (whatsapp-*): [yellow]skip[/yellow] (--without-rag-net)")
+        console.print(
+            "  [dim]·[/dim] RagNet (whatsapp-*): [yellow]skip[/yellow] (--without-rag-net)"
+        )
     if with_qdrant:
         console.print(f"  [dim]·[/dim] qdrant             : {_fmt(a_qd, p_qd)}")
     else:
-        console.print("  [dim]·[/dim] qdrant             : [yellow]skip[/yellow] (default — compartido con mem-vault)")
+        console.print(
+            "  [dim]·[/dim] qdrant             : [yellow]skip[/yellow] (default — compartido con mem-vault)"
+        )
     console.print()
     if loaded_known and n_active == 0:
         console.print("[green]✓[/green] [dim]nada activo — no hay nada que parar.[/dim]")
@@ -521,7 +680,7 @@ def stop(
     for label, category in targets:
         slug = (
             label.replace("com.fer.obsidian-rag-", "")
-            if category in ("watchdog", "obsidian-rag")
+            if category in ("watchdog", "obsidian-rag", "cloudflare")
             else label
         )
         result = _bootout_label(label)
@@ -531,8 +690,10 @@ def stop(
             console.print(f"[green]✓[/green] [{category}] {slug}")
             ok_count += 1
             _log_daemon_run_event(
-                label=label, action="bootout",
-                exit_code=0, reason="rag stop",
+                label=label,
+                action="bootout",
+                exit_code=0,
+                reason="rag stop",
             )
         elif result["ok"]:
             console.print(f"[dim]·[/dim] [{category}] {slug} [dim](ya estaba parado)[/dim]")
@@ -545,16 +706,44 @@ def stop(
             )
             fail_count += 1
             _log_daemon_run_event(
-                label=label, action="bootout",
-                exit_code=result["exit_code"], reason="rag stop (failed)",
+                label=label,
+                action="bootout",
+                exit_code=result["exit_code"],
+                reason="rag stop (failed)",
             )
+
+    # ── Limpieza de locks staled ────────────────────────────────────────
+    # Después de bootout, algunos daemons pueden dejar locks cuyos PIDs ya
+    # no existen. Limpiarlos previene confusiones en el próximo `rag start`.
+    try:
+        _cleanup_staled_locks()
+    except Exception as exc:
+        _silent_log("rag_stop_cleanup_locks", exc)
+
+    # ── Verificación final: no debería haber daemons cargados ──────────
+    # Post-bootout, hacer un chequeo sanity de que nada quedó cargado.
+    final_loaded = _loaded_launchd_labels()
+    obsidian_rag_still_loaded = [
+        lbl
+        for lbl in final_loaded
+        if lbl.startswith("com.fer.obsidian-rag-") or lbl in _RAG_NET_LABELS
+    ]
+    # Cloudflare puede no ser detectable de la misma forma (es dinámico),
+    # pero si encontramos labels obsidian-rag vivos, reportar.
+    if obsidian_rag_still_loaded and ok_count > 0:
+        console.print()
+        console.print(
+            f"[yellow]![/yellow] post-stop, todavía hay daemons cargados: "
+            f"{', '.join(obsidian_rag_still_loaded[:3])}"
+            + ("..." if len(obsidian_rag_still_loaded) > 3 else "")
+        )
+        console.print("[yellow]Hint: probá `rag daemons doctor` para diagnóstico[/yellow]")
 
     # ── Summary ──────────────────────────────────────────────────────────
     console.print()
     if fail_count == 0:
         console.print(
-            f"[green]✓[/green] sistema detenido — "
-            f"{ok_count} parados, {already_count} ya estaban"
+            f"[green]✓[/green] sistema detenido — {ok_count} parados, {already_count} ya estaban"
         )
     else:
         console.print(
@@ -569,7 +758,9 @@ def stop(
     # garantiza "si rag está off, al login nada arranca". `rag start` los
     # regenera desde código via `setup()` — son artefactos, no hay
     # pérdida de estado.
-    archive_root = _LAUNCH_AGENTS_DIR / f".archive-rag-stop-{_dt.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    archive_root = (
+        _LAUNCH_AGENTS_DIR / f".archive-rag-stop-{_dt.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    )
     archived = 0
     archive_skip_categories = {"qdrant"}  # compartidos con mem-vault
     for label, category in targets:
@@ -594,7 +785,9 @@ def stop(
 
     console.print()
     console.print("[dim]Para volver a arrancar:[/dim]")
-    console.print("  [dim]·[/dim] obsidian-rag : [cyan]rag start[/cyan] [dim](o `rag setup` para solo regenerar plists)[/dim]")
+    console.print(
+        "  [dim]·[/dim] obsidian-rag : [cyan]rag start[/cyan] [dim](o `rag setup` para solo regenerar plists)[/dim]"
+    )
     if with_rag_net:
         console.print(
             "  [dim]·[/dim] RagNet       : "
@@ -659,44 +852,61 @@ def _run_catch_up_index(ctx: click.Context) -> None:
 
 @click.command("start")
 @click.option(
-    "--minimal/--full", "minimal", default=True,
+    "--minimal/--full",
+    "minimal",
+    default=True,
     help="Mínimo viable (5 daemons: watch/web/daemon-watchdog/wake-hook/"
-         "maintenance) vs full (los 30 de _services_spec, incluyendo briefs, "
-         "learning loops y productividad pasiva). Default: mínimo. Lo NO "
-         "instalado en modo mínimo se bootouts + removido del disco — "
-         "re-correr con `--full` regenera todo.",
+    "maintenance) vs full (los 30 de _services_spec, incluyendo briefs, "
+    "learning loops y productividad pasiva). Default: mínimo. Lo NO "
+    "instalado en modo mínimo se bootouts + removido del disco — "
+    "re-correr con `--full` regenera todo.",
 )
 @click.option(
-    "--with-rag-net/--without-rag-net", default=True,
+    "--with-rag-net/--without-rag-net",
+    default=True,
     help="Levantar también daemons de RagNet/WhatsApp (whatsapp-bridge/"
-         "listener/healthcheck/vault-sync). Default: sí — sin RagNet la UX "
-         "del sistema queda a medias (web sí, WhatsApp no).",
+    "listener/healthcheck/vault-sync). Default: sí — sin RagNet la UX "
+    "del sistema queda a medias (web sí, WhatsApp no).",
 )
 @click.option(
-    "--with-qdrant", is_flag=True, default=False,
+    "--with-qdrant",
+    is_flag=True,
+    default=False,
     help="Levantar también qdrant (com.fer.qdrant). Default OFF.",
 )
 @click.option(
-    "--all", "start_all", is_flag=True, default=False,
+    "--all",
+    "start_all",
+    is_flag=True,
+    default=False,
     help="Atajo para --with-rag-net + --with-qdrant.",
 )
 @click.option(
-    "--no-index", is_flag=True, default=False,
+    "--no-index",
+    is_flag=True,
+    default=False,
     help="Saltear el catch-up incremental al final (default: sí lo corre, "
-         "para que el corpus quede al último minuto de uso).",
+    "para que el corpus quede al último minuto de uso).",
 )
 @click.option(
-    "--yes", "-y", is_flag=True, help="No pedir confirmación.",
+    "--yes",
+    "-y",
+    is_flag=True,
+    help="No pedir confirmación.",
 )
 @click.option(
-    "--dry-run", is_flag=True, help="Mostrar qué levantaría pero no ejecutar.",
+    "--dry-run",
+    is_flag=True,
+    help="Mostrar qué levantaría pero no ejecutar.",
 )
 @click.option(
-    "--apply-default", is_flag=True, default=False,
+    "--apply-default",
+    is_flag=True,
+    default=False,
     help="Antes de levantar daemons, aplicar el profile default de "
-         "rag-harness (.devin/mcp-profiles/.default). Si no hay default "
-         "seteado, no hace nada. Útil para garantizar un harness consistente "
-         "después de un reboot o un wrap mal cerrado.",
+    "rag-harness (.devin/mcp-profiles/.default). Si no hay default "
+    "seteado, no hace nada. Útil para garantizar un harness consistente "
+    "después de un reboot o un wrap mal cerrado.",
 )
 @click.pass_context
 def start(
@@ -732,7 +942,6 @@ def start(
     qdrant) y re-corré `rag start`.
     """
     from rag import (  # noqa: PLC0415
-        _RAG_LOG_DIR,
         _bootstrap_label,
         _log_daemon_run_event,
         _rag_binary,
@@ -748,7 +957,9 @@ def start(
     rag_bin = _rag_binary()
     if not Path(rag_bin).is_file():
         console.print(f"[red]No encuentro el binario `rag`:[/red] {rag_bin}")
-        console.print("[dim]Instalá primero: uv tool install --reinstall --editable '.[entities]'[/dim]")
+        console.print(
+            "[dim]Instalá primero: uv tool install --reinstall --editable '.[entities]'[/dim]"
+        )
         return
 
     spec_total = len(_services_spec(rag_bin))
@@ -771,11 +982,15 @@ def start(
     if with_rag_net:
         console.print(f"  [dim]·[/dim] RagNet (whatsapp-*)     : {len(_RAG_NET_LABELS)} daemons")
     else:
-        console.print("  [dim]·[/dim] RagNet (whatsapp-*)     : [yellow]skip[/yellow] (--without-rag-net)")
+        console.print(
+            "  [dim]·[/dim] RagNet (whatsapp-*)     : [yellow]skip[/yellow] (--without-rag-net)"
+        )
     if with_qdrant:
         console.print(f"  [dim]·[/dim] qdrant                  : {len(_QDRANT_LABELS)} daemons")
     else:
-        console.print("  [dim]·[/dim] qdrant                  : [yellow]skip[/yellow] (default — usalo si bajaste qdrant)")
+        console.print(
+            "  [dim]·[/dim] qdrant                  : [yellow]skip[/yellow] (default — usalo si bajaste qdrant)"
+        )
     if no_index:
         console.print("  [dim]·[/dim] catch-up index          : [yellow]skip[/yellow] (--no-index)")
     else:
@@ -795,10 +1010,18 @@ def start(
             active_p = _active_path.read_text().strip() if _active_path.exists() else None
             default_p = _default_path.read_text().strip() if _default_path.exists() else None
             if active_p:
-                console.print(f"  [dim]·[/dim] rag-harness profile     : [cyan]{active_p}[/cyan]"
-                              + (" [yellow](≠ default)[/yellow]" if default_p and default_p != active_p else ""))
+                console.print(
+                    f"  [dim]·[/dim] rag-harness profile     : [cyan]{active_p}[/cyan]"
+                    + (
+                        " [yellow](≠ default)[/yellow]"
+                        if default_p and default_p != active_p
+                        else ""
+                    )
+                )
             elif default_p:
-                console.print(f"  [dim]·[/dim] rag-harness default     : [yellow]{default_p}[/yellow] (no aplicado — `rag-harness default --apply`)")
+                console.print(
+                    f"  [dim]·[/dim] rag-harness default     : [yellow]{default_p}[/yellow] (no aplicado — `rag-harness default --apply`)"
+                )
     except Exception:
         # Hook informativo — un error acá no debe romper `rag start`
         pass
@@ -809,33 +1032,35 @@ def start(
         console.print("[dim]Dry-run — no ejecuto nada.[/dim]")
         if apply_default:
             try:
-                _hd = Path(__file__).resolve().parent.parent.parent / ".devin" / "mcp-profiles" / ".default"
+                _hd = (
+                    Path(__file__).resolve().parent.parent.parent
+                    / ".devin"
+                    / "mcp-profiles"
+                    / ".default"
+                )
                 if _hd.exists():
-                    console.print(f"  [dim]would-apply[/dim] [harness] profile default = {_hd.read_text().strip()}")
+                    console.print(
+                        f"  [dim]would-apply[/dim] [harness] profile default = {_hd.read_text().strip()}"
+                    )
                 else:
                     console.print("  [dim]would-skip[/dim] [harness] no hay default seteado")
             except Exception:
                 pass
         if minimal:
             installed = sorted(_MINIMAL_MANAGED_LABELS)
-            console.print(
-                f"  [dim]would-install[/dim] [managed-minimal] {len(installed)} labels:"
-            )
+            console.print(f"  [dim]would-install[/dim] [managed-minimal] {len(installed)} labels:")
             for lbl in installed:
                 console.print(f"    [dim]·[/dim] {lbl}")
             removed = sorted(
-                lbl for lbl, _, _ in _services_spec(rag_bin)
-                if lbl not in _MINIMAL_MANAGED_LABELS
+                lbl for lbl, _, _ in _services_spec(rag_bin) if lbl not in _MINIMAL_MANAGED_LABELS
             )
             if removed:
                 console.print(
-                    f"  [dim]would-remove[/dim] [managed-out-of-scope] "
-                    f"{len(removed)} labels"
+                    f"  [dim]would-remove[/dim] [managed-out-of-scope] {len(removed)} labels"
                 )
         else:
             console.print(
-                f"  [dim]would-install[/dim] [managed-full] "
-                f"{len(_services_spec(rag_bin))} labels"
+                f"  [dim]would-install[/dim] [managed-full] {len(_services_spec(rag_bin))} labels"
             )
         if with_qdrant:
             for lbl in _QDRANT_LABELS:
@@ -859,26 +1084,39 @@ def start(
         try:
             _harness_default = (
                 Path(__file__).resolve().parent.parent.parent
-                / ".devin" / "mcp-profiles" / ".default"
+                / ".devin"
+                / "mcp-profiles"
+                / ".default"
             )
             if _harness_default.exists():
                 _default_name = _harness_default.read_text().strip()
                 console.print()
-                console.print(f"[bold cyan]▸ rag-harness default[/bold cyan] → aplicando '{_default_name}'")
+                console.print(
+                    f"[bold cyan]▸ rag-harness default[/bold cyan] → aplicando '{_default_name}'"
+                )
                 _hb = Path.home() / ".local" / "bin" / "rag-harness"
                 if _hb.exists():
                     import subprocess as _sp
+
                     _r = _sp.run([str(_hb), "use", _default_name], capture_output=True, text=True)
                     if _r.returncode == 0:
                         console.print(f"  [green]✓[/green] profile '{_default_name}' aplicado")
-                        console.print("  [dim](las sesiones existentes de Claude Code / Devin no ven el cambio hasta reabrir)[/dim]")
+                        console.print(
+                            "  [dim](las sesiones existentes de Claude Code / Devin no ven el cambio hasta reabrir)[/dim]"
+                        )
                     else:
-                        console.print(f"  [yellow]![/yellow] rag-harness use falló: {_r.stderr.strip()[:200]}")
+                        console.print(
+                            f"  [yellow]![/yellow] rag-harness use falló: {_r.stderr.strip()[:200]}"
+                        )
                 else:
-                    console.print(f"  [yellow]![/yellow] rag-harness no está en {_hb} — instalá el symlink primero")
+                    console.print(
+                        f"  [yellow]![/yellow] rag-harness no está en {_hb} — instalá el symlink primero"
+                    )
             else:
                 console.print()
-                console.print("[dim]--apply-default pasado pero no hay default seteado — skip[/dim]")
+                console.print(
+                    "[dim]--apply-default pasado pero no hay default seteado — skip[/dim]"
+                )
         except Exception as _exc:
             console.print(f"[dim]--apply-default falló silenciosamente: {_exc!r}[/dim]")
 
@@ -937,14 +1175,13 @@ def start(
                 console.print(f"[green]✓[/green] [{category}] {label}")
                 ext_ok += 1
                 _log_daemon_run_event(
-                    label=label, action="bootstrap",
-                    exit_code=0, reason="rag start",
+                    label=label,
+                    action="bootstrap",
+                    exit_code=0,
+                    reason="rag start",
                 )
             elif result["ok"]:
-                console.print(
-                    f"[dim]·[/dim] [{category}] {label} "
-                    f"[dim](ya estaba cargado)[/dim]"
-                )
+                console.print(f"[dim]·[/dim] [{category}] {label} [dim](ya estaba cargado)[/dim]")
                 ext_already += 1
             else:
                 stderr_hint = result["stderr"][:120] if result["stderr"] else ""
@@ -954,8 +1191,10 @@ def start(
                 )
                 ext_fail += 1
                 _log_daemon_run_event(
-                    label=label, action="bootstrap",
-                    exit_code=result["exit_code"], reason="rag start (failed)",
+                    label=label,
+                    action="bootstrap",
+                    exit_code=result["exit_code"],
+                    reason="rag start (failed)",
                 )
 
     # ── Summary ──────────────────────────────────────────────────────────
@@ -979,7 +1218,6 @@ def start(
             parts.append(f"[red]{ext_fail} fallidos[/red]")
         console.print(f"  [dim]externos:[/dim] {', '.join(parts)}")
     console.print()
-    console.print("[dim]Verificar:[/dim]")
-    console.print("  [dim]·[/dim] [cyan]rag daemons status[/cyan]    — health del control plane")
-    console.print(f"  [dim]·[/dim] [cyan]tail -f {_RAG_LOG_DIR}/web.log[/cyan]  — FastAPI server")
-    console.print("  [dim]·[/dim] [cyan]curl -s http://127.0.0.1:8765/health | jq[/cyan]")
+
+    # ── URLs y endpoints accesibles ──────────────────────────────────────
+    _print_access_urls()

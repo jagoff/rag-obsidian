@@ -224,6 +224,7 @@ def fetch_draft_pairs(
     *,
     exclude_review_only: bool = False,
     use_rejected_synthetic: bool = True,
+    use_expired_synthetic: bool = True,
 ) -> dict:
     """Pull `rag_draft_decisions` y arma listas de gold preference pairs.
 
@@ -239,6 +240,12 @@ def fetch_draft_pairs(
             usa `/no` masivamente sin `/editar`, este path convierte
             esos rejecteds en preference pairs entrenables. Si False,
             se skipean (comportamiento histórico pre-2026-05-10).
+        use_expired_synthetic: si True (default desde 2026-05-10), aplica
+            el mismo synthetic-chosen lookup a rows con `decision='expired'`.
+            Cuando el draft expira sin decisión explícita pero el user
+            respondió manualmente al contacto poco después, esa respuesta
+            es señal igual de fuerte que `/no` + manual reply. Misma
+            window de 30min.
 
     Returns:
         dict con keys:
@@ -256,18 +263,26 @@ def fetch_draft_pairs(
     n_review_only_excluded = 0
     n_rejected_no_chosen = 0  # rejected sin respuesta manual posterior
     n_rejected_synthetic = 0  # rejected promovidos a gold via synthetic chosen
+    n_expired_no_chosen = 0   # expired sin respuesta manual posterior
+    n_expired_synthetic = 0   # expired promovidos a gold via synthetic chosen
+
+    decisions_in = ["approved_editar", "rejected"]
+    if use_expired_synthetic:
+        decisions_in.append("expired")
+    placeholders = ",".join("?" * len(decisions_in))
 
     try:
         with rag._ragvec_state_conn() as conn:
             rows = list(conn.execute(
-                """
+                f"""
                 SELECT id, draft_id, contact_jid, contact_name,
                        original_msgs_json, bot_draft, decision,
                        sent_text, extra_json, ts
                 FROM rag_draft_decisions
-                WHERE decision IN ('approved_editar', 'rejected')
+                WHERE decision IN ({placeholders})
                 ORDER BY ts ASC
-                """
+                """,
+                decisions_in,
             ).fetchall())
     except Exception as exc:
         print(f"[error] reading rag_draft_decisions: {exc}", file=sys.stderr)
@@ -298,8 +313,10 @@ def fetch_draft_pairs(
 
         # Resolver chosen según el tipo de decisión.
         chosen_text: str | None = None
+        chosen_source_kind: str = ""
         if decision == "approved_editar":
             chosen_text = sent_text
+            chosen_source_kind = "approved_editar"
         elif decision == "rejected":
             if not use_rejected_synthetic:
                 n_rejected_no_chosen += 1
@@ -316,6 +333,19 @@ def fetch_draft_pairs(
                 n_rejected_no_chosen += 1
                 continue
             n_rejected_synthetic += 1
+            chosen_source_kind = "rejected_synthetic"
+        elif decision == "expired":
+            if not use_expired_synthetic:
+                continue
+            # Mismo lookup que rejected — ts del expiry es buen proxy.
+            chosen_text = _lookup_synthetic_chosen_from_bridge(
+                jid, ts, window_minutes=30,
+            )
+            if chosen_text is None:
+                n_expired_no_chosen += 1
+                continue
+            n_expired_synthetic += 1
+            chosen_source_kind = "expired_synthetic"
 
         # Common validation: chosen debe existir y diferir de bot_draft.
         if not chosen_text:
@@ -336,10 +366,8 @@ def fetch_draft_pairs(
             # 2026-05-10: marker del origen del chosen — útil para debug
             # y eventualmente para weighting en el DPO loss (los synthetic
             # son ruidosos; podríamos darles peso 0.7 vs 1.0 del editar).
-            "chosen_source": (
-                "approved_editar" if decision == "approved_editar"
-                else "rejected_synthetic"
-            ),
+            # Valores: approved_editar | rejected_synthetic | expired_synthetic.
+            "chosen_source": chosen_source_kind,
         }
         gold.append(item)
 
@@ -351,6 +379,8 @@ def fetch_draft_pairs(
         "n_anti": 0,
         "n_rejected_no_chosen": n_rejected_no_chosen,
         "n_rejected_synthetic": n_rejected_synthetic,
+        "n_expired_no_chosen": n_expired_no_chosen,
+        "n_expired_synthetic": n_expired_synthetic,
         "n_review_only_total": n_review_only_total,
         "n_review_only_excluded": n_review_only_excluded,
         "review_only_ratio": (
@@ -801,18 +831,24 @@ def generate_predictions(
 
 def print_stats(stats: dict, *, exclude_review_only: bool) -> None:
     """Print del resumen del mining (post-fetch_draft_pairs)."""
+    n_rej = stats.get("n_rejected_synthetic", 0)
+    n_exp = stats.get("n_expired_synthetic", 0)
+    n_editar = stats["n_gold"] - n_rej - n_exp
     print("== Mining stats ==", file=sys.stderr)
-    print(f"  Total rows (approved_editar + rejected): "
+    print(f"  Total rows (approved_editar + rejected + expired): "
           f"{stats['n_total_rows']}", file=sys.stderr)
     print(f"  Gold preference pairs (total):            "
           f"{stats['n_gold']}", file=sys.stderr)
     print(f"    · de approved_editar:                   "
-          f"{stats['n_gold'] - stats.get('n_rejected_synthetic', 0)}",
-          file=sys.stderr)
+          f"{n_editar}", file=sys.stderr)
     print(f"    · de rejected + synthetic chosen:       "
-          f"{stats.get('n_rejected_synthetic', 0)}", file=sys.stderr)
+          f"{n_rej}", file=sys.stderr)
+    print(f"    · de expired + synthetic chosen:        "
+          f"{n_exp}", file=sys.stderr)
     print(f"  Rejected rows sin respuesta manual:       "
           f"{stats.get('n_rejected_no_chosen', 0)}", file=sys.stderr)
+    print(f"  Expired rows sin respuesta manual:        "
+          f"{stats.get('n_expired_no_chosen', 0)}", file=sys.stderr)
     print(f"  Review-only rows (extra_json flag):       "
           f"{stats['n_review_only_total']}  "
           f"({stats['review_only_ratio'] * 100:.1f}%)",
@@ -881,6 +917,12 @@ def main() -> None:
                          "sintetizado desde el bridge. Default: usarlas — "
                          "cada /no con respuesta manual del user dentro de "
                          "30min se promueve a preference pair entrenable.")
+    ap.add_argument("--no-expired-synthetic", action="store_true",
+                    help="No usar rows con decision='expired' + chosen "
+                         "sintetizado desde el bridge. Default: usarlas — "
+                         "cada draft que expiró sin decisión + el user "
+                         "respondió manualmente dentro de 30min se "
+                         "promueve a preference pair entrenable.")
     ap.add_argument("--dry-run", action="store_true",
                     help="Build pairs + report stats; NO entrena.")
     ap.add_argument("--max-train-samples", type=int, default=None,
@@ -895,6 +937,7 @@ def main() -> None:
     data = fetch_draft_pairs(
         exclude_review_only=args.exclude_review_only,
         use_rejected_synthetic=not args.no_rejected_synthetic,
+        use_expired_synthetic=not args.no_expired_synthetic,
     )
     print_stats(data["stats"], exclude_review_only=args.exclude_review_only)
 

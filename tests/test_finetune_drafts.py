@@ -77,14 +77,16 @@ def test_mining_pairs_returns_gold_only_skips_rejected(state_db):
     rejected=bot_draft).
     `decision='rejected'` con `use_rejected_synthetic=False` → no se
     sintetiza chosen, se cuenta en `n_rejected_no_chosen`.
-    `decision='approved_si'` / 'expired' → fuera de la query SQL.
+    `decision='expired'` con `use_expired_synthetic=False` → fuera de
+    la query SQL.
+    `decision='approved_si'` → siempre fuera de la query SQL.
 
-    Pasamos `use_rejected_synthetic=False` para no depender del bridge
-    SQLite externo; el path synthetic-chosen tiene sus propios tests
-    abajo con mock del bridge.
+    Pasamos `use_rejected_synthetic=False` y `use_expired_synthetic=False`
+    para no depender del bridge SQLite externo; los paths synthetic-chosen
+    tienen sus propios tests abajo con mock del bridge.
     """
     # 2 approved_editar (gold), 3 rejected (skipped), 1 approved_si
-    # (ignorado por SQL), 1 expired (ignorado por SQL).
+    # (ignorado por SQL), 1 expired (excluido del WHERE con flag OFF).
     _seed_decision(draft_id="g1", decision="approved_editar",
                    bot_draft="draft1", sent_text="edited1")
     _seed_decision(draft_id="g2", decision="approved_editar",
@@ -97,7 +99,9 @@ def test_mining_pairs_returns_gold_only_skips_rejected(state_db):
     _seed_decision(draft_id="e1", decision="expired", bot_draft="bye")
 
     data = finetune_drafts.fetch_draft_pairs(
-        exclude_review_only=False, use_rejected_synthetic=False,
+        exclude_review_only=False,
+        use_rejected_synthetic=False,
+        use_expired_synthetic=False,
     )
 
     assert len(data["gold"]) == 2

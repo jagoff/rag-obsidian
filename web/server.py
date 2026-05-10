@@ -4008,6 +4008,143 @@ def calendar_upcoming(limit: int = 5, days: int = 1) -> dict:
     return {"ok": True, "count": len(events[:limit]), "events": events[:limit]}
 
 
+@app.get("/api/calendar/free")
+def calendar_free_slots(
+    range: str = "today",  # noqa: A002
+    work_start: int = 9,
+    work_end: int = 19,
+    min_minutes: int = 30,
+) -> dict:
+    """Slots libres del calendario en horario laboral.
+
+    Game Changer GC7.2 (2026-05-09): calcula gaps ≥`min_minutes` entre
+    events del calendario, filtrado al rango horario laboral
+    (`work_start`-`work_end`).
+
+    Query params:
+        range: "today" (0d), "tomorrow" (1d), "week" (7d).
+        work_start: hora local inicio jornada (0-23, default 9).
+        work_end: hora local fin jornada (0-23, default 19).
+        min_minutes: gap mínimo a reportar (5-480, default 30).
+
+    Algoritmo:
+        1. Pull events del rango via _fetch_calendar_ahead.
+        2. Para cada día, parse start/end de cada event.
+        3. Calcular gaps entre events consecutivos.
+        4. Filtrar gaps al rango [work_start, work_end].
+        5. Devolver solo gaps ≥ min_minutes.
+
+    Response:
+        {"ok": True, "range": "today", "free_slots":
+            [{"day": "today", "start": "09:00", "end": "10:30", "duration_min": 90}, ...]}
+    """
+    range_normalized = (range or "today").lower().strip()
+    if range_normalized in ("today", "hoy"):
+        days = 0
+        range_label = "hoy"
+    elif range_normalized in ("tomorrow", "mañana", "manana"):
+        days = 1
+        range_label = "mañana"
+    elif range_normalized in ("week", "semana"):
+        days = 7
+        range_label = "esta semana"
+    else:
+        raise HTTPException(status_code=400, detail="range must be today|tomorrow|week")
+
+    work_start = max(0, min(int(work_start), 23))
+    work_end = max(work_start + 1, min(int(work_end), 24))
+    min_minutes = max(5, min(int(min_minutes), 480))
+
+    try:
+        from rag.integrations.calendar import _fetch_calendar_ahead
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"calendar module unavailable: {e}") from e
+
+    try:
+        events = _fetch_calendar_ahead(days_ahead=days, max_events=100) or []
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"calendar fetch failed: {str(e)[:200]}") from e
+
+    # Parse cada evento a (date_label, start_min, end_min) donde *_min es minutos
+    # desde 00:00 del día. Skip eventos sin time_range (all-day).
+    import re as _re
+
+    def _hhmm_to_min(s: str) -> int | None:
+        m = _re.match(r"(\d{1,2}):(\d{2})", s.strip())
+        if not m:
+            return None
+        h, mi = int(m.group(1)), int(m.group(2))
+        if not (0 <= h < 24 and 0 <= mi < 60):
+            return None
+        return h * 60 + mi
+
+    events_by_day: dict[str, list[tuple[int, int]]] = {}
+    for ev in events:
+        tr = (ev.get("time_range") or "").strip()
+        if not tr or "-" not in tr:
+            continue  # all-day, skip
+        parts = tr.split("-")
+        if len(parts) != 2:
+            continue
+        s_min = _hhmm_to_min(parts[0])
+        e_min = _hhmm_to_min(parts[1])
+        if s_min is None or e_min is None or e_min <= s_min:
+            continue
+        day = (ev.get("date_label") or "today").strip().lower()
+        events_by_day.setdefault(day, []).append((s_min, e_min))
+
+    # Compute gaps por día.
+    work_start_min = work_start * 60
+    work_end_min = work_end * 60
+    free: list[dict] = []
+    for day, evs in events_by_day.items():
+        evs.sort()
+        # Cursor recorre desde work_start. Para cada event, gap = [cursor, ev.start].
+        cursor = work_start_min
+        for s_min, e_min in evs:
+            if s_min >= work_end_min:
+                break  # eventos post-jornada irrelevantes para slots
+            if s_min > cursor:
+                gap_start = max(cursor, work_start_min)
+                gap_end = min(s_min, work_end_min)
+                duration = gap_end - gap_start
+                if duration >= min_minutes:
+                    free.append({
+                        "day": day,
+                        "start": f"{gap_start // 60:02d}:{gap_start % 60:02d}",
+                        "end": f"{gap_end // 60:02d}:{gap_end % 60:02d}",
+                        "duration_min": duration,
+                    })
+            cursor = max(cursor, e_min)
+        # Gap final hasta end-of-day.
+        if cursor < work_end_min:
+            gap_end = work_end_min
+            duration = gap_end - cursor
+            if duration >= min_minutes:
+                free.append({
+                    "day": day,
+                    "start": f"{cursor // 60:02d}:{cursor % 60:02d}",
+                    "end": f"{gap_end // 60:02d}:{gap_end % 60:02d}",
+                    "duration_min": duration,
+                })
+
+    # Si no hubo NINGÚN event, todo el horario laboral está libre.
+    if not events_by_day:
+        free.append({
+            "day": "today" if days == 0 else range_normalized,
+            "start": f"{work_start:02d}:00",
+            "end": f"{work_end:02d}:00",
+            "duration_min": (work_end - work_start) * 60,
+        })
+
+    return {
+        "ok": True,
+        "range": range_label,
+        "free_slots": free,
+        "work_window": f"{work_start:02d}:00-{work_end:02d}:00",
+    }
+
+
 @app.get("/api/contacts")
 def list_contacts(q: str = "", kind: str = "any", limit: int = 20) -> dict:
     """Contact picker para el popover de ``/wzp`` y ``/mail`` del web chat.

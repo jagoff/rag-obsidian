@@ -22847,6 +22847,63 @@ def daemons_status_endpoint(request: Request = None) -> dict:  # type: ignore[as
 # ── Fin Panel Daemons ────────────────────────────────────────────────────
 
 
+# ── Ollama-compat shim para listener WA (GC-C, 2026-05-10) ───────────────
+#
+# Tres endpoints expuestos bajo `/ollama/*` que mimic la API de Ollama
+# (`/api/chat`, `/api/tags`, root liveness). Permite que el listener TS
+# (`whatsapp-listener/listener.ts`) apunte `OLLAMA_URL=http://localhost:8765/ollama`
+# y rutear sus 9 call sites (drafts, OCR tagging, calendar helpers, send
+# drafts, etc) al MLX backend in-process del web server — sin daemon
+# Ollama separado, sin duplicar modelos en RAM.
+#
+# Implementación viva en `web/_ollama_compat.py`. Este block solo registra
+# las rutas FastAPI.
+from web._ollama_compat import (  # noqa: E402
+    build_chat_response as _ollama_build_chat_response,
+    list_tags as _ollama_list_tags,
+    shim_liveness as _ollama_shim_liveness,
+    stream_chat_ndjson as _ollama_stream_chat_ndjson,
+)
+
+
+@app.post("/ollama/api/chat")
+async def ollama_compat_chat(request: Request):
+    """Drop-in `/api/chat` Ollama-compat → MLX in-process.
+
+    Si `payload.stream is True` (default Ollama), devolvemos NDJSON
+    streaming. Caso contrario JSON único con `done: true`.
+
+    Header opcional `X-Listener-Trace` propaga trace_id a `rag_queries`
+    para correlar (draft → bot_draft → user reaction) a través del DPO loop.
+    """
+    payload = await request.json()
+    trace_id = request.headers.get("X-Listener-Trace")
+    if isinstance(payload, dict) and payload.get("stream", True):
+        return StreamingResponse(
+            _ollama_stream_chat_ndjson(payload, trace_id=trace_id),
+            media_type="application/x-ndjson",
+        )
+    return _ollama_build_chat_response(payload, trace_id=trace_id)
+
+
+@app.get("/ollama/api/tags")
+def ollama_compat_tags():
+    """`/api/tags` Ollama-compat — listener lo usa como healthcheck.
+    Lista todos los aliases que `MLX_MODEL_ALIAS` resuelve.
+    """
+    return _ollama_list_tags()
+
+
+@app.get("/ollama/")
+@app.get("/ollama")
+def ollama_compat_root():
+    """Liveness root del shim — útil para `curl http://localhost:8765/ollama/`."""
+    return _ollama_shim_liveness()
+
+
+# ── Fin Ollama-compat shim ───────────────────────────────────────────────
+
+
 if __name__ == "__main__":
     import uvicorn
     # Bind host: default 127.0.0.1 (localhost-only, el estándar). Para

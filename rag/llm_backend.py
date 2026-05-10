@@ -84,6 +84,10 @@ MLX_MODEL_ALIAS: dict[str, str] = {
     "command-r:latest": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit-DWQ",
     "command-r": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit-DWQ",
     "qwen2.5:14b": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit-DWQ",
+    # Listener WA usa `qwen2.5:14b-instruct` (DRAFT_HELPER_MODEL en plist) —
+    # ruteamos al mismo MLX HQ tier que `qwen2.5:14b`. Necesario para que el
+    # endpoint Ollama-compat (`/ollama/api/chat`) resuelva sin 404.
+    "qwen2.5:14b-instruct": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit-DWQ",
     "qwen3:30b-a3b": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit-DWQ",
     # Experimental (A/B vs the 3B helper, NOT default until eval CIs OK).
     # DWQ-2510 = revision Oct 2025 con mejor recall en tasks JSON-structured.

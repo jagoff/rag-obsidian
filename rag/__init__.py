@@ -24214,20 +24214,53 @@ def watch(debounce: float, all_vaults: bool):
     # estuviera 100% sano. SLA = 15min, heartbeat = 5min → drift_ratio
     # siempre <1.0 cuando el watcher vive.
     HEARTBEAT_S = 300.0
+    # Idle-unload del embedder MLX (2026-05-10): tras 60s sin file-changes,
+    # forzá un unload del MLX backend (chat + embed) + mx.clear_cache() +
+    # gc. Sin esto, watch quedaba con ~840 MB en IOAccelerator (Metal) +
+    # ~1 GB de tensores swapeados durante 10min (default RAG_MLX_IDLE_TTL).
+    # Cuando llegaba la próxima edición y macOS tenía que paginar de
+    # vuelta, daba la sensación de "Mac que cuelga". Forzar unload acá es
+    # complementario al watchdog: el watchdog actúa bajo memory pressure,
+    # este actúa bajo idle de actividad real. Costo: +1-2s de reload del
+    # embedder en la primera edición post-idle, irrelevante (cadencia
+    # típica de edits del user >> 60s).
+    UNLOAD_IDLE_CYCLES = max(1, int(60.0 / max(debounce, 0.1)))
     last_heartbeat = time.time()
+    empty_cycles = 0
+    unloaded_after_idle = False
     try:
         while True:
             time.sleep(debounce)
+            any_real_work = False
             for vs in vault_state:
                 for name, status, rel, err in _watch_drain_once(vs, pending_lock):
                     if err is not None:
                         console.print(f"  [red]error[/red] [{name}] {rel.name}: {err}")
+                        any_real_work = True
                         continue
                     if status == "skipped":
                         continue
                     color = {"indexed": "green", "removed": "yellow", "empty": "dim"}.get(status, "white")
                     tag = f"[dim][{name}][/dim] " if multi else ""
                     console.print(f"  {tag}[{color}]{status:>8}[/{color}] {rel}")
+                    any_real_work = True
+            if any_real_work:
+                empty_cycles = 0
+                unloaded_after_idle = False
+            else:
+                empty_cycles += 1
+                if empty_cycles == UNLOAD_IDLE_CYCLES and not unloaded_after_idle:
+                    try:
+                        from rag.llm_backend import get_backend  # noqa: PLC0415
+                        if get_backend().unload():
+                            print(
+                                f"[watch] mlx unloaded after "
+                                f"{empty_cycles * debounce:.0f}s idle",
+                                flush=True,
+                            )
+                    except Exception as exc:
+                        _silent_log("watch_idle_unload_failed", exc)
+                    unloaded_after_idle = True
             now_t = time.time()
             if now_t - last_heartbeat >= HEARTBEAT_S:
                 # Print directo (no console.print) para evitar markup

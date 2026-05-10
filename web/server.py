@@ -4504,14 +4504,34 @@ def save_conversation(req: SaveRequest) -> dict:
 
 @app.post("/api/reindex", dependencies=[Depends(_require_admin_token)])
 def trigger_reindex() -> dict:
-    """Fire-and-forget incremental reindex. `--reset` not exposed via web."""
+    """Fire-and-forget incremental reindex. `--reset` not exposed via web.
+    
+    Lockfile previene múltiples procesos simultáneos (memory leak: cada proceso
+    carga scipy/pandas/pyarrow/sklearn/torch/mlx ≈ 5-10GB)."""
+    lock_path = Path.home() / ".local/share/obsidian-rag/reindex.lock"
     try:
-        subprocess.Popen(
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        if lock_path.exists():
+            # Verificar si el proceso está vivo (PID en lockfile)
+            try:
+                pid_str = lock_path.read_text().strip()
+                pid = int(pid_str)
+                os.kill(pid, 0)  # Signal 0: check if process exists
+                return {"ok": True, "message": "index ya está corriendo"}
+            except (ValueError, ProcessLookupError, FileNotFoundError):
+                # Lockfile stale o corrupto, limpiar y continuar
+                lock_path.unlink(missing_ok=True)
+        
+        proc = subprocess.Popen(
             ["rag", "index"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
+        # PID del subprocess `rag index`, NO del web server. Si escribís
+        # os.getpid() acá, el check os.kill(pid, 0) de futuros requests
+        # siempre matchea (web vivo) → bloquea reindex hasta restart.
+        lock_path.write_text(str(proc.pid))
     except FileNotFoundError:
         raise HTTPException(status_code=500, detail="rag CLI no encontrado en PATH")
     except Exception as exc:

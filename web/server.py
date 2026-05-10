@@ -2189,12 +2189,22 @@ _CHAT_RATE_WINDOW = 60.0
 # converger a O(n²) y dominar CPU del handler. Deque hace el shift
 # constant-time. Los tests que hacen `_CHAT_BUCKETS.clear()` siguen
 # funcionando igual (deque soporta `.clear()`).
+#
+# 2026-05-10 fix: el lock acá ABAJO era `with _threading.Lock():` —
+# constructor nuevo por call, NO sincronizaba nada. Bajo carga
+# concurrente N threads del mismo IP podían bypasear el limit (todos
+# leen `len() < limit` en paralelo, todos appendean). Reemplazado por
+# este `_RATE_LIMIT_LOCK` módulo-level — implementa el "Single lock
+# protects both buckets" que el comentario de arriba ya prometía.
+_RATE_LIMIT_LOCK = _threading.Lock()
+
+
 def _check_rate_limit(bucket: dict[str, "_collections.deque"], ip: str,
                       limit: int, window: float) -> None:
     """Sliding-window rate limit per-IP. Raises HTTPException 429 on breach."""
     now = time.time()
     cutoff = now - window
-    with _threading.Lock():
+    with _RATE_LIMIT_LOCK:
         events = bucket[ip]
         # `popleft()` O(1) en deque. Antes con `list.pop(0)` cada remoción
         # era O(len(events)) → bajo carga con 30 events en ventana el

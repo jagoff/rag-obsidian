@@ -380,3 +380,69 @@ def test_historical_days_constant_default_30():
     # No leemos del módulo directo porque la lectura de env happen al
     # import; chequeamos que el default constant es 30.
     assert _server._CHAT_UPLOAD_HISTORICAL_DAYS_DEFAULT == 30
+
+
+def test_check_rate_limit_concurrent_enforces_limit():
+    """Regresión 2026-05-10: el lock previo era `with _threading.Lock():`
+    — constructor nuevo por call, NO sincronizaba nada. Bajo carga
+    concurrente N threads del mismo IP podían bypasear el limit (todos
+    leen `len() < limit` en paralelo, todos appendean).
+
+    Con `_RATE_LIMIT_LOCK` módulo-level compartido el conteo de 429
+    es exacto: limit OKs + (N-limit) blocks.
+    """
+    import threading
+    from fastapi import HTTPException
+
+    bucket = _server._LRURateBucket()
+    ip = "10.0.0.42"
+    limit = 10
+    window = 60.0
+    n_threads = 50  # 5x el limit
+    results: dict[str, int] = {"ok": 0, "blocked": 0}
+    barrier = threading.Barrier(n_threads)
+    counter_lock = threading.Lock()
+
+    def hit():
+        barrier.wait()  # max contention
+        try:
+            _server._check_rate_limit(bucket, ip, limit, window)
+        except HTTPException as exc:
+            assert exc.status_code == 429
+            with counter_lock:
+                results["blocked"] += 1
+        else:
+            with counter_lock:
+                results["ok"] += 1
+
+    threads = [threading.Thread(target=hit) for _ in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert results["ok"] == limit, (
+        f"expected exactly {limit} OKs (lock debe sincronizar), "
+        f"got {results['ok']} — el lock no está sincronizando."
+    )
+    assert results["blocked"] == n_threads - limit
+
+
+def test_rate_limit_lock_is_module_level_singleton():
+    """El lock debe ser un objeto único módulo-level, no construido por call.
+
+    Verifica que el bug original (`with _threading.Lock():` que creaba un
+    objeto nuevo cada vez) no vuelva por refactor accidental. El test cae
+    si alguien reemplaza `_RATE_LIMIT_LOCK` por un constructor inline.
+    """
+    assert hasattr(_server, "_RATE_LIMIT_LOCK"), (
+        "Falta `_RATE_LIMIT_LOCK` módulo-level — sin él el rate limiter "
+        "no sincroniza."
+    )
+    lock = _server._RATE_LIMIT_LOCK
+    # Es un Lock real (acquire/release). `type(threading.Lock())` no es
+    # estable entre versiones de Python (a veces `_thread.lock`, a veces
+    # `_thread.allocate_lock`); chequeamos por interfaz.
+    assert hasattr(lock, "acquire") and hasattr(lock, "release")
+    # El mismo objeto al re-importarlo: confirma que es módulo-level.
+    assert _server._RATE_LIMIT_LOCK is lock

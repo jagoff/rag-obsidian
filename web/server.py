@@ -2645,6 +2645,81 @@ def create_calendar_event(req: CalendarCreateRequest, request: Request) -> dict:
     return {"ok": True, "uid": res}
 
 
+class VlmDescribeRequest(BaseModel):
+    path: str
+
+
+@app.post("/api/vlm/describe")
+def vlm_describe(req: VlmDescribeRequest, request: Request) -> dict:
+    """Describe una imagen usando el dispatcher OCR-or-VLM de rag.ocr.
+
+    Llamado por el listener WhatsApp (TS) cuando un contacto manda
+    imagen y necesitamos contexto descriptivo para componer un draft.
+    Antes el listener corría solo Apple Vision OCR (`runOcrVision`)
+    via subprocess directo; ahora cuando OCR retorna < 20 chars puede
+    hacer fetch acá para que el VLM granite-vision-3.2-2b haga caption
+    descriptivo (escena, objetos, texto residual). Modelo queda warm en
+    RAM entre llamadas (vs cold-start del CLI subprocess).
+
+    Devuelve `{text, source}` donde source es uno de "ocr" / "vlm" / "".
+
+    Path validation: solo aceptamos paths bajo el bridge media dir
+    (`~/repos/whatsapp-mcp/whatsapp-bridge/store/`) o el inbox
+    attachments del vault. El threat model es local-only (loopback +
+    LAN trusted) pero igual no exponemos lectura arbitraria del FS.
+
+    Rate limit: `_BEHAVIOR_BUCKETS` (120 req/60s/IP).
+    """
+    from pathlib import Path as _Path  # noqa: PLC0415
+
+    client_ip = (request.client.host if request.client else "unknown")
+    _check_rate_limit(_BEHAVIOR_BUCKETS, client_ip,
+                      _BEHAVIOR_RATE_LIMIT, _BEHAVIOR_RATE_WINDOW)
+
+    try:
+        raw = _Path(req.path).expanduser().resolve()
+    except (OSError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=f"path inválido: {exc}") from exc
+
+    if not raw.is_file():
+        raise HTTPException(status_code=404, detail="path no es archivo")
+
+    # Allowlist de directorios. Bridge media + vault attachments cubren
+    # el caso del listener (imagen de WhatsApp) y futuro caso del web
+    # server (imagen subida via UI). Cualquier otra ubicación → 403.
+    allowed_roots = [
+        _Path.home() / "repos" / "whatsapp-mcp" / "whatsapp-bridge" / "store",
+        _Path.home() / "Library" / "Mobile Documents" / "iCloud~md~obsidian"
+            / "Documents" / "Notes" / "00-Inbox" / "attachments",
+    ]
+    inside = False
+    for root in allowed_roots:
+        try:
+            raw.relative_to(root.resolve())
+            inside = True
+            break
+        except ValueError:
+            continue
+    if not inside:
+        raise HTTPException(
+            status_code=403,
+            detail="path fuera de allowlist (bridge media + vault attachments only)",
+        )
+
+    if raw.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".gif", ".bmp"}:
+        raise HTTPException(status_code=400, detail=f"extensión no soportada: {raw.suffix}")
+
+    from rag.ocr import _image_text_or_caption  # noqa: PLC0415
+    try:
+        text, source = _image_text_or_caption(raw)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=500, detail=f"_image_text_or_caption falló: {exc}",
+        ) from exc
+
+    return {"text": text, "source": source, "path": str(raw)}
+
+
 class ReminderCompleteRequest(BaseModel):
     reminder_id: str
 

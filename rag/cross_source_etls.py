@@ -218,7 +218,8 @@ def _sync_whatsapp_notes(vault_root: Path) -> dict:
 
 _REMINDERS_VAULT_SUBPATH = f"{_EXTERNAL_INGEST_BASE}/Reminders"
 _CALENDAR_VAULT_SUBPATH = f"{_EXTERNAL_INGEST_BASE}/Calendar"
-_CHROME_VAULT_SUBPATH = f"{_EXTERNAL_INGEST_BASE}/Chrome"
+# `_CHROME_VAULT_SUBPATH` definido en `rag/integrations/chrome_history.py` —
+# re-exportado al final del módulo.
 # `_YOUTUBE_VAULT_SUBPATH` definido en `rag/integrations/youtube.py` —
 # re-exportado al final del módulo para preservar back-compat con
 # `from rag.cross_source_etls import _YOUTUBE_VAULT_SUBPATH`.
@@ -259,20 +260,9 @@ def _harden_oauth_cache_perms() -> None:
 
 _harden_oauth_cache_perms()
 
-_CHROME_HISTORY_PATH = Path.home() / "Library/Application Support/Google/Chrome/Default/History"
-# Chrome epoch is 1601-01-01 UTC microseconds (Windows FILETIME).
-_CHROME_EPOCH_OFFSET_S = 11644473600
-# URL prefixes / patterns we never want indexed — they're navigation noise.
-_CHROME_SKIP_PREFIXES = (
-    "chrome://", "chrome-extension://", "about:", "edge://", "view-source:",
-    "data:", "javascript:", "file:///",
-)
-_CHROME_SKIP_PATTERNS = (
-    re.compile(r"^https?://(www\.)?google\.[^/]+/search\?"),
-    re.compile(r"^https?://(www\.)?google\.[^/]+/url\?"),
-    re.compile(r"^https?://(www\.)?bing\.com/search\?"),
-    re.compile(r"^https?://(duckduckgo\.com|search\.brave\.com)/\?"),
-)
+# Constantes `_CHROME_HISTORY_PATH`, `_CHROME_EPOCH_OFFSET_S`,
+# `_CHROME_SKIP_PREFIXES`, `_CHROME_SKIP_PATTERNS` definidas en
+# `rag/integrations/chrome_history.py` — re-exportadas al final del módulo.
 # `_YOUTUBE_WATCH_RE` definido en `rag/integrations/youtube.py` —
 # re-exportado al final del módulo para preservar back-compat con
 # `from rag.cross_source_etls import _YOUTUBE_WATCH_RE`.
@@ -410,152 +400,11 @@ def _sync_apple_calendar_notes(vault_root: Path, days_ahead: int = 90) -> dict:
     }
 
 
-def _unix_to_chrome_ts(unix_s: float) -> int:
-    return int((unix_s + _CHROME_EPOCH_OFFSET_S) * 1_000_000)
 
-
-def _read_chrome_visits(history_db: Path, hours: int = 48) -> list[dict]:
-    """Read distinct URLs visited in the last `hours` from Chrome History.
-    Chrome locks the SQLite while the browser runs — we copy to /tmp and read
-    the snapshot. Empty list on any error.
-    """
-    from rag import _chrome_to_unix_ts  # lazy — defined in integrations.chrome_bookmarks
-    if not history_db.is_file():
-        return []
-    import shutil
-    import sqlite3 as _sqlite3
-    import tempfile
-    tmp = Path(tempfile.gettempdir()) / "obsidian-rag-chrome-history.db"
-    try:
-        shutil.copy2(history_db, tmp)
-    except OSError:
-        return []
-    try:
-        con = _sqlite3.connect(f"file:{tmp}?mode=ro", uri=True)
-        con.row_factory = _sqlite3.Row
-        cutoff = _unix_to_chrome_ts(time.time() - hours * 3600)
-        rows = con.execute(
-            "SELECT url, title, visit_count, last_visit_time "
-            "FROM urls WHERE last_visit_time > ? "
-            "ORDER BY last_visit_time DESC",
-            (cutoff,),
-        ).fetchall()
-        con.close()
-    except _sqlite3.Error:
-        return []
-    finally:
-        try:
-            tmp.unlink()
-        except OSError as exc:
-            _etl_log_swallow("chrome_history_tmp_unlink", exc)
-
-    out: list[dict] = []
-    seen: set[str] = set()
-    for r in rows:
-        url = (r["url"] or "").strip()
-        if not url or url in seen:
-            continue
-        if any(url.startswith(p) for p in _CHROME_SKIP_PREFIXES):
-            continue
-        if any(p.match(url) for p in _CHROME_SKIP_PATTERNS):
-            continue
-        seen.add(url)
-        out.append({
-            "url": url,
-            "title": (r["title"] or "").strip() or url,
-            "visit_count": int(r["visit_count"] or 0),
-            "ts": _chrome_to_unix_ts(int(r["last_visit_time"] or 0)),
-        })
-    return out
-
-
-def _sync_chrome_history(vault_root: Path, hours: int = 48) -> dict:
-    """Daily snapshot of Chrome history (last `hours`, dedup by exact URL).
-    Also derives a YouTube-only note from URLs matching watch?v=… so YouTube
-    activity surfaces independently in retrieval. Hash-skipped when content
-    matches the existing day file.
-    """
-    import sys as _sys
-    _chrome_hist_path = getattr(_sys.modules.get("rag"), "_CHROME_HISTORY_PATH", _CHROME_HISTORY_PATH)
-    visits = _read_chrome_visits(_chrome_hist_path, hours=hours)
-    if not visits:
-        return {"ok": False, "reason": "no_visits_or_chrome_locked"}
-    now = datetime.now()
-    today = now.strftime("%Y-%m-%d")
-
-    chrome_fm = [
-        "---",
-        "source: chrome-history",
-        f"snapshot_at: {now.isoformat(timespec='seconds')}",
-        f"window_hours: {hours}",
-        f"url_count: {len(visits)}",
-        "tags:",
-        "- chrome-history",
-        "- system-snapshot",
-        "---",
-        "",
-        f"# Chrome history — {today} (últimas {hours}h)",
-        "",
-    ]
-    chrome_lines: list[str] = list(chrome_fm)
-    for v in visits:
-        ts = datetime.fromtimestamp(v["ts"]).strftime("%H:%M")
-        title = v["title"].replace("|", "·")
-        chrome_lines.append(f"- `{ts}` [{title}]({v['url']})")
-    chrome_body = "\n".join(chrome_lines) + "\n"
-
-    chrome_target = vault_root / _CHROME_VAULT_SUBPATH / f"{today}.md"
-    chrome_written = _atomic_write_if_changed(chrome_target, chrome_body)
-
-    yt_videos: list[dict] = []
-    seen_vid: set[str] = set()
-    for v in visits:
-        m = _YOUTUBE_WATCH_RE.match(v["url"])
-        if not m:
-            continue
-        vid = m.group(2)
-        if vid in seen_vid:
-            continue
-        seen_vid.add(vid)
-        yt_videos.append({
-            "video_id": vid,
-            "title": v["title"],
-            "url": f"https://www.youtube.com/watch?v={vid}",
-            "ts": v["ts"],
-        })
-
-    yt_written = 0
-    if yt_videos:
-        yt_fm = [
-            "---",
-            "source: youtube-via-chrome",
-            f"snapshot_at: {now.isoformat(timespec='seconds')}",
-            f"window_hours: {hours}",
-            f"video_count: {len(yt_videos)}",
-            "tags:",
-            "- youtube",
-            "- system-snapshot",
-            "---",
-            "",
-            f"# YouTube watched — {today} (últimas {hours}h, vía Chrome)",
-            "",
-        ]
-        yt_lines: list[str] = list(yt_fm)
-        for v in yt_videos:
-            ts = datetime.fromtimestamp(v["ts"]).strftime("%H:%M")
-            title = v["title"].replace("|", "·")
-            yt_lines.append(f"- `{ts}` [{title}]({v['url']})")
-        yt_body = "\n".join(yt_lines) + "\n"
-        yt_target = vault_root / _YOUTUBE_VAULT_SUBPATH / f"{today}.md"
-        yt_written = 1 if _atomic_write_if_changed(yt_target, yt_body) else 0
-
-    return {
-        "ok": True,
-        "files_written": (1 if chrome_written else 0) + yt_written,
-        "urls": len(visits),
-        "youtube_videos": len(yt_videos),
-        "target": _CHROME_VAULT_SUBPATH,
-    }
+# ── Chrome history ───────────────────────────────────────────────────────────
+# Movido a `rag/integrations/chrome_history.py` (2026-05-09). Re-export al final
+# del módulo preserva back-compat con `from rag.cross_source_etls import *` y
+# `from rag.cross_source_etls import _sync_chrome_history`.
 
 
 # ── Gmail + Google Drive ─────────────────────────────────────────────────────
@@ -715,4 +564,20 @@ from rag.integrations.google_apis import (  # noqa: F401, E402
     _load_google_credentials,
     _sync_gdrive_notes,
     _sync_gmail_notes,
+)
+
+# ── Chrome history (re-export) ───────────────────────────────────────────────
+# Movido a `rag/integrations/chrome_history.py` (2026-05-09). Re-exportado para
+# preservar `from rag.cross_source_etls import _sync_chrome_history` + las
+# constantes (`_CHROME_HISTORY_PATH`, `_CHROME_VAULT_SUBPATH`, etc.) y los
+# monkeypatches en `tests/test_external_etls.py`.
+from rag.integrations.chrome_history import (  # noqa: F401, E402
+    _CHROME_EPOCH_OFFSET_S,
+    _CHROME_HISTORY_PATH,
+    _CHROME_SKIP_PATTERNS,
+    _CHROME_SKIP_PREFIXES,
+    _CHROME_VAULT_SUBPATH,
+    _read_chrome_visits,
+    _sync_chrome_history,
+    _unix_to_chrome_ts,
 )

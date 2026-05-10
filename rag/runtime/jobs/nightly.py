@@ -240,7 +240,6 @@ def reranker_finetune_job() -> dict[str, Any]:
     `rag_supervisor_jobs.signals.exit_code` para diagnóstico vía
     `rag daemons status`; no interrumpe otros jobs.
     """
-    import json  # noqa: PLC0415
     import os  # noqa: PLC0415
     import tempfile  # noqa: PLC0415
 

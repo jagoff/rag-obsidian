@@ -135,7 +135,7 @@ def test_sync_calendar_notes_with_mocked_events(tmp_path):
         stats = rag._sync_apple_calendar_notes(tmp_path)
     assert stats["files_written"] == 1
     assert stats["events"] == 2
-    files = list((tmp_path / "03-Resources/Calendar").glob("*.md"))
+    files = list((tmp_path / "99-obsidian/99-AI/external-ingest/Calendar").glob("*.md"))
     assert len(files) == 1
     body = files[0].read_text()
     assert "Standup" in body and "Cumple Maria" in body

@@ -181,7 +181,8 @@ from rag._constants import _EXTERNAL_INGEST_BASE  # noqa: E402, F401
 
 # `_REMINDERS_VAULT_SUBPATH` definido en `rag/integrations/apple_reminders.py`
 # — re-exportado al final del módulo.
-_CALENDAR_VAULT_SUBPATH = f"{_EXTERNAL_INGEST_BASE}/Calendar"
+# `_CALENDAR_VAULT_SUBPATH` definido en `rag/integrations/apple_calendar.py`
+# — re-exportado al final del módulo.
 # `_CHROME_VAULT_SUBPATH` definido en `rag/integrations/chrome_history.py` —
 # re-exportado al final del módulo.
 # `_YOUTUBE_VAULT_SUBPATH` definido en `rag/integrations/youtube.py` —
@@ -256,58 +257,10 @@ def _atomic_write_if_changed(target: Path, body: str) -> bool:
 # `from rag.cross_source_etls import _sync_reminders_notes`.
 
 
-def _sync_apple_calendar_notes(vault_root: Path, days_ahead: int = 90) -> dict:
-    """Snapshot upcoming Apple Calendar events to per-week notes. Requires
-    icalBuddy (`brew install ical-buddy`); returns silently when missing.
-    """
-    from rag import _apple_enabled, _icalbuddy_path, _fetch_calendar_ahead  # lazy
-    if not _apple_enabled():
-        return {"ok": False, "reason": "apple_disabled"}
-    if not _icalbuddy_path():
-        return {"ok": False, "reason": "icalbuddy_missing"}
-    events = _fetch_calendar_ahead(days_ahead=days_ahead, max_events=200)
-    if not events:
-        return {"ok": True, "files_written": 0, "reason": "no_events"}
-    now = datetime.now()
-    iso_year, iso_week, _ = now.isocalendar()
-    week_label = f"{iso_year}-W{iso_week:02d}"
-
-    fm_lines = [
-        "---",
-        "source: apple-calendar",
-        f"snapshot_at: {now.isoformat(timespec='seconds')}",
-        f"window_days: {days_ahead}",
-        f"event_count: {len(events)}",
-        "tags:",
-        "- apple-calendar",
-        "- system-snapshot",
-        "---",
-        "",
-        f"# Calendar — semana {week_label} (próximos {days_ahead}d)",
-        "",
-    ]
-    body_lines: list[str] = list(fm_lines)
-    current_label = None
-    for ev in events:
-        label = ev.get("date_label") or "(sin fecha)"
-        if label != current_label:
-            body_lines.append(f"## {label}")
-            body_lines.append("")
-            current_label = label
-        time_range = ev.get("time_range") or ""
-        time_part = f"`{time_range}` · " if time_range else ""
-        body_lines.append(f"- {time_part}{ev.get('title', '(sin título)')}")
-    body_lines.append("")
-    body = "\n".join(body_lines)
-
-    target = vault_root / _CALENDAR_VAULT_SUBPATH / f"{week_label}.md"
-    written = _atomic_write_if_changed(target, body)
-    return {
-        "ok": True,
-        "files_written": 1 if written else 0,
-        "events": len(events),
-        "target": _CALENDAR_VAULT_SUBPATH,
-    }
+# ── Apple Calendar ───────────────────────────────────────────────────────────
+# Movido a `rag/integrations/apple_calendar.py` (2026-05-09). Re-export al
+# final del módulo preserva back-compat con
+# `from rag.cross_source_etls import _sync_apple_calendar_notes`.
 
 
 
@@ -507,4 +460,12 @@ from rag.integrations.whatsapp_etl import (  # noqa: F401, E402
 from rag.integrations.apple_reminders import (  # noqa: F401, E402
     _REMINDERS_VAULT_SUBPATH,
     _sync_reminders_notes,
+)
+
+# ── Apple Calendar (re-export) ───────────────────────────────────────────────
+# Movido a `rag/integrations/apple_calendar.py` (2026-05-09). Re-exportado
+# para preservar `from rag.cross_source_etls import _sync_apple_calendar_notes`.
+from rag.integrations.apple_calendar import (  # noqa: F401, E402
+    _CALENDAR_VAULT_SUBPATH,
+    _sync_apple_calendar_notes,
 )

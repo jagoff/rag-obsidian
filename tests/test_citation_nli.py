@@ -258,7 +258,8 @@ class TestApplyNliModeStrip:
         assert "Tercera verificada." in modified
 
     def test_strip_fallback_when_too_short(self):
-        from rag.postprocess import apply_nli_mode, _NLI_STRIP_FALLBACK
+        from rag.postprocess import apply_nli_mode
+        from rag.postprocess_citation_nli import _NLI_STRIP_FALLBACK
 
         # Si todas las oraciones son no-verificadas, el texto queda vacío
         # y debe retornar el fallback
@@ -314,20 +315,20 @@ class TestNliMode:
 class TestGetCitationNliModel:
     def test_load_failed_flag_returns_none(self, monkeypatch):
         """Si _CITATION_NLI_LOAD_FAILED=True, retorna None sin intentar cargar."""
-        import rag.postprocess as pp
-        monkeypatch.setattr(pp, "_CITATION_NLI_LOAD_FAILED", True)
-        monkeypatch.setattr(pp, "_citation_nli_model", None)
-        result = pp._get_citation_nli_model()
+        import rag.postprocess_citation_nli as cn
+        monkeypatch.setattr(cn, "_CITATION_NLI_LOAD_FAILED", True)
+        monkeypatch.setattr(cn, "_citation_nli_model", None)
+        result = cn._get_citation_nli_model()
         assert result is None
 
     def test_already_loaded_returns_cached(self, monkeypatch):
         """Si el modelo ya está cargado, devuelve el mismo objeto."""
-        import rag.postprocess as pp
+        import rag.postprocess_citation_nli as cn
 
         sentinel = object()
-        monkeypatch.setattr(pp, "_citation_nli_model", sentinel)
-        monkeypatch.setattr(pp, "_CITATION_NLI_LOAD_FAILED", False)
-        result = pp._get_citation_nli_model()
+        monkeypatch.setattr(cn, "_citation_nli_model", sentinel)
+        monkeypatch.setattr(cn, "_CITATION_NLI_LOAD_FAILED", False)
+        result = cn._get_citation_nli_model()
         assert result is sentinel
 
 

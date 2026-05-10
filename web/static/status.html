@@ -1221,6 +1221,29 @@
         </div>
         <div id="heatmap" aria-hidden="true"></div>
       </article>
+
+      <!-- #6 Memoria rag-stack — REAL
+           Fuente: /api/status/memory (snapshot agregado por /api/system-
+           memory). Total RSS de la stack rag (web+supervisor+watch+wa)
+           con breakdown por categoría + top procesos + pressure
+           indicator del sistema (free RAM% + swap GB → green/yellow/red).
+           El chart histórico full vive en /dashboard #card-memory; este
+           card es snapshot accionable: si el semáforo está en rojo,
+           hay que mirar qué proceso comió la memoria. -->
+      <article class="insight-card" id="insight-memory" aria-label="Memoria rag-stack">
+        <div class="insight-head">
+          <h2>memoria · rag-stack</h2>
+          <span class="insight-meta" id="mem-meta">—</span>
+        </div>
+        <div class="insight-big">
+          <span class="insight-big-value" id="mem-total">—</span>
+          <span class="insight-big-unit">MB · rag+ollama+sqlite-vec+wa</span>
+          <span class="insight-delta neutral" id="mem-pressure">—</span>
+        </div>
+        <ul class="insight-breakdown" id="mem-top" style="margin-top:6px">
+          <li><span class="cause" style="color:var(--text-faint)">cargando…</span></li>
+        </ul>
+      </article>
     </section>
 
     <div id="content">

@@ -1075,6 +1075,89 @@
     return `${day} ${dom} · ${h}h`;
   }
 
+  // ── #6 Memoria rag-stack ───────────────────────────────────────────
+  // Snapshot del consumo de RAM (web+supervisor+watch+wa) + pressure
+  // global. Match del estilo del card de errores (donut + breakdown):
+  // valor grande en MB, lista top-procs debajo, semáforo a la derecha.
+  // El histórico full vive en /dashboard #card-memory.
+  const $memTotal = document.getElementById("mem-total");
+  const $memMeta = document.getElementById("mem-meta");
+  const $memPressure = document.getElementById("mem-pressure");
+  const $memTop = document.getElementById("mem-top");
+
+  async function fetchMemory() {
+    try {
+      const resp = await fetch("/api/status/memory", { cache: "no-store" });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      renderMemory(data);
+    } catch (e) {
+      console.error("[status] memory fetch failed", e);
+      if ($memMeta) $memMeta.textContent = "sin datos";
+    }
+  }
+
+  function renderMemory(payload) {
+    const total = payload.total_mb;
+    if (total != null) {
+      // Mostrar GB cuando >1024 MB para que no satura el card.
+      $memTotal.textContent = total >= 1024
+        ? (total / 1024).toFixed(2) + " GB"
+        : total.toFixed(0) + " MB";
+    } else {
+      $memTotal.textContent = "—";
+    }
+
+    const sys = payload.system || {};
+    const pressure = sys.pressure || "neutral";
+    const availPct = sys.available_pct;
+    const swap = sys.swap_used_gb;
+    const pressureLabel = pressure === "red" ? "alta"
+      : pressure === "yellow" ? "media"
+      : pressure === "green" ? "ok"
+      : "—";
+    if ($memPressure) {
+      const cls = pressure === "red" ? "bad"
+        : pressure === "yellow" ? "worse"
+        : pressure === "green" ? "better"
+        : "neutral";
+      $memPressure.textContent = `presión ${pressureLabel}`;
+      $memPressure.className = `insight-delta ${cls}`;
+    }
+
+    if ($memMeta) {
+      const parts = [];
+      if (availPct != null) parts.push(`avail ${availPct.toFixed(0)}%`);
+      if (swap != null) parts.push(`swap ${swap.toFixed(1)} GB`);
+      $memMeta.textContent = parts.length ? parts.join(" · ") : "—";
+    }
+
+    if ($memTop) {
+      $memTop.innerHTML = "";
+      const top = Array.isArray(payload.top) ? payload.top : [];
+      if (!top.length) {
+        $memTop.innerHTML = '<li><span class="cause" style="color:var(--text-faint)">sin procesos</span></li>';
+        return;
+      }
+      const frag = document.createDocumentFragment();
+      for (const p of top) {
+        const li = document.createElement("li");
+        const mb = p.mb >= 1024 ? (p.mb / 1024).toFixed(2) + " GB" : Math.round(p.mb) + " MB";
+        li.innerHTML = `<span class="cause">${escapeHtml(p.name)}</span><span class="count">${mb}</span>`;
+        frag.appendChild(li);
+      }
+      $memTop.appendChild(frag);
+    }
+  }
+
+  function escapeHtml(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
   // Kick-off: primer fetch inmediato + loop + insights.
   tick(true);
   fetchLatency();
@@ -1082,6 +1165,7 @@
   fetchFreshness();
   fetchLogs();
   fetchUptime();
+  fetchMemory();
   wireLogsFilters();
   startLoop();
 
@@ -1094,6 +1178,7 @@
     fetchFreshness();
     fetchLogs();
     fetchUptime();
+    fetchMemory();
   });
 
   // Loops separados alineados con los TTL server-side:
@@ -1111,9 +1196,11 @@
   // sentido seguir polleando — el server timea cache de 30-60s).
   // uptime: cache 90s → poll 120s (los buckets horarios cambian de a
   // poco, no hace falta refetchear seguido).
-  const INSIGHT_PERIODS = { lat: 60000, err: 30000, fresh: 30000, logs: 15000, uptime: 120000 };
-  const INSIGHT_FNS = { lat: fetchLatency, err: fetchErrors, fresh: fetchFreshness, logs: fetchLogs, uptime: fetchUptime };
-  const insightIvs = { lat: null, err: null, fresh: null, logs: null, uptime: null };
+  // memory: cache 10s → poll 30s (queremos verlo cambiar tras un
+  // bootout/bootstrap pero no necesitamos cadencia de chart).
+  const INSIGHT_PERIODS = { lat: 60000, err: 30000, fresh: 30000, logs: 15000, uptime: 120000, mem: 30000 };
+  const INSIGHT_FNS = { lat: fetchLatency, err: fetchErrors, fresh: fetchFreshness, logs: fetchLogs, uptime: fetchUptime, mem: fetchMemory };
+  const insightIvs = { lat: null, err: null, fresh: null, logs: null, uptime: null, mem: null };
 
   function startInsightLoops() {
     for (const k of Object.keys(insightIvs)) {
@@ -1155,6 +1242,7 @@
         fetchFreshness();
         fetchLogs();
         fetchUptime();
+        fetchMemory();
       }
     }
   });

@@ -16659,6 +16659,113 @@ def status_uptime(nocache: int = 0) -> dict:
     return payload
 
 
+# ── /api/status/memory — RSS rag-stack + pressure indicator ──────────
+# Snapshot compacto del consumo de RAM de los procesos rag-stack (web,
+# supervisor, watch, whatsapp) + pressure global del sistema (free /
+# swap). Usado por la card #6 del /status. Reusa `_sample_memory()` que
+# ya alimenta el chart de /dashboard, agregando solo el cálculo del
+# semáforo de pressure (green/yellow/red).
+#
+# Pressure heurística:
+#   - "red"    si free_pct < 10 OR swap_used_gb > 6
+#   - "yellow" si free_pct < 25 OR swap_used_gb > 2
+#   - "green"  resto
+# Refleja que en Apple Silicon el primer síntoma de saturación es swap
+# que crece (la unified memory no se "llena" como Linux), no el RAM
+# libre per se. Threshold red 6 GB ≈ 50 % del swap pre-OOM histórico.
+#
+# Cacheado 10s — el endpoint se cachea aún más corto que latency porque
+# el polling del card es cada 30s y queremos que un kickstart manual
+# (post-bootout/bootstrap) se vea sin esperar.
+
+_STATUS_MEMORY_CACHE = ThreadSafeCache(ttl=10.0)
+
+
+def _read_swap_usage() -> float:
+    """Swap usado en GB via `sysctl vm.swapusage`. 0.0 en error."""
+    try:
+        out = subprocess.run(
+            ["sysctl", "-n", "vm.swapusage"],
+            capture_output=True, text=True, errors="replace", timeout=2, check=False,
+        ).stdout
+        m = re.search(r"used\s*=\s*([\d.]+)M", out)
+        if m:
+            return round(float(m.group(1)) / 1024.0, 2)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _status_memory_build_payload() -> dict:
+    """Compone payload para /api/status/memory + card #6."""
+    sample = _sample_memory() or {}
+    by_cat = sample.get("by_category") or {}
+    top_full = sample.get("top") or []
+    vm = sample.get("vm") or {}
+
+    # macOS: "free_mb" subestima — `inactive` también es reclamable. La
+    # métrica que matchea Activity Monitor "Memory Pressure" es
+    # available = free + inactive (speculative no lo exponemos pero es
+    # marginal). Sin esto el semáforo dispara red en operación normal
+    # apenas el FS cache crece (ej. mientras corre `rag index`).
+    free_mb = vm.get("free_mb") or 0.0
+    inactive_mb = vm.get("inactive_mb") or 0.0
+    available_mb = free_mb + inactive_mb
+    physical_mb = sum(
+        vm.get(k, 0.0)
+        for k in ("free_mb", "active_mb", "inactive_mb", "wired_mb", "compressed_mb")
+    )
+    available_pct = (available_mb / physical_mb * 100.0) if physical_mb else None
+    swap_used_gb = _read_swap_usage()
+
+    # Pressure: el síntoma real en Apple Silicon es **swap creciendo**,
+    # no RAM "llena" (el unified memory siempre tiende a estar usado).
+    # Threshold red 4 GB swap ≈ 50% del swap pre-OOM histórico observado
+    # en el bug del 2026-05-10 (~13 GB swapouts). available_pct < 5 es
+    # un fail-safe extra para detectar saturación sin swap (RAM enchula).
+    if (available_pct is not None and available_pct < 5) or swap_used_gb > 4:
+        pressure = "red"
+    elif (available_pct is not None and available_pct < 15) or swap_used_gb > 1:
+        pressure = "yellow"
+    else:
+        pressure = "green"
+
+    return {
+        "generated_at": sample.get("ts") or datetime.now().isoformat(timespec="seconds"),
+        "total_mb": sample.get("total_mb"),
+        "by_category": by_cat,
+        "top": top_full[:5],
+        "system": {
+            "available_pct": round(available_pct, 1) if available_pct is not None else None,
+            "swap_used_gb": swap_used_gb,
+            "pressure": pressure,
+        },
+    }
+
+
+@app.get("/api/status/memory")
+def status_memory(nocache: int = 0) -> dict:
+    """Snapshot de memoria de la stack rag (web, supervisor, watch, wa) +
+    pressure indicator del sistema. Card #6 del /status. ?nocache=1 fuerza
+    refresh.
+
+    Reusa la maquinaria de `_sample_memory()` (también usada por el chart
+    en /dashboard via /api/system-memory) — no agrega nuevo sampler. Para
+    histórico, usar `/api/system-memory?minutes=N` directamente.
+    """
+    if nocache:
+        payload = _status_memory_build_payload()
+        _STATUS_MEMORY_CACHE.put(payload)
+        return payload
+    cached = _STATUS_MEMORY_CACHE.get()
+    if cached:
+        _, payload = cached
+        return payload
+    payload = _status_memory_build_payload()
+    _STATUS_MEMORY_CACHE.put(payload)
+    return payload
+
+
 @app.get("/status")
 def status_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "status.html")

@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Calibration sweep + auto-escalation: Qwen3-Reranker MLX tier finder.
 
 Fase 2 del plan MLX-full-migration (Ola 10, 2026-05-07). Corre `rag eval`

@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Gmail ingester — Phase 1.c of the cross-source corpus.
 
 User decision §10.6 (2026-04-20): OAuth Google Gmail via the existing

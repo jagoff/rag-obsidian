@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Delete bot-initiated impression rows from `rag_behavior` con heurística post-hoc.
 
 Pre-2026-04-28 el `retrieve()` siempre logueaba `log_impressions(source="cli")`

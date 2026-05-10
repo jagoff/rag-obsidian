@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Safari ingester — Phase 2 of the cross-source corpus.
 
 Reads `~/Library/Safari/History.db` (SQLite) for browsing history and

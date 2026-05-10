@@ -858,19 +858,24 @@ function refresh(d) {
   if (idx.chunks) {
     const nFiles = idx.notes_files ?? idx.notes ?? 0;
     const nTitles = idx.notes_titles ?? idx.notes ?? 0;
+    // Audit 2026-05-10 (U8): los counters numéricos del backend (idx.chunks,
+    // idx.tags, idx.folders) son enteros pero pasamos por Number() + toLocaleString
+    // como defense-in-depth: si el backend retornase un string con HTML embebido
+    // (regresión silenciosa de un nuevo writer), se renderiza como literal en lugar
+    // de inyectarse. pr.score igual — número con formato decimal.
     let rows = `
-      <tr><td>Chunks</td><td>${idx.chunks.toLocaleString()}</td></tr>
+      <tr><td>Chunks</td><td>${Number(idx.chunks).toLocaleString()}</td></tr>
       <tr><td>Notas (archivos)</td><td>${Number(nFiles).toLocaleString()}</td></tr>
       <tr><td>Títulos únicos</td><td>${Number(nTitles).toLocaleString()}</td></tr>
-      <tr><td>Tags</td><td>${idx.tags}</td></tr>
-      <tr><td>Carpetas</td><td>${idx.folders}</td></tr>
+      <tr><td>Tags</td><td>${Number(idx.tags).toLocaleString()}</td></tr>
+      <tr><td>Carpetas</td><td>${Number(idx.folders).toLocaleString()}</td></tr>
     `;
     if (idx.top_pagerank && idx.top_pagerank.length) {
       rows += '<tr><td colspan="2" style="color:var(--text-faint);padding-top:10px">Top PageRank</td></tr>';
       for (const pr of idx.top_pagerank) {
         const name = pr.path.split("/").pop().replace(".md", "");
         const cell = pathLink(pr.path, escapeHtml(name), { title: pr.path });
-        rows += `<tr><td style="color:var(--cyan)">${cell}</td><td>${pr.score}</td></tr>`;
+        rows += `<tr><td style="color:var(--cyan)">${cell}</td><td>${escapeHtml(String(pr.score))}</td></tr>`;
       }
     }
     idxEl.innerHTML = `<table class="stats-table"><caption class="sr-only">Estadísticas del index del vault: chunks, notas, títulos únicos, tags, carpetas y top notas por PageRank</caption>${rows}</table>`;

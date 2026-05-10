@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Drafts DPO fine-tune via [`mlx_lm.lora`](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/LORA.md).
 
 Fase 1.2 del plan MLX-full-migration (Ola 10, 2026-05-07). Reemplaza el

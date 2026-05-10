@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Google Calendar ingester — Phase 1.b of the cross-source corpus.
 
 User decision §10.6 (2026-04-20): OAuth Google Calendar via the Claude

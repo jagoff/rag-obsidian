@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Apple Reminders ingester — Phase 1.d of the cross-source corpus.
 
 User decision §10.1 (2026-04-20): Reminders is local-only (EventKit via

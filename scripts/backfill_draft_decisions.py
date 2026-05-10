@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Backfill `rag_draft_decisions` desde `~/.local/share/whatsapp-listener/draft.jsonl`.
 
 Contexto (2026-05-10):

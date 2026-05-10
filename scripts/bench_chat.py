@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Bench de latencia del CLI chat path sin TTY — reproduce lo que hace
 `rag chat` (retrieve + LLM streaming) y reporta timing por etapa.
 

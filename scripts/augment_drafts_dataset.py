@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Data augmentation para el fine-tune de drafts WhatsApp (fase B, 2026-05-01).
 
 Contrato:

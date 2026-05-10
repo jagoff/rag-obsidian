@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Quick smoke test del LoRA adapter de drafts (post-fine-tune).
 
 Uso:

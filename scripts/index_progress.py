@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Real-time progress monitor for `rag index --reset`.
 
 Polls the log file every 5s and shows:

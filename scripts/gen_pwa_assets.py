@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Genera los assets de la PWA (icons + splash screens) para iOS/Android.
 
 Output: `web/static/pwa/*.png`

@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Google Drive cross-source ingester — Phase 1.g (2026-04-24).
 
 Indexa Google Docs / Sheets / Slides del user directo en la colección

@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Export training pairs from all telemetry sources for ranker fine-tuning.
 
 Complements `scripts/finetune_reranker.py` (2026-04-22, peer commit eca8c6f)

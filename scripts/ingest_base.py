@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Helpers compartidos para scripts/ingest_*.py.
 
 Extraído 2026-04-25 del saneamiento: los 8 ingest scripts duplicaban

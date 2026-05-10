@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Weekly consolidation of episodic-memory conversation notes (Phase 2).
 
 Scans `99-obsidian/99-AI/conversations/`, groups

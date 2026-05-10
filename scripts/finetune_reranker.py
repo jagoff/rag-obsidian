@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Fine-tune bge-reranker-v2-m3 on user feedback (GC#2.B/2.C, 2026-04-22).
 
 Two modes are supported, dispatched via `--mode`:

@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Real-time progress monitor for `rag eval` background runs.
 
 Usage:

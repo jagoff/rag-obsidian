@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Smoke test: cargar y ejecutar los 4 modelos MLX via MLXBackend.
 
 Verifica:

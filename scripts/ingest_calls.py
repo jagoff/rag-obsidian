@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Call History ingester — Phase 1.f of the cross-source corpus.
 
 Reads `~/Library/Application Support/CallHistoryDB/CallHistory.storedata`

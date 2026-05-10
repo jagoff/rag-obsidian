@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Adversarial query generator para eval del retriever (skill: evaluate-rag).
 
 Process (Hamel Husain, evals-skills@evaluate-rag):

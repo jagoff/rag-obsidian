@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Fine-tune del modelo de drafts de WhatsApp via DPO + LoRA (2026-05-01).
 
 Contrato:

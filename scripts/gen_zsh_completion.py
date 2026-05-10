@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Genera un completion script de zsh (`_rag`) introspeccionando el árbol de
 Click del CLI `rag`. El resultado es un archivo hand-written fast (no spawnea
 Python en cada Tab — todos los subcomandos, flags, choices y descriptions

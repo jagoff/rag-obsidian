@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """One-shot JSONL→SQLite migration for the rag_* telemetry tables.
 
 Reads every legacy JSONL/JSON state file under ~/.local/share/obsidian-rag/

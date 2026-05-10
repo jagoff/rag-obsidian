@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """WhatsApp ingester — Phase 1.a of the cross-source corpus (§10.1 user
 decision 2026-04-20: WhatsApp first).
 

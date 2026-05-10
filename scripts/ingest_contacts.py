@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Apple Contacts ingester — Phase 1.e of the cross-source corpus.
 
 Reads every `AddressBook-v22.abcddb` SQLite under

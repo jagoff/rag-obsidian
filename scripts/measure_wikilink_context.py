@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Mide cobertura de keywords de relación alrededor de wikilinks en el vault.
 
 Decision gate para typed-edges feature: si <30% de edges tiene señal explícita

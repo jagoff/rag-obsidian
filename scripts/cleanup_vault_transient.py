@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Cleanup transient folders bajo `99-obsidian/99-AI/`.
 
 Background (2026-04-27): el vault Obsidian acumula carpetas de "sistema"

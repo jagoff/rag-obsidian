@@ -56,7 +56,7 @@ import json
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, AsyncGenerator
+from typing import AsyncGenerator
 
 __all__ = [
     "build_chat_response",

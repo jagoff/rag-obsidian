@@ -70,12 +70,9 @@ Aprendido el 2026-04-30.
 
 from __future__ import annotations
 
-import contextlib
 import math
-import re
 from collections import OrderedDict
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Any, Callable
 
 # ──────────────────────────────────────────────────────────────────────────

@@ -81,8 +81,6 @@ mlx-vlm (`_vlm_load`) is also lazy — module load stays fast.
 
 from __future__ import annotations
 
-import hashlib
-import json
 import os
 import re
 import threading

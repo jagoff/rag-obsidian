@@ -221,7 +221,11 @@ def test_sse_acquire_release_slot():
     # Cleanup: liberar todos los slots para no contaminar otros tests.
     for _ in range(cap):
         _server._sse_release_slot(ip)
-    assert ip not in _server._SSE_CONNECTIONS_PER_IP
+    # Post-release total: el helper hace `delete(ip)` cuando el contador
+    # cae a 1, por lo que `get(ip)` debe devolver None. (Antes el cache
+    # era un dict plano y se chequeaba con `not in`; ahora es un
+    # `ThreadSafeCacheMultiKey` cuya API es `.get()`).
+    assert _server._SSE_CONNECTIONS_PER_IP.get(ip) is None
 
 
 def test_sse_endpoint_returns_429_when_over_per_ip_cap(monkeypatch):
@@ -237,9 +241,10 @@ def test_sse_endpoint_returns_429_when_over_per_ip_cap(monkeypatch):
     test_ip = "testclient"
 
     # Reset global counter + pre-fill hasta el cap para simular N
-    # streams ya activos.
+    # streams ya activos. El cache ya no es dict plano (drift detectado
+    # 2026-05-10), ahora es `ThreadSafeCacheMultiKey` — usar `.put()`.
     _server._SSE_CONNECTIONS_PER_IP.clear()
-    _server._SSE_CONNECTIONS_PER_IP[test_ip] = cap
+    _server._SSE_CONNECTIONS_PER_IP.put(test_ip, cap)
 
     try:
         resp = _client.get("/api/dashboard/stream")

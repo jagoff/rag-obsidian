@@ -23,7 +23,6 @@ from pathlib import Path
 import pytest
 
 from rag import (
-    _ENTITY_LABELS,
     _ENTITY_STOPWORDS_GLOBAL,
     _ENTITY_STOPWORDS_PERSON,
     _load_entity_overrides,

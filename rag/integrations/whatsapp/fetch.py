@@ -33,7 +33,7 @@ respetan monkey-patches de tests.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 
 # Bridge guarda `timestamp` como string `YYYY-MM-DD HH:MM:SS-03:00` (Go default

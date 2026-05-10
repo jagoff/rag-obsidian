@@ -353,6 +353,13 @@ import inspect as _inspect_for_tools  # noqa: E402
 # impredecible y leak-sensitive. Filtramos `args` a las keys que la
 # firma del tool acepta antes del dispatch.
 _TOOL_SIG_CACHE: dict[str, set[str]] = {}
+# 2026-05-10: doble-checked locking. Read fast-path es lock-free
+# (`dict.get` atómico bajo GIL); el populate path serializa via lock
+# para evitar que N threads del primer warmup recomputen la misma
+# `inspect.signature` (que el docstring marca explícitamente como
+# costosa). Convención de naming `_<NAME>_LOCK` (10+ locks así en este
+# archivo).
+_TOOL_SIG_CACHE_LOCK = threading.Lock()
 
 
 def _filter_tool_args(name: str, args: dict) -> dict:
@@ -366,23 +373,26 @@ def _filter_tool_args(name: str, args: dict) -> dict:
         return {}
     keys = _TOOL_SIG_CACHE.get(name)
     if keys is None:
-        fn = TOOL_FNS.get(name)
-        if fn is None:
-            keys = set()
-        else:
-            try:
-                sig = _inspect_for_tools.signature(fn)
-                accepts_kwargs = any(
-                    p.kind == _inspect_for_tools.Parameter.VAR_KEYWORD
-                    for p in sig.parameters.values()
-                )
-                keys = (
-                    set(["__all__"]) if accepts_kwargs
-                    else {n for n in sig.parameters.keys()}
-                )
-            except (TypeError, ValueError):
-                keys = set(["__all__"])
-        _TOOL_SIG_CACHE[name] = keys
+        with _TOOL_SIG_CACHE_LOCK:
+            keys = _TOOL_SIG_CACHE.get(name)  # double-check tras adquirir
+            if keys is None:
+                fn = TOOL_FNS.get(name)
+                if fn is None:
+                    keys = set()
+                else:
+                    try:
+                        sig = _inspect_for_tools.signature(fn)
+                        accepts_kwargs = any(
+                            p.kind == _inspect_for_tools.Parameter.VAR_KEYWORD
+                            for p in sig.parameters.values()
+                        )
+                        keys = (
+                            set(["__all__"]) if accepts_kwargs
+                            else {n for n in sig.parameters.keys()}
+                        )
+                    except (TypeError, ValueError):
+                        keys = set(["__all__"])
+                _TOOL_SIG_CACHE[name] = keys
     if "__all__" in keys:
         return args
     return {k: v for k, v in args.items() if k in keys}

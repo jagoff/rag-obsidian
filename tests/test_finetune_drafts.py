@@ -75,9 +75,13 @@ def test_mining_pairs_returns_gold_only_skips_rejected(state_db):
 
     `decision='approved_editar'` → row gold (chosen=sent_text,
     rejected=bot_draft).
-    `decision='rejected'` → no hay chosen alternativo → SKIP. El
-    contador `n_rejected_skipped` documenta cuánta señal se descarta.
+    `decision='rejected'` con `use_rejected_synthetic=False` → no se
+    sintetiza chosen, se cuenta en `n_rejected_no_chosen`.
     `decision='approved_si'` / 'expired' → fuera de la query SQL.
+
+    Pasamos `use_rejected_synthetic=False` para no depender del bridge
+    SQLite externo; el path synthetic-chosen tiene sus propios tests
+    abajo con mock del bridge.
     """
     # 2 approved_editar (gold), 3 rejected (skipped), 1 approved_si
     # (ignorado por SQL), 1 expired (ignorado por SQL).
@@ -92,14 +96,17 @@ def test_mining_pairs_returns_gold_only_skips_rejected(state_db):
                    bot_draft="hi", sent_text="hi")
     _seed_decision(draft_id="e1", decision="expired", bot_draft="bye")
 
-    data = finetune_drafts.fetch_draft_pairs(exclude_review_only=False)
+    data = finetune_drafts.fetch_draft_pairs(
+        exclude_review_only=False, use_rejected_synthetic=False,
+    )
 
     assert len(data["gold"]) == 2
     # `anti` queda vacía siempre — DPO no usa pseudo-anti-patterns.
     assert len(data["anti"]) == 0
     assert data["stats"]["n_gold"] == 2
     assert data["stats"]["n_anti"] == 0
-    assert data["stats"]["n_rejected_skipped"] == 3
+    assert data["stats"]["n_rejected_no_chosen"] == 3
+    assert data["stats"].get("n_rejected_synthetic", 0) == 0
     # Total rows leídas del SQL (approved_editar + rejected, sin
     # approved_si/expired) = 5.
     assert data["stats"]["n_total_rows"] == 5
@@ -152,23 +159,109 @@ def test_exclude_review_only_filters_correctly(state_db):
 
     # Default: incluir review-only. 3 gold (2 normales + 1 review-only).
     # La rejected review-only se cuenta primero como review-only
-    # (=2 total), después como rejected-skipped.
-    data_inc = finetune_drafts.fetch_draft_pairs(exclude_review_only=False)
+    # (=2 total), después como rejected sin chosen.
+    # Pasamos use_rejected_synthetic=False — los tests de synthetic
+    # están aislados abajo con mock del bridge.
+    data_inc = finetune_drafts.fetch_draft_pairs(
+        exclude_review_only=False, use_rejected_synthetic=False,
+    )
     assert len(data_inc["gold"]) == 3
     assert len(data_inc["anti"]) == 0
-    assert data_inc["stats"]["n_rejected_skipped"] == 1
+    assert data_inc["stats"]["n_rejected_no_chosen"] == 1
     assert data_inc["stats"]["n_review_only_total"] == 2
     assert data_inc["stats"]["n_review_only_excluded"] == 0
 
     # Con flag: 2 gold sobreviven (review-only excluidos antes del
     # rejected-skip → la rejected review-only NO incrementa el
-    # rejected_skipped count).
-    data_exc = finetune_drafts.fetch_draft_pairs(exclude_review_only=True)
+    # rejected count).
+    data_exc = finetune_drafts.fetch_draft_pairs(
+        exclude_review_only=True, use_rejected_synthetic=False,
+    )
     assert len(data_exc["gold"]) == 2
     assert len(data_exc["anti"]) == 0
-    assert data_exc["stats"]["n_rejected_skipped"] == 0
+    assert data_exc["stats"]["n_rejected_no_chosen"] == 0
     assert data_exc["stats"]["n_review_only_total"] == 2
     assert data_exc["stats"]["n_review_only_excluded"] == 2
+
+
+# ── Test 2.5: rejected + synthetic chosen del bridge ─────────────────────
+
+
+def test_rejected_with_synthetic_chosen_promotes_to_gold(state_db, monkeypatch):
+    """Cuando `use_rejected_synthetic=True` (default), los rows con
+    decision='rejected' se cruzan con el bridge para sintetizar `chosen`
+    desde la respuesta MANUAL del user post-rechazo.
+
+    Mock-eamos `_lookup_synthetic_chosen_from_bridge` para devolver un
+    texto canned y verificamos que el rejected se promueve a gold con
+    `chosen_source='rejected_synthetic'`.
+
+    Este es EL mecanismo nuevo que convierte cada /no en signal entrenable
+    cuando el user respondió manualmente desde la app.
+    """
+    # 1 approved_editar (gold via path antiguo) + 2 rejected (uno con
+    # chosen sintetizado, otro sin respuesta manual → skipped).
+    _seed_decision(draft_id="ed1", decision="approved_editar",
+                   bot_draft="hola jaja", sent_text="qué hacés che")
+    _seed_decision(draft_id="r_with_response",
+                   contact_jid="fer@s.whatsapp.net",
+                   decision="rejected", bot_draft="si jajaja")
+    _seed_decision(draft_id="r_no_response",
+                   contact_jid="otro@s.whatsapp.net",
+                   decision="rejected", bot_draft="dale jajaja")
+
+    # Mock del lookup: solo "fer@s.whatsapp.net" tiene respuesta manual.
+    def fake_lookup(contact_jid, after_iso_ts, window_minutes=30):
+        if contact_jid == "fer@s.whatsapp.net":
+            return "ya está, gracias por avisar"
+        return None
+
+    monkeypatch.setattr(
+        finetune_drafts, "_lookup_synthetic_chosen_from_bridge", fake_lookup,
+    )
+
+    data = finetune_drafts.fetch_draft_pairs(
+        exclude_review_only=False, use_rejected_synthetic=True,
+    )
+
+    # 2 gold: 1 approved_editar + 1 rejected_synthetic.
+    assert len(data["gold"]) == 2
+    assert data["stats"]["n_gold"] == 2
+    assert data["stats"]["n_rejected_synthetic"] == 1
+    # 1 rejected sin respuesta → counted como no_chosen.
+    assert data["stats"]["n_rejected_no_chosen"] == 1
+
+    sources = sorted(item["chosen_source"] for item in data["gold"])
+    assert sources == ["approved_editar", "rejected_synthetic"]
+
+    # Verificá el contenido del item synthetic.
+    synthetic = next(
+        i for i in data["gold"] if i["chosen_source"] == "rejected_synthetic"
+    )
+    assert synthetic["bot_draft"] == "si jajaja"
+    assert synthetic["sent_text"] == "ya está, gracias por avisar"
+
+
+def test_rejected_synthetic_chosen_equals_bot_draft_skipped(state_db, monkeypatch):
+    """Edge: si la respuesta manual coincide exactamente con el bot_draft,
+    el par es degenerado (DPO log-ratio=0) → skip.
+
+    Ej: bot dice "ok" + user pone /no + user responde manualmente "ok"
+    desde la app. Sería raro pero defensivo.
+    """
+    _seed_decision(draft_id="degen",
+                   contact_jid="x@s.whatsapp.net",
+                   decision="rejected", bot_draft="ok")
+
+    monkeypatch.setattr(
+        finetune_drafts, "_lookup_synthetic_chosen_from_bridge",
+        lambda *a, **kw: "ok",  # mismo que bot_draft
+    )
+    data = finetune_drafts.fetch_draft_pairs(
+        exclude_review_only=False, use_rejected_synthetic=True,
+    )
+    # No promovido a gold porque chosen == rejected.
+    assert len(data["gold"]) == 0
 
 
 # ── Test 3: insuficiente data → exit 1 ───────────────────────────────────

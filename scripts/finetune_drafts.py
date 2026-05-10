@@ -36,11 +36,15 @@ Decisión deliberada — base model 7B vs el 14B en producción:
   (`/api/draft/preview`) para A/B manual del user.
 
 Pipeline:
-  1. Pull de `rag_draft_decisions` con `decision='approved_editar'`. Por
-     default incluye rows con `extra_json.review_only=true`; el flag
-     `--exclude-review-only` los filtra. La data sintética del
-     `augment_drafts_dataset.py` (review_only=true, synthetic=true) se
-     incluye también — ayuda al volumen para que el LoRA generalice.
+  1. Pull de `rag_draft_decisions` con `decision IN ('approved_editar',
+     'rejected')`. Para `approved_editar`: chosen=sent_text directo. Para
+     `rejected` (path agregado 2026-05-10 cuando el user pidió que `/no`
+     también genere aprendizaje): cruzamos con el bridge SQLite buscando
+     la respuesta MANUAL del user post-rechazo (`is_from_me=1` dentro de
+     30min en el chat del contacto). Si encontramos → chosen=esa respuesta;
+     si no → skip el row. Default include review-only rows; flag
+     `--exclude-review-only` los filtra. Flag `--no-rejected-synthetic`
+     para volver al comportamiento pre-2026-05-10.
   2. Construye DPO triplets:
         prompt:   "Conversación con <contacto>:\n<últimos 5 msgs>\n\n## Tu respuesta:\n"
         chosen:   sent_text          ← lo que vos escribiste (target)
@@ -140,7 +144,87 @@ DPO_BETA = 0.1
 # ── Mining de pairs ───────────────────────────────────────────────────────
 
 
-def fetch_draft_pairs(*, exclude_review_only: bool = False) -> dict:
+def _lookup_synthetic_chosen_from_bridge(
+    contact_jid: str,
+    after_iso_ts: str,
+    window_minutes: int = 30,
+) -> str | None:
+    """Para un `rejected` row, busca la respuesta MANUAL del user post-rechazo.
+
+    Lógica: cuando el user pone /no a un draft, típicamente responde manualmente
+    desde la app de WhatsApp. Esa respuesta queda en el bridge SQLite con
+    `is_from_me=1`. La consideramos `chosen` sintético — refleja qué hubiera
+    estado bien según vos.
+
+    Window de 30min: limita a respuestas inmediatamente posteriores al rechazo.
+    Más de 30min, probablemente la respuesta es de otra conversación o cambio
+    de contexto, no relacionada al draft rechazado.
+
+    Returns:
+        El texto del primer `is_from_me=1` post `after_iso_ts` para el contacto,
+        o None si no hay respuesta manual o el bridge no es accesible.
+
+    2026-05-10: agregado para que el path `decision='rejected'` también
+    contribuya al fine-tune DPO. Antes se skipeaba porque DPO requiere
+    `chosen` y `/no` solo provee `rejected`.
+    """
+    import sqlite3
+    bridge_db = (
+        Path.home() / "repos" / "whatsapp-mcp"
+        / "whatsapp-bridge" / "store" / "messages.db"
+    )
+    if not bridge_db.is_file():
+        return None
+    # Convertimos ISO a SQL datetime para comparación. La tabla del bridge
+    # guarda timestamps en formato `2026-05-10 01:43:10-03:00`.
+    try:
+        conn = sqlite3.connect(f"file:{bridge_db}?mode=ro", uri=True, timeout=2.0)
+    except sqlite3.Error:
+        return None
+    try:
+        # Cap por window — solo respuestas dentro de N min post rechazo.
+        cutoff_max_sql = (
+            f"datetime('{after_iso_ts}', '+{int(window_minutes)} minutes')"
+        )
+        # Usamos LIMIT 5 + filter en Python por si el primer match es vacío
+        # / U+200B (anti-loop bot marker — el listener prefijea sus outgoing
+        # con ​; esos NO los queremos como chosen).
+        rows = conn.execute(
+            f"""
+            SELECT content FROM messages
+            WHERE chat_jid = ?
+              AND is_from_me = 1
+              AND content IS NOT NULL
+              AND content != ''
+              AND datetime(timestamp) > datetime(?)
+              AND datetime(timestamp) <= {cutoff_max_sql}
+            ORDER BY datetime(timestamp) ASC
+            LIMIT 5
+            """,
+            (contact_jid, after_iso_ts),
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    for (content,) in rows:
+        text = (content or "").strip()
+        if not text or text.startswith("​"):
+            continue
+        # Cap a 500 chars para no inflar prompts.
+        return text[:500]
+    return None
+
+
+def fetch_draft_pairs(
+    *,
+    exclude_review_only: bool = False,
+    use_rejected_synthetic: bool = True,
+) -> dict:
     """Pull `rag_draft_decisions` y arma listas de gold preference pairs.
 
     Args:
@@ -148,24 +232,30 @@ def fetch_draft_pairs(*, exclude_review_only: bool = False) -> dict:
             `extra_json.review_only` sea truthy. Default False — los
             sintéticos del augmenter Y los reales review-only siguen
             siendo signal real.
+        use_rejected_synthetic: si True (default), procesa rows con
+            `decision='rejected'` cruzando con el bridge SQLite para
+            sintetizar `chosen` desde la respuesta MANUAL del user post-
+            rechazo (`is_from_me=1` dentro de 30min). Cuando el user
+            usa `/no` masivamente sin `/editar`, este path convierte
+            esos rejecteds en preference pairs entrenables. Si False,
+            se skipean (comportamiento histórico pre-2026-05-10).
 
     Returns:
         dict con keys:
             gold: list[dict]    — preference pairs (bot_draft=rejected, sent_text=chosen)
-            anti: list[dict]    — VACÍA siempre (legacy compat: el SFT viejo
-                                  usaba 'rejected' rows como pseudo-anti, DPO
-                                  no las puede usar sin un chosen alternativo)
+            anti: list[dict]    — VACÍA siempre (legacy compat)
             stats: dict         — counts + ratio review-only para reporte
     """
     gold: list[dict] = []
     # `anti` queda vacía — el legacy SFT usaba decision='rejected' rows
     # como pseudo-anti-patterns con target="". DPO requiere AMBOS chosen
-    # y rejected, y no tenemos un "chosen alternativo" para esas rows.
-    # Las skipeamos limpiamente. Las contamos para el reporte.
+    # y rejected; con el path synthetic-chosen los rejected SÍ entran al
+    # gold. Mantenemos `anti` por compat con scripts/observers.
     anti: list[dict] = []
     n_review_only_total = 0
     n_review_only_excluded = 0
-    n_rejected_skipped = 0
+    n_rejected_no_chosen = 0  # rejected sin respuesta manual posterior
+    n_rejected_synthetic = 0  # rejected promovidos a gold via synthetic chosen
 
     try:
         with rag._ragvec_state_conn() as conn:
@@ -201,26 +291,39 @@ def fetch_draft_pairs(*, exclude_review_only: bool = False) -> dict:
                 n_review_only_excluded += 1
                 continue
 
-        # decision='rejected' rows: skip silently. Legacy SFT las
-        # contaba como anti, DPO no puede usarlas.
-        if decision == "rejected":
-            n_rejected_skipped += 1
-            continue
-
-        # Only approved_editar reaches here. Validamos sent_text ≠ bot_draft.
-        if not sent_text:
-            # defensivo: no debería pasar (si fueran iguales sería
-            # approved_si). Skip silently.
-            continue
-        if sent_text == bot_draft:
-            # par degenerado: chosen == rejected → DPO log-ratio = 0,
-            # gradient = 0. Skip para no diluir el batch.
-            continue
-
         try:
             original_msgs = json.loads(msgs_json) if msgs_json else []
         except Exception:
             original_msgs = []
+
+        # Resolver chosen según el tipo de decisión.
+        chosen_text: str | None = None
+        if decision == "approved_editar":
+            chosen_text = sent_text
+        elif decision == "rejected":
+            if not use_rejected_synthetic:
+                n_rejected_no_chosen += 1
+                continue
+            # Buscamos respuesta manual del user post-rechazo en el bridge.
+            # Usamos el ts del rechazo como punto de partida — el user puede
+            # haber tipeado la respuesta manual antes de poner /no, pero el
+            # caso típico es: /no rechaza el draft → user va al chat → tipea
+            # la respuesta. Ts del rejected es proxy razonable.
+            chosen_text = _lookup_synthetic_chosen_from_bridge(
+                jid, ts, window_minutes=30,
+            )
+            if chosen_text is None:
+                n_rejected_no_chosen += 1
+                continue
+            n_rejected_synthetic += 1
+
+        # Common validation: chosen debe existir y diferir de bot_draft.
+        if not chosen_text:
+            continue
+        if chosen_text == (bot_draft or ""):
+            # Par degenerado: chosen == rejected → DPO log-ratio = 0,
+            # gradient = 0. Skip para no diluir el batch.
+            continue
 
         item = {
             "id": rid,
@@ -228,8 +331,15 @@ def fetch_draft_pairs(*, exclude_review_only: bool = False) -> dict:
             "contact_name": name or "",
             "original_msgs": original_msgs,
             "bot_draft": bot_draft or "",
-            "sent_text": sent_text,
+            "sent_text": chosen_text,
             "ts": ts,
+            # 2026-05-10: marker del origen del chosen — útil para debug
+            # y eventualmente para weighting en el DPO loss (los synthetic
+            # son ruidosos; podríamos darles peso 0.7 vs 1.0 del editar).
+            "chosen_source": (
+                "approved_editar" if decision == "approved_editar"
+                else "rejected_synthetic"
+            ),
         }
         gold.append(item)
 
@@ -239,7 +349,8 @@ def fetch_draft_pairs(*, exclude_review_only: bool = False) -> dict:
         # `n_anti` queda en 0 siempre. Mantenemos la key por
         # compat con scripts/observers que la leen.
         "n_anti": 0,
-        "n_rejected_skipped": n_rejected_skipped,
+        "n_rejected_no_chosen": n_rejected_no_chosen,
+        "n_rejected_synthetic": n_rejected_synthetic,
         "n_review_only_total": n_review_only_total,
         "n_review_only_excluded": n_review_only_excluded,
         "review_only_ratio": (
@@ -693,10 +804,15 @@ def print_stats(stats: dict, *, exclude_review_only: bool) -> None:
     print("== Mining stats ==", file=sys.stderr)
     print(f"  Total rows (approved_editar + rejected): "
           f"{stats['n_total_rows']}", file=sys.stderr)
-    print(f"  Gold preference pairs (approved_editar):  "
+    print(f"  Gold preference pairs (total):            "
           f"{stats['n_gold']}", file=sys.stderr)
-    print(f"  Rejected rows skipped (no chosen):        "
-          f"{stats.get('n_rejected_skipped', 0)}", file=sys.stderr)
+    print(f"    · de approved_editar:                   "
+          f"{stats['n_gold'] - stats.get('n_rejected_synthetic', 0)}",
+          file=sys.stderr)
+    print(f"    · de rejected + synthetic chosen:       "
+          f"{stats.get('n_rejected_synthetic', 0)}", file=sys.stderr)
+    print(f"  Rejected rows sin respuesta manual:       "
+          f"{stats.get('n_rejected_no_chosen', 0)}", file=sys.stderr)
     print(f"  Review-only rows (extra_json flag):       "
           f"{stats['n_review_only_total']}  "
           f"({stats['review_only_ratio'] * 100:.1f}%)",
@@ -760,6 +876,11 @@ def main() -> None:
     ap.add_argument("--exclude-review-only", action="store_true",
                     help="Filtrar rows con extra_json.review_only=true. "
                          "Default: incluir (signal real igual).")
+    ap.add_argument("--no-rejected-synthetic", action="store_true",
+                    help="No usar rows con decision='rejected' + chosen "
+                         "sintetizado desde el bridge. Default: usarlas — "
+                         "cada /no con respuesta manual del user dentro de "
+                         "30min se promueve a preference pair entrenable.")
     ap.add_argument("--dry-run", action="store_true",
                     help="Build pairs + report stats; NO entrena.")
     ap.add_argument("--max-train-samples", type=int, default=None,
@@ -771,12 +892,15 @@ def main() -> None:
     print(f"  Base model: {DRAFTS_BASE_MODEL}", file=sys.stderr)
     print(f"  Adapter dir: {DRAFTS_FT_ADAPTER_DIR}", file=sys.stderr)
 
-    data = fetch_draft_pairs(exclude_review_only=args.exclude_review_only)
+    data = fetch_draft_pairs(
+        exclude_review_only=args.exclude_review_only,
+        use_rejected_synthetic=not args.no_rejected_synthetic,
+    )
     print_stats(data["stats"], exclude_review_only=args.exclude_review_only)
 
-    # Build DPO triplets desde gold (approved_editar). Las rows
-    # 'rejected' (sin chosen alternativo) ya se descartaron en
-    # fetch_draft_pairs.
+    # Build DPO triplets desde gold. Incluye approved_editar + rejected
+    # con chosen sintetizado del bridge (cada uno marca su `chosen_source`
+    # en el item para debug/weighting eventual).
     examples = [build_dpo_example(item) for item in data["gold"]]
     print(f"\n  DPO training examples: {len(examples)} preference pairs",
           file=sys.stderr)

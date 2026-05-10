@@ -329,6 +329,10 @@ Catálogo completo (47+ vars) en [`docs/env-vars-catalog.md`](docs/env-vars-cata
 - `RAG_TIMEZONE` — IANA tz (default `America/Argentina/Buenos_Aires`).
 - `OBSIDIAN_RAG_WATCH_EXCLUDE_FOLDERS` — comma-separated.
 
+**Supervisor / scheduler** (audit 2026-05-10 — Mac sleep masacraba cron nightly):
+- `RAG_SCHEDULER_MISFIRE_GRACE_SECONDS=3600` — segundos de gracia para que APScheduler dispare cron jobs missed después de un sleep/wake del Mac. Antes era 60s hardcoded → cron 03:00 (auto_harvest, whisper_vocab, online_tune, etc.) se skipeaba si el Mac dormía. `coalesce=True` colapsa misses en una sola ejecución (no storm). Override: `=600` (10min, conservador), `=21600` (6hr, cubre sleep noche entera), `=None` NO soportado por el wrapper (usar int).
+- `RAG_SUPERVISOR_MLX_WARMUP=0` (default en plist) — desactiva MLX warmup al boot del supervisor para no bloquear el arranque. Activar `=1` solo si querés que los modelos estén pre-warmed (cuesta ~30s adicionales de boot, no aconsejado).
+
 **Dev/debug** (NO producción): `RAG_DEBUG=1`, `RAG_RETRIEVE_TIMING=1`, `RAG_NO_WARMUP=1`, `OBSIDIAN_RAG_SKIP_CONTEXT_SUMMARY=1`, `OBSIDIAN_RAG_SKIP_SYNTHETIC_Q=1`.
 
 ## Architecture invariants

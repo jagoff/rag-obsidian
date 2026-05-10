@@ -113,12 +113,37 @@ class Scheduler:
         self._aps: BackgroundScheduler | None = None
         self._started = False
         if not self.headless:
+            # Audit 2026-05-10: el `misfire_grace_time=60` original masacraba
+            # los cron nightly cuando el Mac dormía. Detectado vía gap analysis
+            # en `rag_supervisor_jobs.routing_rules` (interval 5min): gaps de
+            # 216 min en la madrugada del domingo justo encima de la ventana
+            # 03:00→05:00 (auto_harvest, whisper_vocab, implicit_feedback,
+            # online_tune, maintenance, calibrate). Macbook duerme con
+            # `pmset sleepnow` o lid-close → cron triggers caen fuera del
+            # 60s grace → APScheduler los marca como missed y skipea.
+            #
+            # Mitigación: bump del grace a 3600s (1hr) por default. `coalesce=True`
+            # garantiza que múltiples misses se colapsan en UNA SOLA ejecución
+            # al despertar (no storm).
+            #
+            # Override: `RAG_SCHEDULER_MISFIRE_GRACE_SECONDS=<n>` para subir/bajar
+            # según tolerancia del operador. Valores típicos:
+            #   - 60   = comportamiento histórico (cron pierde si Mac duerme).
+            #   - 600  = balance (cubre siesta corta, pierde sleep nocturno).
+            #   - 3600 = default actual (cubre la mayoría de los wake patterns).
+            #   - 21600 = 6hr (cubre sleep noche entera para macs domésticos).
+            #   - None  = APScheduler ejecuta TODOS los misses (no recomendado:
+            #            storm al wake si Mac estuvo dormido toda la noche).
+            try:
+                grace = int(os.environ.get("RAG_SCHEDULER_MISFIRE_GRACE_SECONDS", "3600"))
+            except ValueError:
+                grace = 3600
             self._aps = BackgroundScheduler(
                 timezone=os.environ.get("RAG_TIMEZONE", "America/Argentina/Buenos_Aires"),
                 job_defaults={
                     "coalesce": True,        # juntar misfires en uno
                     "max_instances": 1,      # no overlapping per job
-                    "misfire_grace_time": 60,
+                    "misfire_grace_time": grace,
                 },
             )
 

@@ -19608,6 +19608,21 @@ def _retry_pending_contradictions(col: SqliteVecCollection) -> int:
     return retried
 
 
+def _contradiction_defer_enabled() -> bool:
+    """True cuando `RAG_INDEX_DEFER_CONTRADICTIONS=1` — el caller (típicamente
+    `rag watch`) quiere SPILLEAR el check a la pending queue en lugar de
+    correr el helper LLM in-process. El próximo `rag index` drena la queue
+    cuando ya tiene el LLM warm para batch — ahorra ~1.5 GB de VRAM en
+    el watch process por archivo indexado.
+
+    Resolved at call time (no module-load) para que tests + plist puedan
+    flipearlo sin reload.
+    """
+    return os.environ.get("RAG_INDEX_DEFER_CONTRADICTIONS", "0").strip().lower() in (
+        "1", "true", "yes",
+    )
+
+
 def _dispatch_contradiction_check(
     col: SqliteVecCollection,
     path: Path,
@@ -19616,6 +19631,10 @@ def _dispatch_contradiction_check(
 ) -> tuple[str, str] | None:
     """Unified entry point for the index-time contradiction check.
 
+    * When `RAG_INDEX_DEFER_CONTRADICTIONS=1` (used by `rag watch`),
+      spillea el check a la pending JSONL sin spawner worker — evita
+      cargar el helper LLM en el proceso de watch (1.5 GB VRAM ahorro).
+      `rag index` posterior drena la queue cuando ya tiene el LLM warm.
     * When `_CONTRADICTION_ASYNC` is on (default), spawns a daemon thread
       and returns `None` immediately — the frontmatter `contradicts:` flag
       lands seconds later, after which watch re-indexes naturally.
@@ -19623,6 +19642,15 @@ def _dispatch_contradiction_check(
       `(new_raw, new_hash)` tuple the caller needs to re-parse if the
       frontmatter was rewritten. Preserves the pre-async behavior verbatim.
     """
+    if _contradiction_defer_enabled():
+        _append_pending_contradiction({
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "path": str(path),
+            "text": text,
+            "doc_id_prefix": doc_id_prefix,
+            "deferred_by": "watch",
+        })
+        return None
     if _contradiction_async_enabled():
         _spawn_contradiction_worker(col, path, text, doc_id_prefix)
         return None

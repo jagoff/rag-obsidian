@@ -116,6 +116,17 @@ def _watch_plist(rag_bin: str) -> str:
             "RAG_MEMORY_PRESSURE_THRESHOLD": "75",
             "RAG_MEMORY_PRESSURE_SWAP_GB": "4.0",
             "RAG_MEMORY_PRESSURE_INTERVAL": "30",
+            # Defer contradiction check (2026-05-10): cada nota indexada
+            # disparaba el helper LLM (qwen2.5:3b, ~1.5 GB VRAM) en un
+            # daemon thread del MISMO proceso watch — peak observado
+            # 13.3 GB durante bursts de 4-5 memos seguidos. Con esto, watch
+            # spillea el check a `~/.local/share/obsidian-rag/contradiction
+            # _pending.jsonl` y el próximo `rag index` (manual o cron) lo
+            # drena con el LLM ya warm para batch. Trade-off: contradicciones
+            # se flaggean con delay (minutos vs segundos) — aceptable
+            # porque el feedback loop principal del user es el chat, no
+            # la frontmatter `contradicts:` realtime.
+            "RAG_INDEX_DEFER_CONTRADICTIONS": "1",
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
         },

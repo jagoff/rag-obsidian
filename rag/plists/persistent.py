@@ -196,13 +196,23 @@ def _web_plist(rag_bin: str) -> str:
             "PYTHONUNBUFFERED": "1",
             "OBSIDIAN_RAG_WEB_CHAT_MODEL": chat_model,
             "RAG_LOCAL_EMBED": "1",
-            "RAG_RERANKER_NEVER_UNLOAD": "1",
+            # Removido 2026-05-10 (memory game-changer): RAG_RERANKER_NEVER_UNLOAD=1
+            # pineaba el bge-reranker (~2.5 GB MPS fp32) en VRAM forever, ignorando
+            # el idle-TTL global. Ahora el reranker se evicta tras
+            # RAG_RERANKER_IDLE_TTL=900 (15min idle) — primer query post-idle paga
+            # ~1-2s extra de reload, pero idle baseline cae ~2.5 GB en uso típico
+            # (user no chatea continuo > 15min). El memory_pressure_watchdog ya
+            # podía forzar unload bajo presión, así que NEVER_UNLOAD funcionaba
+            # solo en operación normal — donde es exactamente cuando NO se quiere
+            # pinear (RAM ociosa = mejor disponible para el resto del sistema).
             "RAG_STATE_SQL": "1",
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
             "FASTEMBED_CACHE_PATH": f"{Path.home()}/.cache/fastembed",
             "RAG_MEMORY_PRESSURE_INTERVAL": "20",
-            "RAG_MEMORY_PRESSURE_THRESHOLD": "80",
+            # 80 → 75 (memory game-changer 2026-05-10): match supervisor+watch
+            # threshold post-fix 1eae161, evicción proactiva 5pp antes del jetsam.
+            "RAG_MEMORY_PRESSURE_THRESHOLD": "75",
             "RAG_MEMORY_PRESSURE_SWAP_GB": "8.0",
             "RAG_AUTO_FIX_WORKER": "1",
             "RAG_AUTO_FIX_HOURLY_CAP": "12",

@@ -456,6 +456,123 @@ class BackfillResult:
     reason: str = ""
 
 
+@dataclass
+class PromoteCandidate:
+    """Una nota existente que cualifica para subir de tier."""
+    note_path: Path
+    display_name: str
+    current_tier: str
+    new_tier: str
+    msg_count: int
+    days_since_last: float
+
+
+def _read_tier_from_frontmatter(note_text: str) -> str:
+    """Leer el campo `tier:` del frontmatter YAML de una nota.
+
+    Returns el valor (string lowercase) o "" si no se pudo extraer.
+    """
+    fm_match = re.match(r"^---\s*\n(.*?)\n---\s*\n", note_text, re.DOTALL)
+    if not fm_match:
+        return ""
+    for line in fm_match.group(1).splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("tier:"):
+            return stripped.split(":", 1)[1].strip().strip('"\'').lower()
+    return ""
+
+
+def _read_wa_jid_from_note(note_text: str) -> str:
+    """Extraer el `wa_jid` del body de una nota."""
+    m = re.search(
+        r"^-\s*\*\*\s*wa_jid\s*\*\*\s*:\s*(.+?)\s*$",
+        note_text, re.IGNORECASE | re.MULTILINE,
+    )
+    return m.group(1).strip() if m else ""
+
+
+def find_promotable_contacts(
+    *,
+    vault_root: Path,
+    bridge_db_path: Path | None = None,
+    days_window: int = 365,
+) -> list[PromoteCandidate]:
+    """Identifica notas existentes con tier=transient (o unknown) que ahora
+    cualificarían como `active` o `core` por la actividad reciente del bridge.
+
+    No edita las notas — solo retorna el plan. El user decide si actualizar
+    el frontmatter a mano (y completar campos faltantes ahora que el contacto
+    "merece" más detalle) o promote vía un futuro --apply.
+
+    Lógica:
+      - Lee todas las notas en `99-Contacts/` con `wa_jid` no-vacío.
+      - Mapea wa_jid → ChatStats del bridge.
+      - Calcula tier actual con `_classify_tier`.
+      - Si tier_actual > tier_nota → candidato.
+
+    Returns: lista de PromoteCandidate ordenada por (new_tier desc, msg_count desc).
+    """
+    bridge_db_path = bridge_db_path or WHATSAPP_BRIDGE_DB_PATH
+    contacts_dir = vault_root / VAULT_CONTACTS_SUBPATH
+    if not contacts_dir.exists():
+        return []
+    if not bridge_db_path.exists():
+        return []
+
+    # 1. Build map wa_jid → (note_path, current_tier).
+    notes_by_jid: dict[str, tuple[Path, str]] = {}
+    for note_path in contacts_dir.glob("*.md"):
+        if note_path.name.startswith("_"):
+            continue
+        try:
+            text = note_path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        wa_jid = _read_wa_jid_from_note(text)
+        if not wa_jid:
+            continue
+        current_tier = _read_tier_from_frontmatter(text) or "unknown"
+        notes_by_jid[wa_jid] = (note_path, current_tier)
+
+    if not notes_by_jid:
+        return []
+
+    # 2. Stats del bridge para esos JIDs.
+    try:
+        conn = sqlite3.connect(f"file:{bridge_db_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return []
+
+    candidates: list[PromoteCandidate] = []
+    _TIER_RANK = {"unknown": 0, "transient": 1, "active": 2, "core": 3}
+
+    try:
+        for stat in _iter_chat_stats(conn, days_window=days_window):
+            entry = notes_by_jid.get(stat.chat_jid)
+            if not entry:
+                continue
+            note_path, current_tier = entry
+            new_tier = _classify_tier(
+                stat.msg_count, stat.span_days, stat.days_since_last,
+            )
+            if _TIER_RANK.get(new_tier, 0) > _TIER_RANK.get(current_tier, 0):
+                candidates.append(PromoteCandidate(
+                    note_path=note_path,
+                    display_name=note_path.stem,
+                    current_tier=current_tier,
+                    new_tier=new_tier,
+                    msg_count=stat.msg_count,
+                    days_since_last=stat.days_since_last,
+                ))
+    finally:
+        conn.close()
+
+    candidates.sort(
+        key=lambda c: (-_TIER_RANK.get(c.new_tier, 0), -c.msg_count),
+    )
+    return candidates
+
+
 def backfill_contacts(
     *,
     vault_root: Path,

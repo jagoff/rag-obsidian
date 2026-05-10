@@ -28,6 +28,7 @@ from rag import _resolve_vault_path, console
 from rag.integrations.whatsapp.contact_backfill import (
     BackfillResult,
     backfill_contacts,
+    find_promotable_contacts,
 )
 
 
@@ -193,3 +194,67 @@ def stats_cmd(days_window: int) -> None:
         days_window=days_window,
     )
     _format_results_table(results, dry_run=True)
+
+
+@wa_contacts.command(name="promote-check")
+@click.option(
+    "--days",
+    "days_window",
+    type=int,
+    default=365,
+    show_default=True,
+    help="Horizonte en días para recalcular tier desde el bridge.",
+)
+def promote_check_cmd(days_window: int) -> None:
+    """Listar notas existentes que cualifican para subir de tier.
+
+    Recorre las notas con `wa_jid` populado en `99-Contacts/`, recalcula
+    el tier actual desde stats del bridge, y lista los casos donde el
+    tier nuevo es mayor que el del frontmatter (transient → active, etc).
+
+    No edita las notas — el user decide si actualizar tier + completar
+    campos faltantes (ahora que el contacto "merece" un dossier más
+    detallado).
+    """
+    from rich.table import Table
+
+    vault_root = _resolve_vault_path()
+    if not vault_root or not Path(vault_root).exists():
+        console.print("[red]No se pudo resolver vault root.[/red]")
+        raise SystemExit(1)
+
+    candidates = find_promotable_contacts(
+        vault_root=Path(vault_root),
+        days_window=days_window,
+    )
+
+    if not candidates:
+        console.print(
+            "[green]Ninguna nota cualifica para promote.[/green] "
+            "Todos los tiers están alineados con la actividad real."
+        )
+        return
+
+    console.print(
+        f"\n[bold cyan]{len(candidates)} contacto(s) cualifican para promote[/bold cyan]\n"
+    )
+    table = Table(show_lines=False, expand=False)
+    table.add_column("Nota", style="cyan")
+    table.add_column("Tier actual", style="dim")
+    table.add_column("→ Nuevo", style="green")
+    table.add_column("Msgs", justify="right")
+    table.add_column("Hace días", justify="right")
+    for c in candidates:
+        table.add_row(
+            c.note_path.name,
+            c.current_tier,
+            c.new_tier,
+            str(c.msg_count),
+            f"{c.days_since_last:.0f}",
+        )
+    console.print(table)
+    console.print(
+        "\n[yellow]Acción sugerida:[/yellow] abrí cada nota en Obsidian, "
+        "actualizá `tier:` en frontmatter y completá los campos "
+        "(`kinship`, `Apodo`, `Relación`, `Notas`) que ahora valen la pena."
+    )

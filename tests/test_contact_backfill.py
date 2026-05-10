@@ -491,3 +491,161 @@ def test_backfill_no_bridge_db_returns_empty(tmp_path: Path) -> None:
         dry_run=True,
     )
     assert results == []
+
+
+# ── find_promotable_contacts ──────────────────────────────────────────────
+
+
+def test_promote_check_finds_transient_with_recent_activity(tmp_path: Path) -> None:
+    """Caso típico: nota tier=transient, pero el bridge muestra
+    actividad que la cualifica como active → candidato a promote."""
+    from rag.integrations.whatsapp.contact_backfill import find_promotable_contacts
+    bridge = _make_bridge_db()
+    try:
+        now = datetime.now()
+        # 20 msgs spread sobre 14 días — califica como active.
+        for i in range(20):
+            _insert_msg(
+                bridge,
+                "5491100@s.whatsapp.net",
+                "5491100",
+                f"hola {i}",
+                now - timedelta(days=14) + timedelta(days=i * 0.7),
+            )
+
+        contacts_dir = tmp_path / "99-obsidian" / "99-Contacts"
+        contacts_dir.mkdir(parents=True)
+        # Nota existente con tier=transient y wa_jid populado.
+        (contacts_dir / "Maria.md").write_text(
+            "---\ntype: mention\ntier: transient\n---\n\n"
+            "- **wa_jid**: 5491100@s.whatsapp.net\n"
+            "- **Apellido / nombre completo**: Maria\n",
+            encoding="utf-8",
+        )
+
+        candidates = find_promotable_contacts(
+            vault_root=tmp_path,
+            bridge_db_path=bridge,
+        )
+        assert len(candidates) == 1
+        c = candidates[0]
+        assert c.display_name == "Maria"
+        assert c.current_tier == "transient"
+        assert c.new_tier == "active"
+        assert c.msg_count == 20
+    finally:
+        bridge.unlink(missing_ok=True)
+
+
+def test_promote_check_skips_aligned_tiers(tmp_path: Path) -> None:
+    """Si tier_actual matchea tier_calculado → no candidato."""
+    from rag.integrations.whatsapp.contact_backfill import find_promotable_contacts
+    bridge = _make_bridge_db()
+    try:
+        now = datetime.now()
+        # Nota tier=transient + bridge activity también transient (3 msgs).
+        for i in range(3):
+            _insert_msg(
+                bridge, "111@s.whatsapp.net", "111", f"hi {i}",
+                now - timedelta(days=10) + timedelta(hours=i),
+            )
+
+        contacts_dir = tmp_path / "99-obsidian" / "99-Contacts"
+        contacts_dir.mkdir(parents=True)
+        (contacts_dir / "Random.md").write_text(
+            "---\ntier: transient\n---\n\n"
+            "- **wa_jid**: 111@s.whatsapp.net\n",
+            encoding="utf-8",
+        )
+
+        candidates = find_promotable_contacts(
+            vault_root=tmp_path,
+            bridge_db_path=bridge,
+        )
+        assert candidates == []
+    finally:
+        bridge.unlink(missing_ok=True)
+
+
+def test_promote_check_unknown_tier_with_active_qualifies(tmp_path: Path) -> None:
+    """Notas con tier=unknown (creadas a mano sin frontmatter) también
+    suben si la actividad lo justifica."""
+    from rag.integrations.whatsapp.contact_backfill import find_promotable_contacts
+    bridge = _make_bridge_db()
+    try:
+        now = datetime.now()
+        # 60 msgs sobre 65d, últimos hace <1d → cumple core
+        # (msg≥50 AND span≥60 AND last≤7).
+        for i in range(60):
+            _insert_msg(
+                bridge, "5491200@s.whatsapp.net", "5491200", f"msg {i}",
+                now - timedelta(days=65) + timedelta(days=i * (65 / 60)),
+            )
+
+        contacts_dir = tmp_path / "99-obsidian" / "99-Contacts"
+        contacts_dir.mkdir(parents=True)
+        # Nota sin frontmatter explícito (tier="" → "unknown").
+        (contacts_dir / "Cristian.md").write_text(
+            "[[Cristian|@Cristian]]\n"
+            "- **Relación**: amigo\n"
+            "- **wa_jid**: 5491200@s.whatsapp.net\n",
+            encoding="utf-8",
+        )
+
+        candidates = find_promotable_contacts(
+            vault_root=tmp_path,
+            bridge_db_path=bridge,
+        )
+        assert len(candidates) == 1
+        assert candidates[0].new_tier == "core"
+        assert candidates[0].current_tier == "unknown"
+    finally:
+        bridge.unlink(missing_ok=True)
+
+
+def test_promote_check_skips_notes_without_wa_jid(tmp_path: Path) -> None:
+    """Notas sin `wa_jid` no se evalúan — no podemos mapear al bridge."""
+    from rag.integrations.whatsapp.contact_backfill import find_promotable_contacts
+    bridge = _make_bridge_db()
+    try:
+        now = datetime.now()
+        for i in range(20):
+            _insert_msg(
+                bridge, "999@s.whatsapp.net", "999", f"x {i}",
+                now - timedelta(days=10) + timedelta(hours=i * 12),
+            )
+
+        contacts_dir = tmp_path / "99-obsidian" / "99-Contacts"
+        contacts_dir.mkdir(parents=True)
+        (contacts_dir / "Mystery.md").write_text(
+            "---\ntier: transient\n---\n\n- **Notas**: sin jid\n",
+            encoding="utf-8",
+        )
+
+        candidates = find_promotable_contacts(
+            vault_root=tmp_path,
+            bridge_db_path=bridge,
+        )
+        assert candidates == []
+    finally:
+        bridge.unlink(missing_ok=True)
+
+
+def test_promote_check_skips_template_files(tmp_path: Path) -> None:
+    """Archivos `_template*.md` se ignoran."""
+    from rag.integrations.whatsapp.contact_backfill import find_promotable_contacts
+    bridge = _make_bridge_db()
+    try:
+        contacts_dir = tmp_path / "99-obsidian" / "99-Contacts"
+        contacts_dir.mkdir(parents=True)
+        (contacts_dir / "_template.md").write_text(
+            "---\ntier: transient\n---\n- **wa_jid**: 999@s.whatsapp.net\n",
+            encoding="utf-8",
+        )
+        candidates = find_promotable_contacts(
+            vault_root=tmp_path,
+            bridge_db_path=bridge,
+        )
+        assert candidates == []
+    finally:
+        bridge.unlink(missing_ok=True)

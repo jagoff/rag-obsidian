@@ -51,7 +51,11 @@ import rag  # noqa: E402
 
 # ── Config ─────────────────────────────────────────────────────────────────
 
-DEFAULT_BRIDGE_DB = Path.home() / "repositories" / "whatsapp-mcp" / "whatsapp-bridge" / "store" / "messages.db"
+# Path canónico vive en `rag.integrations.whatsapp._constants` (corregido
+# 2026-05-09: `~/repos/`, no `~/repositories/`). Reutilizamos esa constante
+# para evitar que este script silent-failee cuando `rag index --source whatsapp`
+# lo invoca sin pasar `bridge_db=` explícito.
+DEFAULT_BRIDGE_DB = rag.WHATSAPP_DB_PATH
 
 # Conversational chunk boundaries.
 CHUNK_SAME_SPEAKER_WINDOW_S = 300     # 5 min — messages closer than this merge

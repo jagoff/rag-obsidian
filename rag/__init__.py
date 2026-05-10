@@ -3040,8 +3040,8 @@ def is_excluded(rel_path: str) -> bool:
     - 99-AI/skills/: live under the vault via symlink chain
       (~/.claude/skills → ~/.agents/skills → vault) for Claude Code to consume.
       Skill definitions/rules, not user notes — redundant with the broader
-      99-obsidian-system rule below but kept as belt-and-suspenders for paths
-      that may live outside 04-Archive via other symlink targets.
+      99-obsidian/ rule below but kept as belt-and-suspenders for paths
+      that may live outside 99-obsidian/ via other symlink targets.
     - 99-obsidian/*: Obsidian system folders (99-Attachments,
       99-Canvas, 99-AI, 99-Daily routine, 99-Forms, 99-Templates) — binary
       assets, template scaffolding, plugin data. Two exceptions stay indexed

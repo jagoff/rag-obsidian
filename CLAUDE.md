@@ -433,8 +433,8 @@ Default: `~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes`. Overri
 
 ## Referencias
 
-- Listener TS: [`/Users/fer/whatsapp-listener`](file:///Users/fer/whatsapp-listener)
-- WhatsApp bridge: `~/repositories/whatsapp-mcp/whatsapp-bridge/store/messages.db`
+- Listener TS: [`/Users/fer/repos/whatsapp-listener`](file:///Users/fer/repos/whatsapp-listener)
+- WhatsApp bridge: `~/repos/whatsapp-mcp/whatsapp-bridge/store/messages.db`
 - Cloudflared URL: `~/.local/share/obsidian-rag/cloudflared-url.txt`
 - Auditoría salud sistema: `python scripts/audit_telemetry_health.py --days 7 --json`
 - Eval baselines + perf history detallada: git log

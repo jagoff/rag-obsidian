@@ -124,6 +124,10 @@ function startSSE() {
     thread.applyPresence(payload);
   });
 
+  sse.on("wa_call", (payload) => {
+    thread.applyCallEvent(payload);
+  });
+
   sse.connect();
 }
 

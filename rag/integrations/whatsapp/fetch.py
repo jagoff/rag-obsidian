@@ -938,6 +938,32 @@ def fetch_thread_for_ui(
             except sqlite3.Error:
                 pass
 
+        # Calls del mismo chat dentro de la ventana del thread cargado.
+        # Se mergen como "synthetic msgs" con `media_type='call'` para que
+        # el render del thread los muestre como bubbles especiales en su
+        # posición cronológica. Ventana = ts del msg más viejo a más nuevo.
+        call_rows: list = []
+        if rows:
+            window_min = rows[-1]["ts"] or ""  # más viejo (rows está DESC)
+            window_max = rows[0]["ts"] or ""   # más nuevo
+            try:
+                call_rows = con.execute(
+                    """
+                    SELECT call_id, chat_jid, from_jid, is_video, is_group,
+                           group_jid, offered_ts, accepted_ts, terminated_ts,
+                           duration_s, status,
+                           COALESCE(terminated_ts, accepted_ts, offered_ts) AS sort_ts
+                    FROM calls
+                    WHERE chat_jid = ?
+                      AND COALESCE(terminated_ts, accepted_ts, offered_ts) BETWEEN ? AND ?
+                    ORDER BY sort_ts ASC
+                    LIMIT 50
+                    """,
+                    (jid, window_min, window_max),
+                ).fetchall()
+            except sqlite3.Error:
+                call_rows = []
+
         messages: list[dict] = []
         for r in reversed(rows):  # cronológico asc para lectura natural
             msg_id = r["id"] or ""
@@ -976,6 +1002,46 @@ def fetch_thread_for_ui(
                 "reactions": reactions,
                 "revoked": is_revoked,
             })
+
+        # Merge calls como synthetic msgs en el thread. Cada call genera
+        # un único bubble basado en su estado final (offered/missed/etc).
+        for c in call_rows:
+            status = c["status"] or "offered"
+            duration_s = c["duration_s"] or 0
+            is_video = bool(c["is_video"])
+            verb = "Videollamada" if is_video else "Llamada"
+            mm = duration_s // 60
+            ss = duration_s % 60
+            if status == "missed":
+                content = f"📵 {verb} perdida"
+            elif status == "rejected":
+                content = f"❌ {verb} rechazada"
+            elif status == "terminated":
+                content = f"📞 {verb} · {mm}:{ss:02d}"
+            elif status == "accepted":
+                content = f"📞 {verb} en curso"
+            else:
+                content = f"📞 {verb} entrante"
+            messages.append({
+                "id": f"call:{c['call_id']}",
+                "ts": _normalize_bridge_ts(c["sort_ts"] or c["offered_ts"] or ""),
+                "sender": c["from_jid"] or "",
+                "sender_label": (c["from_jid"] or "").split("@")[0] or label,
+                "content": content,
+                "is_from_me": False,
+                "media_type": "call",
+                "filename": None,
+                "quoted": None,
+                "reactions": [],
+                "revoked": False,
+                # Metadatos extra para el frontend.
+                "call_status": status,
+                "call_is_video": is_video,
+                "call_duration_s": duration_s,
+            })
+
+        # Resort cronológico tras el merge.
+        messages.sort(key=lambda m: m["ts"] or "")
 
         # `next_before_ts`: el ts del más viejo de los devueltos para que
         # el cliente pida siguiente página con ese valor.

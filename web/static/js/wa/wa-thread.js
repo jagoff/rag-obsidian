@@ -182,6 +182,78 @@ function wireMediaScrollKeepers(body) {
   }
 }
 
+function renderCallBubble(m) {
+  const wrap = document.createElement("div");
+  wrap.className = "wa-call-bubble";
+  wrap.dataset.id = m.id || "";
+  wrap.dataset.status = m.call_status || "offered";
+  wrap.dataset.video = m.call_is_video ? "1" : "0";
+  const icon = document.createElement("span");
+  icon.className = "wa-call-icon";
+  if (m.call_status === "missed") icon.textContent = "📵";
+  else if (m.call_status === "rejected") icon.textContent = "❌";
+  else if (m.call_is_video) icon.textContent = "📹";
+  else icon.textContent = "📞";
+  const text = document.createElement("span");
+  text.className = "wa-call-text";
+  text.textContent = m.content || "Llamada";
+  const time = document.createElement("span");
+  time.className = "wa-call-time";
+  try {
+    const d = new Date(m.ts);
+    if (!isNaN(d.getTime())) {
+      time.textContent = d.toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit" });
+    }
+  } catch {}
+  wrap.appendChild(icon);
+  wrap.appendChild(text);
+  if (time.textContent) wrap.appendChild(time);
+  return wrap;
+}
+
+// SSE handler para wa_call: inserta o updatea el bubble cuando el call
+// está en el thread activo. Si el call ya existe (transition de status:
+// offered → accepted → terminated), se reemplaza in-place.
+export function applyCallEvent(payload) {
+  if (!payload || !payload.call_id || payload.jid !== currentJID) return;
+  if (!els.body) return;
+  const synthetic = {
+    id: `call:${payload.call_id}`,
+    ts: payload.ts || new Date().toISOString(),
+    sender: payload.from_jid || "",
+    sender_label: (payload.from_jid || "").split("@")[0] || "",
+    content: _callContentFromPayload(payload),
+    is_from_me: false,
+    media_type: "call",
+    call_status: payload.status,
+    call_is_video: payload.is_video,
+    call_duration_s: payload.duration_s,
+  };
+  const existing = els.body.querySelector(`.wa-call-bubble[data-id="call:${cssEscape(payload.call_id)}"]`);
+  const fresh = renderCallBubble(synthetic);
+  if (existing) {
+    existing.replaceWith(fresh);
+  } else {
+    const wasAtBottom = els.body.scrollHeight - els.body.scrollTop - els.body.clientHeight < 80;
+    els.body.appendChild(fresh);
+    if (wasAtBottom) snapToLastMessage();
+  }
+}
+
+function _callContentFromPayload(p) {
+  const verb = p.is_video ? "Videollamada" : "Llamada";
+  const ds = p.duration_s || 0;
+  const mm = Math.floor(ds / 60);
+  const ss = ds % 60;
+  switch (p.status) {
+    case "missed": return `📵 ${verb} perdida`;
+    case "rejected": return `❌ ${verb} rechazada`;
+    case "terminated": return `📞 ${verb} · ${mm}:${String(ss).padStart(2, "0")}`;
+    case "accepted": return `📞 ${verb} en curso`;
+    default: return `📞 ${verb} entrante`;
+  }
+}
+
 function renderUnreadDivider() {
   const div = document.createElement("div");
   div.className = "wa-unread-divider";
@@ -190,6 +262,10 @@ function renderUnreadDivider() {
 }
 
 function renderMsg(m, ctx) {
+  // Calls: render como bubble centrada, no como msg normal.
+  if (m.media_type === "call") {
+    return renderCallBubble(m);
+  }
   const div = document.createElement("div");
   div.className = "wa-msg " + (m.is_from_me ? "own" : "other");
   if (m.revoked) div.classList.add("revoked");

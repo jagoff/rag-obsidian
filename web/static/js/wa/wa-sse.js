@@ -7,6 +7,7 @@ const handlers = {
   reaction_changed: [],
   message_revoked: [],
   presence: [],
+  wa_call: [],
   hello: [],
   heartbeat: [],
 };

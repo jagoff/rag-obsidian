@@ -564,6 +564,45 @@ button { cursor: pointer; }
 }
 .wa-empty-state p { margin: 0; }
 
+/* ─── Call bubble ────────────────────────────────────────────────── */
+/* Llamadas (audio/video) entran al thread como bubble centrada
+ * estilo "event card" — no como msg propio/ajeno. Status diferencia
+ * color: missed/rejected en rojo subtle, terminated/accepted en
+ * accent. */
+.wa-call-bubble {
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0;
+  padding: 6px 14px;
+  background: var(--bg-panel-header);
+  border: 1px solid var(--border-divider);
+  border-radius: var(--radius-pill);
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  box-shadow: var(--shadow-msg);
+}
+.wa-call-bubble[data-status="missed"],
+.wa-call-bubble[data-status="rejected"] {
+  border-color: rgba(241, 92, 109, 0.35);
+  background: rgba(241, 92, 109, 0.08);
+  color: var(--red);
+}
+.wa-call-bubble[data-status="terminated"],
+.wa-call-bubble[data-status="accepted"] {
+  color: var(--accent);
+  border-color: rgba(0, 168, 132, 0.32);
+}
+.wa-call-icon { font-size: 14px; line-height: 1; }
+.wa-call-text { font-weight: 500; }
+.wa-call-time {
+  color: var(--text-tertiary);
+  font-size: 11px;
+  margin-left: 4px;
+  font-variant-numeric: tabular-nums;
+}
+
 /* ─── Unread divider ─────────────────────────────────────────────── */
 .wa-unread-divider {
   align-self: stretch;

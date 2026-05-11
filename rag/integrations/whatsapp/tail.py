@@ -42,8 +42,8 @@ _HWM_PATH = Path.home() / ".local/share/obsidian-rag/wa-hwm.json"
 # Estado de módulo (un solo poller por proceso).
 _subscribers: list[asyncio.Queue] = []
 _loop_task: asyncio.Task | None = None
-_dedup: dict[str, set[str]] = {"msg": set(), "react": set(), "revoke": set(), "presence": set()}
-_dedup_order: dict[str, list[str]] = {"msg": [], "react": [], "revoke": [], "presence": []}
+_dedup: dict[str, set[str]] = {"msg": set(), "react": set(), "revoke": set(), "presence": set(), "call": set()}
+_dedup_order: dict[str, list[str]] = {"msg": [], "react": [], "revoke": [], "presence": [], "call": []}
 
 
 def _load_hwm() -> dict[str, str]:
@@ -60,11 +60,12 @@ def _load_hwm() -> dict[str, str]:
                     "reactions": str(data.get("reactions") or _now_bridge_ts()),
                     "revokes": str(data.get("revokes") or _now_bridge_ts()),
                     "presence": str(data.get("presence") or _now_bridge_ts()),
+                    "calls": str(data.get("calls") or _now_bridge_ts()),
                 }
     except Exception as e:
         logger.warning("HWM load failed (%s); arrancando desde now", e)
     now = _now_bridge_ts()
-    return {"messages": now, "reactions": now, "revokes": now, "presence": now}
+    return {"messages": now, "reactions": now, "revokes": now, "presence": now, "calls": now}
 
 
 def _save_hwm(hwm: dict[str, str]) -> None:
@@ -276,6 +277,84 @@ def _poll_once(hwm: dict[str, str]) -> tuple[list[dict[str, Any]], dict[str, str
                     "message_id": r["message_id"],
                     "revoked_by": r["revoked_by"],
                     "ts": _normalize_ts(ts),
+                },
+            })
+
+        # ── calls (audio / video). Poll por la última transición de
+        # estado (offered/accepted/rejected/missed/terminated). El HWM
+        # se basa en COALESCE(terminated_ts, accepted_ts, offered_ts) —
+        # cualquiera de los tres avanza el cursor.
+        try:
+            call_rows = con.execute(
+                """
+                SELECT call_id, chat_jid, from_jid, is_video, is_group,
+                       group_jid, offered_ts, accepted_ts, terminated_ts,
+                       duration_s, status, terminate_reason,
+                       COALESCE(terminated_ts, accepted_ts, offered_ts) AS latest_ts
+                FROM calls
+                WHERE COALESCE(terminated_ts, accepted_ts, offered_ts) > ?
+                ORDER BY latest_ts ASC
+                LIMIT 50
+                """,
+                (hwm["calls"],),
+            ).fetchall()
+        except sqlite3.Error:
+            # Tabla puede no existir en bridges viejos — silent skip.
+            call_rows = []
+        for r in call_rows:
+            call_id = r["call_id"] or ""
+            # Dedup-key incluye status para emitir un event por cada
+            # transición (offered → accepted → terminated emite 3 veces).
+            status = r["status"] or "offered"
+            key = f"{call_id}|{status}"
+            if not _ring_check_add("call", key):
+                continue
+            latest = r["latest_ts"] or ""
+            if latest > new_hwm["calls"]:
+                new_hwm["calls"] = latest
+            jid = r["chat_jid"] or r["from_jid"] or ""
+            is_video = bool(r["is_video"])
+            duration_s = r["duration_s"] or 0
+            # Preview del chat_update (sidebar lo muestra).
+            verb = "Videollamada" if is_video else "Llamada"
+            if status == "missed":
+                preview = f"📵 {verb} perdida"
+            elif status == "rejected":
+                preview = f"❌ {verb} rechazada"
+            elif status == "terminated":
+                mm = duration_s // 60
+                ss = duration_s % 60
+                preview = f"📞 {verb} · {mm}:{ss:02d}"
+            elif status == "accepted":
+                preview = f"📞 {verb} en curso"
+            else:
+                preview = f"📞 {verb} entrante"
+            ts_norm = _normalize_ts(latest)
+            call_payload = {
+                "call_id": call_id,
+                "jid": jid,
+                "from_jid": r["from_jid"] or "",
+                "is_video": is_video,
+                "is_group": bool(r["is_group"]),
+                "group_jid": r["group_jid"] or "",
+                "status": status,
+                "duration_s": duration_s,
+                "offered_ts": _normalize_ts(r["offered_ts"] or ""),
+                "accepted_ts": _normalize_ts(r["accepted_ts"] or "") if r["accepted_ts"] else None,
+                "terminated_ts": _normalize_ts(r["terminated_ts"] or "") if r["terminated_ts"] else None,
+                "ts": ts_norm,
+            }
+            events.append({"type": "wa_call", "data": call_payload})
+            # También un chat_update para que el sidebar reflecte la llamada
+            # como "último evento" del thread con su preview.
+            events.append({
+                "type": "chat_update",
+                "data": {
+                    "jid": jid,
+                    "last_ts": ts_norm,
+                    "last_preview": preview,
+                    "last_from_me": False,
+                    "unread_delta": 1 if status in ("missed", "offered") else 0,
                 },
             })
 

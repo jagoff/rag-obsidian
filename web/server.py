@@ -1358,6 +1358,15 @@ def mirror_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "mirror.html")
 
 
+@app.get("/wa")
+def wa_page() -> FileResponse:
+    """WhatsApp Web propio. Ver plan completo en
+    `~/.claude/plans/kind-floating-melody.md`. Consume `/api/wa/*` para
+    leer chats/threads del bridge SQLite + escribir reactions/revokes/typing.
+    """
+    return FileResponse(STATIC_DIR / "wa.html")
+
+
 @app.get("/api/mirror")
 def api_mirror(date: str | None = None, refresh: int = 0) -> dict:
     """JSON con el estado completo del mirror.
@@ -4091,6 +4100,74 @@ def whatsapp_scheduled_reschedule(
     if not ok:
         return {"ok": False, "reason": "not_pending_or_not_found"}
     return {"ok": True, "id": int(scheduled_id), "scheduled_for_utc": scheduled_for_utc}
+
+
+# ============================================================================
+# /wa — WhatsApp Web propio (paridad full con web.whatsapp.com)
+# ============================================================================
+# Plan completo: ~/.claude/plans/kind-floating-melody.md
+#
+# Surface nuevo bajo `/api/wa/*` que la UI nueva consume. Los endpoints
+# viejos `/api/whatsapp/*` siguen vivos (los usa `fine_tunning.html` para
+# proposal cards) — coexisten.
+#
+# Lecturas: leen del bridge `messages.db` (read-only via URI) + joinean
+# con tablas locales en telemetry.db (rag_wa_read_state).
+# Mutaciones (send, react, revoke, typing): proxy al bridge `:8088`.
+# Real-time inbound: SSE poll de `messages.db` (otra fase del plan).
+
+
+@app.get("/api/wa/chats")
+def wa_chats(
+    limit: int = 50,
+    before_ts: str | None = None,
+    q: str | None = None,
+) -> dict:
+    """Lista paginada de chats para el sidebar de `/wa`.
+
+    Ordenada por `last_message_time DESC`. `before_ts` filtra paginación
+    hacia atrás (next page = pasar el `last_ts` del último elemento
+    devuelto). `q` filtra substring sobre el nombre del chat.
+    """
+    from rag.integrations.whatsapp import fetch as _wa_fetch  # noqa: PLC0415
+
+    chats = _wa_fetch.list_chats_for_ui(limit=limit, before_ts=before_ts, q=q)
+    next_before_ts = chats[-1]["last_ts"] if chats and len(chats) >= limit else None
+    return {"chats": chats, "next_before_ts": next_before_ts}
+
+
+@app.get("/api/wa/thread/{jid}")
+def wa_thread(jid: str, limit: int = 50, before_ts: str | None = None) -> dict:
+    """Historial paginado de un chat por JID.
+
+    Pagina hacia atrás (older messages) con `before_ts`. Mensajes vienen
+    en orden cronológico ascendente. Incluye `reactions`, `revoked`,
+    `quoted` por mensaje.
+    """
+    from rag.integrations.whatsapp import fetch as _wa_fetch  # noqa: PLC0415
+
+    return _wa_fetch.fetch_thread_for_ui(jid, limit=limit, before_ts=before_ts)
+
+
+class _WAMarkReadRequest(BaseModel):
+    jid: str
+    last_seen_ts: str | None = None
+
+
+@app.post("/api/wa/mark_read")
+def wa_mark_read(req: _WAMarkReadRequest) -> dict:
+    """Marca un chat como leído hasta `last_seen_ts` (default: ahora).
+
+    Persiste en `rag_wa_read_state` (telemetry.db) — la próxima
+    `list_chats` muestra `unread_count=0` para este chat hasta que llegue
+    un nuevo mensaje inbound.
+    """
+    from rag.integrations.whatsapp import fetch as _wa_fetch  # noqa: PLC0415
+
+    if not req.jid or "@" not in req.jid:
+        raise HTTPException(status_code=400, detail="jid inválido")
+    ts = _wa_fetch.mark_read_for_ui(req.jid, req.last_seen_ts)
+    return {"ok": True, "jid": req.jid, "last_seen_ts": ts}
 
 
 class MailSendRequest(BaseModel):

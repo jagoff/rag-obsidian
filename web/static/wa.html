@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="es-AR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>RagWeb — WhatsApp local</title>
+  <link rel="stylesheet" href="/static/wa.css">
+  <link rel="manifest" href="/static/manifest.webmanifest">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="RagWeb">
+  <meta name="theme-color" content="#075e54">
+</head>
+<body data-pane="thread">
+  <div class="wa-app">
+    <!-- Sidebar: lista de chats -->
+    <aside class="wa-sidebar" aria-label="Lista de chats">
+      <header class="wa-sidebar-header">
+        <div class="wa-app-title">RagWeb</div>
+        <div class="wa-conn-indicator" id="wa-conn" title="estado del bridge" aria-live="polite">○</div>
+      </header>
+      <div class="wa-search-box">
+        <input type="search" id="wa-search-input" placeholder="Buscar chat..." autocomplete="off">
+      </div>
+      <ul class="wa-chatlist" id="wa-chatlist" aria-live="polite"></ul>
+      <div class="wa-chatlist-loading" id="wa-chatlist-loading">Cargando…</div>
+    </aside>
+
+    <!-- Thread: hilo del chat activo -->
+    <main class="wa-thread" id="wa-thread">
+      <header class="wa-thread-header">
+        <button class="wa-back-btn" id="wa-back-btn" aria-label="Volver a chats">←</button>
+        <div class="wa-thread-avatar" id="wa-thread-avatar" aria-hidden="true"></div>
+        <div class="wa-thread-meta">
+          <div class="wa-thread-name" id="wa-thread-name">Elegí un chat</div>
+          <div class="wa-thread-presence" id="wa-thread-presence"></div>
+        </div>
+      </header>
+      <div class="wa-thread-body" id="wa-thread-body">
+        <div class="wa-empty-state" id="wa-empty-state">
+          <p>Seleccioná un chat del panel izquierdo para empezar a leer.</p>
+        </div>
+      </div>
+      <footer class="wa-composer" id="wa-composer" hidden>
+        <textarea
+          id="wa-composer-input"
+          placeholder="Escribí un mensaje…"
+          rows="1"
+          disabled
+        ></textarea>
+        <button class="wa-send-btn" id="wa-send-btn" disabled>Enviar</button>
+      </footer>
+    </main>
+  </div>
+
+  <script type="module" src="/static/js/wa/wa.js"></script>
+</body>
+</html>

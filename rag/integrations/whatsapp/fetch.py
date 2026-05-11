@@ -677,10 +677,349 @@ def _fetch_whatsapp_recent_with_jid(jid: str, limit: int = 5) -> dict:
     }
 
 
+def _normalize_bridge_ts(ts: str) -> str:
+    """Convierte el timestamp del bridge ("YYYY-MM-DD HH:MM:SS-03:00") a
+    ISO 8601 estricto ("YYYY-MM-DDTHH:MM:SS-03:00") que `Date.parse` del
+    browser acepta sin caprichos. Idempotente para strings ya ISO.
+    """
+    if not ts:
+        return ""
+    return ts.replace(" ", "T", 1) if " " in ts else ts
+
+
+def _avatar_initials(label: str) -> str:
+    """Genera iniciales de 1-2 letras para fallback de avatar.
+
+    Toma las primeras letras de las dos primeras palabras del label.
+    Si solo hay una palabra usa sus 2 primeras letras.
+    """
+    parts = [p for p in (label or "").strip().split() if p and any(ch.isalpha() for ch in p)]
+    if not parts:
+        return "?"
+    if len(parts) == 1:
+        return parts[0][:2].upper()
+    return (parts[0][0] + parts[1][0]).upper()
+
+
+def list_chats_for_ui(
+    limit: int = 50, before_ts: str | None = None, q: str | None = None
+) -> list[dict]:
+    """Lista paginada de chats para el sidebar de `/wa`.
+
+    Output: lista de dicts con ``{jid, label, is_group, last_ts,
+    last_preview, last_from_me, unread_count, avatar_initials}`` ordenada
+    por ``last_ts DESC``. ``before_ts`` filtra para paginación hacia
+    atrás. ``q`` filtra substring sobre `chats.name` (case-insensitive).
+
+    Unread se computa contra `rag_wa_read_state` (telemetry.db): mensajes
+    inbound con `ts > last_seen_ts`. Si nunca se marcó como leído,
+    `last_seen_ts` se asume 1970 → todo inbound cuenta.
+    """
+    import rag as _rag
+    import sqlite3
+
+    from . import _db_local
+
+    _db_local.ensure_schema()
+    db_path = _rag.WHATSAPP_DB_PATH
+    bot_jid = _rag.WHATSAPP_BOT_JID
+    if not db_path.is_file():
+        return []
+
+    cap = max(1, min(int(limit or 50), 200))
+    telemetry_path = _db_local._telemetry_db_path()
+
+    try:
+        # `uri=True` permite que ATTACH use `file:...?mode=ro` para
+        # mantener la conn bridge en read-only desde el mismo proceso.
+        con = sqlite3.connect(f"file:{telemetry_path}", uri=True, timeout=5.0)
+    except sqlite3.Error:
+        return []
+    try:
+        con.row_factory = sqlite3.Row
+        con.execute(f"ATTACH DATABASE 'file:{db_path}?mode=ro' AS br")
+
+        where_clauses = [
+            "c.jid != ?",
+            "c.jid NOT LIKE '%status@broadcast'",
+        ]
+        params: list = [bot_jid]
+        if before_ts:
+            where_clauses.append("c.last_message_time < ?")
+            params.append(before_ts)
+        if q:
+            where_clauses.append("LOWER(COALESCE(c.name, '')) LIKE ?")
+            params.append(f"%{q.lower()}%")
+        params.append(cap)
+
+        sql = f"""
+            SELECT
+              c.jid AS jid,
+              COALESCE(c.name, '') AS name,
+              c.last_message_time AS last_ts,
+              (
+                SELECT m.content
+                FROM br.messages m
+                WHERE m.chat_jid = c.jid
+                ORDER BY m.timestamp DESC
+                LIMIT 1
+              ) AS last_content,
+              (
+                SELECT m.media_type
+                FROM br.messages m
+                WHERE m.chat_jid = c.jid
+                ORDER BY m.timestamp DESC
+                LIMIT 1
+              ) AS last_media,
+              (
+                SELECT m.is_from_me
+                FROM br.messages m
+                WHERE m.chat_jid = c.jid
+                ORDER BY m.timestamp DESC
+                LIMIT 1
+              ) AS last_from_me,
+              COALESCE(rs.last_seen_ts, '1970-01-01T00:00:00') AS last_seen_ts
+            FROM br.chats c
+            LEFT JOIN main.rag_wa_read_state rs ON rs.jid = c.jid
+            WHERE {' AND '.join(where_clauses)}
+            ORDER BY c.last_message_time DESC
+            LIMIT ?
+        """
+        chat_rows = con.execute(sql, params).fetchall()
+
+        out: list[dict] = []
+        for r in chat_rows:
+            jid = r["jid"] or ""
+            name = (r["name"] or "").strip()
+            label = _wa_chat_label(name, jid)
+            if label.startswith("Contacto …") and not any(ch.isalpha() for ch in name):
+                continue
+            last_content = (r["last_content"] or "").strip().replace("\n", " ")
+            last_media = (r["last_media"] or "").strip()
+            preview = last_content or (f"[{last_media}]" if last_media else "")
+            if len(preview) > 120:
+                preview = preview[:117] + "…"
+            # Unread count: inbound msgs con ts > last_seen_ts en la chat.
+            unread = con.execute(
+                """
+                SELECT count(*) AS n
+                FROM br.messages
+                WHERE chat_jid = ?
+                  AND is_from_me = 0
+                  AND timestamp > ?
+                """,
+                (jid, r["last_seen_ts"]),
+            ).fetchone()
+            out.append({
+                "jid": jid,
+                "label": label,
+                "is_group": jid.endswith("@g.us"),
+                "last_ts": _normalize_bridge_ts(r["last_ts"] or ""),
+                "last_preview": preview,
+                "last_from_me": bool(r["last_from_me"]),
+                "unread_count": int(unread["n"]) if unread else 0,
+                "avatar_initials": _avatar_initials(label),
+            })
+        return out
+    except sqlite3.Error:
+        return []
+    finally:
+        try:
+            con.execute("DETACH DATABASE br")
+        except Exception:
+            pass
+        con.close()
+
+
+def fetch_thread_for_ui(
+    jid: str, limit: int = 50, before_ts: str | None = None
+) -> dict:
+    """Historial paginado de un chat para el thread view de `/wa`.
+
+    Pagina hacia atrás por ``timestamp DESC``. Cada mensaje viene con
+    ``id, ts (ISO), sender, sender_label, content, is_from_me,
+    media_type, filename, quoted, reactions, revoked``.
+
+    Reactions se devuelven como lista ``[{emoji, sender_jid, by_me}]``
+    leída de `bridge.reactions`. Revoked es un bool — si está en
+    `bridge.revokes`, el content se reemplaza por marker para que el
+    frontend lo muestre como "este mensaje fue eliminado".
+    """
+    import rag as _rag
+    import sqlite3
+
+    empty = {"jid": jid, "label": "", "is_group": False, "messages": [], "next_before_ts": None}
+    if not jid or "@" not in jid:
+        return empty
+
+    db_path = _rag.WHATSAPP_DB_PATH
+    bot_jid = _rag.WHATSAPP_BOT_JID
+    if not db_path.is_file():
+        return empty
+
+    cap = max(1, min(int(limit or 50), 200))
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+    except sqlite3.Error:
+        return empty
+    try:
+        con.row_factory = sqlite3.Row
+        # Label del chat (de chats.name).
+        chat_row = con.execute(
+            "SELECT name FROM chats WHERE jid = ? LIMIT 1", (jid,)
+        ).fetchone()
+        chat_name = (chat_row["name"] or "") if chat_row else ""
+        label = _wa_chat_label(chat_name, jid)
+        is_group = jid.endswith("@g.us")
+
+        where_clauses = ["m.chat_jid = ?", "m.chat_jid != ?"]
+        params: list = [jid, bot_jid]
+        if before_ts:
+            where_clauses.append("m.timestamp < ?")
+            params.append(before_ts)
+        params.append(cap)
+
+        rows = con.execute(
+            f"""
+            SELECT
+              m.id AS id,
+              m.chat_jid AS chat_jid,
+              m.sender AS sender,
+              m.content AS content,
+              m.timestamp AS ts,
+              m.is_from_me AS is_from_me,
+              m.media_type AS media_type,
+              m.filename AS filename,
+              m.quoted_message_id AS quoted_id,
+              m.quoted_text AS quoted_text
+            FROM messages m
+            WHERE {' AND '.join(where_clauses)}
+            ORDER BY m.timestamp DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+
+        if not rows:
+            return {"jid": jid, "label": label, "is_group": is_group, "messages": [], "next_before_ts": None}
+
+        msg_ids = [r["id"] for r in rows if r["id"]]
+        placeholders = ",".join("?" * len(msg_ids)) if msg_ids else "''"
+
+        revoked_ids: set[str] = set()
+        if msg_ids:
+            try:
+                revoke_rows = con.execute(
+                    f"SELECT message_id FROM revokes WHERE message_id IN ({placeholders})",
+                    msg_ids,
+                ).fetchall()
+                revoked_ids = {r["message_id"] for r in revoke_rows}
+            except sqlite3.Error:
+                # Tabla aún sin filas → sin revokes; OK.
+                pass
+
+        reactions_by_msg: dict[str, list[dict]] = {}
+        if msg_ids:
+            try:
+                react_rows = con.execute(
+                    f"""
+                    SELECT message_id, sender_jid, emoji, ts
+                    FROM reactions
+                    WHERE message_id IN ({placeholders})
+                    ORDER BY ts ASC
+                    """,
+                    msg_ids,
+                ).fetchall()
+                for rr in react_rows:
+                    reactions_by_msg.setdefault(rr["message_id"], []).append({
+                        "emoji": rr["emoji"],
+                        "sender_jid": rr["sender_jid"],
+                    })
+            except sqlite3.Error:
+                pass
+
+        messages: list[dict] = []
+        for r in reversed(rows):  # cronológico asc para lectura natural
+            msg_id = r["id"] or ""
+            is_from_me = bool(r["is_from_me"])
+            sender_raw = (r["sender"] or "").strip()
+            sender_label = "yo" if is_from_me else (sender_raw.split("@")[0] or label)
+            content = (r["content"] or "").strip().replace("\n", " ")
+            media = (r["media_type"] or "").strip()
+            filename = (r["filename"] or "").strip()
+            quoted_id = (r["quoted_id"] or "").strip()
+            quoted_text = (r["quoted_text"] or "").strip()
+            is_revoked = msg_id in revoked_ids
+            if is_revoked:
+                content = ""
+                media = ""
+                filename = ""
+
+            reactions = reactions_by_msg.get(msg_id, [])
+            # Marcar by_me en cada reaction. Si self_jid == sender_jid → by_me.
+            # No tenemos self_jid en este conn, lo dejamos None — el frontend
+            # decide visualmente (puede chequear contra el JID propio del
+            # health endpoint).
+            for rx in reactions:
+                rx["by_me"] = False  # placeholder, frontend filtra real
+
+            messages.append({
+                "id": msg_id,
+                "ts": _normalize_bridge_ts(r["ts"] or ""),
+                "sender": sender_raw,
+                "sender_label": sender_label,
+                "content": content,
+                "is_from_me": is_from_me,
+                "media_type": media or None,
+                "filename": filename or None,
+                "quoted": {"id": quoted_id, "text": quoted_text} if quoted_id else None,
+                "reactions": reactions,
+                "revoked": is_revoked,
+            })
+
+        # `next_before_ts`: el ts del más viejo de los devueltos para que
+        # el cliente pida siguiente página con ese valor.
+        next_before_ts = rows[-1]["ts"] if rows else None
+
+        return {
+            "jid": jid,
+            "label": label,
+            "is_group": is_group,
+            "messages": messages,
+            "next_before_ts": next_before_ts,
+        }
+    except sqlite3.Error:
+        return empty
+    finally:
+        con.close()
+
+
+def mark_read_for_ui(jid: str, last_seen_ts: str | None = None) -> str:
+    """Marca el chat como leído hasta ``last_seen_ts`` (default: ahora).
+
+    Devuelve el timestamp efectivamente persistido (útil para que el
+    frontend update su estado optimista).
+    """
+    from datetime import datetime as _dt
+
+    from . import _db_local
+
+    if not jid or "@" not in jid:
+        return ""
+    ts = (last_seen_ts or "").strip() or _dt.now().strftime("%Y-%m-%dT%H:%M:%S") + _BRIDGE_TZ_OFFSET
+    _db_local.set_last_seen(jid, ts)
+    return ts
+
+
 __all__ = [
     "_fetch_whatsapp_today",
     "_fetch_whatsapp_unread",
     "_wa_chat_label",
     "_fetch_whatsapp_window",
     "_fetch_whatsapp_recent_with_jid",
+    "list_chats_for_ui",
+    "fetch_thread_for_ui",
+    "mark_read_for_ui",
+    "_normalize_bridge_ts",
+    "_avatar_initials",
 ]

@@ -39,6 +39,22 @@ function init() {
   chatlist.load();
   startSSE();
   startClock();
+  startThemeToggle();
+}
+
+function startThemeToggle() {
+  const btn = document.getElementById("wa-theme-toggle");
+  if (!btn) return;
+  const apply = (t) => {
+    document.documentElement.setAttribute("data-theme", t);
+    try {
+      localStorage.setItem("wa-theme", t);
+    } catch {}
+  };
+  btn.addEventListener("click", () => {
+    const cur = document.documentElement.getAttribute("data-theme") || "dark";
+    apply(cur === "dark" ? "light" : "dark");
+  });
 }
 
 function startClock() {

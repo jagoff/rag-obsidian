@@ -20,8 +20,9 @@
  * del terminal mission-control. Acá phosphor para own, cyan para other.
  */
 
-:root {
-  /* Reuse de home.v2.css — si no se carga la global, fallback local. */
+:root,
+:root[data-theme="dark"] {
+  /* DARK — paleta night-ops, default. */
   --bg:           #0a0e14;
   --bg-elev-1:    #10151c;
   --bg-elev-2:    #161c25;
@@ -40,6 +41,39 @@
   --cyan-dim:    #3b6e85;
   --red:         #ff5e5e;
   --magenta:     #d68bff;
+  --crt-scanlines: 1;
+  --grain-opacity: 0.5;
+  --grain-blend: overlay;
+  --shadow-glow-strength: 0.35;
+}
+
+:root[data-theme="light"] {
+  /* LIGHT — paleta "paper terminal" / printed log. Mantiene el feel
+   * mission-control pero invertido: papel cream + tinta oscura, con
+   * los mismos acentos saturados oscurecidos para contrast suficiente. */
+  --bg:           #f3efe4;       /* paper warm */
+  --bg-elev-1:    #ece6d6;       /* panels */
+  --bg-elev-2:    #e2dac6;       /* panel headers */
+  --bg-elev-3:    #d3c9af;       /* hover */
+  --border:        rgba(40, 45, 55, 0.10);
+  --border-strong: rgba(40, 45, 55, 0.22);
+  --border-focus:  rgba(20, 90, 130, 0.55);
+  --text:        #1a1e22;        /* ink */
+  --text-dim:    #5a5648;
+  --text-faint:  #8a8270;
+  --text-muted:  #6a6555;
+  --phosphor:    #0b8543;        /* verde oscuro saturado — contraste 7:1 sobre cream */
+  --phosphor-dim: #c5e8d0;       /* tint para fondos own */
+  --amber:       #b86a0a;
+  --cyan:        #0b5e83;        /* azul atlántico oscuro */
+  --cyan-dim:    #c7e1ed;
+  --red:         #b22222;        /* firebrick */
+  --magenta:     #8b3d7a;
+  --crt-scanlines: 0;            /* sin scanlines en light — molestan sobre papel */
+  --grain-opacity: 0.22;
+  --grain-blend: multiply;       /* grain oscurece levemente en lugar de aclarar */
+  --shadow-glow-strength: 0.12;
+}
 
   --space-1: 4px;
   --space-2: 8px;
@@ -71,7 +105,7 @@ html, body {
   -moz-osx-font-smoothing: grayscale;
 }
 
-/* CRT scanlines (mismo patrón que home.v2) */
+/* CRT scanlines — solo activas en dark mode (var --crt-scanlines=1) */
 body::before {
   content: "";
   position: fixed;
@@ -952,8 +986,8 @@ a:hover { text-decoration: underline; }
   pointer-events: none;
   z-index: 3;
   background-image: url("data:image/svg+xml;utf8,<svg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0.6 0 0 0 0 0.7 0 0 0 0 0.7 0 0 0 0.05 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
-  opacity: 0.5;
-  mix-blend-mode: overlay;
+  opacity: var(--grain-opacity);
+  mix-blend-mode: var(--grain-blend);
 }
 
 /* Brand reformulado: rag (text-dim) · accent · WA (phosphor) + version chip */
@@ -973,7 +1007,7 @@ a:hover { text-decoration: underline; }
 }
 .wa-brand-wa {
   color: var(--phosphor);
-  text-shadow: 0 0 8px rgba(102, 255, 153, 0.35);
+  text-shadow: 0 0 8px color-mix(in srgb, var(--phosphor) calc(var(--shadow-glow-strength) * 100%), transparent);
 }
 .wa-brand-version {
   margin-left: 10px;
@@ -1266,6 +1300,74 @@ a:hover { text-decoration: underline; }
   color: var(--text-faint);
   opacity: 0.3;
 }
+
+/* Theme toggle button — pareja split-disc para sugerir dual mode */
+.wa-header-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.wa-theme-toggle {
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  border-radius: 2px;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  cursor: pointer;
+  color: var(--text-dim);
+  font-size: 14px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  overflow: hidden;
+  transition: border-color 120ms, color 120ms, background 120ms;
+}
+.wa-theme-toggle:hover {
+  border-color: var(--cyan);
+  color: var(--cyan);
+  background: var(--bg-elev-2);
+}
+.wa-theme-icon {
+  position: absolute;
+  inset: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: opacity 180ms, transform 220ms;
+}
+:root[data-theme="dark"] .wa-theme-icon-dark   { opacity: 1; transform: rotate(0deg); }
+:root[data-theme="dark"] .wa-theme-icon-light  { opacity: 0; transform: rotate(-90deg); }
+:root[data-theme="light"] .wa-theme-icon-dark  { opacity: 0; transform: rotate(90deg); }
+:root[data-theme="light"] .wa-theme-icon-light { opacity: 1; transform: rotate(0deg); }
+
+/* Light-mode tweaks: el grain con multiply oscurece, el brand-WA pierde
+   shadow-glow porque el bg-paper no resiste un halo phosphor saturado. */
+:root[data-theme="light"] .wa-msg.own {
+  background: linear-gradient(
+    180deg,
+    rgba(11, 133, 67, 0.04) 0%,
+    rgba(11, 133, 67, 0.10) 100%
+  );
+  border-color: rgba(11, 133, 67, 0.30);
+}
+:root[data-theme="light"] .wa-msg-time {
+  background: rgba(0, 0, 0, 0.05);
+}
+:root[data-theme="light"] .wa-msg.own .wa-msg-time {
+  background: rgba(11, 133, 67, 0.10);
+}
+:root[data-theme="light"] .wa-chat-unread {
+  box-shadow: 0 0 4px rgba(11, 133, 67, 0.18);
+}
+:root[data-theme="light"] .wa-conn-indicator.ok .wa-signal-bars i {
+  /* En light el flicker se ve raro; mantenemos opacity full sin animation. */
+  animation: none !important;
+  opacity: 1;
+}
+:root[data-theme="light"] body::before { display: none; }
 
 /* Reduce motion: respeta preference del user */
 @media (prefers-reduced-motion: reduce) {

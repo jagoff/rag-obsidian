@@ -897,6 +897,81 @@ function _dueBadge(days) {
   return `<span class="kpi-delta ${cls}" style="font-size: 11px;">${txt}</span>`;
 }
 
+// Bar chart vertical de gasto diario dentro del ciclo. La idea es que el
+// user vea cuándo se concentra el gasto (¿fin de mes? ¿días puntuales?).
+// Las barras del día 0 hasta last day del ciclo, con $0 para días sin
+// compras. Eje X solo muestra día (1-31) — el mes ya está implícito en
+// el header "ciclo 2026-04-30 → 2026-05-28".
+function _renderCardDailyBars(canvasId, purchases, color) {
+  destroyChart(canvasId);
+  const ctx = document.getElementById(canvasId);
+  if (!ctx || !purchases || !purchases.length) return;
+
+  // Bucketize: { "YYYY-MM-DD": sum }.
+  const byDay = new Map();
+  for (const p of purchases) {
+    if (!p.date) continue;
+    byDay.set(p.date, (byDay.get(p.date) || 0) + (p.amount || 0));
+  }
+  if (!byDay.size) return;
+
+  // Build day range from min(date) to max(date) inclusive, $0 for gaps.
+  const dates = [...byDay.keys()].sort();
+  const start = new Date(dates[0] + "T00:00:00");
+  const end = new Date(dates[dates.length - 1] + "T00:00:00");
+  const labels = [];
+  const values = [];
+  const fullDates = [];
+  for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+    const iso = d.toISOString().slice(0, 10);
+    fullDates.push(iso);
+    labels.push(String(d.getDate()).padStart(2, "0"));
+    values.push(byDay.get(iso) || 0);
+  }
+
+  state.charts[canvasId] = new Chart(ctx, {
+    type: "bar",
+    data: {
+      labels,
+      datasets: [{
+        data: values,
+        backgroundColor: color || C.cyan,
+        borderColor: color || C.cyan,
+        borderRadius: 3, borderWidth: 0,
+        maxBarThickness: 18,
+      }],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            title: (items) => {
+              const idx = items[0].dataIndex;
+              return fmtDateShort(fullDates[idx]);
+            },
+            label: (ctx) => " " + fmtMoneyARS(ctx.parsed.y),
+          },
+        },
+      },
+      scales: {
+        x: {
+          ticks: { color: C.dim, font: { size: 9 }, maxRotation: 0, autoSkip: true, autoSkipPadding: 12 },
+          grid: { display: false },
+          border: { color: C.border },
+        },
+        y: {
+          ticks: { color: C.dim, font: { size: 9 }, callback: (v) => fmtMoneyARSCompact(v) },
+          grid: { color: C.grid },
+          border: { display: false },
+          beginAtZero: true,
+        },
+      },
+    },
+  });
+}
+
 // Render donut simple usando Chart.js — devuelve canvas id para mount.
 function _renderCardDonut(canvasId, labels, values, colors, centerLabel, centerValue) {
   destroyChart(canvasId);
@@ -1039,6 +1114,163 @@ function renderCards(cards) {
       </div>
     `;
 
+    // ── Recurrentes (necesario antes de forecast — fixed monthly los usa).
+    const merchantCount = new Map();
+    [...purchasesAR, ...purchasesUSD].forEach((p) => {
+      const m = _normalizeMerchant(p.description);
+      const cur = p.currency || "ARS";
+      const key = `${m}|${cur}`;
+      const ex = merchantCount.get(key) || { name: m, currency: cur, n: 0, total: 0, items: [] };
+      ex.n += 1;
+      ex.total += p.amount || 0;
+      ex.items.push(p);
+      merchantCount.set(key, ex);
+    });
+    const recurring = [...merchantCount.values()].filter((m) => m.n >= 2)
+      .sort((a, b) => b.total - a.total);
+
+    // ── Proyección próximo mes ─────────────────────────────────────────
+    //
+    // Estimación derivada del ciclo actual + heurística:
+    //
+    //   FIJO MENSUAL = servicios + streaming + recurrentes detectados
+    //                  (lo que se repite todos los meses sí o sí)
+    //   VARIABLE    = compras + movilidad + comida + salud + otros
+    //                  (lo que cambia según el mes — Uber, marketplace, etc.)
+    //
+    // Proyección próximo mes ≈ FIJO + asumir VARIABLE similar.
+    //
+    // El user puede pisar el FIJO con un input manual (persistido en
+    // localStorage por last4) cuando sabe que cierta cuota termina o
+    // entra una nueva. NO tenemos data de cuotas en el payload del
+    // banco — fix sería en `web/finance_dashboard.py` parseando el
+    // xlsx con detalle. Por ahora override manual.
+    //
+    // Categorías "fijas" vs "variables" definidas en sets abajo —
+    // categoría id viene de _inferCategory. "Otros" cae en variable
+    // por default (asunción conservadora).
+    const FIXED_CAT_IDS = new Set(["servicios", "streaming", "salud"]);
+    let fixedARS = 0, variableARS = 0;
+    purchasesAR.forEach((p) => {
+      const cat = _inferCategory(p.description);
+      if (FIXED_CAT_IDS.has(cat.id)) fixedARS += (p.amount || 0);
+      else variableARS += (p.amount || 0);
+    });
+    // Para los "Otros" sin categoría, miramos si están en recurrentes
+    // detectados (≥2 cobros) → si sí, contar como fijo (ej. Adventistas
+    // que no matchea ninguna regex pero claramente es fijo si aparece
+    // mensualmente).
+    const recurringARSMerchants = new Set(
+      recurring.filter((r) => r.currency === "ARS").map((r) => r.name.toLowerCase())
+    );
+    let movedToFixed = 0;
+    purchasesAR.forEach((p) => {
+      const cat = _inferCategory(p.description);
+      if (cat.id === "otros") {
+        const m = _normalizeMerchant(p.description).toLowerCase();
+        if (recurringARSMerchants.has(m)) {
+          movedToFixed += (p.amount || 0);
+        }
+      }
+    });
+    fixedARS += movedToFixed;
+    variableARS -= movedToFixed;
+
+    // Override del fijo (localStorage por tarjeta last4).
+    const STORAGE_KEY = `cc-fixed-override-${card.last4 || "x"}`;
+    let fixedOverride = null;
+    try {
+      const v = localStorage.getItem(STORAGE_KEY);
+      if (v != null && v !== "") {
+        const n = parseFloat(v);
+        if (!isNaN(n)) fixedOverride = n;
+      }
+    } catch (_) {}
+    const fixedEffective = fixedOverride != null ? fixedOverride : fixedARS;
+    const projectedNextARS = fixedEffective + variableARS;
+
+    // Variación vs total este mes (% delta).
+    const deltaPct = card.total_ars > 0
+      ? ((projectedNextARS - card.total_ars) / card.total_ars) * 100
+      : null;
+    const deltaCls = deltaPct == null ? "neutral"
+      : deltaPct > 5 ? "down"
+      : deltaPct < -5 ? "up" : "neutral";
+    const deltaTxt = deltaPct == null ? "—"
+      : (deltaPct > 0 ? "+" : "") + deltaPct.toFixed(1) + "%";
+
+    const forecastInputId = `${cardKey}-fixed-input`;
+    const forecastSection = (purchasesAR.length > 0) ? `
+      <div class="cc-section cc-forecast">
+        <div class="cc-section-title">Resumen del ciclo + proyección</div>
+        <div class="cc-forecast-grid">
+          <div class="cc-fcast-cell">
+            <span class="cc-fcast-label">Total este mes · ARS</span>
+            <span class="cc-fcast-value">${fmtMoneyARS(card.total_ars)}</span>
+          </div>
+          <div class="cc-fcast-cell">
+            <span class="cc-fcast-label">
+              Gasto fijo mensual
+              <small style="color: var(--text-faint); font-size: 9px;">
+                (servicios + streaming + recurrentes)
+              </small>
+            </span>
+            <span class="cc-fcast-value" style="color: var(--yellow);">${fmtMoneyARS(fixedEffective)}</span>
+            ${fixedOverride != null ? `
+              <small style="font-size: 9px; color: var(--text-faint);">
+                override · detectado ${fmtMoneyARS(fixedARS)}
+              </small>` : ""}
+          </div>
+          <div class="cc-fcast-cell">
+            <span class="cc-fcast-label">Gasto variable</span>
+            <span class="cc-fcast-value" style="color: var(--cyan);">${fmtMoneyARS(variableARS)}</span>
+          </div>
+          <div class="cc-fcast-cell cc-fcast-projection">
+            <span class="cc-fcast-label">Proyección próximo mes</span>
+            <span class="cc-fcast-value" style="color: var(--green);">${fmtMoneyARS(projectedNextARS)}</span>
+            <small class="kpi-delta ${deltaCls}" style="font-size: 11px;">${deltaTxt} vs este mes</small>
+          </div>
+        </div>
+
+        <div class="cc-forecast-editor">
+          <label for="${forecastInputId}" class="cc-forecast-label">
+            Ajustar gasto fijo mensual
+            <small style="color: var(--text-faint); font-size: 10px; display: block;">
+              Si termina una cuota o agregás un servicio nuevo, ajustá acá.
+              Persiste por tarjeta (last4 = ${escapeHtml(card.last4 || "?")}).
+            </small>
+          </label>
+          <div class="cc-forecast-input-row">
+            <span class="cc-forecast-prefix">$</span>
+            <input type="number" inputmode="numeric" step="1000" id="${forecastInputId}"
+                   class="cc-forecast-input"
+                   placeholder="${fixedARS.toFixed(0)}"
+                   value="${fixedOverride != null ? fixedOverride.toFixed(0) : ""}"
+                   aria-label="Gasto fijo mensual override en ARS">
+            <button type="button" class="cc-forecast-reset" data-cc-reset="${cardKey}"
+                    title="Volver al valor detectado">↺</button>
+          </div>
+        </div>
+
+        <div class="cc-forecast-note">
+          Cuotas en curso no se detectan automáticamente. Si el banco
+          incluye una cuota que termina próximamente, restala manualmente
+          del fijo. Suba la cifra cuando agregues un servicio nuevo.
+        </div>
+      </div>
+    ` : "";
+
+    // ── Daily bars: gasto ARS por día del ciclo.
+    const dailyCanvasId = `${cardKey}-daily`;
+    const dailySection = purchasesAR.length >= 3 ? `
+      <div class="cc-section">
+        <div class="cc-section-title">Gasto diario del ciclo · ARS</div>
+        <div class="cc-daily-wrap">
+          <canvas id="${dailyCanvasId}" aria-label="Barras: gasto ARS por día del ciclo"></canvas>
+        </div>
+      </div>
+    ` : "";
+
     // ── Composición ARS: consumos vs cargos extra (donut).
     const compoCanvasId = `${cardKey}-compo`;
     const compoSection = (totalConsumosARS + otherARS) > 0 ? `
@@ -1095,19 +1327,7 @@ function renderCards(cards) {
     ` : "";
 
     // ── Recurrentes detectados (mismo merchant ≥2 veces, ARS o USD).
-    const merchantCount = new Map();
-    [...purchasesAR, ...purchasesUSD].forEach((p) => {
-      const m = _normalizeMerchant(p.description);
-      const cur = p.currency || "ARS";
-      const key = `${m}|${cur}`;
-      const ex = merchantCount.get(key) || { name: m, currency: cur, n: 0, total: 0, items: [] };
-      ex.n += 1;
-      ex.total += p.amount || 0;
-      ex.items.push(p);
-      merchantCount.set(key, ex);
-    });
-    const recurring = [...merchantCount.values()].filter((m) => m.n >= 2)
-      .sort((a, b) => b.total - a.total);
+    // `recurring` ya está computado arriba (lo usa el forecast block).
     const recurringSection = recurring.length ? `
       <div class="cc-section">
         <div class="cc-section-title">Recurrentes detectados · ${recurring.length}</div>
@@ -1222,6 +1442,8 @@ function renderCards(cards) {
 
     detail.innerHTML = `
       ${headerHtml}
+      ${forecastSection}
+      ${dailySection}
       ${compoSection}
       ${catSection}
       ${recurringSection}
@@ -1234,7 +1456,7 @@ function renderCards(cards) {
     wrap.appendChild(detail);
     container.appendChild(wrap);
 
-    // ── Post-mount: chart + tab handlers.
+    // ── Post-mount: charts + handlers.
     if ((totalConsumosARS + otherARS) > 0) {
       _renderCardDonut(
         compoCanvasId,
@@ -1243,8 +1465,11 @@ function renderCards(cards) {
         [palette[0], palette[2]],
       );
     }
+    if (purchasesAR.length >= 3) {
+      _renderCardDailyBars(dailyCanvasId, purchasesAR, C.cyan);
+    }
 
-    // Tab switcher.
+    // Tab switcher (consumos ARS / USD).
     wrap.querySelectorAll(".cc-tab").forEach((btn) => {
       btn.addEventListener("click", () => {
         const targetId = btn.dataset.tab;
@@ -1257,6 +1482,29 @@ function renderCards(cards) {
         });
       });
     });
+
+    // Forecast override: input + reset. Persiste por last4. Re-render
+    // toda la sección cards cuando cambia (más simple que recomputar in-place).
+    const input = wrap.querySelector(`#${forecastInputId}`);
+    if (input) {
+      const commit = () => {
+        const v = input.value.trim();
+        try {
+          if (v === "") localStorage.removeItem(STORAGE_KEY);
+          else localStorage.setItem(STORAGE_KEY, String(parseFloat(v)));
+        } catch (_) {}
+        renderCards(cards);
+      };
+      input.addEventListener("change", commit);
+      input.addEventListener("blur", commit);
+    }
+    const resetBtn = wrap.querySelector(`[data-cc-reset="${cardKey}"]`);
+    if (resetBtn) {
+      resetBtn.addEventListener("click", () => {
+        try { localStorage.removeItem(STORAGE_KEY); } catch (_) {}
+        renderCards(cards);
+      });
+    }
   });
 }
 

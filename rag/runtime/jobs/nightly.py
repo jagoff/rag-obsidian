@@ -46,6 +46,8 @@ logger = logging.getLogger(__name__)
 
 
 _RAG_BIN = str(Path.home() / ".local/bin/rag")
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+_VENV_PY = _REPO_ROOT / ".venv" / "bin" / "python"
 _SUBPROCESS_TIMEOUT_S = 1800  # 30 min — generous, online-tune tarda 24min warm
 
 
@@ -106,6 +108,35 @@ def _run_subprocess(
 
 
 # ── Jobs ────────────────────────────────────────────────────────────────────
+
+
+@cron(
+    hour=2, minute=30,
+    label="identity_fingerprint_refresh",
+    description="Recompute style fingerprint del user (G2 — Identity Layer 2).",
+)
+def identity_fingerprint_refresh_job() -> dict[str, Any]:
+    """Equivalente a `python -c 'from rag.identity_layer import compute_fingerprint; compute_fingerprint(90)'`.
+
+    Schedule: 02:30 daily, antes de auto_harvest (03:00). El fingerprint
+    se persiste a `~/.local/share/obsidian-rag/identity_fingerprint.json`
+    y se lee on-demand por `system_prompt_for_intent` para inyectar al
+    prompt del chat/draft loop.
+
+    Out: stdout con metrics del último compute (n_samples, avg_words).
+    """
+    return _run_subprocess(
+        [str(_VENV_PY), "-c",
+         "from rag.identity_layer import compute_fingerprint; "
+         "fp = compute_fingerprint(days=90); "
+         "print(f\"n={fp.get('n_samples')} avg={fp.get('avg_words_per_msg')}\")"],
+        extra_env={
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "PYTHONPATH": str(_REPO_ROOT),
+        },
+        timeout=120,
+    )
 
 
 @cron(

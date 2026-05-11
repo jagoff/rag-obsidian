@@ -13867,9 +13867,29 @@ def system_prompt_for_intent(intent: str, loose: bool) -> str:
     así `RAG_PROMPT_<NAME>_VERSION` env override aplica en runtime sin
     restart. Pre-fix las constantes `SYSTEM_RULES_*` quedaban fijas al
     import — override requería reload del proceso.
+
+    **2026-05-11 (G2 — Identity Layer 2)**: si el intent es conversacional
+    (semantic, default), appendea el style fingerprint del user al final
+    del prompt. Mantiene el prompt base intacto + suma 5-8 líneas con cómo
+    escribe el user (longitud típica, slang, emoji rate). Skipea para
+    intents factuales (lookup, comparison, synthesis) donde el estilo no
+    aplica. Failsafe: si no hay fingerprint computado, no inyecta nada.
     """
     name = _prompt_name_for_intent(intent, loose)
-    return load_prompt(name, version="latest")
+    base = load_prompt(name, version="latest")
+    # Solo intents conversacionales reciben fingerprint. Strict y semantic
+    # (default) son los flujos donde el LLM genera respuestas que el user
+    # va a leer / mandar — esos sí queremos que suenen como él.
+    if name in ("strict", "semantic", "chat"):
+        try:
+            from rag.identity_layer import summarize_for_prompt  # noqa: PLC0415
+            fingerprint = summarize_for_prompt()
+            if fingerprint:
+                return base + "\n" + fingerprint
+        except Exception:  # noqa: BLE001
+            # Silent — si hay bug en el extractor, no rompemos el prompt.
+            pass
+    return base
 
 
 def system_prompt_with_version(

@@ -405,22 +405,26 @@ def _wa_chat_label(raw_name: str, jid: str) -> str:
 
 
 def _wa_display_name(jid: str, raw_name: str = "") -> str:
-    """JID → nombre legible para UI. Prefiere el contact note del vault
-    (`99-obsidian/99-Contacts/<Name>.md`, con frontmatter `wa_jid`) sobre
-    el `push_name` que vino del bridge; muchos peers no setean push_name
-    y el bridge guarda solo el número de teléfono, que termina en la UI
-    como "5493425…" en vez de "Mama".
+    """JID → nombre legible para UI.
 
-    Fallback chain: contact note → bridge name (vía `_wa_chat_label`) →
-    `Contacto …<last4>`. Cache mtime-aware del side de `_lookup_contact_name`,
-    no agrega I/O por mensaje en threads grandes.
+    Pedido user 2026-05-11 "quiero que los nombres se muestren tal cual
+    se ven en los grupos": el bridge name (push_name del peer, lo que
+    aparece en WhatsApp Web) gana sobre el contact note del vault.
+    Antes el vault era primary y a veces mostraba un nick ("Mama")
+    distinto del nombre que ves en el grupo. Ahora chain:
+
+      (1) bridge name si tiene letras (alpha) — `Grecia 🩷`, `Juan P.`
+      (2) contact note del vault — solo si el bridge no aporta nada
+      (3) `Contacto …<last4>` fallback final
 
     El bridge guarda el `sender` de mensajes de grupo a veces como JID
     completo (`123@lid` / `123@s.whatsapp.net`) y a veces como bare
-    local-part (`123`). Probamos las 3 variantes para que el lookup
-    pegue tanto a contact notes con `wa_jid: 123@lid` como con `wa_jid:
-    123@s.whatsapp.net`.
+    local-part (`123`); para el fallback (2) probamos las 3 variantes
+    para que el lookup matchee `wa_jid: 123@lid` o `wa_jid: 123@s.wa`.
     """
+    name = (raw_name or "").strip()
+    if name and any(ch.isalpha() for ch in name):
+        return name
     if jid:
         try:
             from rag.integrations.whatsapp.voice_notes import (  # noqa: PLC0415
@@ -430,12 +434,12 @@ def _wa_display_name(jid: str, raw_name: str = "") -> str:
             if "@" not in jid:
                 candidates.extend([f"{jid}@lid", f"{jid}@s.whatsapp.net"])
             for cand in candidates:
-                name = _lookup_contact_name(cand)
-                if name:
-                    return name
+                vault_name = _lookup_contact_name(cand)
+                if vault_name:
+                    return vault_name
         except Exception:
             pass
-    return _wa_chat_label(raw_name, jid)
+    return _wa_chat_label(name, jid)
 
 
 def _fetch_whatsapp_window(

@@ -38,9 +38,9 @@ export function attach(bodyEl) {
     if (_selecting) return;
     const target = ev.target.closest && ev.target.closest(".wa-msg");
     if (!target || target.classList.contains("revoked")) return;
-    // El click sobre el kebab tiene su propio handler; no arrancamos
+    // El click sobre el trash tiene su propio handler; no arrancamos
     // long-press desde ahí.
-    if (ev.target.closest && ev.target.closest(".wa-msg-kebab")) return;
+    if (ev.target.closest && ev.target.closest(".wa-msg-trash")) return;
     activeMsgEl = target;
     clearTimeout(pressTimer);
     pressTimer = setTimeout(() => {
@@ -68,19 +68,21 @@ export function attach(bodyEl) {
     openMenu(target, ev);
   });
 
-  // Click sobre el kebab `⋮` (visible al hover en burbujas own) →
-  // abre el mismo menu. Delegated para que sirva con messages
-  // renderizados después del attach.
+  // Click sobre el ícono trash `🗑` (visible al hover en burbujas own)
+  // → directo al delete confirm. NO abre el menu para no superponerse
+  // con otros UI elements (feedback user: el menu se cruzaba con
+  // day-dividers + reactions, era confuso). Para reacciones o
+  // selección múltiple usar long-press / contextmenu / right-click.
   bodyEl.addEventListener("click", (ev) => {
     if (_selecting) return;
-    const kebab = ev.target.closest && ev.target.closest(".wa-msg-kebab");
-    if (!kebab) return;
+    const trash = ev.target.closest && ev.target.closest(".wa-msg-trash");
+    if (!trash) return;
     ev.preventDefault();
     ev.stopPropagation();
-    const target = kebab.closest(".wa-msg");
+    const target = trash.closest(".wa-msg");
     if (!target || target.classList.contains("revoked")) return;
     activeMsgEl = target;
-    openMenu(target, ev);
+    doRevoke();
   }, true);
 
   // Suprimir el siguiente click si el user soltó después de abrir el menu.
@@ -98,20 +100,29 @@ export function attach(bodyEl) {
   });
 }
 
-// Inserta el kebab `⋮` en burbujas propias. El renderer (`wa-thread.js`)
-// lo llama después de armar el `.wa-msg.own`. Se separa para que la
-// lógica de "qué affordances tiene cada msg" viva acá y no se duplique
-// en el renderer.
+// Inserta el ícono trash 🗑 en burbujas propias. El renderer
+// (`wa-thread.js`) lo llama después de armar el `.wa-msg.own`. Click
+// va directo al delete confirm — para reacciones / multi-select usar
+// long-press / right-click. Visible solo al hover (default opacity 0).
 export function attachOwnMenuAffordance(msgEl) {
   if (!msgEl || !msgEl.classList || !msgEl.classList.contains("own")) return;
   if (msgEl.classList.contains("revoked")) return;
-  if (msgEl.querySelector(".wa-msg-kebab")) return;
+  if (msgEl.querySelector(".wa-msg-trash")) return;
   const btn = document.createElement("button");
   btn.type = "button";
-  btn.className = "wa-msg-kebab";
-  btn.setAttribute("aria-label", "Acciones del mensaje");
-  btn.title = "Acciones (reaccionar, eliminar)";
-  btn.textContent = "⋮";
+  btn.className = "wa-msg-trash";
+  btn.setAttribute("aria-label", "Eliminar mensaje");
+  btn.title = "Eliminar mensaje";
+  // SVG inline para no depender de fuentes con glyph 🗑️ (en macOS el
+  // emoji renderiza colorido y desentona con el resto del UI).
+  btn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" '
+    + 'stroke="currentColor" stroke-width="2" stroke-linecap="round" '
+    + 'stroke-linejoin="round" aria-hidden="true">'
+    + '<polyline points="3 6 5 6 21 6"></polyline>'
+    + '<path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path>'
+    + '<path d="M10 11v6"></path><path d="M14 11v6"></path>'
+    + '<path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"></path>'
+    + '</svg>';
   msgEl.appendChild(btn);
 }
 
@@ -318,7 +329,7 @@ function onSelectClick(ev) {
   if (!target || target.classList.contains("revoked")) return;
   // Evitamos toggles cuando el user clickea sobre links / media / el
   // botón delete del action bar (que vive fuera del thread body).
-  if (ev.target.closest(".wa-msg-kebab")) return;
+  if (ev.target.closest(".wa-msg-trash")) return;
   ev.preventDefault();
   ev.stopPropagation();
   const id = target.dataset.id || "";

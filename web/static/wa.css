@@ -821,43 +821,42 @@ button { cursor: pointer; }
   transform: none !important;
 }
 
-/* Kebab `⋮` en burbujas propias — afford visible para abrir el menu
-   de acciones (reaccionar / eliminar / seleccionar varios). Siempre
-   visible (opacity 0.45 → 1 al hover) para que sea descubrible sin
-   tener que adivinar long-press o right-click. */
-.wa-msg-kebab {
+/* Trash 🗑 en burbujas propias — única afford visible (hover-only)
+   para eliminar mensajes. Reemplaza el kebab `⋮` previo que se
+   superponía con day-dividers y reaction chips. Para reaccionar o
+   seleccionar varios: long-press / right-click. */
+.wa-msg-trash {
   position: absolute;
-  top: 3px;
-  right: 5px;
-  width: 22px;
-  height: 22px;
+  top: 50%;
+  right: -28px;
+  transform: translateY(-50%);
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   border-radius: 50%;
   border: 0;
-  background: rgba(0, 0, 0, 0.22);
-  color: rgba(255, 255, 255, 0.95);
-  font-size: 16px;
-  line-height: 18px;
-  font-weight: 700;
+  background: transparent;
+  color: var(--text-secondary);
   padding: 0;
   cursor: pointer;
-  opacity: 0.45;
-  transition: opacity 0.12s ease, background 0.12s ease;
+  opacity: 0;
+  transition: opacity 0.12s ease, color 0.12s ease, background 0.12s ease;
   z-index: 2;
 }
-.wa-msg.own:hover .wa-msg-kebab,
-.wa-msg-kebab:focus-visible,
-.wa-msg-kebab:hover {
+.wa-msg.own:hover .wa-msg-trash,
+.wa-msg-trash:focus-visible {
+  opacity: 0.7;
+}
+.wa-msg-trash:hover {
   opacity: 1;
+  color: var(--red, #f15c6d);
+  background: rgba(241, 92, 109, 0.08);
 }
-.wa-msg-kebab:hover {
-  background: rgba(0, 0, 0, 0.45);
-}
-[data-theme="light"] .wa-msg-kebab {
-  background: rgba(0, 0, 0, 0.12);
-  color: rgba(0, 0, 0, 0.72);
-}
-[data-theme="light"] .wa-msg-kebab:hover {
-  background: rgba(0, 0, 0, 0.22);
+/* Touch devices: hover no se dispara, mantener visible discreto. */
+@media (hover: none) {
+  .wa-msg-trash { opacity: 0.5; }
 }
 
 /* ─── Selection mode (bulk delete) ─────────────────────────────────
@@ -895,7 +894,7 @@ button { cursor: pointer; }
   justify-content: center;
   line-height: 1;
 }
-.wa-thread.selecting .wa-msg-kebab { display: none; }
+.wa-thread.selecting .wa-msg-trash { display: none; }
 
 .wa-select-bar {
   position: sticky;

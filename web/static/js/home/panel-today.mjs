@@ -324,12 +324,20 @@ export function renderTodayHero(payload) {
   const md = payload.today?.narrative || "";
   const split = splitNarrative(md);
 
-  const sectionHTML = (cls, emoji, label, count, contentHTML, emptyText) => `
+  // Si el cuadro queda sin contenido real, NO lo renderizamos — preferimos
+  // ocultar a mostrar un placeholder vacío ("Aún sin brief…", "todo
+  // procesado ✓"). Aplica a las hero-sections regulares; agenda tiene su
+  // propio gate más abajo porque su body tiene siempre los dos sub-bloques.
+  const sectionHTML = (cls, emoji, label, count, contentHTML, _emptyText) => {
+    const trimmed = (contentHTML || "").trim();
+    if (!trimmed) return "";
+    return `
     <div class="hero-section ${cls}">
       <h3><span>${emoji} ${escapeHTML(label)}</span>${count != null ? `<span class="count">${count}</span>` : ""}</h3>
-      <div class="prose">${contentHTML || `<div class="empty">${escapeHTML(emptyText)}</div>`}</div>
+      <div class="prose">${trimmed}</div>
     </div>
   `;
+  };
 
   const fromName = (s) => (s || "").split("<")[0].trim() || s || "";
   const truncate = (s, n) => (s || "").length > n ? (s || "").slice(0, n) + "…" : (s || "");
@@ -538,19 +546,30 @@ export function renderTodayHero(payload) {
     </div>
   `;
   const agendaCount = (todayCount || 0) + (tomorrowCount || 0);
-  const agendaHTML = `
+  // Misma regla "hide if empty" para agenda: cuando ningún sub-bloque tiene
+  // items reales (todayHTML/tomorrowHTML vacíos), no la renderizamos.
+  const agendaHasContent = !!((todayHTML || "").trim() || (tomorrowHTML || "").trim());
+  const agendaHTML = agendaHasContent ? `
     <div class="hero-section s-agenda">
       <h3><span>🌅 Agenda</span>${agendaCount ? `<span class="count">${agendaCount}</span>` : ""}</h3>
       ${agendaBody}
     </div>
-  `;
+  ` : "";
 
-  bodyEl.innerHTML = [
-    sectionHTML("s-narrative", "🪞", "Lo que pasó hoy", null, narrativeHTML, "Aún sin brief — pulsá ↻ arriba para generar"),
-    sectionHTML("s-inbox", "📥", "Sin procesar", inboxCount || null, inboxHTML, "todo procesado ✓"),
-    sectionHTML("s-questions", "🔍", "Preguntas abiertas", questionsCount || null, questionsHTML, "sin preguntas pendientes"),
+  const heroPieces = [
+    sectionHTML("s-narrative", "🪞", "Lo que pasó hoy", null, narrativeHTML, ""),
+    sectionHTML("s-inbox", "📥", "Sin procesar", inboxCount || null, inboxHTML, ""),
+    sectionHTML("s-questions", "🔍", "Preguntas abiertas", questionsCount || null, questionsHTML, ""),
     agendaHTML,
-  ].join("");
+  ].filter((s) => (s || "").trim().length > 0);
+  // Cuando TODOS los cuadros están vacíos, mostrar un solo placeholder para
+  // el caso pre-brief (no dejar el hero completamente en blanco sin pista
+  // de cómo arrancarlo).
+  if (heroPieces.length === 0) {
+    bodyEl.innerHTML = `<div class="empty">Aún sin brief — pulsá ↻ arriba para generar</div>`;
+  } else {
+    bodyEl.innerHTML = heroPieces.join("");
+  }
 
   // Inyectar botones inline "crear reminder" en cada <li> de "Para mañana"
   _injectTomorrowReminderButtons(_createdReminderTexts);

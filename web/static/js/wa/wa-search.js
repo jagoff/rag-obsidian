@@ -72,15 +72,30 @@ async function runSearch(q) {
   if (!els.list) return;
   if (els.loading) els.loading.classList.remove("hidden");
   try {
-    const params = new URLSearchParams({
-      q,
-      limit: "80",
-      mode: searchBackend,
+    // Dos fetchs en paralelo:
+    //   - /api/wa/chats?q=... → contactos cuyo label matchea.
+    //   - /api/wa/search?... → mensajes que matchean (FTS o semantic).
+    // Renderizamos los contactos arriba, después los mensajes
+    // (pedido user: "primero aparecen contactos que matcheen con la
+    // busqueda, despues chats").
+    const msgParams = new URLSearchParams({
+      q, limit: "80", mode: searchBackend,
     });
-    const r = await fetch("/api/wa/search?" + params, { credentials: "same-origin" });
-    if (!r.ok) throw new Error(`search ${r.status}`);
-    const data = await r.json();
-    renderHits(data.hits || [], q, data.mode || searchBackend);
+    const chatParams = new URLSearchParams({ q, limit: "20" });
+    const [chatResp, msgResp] = await Promise.all([
+      fetch("/api/wa/chats?" + chatParams, { credentials: "same-origin" }),
+      fetch("/api/wa/search?" + msgParams, { credentials: "same-origin" }),
+    ]);
+    if (!chatResp.ok) throw new Error(`chats ${chatResp.status}`);
+    if (!msgResp.ok) throw new Error(`search ${msgResp.status}`);
+    const chatData = await chatResp.json();
+    const msgData = await msgResp.json();
+    renderCombined(
+      chatData.chats || [],
+      msgData.hits || [],
+      q,
+      msgData.mode || searchBackend,
+    );
   } catch (e) {
     console.error("[wa-search] failed", e);
     els.list.innerHTML = `<li class="wa-empty-state">error de search: ${e.message}</li>`;
@@ -89,46 +104,73 @@ async function runSearch(q) {
   }
 }
 
-function renderHits(hits, q, mode) {
+function renderCombined(chats, hits, q, mode) {
   if (!els.list) return;
   els.list.innerHTML = "";
-  if (hits.length === 0) {
+  if (chats.length === 0 && hits.length === 0) {
     els.list.innerHTML = `<li class="wa-search-empty">sin resultados para "${escapeHtml(q)}"</li>`;
     return;
   }
-  for (const h of hits) {
-    const li = document.createElement("li");
-    li.className = "wa-search-hit";
-    li.dataset.jid = h.chat_jid;
-    li.dataset.messageId = h.id;
-    li.addEventListener("click", () => {
-      if (onSelectCallback) onSelectCallback(h.chat_jid, h.id);
-    });
-    const ts = h.ts ? new Date(h.ts) : null;
-    const tsLabel = ts && !Number.isNaN(ts.getTime())
-      ? ts.toLocaleDateString("es-AR", { day: "2-digit", month: "2-digit", year: "2-digit" })
-      : "";
-    // FTS devuelve `snippet` con `<mark>` highlights; semantic devuelve
-    // `content` raw + `distance`. Renderizamos distinto pero con la
-    // misma class (`.wa-search-snippet`).
-    let bodyHTML;
-    let scoreTag = "";
-    if (mode === "semantic") {
-      const dist = typeof h.distance === "number" ? h.distance.toFixed(2) : "";
-      bodyHTML = escapeHtml(h.content || "");
-      scoreTag = dist ? `<span class="wa-search-score" title="cosine distance — 0 = idéntico">d=${dist}</span>` : "";
-    } else {
-      bodyHTML = sanitizeSnippetHTML(h.snippet || "");
+  // Sección 1: Contactos.
+  if (chats.length > 0) {
+    appendSection("Contactos", chats.length);
+    for (const c of chats) {
+      const li = document.createElement("li");
+      li.className = "wa-search-contact";
+      li.dataset.jid = c.jid;
+      li.addEventListener("click", () => {
+        if (onSelectCallback) onSelectCallback(c.jid, null);
+      });
+      const preview = (c.last_preview || "").trim();
+      li.innerHTML = `
+        <div class="wa-search-contact-name">${escapeHtml(c.label || c.jid)}</div>
+        ${preview ? `<div class="wa-search-contact-preview">${escapeHtml(preview)}</div>` : ""}
+      `;
+      els.list.appendChild(li);
     }
-    li.innerHTML = `
-      <div class="wa-search-meta">
-        <span class="wa-search-chat">${escapeHtml(h.chat_name || h.chat_jid)}</span>
-        <span class="wa-search-ts">${tsLabel}${scoreTag}</span>
-      </div>
-      <div class="wa-search-snippet">${bodyHTML}</div>
-    `;
-    els.list.appendChild(li);
   }
+  // Sección 2: Mensajes.
+  if (hits.length > 0) {
+    appendSection("Mensajes", hits.length);
+    for (const h of hits) {
+      const li = document.createElement("li");
+      li.className = "wa-search-hit";
+      li.dataset.jid = h.chat_jid;
+      li.dataset.messageId = h.id;
+      li.addEventListener("click", () => {
+        if (onSelectCallback) onSelectCallback(h.chat_jid, h.id);
+      });
+      const ts = h.ts ? new Date(h.ts) : null;
+      const tsLabel = ts && !Number.isNaN(ts.getTime())
+        ? ts.toLocaleDateString("es-AR", { day: "2-digit", month: "2-digit", year: "2-digit" })
+        : "";
+      let bodyHTML;
+      let scoreTag = "";
+      if (mode === "semantic") {
+        const dist = typeof h.distance === "number" ? h.distance.toFixed(2) : "";
+        bodyHTML = escapeHtml(h.content || "");
+        scoreTag = dist ? `<span class="wa-search-score" title="cosine distance — 0 = idéntico">d=${dist}</span>` : "";
+      } else {
+        bodyHTML = sanitizeSnippetHTML(h.snippet || "");
+      }
+      li.innerHTML = `
+        <div class="wa-search-meta">
+          <span class="wa-search-chat">${escapeHtml(h.chat_name || h.chat_jid)}</span>
+          <span class="wa-search-ts">${tsLabel}${scoreTag}</span>
+        </div>
+        <div class="wa-search-snippet">${bodyHTML}</div>
+      `;
+      els.list.appendChild(li);
+    }
+  }
+}
+
+function appendSection(title, count) {
+  const li = document.createElement("li");
+  li.className = "wa-search-section";
+  li.innerHTML = `<span class="wa-search-section-title">${escapeHtml(title)}</span>`
+    + `<span class="wa-search-section-count">${count}</span>`;
+  els.list.appendChild(li);
 }
 
 // Permitir SOLO `<mark>` y `</mark>` en el snippet — el resto se escapa.

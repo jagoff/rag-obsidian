@@ -4145,21 +4145,13 @@ def wa_chats(
 
 @app.post("/api/wa/chats/{jid}/pin")
 def wa_chat_pin(jid: str) -> dict:
-    """Pin un CONTACTO (individual) a la sidebar. Idempotente.
-
-    Solo aplica a chats individuales (`@s.whatsapp.net` o `@lid`) —
-    grupos no se pueden pinear (pedido user: "es un pin de Contacto,
-    no de chats"). Group JIDs (`@g.us`) → 400.
+    """Pin un chat (contacto individual o grupo) a la sidebar.
+    Idempotente. Pedido user 2026-05-11: aplica a ambos kinds.
     """
     from rag.integrations.whatsapp import _db_local  # noqa: PLC0415
 
     if not jid or "@" not in jid:
         raise HTTPException(status_code=400, detail="jid inválido")
-    if jid.endswith("@g.us"):
-        raise HTTPException(
-            status_code=400,
-            detail="pin solo aplica a contactos individuales, no grupos",
-        )
     _db_local.pin_chat(jid)
     return {"ok": True, "pinned": True}
 

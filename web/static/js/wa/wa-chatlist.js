@@ -106,8 +106,8 @@ function render() {
       selectChat(c.jid);
     });
 
-    // Pin solo aplica a contactos individuales, no a grupos.
-    const canPin = !c.is_group;
+    // Pin aplica a cualquier chat (contacto individual o grupo).
+    const canPin = true;
     const pinTitle = c.pinned ? "Despinear" : "Pinear al tope";
     const pinIcon = c.pinned
       // Pinned: tachuela rellena (SVG filled).

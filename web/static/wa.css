@@ -1463,6 +1463,47 @@ button { cursor: pointer; }
 }
 .wa-search-ts { font-variant-numeric: tabular-nums; }
 
+/* Secciones del search results — header tipo "Contactos / Mensajes"
+   estilo WhatsApp Web. Layout flex con count alineado a la derecha. */
+.wa-search-section {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px 4px;
+  background: var(--bg-panel);
+  font-size: 11px;
+  color: var(--accent, #06d6a0);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-weight: 600;
+  list-style: none;
+  cursor: default;
+}
+.wa-search-section-count {
+  color: var(--text-secondary);
+  font-weight: 400;
+}
+
+.wa-search-contact {
+  padding: 8px 14px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border-divider);
+}
+.wa-search-contact:hover { background: var(--bg-panel-hover); }
+.wa-search-contact-name {
+  font-size: 14px;
+  color: var(--text-primary);
+  font-weight: 500;
+}
+.wa-search-contact-preview {
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* ─── Gap summary pin (auto-resume) ──────────────────────────────────
    Banner arriba del thread cuando el user vuelve después de ≥24h
    con ≥5 msgs inbound nuevos. 3 líneas con el resume del LLM

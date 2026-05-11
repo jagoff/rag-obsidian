@@ -896,9 +896,7 @@ def list_chats_for_ui(
                 (jid, r["last_seen_ts"]),
             ).fetchone()
             is_group = jid.endswith("@g.us")
-            # Pin solo aplica a contactos individuales. Aunque el JID
-            # esté en la tabla por accidente, lo ignoramos.
-            is_pinned = (not is_group) and (jid in pinned_map)
+            is_pinned = jid in pinned_map
             out.append({
                 "jid": jid,
                 "label": label,

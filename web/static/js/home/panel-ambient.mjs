@@ -22,6 +22,14 @@ export function renderWeather(payload) {
   if (loc) headerParts.push(escapeHTML(loc.split(",")[0]));
   if (cur.description) headerParts.push(escapeHTML(cur.description));
   if (cur.temp_C != null) headerParts.push(`${cur.temp_C}°C`);
+  // Probabilidad de lluvia AHORA — siempre se muestra (regla 2026-05-11
+  // user: "Weather tiene que informar la probabilidad de lluvia"). Antes
+  // solo aparecía cuando ≥30%, lo que dejaba el panel sin la métrica
+  // clave en días secos (que es información útil: "0% = no llueve").
+  const curRain = cur.rain_probability_pct;
+  if (curRain != null && curRain !== "") {
+    headerParts.push(`💧 ${curRain}%`);
+  }
   const headerHTML = headerParts.length
     ? `<div class="row-meta" style="margin-bottom: var(--space-3); font-size: 13px; color: var(--text);">
         ${headerParts.join(" · ")}
@@ -60,10 +68,13 @@ export function renderWeather(payload) {
     const tempRange = (d.minC != null && d.maxC != null)
       ? `${d.minC}°–${d.maxC}°`
       : (d.avgC != null ? `${d.avgC}°` : "");
+    // Probabilidad de lluvia SIEMPRE — even 0% es info útil para el user.
+    // Threshold ≥30% de antes ocultaba la métrica los días secos.
     const rain = Number(d.chanceofrain) || 0;
+    const rainLabel = `💧 ${rain}%`;
     const metaBits = [
       d.description ? escapeHTML(d.description) : "",
-      rain >= 30 ? `💧 ${rain}%` : "",
+      rainLabel,
     ].filter(Boolean);
     return `<div class="row" style="padding: 4px 0;">
       <div class="row-main">

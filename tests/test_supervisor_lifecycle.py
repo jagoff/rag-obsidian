@@ -32,6 +32,20 @@ def short_tmpdir():
 
 
 @pytest.fixture(autouse=True)
+def _isolate_telemetry_db(tmp_path, monkeypatch):
+    """Aisla `rag_supervisor_jobs` a un tmp_path per-test.
+
+    Pre-fix (audit 2026-05-11): el handler IPC ``run`` invoca
+    ``scheduler.run_now()`` → ``_persist_run()`` →
+    ``insert_supervisor_job_run()``, que resolvía ``OBSIDIAN_RAG_DB_PATH``
+    en runtime y escribía a la telemetry.db de PROD. Resultado: 16+ rows
+    con ``job_label='trigger_test'`` apareciendo en prod cada vez que la
+    suite corría. Idéntico patrón al fix de ``test_runtime_scheduler.py``.
+    """
+    monkeypatch.setenv("OBSIDIAN_RAG_DB_PATH", str(tmp_path))
+
+
+@pytest.fixture(autouse=True)
 def _reset_state():
     import sys as _sys
     Scheduler.reset_global()

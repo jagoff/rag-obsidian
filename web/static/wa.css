@@ -849,8 +849,8 @@ button { cursor: pointer; }
 }
 .wa-msg-trash { top: 4px; }
 .wa-msg-select { top: 30px; }
-.wa-msg.own:hover .wa-msg-trash,
-.wa-msg.own:hover .wa-msg-select,
+.wa-msg:hover .wa-msg-trash,
+.wa-msg:hover .wa-msg-select,
 .wa-msg-trash:focus-visible,
 .wa-msg-select:focus-visible {
   opacity: 1;

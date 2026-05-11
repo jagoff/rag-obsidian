@@ -22,6 +22,21 @@ def _reset_scheduler():
     Scheduler.reset_global()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_telemetry_db(tmp_path, monkeypatch):
+    """Aisla `rag_supervisor_jobs` a un tmp_path per-test.
+
+    Pre-fix (audit 2026-05-11): `run_now()` → `_persist_run()` →
+    `insert_supervisor_job_run()` escribía a la telemetry.db de PROD
+    porque ningún fixture seteaba `OBSIDIAN_RAG_DB_PATH`. Resultado:
+    15+ rows con `job_label IN ('failing_job', 'bad_job', 'counter_job',
+    'stat_job')` apareciendo en prod cada vez que la suite corría.
+    `stale_etl_signal` no las flaggeaba (no son labels conocidos), pero
+    ensuciaban queries de analytics + auditoría.
+    """
+    monkeypatch.setenv("OBSIDIAN_RAG_DB_PATH", str(tmp_path))
+
+
 def test_cron_decorator_registers_job():
     @cron(hour=3, minute=0, label="test_cron_job")
     def handler():

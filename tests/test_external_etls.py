@@ -316,6 +316,150 @@ def test_sync_claude_code_silent_without_dir(tmp_path, monkeypatch):
     assert stats == {"ok": False, "reason": "no_claude_projects_dir"}
 
 
+def test_claude_web_slug_basic_and_unicode():
+    s = rag._claude_web_slug("Hola Mundo Cómo estás", "abcd1234-5678-9abc-def0-000000000000")
+    assert s.startswith("hola-mundo-c-mo-est-s-")
+    assert s.endswith("-abcd1234")
+    # unicode-only fallback
+    assert rag._claude_web_slug("汉字", "deadbeef-aaaa-bbbb-cccc-000000000000").startswith("untitled-")
+
+
+def test_claude_web_extract_turn_text_field():
+    msg = {"sender": "human", "text": "hola", "created_at": "2026-05-10T12:00:00Z"}
+    role, ts, body = rag._claude_web_extract_turn(msg)
+    assert role == "user" and body == "hola" and ts.startswith("2026-05-10")
+
+
+def test_claude_web_extract_turn_content_blocks():
+    msg = {
+        "sender": "assistant",
+        "content": [
+            {"type": "text", "text": "leyendo archivo"},
+            {"type": "tool_use", "name": "Read"},
+        ],
+        "created_at": "2026-05-10T12:01:00Z",
+        "files": [{"file_name": "foo.pdf"}],
+    }
+    role, _, body = rag._claude_web_extract_turn(msg)
+    assert role == "assistant"
+    assert "leyendo archivo" in body and "[tool_use:Read]" in body
+    assert "[file: foo.pdf]" in body
+
+
+def test_claude_web_extract_turn_redacts(monkeypatch):
+    monkeypatch.setattr(rag, "_CLAUDE_WEB_TURN_BODY_CAP", 200)
+    msg = {"sender": "human", "text": "leak: ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa rest", "created_at": "2026-05-10T12:00:00Z"}
+    _r, _t, body = rag._claude_web_extract_turn(msg)
+    assert "REDACTED" in body
+
+
+def test_claude_web_skips_other_senders():
+    assert rag._claude_web_extract_turn({"sender": "tool"}) is None
+    assert rag._claude_web_extract_turn({"sender": "human", "text": "  "}) is None
+
+
+def test_sync_claude_web_silent_without_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(rag, "_CLAUDE_WEB_EXPORT_DIR", tmp_path / "missing")
+    stats = rag._sync_claude_web_conversations(tmp_path)
+    assert stats == {"ok": False, "reason": "no_claude_web_export_dir"}
+
+
+def test_sync_claude_web_silent_without_export(tmp_path, monkeypatch):
+    export_dir = tmp_path / "export"
+    export_dir.mkdir()
+    monkeypatch.setattr(rag, "_CLAUDE_WEB_EXPORT_DIR", export_dir)
+    stats = rag._sync_claude_web_conversations(tmp_path)
+    assert stats == {"ok": False, "reason": "no_export_found"}
+
+
+def test_sync_claude_web_extracted_dir(tmp_path, monkeypatch):
+    """User unzipped the export — ETL should still parse it."""
+    export_dir = tmp_path / "export"
+    extracted = export_dir / "data-2026-05-10"
+    extracted.mkdir(parents=True)
+    import json as _json
+    (extracted / "conversations.json").write_text(_json.dumps([
+        {
+            "uuid": "11111111-2222-3333-4444-555555555555",
+            "name": "Mi conversación",
+            "created_at": "2026-05-10T12:00:00Z",
+            "updated_at": "2026-05-10T12:05:00Z",
+            "chat_messages": [
+                {"sender": "human", "text": "hola Claude", "created_at": "2026-05-10T12:00:00Z"},
+                {"sender": "assistant",
+                 "content": [{"type": "text", "text": "qué necesitás"}],
+                 "created_at": "2026-05-10T12:00:05Z"},
+            ],
+        },
+    ]), encoding="utf-8")
+    monkeypatch.setattr(rag, "_CLAUDE_WEB_EXPORT_DIR", export_dir)
+    stats = rag._sync_claude_web_conversations(tmp_path)
+    assert stats["ok"] is True
+    assert stats["files_written"] == 1
+    assert stats["conversations_seen"] == 1
+    # File should land under Claude-Web/ with slug-uuid8 name
+    written = list((tmp_path / "99-obsidian/99-AI/external-ingest/Claude-Web").glob("*.md"))
+    assert len(written) == 1
+    text = written[0].read_text(encoding="utf-8")
+    assert "hola Claude" in text and "qué necesitás" in text
+    assert "source: claude-web" in text
+    assert "conversation_uuid: 11111111-2222-3333-4444-555555555555" in text
+
+
+def test_sync_claude_web_zip(tmp_path, monkeypatch):
+    """Happy path: user dropped a fresh .zip — ETL reads conversations.json
+    from inside the archive without extracting it.
+    """
+    import json as _json
+    import zipfile as _zip
+    export_dir = tmp_path / "export"
+    export_dir.mkdir()
+    zip_path = export_dir / "data-2026-05-10-12-00-00.zip"
+    convs = _json.dumps([
+        {
+            "uuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "name": "Test ZIP",
+            "created_at": "2026-05-10T12:00:00Z",
+            "updated_at": "2026-05-10T12:05:00Z",
+            "chat_messages": [
+                {"sender": "human", "text": "via zip", "created_at": "2026-05-10T12:00:00Z"},
+                {"sender": "assistant", "text": "perfect", "created_at": "2026-05-10T12:00:05Z"},
+            ],
+        },
+    ])
+    with _zip.ZipFile(zip_path, "w") as zf:
+        zf.writestr("conversations.json", convs)
+        zf.writestr("users.json", "{}")
+    monkeypatch.setattr(rag, "_CLAUDE_WEB_EXPORT_DIR", export_dir)
+    stats = rag._sync_claude_web_conversations(tmp_path)
+    assert stats["files_written"] == 1
+    assert stats["source"] == "data-2026-05-10-12-00-00.zip"
+
+
+def test_sync_claude_web_hash_skip(tmp_path, monkeypatch):
+    """Re-running with identical export hash-skips writes."""
+    import json as _json
+    export_dir = tmp_path / "export"
+    extracted = export_dir / "data"
+    extracted.mkdir(parents=True)
+    (extracted / "conversations.json").write_text(_json.dumps([
+        {
+            "uuid": "ffffffff-1111-2222-3333-444444444444",
+            "name": "Re-run",
+            "created_at": "2026-05-10T12:00:00Z",
+            "updated_at": "2026-05-10T12:05:00Z",
+            "chat_messages": [
+                {"sender": "human", "text": "ping", "created_at": "2026-05-10T12:00:00Z"},
+            ],
+        },
+    ]), encoding="utf-8")
+    monkeypatch.setattr(rag, "_CLAUDE_WEB_EXPORT_DIR", export_dir)
+    rag._sync_claude_web_conversations(tmp_path)
+    stats2 = rag._sync_claude_web_conversations(tmp_path)
+    assert stats2["files_written"] == 0
+    assert stats2["skipped"] == 1
+
+
 def test_sync_youtube_transcripts_skips_existing(tmp_path, monkeypatch):
     yt_dir = tmp_path / "99-obsidian/99-AI/external-ingest/YouTube"
     yt_dir.mkdir(parents=True)

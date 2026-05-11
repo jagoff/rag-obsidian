@@ -9,6 +9,7 @@ Re-implementación in-supervisor de los daemons launchd nightly:
 | 03:25 daily      | implicit_feedback | com.fer.obsidian-rag-implicit-feedback |
 | 03:30 daily      | online_tune       | com.fer.obsidian-rag-online-tune       |
 | 04:00 daily      | maintenance       | com.fer.obsidian-rag-maintenance       |
+| 04:00 weekly Sun | drafts_finetune   | (nuevo 2026-05-11, cierra draft loop)  |
 | 04:30 weekly Sun | reranker_finetune | (nuevo 2026-05-10, ex feature dormida) |
 | 05:00 daily      | calibrate         | com.fer.obsidian-rag-calibrate         |
 
@@ -343,6 +344,128 @@ def reranker_finetune_job() -> dict[str, Any]:
             os.unlink(tmp_path)
         except OSError:
             pass
+
+
+@cron(
+    hour=4, minute=0, day_of_week=6,
+    label="drafts_finetune",
+    description="Weekly DPO+LoRA fine-tune del modelo de drafts WhatsApp si hay signal suficiente.",
+)
+def drafts_finetune_job() -> dict[str, Any]:
+    """DPO+LoRA fine-tune semanal del modelo de drafts (Qwen2.5-7B base).
+
+    Schedule: domingo 04:00 (antes del reranker 04:30 → eviten chocar
+    GPU/CPU). Cierra el loop del bot WA: ``rag_draft_decisions`` ya
+    captura ``/si /no /editar`` reales del user; este job aprende sobre
+    esos pares de preferencia y deja un adapter LoRA que el endpoint
+    ``/api/draft/preview`` carga cuando ``RAG_DRAFTS_FT=1``.
+
+    Pipeline:
+      1. Augmenta dataset via ``scripts/augment_drafts_dataset.py`` —
+         inserta pares synthetic `(corporate_template_draft, sent_text)`
+         desde outgoing reales del bridge SQLite. Solo agrega nuevos
+         (idempotente vía `draft_id=synthetic-{wa_msg_id}` UNIQUE),
+         existing rows skip. Si el bridge no está disponible → noop.
+      2. Cuenta pares con preference completo (``approved_editar`` con
+         ``sent_text`` + synthetic). Si < ``RAG_DRAFTS_FINETUNE_MIN_PAIRS``
+         (default 100, según el script real) → exit 0 silent.
+      3. Si ≥ threshold → corre ``scripts/finetune_drafts.py --epochs 1``
+         con DPO. Adapter cae en ``~/.local/share/obsidian-rag/drafts_ft/``.
+      4. Activación opt-in via env ``RAG_DRAFTS_FT=1`` (el endpoint
+         ``/api/draft/preview`` lo lee). Default OFF — el user habilita
+         a mano post-validation A/B.
+
+    Gate por env ``RAG_AUTO_FINETUNE_DRAFTS`` (default ``1``, opt-out
+    via ``=0``). Razón: si el job falla por dependencia faltante
+    (``peft`` / ``trl``) o disco, NO queremos spammear daemon
+    failures cada domingo — el operador puede silenciar con un env
+    var en el plist del supervisor sin tocar código.
+
+    Silent-fail policy igual al resto: exit_code≠0 queda en
+    ``rag_supervisor_jobs.signals`` para ``rag daemons status``;
+    no interrumpe otros jobs.
+    """
+    import os  # noqa: PLC0415
+
+    if os.environ.get("RAG_AUTO_FINETUNE_DRAFTS", "1") != "1":
+        return {"exit_code": 0, "phase": "gated_off"}
+
+    repo_root = Path(__file__).resolve().parent.parent.parent.parent
+    py_bin = str(repo_root / ".venv" / "bin" / "python")
+    augment_script = str(repo_root / "scripts" / "augment_drafts_dataset.py")
+    finetune_script = str(repo_root / "scripts" / "finetune_drafts.py")
+    min_pairs = int(os.environ.get("RAG_DRAFTS_FINETUNE_MIN_PAIRS", "100"))
+
+    # ── 1. Augment (best-effort) ─────────────────────────────────────
+    if Path(augment_script).is_file():
+        augment = _run_subprocess(
+            [py_bin, augment_script],
+            extra_env={"NO_COLOR": "1", "TERM": "dumb"},
+            timeout=300,
+        )
+        augment_exit = augment["exit_code"]
+        augment_stderr = augment.get("last_stderr")
+    else:
+        augment_exit = -1  # script missing → siguen los demás pasos
+        augment_stderr = "augment_script_missing"
+
+    # ── 2. Count preference pairs ────────────────────────────────────
+    n_pairs = 0
+    try:
+        from rag import _ragvec_state_conn  # noqa: PLC0415
+        with _ragvec_state_conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM rag_draft_decisions WHERE "
+                "decision IN ('approved_editar') AND sent_text IS NOT NULL "
+                "AND length(sent_text) >= 10"
+            ).fetchone()
+            n_pairs = int(row[0] or 0) if row else 0
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("drafts_finetune: count failed: %s", exc)
+        return {
+            "exit_code": 1,
+            "phase": "count_failed",
+            "last_stderr": str(exc)[:200],
+            "augment_exit": augment_exit,
+            "augment_stderr": augment_stderr,
+        }
+
+    if n_pairs < min_pairs:
+        logger.info(
+            "drafts_finetune: skip — n_pairs=%d < min_pairs=%d (próximo domingo retry)",
+            n_pairs, min_pairs,
+        )
+        return {
+            "exit_code": 0,
+            "phase": "skip_insufficient_signal",
+            "n_pairs": n_pairs,
+            "min_pairs": min_pairs,
+            "augment_exit": augment_exit,
+        }
+
+    # ── 3. Fine-tune ─────────────────────────────────────────────────
+    if not Path(finetune_script).is_file():
+        return {
+            "exit_code": 1, "phase": "finetune_script_missing",
+            "n_pairs": n_pairs,
+        }
+    train = _run_subprocess(
+        [py_bin, finetune_script, "--epochs", "1"],
+        extra_env={
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+        },
+        timeout=2700,
+    )
+    return {
+        "exit_code": train["exit_code"],
+        "phase": "trained" if train["exit_code"] == 0 else "train_failed",
+        "n_pairs": n_pairs,
+        "augment_exit": augment_exit,
+        "last_stderr": train.get("last_stderr"),
+    }
 
 
 @cron(

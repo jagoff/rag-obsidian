@@ -10602,11 +10602,17 @@ def _home_compute(
         # gmail API, 0.05s wa SQLite, 2s icalBuddy, 0.1s yt sqlite) ≈
         # 5s. Silent-fail por fetcher: si gmail falla el resto sigue.
         from concurrent.futures import ThreadPoolExecutor as _TPE
-        with _TPE(max_workers=4, thread_name_prefix="today-extras") as _t_pool:
+        from rag import _fetch_chrome_today_domains, _fetch_screentime_today
+        with _TPE(max_workers=6, thread_name_prefix="today-extras") as _t_pool:
             fut_gmail_today = _t_pool.submit(_fetch_gmail_today, now, 8)
             fut_wa_today    = _t_pool.submit(_fetch_whatsapp_today, now, 8)
             fut_cal_today   = _t_pool.submit(_fetch_calendar_today, 15)
             fut_yt_today    = _t_pool.submit(_fetch_youtube_today, now, 5)
+            # Energy-aware extras (2026-05-11): screentime + chrome
+            # browsing de HOY. Silent-fail si Chrome locked / screentime
+            # db rotada.
+            fut_screentime  = _t_pool.submit(_fetch_screentime_today, now, 5)
+            fut_chrome_today= _t_pool.submit(_fetch_chrome_today_domains, now, 8)
             try:
                 gmail_today = fut_gmail_today.result(timeout=10) or []
             except Exception:
@@ -10623,6 +10629,14 @@ def _home_compute(
                 yt_today = fut_yt_today.result(timeout=5) or []
             except Exception:
                 yt_today = []
+            try:
+                screentime_today = fut_screentime.result(timeout=5)
+            except Exception:
+                screentime_today = None
+            try:
+                chrome_today = fut_chrome_today.result(timeout=5) or []
+            except Exception:
+                chrome_today = []
         # Cross-source extras precisos para el LLM — pisamos los aliases
         # "lite" con los TODAY-strict que acabamos de fetchear (00:00→now
         # cut), y dedupeamos YouTube. El correlator ya corrió arriba con
@@ -10641,6 +10655,8 @@ def _home_compute(
             "calendar_today": cal_today,
             "youtube_today": yt_today,
             "youtube_recent": yt_recent,
+            "screentime_today": screentime_today,
+            "chrome_today": chrome_today,
         }
         from rag.today_correlator import correlate_today_signals as _corr
         try:

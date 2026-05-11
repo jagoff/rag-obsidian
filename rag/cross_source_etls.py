@@ -120,6 +120,16 @@ __all__ = [
     "_redact_secrets",
     "_claude_extract_turn",
     "_sync_claude_code_transcripts",
+    # Claude.ai web conversations
+    "_CLAUDE_WEB_EXPORT_DIR",
+    "_CLAUDE_WEB_INDEX_WINDOW_DAYS",
+    "_CLAUDE_WEB_TURN_BODY_CAP",
+    "_CLAUDE_WEB_VAULT_SUBPATH",
+    "_claude_web_extract_turn",
+    "_claude_web_slug",
+    "_claude_web_pick_export",
+    "_claude_web_load_conversations",
+    "_sync_claude_web_conversations",
     # YouTube transcripts
     "_YT_TRANSCRIPT_LANG_PRIORITY",
     "_YT_TRANSCRIPT_BATCH",
@@ -324,6 +334,22 @@ from rag.integrations.claude_code import (  # noqa: F401, E402
     _claude_extract_turn,
     _redact_secrets,
     _sync_claude_code_transcripts,
+)
+
+# ── Claude.ai web conversations (re-export) ──────────────────────────────────
+# Lives en `rag/integrations/claude_web.py` (2026-05-11). Re-exportado para
+# preservar `from rag.cross_source_etls import _sync_claude_web_conversations`
+# y los monkeypatches en tests (`tests/test_external_etls.py`).
+from rag.integrations.claude_web import (  # noqa: F401, E402
+    _CLAUDE_WEB_EXPORT_DIR,
+    _CLAUDE_WEB_INDEX_WINDOW_DAYS,
+    _CLAUDE_WEB_TURN_BODY_CAP,
+    _CLAUDE_WEB_VAULT_SUBPATH,
+    _claude_web_extract_turn,
+    _claude_web_load_conversations,
+    _claude_web_pick_export,
+    _claude_web_slug,
+    _sync_claude_web_conversations,
 )
 
 # ── GitHub activity (re-export) ───────────────────────────────────────────────

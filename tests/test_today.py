@@ -361,6 +361,70 @@ def test_render_today_prompt_includes_calendar_tomorrow():
     assert "10:00" in prompt
 
 
+def test_render_today_prompt_includes_screentime_today():
+    """screentime_today renderiza apps + total + categorías + guardrail
+    anti-moralización. Skipea si no hay top_apps.
+    """
+    extras = {
+        "screentime_today": {
+            "available": True,
+            "total_secs": 14400,  # 4h
+            "top_apps": [
+                {"bundle": "com.anthropic.claudefordesktop",
+                 "label": "Claude", "secs": 7200},
+                {"bundle": "md.obsidian", "label": "Obsidian", "secs": 3600},
+            ],
+            "categories": {"code": 7200, "notas": 3600, "browser": 1800},
+        },
+    }
+    prompt = rag._render_today_prompt("2026-05-11", _ev_minimal(), extras=extras)
+    assert "🖥 Screentime" in prompt
+    assert "Claude · 2h" in prompt
+    assert "Obsidian · 1h" in prompt
+    assert "PROHIBIDO moralizar" in prompt
+
+
+def test_render_today_prompt_skips_screentime_when_empty():
+    """top_apps vacío o screentime_today None → no section rendered."""
+    prompt_none = rag._render_today_prompt(
+        "2026-05-11", _ev_minimal(), extras={"screentime_today": None}
+    )
+    assert "🖥 Screentime" not in prompt_none
+    prompt_empty = rag._render_today_prompt(
+        "2026-05-11", _ev_minimal(),
+        extras={"screentime_today": {"available": True, "total_secs": 0, "top_apps": []}},
+    )
+    assert "🖥 Screentime" not in prompt_empty
+
+
+def test_render_today_prompt_includes_chrome_today_domains():
+    """chrome_today (URLs visitados HOY agrupados por dominio) renderiza
+    con domain + visits + sample title, y guardrail anti-invención de links.
+    """
+    extras = {
+        "chrome_today": [
+            {"domain": "fastapi.tiangolo.com", "visits": 12,
+             "sample_title": "FastAPI docs",
+             "sample_url": "https://fastapi.tiangolo.com/"},
+            {"domain": "github.com", "visits": 5,
+             "sample_title": "claude-flow",
+             "sample_url": "https://github.com/x/y"},
+        ],
+    }
+    prompt = rag._render_today_prompt("2026-05-11", _ev_minimal(), extras=extras)
+    assert "🌐 Chrome — webs visitadas HOY" in prompt
+    assert "**fastapi.tiangolo.com** (12 visits)" in prompt
+    assert "**github.com** (5 visits)" in prompt
+    assert "Nunca inventes el link" in prompt
+
+
+def test_render_today_prompt_skips_chrome_today_when_empty():
+    prompt = rag._render_today_prompt(
+        "2026-05-11", _ev_minimal(), extras={"chrome_today": []}
+    )
+    assert "🌐 Chrome — webs visitadas HOY" not in prompt
+
+
 def test_render_today_prompt_includes_youtube_drive_bookmarks():
     extras = {
         "youtube_watched": [

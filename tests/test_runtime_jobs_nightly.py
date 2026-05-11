@@ -44,6 +44,10 @@ def test_six_jobs_registered():
         "online_tune",
         "maintenance",
         "calibrate",
+        # 2026-05-10: weekly reranker LoRA fine-tune (Sun 04:30).
+        "reranker_finetune",
+        # 2026-05-11: weekly drafts DPO+LoRA fine-tune (Sun 04:00).
+        "drafts_finetune",
     }
     actual = set(sched.jobs())
     assert expected.issubset(actual), (
@@ -61,6 +65,8 @@ def test_schedules_match_plists():
         "implicit_feedback": {"hour": 3, "minute": 25},
         "online_tune": {"hour": 3, "minute": 30},
         "maintenance": {"hour": 4, "minute": 0},
+        "drafts_finetune": {"hour": 4, "minute": 0, "day_of_week": 6},
+        "reranker_finetune": {"hour": 4, "minute": 30, "day_of_week": 6},
         "calibrate": {"hour": 5, "minute": 0},
     }
     for label, expected_args in expected_schedules.items():
@@ -183,3 +189,92 @@ def test_online_tune_uses_extended_timeout(monkeypatch):
     assert captured["timeout"] == 2700
     assert "tune" in captured["args"]
     assert "--online" in captured["args"]
+
+
+def test_drafts_finetune_gated_off(monkeypatch):
+    """RAG_AUTO_FINETUNE_DRAFTS=0 → exit_code 0 sin tocar nada."""
+    mod = _import_nightly()
+    monkeypatch.setenv("RAG_AUTO_FINETUNE_DRAFTS", "0")
+    # Si llamara subprocess o SQL, este fake explotaría.
+    monkeypatch.setattr(
+        mod, "_run_subprocess",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("no debería ejecutarse")),
+    )
+    result = mod.drafts_finetune_job()
+    assert result["exit_code"] == 0
+    assert result["phase"] == "gated_off"
+
+
+def test_drafts_finetune_skip_insufficient_signal(monkeypatch):
+    """N pares < threshold → skip silent."""
+    mod = _import_nightly()
+    monkeypatch.setenv("RAG_AUTO_FINETUNE_DRAFTS", "1")
+    monkeypatch.setenv("RAG_DRAFTS_FINETUNE_MIN_PAIRS", "100")
+
+    # Fake augment OK + count = 3.
+    monkeypatch.setattr(
+        mod, "_run_subprocess",
+        lambda *a, **kw: {"exit_code": 0, "stdout_lines": 0, "stderr_lines": 0,
+                          "last_stderr": None},
+    )
+    # Fake SQL count → 3 rows.
+    import contextlib
+
+    class _FakeConn:
+        def execute(self, *a, **kw):
+            class _Cursor:
+                def fetchone(self_inner):
+                    return (3,)
+            return _Cursor()
+
+    @contextlib.contextmanager
+    def _fake_state_conn():
+        yield _FakeConn()
+
+    import rag
+    monkeypatch.setattr(rag, "_ragvec_state_conn", _fake_state_conn)
+    result = mod.drafts_finetune_job()
+    assert result["exit_code"] == 0
+    assert result["phase"] == "skip_insufficient_signal"
+    assert result["n_pairs"] == 3
+    assert result["min_pairs"] == 100
+
+
+def test_drafts_finetune_triggers_when_enough(monkeypatch):
+    """N pares ≥ threshold → augment + finetune subprocess corren."""
+    mod = _import_nightly()
+    monkeypatch.setenv("RAG_AUTO_FINETUNE_DRAFTS", "1")
+    monkeypatch.setenv("RAG_DRAFTS_FINETUNE_MIN_PAIRS", "10")
+
+    calls: list[list[str]] = []
+
+    def _fake_run(args, *, timeout=None, extra_env=None):
+        calls.append(args)
+        return {"exit_code": 0, "stdout_lines": 5, "stderr_lines": 0,
+                "last_stderr": None}
+
+    monkeypatch.setattr(mod, "_run_subprocess", _fake_run)
+
+    import contextlib
+
+    class _FakeConn:
+        def execute(self, *a, **kw):
+            class _Cursor:
+                def fetchone(self_inner):
+                    return (42,)
+            return _Cursor()
+
+    @contextlib.contextmanager
+    def _fake_state_conn():
+        yield _FakeConn()
+
+    import rag
+    monkeypatch.setattr(rag, "_ragvec_state_conn", _fake_state_conn)
+    result = mod.drafts_finetune_job()
+    assert result["exit_code"] == 0
+    assert result["phase"] == "trained"
+    assert result["n_pairs"] == 42
+    # augment + finetune corren (en ese orden).
+    assert len(calls) == 2
+    assert any("augment_drafts_dataset.py" in arg for arg in calls[0])
+    assert any("finetune_drafts.py" in arg for arg in calls[1])

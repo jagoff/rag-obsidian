@@ -264,3 +264,119 @@ def _fetch_youtube_today(now: datetime, n: int = 5) -> list[dict]:
         if len(out) >= n:
             break
     return out
+
+
+def _fetch_chrome_today_domains(now: datetime, top_n: int = 8) -> list[dict]:
+    """URLs visitados HOY (00:00 → now) agrupados por dominio. Una sola
+    fila por dominio con su top title como sample, para el evening brief.
+
+    Reusa la lectura snapshotted-to-/tmp de Chrome History — Chrome
+    bloquea el DB mientras está abierto. Filtra los mismos prefixes /
+    SERPs que `_read_chrome_visits` (chrome://, google.com/search, etc.)
+    via re-uso de `_CHROME_SKIP_PREFIXES` + `_CHROME_SKIP_PATTERNS`.
+
+    Returns list of `{domain, visits, sample_title, sample_url}` ordered
+    por visits DESC. Empty list cuando no hay browsing hoy o Chrome
+    locked / no instalado.
+    """
+    from urllib.parse import urlparse
+
+    src = Path.home() / "Library/Application Support/Google/Chrome/Default/History"
+    if not src.is_file():
+        return []
+
+    # Local epoch offset (igual que `_fetch_youtube_today` arriba — evita
+    # tocar el import de `rag` durante boot del package).
+    CHROME_EPOCH_OFFSET = 11_644_473_600
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    window_start_chrome = int(
+        (today_start.timestamp() + CHROME_EPOCH_OFFSET) * 1_000_000
+    )
+
+    # Lazy-import skip lists del módulo chrome_history para mantener
+    # paridad con `_read_chrome_visits` sin duplicar las regex.
+    try:
+        from rag.integrations.chrome_history import (
+            _CHROME_SKIP_PREFIXES,
+            _CHROME_SKIP_PATTERNS,
+        )
+    except Exception:
+        _CHROME_SKIP_PREFIXES = ("chrome://", "chrome-extension://", "about:", "data:")
+        _CHROME_SKIP_PATTERNS = ()
+
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=True) as tmp:
+        try:
+            shutil.copyfile(src, tmp.name)
+        except OSError as exc:
+            try:
+                from rag import _silent_log
+                _silent_log("chrome_today_copy_failed", exc)
+            except Exception:
+                pass
+            return []
+        try:
+            conn = sqlite3.connect(f"file:{tmp.name}?mode=ro", uri=True)
+        except sqlite3.Error as exc:
+            try:
+                from rag import _silent_log
+                _silent_log("chrome_today_connect_failed", exc)
+            except Exception:
+                pass
+            return []
+        try:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT u.url AS url, u.title AS title,
+                       COUNT(v.id) AS visit_count
+                FROM urls u
+                JOIN visits v ON v.url = u.id
+                WHERE v.visit_time >= ?
+                GROUP BY u.url
+                ORDER BY visit_count DESC
+                LIMIT 200
+                """,
+                (window_start_chrome,),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            try:
+                from rag import _silent_log
+                _silent_log("chrome_today_query_failed", exc)
+            except Exception:
+                pass
+            return []
+        finally:
+            conn.close()
+
+    by_domain: dict[str, dict] = {}
+    for r in rows:
+        url = (r["url"] or "").strip()
+        if not url:
+            continue
+        if any(url.startswith(p) for p in _CHROME_SKIP_PREFIXES):
+            continue
+        if any(p.match(url) for p in _CHROME_SKIP_PATTERNS):
+            continue
+        try:
+            host = urlparse(url).netloc.lower()
+            if host.startswith("www."):
+                host = host[4:]
+        except Exception:
+            continue
+        if not host:
+            continue
+        bucket = by_domain.get(host)
+        title = (r["title"] or "").strip() or url
+        visits = int(r["visit_count"] or 0)
+        if bucket is None:
+            by_domain[host] = {
+                "domain": host,
+                "visits": visits,
+                "sample_title": title,
+                "sample_url": url,
+            }
+        else:
+            bucket["visits"] += visits
+            # Keep the first (most-visited) title as sample.
+    ranked = sorted(by_domain.values(), key=lambda d: d["visits"], reverse=True)
+    return ranked[:top_n]

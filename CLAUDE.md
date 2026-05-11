@@ -465,5 +465,6 @@ Default: `~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes`. Overri
 - Listener TS: [`/Users/fer/repos/whatsapp-listener`](file:///Users/fer/repos/whatsapp-listener)
 - WhatsApp bridge: `~/repos/whatsapp-mcp/whatsapp-bridge/store/messages.db`
 - Cloudflared URL: `~/.local/share/obsidian-rag/cloudflared-url.txt`
+- Claude.ai web export: `~/.claude-ai-export/` (drop ZIP de [Settings → Privacy → Export account data](https://claude.ai/settings/data-privacy-controls); el ETL [`_sync_claude_web_conversations`](rag/integrations/claude_web.py) corre en cada `rag index` y materializa cada conversación bajo `99-obsidian/99-AI/external-ingest/Claude-Web/`).
 - Auditoría salud sistema: `python scripts/audit_telemetry_health.py --days 7 --json`
 - Eval baselines + perf history detallada: git log

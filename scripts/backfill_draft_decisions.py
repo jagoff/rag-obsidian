@@ -3,12 +3,16 @@
 
 Contexto (2026-05-10):
   El listener TS llama POST `/api/draft/decision` cada vez que el user
-  hace `/si /no /editar` o el draft expira. Eso persiste en la tabla
-  SQL `rag_draft_decisions` (telemetry.db). Pero el endpoint y/o el
-  helper Python `_record_draft_decision` empezaron a estar disponibles
-  bastante después de que el listener arrancara — el JSONL local
-  `draft.jsonl` tiene 13 días de eventos (2026-04-27 → 2026-05-10),
-  mientras que la tabla SQL tiene solo rows de 2026-05-10.
+  decide sobre un draft (approve / reject / edit) o el draft expira.
+  Hasta 2026-05-10 (later) el path era `/si /no /editar` standalone;
+  desde entonces es reply-by-quote al draft posteado en RagNet (mismas
+  decisions persistidas: `approved_si`, `approved_editar`, `rejected`,
+  `expired`). Eso persiste en la tabla SQL `rag_draft_decisions`
+  (telemetry.db). Pero el endpoint y/o el helper Python
+  `_record_draft_decision` empezaron a estar disponibles bastante
+  después de que el listener arrancara — el JSONL local `draft.jsonl`
+  tiene 13 días de eventos (2026-04-27 → 2026-05-10), mientras que la
+  tabla SQL tiene solo rows de 2026-05-10.
 
 Resultado: 30+ pares de preference (approved_editar, rejected,
 expired) no se contabilizan para el path de fine-tune (DPO necesita

@@ -249,6 +249,32 @@ def _render_screentime_section(st: dict) -> str:
     return "\n".join(lines)
 
 
+def _fetch_screentime_today(now: datetime, top_n: int = 5) -> dict | None:
+    """Today 00:00 → now bucket de screentime para el evening brief.
+
+    Returns the same shape as ``_collect_screentime`` con un slice de los
+    top N apps + categorías. Returns ``None`` cuando la DB no está
+    disponible o el día acumula < 5 min (Mac dormido / no usado) — el
+    prompt builder skipea el bucket en ese caso.
+
+    Solo data factual ("Claude.app 4h, Ghostty 2h") — NO infiere mood ni
+    fatiga. El render del prompt es responsable de no moralizar.
+    """
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    st = _collect_screentime(start, now)
+    if not st.get("available"):
+        return None
+    total = int(st.get("total_secs") or 0)
+    if total < 300:
+        return None
+    return {
+        "available": True,
+        "total_secs": total,
+        "top_apps": (st.get("top_apps") or [])[:top_n],
+        "categories": st.get("categories") or {},
+    }
+
+
 # ── Screen Time persistence (daily + monthly) ─────────────────────────────────
 # ETL writers — extraídos de `rag/cross_source_etls.py` (2026-05-09). Mantienen
 # el contrato de "silent fail + hash-skip + write only if changed" del resto

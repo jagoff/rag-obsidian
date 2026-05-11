@@ -22854,6 +22854,11 @@ def _format_etl_detail(kind: str, stats: dict) -> str:
         return f"{stats.get('events', 0)} eventos · {stats.get('open_prs', 0)} open PRs"
     if kind == "claude":
         return f"{stats.get('sessions_seen', 0)} sesiones (30d)"
+    if kind == "claude-web":
+        return (
+            f"{stats.get('conversations_seen', 0)} convs · "
+            f"src={stats.get('source', '?')}"
+        )
     if kind == "yt-trans":
         return (
             f"{stats.get('fetched_this_run', 0)} fetched · "
@@ -22883,6 +22888,7 @@ _ETL_QUIET_REASONS = frozenset({
     "no_visits_or_chrome_locked", "no_data", "no_events",
     "no_messages", "no_docs", "no_google_credentials",
     "no_videos", "no_recent_sessions", "no_claude_projects_dir",
+    "no_claude_web_export_dir", "no_export_found", "export_unreadable",
     "gh_unavailable_or_unauth", "gh_no_login", "no_activity",
     "no_spotify_credentials", "no_spotify_token",
 })
@@ -22991,6 +22997,10 @@ def _run_cross_source_etls(vault_path: Path) -> None:
         # la quiere reactivar manualmente; el hook se eliminó acá.
         ("GitHub",     _sync_github_activity,        "github"),
         ("Claude",     _sync_claude_code_transcripts,"claude"),
+        # Claude.ai web — parsea ZIP que el user dropea en
+        # ~/.claude-ai-export/ (Settings → Privacy → Export account data).
+        # Silent-fail si la carpeta no existe o no hay export aún.
+        ("Claude-Web", _sync_claude_web_conversations,"claude-web"),
         ("YT trans.",  _sync_youtube_transcripts,    "yt-trans"),
         ("Spotify",    _sync_spotify_notes,          "spotify"),
         # Screen Time — persist macOS knowledgeC.db (foreground app usage)
@@ -41412,6 +41422,7 @@ def _render_today_prompt(
         extras.get(k) for k in (
             # TODAY-only buckets (corte 00:00 local)
             "gmail_today", "whatsapp_today", "calendar_today", "youtube_today",
+            "screentime_today", "chrome_today",
             # Rolling windows / stale buckets
             "gmail_unread", "whatsapp_unreplied", "tomorrow_calendar",
             "drive_recent", "youtube_watched", "youtube_recent",
@@ -41877,6 +41888,62 @@ def _render_today_prompt(
             folder = b.get("folder") or ""
             tail = f" [{folder}]" if folder else ""
             parts.append(f"- {name}{tail}")
+        parts.append("")
+    # ── SCREENTIME HOY — apps en foreground (macOS Screen Time DB).
+    # Solo data factual ("Claude.app 4h, Ghostty 2h"). El LLM NO debe
+    # moralizar ni inferir mood — esa interpretación queda para la
+    # regla #8 con datos de pillow + cross-patterns. Esto es solo
+    # "dónde se fue el tiempo".
+    st_today = extras.get("screentime_today")
+    if st_today and st_today.get("top_apps"):
+        st_total = int(st_today.get("total_secs") or 0)
+        st_hm = _fmt_hm(st_total) if st_total else "0min"
+        parts.append(
+            f"## 🖥 Screentime — apps en foreground HOY ({st_hm} activo):"
+        )
+        for app in st_today["top_apps"][:5]:
+            label = app.get("label") or app.get("bundle") or "?"
+            secs = int(app.get("secs") or 0)
+            parts.append(f"- {label} · {_fmt_hm(secs)}")
+        cats = st_today.get("categories") or {}
+        if cats:
+            order = ["code", "notas", "comms", "browser", "media", "otros"]
+            cat_bits = [
+                f"{k} {_fmt_hm(cats[k])}" for k in order
+                if cats.get(k, 0) >= 60
+            ]
+            if cat_bits:
+                parts.append(f"- por categoría: {' · '.join(cat_bits)}")
+        parts.append(
+            "(Mencionalo SOLO si encaja con la narrativa — ej. si "
+            "dominaste un proyecto en una herramienta específica. "
+            "PROHIBIDO moralizar 'usaste demasiado X', 'tenés que "
+            "desconectarte', 'descansá de la pantalla'. Es data hard, "
+            "no consejo terapéutico.)"
+        )
+        parts.append("")
+    # ── CHROME HOY — webs visitadas (dominio + ejemplo). Distinto a
+    # Chrome bookmarks (high-intent reads, rolling) — esto es ambient
+    # browsing del día. El LLM puede conectar "investigaste X" con
+    # notas tocadas o queries low-conf que tocan el mismo tema.
+    ch_today = extras.get("chrome_today") or []
+    if ch_today:
+        parts.append(
+            f"## 🌐 Chrome — webs visitadas HOY (top {len(ch_today[:8])} dominios):"
+        )
+        for d in ch_today[:8]:
+            domain = d.get("domain") or "?"
+            visits = d.get("visits") or 0
+            sample = (d.get("sample_title") or "")[:70]
+            sample_part = f" — ej. \"{sample}\"" if sample and sample != domain else ""
+            parts.append(f"- **{domain}** ({visits} visits){sample_part}")
+        parts.append(
+            "(Si una nota tocada hoy o una query low-conf TOCA el "
+            "mismo tema que un dominio acá, mencionalo como observación "
+            "factual: 'mientras escribías sobre X, navegaste Y'. "
+            "Nunca inventes el link si no es obvio. NO listar como "
+            "lista cruda — incorporar al recap si aporta.)"
+        )
         parts.append("")
     loops_stale = extras.get("loops_stale") or []
     if loops_stale:
@@ -43153,12 +43220,18 @@ def _build_today_extras_for_cli(target: datetime) -> dict:
     """
     from concurrent.futures import ThreadPoolExecutor
 
-    with ThreadPoolExecutor(max_workers=5, thread_name_prefix="cli-today") as pool:
+    with ThreadPoolExecutor(max_workers=7, thread_name_prefix="cli-today") as pool:
         fut_gmail = pool.submit(_fetch_gmail_today, target, 8)
         fut_wa = pool.submit(_fetch_whatsapp_today, target, 8)
         fut_cal_today = pool.submit(_fetch_calendar_today, 15)
         fut_yt_today = pool.submit(_fetch_youtube_today, target, 5)
         fut_cal_tomorrow = pool.submit(_fetch_calendar_ahead, 1, 10)
+        # Energy-aware extras (2026-05-11): screentime + chrome browsing
+        # de HOY. Permiten que el prompt mencione factualmente dónde se
+        # fue el día ("usaste Claude.app 4h, navegaste mucho fastapi.tiangolo.com")
+        # sin moralizar. Silent-fail por fetcher.
+        fut_screentime = pool.submit(_fetch_screentime_today, target, 5)
+        fut_chrome_today = pool.submit(_fetch_chrome_today_domains, target, 8)
 
         def _safe(fut, default, timeout: float):
             try:
@@ -43171,6 +43244,8 @@ def _build_today_extras_for_cli(target: datetime) -> dict:
         cal_today = _safe(fut_cal_today, [], 10.0)
         yt_today = _safe(fut_yt_today, [], 5.0)
         cal_tomorrow = _safe(fut_cal_tomorrow, [], 10.0)
+        screentime_today = _safe(fut_screentime, None, 5.0)
+        chrome_today = _safe(fut_chrome_today, [], 5.0)
 
     extras: dict = {
         "gmail_today": gmail_today,
@@ -43178,6 +43253,8 @@ def _build_today_extras_for_cli(target: datetime) -> dict:
         "calendar_today": cal_today,
         "youtube_today": yt_today,
         "tomorrow_calendar": cal_tomorrow,
+        "screentime_today": screentime_today,
+        "chrome_today": chrome_today,
     }
     # Pre-correlate cross-source antes de pasar al LLM. Misma lógica que
     # el web — el LLM 7B no descubre patrones cross-source flat, los
@@ -52510,6 +52587,7 @@ from rag.integrations.chrome_bookmarks import (  # noqa: E402, F401
     _chrome_bookmarks_root,
     _chrome_to_unix_ts,
     _fetch_chrome_bookmarks_used,
+    _fetch_chrome_today_domains,
     _fetch_youtube_today,
 )
 from rag.integrations.drive import (  # noqa: E402, F401
@@ -52542,6 +52620,7 @@ from rag.integrations.screentime import (  # noqa: E402, F401
     _SCREENTIME_CATEGORIES,
     _SCREENTIME_COCOA_OFFSET,
     _collect_screentime,
+    _fetch_screentime_today,
     _render_screentime_section,
     _screentime_app_label,
     _screentime_category,

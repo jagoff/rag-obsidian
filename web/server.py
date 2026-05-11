@@ -21486,10 +21486,12 @@ def learning_api(days: int = 30) -> dict:
     independiente — un SQL error en una NO contamina las otras (las
     funciones de `web.learning_queries` envuelven sus reads con
     `_sql_read_with_retry` y devuelven shape vacío en error)."""
-    now_ts = time.time()
-    cached, fresh = _LEARNING_CACHE.get(days, now_ts)
-    if fresh and cached is not None:
-        return cached
+    cached = _LEARNING_CACHE.get(days)
+    if cached is not None:
+        # `ThreadSafeCacheMultiKey.get` retorna (ts, payload). Sin unpack,
+        # FastAPI levanta ResponseValidationError (espera dict, no tuple).
+        _, payload = cached
+        return payload
     # Lazy import: módulo nuevo, no queremos cargarlo al import-time del
     # servidor si nadie pide /learning. Después del primer hit
     # queda cacheado por el import system; las llamadas subsiguientes son
@@ -21534,7 +21536,7 @@ def learning_api(days: int = 30) -> dict:
             "vault_intelligence": vault_intelligence(days),
         },
     }
-    _LEARNING_CACHE.set(days, payload, now_ts)
+    _LEARNING_CACHE.put(days, payload)
     return payload
 
 

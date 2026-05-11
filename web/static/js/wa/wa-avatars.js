@@ -46,7 +46,10 @@ export function renderInto(el, jid, initials, chatName) {
 
   const img = new Image();
   img.alt = "";
-  img.loading = "lazy";
+  // NO setear `loading="lazy"` acá: cuando un <img> está OFF-DOM con
+  // lazy, el browser nunca dispara el request (verificado en Chrome
+  // 2026-05-11 — el load event no firea hasta que se appende, pero
+  // el código depende del onload PARA appenderlo → deadlock).
   img.decoding = "async";
   img.referrerPolicy = "no-referrer";
   img.style.width = "100%";

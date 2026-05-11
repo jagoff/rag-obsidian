@@ -2,7 +2,7 @@
 // Click → notifica al entry point para abrir el thread correspondiente.
 
 import { fetchChats } from "./wa-api.js";
-import { colorFor } from "./wa-avatars.js";
+import { colorFor, renderInto as renderAvatar } from "./wa-avatars.js";
 
 const els = {
   list: null,
@@ -75,11 +75,8 @@ function render() {
     if (c.jid === activeJID) li.classList.add("active");
     li.addEventListener("click", () => selectChat(c.jid));
 
-    const avatarColor = colorFor(c.jid);
     li.innerHTML = `
-      <div class="wa-chat-avatar" style="background:${avatarColor}">
-        <span>${escapeHtml(c.avatar_initials || "?")}</span>
-      </div>
+      <div class="wa-chat-avatar" data-jid="${escapeHtml(c.jid)}"></div>
       <div class="wa-chat-body">
         <div class="wa-chat-name-row">
           <div class="wa-chat-name">${escapeHtml(c.label)}</div>
@@ -91,6 +88,8 @@ function render() {
         </div>
       </div>
     `;
+    const avatarEl = li.querySelector(".wa-chat-avatar");
+    renderAvatar(avatarEl, c.jid, c.avatar_initials, c.label);
     els.list.appendChild(li);
   }
 }

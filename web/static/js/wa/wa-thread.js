@@ -70,7 +70,7 @@ export async function open(jid) {
   // Header
   if (els.header.name) els.header.name.textContent = data.label || jid;
   if (els.header.avatar) {
-    renderAvatar(els.header.avatar, jid, initialsFromLabel(data.label || ""));
+    renderAvatar(els.header.avatar, jid, initialsFromLabel(data.label || ""), data.label);
   }
   if (els.header.presence) els.header.presence.textContent = "";
 

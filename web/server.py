@@ -4240,6 +4240,36 @@ class _WATypingRequest(BaseModel):
     state: str  # "composing" | "paused" | "recording"
 
 
+@app.get("/api/wa/avatar/{jid}")
+def wa_avatar(jid: str, name: str | None = None) -> FileResponse:
+    """Devuelve la foto del contacto extraída de Apple Contacts.app.
+
+    Fuente preferida sobre el bridge `/api/avatar` (whatsmeow): las
+    fotos de Apple Contacts son las que el user puso, no las que WA
+    sirve públicamente, y NO requieren round-trip al bridge.
+
+    `name` opcional: cuando el JID es `*@lid` (Linked Identifier sin
+    número), el caller puede pasar `chat_name` del bridge para
+    matchear por nombre en Contacts. La UI del sidebar/thread tiene
+    ese dato readily.
+
+    404 si el contacto no tiene foto en Contacts o no existe — el
+    frontend cae al fallback de iniciales.
+    """
+    from rag.integrations.whatsapp import avatars as _wa_avatars  # noqa: PLC0415
+
+    if not jid or "@" not in jid:
+        raise HTTPException(status_code=400, detail="jid inválido")
+    path = _wa_avatars.get_avatar_path(jid, chat_name=name)
+    if not path:
+        raise HTTPException(status_code=404, detail="sin foto en Apple Contacts")
+    return FileResponse(
+        path,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "private, max-age=604800"},
+    )
+
+
 @app.post("/api/wa/typing")
 def wa_typing(req: _WATypingRequest) -> dict:
     """Envía presence (typing/recording) al contacto. Fire-and-forget."""

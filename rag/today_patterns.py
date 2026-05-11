@@ -208,6 +208,11 @@ def detect_wa_silences(
     finally:
         con.close()
     n = now or datetime.now()
+    # Dedup by normalized name — same contact on multiple JIDs (e.g.
+    # linked-device `@lid` + phone `@s.whatsapp.net`) should surface
+    # once, with combined msgs_7d and the most-recently-active JID kept
+    # for the link target.
+    by_name: dict[str, dict] = {}
     for r in rows:
         raw_name = (r["name"] or "").strip()
         jid_prefix = (r["jid"] or "").split("@")[0]
@@ -224,15 +229,29 @@ def detect_wa_silences(
                 hours_silent = round((n - last_dt).total_seconds() / 3600.0, 1)
             except ValueError:
                 pass
-        out.append({
+        entry = {
             "jid": r["jid"],
             "name": display,
             "msgs_7d": int(r["msgs_7d"]),
             "last_msg_iso": last_iso,
             "hours_silent": hours_silent,
-        })
-        if len(out) >= _MAX_SILENCES:
-            break
+        }
+        key = display.casefold()
+        prev = by_name.get(key)
+        if prev is None:
+            by_name[key] = entry
+            continue
+        prev["msgs_7d"] += entry["msgs_7d"]
+        prev_h = prev["hours_silent"]
+        cur_h = entry["hours_silent"]
+        if cur_h is not None and (prev_h is None or cur_h < prev_h):
+            prev["jid"] = entry["jid"]
+            prev["last_msg_iso"] = entry["last_msg_iso"]
+            prev["hours_silent"] = cur_h
+            prev["name"] = entry["name"]
+    out = sorted(
+        by_name.values(), key=lambda x: -x["msgs_7d"]
+    )[:_MAX_SILENCES]
     return out
 
 

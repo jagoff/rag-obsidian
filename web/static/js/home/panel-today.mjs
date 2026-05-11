@@ -781,6 +781,14 @@ export function wireHeroLayout() {
       sec.addEventListener("dragleave", _onHeroDragLeave);
       sec.addEventListener("drop", _onHeroDrop);
     }
+    // Anchors/imgs dentro de `.prose` son draggable=true por default en
+    // HTML5 — eso secuestra el dragstart del panel cuando el user agarra
+    // sobre el contenido en lugar del header. Forzar draggable=false en
+    // los hijos para que el drag siempre dispare en `.hero-section`.
+    // Re-corre cada render porque innerHTML del body se regenera.
+    sec.querySelectorAll("a, img").forEach((el) => {
+      el.setAttribute("draggable", "false");
+    });
   });
 }
 

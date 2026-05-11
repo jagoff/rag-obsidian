@@ -4600,19 +4600,38 @@ async def wa_send_media(
 
 
 @app.get("/api/wa/search")
-def wa_search(q: str = Query(...), limit: int = 50, jid: str | None = None) -> dict:
-    """Search FTS5 cross-chat sobre `rag_wa_messages_mirror`.
+def wa_search(
+    q: str = Query(...),
+    limit: int = 50,
+    jid: str | None = None,
+    mode: str = "fts",
+) -> dict:
+    """Search cross-chat sobre `rag_wa_messages_mirror`. Dos backends:
 
-    Devuelve `{hits: [{id, chat_jid, chat_name, ts, sender, snippet}]}`
-    con highlight HTML `<mark>...</mark>` en el snippet. El frontend
-    sanitiza ese HTML solo dejando pasar `<mark>` antes de injectar.
+    - `mode=fts` (default, retro-compat): FTS5 con highlight `<mark>`.
+      Devuelve `{hits: [{id, chat_jid, chat_name, ts, sender, snippet}]}`.
+    - `mode=semantic`: sqlite-vec k-NN con Qwen3-Embedding (1024-dim).
+      Devuelve `{hits: [{id, chat_jid, chat_name, ts, sender, content,
+      distance}]}`. Embedea la query in-process (~10-30ms cold, <2ms
+      warm). Requiere haber corrido `/api/wa/search/index` al menos
+      una vez para popular el vec store; sin index devuelve `[]`.
+
+    El frontend sanitiza el HTML del snippet solo dejando pasar `<mark>`
+    antes de injectar (para FTS); semantic devuelve `content` raw que
+    se escapa en client-side.
     """
-    from rag.integrations.whatsapp import search as _wa_search  # noqa: PLC0415
-
     if not q or not q.strip():
-        return {"hits": []}
+        return {"hits": [], "mode": mode}
+    mode_norm = (mode or "fts").strip().lower()
+    if mode_norm == "semantic":
+        from rag.integrations.whatsapp import (  # noqa: PLC0415
+            search_semantic as _wa_sem,
+        )
+        hits = _wa_sem.search(q, jid=jid, limit=limit)
+        return {"hits": hits, "mode": "semantic"}
+    from rag.integrations.whatsapp import search as _wa_search  # noqa: PLC0415
     hits = _wa_search.search(q, jid=jid, limit=limit)
-    return {"hits": hits}
+    return {"hits": hits, "mode": "fts"}
 
 
 @app.post("/api/wa/search/backfill", dependencies=[Depends(_require_admin_token)])
@@ -4624,6 +4643,29 @@ def wa_search_backfill() -> dict:
 
     inserted = _wa_search.backfill_mirror()
     return {"ok": True, "inserted": inserted}
+
+
+@app.post("/api/wa/search/index", dependencies=[Depends(_require_admin_token)])
+def wa_search_index(full: bool = False) -> dict:
+    """Indexa rows pending del mirror al vec store (sqlite-vec).
+
+    `full=true` → drena la pending list (puede tomar minutos en
+    corpus de >10k msgs; embedder MLX in-process). `full=false`
+    (default) → un solo batch (64 rows, ~0.5-1s cold). Útil para
+    cron incremental.
+
+    Idempotente: rows ya embeddedas se ignoran via NOT IN subquery.
+    """
+    from rag.integrations.whatsapp import (  # noqa: PLC0415
+        search_semantic as _wa_sem,
+    )
+
+    if full:
+        inserted = _wa_sem.index_all_pending()
+    else:
+        inserted = _wa_sem.index_pending()
+    pending = _wa_sem.pending_count()
+    return {"ok": True, "inserted": inserted, "pending": pending}
 
 
 @app.post("/api/wa/voice")

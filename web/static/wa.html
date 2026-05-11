@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <title>rag · wzp</title>
-  <link rel="stylesheet" href="/static/wa.css?v=25">
+  <link rel="stylesheet" href="/static/wa.css?v=26">
   <link rel="manifest" href="/static/manifest.webmanifest">
   <link rel="icon" type="image/png" sizes="32x32" href="/static/pwa/favicon-32.png">
   <link rel="icon" type="image/png" sizes="16x16" href="/static/pwa/favicon-16.png">
@@ -65,7 +65,11 @@
         <a href="/finance">finance</a>
       </nav>
       <div class="wa-search-box">
-        <input type="search" id="wa-search-input" placeholder="buscar chat..." autocomplete="off">
+        <input type="search" id="wa-search-input" placeholder="buscar chat o mensaje…" autocomplete="off">
+        <div class="wa-search-mode" id="wa-search-mode" role="group" aria-label="modo de búsqueda" hidden>
+          <button type="button" class="wa-search-mode-btn active" data-mode="fts" title="Match exacto (FTS5)">texto</button>
+          <button type="button" class="wa-search-mode-btn" data-mode="semantic" title="Por significado (embeddings)">semántico</button>
+        </div>
       </div>
       <ul class="wa-chatlist" id="wa-chatlist" aria-live="polite"></ul>
       <div class="wa-chatlist-loading" id="wa-chatlist-loading">
@@ -143,6 +147,6 @@
        borrar mensajes propios). Loopback-only — un device LAN/tunnel
        no recibe el token y el delete falla server-side con 401. -->
   <script src="/static/admin-auth.js"></script>
-  <script type="module" src="/static/js/wa/wa.js?v=23"></script>
+  <script type="module" src="/static/js/wa/wa.js?v=24"></script>
 </body>
 </html>

@@ -235,11 +235,9 @@ async function doRevoke() {
   const messageId = activeMsgEl.dataset.id || "";
   closeMenu();
   if (!messageId) return;
-  // Confirmación destructiva — el delete-for-everyone es irreversible
-  // (el bridge persiste un revoke event y los peers reciben el tomb).
-  if (!window.confirm("Eliminar este mensaje para todos? No se puede deshacer.")) {
-    return;
-  }
+  // Pedido user 2026-05-11: "no hace falta que confirme el borrado".
+  // Trash hover-only + click = delete directo. El SSE marca revoked
+  // optimistic; si falló al server, mostramos alert con el error.
   try {
     // admin-auth.js inyecta el Bearer del admin_token automáticamente
     // (loopback-only). Si el browser está en LAN/tunnel, el server
@@ -384,9 +382,9 @@ function updateSelectBar() {
 async function bulkRevoke() {
   if (!currentJID || _selectedIds.size === 0) return;
   const ids = [..._selectedIds];
-  if (!window.confirm(
-    `Eliminar ${ids.length} mensaje${ids.length === 1 ? "" : "s"} para todos? No se puede deshacer.`,
-  )) return;
+  // Sin confirm (pedido user 2026-05-11) — el modo selección ya
+  // requiere acción explícita (entrar al modo + tickear + click
+  // Eliminar), así que la confirmación extra es ruido.
   const delBtn = _selectBar?.querySelector(".wa-select-delete");
   if (delBtn) {
     delBtn.disabled = true;

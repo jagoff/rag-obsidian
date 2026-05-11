@@ -4216,14 +4216,26 @@ async def wa_draft_check(req: _WADraftCheckRequest, request: Request) -> dict:
 
     # Slug del jid actual para excluir hits que sean del mismo thread —
     # de lo contrario el draft matchearía contra los msgs del propio chat
-    # y todo daría "contradicción" trivial.
-    from rag.integrations.whatsapp.voice_notes import _slug_jid  # noqa: PLC0415
-
-    self_slug = _slug_jid(req.jid)
-    exclude_prefixes = (
-        f"99-obsidian/99-AI/external-ingest/whatsapp-voice/{self_slug}/",
-        f"99-obsidian/99-AI/external-ingest/whatsapp/{self_slug}/",
+    # y todo daría "contradicción" trivial. Tanto el jid-slug legacy
+    # como el contact-slug nuevo entran al exclude por las dudas.
+    from rag.integrations.whatsapp.voice_notes import (  # noqa: PLC0415
+        _lookup_contact_name,
+        _slug_jid,
+        _slug_name,
     )
+
+    self_jid_slug = _slug_jid(req.jid)
+    self_contact_name = _lookup_contact_name(req.jid)
+    exclude_set = {
+        f"99-obsidian/99-AI/external-ingest/whatsapp-voice/{self_jid_slug}/",
+        f"99-obsidian/99-AI/external-ingest/whatsapp/{self_jid_slug}/",
+    }
+    if self_contact_name:
+        cslug = _slug_name(self_contact_name)
+        exclude_set.add(
+            f"99-obsidian/99-AI/external-ingest/whatsapp-voice/{cslug}/"
+        )
+    exclude_prefixes = tuple(exclude_set)
 
     try:
         result = await asyncio.to_thread(
@@ -4726,6 +4738,21 @@ def wa_voice_transcript(message_id: str, jid: str) -> dict:
                 "error_kind": "transcribe_failed",
                 "error": cached.get("error") or "",
             }
+        # Best-effort re-write de la nota al vault. Esto garantiza que
+        # transcripts viejos (escritos antes de que existiera la
+        # resolución por contact-slug) migren al folder correcto la
+        # próxima vez que se consulten desde la UI. Idempotente — si
+        # el body no cambió, no toca disco.
+        try:
+            from rag.integrations.whatsapp import voice_notes as _voice_notes  # noqa: PLC0415
+            _voice_notes.write_voice_note(
+                msg_id=message_id, jid=jid,
+                sender=cached.get("sender"),
+                text=cached.get("text") or "",
+                audio_ts=cached.get("audio_ts") or "",
+            )
+        except Exception:
+            pass
         return {
             "ok": True,
             "cached": True,

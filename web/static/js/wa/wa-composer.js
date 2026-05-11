@@ -5,6 +5,7 @@
 
 import { sendText, typing as sendTyping } from "./wa-api.js";
 import { uploadMedia } from "./wa-media.js";
+import * as voice from "./wa-voice.js";
 
 const els = {
   root: null,
@@ -77,6 +78,33 @@ export function init({ rootEl, onOptimisticInsert }) {
   root.addEventListener("dragover", onDragOver);
   root.addEventListener("dragleave", onDragLeave);
   root.addEventListener("drop", onDrop);
+
+  // Voice notes init
+  voice.init({
+    btnEl: document.getElementById("wa-mic-btn"),
+    recordBarEl: document.getElementById("wa-record-bar"),
+    recordTimerEl: document.getElementById("wa-record-timer"),
+    onSend: ({ jid, blob, transcript }) => {
+      // Optimistic insert al thread.
+      const tempId = `tmp-${Date.now()}-voice-${Math.random().toString(36).slice(2, 8)}`;
+      if (onOptimisticInsertCb) {
+        onOptimisticInsertCb(jid, {
+          id: tempId,
+          ts: new Date().toISOString(),
+          sender: "yo",
+          sender_label: "yo",
+          content: transcript || "[voice note]",
+          is_from_me: true,
+          media_type: "audio",
+          filename: "voice.ogg",
+          quoted: null,
+          reactions: [],
+          revoked: false,
+          pending: true,
+        });
+      }
+    },
+  });
 }
 
 async function sendMediaFile(file) {
@@ -158,6 +186,7 @@ function stopTyping() {
 
 export function setActiveChat(jid) {
   stopTyping();
+  voice.setActiveJID(jid);
   currentJID = jid;
   pendingReply = null;
   hideReplyBar();

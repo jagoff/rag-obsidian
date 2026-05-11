@@ -4377,6 +4377,94 @@ async def wa_send_media(
     }
 
 
+@app.post("/api/wa/voice")
+async def wa_voice(
+    request: Request,
+    jid: str = Form(...),
+    transcribe_only: bool = Form(False),
+    language: str = Form("es"),
+    reply_to_id: str = Form(""),
+    audio: UploadFile = File(...),
+) -> dict:
+    """Voice note pipeline: webm/opus del browser → Whisper transcribe
+    + opcionalmente → ffmpeg encode opus PTT → bridge send.
+
+    Body multipart:
+    - `audio` (file): blob `audio/webm;codecs=opus` típico del MediaRecorder.
+    - `jid`: destinatario.
+    - `transcribe_only` (bool): si true, devuelve `{text, ...}` sin mandar.
+    - `language`: forzado al transcribe (default `es` ya que el user es AR).
+    - `reply_to_id` (str opcional): para citar un msg previo.
+
+    Devuelve:
+    - `transcribe_only=True`: `{ok, text, language, duration_s, cached}`.
+    - normal: `{ok, error_kind, message_id?, text}` con el transcript
+      como side-info (útil para mostrar al user qué se mandó).
+    """
+    from rag.integrations.whatsapp import bridge_client as _bc, voice as _voice  # noqa: PLC0415
+
+    if not jid or "@" not in jid:
+        raise HTTPException(status_code=400, detail="jid inválido")
+    if not audio:
+        raise HTTPException(status_code=400, detail="audio requerido")
+    body = await audio.read()
+    if not body:
+        raise HTTPException(status_code=400, detail="audio vacío")
+    if len(body) > 16 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="audio demasiado grande (>16MB)")
+
+    suffix = ".webm"
+    if audio.filename and "." in audio.filename:
+        ext = audio.filename.rsplit(".", 1)[-1].lower()
+        if 1 <= len(ext) <= 5 and ext.isalnum():
+            suffix = "." + ext
+    tmp_in = _voice.write_blob_to_tmp(body, suffix=suffix)
+
+    try:
+        # 1) Transcribe (con cache SQL).
+        try:
+            tr = _voice.transcribe_blob(body, language=language, suffix=suffix)
+        except Exception as e:
+            # Limpiar y reportar — Whisper puede fallar por modelo no descargado.
+            return {"ok": False, "error_kind": "transcribe_failed", "error": repr(e)[:200]}
+
+        text = (tr or {}).get("text", "").strip()
+
+        if transcribe_only:
+            return {
+                "ok": True,
+                "text": text,
+                "language": (tr or {}).get("language"),
+                "duration_s": (tr or {}).get("duration_s"),
+                "cached": (tr or {}).get("cached", False),
+            }
+
+        # 2) Encode a ogg/opus PTT.
+        opus_path = _voice.to_opus(tmp_in)
+        if opus_path is None:
+            return {"ok": False, "error_kind": "encode_failed", "text": text}
+
+        # 3) Send al bridge — para PTT, el bridge ya hardcodea
+        # `Audio.PTT = true` cuando es .ogg/opus.
+        reply_to = None
+        if reply_to_id:
+            reply_to = {"message_id": reply_to_id, "original_text": "", "sender_jid": ""}
+        try:
+            resp = _bc.send_ptt(jid, str(opus_path), reply_to=reply_to)
+        except _bc.BridgeError as e:
+            return {"ok": False, "error_kind": "bridge_error", "error": str(e), "text": text}
+        finally:
+            _voice.cleanup(opus_path)
+        return {
+            "ok": True,
+            "error_kind": "sent",
+            "message_id": resp.get("message_id"),
+            "text": text,
+        }
+    finally:
+        _voice.cleanup(tmp_in)
+
+
 @app.get("/api/wa/avatar/{jid}")
 def wa_avatar(jid: str, name: str | None = None) -> FileResponse:
     """Devuelve la foto del contacto extraída de Apple Contacts.app.

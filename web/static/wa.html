@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <title>rag · wa</title>
-  <link rel="stylesheet" href="/static/wa.css?v=6">
+  <link rel="stylesheet" href="/static/wa.css?v=7">
   <link rel="manifest" href="/static/manifest.webmanifest">
   <link rel="icon" type="image/png" sizes="32x32" href="/static/pwa/favicon-32.png">
   <link rel="icon" type="image/png" sizes="16x16" href="/static/pwa/favicon-16.png">
@@ -115,16 +115,29 @@
           <span class="wa-kbd-sep">·</span>
           <kbd>dbl-click</kbd> responder
         </div>
+        <button class="wa-mic-btn" id="wa-mic-btn"
+                type="button"
+                title="grabar voice note (whisper + opus PTT)"
+                aria-label="grabar audio"
+                disabled>
+          <span class="wa-mic-icon" aria-hidden="true">●</span>
+        </button>
         <button class="wa-send-btn" id="wa-send-btn">
           <span class="wa-send-label">enviar</span>
           <span class="wa-send-arrows" aria-hidden="true">
             <i>▸</i><i>▸</i><i>▸</i>
           </span>
         </button>
+        <div class="wa-record-bar" id="wa-record-bar" hidden>
+          <span class="wa-record-dot" aria-hidden="true"></span>
+          <span class="wa-record-label">REC</span>
+          <span class="wa-record-timer" id="wa-record-timer">0:00</span>
+          <span class="wa-record-hint">click mic para parar</span>
+        </div>
       </footer>
     </main>
   </div>
 
-  <script type="module" src="/static/js/wa/wa.js?v=5"></script>
+  <script type="module" src="/static/js/wa/wa.js?v=6"></script>
 </body>
 </html>

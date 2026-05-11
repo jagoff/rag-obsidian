@@ -323,22 +323,31 @@ def get_avatar_path(jid: str, chat_name: str | None = None) -> Path | None:
         except OSError:
             pass
 
-    if miss_path.is_file():
-        try:
-            if now - miss_path.stat().st_mtime < _MISS_TTL_S:
-                return None
-        except OSError:
-            pass
-
+    # Match contra Apple Contacts ANTES de chequear el .miss cache:
+    # el .miss queda keyed por jid sin chat_name, así que un miss
+    # viejo (de cuando el lookup no tenía chat_name) bloqueaba
+    # fetches válidos cuando el chat_name aparecía después. Si HAY
+    # match en el index, forzamos el fetch ignorando el miss.
     digits = _digits_from_jid(jid)
     index = _index_get()
     name_exact = _match_contact(index, digits, chat_name)
+
     if name_exact and _fetch_image(name_exact, out_path):
         try:
             miss_path.unlink(missing_ok=True)
         except OSError:
             pass
         return out_path
+
+    # Solo respetar el .miss cache cuando NO había match — si nunca
+    # vamos a poder resolver Apple Contacts, evitar re-correr osascript
+    # cada 200ms del scroll.
+    if not name_exact and miss_path.is_file():
+        try:
+            if now - miss_path.stat().st_mtime < _MISS_TTL_S:
+                return None
+        except OSError:
+            pass
 
     try:
         miss_path.touch()

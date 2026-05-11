@@ -909,14 +909,53 @@ def list_chats_for_ui(
                 "pinned": is_pinned,
                 "pinned_ts": pinned_map.get(jid, "") if is_pinned else "",
             })
+        # Dedupe: cuando hay 2+ JIDs (típicamente uno `@lid` + uno
+        # `@s.whatsapp.net`) que resuelven al MISMO label (Apple
+        # Contacts o vault contact note), colapsamos al de actividad
+        # más reciente. Pedido user 2026-05-11 "Maria está duplicada".
+        # Grupos quedan exentos — `@g.us` con mismo nombre son
+        # legítimamente distintos. Pinned también: si el user pineó
+        # una variante, esa gana sobre la otra.
+        by_label: dict[str, dict] = {}
+        out_dedup: list[dict] = []
+        for c in out:
+            if c.get("is_group"):
+                out_dedup.append(c)
+                continue
+            key = (c.get("label") or "").strip().lower()
+            if not key or key.startswith("contacto "):
+                out_dedup.append(c)
+                continue
+            existing = by_label.get(key)
+            if not existing:
+                by_label[key] = c
+                out_dedup.append(c)
+                continue
+            # Conflict: keep the one con pinned, sino el de last_ts
+            # más reciente, sino el con más unread.
+            keep_new = False
+            if c.get("pinned") and not existing.get("pinned"):
+                keep_new = True
+            elif not c.get("pinned") and existing.get("pinned"):
+                keep_new = False
+            elif _ts_sort_key(c.get("last_ts", "")) > _ts_sort_key(existing.get("last_ts", "")):
+                keep_new = True
+            elif (c.get("unread_count") or 0) > (existing.get("unread_count") or 0):
+                keep_new = True
+            if keep_new:
+                # Reemplazar in-place en out_dedup.
+                idx = out_dedup.index(existing)
+                out_dedup[idx] = c
+                by_label[key] = c
+
         # Sort: pinned primero (más reciente pin arriba), después el resto
         # por last_ts desc igual que antes. WhatsApp Web hace lo mismo.
-        out.sort(key=lambda c: (
+        out_dedup.sort(key=lambda c: (
             0 if c.get("pinned") else 1,
             -1 * _ts_sort_key(c.get("pinned_ts", "")) if c.get("pinned")
                 else -1 * _ts_sort_key(c.get("last_ts", "")),
         ))
-        return out
+        return out_dedup
     except sqlite3.Error:
         return []
     finally:

@@ -12882,6 +12882,23 @@ def classify_intent(
             params["folder"] = f
             break
 
+    # Episodic intent (G4, 2026-05-11): ancla temporal + verbo reflexivo
+    # → narrativa cronológica en lugar de chunks rankeados. Se chequea
+    # ANTES del resto porque "qué pasó la semana pasada con X" tiene
+    # tokens que también disparan recent/agenda. El detector es
+    # selectivo (requiere AMBOS: anchor + reflexive verb), pocos
+    # falsos positivos.
+    try:
+        from rag.episodic import is_episodic, parse_temporal_anchor  # noqa: PLC0415
+
+        if is_episodic(question):
+            tr = parse_temporal_anchor(question)
+            if tr:
+                params["date_range"] = tr
+                return "episodic", params
+    except Exception:  # noqa: BLE001
+        pass
+
     if _INTENT_COUNT_RE.search(question):
         return "count", params
     if _INTENT_LIST_RE.search(question):
@@ -13885,9 +13902,16 @@ def system_prompt_for_intent(intent: str, loose: bool) -> str:
             from rag.identity_layer import summarize_for_prompt  # noqa: PLC0415
             fingerprint = summarize_for_prompt()
             if fingerprint:
-                return base + "\n" + fingerprint
+                base = base + "\n" + fingerprint
         except Exception:  # noqa: BLE001
             # Silent — si hay bug en el extractor, no rompemos el prompt.
+            pass
+    # G4 — Episodic intent appendea instrucción narrativa.
+    if intent == "episodic":
+        try:
+            from rag.episodic import episodic_system_prompt_suffix  # noqa: PLC0415
+            base = base + episodic_system_prompt_suffix()
+        except Exception:  # noqa: BLE001
             pass
     return base
 

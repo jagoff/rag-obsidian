@@ -290,8 +290,12 @@ function renderMsg(m, ctx) {
     return div;
   }
 
-  // Sender (solo en grupos + no propios)
-  if (ctx.is_group && !m.is_from_me && m.sender_label) {
+  // Sender label arriba de cada mensaje inbound. Antes solo en grupos;
+  // pedido user 2026-05-11 "quiero que todos los mensajes se vean asi,
+  // nombre arriba, texto abajo, hora de envio" → extender a 1-on-1.
+  // Propios no llevan label (el alineamiento + color de la burbuja ya
+  // los distingue, mismo criterio que el render previo de grupos).
+  if (!m.is_from_me && m.sender_label) {
     const sender = document.createElement("div");
     sender.className = "wa-msg-sender";
     sender.textContent = m.sender_label;

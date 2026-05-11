@@ -360,50 +360,47 @@ button { cursor: pointer; }
 .wa-chat-item.active { background: var(--bg-panel-active); }
 .wa-chat-item.active::after { background: transparent; }
 
-/* Pin button — afford hover-only sobre el lado izquierdo del chat
-   en el sidebar. Cuando el chat está pinned, queda visible siempre
-   con la versión filled del icono. Click toggle pin/unpin → re-sort
-   automático. Pinned chats viven en el tope de la lista. */
+/* Pin button — afford hover-only en chats individuales (no grupos).
+   Mismo lenguaje visual que `.wa-msg-trash` / `.wa-msg-select` del
+   thread: círculo bg semi-opaco, hover-only (opacity 0 → 1), icono
+   white. Diferencia entre estado pinned/unpinned: outline vs filled.
+   Pinned chats viven en el tope de la lista — el indicador visual
+   de "está pinned" es la posición, no el botón. */
 .wa-chat-pin {
   position: absolute;
   left: 4px;
   top: 50%;
   transform: translateY(-50%);
-  width: 20px;
-  height: 20px;
+  width: 22px;
+  height: 22px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   border: 0;
   border-radius: 50%;
-  background: transparent;
-  color: var(--text-secondary);
+  background: rgba(0, 0, 0, 0.32);
+  color: rgba(255, 255, 255, 0.92);
   padding: 0;
   cursor: pointer;
   opacity: 0;
   transition: opacity 0.12s ease, color 0.12s ease, background 0.12s ease;
-  z-index: 2;
+  z-index: 3;
 }
 .wa-chat-item:hover .wa-chat-pin,
 .wa-chat-pin:focus-visible {
-  opacity: 0.7;
+  opacity: 1;
 }
 .wa-chat-pin:hover {
-  opacity: 1;
-  color: var(--accent, #06d6a0);
-  background: rgba(6, 214, 160, 0.1);
+  color: #fff;
+  background: rgba(6, 214, 160, 0.85);
 }
-/* Pinned: tachuela filled siempre visible. */
-.wa-chat-item.pinned .wa-chat-pin {
-  opacity: 0.9;
-  color: var(--accent, #06d6a0);
+[data-theme="light"] .wa-chat-pin {
+  background: rgba(0, 0, 0, 0.18);
+  color: rgba(0, 0, 0, 0.72);
 }
-.wa-chat-item.pinned:hover .wa-chat-pin {
-  opacity: 1;
-}
-/* Touch devices: hover no se dispara — affordance siempre semi-visible. */
+/* Touch devices: hover no se dispara — keep visible discreto. */
 @media (hover: none) {
-  .wa-chat-pin { opacity: 0.45; }
+  .wa-chat-pin { opacity: 0.5; }
 }
 
 .wa-chat-avatar {

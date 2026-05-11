@@ -763,7 +763,10 @@ def _avatar_initials(label: str) -> str:
 
 
 def list_chats_for_ui(
-    limit: int = 50, before_ts: str | None = None, q: str | None = None
+    limit: int = 50,
+    before_ts: str | None = None,
+    q: str | None = None,
+    view: str = "default",
 ) -> list[dict]:
     """Lista paginada de chats para el sidebar de `/wa`.
 
@@ -810,18 +813,34 @@ def list_chats_for_ui(
         # MAX en el SELECT es ~3x más caro que c.last_message_time pero
         # se carga una sola vez al abrir el sidebar y la lectura de
         # 100-300 chats tarda <50ms con el idx_messages_chat_ts existente.
+        # Pre-fetch maps de pinned + archived ANTES del SQL para poder
+        # filtrar a nivel query — sin esto el LIMIT del SQL excluye
+        # archivados viejos que no entran en el top-N por last_ts.
+        pinned_map = _db_local.get_pinned_chats()
+        archived_map = _db_local.get_archived_chats()
+        view_norm = (view or "default").lower()
+
         where_clauses = [
             "c.jid != ?",
             "c.jid NOT LIKE '%status@broadcast'",
         ]
         params: list = [bot_jid]
-        # before_ts filter ahora compara contra el computed `last_ts`
-        # via HAVING en la outer query (sub-query SELECT puede usar
-        # parameters via la lista params, pero no rebindeable a HAVING).
-        # Para simplicidad lo movemos a un wrapping CTE-like via outer.
         if q:
             where_clauses.append("LOWER(COALESCE(c.name, '')) LIKE ?")
             params.append(f"%{q.lower()}%")
+        # View filter at SQL level — garantiza que el LIMIT respete el
+        # subset (archivados pueden tener last_ts viejo y caer fuera
+        # del top-N si filtráramos solo en Python).
+        if archived_map:
+            placeholders = ",".join("?" * len(archived_map))
+            if view_norm == "archived":
+                where_clauses.append(f"c.jid IN ({placeholders})")
+            else:
+                where_clauses.append(f"c.jid NOT IN ({placeholders})")
+            params.extend(archived_map.keys())
+        elif view_norm == "archived":
+            # No hay archivados — return early sin tocar el bridge.
+            return []
         having_clause = ""
         if before_ts:
             having_clause = "HAVING computed_last_ts IS NOT NULL AND computed_last_ts < ?"
@@ -868,9 +887,7 @@ def list_chats_for_ui(
         """
         chat_rows = con.execute(sql, params).fetchall()
 
-        # Pinned chats — map jid → pinned_ts. Lo levantamos una sola vez
-        # por call para no scattear queries al SQL state DB.
-        pinned_map = _db_local.get_pinned_chats()
+        # pinned_map + archived_map ya cargados arriba (pre-SQL).
 
         out: list[dict] = []
         for r in chat_rows:
@@ -897,6 +914,8 @@ def list_chats_for_ui(
             ).fetchone()
             is_group = jid.endswith("@g.us")
             is_pinned = jid in pinned_map
+            is_archived = jid in archived_map
+            # Filter SQL ya excluyó archivados según view — no re-filtrar.
             out.append({
                 "jid": jid,
                 "label": label,
@@ -908,6 +927,7 @@ def list_chats_for_ui(
                 "avatar_initials": _avatar_initials(label),
                 "pinned": is_pinned,
                 "pinned_ts": pinned_map.get(jid, "") if is_pinned else "",
+                "archived": is_archived,
             })
         # Dedupe: cuando hay 2+ JIDs (típicamente uno `@lid` + uno
         # `@s.whatsapp.net`) que resuelven al MISMO label (Apple

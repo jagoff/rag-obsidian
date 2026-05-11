@@ -22,10 +22,11 @@ async function jsonPOST(path, body) {
   return r.json();
 }
 
-export async function fetchChats({ limit = 50, beforeTs = null, q = null } = {}) {
+export async function fetchChats({ limit = 50, beforeTs = null, q = null, view = "default" } = {}) {
   const params = new URLSearchParams({ limit: String(limit) });
   if (beforeTs) params.set("before_ts", beforeTs);
   if (q) params.set("q", q);
+  if (view && view !== "default") params.set("view", view);
   return jsonGET(`/api/wa/chats?${params}`);
 }
 
@@ -86,6 +87,24 @@ export async function unpinChat(jid) {
     credentials: "same-origin",
   });
   if (!r.ok) throw new Error(`unpin ${r.status}`);
+  return r.json();
+}
+
+export async function archiveChat(jid) {
+  const r = await fetch(`/api/wa/chats/${encodeURIComponent(jid)}/archive`, {
+    method: "POST",
+    credentials: "same-origin",
+  });
+  if (!r.ok) throw new Error(`archive ${r.status}`);
+  return r.json();
+}
+
+export async function unarchiveChat(jid) {
+  const r = await fetch(`/api/wa/chats/${encodeURIComponent(jid)}/unarchive`, {
+    method: "POST",
+    credentials: "same-origin",
+  });
+  if (!r.ok) throw new Error(`unarchive ${r.status}`);
   return r.json();
 }
 

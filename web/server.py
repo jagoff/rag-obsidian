@@ -4129,18 +4129,47 @@ def wa_chats(
     limit: int = 50,
     before_ts: str | None = None,
     q: str | None = None,
+    view: str = "default",  # "default" | "archived"
 ) -> dict:
     """Lista paginada de chats para el sidebar de `/wa`.
 
     Ordenada por `last_message_time DESC`. `before_ts` filtra paginación
-    hacia atrás (next page = pasar el `last_ts` del último elemento
-    devuelto). `q` filtra substring sobre el nombre del chat.
+    hacia atrás. `q` filtra substring sobre el nombre del chat. `view`:
+    - `default`: chats NO archivados (excluye `rag_wa_archived_chats`).
+    - `archived`: SOLO chats archivados.
     """
     from rag.integrations.whatsapp import fetch as _wa_fetch  # noqa: PLC0415
 
-    chats = _wa_fetch.list_chats_for_ui(limit=limit, before_ts=before_ts, q=q)
+    chats = _wa_fetch.list_chats_for_ui(
+        limit=limit, before_ts=before_ts, q=q,
+        view=(view or "default").strip().lower(),
+    )
     next_before_ts = chats[-1]["last_ts"] if chats and len(chats) >= limit else None
     return {"chats": chats, "next_before_ts": next_before_ts}
+
+
+@app.post("/api/wa/chats/{jid}/archive")
+def wa_chat_archive(jid: str) -> dict:
+    """Archiva un chat — sale del sidebar default, accesible solo desde
+    la vista "Archivados". Idempotente.
+    """
+    from rag.integrations.whatsapp import _db_local  # noqa: PLC0415
+
+    if not jid or "@" not in jid:
+        raise HTTPException(status_code=400, detail="jid inválido")
+    _db_local.archive_chat(jid)
+    return {"ok": True, "archived": True}
+
+
+@app.post("/api/wa/chats/{jid}/unarchive")
+def wa_chat_unarchive(jid: str) -> dict:
+    """Saca un chat del archivo — vuelve al sidebar default."""
+    from rag.integrations.whatsapp import _db_local  # noqa: PLC0415
+
+    if not jid or "@" not in jid:
+        raise HTTPException(status_code=400, detail="jid inválido")
+    _db_local.unarchive_chat(jid)
+    return {"ok": True, "archived": False}
 
 
 @app.post("/api/wa/chats/{jid}/pin")

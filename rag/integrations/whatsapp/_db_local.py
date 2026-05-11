@@ -119,6 +119,15 @@ CREATE TABLE IF NOT EXISTS rag_wa_pinned_chats (
     jid TEXT PRIMARY KEY,
     pinned_ts TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- Chats archivados (feat 2026-05-11). Row presente = archived → no
+-- aparece en el sidebar default. Toggle "Archivados" muestra solo
+-- estos. WhatsApp-style — el user mete chats viejos/silenciosos
+-- afuera para dejar la lista principal limpia.
+CREATE TABLE IF NOT EXISTS rag_wa_archived_chats (
+    jid TEXT PRIMARY KEY,
+    archived_ts TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -209,6 +218,50 @@ def unpin_chat(jid: str) -> bool:
             "DELETE FROM rag_wa_pinned_chats WHERE jid = ?", (jid,),
         )
         return bool(cur.rowcount)
+    finally:
+        conn.close()
+
+
+def archive_chat(jid: str) -> bool:
+    """Marca un chat como archivado. Idempotente."""
+    ensure_schema()
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT INTO rag_wa_archived_chats (jid, archived_ts) "
+            "VALUES (?, datetime('now')) "
+            "ON CONFLICT(jid) DO UPDATE SET archived_ts = excluded.archived_ts",
+            (jid,),
+        )
+        return True
+    finally:
+        conn.close()
+
+
+def unarchive_chat(jid: str) -> bool:
+    """Saca un chat del archivo."""
+    ensure_schema()
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "DELETE FROM rag_wa_archived_chats WHERE jid = ?", (jid,),
+        )
+        return bool(cur.rowcount)
+    finally:
+        conn.close()
+
+
+def get_archived_chats() -> dict[str, str]:
+    """Devuelve `{jid: archived_ts}` para todos los archivados."""
+    ensure_schema()
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT jid, archived_ts FROM rag_wa_archived_chats"
+        ).fetchall()
+        return {r["jid"]: r["archived_ts"] for r in rows}
+    except sqlite3.Error:
+        return {}
     finally:
         conn.close()
 

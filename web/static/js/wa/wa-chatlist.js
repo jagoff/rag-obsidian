@@ -1,7 +1,7 @@
 // Render del sidebar — lista de chats con avatar/nombre/preview/unread.
 // Click → notifica al entry point para abrir el thread correspondiente.
 
-import { fetchChats, pinChat, unpinChat } from "./wa-api.js";
+import { fetchChats, pinChat, unpinChat, archiveChat, unarchiveChat } from "./wa-api.js";
 import { colorFor, renderInto as renderAvatar } from "./wa-avatars.js";
 import * as search from "./wa-search.js";
 
@@ -13,6 +13,9 @@ const els = {
 
 let allChats = [];
 let activeJID = null;
+// View mode: "default" muestra chats no-archivados, "archived" muestra
+// solo los archivados. Toggle desde el botón del sidebar header.
+let currentView = "default";
 let onSelectCallback = null;
 let searchTimer = null;
 let lastSearchQuery = "";
@@ -39,12 +42,57 @@ export function init({ listEl, loadingEl, searchEl, onSelect }) {
       if (onSelectCallback) onSelectCallback(jid);
     },
   });
+
+  // View toggle (default ↔ archived) — botón inyectado en el sidebar
+  // header. Click cambia currentView y re-fetcha. Estado activo
+  // visualizado con class `.archived-mode` en el body para hint en
+  // el header/empty-state.
+  mountViewToggle();
+}
+
+function mountViewToggle() {
+  const header = document.querySelector(".wa-sidebar-header .wa-header-right");
+  if (!header || header.querySelector(".wa-archive-toggle")) return;
+  const btn = document.createElement("button");
+  btn.className = "wa-archive-toggle";
+  btn.type = "button";
+  btn.title = "Ver archivados";
+  btn.setAttribute("aria-label", "Ver archivados");
+  btn.innerHTML = `
+    <svg viewBox="0 0 24 24" width="16" height="16" fill="none"
+         stroke="currentColor" stroke-width="2" stroke-linecap="round"
+         stroke-linejoin="round" aria-hidden="true">
+      <path d="M21 8v13H3V8"/>
+      <rect x="1" y="3" width="22" height="5"/>
+      <line x1="10" y1="12" x2="14" y2="12"/>
+    </svg>
+  `;
+  btn.addEventListener("click", () => toggleView());
+  // Insertar antes del wa-conn indicator si existe.
+  const conn = header.querySelector(".wa-conn-indicator");
+  if (conn) header.insertBefore(btn, conn);
+  else header.appendChild(btn);
+}
+
+function toggleView() {
+  currentView = currentView === "archived" ? "default" : "archived";
+  document.body.classList.toggle("archived-mode", currentView === "archived");
+  const btn = document.querySelector(".wa-archive-toggle");
+  if (btn) {
+    btn.classList.toggle("active", currentView === "archived");
+    btn.title = currentView === "archived" ? "Volver a chats" : "Ver archivados";
+  }
+  load();
 }
 
 export async function load() {
   if (els.loading) els.loading.classList.remove("hidden");
   try {
-    const data = await fetchChats({ limit: 80, q: lastSearchQuery || null });
+    const data = await fetchChats({
+      limit: 80,
+      q: lastSearchQuery || null,
+      view: currentView,
+    });
     allChats = data.chats || [];
     render();
     updateStats();
@@ -101,8 +149,9 @@ function render() {
     li.dataset.jid = c.jid;
     if (c.jid === activeJID) li.classList.add("active");
     li.addEventListener("click", (ev) => {
-      // No abrir el chat si el click fue sobre el pin button.
+      // No abrir el chat si el click fue sobre pin o archive.
       if (ev.target.closest(".wa-chat-pin")) return;
+      if (ev.target.closest(".wa-chat-archive")) return;
       selectChat(c.jid);
     });
 
@@ -118,8 +167,18 @@ function render() {
       ? `<button class="wa-chat-pin" type="button" title="${pinTitle}" aria-label="${pinTitle}">${pinIcon}</button>`
       : "";
 
+    // Archive button — toggle dependiendo del view actual:
+    // - en default → "Archivar"
+    // - en archived → "Desarchivar"
+    const archTitle = c.archived ? "Desarchivar" : "Archivar";
+    const archIcon = c.archived
+      ? `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 8v13H3V8"/><rect x="1" y="3" width="22" height="5"/><polyline points="9 14 12 11 15 14"/><line x1="12" y1="11" x2="12" y2="19"/></svg>`
+      : `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 8v13H3V8"/><rect x="1" y="3" width="22" height="5"/><line x1="10" y1="12" x2="14" y2="12"/></svg>`;
+    const archBtnHTML = `<button class="wa-chat-archive" type="button" title="${archTitle}" aria-label="${archTitle}">${archIcon}</button>`;
+
     li.innerHTML = `
       ${pinBtnHTML}
+      ${archBtnHTML}
       <div class="wa-chat-avatar" data-jid="${escapeHtml(c.jid)}"></div>
       <div class="wa-chat-body">
         <div class="wa-chat-name-row">
@@ -134,6 +193,31 @@ function render() {
     `;
     const avatarEl = li.querySelector(".wa-chat-avatar");
     renderAvatar(avatarEl, c.jid, c.avatar_initials, c.label);
+    const archBtn = li.querySelector(".wa-chat-archive");
+    if (archBtn) {
+      archBtn.addEventListener("click", async (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        try {
+          if (c.archived) {
+            await unarchiveChat(c.jid);
+          } else {
+            await archiveChat(c.jid);
+          }
+          // Remove inmediato del view actual con animation suave.
+          li.style.transition = "opacity 0.18s ease, transform 0.18s ease";
+          li.style.opacity = "0";
+          li.style.transform = "translateX(20px)";
+          setTimeout(() => {
+            allChats = allChats.filter((x) => x.jid !== c.jid);
+            render();
+          }, 180);
+        } catch (e) {
+          console.error("[wa-chatlist] archive toggle failed", e);
+        }
+      });
+    }
+
     const pinBtn = li.querySelector(".wa-chat-pin");
     if (pinBtn) {
       pinBtn.addEventListener("click", async (ev) => {

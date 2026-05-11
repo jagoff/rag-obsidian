@@ -547,7 +547,10 @@ button { cursor: pointer; }
   display: flex;
   flex-direction: column;
   gap: 2px;
-  scroll-behavior: smooth;
+  /* `scroll-behavior: smooth` rompe los jumps programáticos al fondo
+   * cuando media async empuja el scrollHeight — la animación queda
+   * persiguiendo un target obsoleto. Mantenemos los jumps instant. */
+  scroll-behavior: auto;
 }
 
 .wa-empty-state {

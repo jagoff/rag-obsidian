@@ -75,14 +75,13 @@ export async function open(jid) {
     els.body.innerHTML = "";
     renderMessages(data.messages || [], data, /*prepend=*/ false);
     oldestTs = data.next_before_ts;
-    // Siempre scroll al último mensaje al abrir un chat (igual que WhatsApp Web).
-    // Hacemos triple-pasada para cubrir el caso de imágenes/audios que cargan
-    // async después del primer paint y bajan más el scrollHeight final:
-    //   1) sync inmediato (paint inicial)
-    //   2) próximo frame (layout estabilizado)
-    //   3) cuando cada <img>/<video>/<audio> dispara 'load'/'loadedmetadata'
-    scrollToBottomNow();
-    requestAnimationFrame(scrollToBottomNow);
+    // Saltamos directo al ÚLTIMO mensaje (no a `scrollTop = scrollHeight`,
+    // que depende de heights todavía sin medir cuando hay imágenes/audios
+    // con loading="lazy" / preload="metadata"). `scrollIntoView` sobre el
+    // último child anchora visualmente ahí; cuando media de mensajes
+    // anteriores carga después, re-llamamos el mismo método y volvemos
+    // a quedar pegados al último.
+    snapToLastMessage();
     wireMediaScrollKeepers(els.body);
   }
 
@@ -147,21 +146,29 @@ function renderMessages(messages, threadCtx, prepend) {
   }
 }
 
-function scrollToBottomNow() {
+function snapToLastMessage() {
   if (!els.body) return;
-  els.body.scrollTop = els.body.scrollHeight;
+  const last = els.body.lastElementChild;
+  if (last && typeof last.scrollIntoView === "function") {
+    // `block: 'end'` deja el bottom del último mensaje pegado al bottom
+    // del viewport. `behavior: 'instant'` mata cualquier smooth heredado
+    // del CSS o del polyfill.
+    last.scrollIntoView({ block: "end", behavior: "instant" });
+  } else {
+    els.body.scrollTop = els.body.scrollHeight;
+  }
 }
 
-// Mientras el user no scrollee, mantenemos el viewport en el fondo a
-// medida que las imágenes/audios cargan y empujan el scrollHeight.
-// Se autocancela apenas el user toca la rueda/touchpad o el scrollbar.
+// Mantiene el viewport pegado al último mensaje mientras las
+// imágenes/audios cargan async. Se autocancela apenas el user toca
+// wheel/touchpad o scrollea > 80px hacia arriba — para no pelearle
+// la intención.
 function wireMediaScrollKeepers(body) {
   let active = true;
   const cancel = () => { active = false; };
   body.addEventListener("wheel", cancel, { passive: true, once: true });
   body.addEventListener("touchstart", cancel, { passive: true, once: true });
   body.addEventListener("scroll", () => {
-    // si el user scrolleó hacia arriba > 80px del fondo, asumimos intent.
     if (els.body.scrollHeight - els.body.scrollTop - els.body.clientHeight > 80) {
       active = false;
     }
@@ -170,12 +177,8 @@ function wireMediaScrollKeepers(body) {
   const media = body.querySelectorAll("img, video, audio");
   for (const el of media) {
     const ev = el.tagName === "IMG" ? "load" : "loadedmetadata";
-    el.addEventListener(ev, () => {
-      if (active) scrollToBottomNow();
-    }, { once: true });
-    el.addEventListener("error", () => {
-      if (active) scrollToBottomNow();
-    }, { once: true });
+    el.addEventListener(ev, () => { if (active) snapToLastMessage(); }, { once: true });
+    el.addEventListener("error", () => { if (active) snapToLastMessage(); }, { once: true });
   }
 }
 

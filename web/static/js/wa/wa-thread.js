@@ -4,6 +4,7 @@
 import { fetchThread, markRead } from "./wa-api.js";
 import { renderInto as renderAvatar } from "./wa-avatars.js";
 import * as composer from "./wa-composer.js";
+import * as reactions from "./wa-reactions.js";
 
 const els = {
   body: null,
@@ -43,6 +44,7 @@ export function init({ bodyEl, emptyEl, nameEl, avatarEl, presenceEl, composerEl
       appendMessageIfActive(jid, message);
     },
   });
+  reactions.attach(els.body);
 }
 
 export async function open(jid) {
@@ -94,6 +96,7 @@ export async function open(jid) {
 
   currentCtx = { is_group: !!data.is_group };
   composer.setActiveChat(jid);
+  reactions.setActiveJID(jid);
 }
 
 async function onScroll() {
@@ -142,6 +145,7 @@ function renderMsg(m, ctx) {
   div.className = "wa-msg " + (m.is_from_me ? "own" : "other");
   if (m.revoked) div.classList.add("revoked");
   div.dataset.id = m.id || "";
+  div.dataset.sender = m.sender || "";
 
   if (m.revoked) {
     div.textContent = "🚫 Este mensaje fue eliminado";

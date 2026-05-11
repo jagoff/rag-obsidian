@@ -494,6 +494,57 @@ html, body {
 .wa-msg.failed .wa-msg-time {
   color: #e74c3c;
 }
+
+/* Long-press reaction menu — flotante, posicionado por JS */
+.wa-reaction-menu {
+  position: fixed;
+  z-index: 100;
+  background: var(--wa-sidebar-bg);
+  border-radius: 999px;
+  padding: 6px 8px;
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+  border: 1px solid var(--wa-divider);
+  user-select: none;
+}
+.wa-reaction-emoji,
+.wa-reaction-more {
+  background: transparent;
+  border: none;
+  font-size: 22px;
+  line-height: 1;
+  padding: 4px 6px;
+  cursor: pointer;
+  border-radius: 50%;
+  transition: transform 0.15s ease, background 0.15s ease;
+}
+.wa-reaction-emoji:hover,
+.wa-reaction-more:hover {
+  background: var(--wa-sidebar-hover);
+  transform: scale(1.2);
+}
+.wa-reaction-sep {
+  width: 1px;
+  align-self: stretch;
+  background: var(--wa-divider);
+  margin: 2px 6px;
+}
+.wa-reaction-delete {
+  background: transparent;
+  border: none;
+  color: #e74c3c;
+  font-size: 13px;
+  font-weight: 500;
+  padding: 6px 10px;
+  cursor: pointer;
+  border-radius: 6px;
+  white-space: nowrap;
+}
+.wa-reaction-delete:hover {
+  background: rgba(231, 76, 60, 0.1);
+}
 .wa-send-btn {
   background: var(--wa-green);
   color: #fff;

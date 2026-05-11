@@ -4182,6 +4182,80 @@ class _WASendRequest(BaseModel):
     reply_to: _WAReplyTo | None = None
 
 
+class _WAReactRequest(BaseModel):
+    jid: str
+    message_id: str
+    sender_jid: str
+    from_me: bool
+    emoji: str  # "" = remove
+
+
+@app.post("/api/wa/react")
+def wa_react(req: _WAReactRequest) -> dict:
+    """Reacciona a un mensaje (o remueve la reacción si emoji='').
+
+    El bridge persiste la fila en `reactions` y el SSE tail emite
+    `reaction_changed` para multi-tab sync.
+    """
+    from rag.integrations.whatsapp import bridge_client as _bc  # noqa: PLC0415
+
+    if not req.jid or "@" not in req.jid:
+        raise HTTPException(status_code=400, detail="jid inválido")
+    if not req.message_id:
+        raise HTTPException(status_code=400, detail="message_id requerido")
+    try:
+        _bc.react(req.jid, req.message_id, req.sender_jid, req.from_me, req.emoji)
+        return {"ok": True}
+    except _bc.BridgeError as e:
+        return {"ok": False, "error": str(e), "status": e.status}
+
+
+class _WARevokeRequest(BaseModel):
+    jid: str
+    message_id: str
+
+
+@app.post("/api/wa/revoke", dependencies=[Depends(_require_admin_token)])
+def wa_revoke(req: _WARevokeRequest) -> dict:
+    """Borra un mensaje propio para todos (delete-for-everyone).
+
+    Requiere admin-token — operación destructiva. El bridge persiste
+    en `revokes` y SSE emite `message_revoked`.
+    """
+    from rag.integrations.whatsapp import bridge_client as _bc  # noqa: PLC0415
+
+    if not req.jid or "@" not in req.jid:
+        raise HTTPException(status_code=400, detail="jid inválido")
+    if not req.message_id:
+        raise HTTPException(status_code=400, detail="message_id requerido")
+    try:
+        _bc.revoke(req.jid, req.message_id)
+        return {"ok": True}
+    except _bc.BridgeError as e:
+        return {"ok": False, "error": str(e), "status": e.status}
+
+
+class _WATypingRequest(BaseModel):
+    jid: str
+    state: str  # "composing" | "paused" | "recording"
+
+
+@app.post("/api/wa/typing")
+def wa_typing(req: _WATypingRequest) -> dict:
+    """Envía presence (typing/recording) al contacto. Fire-and-forget."""
+    from rag.integrations.whatsapp import bridge_client as _bc  # noqa: PLC0415
+
+    if not req.jid or "@" not in req.jid:
+        raise HTTPException(status_code=400, detail="jid inválido")
+    if req.state not in {"composing", "paused", "recording"}:
+        raise HTTPException(status_code=400, detail="state inválido")
+    try:
+        _bc.typing(req.jid, req.state)
+        return {"ok": True}
+    except _bc.BridgeError as e:
+        return {"ok": False, "error": str(e), "status": e.status}
+
+
 @app.post("/api/wa/send")
 def wa_send(req: _WASendRequest) -> dict:
     """Envía un mensaje de texto via el bridge. Soporta `reply_to` para

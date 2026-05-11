@@ -3,7 +3,7 @@
 // el SSE trae el `new_message` real con el mismo content+jid+~5s, el
 // thread la reemplaza por la versión persistida del bridge.
 
-import { sendText } from "./wa-api.js";
+import { sendText, typing as sendTyping } from "./wa-api.js";
 
 const els = {
   root: null,
@@ -29,17 +29,57 @@ export function init({ rootEl, onOptimisticInsert }) {
   els.replyBar.hidden = true;
   rootEl.insertBefore(els.replyBar, els.input);
 
-  els.input.addEventListener("input", autosize);
+  els.input.addEventListener("input", () => {
+    autosize();
+    pingTyping();
+  });
   els.input.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       submit();
     }
   });
+  els.input.addEventListener("blur", () => stopTyping());
   els.btn.addEventListener("click", submit);
 }
 
+// Typing emit: composing cada 5s mientras hay focus + texto. Auto-paused
+// si pasan 4s sin tipear o si el textarea pierde focus.
+let typingActive = false;
+let typingInterval = null;
+let typingIdleTimer = null;
+
+function pingTyping() {
+  if (!currentJID || !els.input) return;
+  const has = (els.input.value || "").trim().length > 0;
+  if (!has) {
+    stopTyping();
+    return;
+  }
+  if (!typingActive) {
+    typingActive = true;
+    sendTyping(currentJID, "composing");
+    typingInterval = setInterval(() => {
+      if (typingActive && currentJID) sendTyping(currentJID, "composing");
+    }, 5000);
+  }
+  // Reset idle: si no tipea por 4s, pausamos.
+  clearTimeout(typingIdleTimer);
+  typingIdleTimer = setTimeout(stopTyping, 4000);
+}
+
+function stopTyping() {
+  if (!typingActive) return;
+  typingActive = false;
+  clearInterval(typingInterval);
+  typingInterval = null;
+  clearTimeout(typingIdleTimer);
+  typingIdleTimer = null;
+  if (currentJID) sendTyping(currentJID, "paused");
+}
+
 export function setActiveChat(jid) {
+  stopTyping();
   currentJID = jid;
   pendingReply = null;
   hideReplyBar();
@@ -50,7 +90,6 @@ export function setActiveChat(jid) {
     autosize();
   }
   if (els.btn) els.btn.disabled = !jid;
-  if (els.root) els.root.hidden = !jid;
 }
 
 export function setReply(replyTo) {
@@ -120,6 +159,7 @@ async function submit() {
   els.input.value = "";
   autosize();
   setReply(null);
+  stopTyping();
   els.btn.disabled = true;
 
   try {

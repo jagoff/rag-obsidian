@@ -44,6 +44,40 @@ export async function sendText(jid, text, replyTo = null) {
   return jsonPOST("/api/wa/send", body);
 }
 
+export async function react(jid, messageId, senderJid, fromMe, emoji) {
+  return jsonPOST("/api/wa/react", {
+    jid,
+    message_id: messageId,
+    sender_jid: senderJid || "",
+    from_me: !!fromMe,
+    emoji: emoji || "",
+  });
+}
+
+export async function revoke(jid, messageId, adminToken) {
+  const r = await fetch("/api/wa/revoke", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...(adminToken ? { "Authorization": `Bearer ${adminToken}` } : {}),
+    },
+    credentials: "same-origin",
+    body: JSON.stringify({ jid, message_id: messageId }),
+  });
+  if (!r.ok) throw new Error(`POST /api/wa/revoke → ${r.status}`);
+  return r.json();
+}
+
+export async function typing(jid, state) {
+  // Fire-and-forget; los errores los swallow para no romper UX.
+  try {
+    return await jsonPOST("/api/wa/typing", { jid, state });
+  } catch (e) {
+    console.debug("[wa-api] typing failed (ignored)", e);
+    return { ok: false };
+  }
+}
+
 // Health del bridge — usado por el indicador visual del header.
 export async function bridgeHealth() {
   try {

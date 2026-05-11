@@ -57,17 +57,18 @@ def health_probe_web(
     host: str = "127.0.0.1",
     port: int = 8765,
     timeout: float = 2.0,
-    retries: int = 6,
-    retry_delay: float = 1.5,
+    retries: int = 15,
+    retry_delay: float = 2.0,
 ) -> tuple[bool, int]:
     """Probe a /health del web server. Retorna (ok, latency_ms).
 
-    Retry budget total: `retries * retry_delay + retries * timeout` ≈ 21s
-    (default 6 × 1.5s sleep + 6 × 2s timeout). Cubre el warmup MLX típico
-    del web (~3-5s carga chat + embedder + reranker) post-bootstrap. Si
-    el web realmente está down el probe gasta ~21s antes de declararlo
-    muerto — costo aceptable comparado con falso negativo "no respondió"
-    cuando el server está perfectamente vivo en warmup.
+    Retry budget total: `retries * retry_delay + retries * timeout` ≈ 60s
+    (default 15 × 2s sleep + 15 × 2s timeout). El warmup MLX del web
+    incluye chat (~2s) + embedder (~3-6s) + reranker (~2s) + corpus
+    prewarm (variable, hasta 30s en vaults grandes) — total puede llegar
+    a ~30-45s en el peor caso. Budget de 60s da margen para no falsos
+    negativos. Si el web realmente está down el probe gasta hasta 60s
+    antes de declararlo muerto.
 
     ok=True si responde 200 dentro del budget; False si todos los intentos
     fallan. latency_ms=0 si nunca conectó.

@@ -314,7 +314,22 @@ def _setup_install(
     _domain = f"gui/{_uid}"
 
     def _bootout(plist_path: Path, label: str) -> None:
-        """`launchctl bootout` reemplazo de `launchctl unload`."""
+        """`launchctl bootout` + wait until el daemon está REALMENTE gone.
+
+        `launchctl bootout` devuelve sync (el subprocess termina) pero el
+        teardown interno de launchd queda en flight — el daemon puede seguir
+        listado por 1-3s mientras drena. Si bootstrappeamos en esa ventana,
+        macOS Sequoia devuelve EIO 5 ("Input/output error") porque ve el
+        slot ocupado por el daemon viejo en death throes.
+
+        Fix: poll `launchctl list` hasta que el label DESAPAREZCA (max 3s).
+        Eso garantiza que el bootstrap subsiguiente trabaje contra un slot
+        limpio. Si el label nunca desaparece (daemon zombie), seguimos
+        adelante igual — el bootstrap fallará ruidosamente y el caller lo
+        verá.
+        """
+        from rag.cli.daemons_control import _loaded_launchd_labels  # noqa: PLC0415
+        import time as _time  # noqa: PLC0415
         try:
             subprocess.run(
                 ["launchctl", "bootout", f"{_domain}/{label}"],
@@ -322,7 +337,13 @@ def _setup_install(
                 capture_output=True,
             )
         except Exception:
-            pass
+            return
+        # Poll hasta 3s o hasta que el label desaparezca.
+        deadline = _time.time() + 3.0
+        while _time.time() < deadline:
+            if label not in _loaded_launchd_labels():
+                return
+            _time.sleep(0.1)
 
     for deprecated in _DEPRECATED_LABELS:
         dep_plist = _LAUNCH_AGENTS_DIR / f"{deprecated}.plist"
@@ -402,13 +423,24 @@ def _setup_install(
 
             res = _bootstrap_once()
             if res.returncode not in (0, 37):
-                if label in _loaded_launchd_labels():
-                    # EIO 5 silencioso == "already loaded".
-                    res.returncode = 0
-                else:
-                    time.sleep(0.5)
-                    res = _bootstrap_once()
-                    if res.returncode not in (0, 37) and label in _loaded_launchd_labels():
+                # IMPORTANTE: NO trustear `_loaded_launchd_labels()` acá
+                # porque venimos de bootouttear este mismo label hace ~ms.
+                # El daemon listado puede ser el viejo en death throes,
+                # NO uno nuevo recién bootstrappeado. Bug detectado
+                # 2026-05-10: el check de "ya cargado" reportaba ✓ falso
+                # cuando el bootstrap realmente había fallado, dejando
+                # los daemons sin levantar.
+                #
+                # Recovery correcto: sleep + retry bootstrap. Si después del
+                # retry sigue fallando Y el label aparece cargado, ahí sí
+                # confiar (el daemon nuevo respondió al retry, el listado
+                # es legítimo). El _bootout() previo ya esperó a que el
+                # daemon viejo desaparezca, así que en este punto no debería
+                # haber zombies.
+                time.sleep(0.5)
+                res = _bootstrap_once()
+                if res.returncode not in (0, 37):
+                    if label in _loaded_launchd_labels():
                         res.returncode = 0
 
             if res.returncode in (0, 37):

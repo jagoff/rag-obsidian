@@ -3,7 +3,7 @@
 // el SSE trae el `new_message` real con el mismo content+jid+~5s, el
 // thread la reemplaza por la versión persistida del bridge.
 
-import { sendText, typing as sendTyping } from "./wa-api.js";
+import { sendText, typing as sendTyping, toneShift } from "./wa-api.js";
 import { uploadMedia } from "./wa-media.js";
 import * as voice from "./wa-voice.js";
 
@@ -12,11 +12,17 @@ const els = {
   input: null,
   btn: null,
   replyBar: null,
+  toneBar: null,
 };
 
 let currentJID = null;
 let pendingReply = null; // {message_id, original_text, sender_jid}
 let onOptimisticInsertCb = null;
+
+// Tone shifter: stack de undos para back/forward entre tonos. Cada entry
+// es el texto del input ANTES del shift. La undo button vuelve al
+// previous, no necesariamente al original (si aplicaste 2 shifts encadenados).
+let toneUndoStack = [];
 
 export function init({ rootEl, onOptimisticInsert }) {
   els.root = rootEl;
@@ -28,10 +34,15 @@ export function init({ rootEl, onOptimisticInsert }) {
   // Reply bar se crea lazy en setReply(); cuando no hay reply
   // activo no queda DOM ruido.
 
+  // Tone shifter chips — se montan lazy debajo del textarea. Hidden
+  // hasta que el textarea tenga contenido.
+  mountToneBar();
+
   els.input.addEventListener("input", () => {
     autosize();
     pingTyping();
     scheduleDraftCheck();
+    updateToneBarVisibility();
   });
   els.input.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -187,6 +198,11 @@ export function setActiveChat(jid) {
   voice.setActiveJID(jid);
   currentJID = jid;
   pendingReply = null;
+  // Switch de chat resetea el undo stack del tone shifter — el texto
+  // que estaba en el composer pertenecía al chat anterior.
+  toneUndoStack = [];
+  refreshUndoBtn();
+  updateToneBarVisibility();
   hideReplyBar();
   clearDraftBadge();
   // El composer usa la class `.idle` (no `disabled` HTML) para que la
@@ -376,6 +392,9 @@ async function submit() {
   setReply(null);
   clearDraftBadge();
   stopTyping();
+  // Send → reset tone undo stack (msg ya fue).
+  toneUndoStack = [];
+  updateToneBarVisibility();
   if (els.btn) els.btn.classList.add("sending");
 
   try {
@@ -408,4 +427,125 @@ function markFailed(tempId, reason) {
   el.classList.add("failed");
   const t = el.querySelector(".wa-msg-time");
   if (t) t.textContent = `falló: ${reason}`;
+}
+
+
+// ─────────────────────────────────────────────────────────────
+// Tone shifter (chips debajo del composer)
+// ─────────────────────────────────────────────────────────────
+//
+// 4 chips: +formal · +casual · +corto · +cariñoso.
+// - Hidden cuando el textarea está vacío.
+// - Click → fetch /api/wa/tone-shift → reemplaza input + push undo.
+// - Botón "↺" aparece después del primer shift; pop del stack.
+// - Mientras espera el LLM, chip muestra spinner inline y disables todos.
+//
+// Innovador porque ningún cliente reescribe contextual el draft. El
+// LLM ya está warm (qwen2.5:3b), call cuesta 1-2s warm, cached
+// instant para back/forward.
+
+const _TONES = [
+  { id: "formal", label: "+ formal", title: "Más formal y prolijo" },
+  { id: "casual", label: "+ casual", title: "Más relajado e informal" },
+  { id: "short", label: "+ corto", title: "Más corto y directo" },
+  { id: "warm", label: "+ cariñoso", title: "Más cálido" },
+];
+
+function mountToneBar() {
+  if (!els.root || els.toneBar) return;
+  const bar = document.createElement("div");
+  bar.className = "wa-tone-bar";
+  bar.hidden = true;
+  for (const t of _TONES) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "wa-tone-chip";
+    btn.dataset.tone = t.id;
+    btn.title = t.title;
+    btn.textContent = t.label;
+    btn.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      applyTone(t.id);
+    });
+    bar.appendChild(btn);
+  }
+  // Undo button — hidden hasta que haya algo en el stack.
+  const undo = document.createElement("button");
+  undo.type = "button";
+  undo.className = "wa-tone-undo";
+  undo.title = "Revertir al texto anterior";
+  undo.textContent = "↺";
+  undo.hidden = true;
+  undo.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    undoTone();
+  });
+  bar.appendChild(undo);
+  // Insertar después del textarea (antes del kbd hint si existe).
+  const inputEl = els.input;
+  if (inputEl && inputEl.parentNode) {
+    inputEl.parentNode.insertBefore(bar, inputEl.nextSibling);
+  } else {
+    els.root.appendChild(bar);
+  }
+  els.toneBar = bar;
+}
+
+function updateToneBarVisibility() {
+  if (!els.toneBar || !els.input) return;
+  const has = (els.input.value || "").trim().length > 0;
+  els.toneBar.hidden = !has;
+  // Reset undo stack si el user borró todo a mano.
+  if (!has && toneUndoStack.length) toneUndoStack = [];
+  refreshUndoBtn();
+}
+
+function refreshUndoBtn() {
+  if (!els.toneBar) return;
+  const undo = els.toneBar.querySelector(".wa-tone-undo");
+  if (!undo) return;
+  undo.hidden = toneUndoStack.length === 0;
+}
+
+async function applyTone(tone) {
+  if (!els.input || !els.toneBar) return;
+  const text = (els.input.value || "").trim();
+  if (!text) return;
+  const chips = els.toneBar.querySelectorAll(".wa-tone-chip");
+  const target = els.toneBar.querySelector(`[data-tone="${tone}"]`);
+  // UI: disable mientras corre + highlight el target con shimmer.
+  chips.forEach((c) => { c.disabled = true; });
+  if (target) target.classList.add("loading");
+  try {
+    const data = await toneShift(text, tone);
+    if (!data || !data.shifted) throw new Error("respuesta vacía");
+    // Push undo del texto previo.
+    toneUndoStack.push(text);
+    if (toneUndoStack.length > 5) toneUndoStack.shift();
+    els.input.value = data.shifted;
+    autosize();
+    refreshUndoBtn();
+    // Si el LLM devolvió el mismo texto (noop), feedback visual.
+    if (data.noop && target) {
+      target.classList.add("noop");
+      setTimeout(() => target.classList.remove("noop"), 1200);
+    }
+  } catch (e) {
+    console.error("[wa-composer] tone-shift failed", e);
+    if (target) target.classList.add("error");
+    setTimeout(() => target?.classList.remove("error"), 1500);
+  } finally {
+    chips.forEach((c) => { c.disabled = false; });
+    if (target) target.classList.remove("loading");
+    els.input.focus();
+  }
+}
+
+function undoTone() {
+  if (!els.input || toneUndoStack.length === 0) return;
+  const prev = toneUndoStack.pop();
+  els.input.value = prev;
+  autosize();
+  refreshUndoBtn();
+  els.input.focus();
 }

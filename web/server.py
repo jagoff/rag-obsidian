@@ -4180,6 +4180,36 @@ def wa_thread(jid: str, limit: int = 50, before_ts: str | None = None) -> dict:
     return _wa_fetch.fetch_thread_for_ui(jid, limit=limit, before_ts=before_ts)
 
 
+class _WAToneShiftRequest(BaseModel):
+    text: str
+    tone: str  # "formal" | "casual" | "short" | "warm"
+
+
+@app.post("/api/wa/tone-shift")
+def wa_tone_shift(req: _WAToneShiftRequest) -> dict:
+    """Reescribe `text` en `tone` vía qwen2.5:3b MLX. Cache por
+    (text, tone) — re-pegar entre tonos es instant para back/forward.
+
+    Devuelve `{shifted, tone, noop}`. `noop=True` cuando el LLM
+    devolvió el mismo input (texto ya está en ese tono).
+    """
+    from rag.integrations.whatsapp import tone_shift as _wa_tone  # noqa: PLC0415
+
+    text = (req.text or "").strip()
+    tone = (req.tone or "").strip().lower()
+    if not text:
+        raise HTTPException(status_code=400, detail="text requerido")
+    if tone not in ("formal", "casual", "short", "warm"):
+        raise HTTPException(
+            status_code=400,
+            detail="tone debe ser formal|casual|short|warm",
+        )
+    result = _wa_tone.shift_tone(text, tone)
+    if result is None:
+        raise HTTPException(status_code=500, detail="tone-shift failed")
+    return result
+
+
 class _WATranslateRequest(BaseModel):
     msg_id: str | None = ""
     content: str

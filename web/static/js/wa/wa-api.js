@@ -89,6 +89,20 @@ export async function unpinChat(jid) {
   return r.json();
 }
 
+export async function toneShift(text, tone) {
+  const r = await fetch("/api/wa/tone-shift", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    credentials: "same-origin",
+    body: JSON.stringify({ text, tone }),
+  });
+  if (!r.ok) {
+    const txt = await r.text().catch(() => "");
+    throw new Error(`tone-shift ${r.status}${txt ? " — " + txt.slice(0, 100) : ""}`);
+  }
+  return r.json();
+}
+
 export async function translate(msgId, content) {
   const r = await fetch("/api/wa/translate", {
     method: "POST",

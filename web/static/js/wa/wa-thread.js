@@ -290,15 +290,13 @@ function renderMsg(m, ctx) {
     return div;
   }
 
-  // Sender label arriba de cada mensaje inbound. Antes solo en grupos;
-  // pedido user 2026-05-11 "quiero que todos los mensajes se vean asi,
-  // nombre arriba, texto abajo, hora de envio" → extender a 1-on-1.
-  // Propios no llevan label (el alineamiento + color de la burbuja ya
-  // los distingue, mismo criterio que el render previo de grupos).
-  if (!m.is_from_me && m.sender_label) {
+  // Sender label arriba de cada mensaje (inbound + outbound). Pedido
+  // user 2026-05-11: en propios va "Yo" como label uniforme; en
+  // inbound el nombre resuelto via push_name → Apple Contacts → vault.
+  if (m.sender_label) {
     const sender = document.createElement("div");
     sender.className = "wa-msg-sender";
-    sender.textContent = m.sender_label;
+    sender.textContent = m.is_from_me ? "Yo" : m.sender_label;
     div.appendChild(sender);
   }
 

@@ -681,6 +681,15 @@ button { cursor: pointer; }
   color: var(--link);
   margin-bottom: 2px;
 }
+/* En burbujas propias el label "Yo" va con un tono más sutil — el
+   `--link` cyan resalta sobre el fondo verde-oscuro y se ve agresivo.
+   Misma lógica que `.wa-msg.own .wa-msg-time` (líneas abajo). */
+.wa-msg.own .wa-msg-sender {
+  color: rgba(233, 237, 239, 0.85);
+}
+[data-theme="light"] .wa-msg.own .wa-msg-sender {
+  color: rgba(0, 0, 0, 0.65);
+}
 
 .wa-msg-quoted {
   background: var(--bg-quoted);

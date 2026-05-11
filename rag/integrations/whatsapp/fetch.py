@@ -407,24 +407,47 @@ def _wa_chat_label(raw_name: str, jid: str) -> str:
 def _wa_display_name(jid: str, raw_name: str = "") -> str:
     """JID → nombre legible para UI.
 
-    Pedido user 2026-05-11 "quiero que los nombres se muestren tal cual
-    se ven en los grupos": el bridge name (push_name del peer, lo que
-    aparece en WhatsApp Web) gana sobre el contact note del vault.
-    Antes el vault era primary y a veces mostraba un nick ("Mama")
-    distinto del nombre que ves en el grupo. Ahora chain:
+    Pedidos user 2026-05-11:
+    (a) "quiero que los nombres se muestren tal cual se ven en los grupos"
+        → bridge push_name primary cuando tiene letras.
+    (b) "sigo viendo los nombres solo en los grupos" → cuando el peer
+        NO setea push_name, el bridge guarda solo dígitos y antes
+        salía "Contacto …8405". Ahora probamos Apple Contacts (que es
+        donde el user tiene a sus contactos saved) por digits del jid
+        — lo mismo que hace WhatsApp en el phone cuando matchea el
+        número con la libreta.
 
-      (1) bridge name si tiene letras (alpha) — `Grecia 🩷`, `Juan P.`
-      (2) contact note del vault — solo si el bridge no aporta nada
-      (3) `Contacto …<last4>` fallback final
+    Chain final:
+      (1) bridge name si tiene letras (alpha) → `Grecia 🩷`, `Juan P.`
+      (2) Apple Contacts por phone digits → `Hikari sushi`, `Oscar F.`
+      (3) contact note del vault (`99-Contacts/<X>.md` con `wa_jid:`)
+      (4) `Contacto …<last4>` fallback final
 
     El bridge guarda el `sender` de mensajes de grupo a veces como JID
     completo (`123@lid` / `123@s.whatsapp.net`) y a veces como bare
-    local-part (`123`); para el fallback (2) probamos las 3 variantes
-    para que el lookup matchee `wa_jid: 123@lid` o `wa_jid: 123@s.wa`.
+    local-part (`123`); para (3) probamos las 3 variantes para que el
+    lookup matchee `wa_jid: 123@lid` o `wa_jid: 123@s.wa`.
     """
     name = (raw_name or "").strip()
     if name and any(ch.isalpha() for ch in name):
         return name
+    # Apple Contacts lookup por dígitos del JID. Solo aplica a
+    # `@s.whatsapp.net` (LIDs no tienen relación con el número real).
+    if jid and "@s.whatsapp.net" in jid:
+        digits = jid.split("@")[0]
+        if digits.isdigit():
+            try:
+                from rag import _load_contacts_phone_index  # noqa: PLC0415
+                idx = _load_contacts_phone_index()
+                # Probamos full digits + suffixes progresivos. El index
+                # guarda tanto "5493424868405" (full) como "24868405"
+                # (local 8 dígitos), así que ambos pegan al cache.
+                for k in (digits, digits[-10:], digits[-8:]):
+                    apple = idx.get(k)
+                    if apple and any(ch.isalpha() for ch in apple):
+                        return apple
+            except Exception:
+                pass
     if jid:
         try:
             from rag.integrations.whatsapp.voice_notes import (  # noqa: PLC0415

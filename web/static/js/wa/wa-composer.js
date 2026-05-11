@@ -25,11 +25,8 @@ export function init({ rootEl, onOptimisticInsert }) {
   els.btn = rootEl.querySelector(".wa-send-btn");
   onOptimisticInsertCb = onOptimisticInsert;
 
-  // Inserto bar de reply preview justo arriba del textarea.
-  els.replyBar = document.createElement("div");
-  els.replyBar.className = "wa-reply-bar";
-  els.replyBar.hidden = true;
-  rootEl.insertBefore(els.replyBar, els.input);
+  // Reply bar se crea lazy en setReply(); cuando no hay reply
+  // activo no queda DOM ruido.
 
   els.input.addEventListener("input", () => {
     autosize();
@@ -206,12 +203,16 @@ export function setActiveChat(jid) {
 
 export function setReply(replyTo) {
   pendingReply = replyTo;
-  if (!els.replyBar) return;
   if (!replyTo) {
     hideReplyBar();
     return;
   }
-  els.replyBar.hidden = false;
+  if (!els.replyBar) {
+    if (!els.root || !els.input) return;
+    els.replyBar = document.createElement("div");
+    els.replyBar.className = "wa-reply-bar";
+    els.root.insertBefore(els.replyBar, els.input);
+  }
   els.replyBar.innerHTML = `
     <div class="wa-reply-bar-text">
       <strong>Respondiendo a:</strong>
@@ -228,8 +229,8 @@ export function setReply(replyTo) {
 
 function hideReplyBar() {
   if (els.replyBar) {
-    els.replyBar.hidden = true;
-    els.replyBar.innerHTML = "";
+    els.replyBar.remove();
+    els.replyBar = null;
   }
 }
 

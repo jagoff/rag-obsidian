@@ -351,10 +351,16 @@ def _parse_vault_contact(path: Path, text: str | None = None) -> dict:
         # "- **Label**: value" — el label es regex (puede traer sets como
         # `[eé]` para tolerancia a acentos). NO escapamos corchetes a
         # propósito; el caller pasa labels seguras / hardcodeadas.
+        # Uso `[ \t]*` (horizontal whitespace) en vez de `\s*` para NO
+        # cruzar newlines. Bug 2026-05-11: `\s*` después del `:` era
+        # greedy y consumía `\n` + línea siguiente cuando el bullet
+        # estaba vacío (ej. `- **Apodo**:`), capturando como value el
+        # contenido del bullet de abajo. Síntoma: `short_name` salía
+        # como literal `- **Apellido / nombre completo**: Erica Franzen`.
         pattern = (
-            r"^-\s*\*\*\s*"
+            r"^-[ \t]*\*\*[ \t]*"
             + label
-            + r"\s*\*\*\s*:\s*(.+)$"
+            + r"[ \t]*\*\*[ \t]*:[ \t]*(.*)$"
         )
         m = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
         return m.group(1).strip() if m else ""

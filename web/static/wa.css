@@ -265,6 +265,9 @@ button { cursor: pointer; }
   flex-direction: column;
   gap: 6px;
 }
+/* Cuando el mode toggle (FTS/Semantic) está oculto, el box queda con
+   el alto canónico del input (--search-h = 49px). Cuando aparece el
+   toggle, crece naturalmente sin afectar el alto del input. */
 .wa-search-mode {
   display: inline-flex;
   gap: 4px;
@@ -291,18 +294,36 @@ button { cursor: pointer; }
   font-weight: 600;
 }
 .wa-search-box input[type="search"] {
-  flex: 1;
+  /* `appearance: none` saca los chrome decorations default del browser
+     (clear cross, border radius redondo, padding asimétrico) que
+     descuadran el alto comparado con los demás inputs del sistema. */
+  appearance: none;
+  -webkit-appearance: none;
+  box-sizing: border-box;
+  width: 100%;
+  flex: 0 0 auto;
   height: 35px;
   background: var(--bg-input);
   border: 0;
   border-radius: var(--radius-input);
   padding: 0 14px 0 38px;
+  margin: 0;
   color: var(--text-primary);
   font-size: var(--fs-md);
+  font-family: inherit;
+  line-height: 1;
   outline: none;
   background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='18' height='18' viewBox='0 0 24 24' fill='none' stroke='%238696a0' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><circle cx='11' cy='11' r='7'/><line x1='21' y1='21' x2='16.65' y2='16.65'/></svg>");
   background-repeat: no-repeat;
   background-position: 12px center;
+}
+.wa-search-box input[type="search"]::-webkit-search-decoration,
+.wa-search-box input[type="search"]::-webkit-search-cancel-button,
+.wa-search-box input[type="search"]::-webkit-search-results-button,
+.wa-search-box input[type="search"]::-webkit-search-results-decoration {
+  -webkit-appearance: none;
+  appearance: none;
+  display: none;
 }
 .wa-search-box input[type="search"]::placeholder { color: var(--text-secondary); }
 .wa-search-box input[type="search"]:focus { box-shadow: inset 0 0 0 1px var(--accent); }

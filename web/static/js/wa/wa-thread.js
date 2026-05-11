@@ -107,6 +107,57 @@ export async function open(jid) {
   currentCtx = { is_group: !!data.is_group };
   composer.setActiveChat(jid);
   reactions.setActiveJID(jid);
+
+  // Auto-resume del gap (≥24h sin leer, ≥5 msgs inbound nuevos).
+  // Llamada async POST-render — el thread ya está pintado, el resume
+  // aparece pinned arriba cuando el LLM termina (2-5s). Si no hay gap
+  // o falla el LLM, no hace nada.
+  loadGapSummary(jid).catch((e) => console.warn("[wa-thread] gap-summary fail", e));
+}
+
+async function loadGapSummary(jid) {
+  // Skip si el thread cambió mientras esperábamos.
+  const captureJID = jid;
+  let resp;
+  try {
+    resp = await fetch(`/api/wa/thread/${encodeURIComponent(jid)}/gap-summary`, {
+      credentials: "same-origin",
+    });
+  } catch (_) {
+    return;
+  }
+  if (!resp.ok) return;
+  const data = await resp.json().catch(() => null);
+  if (!data || !data.summary) return;
+  if (currentJID !== captureJID) return; // user cambió de chat
+  renderGapSummary(data.summary);
+}
+
+function renderGapSummary(s) {
+  if (!els.body) return;
+  // Si ya hay un pin previo (caso re-open mismo chat), reemplazar.
+  const old = document.getElementById("wa-gap-pin");
+  if (old) old.remove();
+  const pin = document.createElement("div");
+  pin.id = "wa-gap-pin";
+  pin.className = "wa-gap-pin" + (s.urgent ? " urgent" : "");
+  const head = document.createElement("div");
+  head.className = "wa-gap-pin-head";
+  head.innerHTML = `<span class="wa-gap-pin-icon">${s.urgent ? "🔴" : "📌"}</span>`
+    + `<span class="wa-gap-pin-label">Te perdiste ${s.hours_ago}h · ${s.msgs_count} msgs nuevos</span>`
+    + `<button class="wa-gap-pin-close" type="button" title="ocultar">×</button>`;
+  pin.appendChild(head);
+  for (const line of s.summary) {
+    const ln = document.createElement("div");
+    ln.className = "wa-gap-pin-line";
+    ln.textContent = line;
+    pin.appendChild(ln);
+  }
+  head.querySelector(".wa-gap-pin-close").addEventListener("click", () => {
+    pin.remove();
+  });
+  // Insertar al principio del body (antes del primer day-divider / msg).
+  els.body.insertBefore(pin, els.body.firstChild);
 }
 
 async function onScroll() {

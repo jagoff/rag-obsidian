@@ -4156,6 +4156,49 @@ def wa_thread(jid: str, limit: int = 50, before_ts: str | None = None) -> dict:
     return _wa_fetch.fetch_thread_for_ui(jid, limit=limit, before_ts=before_ts)
 
 
+@app.get("/api/wa/thread/{jid}/gap-summary")
+def wa_gap_summary(
+    jid: str,
+    unread: int = 5,
+    hours: int = 24,
+) -> dict:
+    """Auto-resume del gap inbound desde el último `last_seen_ts` del user.
+
+    Llama al helper LLM (qwen2.5:3b MLX in-process) cuando hay >=`unread`
+    msgs nuevos Y el gap >= `hours` horas. Cache process-level por
+    (jid, latest_msg_id) — re-pegar al endpoint con el mismo estado
+    devuelve el cacheado en <1ms.
+
+    Devuelve:
+    - `{summary: [str], urgent: bool, msgs_count, hours_ago, last_msg_id}`
+      cuando el gap califica.
+    - `null` cuando no hay gap (poca actividad o user vio el chat
+      recientemente).
+
+    Endpoint separado del fetch principal del thread para no bloquear
+    el render con 2-5s de LLM call.
+    """
+    from rag.integrations.whatsapp import (  # noqa: PLC0415
+        fetch as _wa_fetch,
+        gap_summary as _gap,
+    )
+
+    if not jid or "@" not in jid:
+        raise HTTPException(status_code=400, detail="jid inválido")
+    # Resolver label para el prompt (mejor que el JID raw).
+    try:
+        chat_label = _wa_fetch._wa_display_name(jid, "")
+    except Exception:
+        chat_label = jid.split("@")[0]
+    summary = _gap.summarize_gap(
+        jid,
+        threshold_unread=max(1, int(unread)),
+        threshold_hours=max(1, int(hours)),
+        label=chat_label,
+    )
+    return {"summary": summary}
+
+
 class _WAMarkReadRequest(BaseModel):
     jid: str
     last_seen_ts: str | None = None

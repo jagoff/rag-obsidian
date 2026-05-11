@@ -1398,6 +1398,66 @@ button { cursor: pointer; }
   border-radius: 2px;
 }
 .wa-search-ts { font-variant-numeric: tabular-nums; }
+
+/* ─── Gap summary pin (auto-resume) ──────────────────────────────────
+   Banner arriba del thread cuando el user vuelve después de ≥24h
+   con ≥5 msgs inbound nuevos. 3 líneas con el resume del LLM
+   (qwen2.5:3b). Variante `.urgent` con borde rojo cuando el peer
+   mencionó deadline / queja / pregunta repetida sin respuesta. */
+.wa-gap-pin {
+  margin: 6px auto 12px;
+  width: calc(100% - 16px);
+  max-width: 640px;
+  padding: 10px 14px;
+  background: var(--bg-quoted, rgba(255,255,255,0.04));
+  border-left: 3px solid var(--accent, #06d6a0);
+  border-radius: 6px;
+  font-size: 13.5px;
+  line-height: 1.4;
+  color: var(--text-primary);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+}
+.wa-gap-pin.urgent {
+  border-left-color: var(--red, #f15c6d);
+  background: rgba(241, 92, 109, 0.06);
+}
+.wa-gap-pin-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 6px;
+}
+.wa-gap-pin-icon { font-size: 14px; }
+.wa-gap-pin-label { flex: 1; }
+.wa-gap-pin-close {
+  background: transparent;
+  border: 0;
+  color: var(--text-secondary);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 4px;
+  border-radius: 4px;
+}
+.wa-gap-pin-close:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.06);
+}
+.wa-gap-pin-line {
+  margin: 2px 0;
+}
+.wa-gap-pin-line::before {
+  content: "•";
+  color: var(--accent, #06d6a0);
+  margin-right: 6px;
+}
+.wa-gap-pin.urgent .wa-gap-pin-line::before {
+  color: var(--red, #f15c6d);
+}
 .wa-search-score {
   margin-left: 6px;
   font-size: 10px;

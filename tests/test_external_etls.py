@@ -67,6 +67,66 @@ def test_read_chrome_visits_returns_empty_when_db_missing(tmp_path):
     assert rag._read_chrome_visits(tmp_path / "nope.db") == []
 
 
+def test_chrome_history_paths_single_when_legacy_overridden(tmp_path):
+    """Cuando `_CHROME_HISTORY_PATH` está monkeypatched (test mode),
+    `_chrome_history_paths()` devuelve SOLO esa entry single — sin
+    walk de ~/Library/.../Chrome (test isolation tight).
+    """
+    fake = tmp_path / "History"
+    fake.write_bytes(b"")  # valid file
+    with patch.object(rag, "_CHROME_HISTORY_PATH", fake):
+        paths = rag._chrome_history_paths()
+    assert paths == [("Default", fake)]
+
+
+def test_chrome_history_paths_empty_when_legacy_missing(tmp_path):
+    """Monkeypatched a path inexistente → list vacía."""
+    with patch.object(rag, "_CHROME_HISTORY_PATH", tmp_path / "absent"):
+        paths = rag._chrome_history_paths()
+    assert paths == []
+
+
+def test_sync_chrome_history_merges_two_profiles(tmp_path, monkeypatch):
+    """Multi-profile: simulamos 2 Chrome flavors (Chrome stable + Canary),
+    cada uno con un seeded `History`. `_sync_chrome_history` deduplica
+    URLs idénticas y mergea las distintas.
+    """
+    # Stub _chrome_history_paths para devolver 2 DBs simuladas — bypassa
+    # la lectura real de ~/Library/...
+    db_stable = tmp_path / "stable" / "History"
+    db_stable.parent.mkdir()
+    db_canary = tmp_path / "canary" / "History"
+    db_canary.parent.mkdir()
+    now = time.time()
+    fresh = rag._unix_to_chrome_ts(now - 1800)  # 30min ago
+    _seed_chrome_db(db_stable, [
+        (1, "https://example.com/post", "Stable Post", 5, fresh),
+        (2, "https://shared.com/article", "Shared via stable", 2,
+         rag._unix_to_chrome_ts(now - 7200)),  # 2h ago
+    ])
+    _seed_chrome_db(db_canary, [
+        (1, "https://canary-only.com/x", "Canary only", 3, fresh),
+        (2, "https://shared.com/article", "Shared via canary", 4,
+         rag._unix_to_chrome_ts(now - 600)),  # 10min ago — más reciente
+    ])
+    monkeypatch.setattr(
+        rag, "_chrome_history_paths",
+        lambda: [("Default", db_stable), ("Canary/Default", db_canary)],
+    )
+
+    stats = rag._sync_chrome_history(tmp_path)
+    assert stats["ok"] is True
+    # 3 URLs únicas: example.com (stable), canary-only (canary), shared (deduped)
+    assert stats["urls"] == 3
+    today = time.strftime("%Y-%m-%d")
+    chrome_md = (tmp_path / "99-obsidian/99-AI/external-ingest/Chrome" / f"{today}.md").read_text()
+    assert "Stable Post" in chrome_md
+    assert "Canary only" in chrome_md
+    # Shared URL: el title del profile con MAYOR ts gana (canary, 10min ago).
+    assert "Shared via canary" in chrome_md
+    assert "Shared via stable" not in chrome_md
+
+
 def test_sync_chrome_history_writes_chrome_and_youtube(tmp_path):
     db = tmp_path / "History"
     now = time.time()

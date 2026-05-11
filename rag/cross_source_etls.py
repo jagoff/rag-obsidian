@@ -90,6 +90,8 @@ __all__ = [
     # OAuth / Chrome helpers
     "_harden_oauth_cache_perms",
     "_CHROME_HISTORY_PATH",
+    "_CHROME_FLAVORS",
+    "_chrome_history_paths",
     "_CHROME_EPOCH_OFFSET_S",
     "_CHROME_SKIP_PREFIXES",
     "_CHROME_SKIP_PATTERNS",
@@ -456,10 +458,12 @@ from rag.integrations.google_apis import (  # noqa: F401, E402
 # monkeypatches en `tests/test_external_etls.py`.
 from rag.integrations.chrome_history import (  # noqa: F401, E402
     _CHROME_EPOCH_OFFSET_S,
+    _CHROME_FLAVORS,
     _CHROME_HISTORY_PATH,
     _CHROME_SKIP_PATTERNS,
     _CHROME_SKIP_PREFIXES,
     _CHROME_VAULT_SUBPATH,
+    _chrome_history_paths,
     _read_chrome_visits,
     _sync_chrome_history,
     _unix_to_chrome_ts,

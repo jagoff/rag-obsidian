@@ -42,10 +42,12 @@ from rag._constants import _EXTERNAL_INGEST_BASE
 __all__ = [
     "_CHROME_VAULT_SUBPATH",
     "_CHROME_HISTORY_PATH",
+    "_CHROME_FLAVORS",
     "_CHROME_EPOCH_OFFSET_S",
     "_CHROME_SKIP_PREFIXES",
     "_CHROME_SKIP_PATTERNS",
     "_unix_to_chrome_ts",
+    "_chrome_history_paths",
     "_read_chrome_visits",
     "_sync_chrome_history",
 ]
@@ -53,6 +55,18 @@ __all__ = [
 _CHROME_VAULT_SUBPATH = f"{_EXTERNAL_INGEST_BASE}/Chrome"
 
 _CHROME_HISTORY_PATH = Path.home() / "Library/Application Support/Google/Chrome/Default/History"
+# Chrome-family flavors instalados típicamente bajo `~/Library/Application Support/`.
+# Cada uno puede tener varios profiles ("Default", "Profile 1", "Profile 2", ...).
+# El label vacío significa Chrome stable (no se prefija el label en la attribution);
+# los demás se prefijan ("Canary/Default", "Beta/Profile 1") para no confundir.
+_CHROME_FLAVORS: tuple[tuple[str, str], ...] = (
+    ("Google/Chrome", ""),
+    ("Google/Chrome Canary", "Canary"),
+    ("Google/Chrome Beta", "Beta"),
+    ("Google/Chrome Dev", "Dev"),
+    ("Chromium", "Chromium"),
+    ("BraveSoftware/Brave-Browser", "Brave"),
+)
 # Chrome epoch is 1601-01-01 UTC microseconds (Windows FILETIME).
 _CHROME_EPOCH_OFFSET_S = 11644473600
 # URL prefixes / patterns we never want indexed — they're navigation noise.
@@ -70,6 +84,63 @@ _CHROME_SKIP_PATTERNS = (
 
 def _unix_to_chrome_ts(unix_s: float) -> int:
     return int((unix_s + _CHROME_EPOCH_OFFSET_S) * 1_000_000)
+
+
+def _chrome_history_paths() -> list[tuple[str, Path]]:
+    """Return ``[(label, History_path), ...]`` para CADA profile de CADA
+    Chrome-family browser instalado bajo ``~/Library/Application Support/``.
+
+    Label format:
+      - flavor stable + Default → ``"Default"``
+      - flavor stable + Profile 1 → ``"Profile 1"``
+      - flavor non-stable + Default → ``"Canary/Default"`` (etc.)
+
+    Solo entries cuyo archivo ``History`` existe — Chrome lo crea cuando
+    el browser arranca por primera vez.
+
+    Back-compat con tests (``patch.object(rag, "_CHROME_HISTORY_PATH", ...)``):
+    si el ``_CHROME_HISTORY_PATH`` resuelto al runtime es DISTINTO al
+    default real (i.e. monkeypatched a un tmp_path), retornamos solo ese
+    path como single-entry (test isolation tight). En real usage el
+    constant es el default → walk all flavors.
+    """
+    import sys
+    rag_mod = sys.modules.get("rag")
+    legacy = getattr(rag_mod, "_CHROME_HISTORY_PATH", _CHROME_HISTORY_PATH)
+    default_path = Path.home() / "Library/Application Support/Google/Chrome/Default/History"
+    try:
+        is_default = Path(legacy).resolve(strict=False) == default_path.resolve(strict=False)
+    except (TypeError, ValueError):
+        is_default = False
+    if not is_default:
+        # Monkeypatched or user-overridden — honor it as the single source.
+        if Path(legacy).is_file():
+            return [("Default", Path(legacy))]
+        return []
+
+    base = Path.home() / "Library" / "Application Support"
+    found: list[tuple[str, Path]] = []
+    for flavor_dir, flavor_label in _CHROME_FLAVORS:
+        root = base / flavor_dir
+        if not root.is_dir():
+            continue
+        try:
+            children = sorted(root.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            if not child.is_dir():
+                continue
+            # Chrome profile dirs son SOLO "Default" o "Profile N" (N ≥ 1).
+            # Otros (System Profile, GrShaderCache, etc.) NO son profiles.
+            if child.name != "Default" and not child.name.startswith("Profile "):
+                continue
+            hist = child / "History"
+            if not hist.is_file():
+                continue
+            label = f"{flavor_label}/{child.name}" if flavor_label else child.name
+            found.append((label, hist))
+    return found
 
 
 def _read_chrome_visits(history_db: Path, hours: int = 48) -> list[dict]:
@@ -138,10 +209,32 @@ def _sync_chrome_history(vault_root: Path, hours: int = 48) -> dict:
     from rag.cross_source_etls import _atomic_write_if_changed
     from rag.integrations.youtube import _YOUTUBE_VAULT_SUBPATH, _YOUTUBE_WATCH_RE
 
-    _chrome_hist_path = getattr(sys.modules.get("rag"), "_CHROME_HISTORY_PATH", _CHROME_HISTORY_PATH)
-    visits = _read_chrome_visits(_chrome_hist_path, hours=hours)
-    if not visits:
+    # Iteramos sobre todos los profiles de TODOS los Chrome-family browsers
+    # (Default + Profile N de Chrome stable + Canary + Beta + Dev + Chromium
+    # + Brave). El user puede tener sesiones simultáneas en varios y queremos
+    # capturarlas TODAS para que el brief no tenga blind spots. Dedupe por
+    # URL exacta — si dos profiles abrieron la misma URL, gana la más
+    # reciente (mayor `ts`).
+    #
+    # Re-resolve via `sys.modules["rag"]` para que tests que monkeypatchan
+    # `rag._chrome_history_paths` propaguen al call site interno (mismo
+    # shim pattern que `_CHROME_HISTORY_PATH`).
+    _paths_fn = getattr(sys.modules.get("rag"), "_chrome_history_paths", _chrome_history_paths)
+    paths = _paths_fn()
+    if not paths:
         return {"ok": False, "reason": "no_visits_or_chrome_locked"}
+    by_url: dict[str, dict] = {}
+    for _label, hist_path in paths:
+        for v in _read_chrome_visits(hist_path, hours=hours):
+            url = v.get("url")
+            if not url:
+                continue
+            prev = by_url.get(url)
+            if prev is None or (v.get("ts") or 0) > (prev.get("ts") or 0):
+                by_url[url] = v
+    if not by_url:
+        return {"ok": False, "reason": "no_visits_or_chrome_locked"}
+    visits = sorted(by_url.values(), key=lambda v: v.get("ts") or 0, reverse=True)
     now = datetime.now()
     today = now.strftime("%Y-%m-%d")
 

@@ -7925,10 +7925,11 @@ def _fetch_chrome_top_week(n: int = 5) -> list[dict]:
 
     Known limitations (document, not fix — this endpoint is ambient signal,
     not a source of truth):
-    - **Multi-profile**: only reads `Default/`. Chrome stores per-profile
-      histories in sibling dirs (`Profile 1/History`, `Profile 2/History`, …).
-      Users with multiple profiles get a partial top-n. `Local State` JSON
-      would list them if we ever want to aggregate.
+    - **Multi-profile** (resolved 2026-05-11 via ``_chrome_history_paths()``):
+      itera Default + Profile N de Chrome stable + Canary + Beta + Dev +
+      Chromium + Brave. Visit counts se suman entre profiles para una
+      URL idéntica; last_visit gana el máximo. Profile fail → silent
+      continue al siguiente.
     - **WAL mode**: Chrome uses SQLite WAL; recent visits may live in
       `History-wal` until checkpointed. Copying only `History` misses the
       tail of "right now". Acceptable for a 7-day window.
@@ -7939,48 +7940,83 @@ def _fetch_chrome_top_week(n: int = 5) -> list[dict]:
     import sqlite3
     import tempfile
 
-    src = Path.home() / "Library/Application Support/Google/Chrome/Default/History"
-    if not src.is_file():
+    from rag.integrations.chrome_history import _chrome_history_paths
+
+    paths = _chrome_history_paths()
+    if not paths:
         return []
 
     CHROME_EPOCH_OFFSET = 11_644_473_600  # seconds between 1601-01-01 and 1970-01-01
     now_ts = time.time()
     week_ago_chrome = int((now_ts - 7 * 86_400 + CHROME_EPOCH_OFFSET) * 1_000_000)
 
-    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=True) as tmp:
-        shutil.copyfile(src, tmp.name)
-        conn = sqlite3.connect(f"file:{tmp.name}?mode=ro", uri=True)
-        try:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                """
-                SELECT u.url AS url, u.title AS title,
-                       COUNT(v.id) AS visit_count,
-                       MAX(v.visit_time) AS last_visit
-                FROM urls u
-                JOIN visits v ON v.url = u.id
-                WHERE v.visit_time >= ?
-                  AND u.url NOT LIKE 'chrome://%'
-                  AND u.url NOT LIKE 'chrome-extension://%'
-                  AND u.url NOT LIKE 'file://%'
-                  AND u.url NOT LIKE '%://localhost%'
-                  AND u.url NOT LIKE '%://127.0.0.1%'
-                GROUP BY u.url
-                ORDER BY visit_count DESC
-                LIMIT ?
-                """,
-                (week_ago_chrome, n),
-            ).fetchall()
-        finally:
-            conn.close()
+    by_url: dict[str, dict] = {}
+    for _label, src in paths:
+        with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=True) as tmp:
+            try:
+                shutil.copyfile(src, tmp.name)
+            except OSError:
+                continue
+            try:
+                conn = sqlite3.connect(f"file:{tmp.name}?mode=ro", uri=True)
+            except sqlite3.Error:
+                continue
+            try:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    """
+                    SELECT u.url AS url, u.title AS title,
+                           COUNT(v.id) AS visit_count,
+                           MAX(v.visit_time) AS last_visit
+                    FROM urls u
+                    JOIN visits v ON v.url = u.id
+                    WHERE v.visit_time >= ?
+                      AND u.url NOT LIKE 'chrome://%'
+                      AND u.url NOT LIKE 'chrome-extension://%'
+                      AND u.url NOT LIKE 'file://%'
+                      AND u.url NOT LIKE '%://localhost%'
+                      AND u.url NOT LIKE '%://127.0.0.1%'
+                    GROUP BY u.url
+                    ORDER BY visit_count DESC
+                    LIMIT 200
+                    """,
+                    (week_ago_chrome,),
+                ).fetchall()
+            except sqlite3.Error:
+                rows = []
+            finally:
+                conn.close()
+        for r in rows:
+            url = r["url"]
+            vc = int(r["visit_count"] or 0)
+            lv = int(r["last_visit"] or 0)
+            prev = by_url.get(url)
+            if prev is None:
+                by_url[url] = {
+                    "title": r["title"] or "",
+                    "visit_count": vc,
+                    "last_visit": lv,
+                }
+            else:
+                prev["visit_count"] += vc
+                if lv > prev["last_visit"]:
+                    prev["last_visit"] = lv
+                    if r["title"]:
+                        prev["title"] = r["title"]
+
+    ranked = sorted(
+        by_url.items(),
+        key=lambda kv: kv[1]["visit_count"],
+        reverse=True,
+    )[:n]
 
     out: list[dict] = []
-    for r in rows:
-        last_unix = (r["last_visit"] / 1_000_000) - CHROME_EPOCH_OFFSET
+    for url, agg in ranked:
+        last_unix = (agg["last_visit"] / 1_000_000) - CHROME_EPOCH_OFFSET
         out.append({
-            "title": r["title"] or "",
-            "url": r["url"],
-            "visit_count": int(r["visit_count"]),
+            "title": agg["title"],
+            "url": url,
+            "visit_count": agg["visit_count"],
             "last_visit_iso": datetime.fromtimestamp(last_unix).isoformat(timespec="seconds"),
         })
     return out
@@ -8255,41 +8291,55 @@ def _fetch_youtube_watched(n: int = 5, hours: int = 168) -> list[dict]:
     import tempfile
     from urllib.parse import urlparse, parse_qs
 
-    src = Path.home() / "Library/Application Support/Google/Chrome/Default/History"
-    if not src.is_file():
+    from rag.integrations.chrome_history import _chrome_history_paths
+
+    paths = _chrome_history_paths()
+    if not paths:
         return []
 
     CHROME_EPOCH_OFFSET = 11_644_473_600
     now_ts = time.time()
     window_start_chrome = int((now_ts - hours * 3_600 + CHROME_EPOCH_OFFSET) * 1_000_000)
 
-    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=True) as tmp:
-        shutil.copyfile(src, tmp.name)
-        conn = sqlite3.connect(f"file:{tmp.name}?mode=ro", uri=True)
-        try:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                """
-                SELECT u.url AS url, u.title AS title,
-                       COUNT(v.id) AS visit_count,
-                       MAX(v.visit_time) AS last_visit
-                FROM urls u
-                JOIN visits v ON v.url = u.id
-                WHERE v.visit_time >= ?
-                  AND (
-                       u.url LIKE '%://www.youtube.com/watch%'
-                    OR u.url LIKE '%://youtube.com/watch%'
-                    OR u.url LIKE '%://m.youtube.com/watch%'
-                    OR u.url LIKE '%://youtu.be/%'
-                  )
-                GROUP BY u.url
-                ORDER BY last_visit DESC
-                LIMIT 50
-                """,
-                (window_start_chrome,),
-            ).fetchall()
-        finally:
-            conn.close()
+    rows: list = []
+    for _label, src in paths:
+        with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=True) as tmp:
+            try:
+                shutil.copyfile(src, tmp.name)
+            except OSError:
+                continue
+            try:
+                conn = sqlite3.connect(f"file:{tmp.name}?mode=ro", uri=True)
+            except sqlite3.Error:
+                continue
+            try:
+                conn.row_factory = sqlite3.Row
+                rows.extend(conn.execute(
+                    """
+                    SELECT u.url AS url, u.title AS title,
+                           COUNT(v.id) AS visit_count,
+                           MAX(v.visit_time) AS last_visit
+                    FROM urls u
+                    JOIN visits v ON v.url = u.id
+                    WHERE v.visit_time >= ?
+                      AND (
+                           u.url LIKE '%://www.youtube.com/watch%'
+                        OR u.url LIKE '%://youtube.com/watch%'
+                        OR u.url LIKE '%://m.youtube.com/watch%'
+                        OR u.url LIKE '%://youtu.be/%'
+                      )
+                    GROUP BY u.url
+                    ORDER BY last_visit DESC
+                    LIMIT 50
+                    """,
+                    (window_start_chrome,),
+                ).fetchall())
+            except sqlite3.Error:
+                pass
+            finally:
+                conn.close()
+
+    rows.sort(key=lambda r: r["last_visit"] or 0, reverse=True)
 
     seen_ids: set[str] = set()
     out: list[dict] = []

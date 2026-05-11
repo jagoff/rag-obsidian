@@ -66,12 +66,43 @@ def _fetch_chrome_bookmarks_used(hours: int = 48, n: int = 5) -> list[dict]:
     Chrome's `visit_time` is microseconds since 1601-01-01 UTC — same epoch as
     `Bookmarks.date_added`, which is why the conversion constant is shared
     with `_fetch_chrome_top_week`. Silent-fail if either file is missing.
+
+    Multi-profile (2026-05-11): iteramos cada `(profile, Bookmarks, History)`
+    pair de cada Chrome-family browser. Bookmarks de TODOS los profiles se
+    funden; visits del MISMO profile que el bookmark dominan (no asumimos
+    que Canary y stable comparten visits). Dedupe final por URL.
     """
-    bm_path = Path.home() / "Library/Application Support/Google/Chrome/Default/Bookmarks"
-    hist_path = Path.home() / "Library/Application Support/Google/Chrome/Default/History"
-    if not bm_path.is_file() or not hist_path.is_file():
+    # Pair Bookmarks + History por profile. Solo profiles donde AMBOS
+    # archivos existen entran al join.
+    from rag.integrations.chrome_history import _CHROME_FLAVORS
+    profile_pairs: list[tuple[Path, Path]] = []
+    base = Path.home() / "Library" / "Application Support"
+    for flavor_dir, _label in _CHROME_FLAVORS:
+        root = base / flavor_dir
+        if not root.is_dir():
+            continue
+        try:
+            children = sorted(root.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            if not child.is_dir():
+                continue
+            if child.name != "Default" and not child.name.startswith("Profile "):
+                continue
+            bm = child / "Bookmarks"
+            hist = child / "History"
+            if bm.is_file() and hist.is_file():
+                profile_pairs.append((bm, hist))
+    if not profile_pairs:
         return []
 
+    # Cargamos la primera pair "primaria" (Default de Chrome stable, casi
+    # siempre primero por orden de _CHROME_FLAVORS + iterdir). Mantenemos
+    # el shape del JSON tree de la primera para back-compat de tests
+    # antiguos que asumían un solo árbol. Las demás pairs se procesan
+    # adelante en el merge.
+    bm_path, hist_path = profile_pairs[0]
     try:
         tree = json.loads(bm_path.read_text(encoding="utf-8"))
     except Exception:
@@ -98,6 +129,16 @@ def _fetch_chrome_bookmarks_used(hours: int = 48, n: int = 5) -> list[dict]:
     for root in (tree.get("roots") or {}).values():
         _walk(root, "")
 
+    # Merge bookmarks from other profiles too — el user puede tener una
+    # cuenta personal en Default y otra de laburo en Profile 1.
+    for extra_bm, _extra_hist in profile_pairs[1:]:
+        try:
+            extra_tree = json.loads(extra_bm.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        for root in (extra_tree.get("roots") or {}).values():
+            _walk(root, "")
+
     if not bookmarks:
         return []
 
@@ -105,39 +146,68 @@ def _fetch_chrome_bookmarks_used(hours: int = 48, n: int = 5) -> list[dict]:
     now_ts = time.time()
     window_chrome = int((now_ts - hours * 3600 + CHROME_EPOCH_OFFSET) * 1_000_000)
 
-    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=True) as tmp:
-        shutil.copyfile(hist_path, tmp.name)
-        conn = sqlite3.connect(f"file:{tmp.name}?mode=ro", uri=True)
-        try:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                """
-                SELECT u.url AS url,
-                       COUNT(v.id) AS visit_count,
-                       MAX(v.visit_time) AS last_visit
-                FROM urls u
-                JOIN visits v ON v.url = u.id
-                WHERE v.visit_time >= ?
-                GROUP BY u.url
-                ORDER BY last_visit DESC
-                """,
-                (window_chrome,),
-            ).fetchall()
-        finally:
-            conn.close()
+    # Por cada History DB del profile_pairs, mergeamos rows. El visit_count
+    # se suma (mismo URL visto en 2 profiles = más intent total); el
+    # last_visit gana el máximo.
+    by_url: dict[str, dict] = {}
+    for _bm_path, profile_hist in profile_pairs:
+        with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=True) as tmp:
+            try:
+                shutil.copyfile(profile_hist, tmp.name)
+            except OSError:
+                continue
+            try:
+                conn = sqlite3.connect(f"file:{tmp.name}?mode=ro", uri=True)
+            except sqlite3.Error:
+                continue
+            try:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    """
+                    SELECT u.url AS url,
+                           COUNT(v.id) AS visit_count,
+                           MAX(v.visit_time) AS last_visit
+                    FROM urls u
+                    JOIN visits v ON v.url = u.id
+                    WHERE v.visit_time >= ?
+                    GROUP BY u.url
+                    ORDER BY last_visit DESC
+                    """,
+                    (window_chrome,),
+                ).fetchall()
+            except sqlite3.Error:
+                rows = []
+            finally:
+                conn.close()
+        for r in rows:
+            url = r["url"]
+            if url not in bookmarks:
+                continue
+            prev = by_url.get(url)
+            vc = int(r["visit_count"] or 0)
+            lv = int(r["last_visit"] or 0)
+            if prev is None:
+                by_url[url] = {"visit_count": vc, "last_visit": lv}
+            else:
+                prev["visit_count"] += vc
+                if lv > prev["last_visit"]:
+                    prev["last_visit"] = lv
+
+    ranked = sorted(
+        by_url.items(),
+        key=lambda kv: kv[1]["last_visit"],
+        reverse=True,
+    )
 
     out: list[dict] = []
-    for r in rows:
-        url = r["url"]
-        meta = bookmarks.get(url)
-        if not meta:
-            continue
-        last_unix = (r["last_visit"] / 1_000_000) - CHROME_EPOCH_OFFSET
+    for url, agg in ranked:
+        meta = bookmarks[url]
+        last_unix = (agg["last_visit"] / 1_000_000) - CHROME_EPOCH_OFFSET
         out.append({
             "name": meta["name"],
             "url": url,
             "folder": meta["folder"],
-            "visit_count": int(r["visit_count"]),
+            "visit_count": agg["visit_count"],
             "last_visit_iso": datetime.fromtimestamp(last_unix).isoformat(timespec="seconds"),
         })
         if len(out) >= n:
@@ -166,8 +236,10 @@ def _fetch_youtube_today(now: datetime, n: int = 5) -> list[dict]:
     """
     from urllib.parse import parse_qs, urlparse
 
-    src = Path.home() / "Library/Application Support/Google/Chrome/Default/History"
-    if not src.is_file():
+    from rag.integrations.chrome_history import _chrome_history_paths
+
+    paths = _chrome_history_paths()
+    if not paths:
         return []
 
     CHROME_EPOCH_OFFSET = 11_644_473_600
@@ -176,62 +248,73 @@ def _fetch_youtube_today(now: datetime, n: int = 5) -> list[dict]:
         (today_start.timestamp() + CHROME_EPOCH_OFFSET) * 1_000_000
     )
 
-    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=True) as tmp:
-        try:
-            shutil.copyfile(src, tmp.name)
-        except OSError as exc:
-            # Bug Hunt 2026-05-08 (M Int chrome_bookmarks): pre-fix los
-            # 3 except branches swallowing total sin traza. Cuando Chrome
-            # tenía la History DB locked (browser corriendo + WAL mode), el
-            # panel YouTube/bookmarks devolvía empty sin razón visible
-            # → operador no podía diferenciar "user no usó YT hoy" de
-            # "Chrome bloqueando la copy". Compat lazy import.
+    # Mergeamos rows de todos los profiles. Cada profile → snapshot a tmp
+    # + query. Falla silenciosa por profile (Chrome stable abierto pero
+    # Canary disponible, etc.) — el peor caso es []. Cada try/except
+    # loguea via _silent_log para que el operador pueda diagnosticar.
+    rows: list = []
+    for _label, src in paths:
+        with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=True) as tmp:
             try:
-                from rag import _silent_log
-                _silent_log("chrome_youtube_copy_failed", exc)
-            except Exception:
-                pass
-            return []
-        try:
-            conn = sqlite3.connect(f"file:{tmp.name}?mode=ro", uri=True)
-        except sqlite3.Error as exc:
+                shutil.copyfile(src, tmp.name)
+            except OSError as exc:
+                # Bug Hunt 2026-05-08 (M Int chrome_bookmarks): pre-fix los
+                # 3 except branches swallowing total sin traza. Cuando un
+                # profile de Chrome tenía la History DB locked (browser
+                # corriendo + WAL mode), el panel YouTube/bookmarks devolvía
+                # empty sin razón visible → operador no podía diferenciar
+                # "user no usó YT hoy" de "Chrome bloqueando la copy".
+                # Compat lazy import. Continuamos al siguiente profile —
+                # multi-profile (2026-05-11) no aborta si un profile rompe.
+                try:
+                    from rag import _silent_log
+                    _silent_log("chrome_youtube_copy_failed", exc)
+                except Exception:
+                    pass
+                continue
             try:
-                from rag import _silent_log
-                _silent_log("chrome_youtube_connect_failed", exc)
-            except Exception:
-                pass
-            return []
-        try:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                """
-                SELECT u.url AS url, u.title AS title,
-                       COUNT(v.id) AS visit_count,
-                       MAX(v.visit_time) AS last_visit
-                FROM urls u
-                JOIN visits v ON v.url = u.id
-                WHERE v.visit_time >= ?
-                  AND (
-                       u.url LIKE '%://www.youtube.com/watch%'
-                    OR u.url LIKE '%://youtube.com/watch%'
-                    OR u.url LIKE '%://m.youtube.com/watch%'
-                    OR u.url LIKE '%://youtu.be/%'
-                  )
-                GROUP BY u.url
-                ORDER BY last_visit DESC
-                LIMIT 50
-                """,
-                (window_start_chrome,),
-            ).fetchall()
-        except sqlite3.Error as exc:
+                conn = sqlite3.connect(f"file:{tmp.name}?mode=ro", uri=True)
+            except sqlite3.Error as exc:
+                try:
+                    from rag import _silent_log
+                    _silent_log("chrome_youtube_connect_failed", exc)
+                except Exception:
+                    pass
+                continue
             try:
-                from rag import _silent_log
-                _silent_log("chrome_youtube_query_failed", exc)
-            except Exception:
-                pass
-            return []
-        finally:
-            conn.close()
+                conn.row_factory = sqlite3.Row
+                rows.extend(conn.execute(
+                    """
+                    SELECT u.url AS url, u.title AS title,
+                           COUNT(v.id) AS visit_count,
+                           MAX(v.visit_time) AS last_visit
+                    FROM urls u
+                    JOIN visits v ON v.url = u.id
+                    WHERE v.visit_time >= ?
+                      AND (
+                           u.url LIKE '%://www.youtube.com/watch%'
+                        OR u.url LIKE '%://youtube.com/watch%'
+                        OR u.url LIKE '%://m.youtube.com/watch%'
+                        OR u.url LIKE '%://youtu.be/%'
+                      )
+                    GROUP BY u.url
+                    ORDER BY last_visit DESC
+                    LIMIT 50
+                    """,
+                    (window_start_chrome,),
+                ).fetchall())
+            except sqlite3.Error as exc:
+                try:
+                    from rag import _silent_log
+                    _silent_log("chrome_youtube_query_failed", exc)
+                except Exception:
+                    pass
+            finally:
+                conn.close()
+
+    # Sort rows across profiles by last_visit desc before dedup so the
+    # video_id ganador es el más recientemente visto en cualquier profile.
+    rows.sort(key=lambda r: r["last_visit"] or 0, reverse=True)
 
     seen_ids: set[str] = set()
     out: list[dict] = []
@@ -281,8 +364,14 @@ def _fetch_chrome_today_domains(now: datetime, top_n: int = 8) -> list[dict]:
     """
     from urllib.parse import urlparse
 
-    src = Path.home() / "Library/Application Support/Google/Chrome/Default/History"
-    if not src.is_file():
+    from rag.integrations.chrome_history import (
+        _CHROME_SKIP_PREFIXES,
+        _CHROME_SKIP_PATTERNS,
+        _chrome_history_paths,
+    )
+
+    paths = _chrome_history_paths()
+    if not paths:
         return []
 
     # Local epoch offset (igual que `_fetch_youtube_today` arriba — evita
@@ -293,60 +382,52 @@ def _fetch_chrome_today_domains(now: datetime, top_n: int = 8) -> list[dict]:
         (today_start.timestamp() + CHROME_EPOCH_OFFSET) * 1_000_000
     )
 
-    # Lazy-import skip lists del módulo chrome_history para mantener
-    # paridad con `_read_chrome_visits` sin duplicar las regex.
-    try:
-        from rag.integrations.chrome_history import (
-            _CHROME_SKIP_PREFIXES,
-            _CHROME_SKIP_PATTERNS,
-        )
-    except Exception:
-        _CHROME_SKIP_PREFIXES = ("chrome://", "chrome-extension://", "about:", "data:")
-        _CHROME_SKIP_PATTERNS = ()
-
-    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=True) as tmp:
-        try:
-            shutil.copyfile(src, tmp.name)
-        except OSError as exc:
+    # Mergeamos rows de cada profile (multi-profile 2026-05-11). Cada
+    # profile → snapshot + query — fail silencioso por profile.
+    rows: list = []
+    for _label, src in paths:
+        with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=True) as tmp:
             try:
-                from rag import _silent_log
-                _silent_log("chrome_today_copy_failed", exc)
-            except Exception:
-                pass
-            return []
-        try:
-            conn = sqlite3.connect(f"file:{tmp.name}?mode=ro", uri=True)
-        except sqlite3.Error as exc:
+                shutil.copyfile(src, tmp.name)
+            except OSError as exc:
+                try:
+                    from rag import _silent_log
+                    _silent_log("chrome_today_copy_failed", exc)
+                except Exception:
+                    pass
+                continue
             try:
-                from rag import _silent_log
-                _silent_log("chrome_today_connect_failed", exc)
-            except Exception:
-                pass
-            return []
-        try:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                """
-                SELECT u.url AS url, u.title AS title,
-                       COUNT(v.id) AS visit_count
-                FROM urls u
-                JOIN visits v ON v.url = u.id
-                WHERE v.visit_time >= ?
-                GROUP BY u.url
-                ORDER BY visit_count DESC
-                LIMIT 200
-                """,
-                (window_start_chrome,),
-            ).fetchall()
-        except sqlite3.Error as exc:
+                conn = sqlite3.connect(f"file:{tmp.name}?mode=ro", uri=True)
+            except sqlite3.Error as exc:
+                try:
+                    from rag import _silent_log
+                    _silent_log("chrome_today_connect_failed", exc)
+                except Exception:
+                    pass
+                continue
             try:
-                from rag import _silent_log
-                _silent_log("chrome_today_query_failed", exc)
-            except Exception:
-                pass
-            return []
-        finally:
-            conn.close()
+                conn.row_factory = sqlite3.Row
+                rows.extend(conn.execute(
+                    """
+                    SELECT u.url AS url, u.title AS title,
+                           COUNT(v.id) AS visit_count
+                    FROM urls u
+                    JOIN visits v ON v.url = u.id
+                    WHERE v.visit_time >= ?
+                    GROUP BY u.url
+                    ORDER BY visit_count DESC
+                    LIMIT 200
+                    """,
+                    (window_start_chrome,),
+                ).fetchall())
+            except sqlite3.Error as exc:
+                try:
+                    from rag import _silent_log
+                    _silent_log("chrome_today_query_failed", exc)
+                except Exception:
+                    pass
+            finally:
+                conn.close()
 
     by_domain: dict[str, dict] = {}
     for r in rows:

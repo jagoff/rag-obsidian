@@ -4668,7 +4668,7 @@ async def wa_voice(
 
 
 @app.get("/api/wa/avatar/{jid}")
-def wa_avatar(jid: str, name: str | None = None) -> FileResponse:
+async def wa_avatar(jid: str, name: str | None = None):
     """Devuelve la foto del contacto extraída de Apple Contacts.app.
 
     Fuente preferida sobre el bridge `/api/avatar` (whatsmeow): las
@@ -4688,13 +4688,33 @@ def wa_avatar(jid: str, name: str | None = None) -> FileResponse:
     if not jid or "@" not in jid:
         raise HTTPException(status_code=400, detail="jid inválido")
     path = _wa_avatars.get_avatar_path(jid, chat_name=name)
-    if not path:
-        raise HTTPException(status_code=404, detail="sin foto en Apple Contacts")
-    return FileResponse(
-        path,
-        media_type="image/jpeg",
-        headers={"Cache-Control": "private, max-age=604800"},
-    )
+    if path:
+        return FileResponse(
+            path,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "private, max-age=604800"},
+        )
+
+    # Fallback al bridge `/api/avatar` — usa la foto de perfil pública de
+    # WhatsApp (cache 7d en `store/avatars/`). Si el contacto tiene la
+    # privacy lockeada o nunca tuvo foto, el bridge devuelve 404 → 404.
+    import httpx  # noqa: PLC0415
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(
+                "http://127.0.0.1:8088/api/avatar",
+                params={"jid": jid},
+            )
+        if r.status_code == 200 and r.content:
+            return Response(
+                content=r.content,
+                media_type=r.headers.get("content-type", "image/jpeg"),
+                headers={"Cache-Control": "private, max-age=604800"},
+            )
+    except Exception:
+        pass
+    raise HTTPException(status_code=404, detail="sin foto disponible")
 
 
 @app.get("/api/wa/voice/transcript/{message_id}")

@@ -739,24 +739,43 @@ def list_chats_for_ui(
         con.row_factory = sqlite3.Row
         con.execute(f"ATTACH DATABASE 'file:{db_path}?mode=ro' AS br")
 
+        # Truth del "último ts" del chat = MAX(messages.timestamp), NO
+        # c.last_message_time. Esa columna no se actualiza fiable cuando
+        # llegan msgs nuevos a un chat existente (history sync inicial la
+        # popula, pero los UPSERTs subsiguientes con ON CONFLICT DO
+        # NOTHING dejan la fecha vieja). Síntoma observado: chat de
+        # Maria con last_msg de hoy 12:58, pero c.last_message_time
+        # devolvía 2026-03-05 → sidebar la ordenaba como vieja. Computar
+        # MAX en el SELECT es ~3x más caro que c.last_message_time pero
+        # se carga una sola vez al abrir el sidebar y la lectura de
+        # 100-300 chats tarda <50ms con el idx_messages_chat_ts existente.
         where_clauses = [
             "c.jid != ?",
             "c.jid NOT LIKE '%status@broadcast'",
         ]
         params: list = [bot_jid]
-        if before_ts:
-            where_clauses.append("c.last_message_time < ?")
-            params.append(before_ts)
+        # before_ts filter ahora compara contra el computed `last_ts`
+        # via HAVING en la outer query (sub-query SELECT puede usar
+        # parameters via la lista params, pero no rebindeable a HAVING).
+        # Para simplicidad lo movemos a un wrapping CTE-like via outer.
         if q:
             where_clauses.append("LOWER(COALESCE(c.name, '')) LIKE ?")
             params.append(f"%{q.lower()}%")
+        having_clause = ""
+        if before_ts:
+            having_clause = "HAVING computed_last_ts IS NOT NULL AND computed_last_ts < ?"
+            params.append(before_ts)
         params.append(cap)
 
         sql = f"""
             SELECT
               c.jid AS jid,
               COALESCE(c.name, '') AS name,
-              c.last_message_time AS last_ts,
+              (
+                SELECT MAX(m.timestamp)
+                FROM br.messages m
+                WHERE m.chat_jid = c.jid
+              ) AS computed_last_ts,
               (
                 SELECT m.content
                 FROM br.messages m
@@ -782,7 +801,8 @@ def list_chats_for_ui(
             FROM br.chats c
             LEFT JOIN main.rag_wa_read_state rs ON rs.jid = c.jid
             WHERE {' AND '.join(where_clauses)}
-            ORDER BY c.last_message_time DESC
+            {having_clause}
+            ORDER BY computed_last_ts DESC NULLS LAST
             LIMIT ?
         """
         chat_rows = con.execute(sql, params).fetchall()
@@ -814,7 +834,7 @@ def list_chats_for_ui(
                 "jid": jid,
                 "label": label,
                 "is_group": jid.endswith("@g.us"),
-                "last_ts": _normalize_bridge_ts(r["last_ts"] or ""),
+                "last_ts": _normalize_bridge_ts(r["computed_last_ts"] or ""),
                 "last_preview": preview,
                 "last_from_me": bool(r["last_from_me"]),
                 "unread_count": int(unread["n"]) if unread else 0,

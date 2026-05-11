@@ -110,6 +110,15 @@ CREATE TABLE IF NOT EXISTS rag_wa_voice_transcripts (
 );
 CREATE INDEX IF NOT EXISTS idx_rag_wa_voice_transcripts_jid
     ON rag_wa_voice_transcripts(jid, audio_ts DESC);
+
+-- Chats pinneados a la sidebar (feat 2026-05-11). Row presente = pinned;
+-- delete = unpinned. `pinned_ts` permite tiebreak entre pins (más
+-- reciente arriba, igual que WhatsApp Web). El JID puede ser de un
+-- contacto individual o un grupo; ambos casos se tratan igual.
+CREATE TABLE IF NOT EXISTS rag_wa_pinned_chats (
+    jid TEXT PRIMARY KEY,
+    pinned_ts TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -169,6 +178,54 @@ def set_last_seen(jid: str, last_seen_ts: str) -> None:
             "updated_at = datetime('now')",
             (jid, last_seen_ts),
         )
+    finally:
+        conn.close()
+
+
+def pin_chat(jid: str) -> bool:
+    """Marca un chat como pinned. Idempotente — re-pin actualiza el `ts`
+    (efecto: el chat sube al top entre los pinned).
+    """
+    ensure_schema()
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT INTO rag_wa_pinned_chats (jid, pinned_ts) "
+            "VALUES (?, datetime('now')) "
+            "ON CONFLICT(jid) DO UPDATE SET pinned_ts = excluded.pinned_ts",
+            (jid,),
+        )
+        return True
+    finally:
+        conn.close()
+
+
+def unpin_chat(jid: str) -> bool:
+    """Quita el pin. Devuelve True si había row para borrar."""
+    ensure_schema()
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "DELETE FROM rag_wa_pinned_chats WHERE jid = ?", (jid,),
+        )
+        return bool(cur.rowcount)
+    finally:
+        conn.close()
+
+
+def get_pinned_chats() -> dict[str, str]:
+    """Devuelve `{jid: pinned_ts}` para todos los chats pinned. Vacío si
+    la tabla está vacía o no existe yet.
+    """
+    ensure_schema()
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT jid, pinned_ts FROM rag_wa_pinned_chats"
+        ).fetchall()
+        return {r["jid"]: r["pinned_ts"] for r in rows}
+    except sqlite3.Error:
+        return {}
     finally:
         conn.close()
 

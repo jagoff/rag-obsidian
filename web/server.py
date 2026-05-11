@@ -4143,6 +4143,28 @@ def wa_chats(
     return {"chats": chats, "next_before_ts": next_before_ts}
 
 
+@app.post("/api/wa/chats/{jid}/pin")
+def wa_chat_pin(jid: str) -> dict:
+    """Pin un chat a la sidebar. Idempotente — re-pin actualiza ts."""
+    from rag.integrations.whatsapp import _db_local  # noqa: PLC0415
+
+    if not jid or "@" not in jid:
+        raise HTTPException(status_code=400, detail="jid inválido")
+    _db_local.pin_chat(jid)
+    return {"ok": True, "pinned": True}
+
+
+@app.post("/api/wa/chats/{jid}/unpin")
+def wa_chat_unpin(jid: str) -> dict:
+    """Unpin un chat. No-op si no estaba pinned."""
+    from rag.integrations.whatsapp import _db_local  # noqa: PLC0415
+
+    if not jid or "@" not in jid:
+        raise HTTPException(status_code=400, detail="jid inválido")
+    _db_local.unpin_chat(jid)
+    return {"ok": True, "pinned": False}
+
+
 @app.get("/api/wa/thread/{jid}")
 def wa_thread(jid: str, limit: int = 50, before_ts: str | None = None) -> dict:
     """Historial paginado de un chat por JID.

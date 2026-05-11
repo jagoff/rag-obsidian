@@ -868,6 +868,10 @@ def list_chats_for_ui(
         """
         chat_rows = con.execute(sql, params).fetchall()
 
+        # Pinned chats — map jid → pinned_ts. Lo levantamos una sola vez
+        # por call para no scattear queries al SQL state DB.
+        pinned_map = _db_local.get_pinned_chats()
+
         out: list[dict] = []
         for r in chat_rows:
             jid = r["jid"] or ""
@@ -900,7 +904,16 @@ def list_chats_for_ui(
                 "last_from_me": bool(r["last_from_me"]),
                 "unread_count": int(unread["n"]) if unread else 0,
                 "avatar_initials": _avatar_initials(label),
+                "pinned": jid in pinned_map,
+                "pinned_ts": pinned_map.get(jid, ""),
             })
+        # Sort: pinned primero (más reciente pin arriba), después el resto
+        # por last_ts desc igual que antes. WhatsApp Web hace lo mismo.
+        out.sort(key=lambda c: (
+            0 if c.get("pinned") else 1,
+            -1 * _ts_sort_key(c.get("pinned_ts", "")) if c.get("pinned")
+                else -1 * _ts_sort_key(c.get("last_ts", "")),
+        ))
         return out
     except sqlite3.Error:
         return []
@@ -910,6 +923,18 @@ def list_chats_for_ui(
         except Exception:
             pass
         con.close()
+
+
+def _ts_sort_key(iso: str) -> float:
+    """ISO timestamp → epoch para sort. Empty / malformado → 0."""
+    if not iso:
+        return 0.0
+    try:
+        return datetime.fromisoformat(
+            iso.replace(" ", "T", 1).split("+", 1)[0].split("Z", 1)[0]
+        ).timestamp()
+    except Exception:
+        return 0.0
 
 
 def fetch_thread_for_ui(

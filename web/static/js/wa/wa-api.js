@@ -71,6 +71,24 @@ export async function revoke(jid, messageId) {
   return r.json();
 }
 
+export async function pinChat(jid) {
+  const r = await fetch(`/api/wa/chats/${encodeURIComponent(jid)}/pin`, {
+    method: "POST",
+    credentials: "same-origin",
+  });
+  if (!r.ok) throw new Error(`pin ${r.status}`);
+  return r.json();
+}
+
+export async function unpinChat(jid) {
+  const r = await fetch(`/api/wa/chats/${encodeURIComponent(jid)}/unpin`, {
+    method: "POST",
+    credentials: "same-origin",
+  });
+  if (!r.ok) throw new Error(`unpin ${r.status}`);
+  return r.json();
+}
+
 export async function hide(jid, messageId) {
   // "Delete for me" — solo escribe en la tabla `revokes` del bridge
   // local, no envía protocol message. Usado para mensajes inbound

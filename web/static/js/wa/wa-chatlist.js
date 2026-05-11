@@ -1,7 +1,7 @@
 // Render del sidebar — lista de chats con avatar/nombre/preview/unread.
 // Click → notifica al entry point para abrir el thread correspondiente.
 
-import { fetchChats } from "./wa-api.js";
+import { fetchChats, pinChat, unpinChat } from "./wa-api.js";
 import { colorFor, renderInto as renderAvatar } from "./wa-avatars.js";
 import * as search from "./wa-search.js";
 
@@ -97,12 +97,24 @@ function render() {
   els.list.innerHTML = "";
   for (const c of allChats) {
     const li = document.createElement("li");
-    li.className = "wa-chat-item";
+    li.className = "wa-chat-item" + (c.pinned ? " pinned" : "");
     li.dataset.jid = c.jid;
     if (c.jid === activeJID) li.classList.add("active");
-    li.addEventListener("click", () => selectChat(c.jid));
+    li.addEventListener("click", (ev) => {
+      // No abrir el chat si el click fue sobre el pin button.
+      if (ev.target.closest(".wa-chat-pin")) return;
+      selectChat(c.jid);
+    });
+
+    const pinTitle = c.pinned ? "Despinear" : "Pinear al tope";
+    const pinIcon = c.pinned
+      // Pinned: tachuela rellena (SVG filled).
+      ? `<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M16 3l5 5-4 1-3 7-2-2-4 4-1-1 4-4-2-2 7-3z"/></svg>`
+      // Unpinned: outline.
+      : `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 3l5 5-4 1-3 7-2-2-4 4-1-1 4-4-2-2 7-3z"/></svg>`;
 
     li.innerHTML = `
+      <button class="wa-chat-pin" type="button" title="${pinTitle}" aria-label="${pinTitle}">${pinIcon}</button>
       <div class="wa-chat-avatar" data-jid="${escapeHtml(c.jid)}"></div>
       <div class="wa-chat-body">
         <div class="wa-chat-name-row">
@@ -117,8 +129,38 @@ function render() {
     `;
     const avatarEl = li.querySelector(".wa-chat-avatar");
     renderAvatar(avatarEl, c.jid, c.avatar_initials, c.label);
+    const pinBtn = li.querySelector(".wa-chat-pin");
+    pinBtn.addEventListener("click", async (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      try {
+        const next = !c.pinned;
+        if (next) {
+          await pinChat(c.jid);
+        } else {
+          await unpinChat(c.jid);
+        }
+        c.pinned = next;
+        c.pinned_ts = next ? new Date().toISOString() : "";
+        // Re-sort + re-render para subir/bajar el chat.
+        resortChats();
+        render();
+      } catch (e) {
+        console.error("[wa-chatlist] pin toggle failed", e);
+      }
+    });
     els.list.appendChild(li);
   }
+}
+
+function resortChats() {
+  allChats.sort((a, b) => {
+    if (a.pinned && !b.pinned) return -1;
+    if (!a.pinned && b.pinned) return 1;
+    const tsA = a.pinned ? (a.pinned_ts || "") : (a.last_ts || "");
+    const tsB = b.pinned ? (b.pinned_ts || "") : (b.last_ts || "");
+    return tsB.localeCompare(tsA);
+  });
 }
 
 export function setActive(jid) {
@@ -145,9 +187,12 @@ export function applyChatUpdate(payload) {
   if (payload.jid !== activeJID && payload.unread_delta) {
     c.unread_count = (c.unread_count || 0) + payload.unread_delta;
   }
-  // Mover al top.
+  // Reordenar respetando pinned: los pinned siempre quedan arriba
+  // ordenados por pinned_ts; los demás por last_ts. Sin esto, un msg
+  // nuevo a un chat unpinned lo movía arriba de los pinned.
   allChats.splice(idx, 1);
-  allChats.unshift(c);
+  allChats.push(c);
+  resortChats();
   render();
   updateStats();
 }

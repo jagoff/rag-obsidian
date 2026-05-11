@@ -4410,6 +4410,47 @@ def wa_revoke(req: _WARevokeRequest) -> dict:
         return {"ok": False, "error": str(e), "status": e.status}
 
 
+@app.post("/api/wa/hide", dependencies=[Depends(_require_admin_token)])
+def wa_hide(req: _WARevokeRequest) -> dict:
+    """Oculta un mensaje localmente (delete-for-me) — solo afecta esta
+    vista. WhatsApp protocol no permite revocar mensajes ajenos; para
+    los inbound escribimos directo a la tabla `revokes` del bridge DB
+    con `revoked_by='local-only'`, así el próximo fetch_thread_for_ui
+    devuelve `revoked=true` y el frontend renderea el tomb.
+
+    NO se notifica al peer ni a otros devices del user.
+    """
+    import sqlite3 as _sqlite3  # noqa: PLC0415
+    import time as _time  # noqa: PLC0415
+
+    import rag as _rag  # noqa: PLC0415
+
+    if not req.jid or "@" not in req.jid:
+        raise HTTPException(status_code=400, detail="jid inválido")
+    if not req.message_id:
+        raise HTTPException(status_code=400, detail="message_id requerido")
+    db_path = _rag.WHATSAPP_DB_PATH
+    if not db_path.is_file():
+        raise HTTPException(status_code=503, detail="bridge DB no disponible")
+    # WAL mode permite que la web abra en RW concurrente con el bridge.
+    # `INSERT OR IGNORE` para idempotencia (re-click del trash no rompe).
+    try:
+        con = _sqlite3.connect(str(db_path), timeout=5.0)
+        try:
+            now_iso = _time.strftime("%Y-%m-%dT%H:%M:%S")
+            con.execute(
+                "INSERT OR IGNORE INTO revokes (message_id, chat_jid, "
+                "revoked_by, ts) VALUES (?, ?, ?, ?)",
+                (req.message_id, req.jid, "local-only", now_iso),
+            )
+            con.commit()
+        finally:
+            con.close()
+    except _sqlite3.Error as exc:
+        raise HTTPException(status_code=500, detail=f"sqlite: {exc}")
+    return {"ok": True}
+
+
 class _WATypingRequest(BaseModel):
     jid: str
     state: str  # "composing" | "paused" | "recording"

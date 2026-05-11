@@ -879,16 +879,16 @@ button { cursor: pointer; }
    las burbujas propias se vuelven clickeables para marcarlas. Un
    action bar fijo arriba del composer muestra cuántas hay y el botón
    "Eliminar (N)". */
-.wa-thread.selecting .wa-msg.own {
+.wa-thread.selecting .wa-msg {
   cursor: pointer;
   user-select: none;
+  padding-top: 26px;
 }
-.wa-thread.selecting .wa-msg.own::before {
+.wa-thread.selecting .wa-msg::before {
   content: "";
   position: absolute;
-  left: -28px;
-  top: 50%;
-  transform: translateY(-50%);
+  top: 4px;
+  right: 4px;
   width: 20px;
   height: 20px;
   border-radius: 50%;
@@ -897,7 +897,7 @@ button { cursor: pointer; }
   box-sizing: border-box;
   transition: background 0.1s ease, border-color 0.1s ease;
 }
-.wa-thread.selecting .wa-msg.own.selected::before {
+.wa-thread.selecting .wa-msg.selected::before {
   background: var(--accent, #06d6a0);
   border-color: var(--accent, #06d6a0);
   content: "✓";

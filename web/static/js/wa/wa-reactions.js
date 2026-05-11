@@ -11,7 +11,7 @@
 //   descubrible que el long-press para usuarios desktop).
 // - Click fuera del picker lo cierra.
 
-import { react, revoke } from "./wa-api.js";
+import { react, revoke, hide } from "./wa-api.js";
 
 const PRESET = ["❤️", "👍", "😂", "😮", "😢", "🙏", "🔥", "👏"];
 const LONGPRESS_MS = 450;
@@ -110,13 +110,17 @@ export function attach(bodyEl) {
   });
 }
 
-// Inserta dos affordances hover-only en burbujas propias:
+// Inserta dos affordances hover-only en CUALQUIER burbuja (own o
+// other):
 //   1) `.wa-msg-trash` arriba — click directo = delete.
-//   2) `.wa-msg-select` justo abajo del trash — círculo que entra al
-//      modo selección múltiple (pedido user 2026-05-11).
+//        own  → revoke real (delete-for-everyone, notifica al peer).
+//        other → hide local (delete-for-me, solo en este device).
+//   2) `.wa-msg-select` justo abajo del trash — entra al modo
+//      selección múltiple (acepta own + other, mezcla está OK porque
+//      el bulk delete rutea cada uno al endpoint correcto).
 // Para reacciones queda long-press / right-click.
 export function attachOwnMenuAffordance(msgEl) {
-  if (!msgEl || !msgEl.classList || !msgEl.classList.contains("own")) return;
+  if (!msgEl || !msgEl.classList) return;
   if (msgEl.classList.contains("revoked")) return;
   if (msgEl.querySelector(".wa-msg-trash")) return;
   const trash = document.createElement("button");
@@ -256,25 +260,26 @@ async function sendReaction(emoji) {
 async function doRevoke() {
   if (!activeMsgEl || !currentJID) return closeMenu();
   const messageId = activeMsgEl.dataset.id || "";
+  const isOwn = activeMsgEl.classList.contains("own");
   closeMenu();
   if (!messageId) return;
-  // Pedido user 2026-05-11: "no hace falta que confirme el borrado".
-  // Trash hover-only + click = delete directo. El SSE marca revoked
-  // optimistic; si falló al server, mostramos alert con el error.
   try {
-    // admin-auth.js inyecta el Bearer del admin_token automáticamente
-    // (loopback-only). Si el browser está en LAN/tunnel, el server
-    // responde 401 — el catch muestra el detail.
-    await revoke(currentJID, messageId);
-    // El SSE va a marcar revoked en breve; pero para feedback instant
-    // marcamos optimistic.
-    const msgEl = document.querySelector(`.wa-msg[data-id="${cssEscape(messageId)}"]`);
-    if (msgEl) {
-      msgEl.classList.add("revoked");
-      msgEl.innerHTML = "🚫 Este mensaje fue eliminado";
+    // own → revoke (delete-for-everyone, notifica al peer).
+    // other → hide (delete-for-me local, no notifica).
+    if (isOwn) {
+      await revoke(currentJID, messageId);
+    } else {
+      await hide(currentJID, messageId);
     }
+    // Feedback instant. Para own: removemos la burbuja entera (pedido
+    // user: "si elimino los de mi lado, no hace falta mostrar ese
+    // mensaje"). Para other: lo dejamos como tomb porque la regla
+    // distinta sería si el peer borra el suyo (eso sí se muestra,
+    // pero esos vienen vía SSE con revoked_by=peer, no por este path).
+    const msgEl = document.querySelector(`.wa-msg[data-id="${cssEscape(messageId)}"]`);
+    if (msgEl) msgEl.remove();
   } catch (e) {
-    console.error("[wa-reactions] revoke failed", e);
+    console.error("[wa-reactions] delete failed", e);
     const msg = /401/.test(e.message)
       ? "No se pudo eliminar: este device no tiene admin token (solo desde localhost / ra.ai)."
       : `No se pudo eliminar: ${e.message}`;
@@ -416,15 +421,17 @@ async function bulkRevoke() {
   let ok = 0;
   const errors = [];
   for (const id of ids) {
+    const el = document.querySelector(`.wa-msg[data-id="${cssEscape(id)}"]`);
+    const isOwn = el?.classList.contains("own");
     try {
-      await revoke(currentJID, id);
-      ok += 1;
-      const el = document.querySelector(`.wa-msg[data-id="${cssEscape(id)}"]`);
-      if (el) {
-        el.classList.remove("selected");
-        el.classList.add("revoked");
-        el.innerHTML = "🚫 Este mensaje fue eliminado";
+      if (isOwn) {
+        await revoke(currentJID, id);
+      } else {
+        await hide(currentJID, id);
       }
+      ok += 1;
+      // Removemos la burbuja entera (sin tomb) en ambos casos.
+      if (el) el.remove();
     } catch (e) {
       errors.push(`${id}: ${e.message}`);
     }

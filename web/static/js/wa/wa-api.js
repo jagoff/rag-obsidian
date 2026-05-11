@@ -71,6 +71,23 @@ export async function revoke(jid, messageId) {
   return r.json();
 }
 
+export async function hide(jid, messageId) {
+  // "Delete for me" — solo escribe en la tabla `revokes` del bridge
+  // local, no envía protocol message. Usado para mensajes inbound
+  // (WhatsApp no permite revoke-for-everyone de mensajes ajenos).
+  const r = await fetch("/api/wa/hide", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    credentials: "same-origin",
+    body: JSON.stringify({ jid, message_id: messageId }),
+  });
+  if (!r.ok) {
+    const txt = await r.text().catch(() => "");
+    throw new Error(`POST /api/wa/hide → ${r.status}${txt ? ` — ${txt.slice(0, 200)}` : ""}`);
+  }
+  return r.json();
+}
+
 export async function typing(jid, state) {
   // Fire-and-forget; los errores los swallow para no romper UX.
   try {

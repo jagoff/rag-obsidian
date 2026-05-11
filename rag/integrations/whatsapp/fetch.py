@@ -987,14 +987,25 @@ def fetch_thread_for_ui(
         msg_ids = [r["id"] for r in rows if r["id"]]
         placeholders = ",".join("?" * len(msg_ids)) if msg_ids else "''"
 
+        # revoked_by_map: msg_id → quién revocó (peer jid / my jid /
+        # "local-only"). Usamos esto para decidir si mostrar tomb
+        # ("🚫 Este mensaje fue eliminado") o ocultar el msg entero:
+        # - Si is_from_me Y revoked → ocultar (no muestro tomb de mis
+        #   propios mensajes, pedido user 2026-05-11).
+        # - Si revoked_by == "local-only" → ocultar (hide-for-me local).
+        # - Si revoked por peer (peer JID) → tomb.
         revoked_ids: set[str] = set()
+        revoked_by_map: dict[str, str] = {}
         if msg_ids:
             try:
                 revoke_rows = con.execute(
-                    f"SELECT message_id FROM revokes WHERE message_id IN ({placeholders})",
+                    f"SELECT message_id, revoked_by FROM revokes "
+                    f"WHERE message_id IN ({placeholders})",
                     msg_ids,
                 ).fetchall()
-                revoked_ids = {r["message_id"] for r in revoke_rows}
+                for r in revoke_rows:
+                    revoked_ids.add(r["message_id"])
+                    revoked_by_map[r["message_id"]] = r["revoked_by"] or ""
             except sqlite3.Error:
                 # Tabla aún sin filas → sin revokes; OK.
                 pass
@@ -1100,7 +1111,14 @@ def fetch_thread_for_ui(
             quoted_id = (r["quoted_id"] or "").strip()
             quoted_text = (r["quoted_text"] or "").strip()
             is_revoked = msg_id in revoked_ids
+            revoked_by = revoked_by_map.get(msg_id, "")
             if is_revoked:
+                # Hide-for-me: nunca renderear (msg propio que el user
+                # borró, o msg ajeno que el user ocultó localmente vía
+                # /api/wa/hide). Distinto del tomb que sí queremos ver
+                # cuando es el peer el que borra su msg.
+                if is_from_me or revoked_by == "local-only":
+                    continue
                 content = ""
                 media = ""
                 filename = ""

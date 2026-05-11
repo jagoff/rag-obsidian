@@ -75,11 +75,15 @@ export async function open(jid) {
     els.body.innerHTML = "";
     renderMessages(data.messages || [], data, /*prepend=*/ false);
     oldestTs = data.next_before_ts;
-    // Siempre scroll al fondo al abrir un chat (igual que WhatsApp Web).
-    // Si el user paginó hacia arriba durante esta sesión, scrollPositions
-    // se usa solo para volver al mismo punto cuando el mismo chat sigue
-    // abierto entre fetches (no entre clicks distintos).
-    els.body.scrollTop = els.body.scrollHeight;
+    // Siempre scroll al último mensaje al abrir un chat (igual que WhatsApp Web).
+    // Hacemos triple-pasada para cubrir el caso de imágenes/audios que cargan
+    // async después del primer paint y bajan más el scrollHeight final:
+    //   1) sync inmediato (paint inicial)
+    //   2) próximo frame (layout estabilizado)
+    //   3) cuando cada <img>/<video>/<audio> dispara 'load'/'loadedmetadata'
+    scrollToBottomNow();
+    requestAnimationFrame(scrollToBottomNow);
+    wireMediaScrollKeepers(els.body);
   }
 
   // Marcar leído contra el último ts visible
@@ -140,6 +144,38 @@ function renderMessages(messages, threadCtx, prepend) {
     els.body.insertBefore(frag, els.body.firstChild);
   } else {
     els.body.appendChild(frag);
+  }
+}
+
+function scrollToBottomNow() {
+  if (!els.body) return;
+  els.body.scrollTop = els.body.scrollHeight;
+}
+
+// Mientras el user no scrollee, mantenemos el viewport en el fondo a
+// medida que las imágenes/audios cargan y empujan el scrollHeight.
+// Se autocancela apenas el user toca la rueda/touchpad o el scrollbar.
+function wireMediaScrollKeepers(body) {
+  let active = true;
+  const cancel = () => { active = false; };
+  body.addEventListener("wheel", cancel, { passive: true, once: true });
+  body.addEventListener("touchstart", cancel, { passive: true, once: true });
+  body.addEventListener("scroll", () => {
+    // si el user scrolleó hacia arriba > 80px del fondo, asumimos intent.
+    if (els.body.scrollHeight - els.body.scrollTop - els.body.clientHeight > 80) {
+      active = false;
+    }
+  }, { passive: true });
+
+  const media = body.querySelectorAll("img, video, audio");
+  for (const el of media) {
+    const ev = el.tagName === "IMG" ? "load" : "loadedmetadata";
+    el.addEventListener(ev, () => {
+      if (active) scrollToBottomNow();
+    }, { once: true });
+    el.addEventListener("error", () => {
+      if (active) scrollToBottomNow();
+    }, { once: true });
   }
 }
 

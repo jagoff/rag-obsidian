@@ -1,29 +1,51 @@
 <!DOCTYPE html>
-<html lang="es-AR">
+<html lang="es-AR" data-theme="dark">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-  <title>RagWeb — WhatsApp local</title>
-  <link rel="stylesheet" href="/static/wa.css">
+  <title>rag · wa</title>
+  <link rel="stylesheet" href="/static/wa.css?v=2">
   <link rel="manifest" href="/static/manifest.webmanifest">
+  <link rel="icon" type="image/png" sizes="32x32" href="/static/pwa/favicon-32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/static/pwa/favicon-16.png">
+  <link rel="apple-touch-icon" href="/static/pwa/apple-touch-icon.png">
   <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <meta name="apple-mobile-web-app-title" content="RagWeb">
-  <meta name="theme-color" content="#075e54">
+  <meta name="apple-mobile-web-app-title" content="rag·wa">
+  <meta name="theme-color" content="#0a0e14">
+  <script>
+    // Forzar update del Service Worker antes que cualquier otra cosa.
+    // Si hay un SW v36 cacheando JS viejo, esto le pide al browser que
+    // revise sw.js otra vez; con skipWaiting() + clients.claim() el v37
+    // toma control y limpia los caches stale.
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.getRegistrations().then((rs) => {
+        rs.forEach((r) => r.update());
+      });
+    }
+  </script>
 </head>
 <body data-pane="thread">
   <div class="wa-app">
     <!-- Sidebar: lista de chats -->
     <aside class="wa-sidebar" aria-label="Lista de chats">
       <header class="wa-sidebar-header">
-        <div class="wa-app-title">RagWeb</div>
-        <div class="wa-conn-indicator" id="wa-conn" title="estado del bridge" aria-live="polite">○</div>
+        <div class="wa-app-title">rag<span class="accent">·</span>wa</div>
+        <div class="wa-conn-indicator" id="wa-conn" title="estado del bridge" aria-live="polite">●</div>
       </header>
+      <nav class="wa-sidebar-nav" aria-label="otras páginas">
+        <a href="/mirror">mirror</a>
+        <a href="/chat">chat</a>
+        <a href="/wa" class="current">wa</a>
+        <a href="/dashboard">dashboard</a>
+        <a href="/finance">finance</a>
+      </nav>
       <div class="wa-search-box">
-        <input type="search" id="wa-search-input" placeholder="Buscar chat..." autocomplete="off">
+        <input type="search" id="wa-search-input" placeholder="buscar chat..." autocomplete="off">
       </div>
       <ul class="wa-chatlist" id="wa-chatlist" aria-live="polite"></ul>
-      <div class="wa-chatlist-loading" id="wa-chatlist-loading">Cargando…</div>
+      <div class="wa-chatlist-loading" id="wa-chatlist-loading">cargando…</div>
     </aside>
 
     <!-- Thread: hilo del chat activo -->
@@ -32,27 +54,26 @@
         <button class="wa-back-btn" id="wa-back-btn" aria-label="Volver a chats">←</button>
         <div class="wa-thread-avatar" id="wa-thread-avatar" aria-hidden="true"></div>
         <div class="wa-thread-meta">
-          <div class="wa-thread-name" id="wa-thread-name">Elegí un chat</div>
+          <div class="wa-thread-name" id="wa-thread-name">elegí un chat</div>
           <div class="wa-thread-presence" id="wa-thread-presence"></div>
         </div>
       </header>
       <div class="wa-thread-body" id="wa-thread-body">
         <div class="wa-empty-state" id="wa-empty-state">
-          <p>Seleccioná un chat del panel izquierdo para empezar a leer.</p>
+          <p>seleccioná un chat del panel izquierdo para empezar a leer.</p>
         </div>
       </div>
-      <footer class="wa-composer" id="wa-composer">
+      <footer class="wa-composer idle" id="wa-composer">
         <textarea
           id="wa-composer-input"
-          placeholder="Elegí un chat para escribir"
+          placeholder="elegí un chat para escribir"
           rows="1"
-          disabled
         ></textarea>
-        <button class="wa-send-btn" id="wa-send-btn" disabled>Enviar</button>
+        <button class="wa-send-btn" id="wa-send-btn">enviar</button>
       </footer>
     </main>
   </div>
 
-  <script type="module" src="/static/js/wa/wa.js"></script>
+  <script type="module" src="/static/js/wa/wa.js?v=2"></script>
 </body>
 </html>

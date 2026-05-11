@@ -83,13 +83,18 @@ export function setActiveChat(jid) {
   currentJID = jid;
   pendingReply = null;
   hideReplyBar();
+  // El composer usa la class `.idle` (no `disabled` HTML) para que la
+  // UI no quede atascada si el JS no carga (ver wa.html — el composer
+  // arranca con clase `.idle`). El submit() también guardea sobre
+  // `currentJID` por las dudas.
+  if (els.root) {
+    els.root.classList.toggle("idle", !jid);
+  }
   if (els.input) {
-    els.input.disabled = !jid;
     els.input.value = "";
-    els.input.placeholder = jid ? "Escribí un mensaje…" : "Elegí un chat para escribir";
+    els.input.placeholder = jid ? "escribí un mensaje…" : "elegí un chat para escribir";
     autosize();
   }
-  if (els.btn) els.btn.disabled = !jid;
 }
 
 export function setReply(replyTo) {
@@ -129,7 +134,11 @@ function autosize() {
 }
 
 async function submit() {
-  if (!currentJID || !els.input || !els.btn) return;
+  if (!els.input || !els.btn) return;
+  if (!currentJID) {
+    window.alert("elegí un chat antes de mandar mensajes.");
+    return;
+  }
   const text = (els.input.value || "").trim();
   if (!text) return;
 
@@ -160,7 +169,7 @@ async function submit() {
   autosize();
   setReply(null);
   stopTyping();
-  els.btn.disabled = true;
+  if (els.btn) els.btn.classList.add("sending");
 
   try {
     const r = await sendText(currentJID, text, replyTo);
@@ -175,7 +184,7 @@ async function submit() {
     console.error("[wa-composer] send failed", e);
     markFailed(tempId, e.message || "error");
   } finally {
-    els.btn.disabled = false;
+    if (els.btn) els.btn.classList.remove("sending");
     if (els.input) els.input.focus();
   }
 }

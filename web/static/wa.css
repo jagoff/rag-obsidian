@@ -1301,6 +1301,147 @@ a:hover { text-decoration: underline; }
   opacity: 0.3;
 }
 
+/* ── Media inbound + lightbox ─────────────────────────────── */
+
+.wa-media {
+  display: block;
+  margin: 4px 0 6px;
+  max-width: 100%;
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  overflow: hidden;
+  background: var(--bg);
+  position: relative;
+}
+.wa-media-image img {
+  display: block;
+  max-width: 320px;
+  max-height: 360px;
+  width: auto;
+  height: auto;
+  cursor: zoom-in;
+  transition: filter 140ms;
+}
+.wa-media-image img:hover { filter: brightness(1.08); }
+.wa-media.missing {
+  padding: var(--space-3);
+  text-align: center;
+  color: var(--text-faint);
+  font-size: 11px;
+  cursor: default;
+}
+.wa-media-missing small { opacity: 0.7; }
+
+.wa-media-audio,
+.wa-media-video {
+  padding: 6px 8px;
+}
+.wa-media-audio audio {
+  width: 100%;
+  min-width: 240px;
+  height: 36px;
+}
+.wa-media-video video {
+  max-width: 360px;
+  max-height: 320px;
+  display: block;
+}
+
+.wa-media-doc {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  text-decoration: none;
+  color: var(--text);
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  font-size: var(--fs-small);
+  transition: border-color 100ms, background 100ms;
+  max-width: 340px;
+}
+.wa-media-doc:hover {
+  border-color: var(--cyan);
+  background: var(--bg-elev-3);
+}
+.wa-media-doc-icon {
+  font-size: 20px;
+  color: var(--cyan);
+  flex-shrink: 0;
+}
+.wa-media-doc-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+}
+.wa-media-doc-action {
+  color: var(--phosphor);
+  font-weight: 700;
+  font-size: 16px;
+}
+
+/* Lightbox modal */
+.wa-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(0, 0, 0, 0.85);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-4);
+  cursor: zoom-out;
+  animation: wa-lightbox-in 180ms ease-out;
+  backdrop-filter: blur(4px);
+}
+@keyframes wa-lightbox-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+.wa-lightbox-img {
+  max-width: 100%;
+  max-height: 100%;
+  border: 1px solid var(--border-strong);
+  box-shadow: 0 4px 30px rgba(0, 0, 0, 0.6);
+  cursor: default;
+}
+.wa-lightbox-close {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border-strong);
+  color: var(--text);
+  font-size: 16px;
+  width: 32px;
+  height: 32px;
+  border-radius: 2px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.wa-lightbox-close:hover {
+  background: var(--bg-elev-3);
+  border-color: var(--cyan);
+  color: var(--cyan);
+}
+
+/* Drop zone visual feedback */
+.wa-composer.dragging {
+  background: var(--bg-elev-3);
+  outline: 1px dashed var(--cyan);
+  outline-offset: -4px;
+}
+.wa-composer.dragging textarea {
+  background: transparent;
+  border-color: var(--cyan);
+}
+
 /* Theme toggle button — pareja split-disc para sugerir dual mode */
 .wa-header-right {
   display: inline-flex;

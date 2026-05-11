@@ -212,7 +212,7 @@ try:
 except ImportError:
     _HEIC_AVAILABLE = False
 
-from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
@@ -4238,6 +4238,143 @@ def wa_revoke(req: _WARevokeRequest) -> dict:
 class _WATypingRequest(BaseModel):
     jid: str
     state: str  # "composing" | "paused" | "recording"
+
+
+@app.get("/api/wa/media/{message_id}")
+def wa_media(message_id: str, jid: str) -> FileResponse:
+    """Sirve un archivo de media de un mensaje del bridge.
+
+    1. Intenta resolverlo via ``_bridge_media_path`` (path local que ya
+       descargó el bridge — la mayoría de los media inbound).
+    2. Si no existe, llama ``bridge_client.download_media`` para
+       forzar descarga ad-hoc y vuelve a chequear.
+    3. 404 si sigue sin existir.
+
+    Si el media existe en `messages.db.filename` pero el archivo aún
+    no se bajó (puede pasar en mensajes muy viejos cuyo media expiró),
+    el endpoint devuelve 404 — el frontend muestra un placeholder.
+
+    `Cache-Control: private, max-age=86400` (24h) — los media en
+    WhatsApp son inmutables por message_id; el caché agresivo es safe.
+    """
+    import mimetypes  # noqa: PLC0415
+    import sqlite3 as _sqlite3  # noqa: PLC0415
+
+    from rag.integrations.whatsapp import bridge_client as _bc, fetch as _wa_fetch  # noqa: PLC0415
+    import rag as _rag  # noqa: PLC0415
+
+    if not jid or "@" not in jid:
+        raise HTTPException(status_code=400, detail="jid inválido")
+    if not message_id:
+        raise HTTPException(status_code=400, detail="message_id requerido")
+
+    # Look up filename del bridge DB.
+    db_path = _rag.WHATSAPP_DB_PATH
+    if not db_path.is_file():
+        raise HTTPException(status_code=503, detail="bridge DB no disponible")
+    try:
+        con = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+        row = con.execute(
+            "SELECT filename, media_type FROM messages WHERE id = ? AND chat_jid = ?",
+            (message_id, jid),
+        ).fetchone()
+        con.close()
+    except _sqlite3.Error:
+        raise HTTPException(status_code=500, detail="error leyendo bridge DB")
+    if not row or not row[0]:
+        raise HTTPException(status_code=404, detail="media no encontrada")
+    filename, media_type = row
+
+    path = _wa_fetch._bridge_media_path(jid, filename)
+    if path is None or not path.is_file():
+        # Forzar descarga
+        try:
+            _bc.download_media(message_id, jid)
+            path = _wa_fetch._bridge_media_path(jid, filename)
+        except _bc.BridgeError:
+            path = None
+    if path is None or not path.is_file():
+        raise HTTPException(status_code=404, detail="media no descargada")
+
+    mime, _ = mimetypes.guess_type(str(path))
+    if not mime:
+        mime = f"application/{(media_type or 'octet-stream').lower()}"
+    return FileResponse(
+        path,
+        media_type=mime,
+        headers={
+            "Cache-Control": "private, max-age=86400",
+            "Content-Disposition": f'inline; filename="{filename}"',
+        },
+    )
+
+
+_WA_MEDIA_OUT_DIR = Path.home() / ".local/share/obsidian-rag/wa-media/out"
+
+
+@app.post("/api/wa/send_media")
+async def wa_send_media(
+    request: Request,
+    jid: str = Form(...),
+    caption: str = Form(""),
+    reply_to_id: str = Form(""),
+    file: UploadFile = File(...),
+) -> dict:
+    """Manda un media (foto/video/audio/doc) al contacto.
+
+    Recibe multipart con `file` + form fields `jid`, `caption?`,
+    `reply_to_id?`. Guarda el archivo en
+    ``~/.local/share/obsidian-rag/wa-media/out/<YYYY-MM>/<uuid>.<ext>``
+    y le pasa el path absoluto al bridge — el bridge lee el archivo,
+    lo encrypta y sube a los servers de WhatsApp.
+
+    Devuelve `{ok, error_kind, message_id?}`. El SSE va a emitir
+    `new_message` para el mensaje propio cuando el bridge lo persista.
+    """
+    import datetime as _dt  # noqa: PLC0415
+    import uuid as _uuid  # noqa: PLC0415
+
+    from rag.integrations.whatsapp import bridge_client as _bc  # noqa: PLC0415
+
+    if not jid or "@" not in jid:
+        raise HTTPException(status_code=400, detail="jid inválido")
+    if not file or not file.filename:
+        raise HTTPException(status_code=400, detail="file requerido")
+
+    # Tamaño cap defensivo (WhatsApp ~100 MB para video, 16 MB para imagen)
+    max_bytes = 100 * 1024 * 1024
+    body_bytes = await file.read()
+    if len(body_bytes) > max_bytes:
+        raise HTTPException(status_code=413, detail=f"file demasiado grande (>{max_bytes // 1024 // 1024}MB)")
+    if len(body_bytes) == 0:
+        raise HTTPException(status_code=400, detail="file vacío")
+
+    # Path: ~/.local/share/obsidian-rag/wa-media/out/2026-05/<uuid>.<ext>
+    now = _dt.datetime.now()
+    month_dir = _WA_MEDIA_OUT_DIR / f"{now.year:04d}-{now.month:02d}"
+    month_dir.mkdir(parents=True, exist_ok=True)
+    ext = ""
+    if "." in file.filename:
+        raw_ext = file.filename.rsplit(".", 1)[-1].lower()
+        if 1 <= len(raw_ext) <= 8 and raw_ext.isalnum():
+            ext = "." + raw_ext
+    out_path = month_dir / f"{_uuid.uuid4().hex}{ext}"
+    out_path.write_bytes(body_bytes)
+
+    reply_to = None
+    if reply_to_id:
+        reply_to = {"message_id": reply_to_id, "original_text": "", "sender_jid": ""}
+
+    try:
+        resp = _bc.send_media(jid, str(out_path), caption=caption, reply_to=reply_to)
+    except _bc.BridgeError as e:
+        return {"ok": False, "error_kind": "bridge_error", "error": str(e), "status": e.status}
+    return {
+        "ok": True,
+        "error_kind": "sent",
+        "message_id": resp.get("message_id"),
+        "filename": file.filename,
+    }
 
 
 @app.get("/api/wa/avatar/{jid}")

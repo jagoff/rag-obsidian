@@ -4,6 +4,7 @@
 // thread la reemplaza por la versión persistida del bridge.
 
 import { sendText, typing as sendTyping } from "./wa-api.js";
+import { uploadMedia } from "./wa-media.js";
 
 const els = {
   root: null,
@@ -41,6 +42,83 @@ export function init({ rootEl, onOptimisticInsert }) {
   });
   els.input.addEventListener("blur", () => stopTyping());
   els.btn.addEventListener("click", submit);
+
+  // Paste image desde clipboard.
+  els.input.addEventListener("paste", (e) => {
+    if (!currentJID || !e.clipboardData) return;
+    const items = Array.from(e.clipboardData.items || []);
+    for (const it of items) {
+      if (it.kind === "file" && it.type && it.type.startsWith("image/")) {
+        const f = it.getAsFile();
+        if (f) {
+          e.preventDefault();
+          sendMediaFile(f);
+          return;
+        }
+      }
+    }
+  });
+
+  // Drag & drop sobre todo el composer.
+  const root = els.root;
+  const onDragOver = (e) => {
+    if (!currentJID) return;
+    e.preventDefault();
+    root.classList.add("dragging");
+  };
+  const onDragLeave = () => root.classList.remove("dragging");
+  const onDrop = (e) => {
+    e.preventDefault();
+    root.classList.remove("dragging");
+    if (!currentJID || !e.dataTransfer) return;
+    const files = Array.from(e.dataTransfer.files || []);
+    for (const f of files) sendMediaFile(f);
+  };
+  root.addEventListener("dragover", onDragOver);
+  root.addEventListener("dragleave", onDragLeave);
+  root.addEventListener("drop", onDrop);
+}
+
+async function sendMediaFile(file) {
+  if (!currentJID || !file) return;
+  const replyTo = pendingReply;
+  const tempId = `tmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const isImage = (file.type || "").startsWith("image/");
+  const isVideo = (file.type || "").startsWith("video/");
+  const isAudio = (file.type || "").startsWith("audio/");
+  const mediaType = isImage ? "image" : isVideo ? "video" : isAudio ? "audio" : "document";
+
+  if (onOptimisticInsertCb) {
+    onOptimisticInsertCb(currentJID, {
+      id: tempId,
+      ts: new Date().toISOString(),
+      sender: "yo",
+      sender_label: "yo",
+      content: `[subiendo ${file.name}…]`,
+      is_from_me: true,
+      media_type: mediaType,
+      filename: file.name,
+      quoted: null,
+      reactions: [],
+      revoked: false,
+      pending: true,
+    });
+  }
+  setReply(null);
+
+  try {
+    await uploadMedia(currentJID, file, { replyToId: replyTo ? replyTo.message_id : "" });
+    // Optimistic queda como pending hasta que SSE traiga el real.
+  } catch (e) {
+    console.error("[wa-composer] sendMediaFile failed", e);
+    const el = document.querySelector(`.wa-msg[data-id="${tempId}"]`);
+    if (el) {
+      el.classList.remove("pending");
+      el.classList.add("failed");
+      const t = el.querySelector(".wa-msg-time");
+      if (t) t.textContent = `falló: ${e.message || "upload"}`;
+    }
+  }
 }
 
 // Typing emit: composing cada 5s mientras hay focus + texto. Auto-paused

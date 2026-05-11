@@ -5,6 +5,7 @@ import { fetchThread, markRead } from "./wa-api.js";
 import { renderInto as renderAvatar } from "./wa-avatars.js";
 import * as composer from "./wa-composer.js";
 import * as reactions from "./wa-reactions.js";
+import * as media from "./wa-media.js";
 
 const els = {
   body: null,
@@ -168,8 +169,12 @@ function renderMsg(m, ctx) {
     div.appendChild(q);
   }
 
-  // Media hint (Fase 7 lo va a renderear visualmente)
-  if (m.media_type) {
+  // Media render (Fase 7) — solo si tenemos `id` real (no pending optimistic).
+  if (m.media_type && m.id && !String(m.id).startsWith("tmp-") && !m.pending) {
+    const mediaMsg = { ...m, jid: currentJID, chat_jid: currentJID };
+    media.renderInto(div, mediaMsg);
+  } else if (m.media_type) {
+    // Fallback hint mientras está pending (sin id real).
     const hint = document.createElement("div");
     hint.className = "wa-msg-media-hint";
     hint.textContent = `[${m.media_type}${m.filename ? `: ${m.filename}` : ""}]`;

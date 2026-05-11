@@ -597,7 +597,12 @@ export function renderTodayHero(payload) {
 // chequean estado previo antes de duplicar nodos / handlers.
 
 const LS_HERO_ORDER = "home.v2.hero-subs.order.v1";
-const LS_HERO_SUB_COLLAPSED = "home.v2.hero-subs.collapsed.v1";
+// v1 → v2 (2026-05-11): el estado colapsado heredado dejaba a usuarios
+// con boxes "vacíos" visualmente (h3 visible + body oculto por CSS
+// `[data-collapsed="true"] .prose`) sin pista de cómo expandir. Bumpear
+// la key invalida el estado viejo — las cajas empiezan expandidas por
+// default; el user puede re-colapsar si quiere.
+const LS_HERO_SUB_COLLAPSED = "home.v2.hero-subs.collapsed.v2";
 
 // Clase identificadora estable por hero-section (se persiste en LS).
 const HERO_SECTION_KEYS = ["s-narrative", "s-inbox", "s-questions", "s-agenda"];

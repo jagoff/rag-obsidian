@@ -250,6 +250,51 @@ def recent_tracks_today(limit: int = 20) -> list[dict]:
     return out
 
 
+def recent_tracks_lookback(days: int = 7, limit: int = 10) -> list[dict]:
+    """Fallback para el panel del home cuando `recent_tracks_today` viene
+    vacío — devuelve lo último escuchado en los últimos `days` días.
+
+    Caso de uso: 2026-05-11 user reportó "spotify está vacío" porque
+    cerró Spotify desktop ayer y no hay tracks del día actual. La regla
+    pedida: "debería traer lo último que se escuchó". Esta función
+    cubre exactamente ese fallback — si la tabla tiene datos históricos
+    los surface aunque el día de hoy esté en blanco.
+
+    El frontend renderea `first_seen` con `fmtTimeAgo` así que el track
+    se va a ver con label "hace 1d / 3h" según corresponda — el user
+    entiende que no es de hoy sin necesidad de un toggle visual extra.
+
+    Returns: mismo shape que `recent_tracks_today`, o [].
+    """
+    from rag import _ragvec_state_conn  # noqa: PLC0415
+
+    cutoff = time.time() - (days * 86400)
+    try:
+        with _ragvec_state_conn() as conn:
+            rows = conn.execute(
+                "SELECT track_id, name, artist, album, first_seen, last_seen "
+                "FROM rag_spotify_log WHERE first_seen >= ? "
+                "ORDER BY first_seen DESC LIMIT ?",
+                (cutoff, int(limit)),
+            ).fetchall()
+    except Exception:
+        return []
+    out: list[dict] = []
+    for r in rows:
+        first_seen = float(r[4])
+        last_seen = float(r[5])
+        out.append({
+            "track_id": r[0],
+            "name": r[1],
+            "artist": r[2],
+            "album": r[3] or "",
+            "first_seen": first_seen,
+            "last_seen": last_seen,
+            "duration_played_s": int(last_seen - first_seen),
+        })
+    return out
+
+
 # Acciones soportadas por `control()`. Mapean 1:1 a comandos AppleScript
 # del Spotify desktop app ([docs](https://developer.spotify.com/documentation/applescript)
 # — sí, Spotify mantiene una scripting dictionary pública). `playpause`

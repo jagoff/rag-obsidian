@@ -414,6 +414,8 @@ def _fetch_chrome_today_domains(now: datetime, top_n: int = 8) -> list[dict]:
                     FROM urls u
                     JOIN visits v ON v.url = u.id
                     WHERE v.visit_time >= ?
+                      AND u.url NOT LIKE '%://localhost%'
+                      AND u.url NOT LIKE '%://127.0.0.1%'
                     GROUP BY u.url
                     ORDER BY visit_count DESC
                     LIMIT 200

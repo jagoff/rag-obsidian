@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#1a1a1f">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="rag · memo">
+  <title>rag · memo</title>
+
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" type="image/png" sizes="32x32" href="/static/pwa/favicon-32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/static/pwa/favicon-16.png">
+  <link rel="apple-touch-icon" href="/static/pwa/apple-touch-icon.png">
+
+  <script>
+    (function () {
+      try {
+        var t = localStorage.getItem("rag-theme");
+        if (t === "light" || t === "dark") {
+          document.documentElement.setAttribute("data-theme", t);
+        }
+      } catch (e) {}
+    })();
+  </script>
+  <script src="/static/pwa/register-sw.js" defer></script>
+
+  <style>
+    :root {
+      --bg: #1a1a1f;
+      --bg-elev: #222228;
+      --bg-card: #26262c;
+      --border: #33333a;
+      --border-strong: #3e3e46;
+      --text: #ececed;
+      --text-dim: #a0a0a6;
+      --text-faint: #7a7a82;
+      --green: #7ee787;
+      --cyan: #79c0ff;
+      --yellow: #e3c27a;
+      --red: #ff7b72;
+      --purple: #d2a8ff;
+      --orange: #ffa657;
+      --pink: #f778ba;
+      --hover: rgba(255,255,255,0.06);
+      color-scheme: dark;
+    }
+    :root[data-theme="light"] {
+      --bg: #fafafa;
+      --bg-elev: #ffffff;
+      --bg-card: #ffffff;
+      --border: #e2e2e5;
+      --border-strong: #c8c8cc;
+      --text: #1a1a1f;
+      --text-dim: #5a5a62;
+      --text-faint: #8a8a92;
+      --hover: rgba(0,0,0,0.04);
+      color-scheme: light;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      padding: 14px 22px;
+      background: var(--bg-elev);
+      border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    .topbar h1 {
+      margin: 0;
+      font-size: 16px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+    }
+    .topbar h1 .dim {
+      color: var(--text-dim);
+      font-weight: 400;
+    }
+    .topbar-link {
+      color: var(--text-dim);
+      text-decoration: none;
+      font-size: 13px;
+      padding: 4px 8px;
+      border-radius: 5px;
+    }
+    .topbar-link:hover { background: var(--hover); color: var(--text); }
+    .topbar-spacer { flex: 1; }
+
+    .container {
+      padding: 22px;
+      max-width: 1400px;
+      margin: 0 auto;
+    }
+
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+    .stat-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px 16px;
+    }
+    .stat-card .label {
+      font-size: 11px;
+      color: var(--text-faint);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 6px;
+    }
+    .stat-card .value {
+      font-size: 22px;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+    }
+    .stat-card .sub {
+      font-size: 11px;
+      color: var(--text-dim);
+      margin-top: 4px;
+    }
+
+    .types-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 18px;
+    }
+    .type-pill {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 5px 12px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: all 80ms;
+      color: var(--text-dim);
+      user-select: none;
+    }
+    .type-pill:hover { border-color: var(--border-strong); color: var(--text); }
+    .type-pill.active {
+      background: var(--cyan);
+      color: #0a0a0f;
+      border-color: var(--cyan);
+      font-weight: 600;
+    }
+    .type-pill .count {
+      opacity: 0.7;
+      margin-left: 5px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .body-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 360px;
+      gap: 20px;
+    }
+    @media (max-width: 980px) {
+      .body-grid { grid-template-columns: 1fr; }
+    }
+
+    .panel {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .panel-header {
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .panel-header .small {
+      font-size: 11px;
+      color: var(--text-faint);
+      font-weight: 400;
+    }
+
+    table.memos {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    table.memos th, table.memos td {
+      text-align: left;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border);
+    }
+    table.memos th {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--text-faint);
+      font-weight: 500;
+      background: var(--bg-elev);
+      position: sticky;
+      top: 0;
+    }
+    table.memos tr { cursor: pointer; }
+    table.memos tr:hover td { background: var(--hover); }
+    table.memos tr.selected td { background: rgba(121, 192, 255, 0.10); }
+
+    .type-tag {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+    .type-tag[data-type="bug"] { background: rgba(255, 123, 114, 0.15); color: var(--red); }
+    .type-tag[data-type="fact"] { background: rgba(121, 192, 255, 0.15); color: var(--cyan); }
+    .type-tag[data-type="decision"] { background: rgba(210, 168, 255, 0.15); color: var(--purple); }
+    .type-tag[data-type="note"] { background: rgba(126, 231, 135, 0.15); color: var(--green); }
+    .type-tag[data-type="preference"] { background: rgba(227, 194, 122, 0.15); color: var(--yellow); }
+
+    .tag-chip {
+      display: inline-block;
+      background: var(--bg-elev);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 1px 6px;
+      margin-right: 4px;
+      font-size: 10px;
+      color: var(--text-dim);
+    }
+
+    .ago {
+      color: var(--text-faint);
+      font-variant-numeric: tabular-nums;
+      font-size: 12px;
+    }
+
+    .tags-cloud {
+      padding: 14px 16px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .tag-cloud-item {
+      background: var(--bg-elev);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 3px 8px;
+      font-size: 11px;
+      color: var(--text-dim);
+    }
+    .tag-cloud-item .count { color: var(--text-faint); margin-left: 4px; }
+
+    .detail {
+      padding: 16px 18px;
+      max-height: 70vh;
+      overflow-y: auto;
+    }
+    .detail .empty {
+      color: var(--text-faint);
+      font-size: 13px;
+      text-align: center;
+      padding: 30px 10px;
+    }
+    .detail h2 {
+      margin: 0 0 6px;
+      font-size: 15px;
+      font-weight: 600;
+      line-height: 1.35;
+    }
+    .detail .meta-row {
+      font-size: 11px;
+      color: var(--text-faint);
+      margin-bottom: 12px;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .detail .body {
+      white-space: pre-wrap;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 12.5px;
+      line-height: 1.55;
+      color: var(--text);
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px 14px;
+      margin-top: 8px;
+    }
+    .detail .path {
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 11px;
+      color: var(--text-faint);
+      word-break: break-all;
+    }
+
+    .banner-error {
+      background: rgba(255, 123, 114, 0.10);
+      border: 1px solid rgba(255, 123, 114, 0.30);
+      color: var(--red);
+      padding: 12px 16px;
+      border-radius: 6px;
+      margin-bottom: 16px;
+      font-size: 13px;
+    }
+
+    .loading {
+      color: var(--text-faint);
+      font-size: 13px;
+      padding: 20px 16px;
+    }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <h1>rag <span class="dim">· memo</span></h1>
+    <span class="topbar-link" id="paths-hint" style="font-size: 11px;"></span>
+    <span class="topbar-spacer"></span>
+    <a class="topbar-link" href="/">home</a>
+    <a class="topbar-link" href="/atlas">atlas</a>
+    <a class="topbar-link" href="/dashboard">dashboard</a>
+    <a class="topbar-link" href="/mirror">mirror</a>
+  </div>
+
+  <div class="container">
+    <div id="error-banner"></div>
+
+    <div class="stats-grid" id="stats-grid">
+      <div class="loading">Cargando…</div>
+    </div>
+
+    <div class="types-row" id="types-row"></div>
+
+    <div class="body-grid">
+      <div>
+        <div class="panel">
+          <div class="panel-header">
+            <span>Memorias recientes</span>
+            <span class="small" id="recent-meta"></span>
+          </div>
+          <div style="max-height: 70vh; overflow-y: auto;">
+            <table class="memos">
+              <thead>
+                <tr>
+                  <th>Tipo</th>
+                  <th>Título</th>
+                  <th>Tags</th>
+                  <th>Cuando</th>
+                </tr>
+              </thead>
+              <tbody id="memos-tbody">
+                <tr><td colspan="4" class="loading">Cargando…</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <div class="panel" style="margin-bottom: 16px;">
+          <div class="panel-header">
+            <span>Detalle</span>
+            <span class="small" id="detail-id"></span>
+          </div>
+          <div class="detail" id="detail">
+            <div class="empty">Click en una memoria para verla.</div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <span>Tags más usados</span>
+            <span class="small">top 20</span>
+          </div>
+          <div class="tags-cloud" id="tags-cloud">
+            <div class="loading">…</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/memo.js" defer></script>
+</body>
+</html>

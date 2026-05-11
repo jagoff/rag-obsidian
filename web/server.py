@@ -664,50 +664,76 @@ app.mount(
     name="static",
 )
 
-# ── /mem-vault: mem-vault UI mounted as a sub-application ────────────────
-# Boot mem-vault's FastAPI app once (Qdrant + mem0 are expensive) and let
-# it serve everything under /mem-vault/*. Same origin as the rest of the
-# web UI so links + cookies + CSP work without surprises. Best-effort: if
-# the mem-vault package isn't installed in this venv (it lives in a
-# separate repo, optional dep) we just skip the mount and the link in the
-# navbar will 404 — easy to spot but doesn't crash the rest of the server.
+# ── /memo: visor de las memorias del MCP `memo` ──────────────────────────
+# `memo` es el sucesor de `mem-vault` (2026-05-10): mismo rol — memoria
+# persistente del agente sobre bugs / decisiones / preferencias / facts —
+# pero el stack es local-first puro (sqlite-vec + MLX, sin Qdrant ni
+# Ollama). Como `memo` solo expone CLI + MCP stdio (no servidor HTTP
+# propio), montamos una vista read-only acá que lee directo sus 3 sqlite
+# files en `~/.local/share/memo/` + los `.md` en `99-obsidian/99-AI/memory/`.
 #
-# Renamed from /memory → /mem-vault on 2026-05-02 to align the public URL
-# (https://ra.ai/mem-vault) with the project name. The legacy /memory path
-# is kept as a 308 redirect below so bookmarks + external links keep
-# working without a flag day.
-try:
-    from mem_vault.ui.server import create_app as _mem_vault_create_app  # type: ignore[import-not-found]
+# El módulo `web.memo_dashboard` se importa lazy adentro de cada handler
+# para que el server arranque aunque `memo` no esté inicializado todavía
+# (e.g. primer boot pre `memo init`).
+#
+# Legacy: `/mem-vault` y `/memory` redirigen a `/memo` con 308 para no
+# romper bookmarks ni links en notas viejas.
+from fastapi.responses import RedirectResponse as _MemoRedirect
 
-    _mem_vault_app = _mem_vault_create_app()
-    app.mount("/mem-vault", _mem_vault_app, name="mem-vault-ui")
-    print("[mem-vault] UI mounted at /mem-vault", file=sys.stderr, flush=True)
 
-    # Redirect legacy /memory → /mem-vault. 308 preserves the method
-    # (HTMX uses GET for the dashboard fetches, but a future PATCH /api/v1
-    # call wouldn't get downgraded to GET like a 301/302 would).
-    from fastapi.responses import RedirectResponse as _MemVaultRedirect
+@app.get("/memo")
+def memo_page() -> FileResponse:
+    """HTML del dashboard /memo. Hidrata via /api/memo."""
+    return FileResponse(STATIC_DIR / "memo.html")
 
-    @app.get("/memory")
-    @app.get("/memory/{path:path}")
-    async def _memory_legacy_redirect(request: Request, path: str = ""):
-        # Preserve the suffix and any query string so bookmarks like
-        # /memory/?focus=foo land at /mem-vault/?focus=foo cleanly.
-        suffix = f"/{path}" if path else "/"
-        qs = request.url.query
-        target = f"/mem-vault{suffix}"
-        if qs:
-            target = f"{target}?{qs}"
-        return _MemVaultRedirect(url=target, status_code=308)
 
-except Exception as _exc:  # pragma: no cover — best-effort wiring
-    print(
-        f"[mem-vault] UI not mounted ({_exc}). "
-        "Install with `uv pip install --editable /path/to/mem-vault[ui,hybrid]` "
-        "if you want /mem-vault to work.",
-        file=sys.stderr,
-        flush=True,
-    )
+@app.get("/api/memo")
+def memo_api(limit: int = 30, type: str | None = None) -> dict:
+    """Snapshot de las memorias del MCP `memo` — totales por tipo +
+    activity (saved últimas 24h / 7d / 30d) + tags más usados +
+    listado de las `limit` más recientes (opcional filtradas por `type`).
+
+    TTL 30s. Fuente: `~/.local/share/memo/{memvec,history}.db`.
+    """
+    from web.memo_dashboard import snapshot
+
+    return snapshot(limit=limit, type_filter=type)
+
+
+@app.get("/api/memo/note")
+def memo_note_api(id: str | None = None, path: str | None = None) -> dict:
+    """Detalle de una memoria — metadata + body markdown.
+
+    Acepta `id` (full o prefijo ≥4 chars) o `path` relativo al vault.
+    El body se lee del `.md` (source of truth de memo, no del sqlite).
+    """
+    from web.memo_dashboard import note_detail
+
+    return note_detail(memo_id=id, path=path)
+
+
+@app.get("/mem-vault")
+@app.get("/mem-vault/{path:path}")
+async def _mem_vault_legacy_redirect(request: Request, path: str = ""):
+    """Legacy: /mem-vault/... → /memo (308 preserva método).
+    Bookmarks viejos + links en notas Obsidian siguen andando.
+    """
+    qs = request.url.query
+    target = "/memo"
+    if qs:
+        target = f"{target}?{qs}"
+    return _MemoRedirect(url=target, status_code=308)
+
+
+@app.get("/memory")
+@app.get("/memory/{path:path}")
+async def _memory_legacy_redirect(request: Request, path: str = ""):
+    """Legacy aún más viejo: /memory/... → /memo."""
+    qs = request.url.query
+    target = "/memo"
+    if qs:
+        target = f"{target}?{qs}"
+    return _MemoRedirect(url=target, status_code=308)
 
 # CORS: same-origin only. The server is bound to 127.0.0.1 by the
 # launchd plist, so cross-origin requests would come from a browser

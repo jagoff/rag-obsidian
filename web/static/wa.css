@@ -739,14 +739,44 @@ button { cursor: pointer; }
 }
 .wa-media-audio {
   display: flex;
-  align-items: center;
-  gap: 8px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
   background: var(--bg-quoted);
-  border-radius: var(--radius-pill);
-  padding: 6px 10px;
-  min-width: 200px;
+  border-radius: 12px;
+  padding: 8px 10px;
+  min-width: 240px;
 }
 .wa-media-audio audio { width: 100%; }
+.wa-voice-transcript-btn {
+  background: transparent;
+  border: 0;
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  text-align: left;
+  padding: 2px 4px;
+  letter-spacing: 0.2px;
+  cursor: pointer;
+  align-self: flex-start;
+  border-radius: 4px;
+  transition: color 0.1s ease, background 0.1s ease;
+}
+.wa-voice-transcript-btn:hover { color: var(--accent); background: rgba(0,168,132,0.08); }
+.wa-voice-transcript-btn[data-state="loading"] { color: var(--accent); opacity: 0.7; cursor: wait; }
+.wa-voice-transcript-btn[data-state="error"] { color: var(--red); }
+.wa-voice-transcript-box {
+  font-size: 13px;
+  line-height: 18px;
+  color: var(--text-primary);
+  background: rgba(0,0,0,0.18);
+  border-left: 2px solid var(--accent);
+  padding: 6px 10px;
+  border-radius: 4px;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  max-height: 200px;
+  overflow-y: auto;
+}
 .wa-media-doc {
   display: flex;
   align-items: center;
@@ -961,6 +991,77 @@ button { cursor: pointer; }
   padding: 4px;
   line-height: 1;
   cursor: pointer;
+}
+
+/* ─── Draft contradiction radar ──────────────────────────────────── */
+/* Badge que aparece arriba del composer cuando el draft choca con
+ * info reciente del historial. Color amber (no rojo) para que no
+ * grite — es un "ojo" sugerente, no un bloqueante. */
+.wa-draft-warn {
+  position: relative;
+  background: rgba(255, 184, 77, 0.10);
+  border: 1px solid rgba(255, 184, 77, 0.35);
+  border-radius: 8px;
+  padding: 8px 36px 8px 12px;
+  font-size: 12.5px;
+  line-height: 17px;
+  color: var(--amber);
+  margin-bottom: 8px;
+}
+.wa-draft-warn-summary {
+  background: transparent;
+  border: 0;
+  color: var(--amber);
+  font-size: inherit;
+  padding: 0;
+  text-align: left;
+  cursor: pointer;
+  width: 100%;
+}
+.wa-draft-warn-summary strong { font-weight: 700; }
+.wa-draft-warn-close {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  background: transparent;
+  border: 0;
+  color: var(--text-secondary);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.wa-draft-warn-close:hover { background: rgba(255, 184, 77, 0.18); color: var(--amber); }
+.wa-draft-warn-list {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.wa-draft-warn-row {
+  background: rgba(0,0,0,0.18);
+  border-radius: 6px;
+  padding: 6px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.wa-draft-warn-reason {
+  color: var(--amber);
+  font-weight: 600;
+  font-size: 12px;
+}
+.wa-draft-warn-snippet {
+  color: var(--text-primary);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+.wa-draft-warn-meta {
+  color: var(--text-tertiary);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
 }
 
 /* ─── Voice note preview ─────────────────────────────────────────── */

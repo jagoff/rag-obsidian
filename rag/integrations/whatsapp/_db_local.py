@@ -92,6 +92,24 @@ CREATE TRIGGER IF NOT EXISTS rag_wa_fts_au AFTER UPDATE ON rag_wa_messages_mirro
     INSERT INTO rag_wa_fts(rowid, content, sender, chat_jid, ts)
     VALUES (new.rowid, new.content, new.sender, new.chat_jid, new.ts);
 END;
+
+-- Cache de transcripts de voice notes inbound. `msg_id` es PK porque
+-- WhatsApp msg ids son únicos globalmente. `text` puede ser '' cuando
+-- whisper falló — guardamos la fila igual para no re-intentar en loop.
+CREATE TABLE IF NOT EXISTS rag_wa_voice_transcripts (
+    msg_id TEXT PRIMARY KEY,
+    jid TEXT NOT NULL,
+    sender TEXT,
+    text TEXT NOT NULL DEFAULT '',
+    language TEXT,
+    duration_s REAL,
+    model TEXT,
+    error TEXT,
+    audio_ts TEXT,
+    created_ts TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_rag_wa_voice_transcripts_jid
+    ON rag_wa_voice_transcripts(jid, audio_ts DESC);
 """
 
 
@@ -189,5 +207,57 @@ def max_mirror_ts() -> str | None:
     try:
         row = conn.execute("SELECT MAX(ts) AS m FROM rag_wa_messages_mirror").fetchone()
         return row["m"] if row and row["m"] else None
+    finally:
+        conn.close()
+
+
+def get_voice_transcript(msg_id: str) -> dict | None:
+    """Lee transcript cacheado para un msg_id. None si no existe.
+
+    Filas con `error` set son cache "negative" — no re-transcribir.
+    """
+    if not msg_id:
+        return None
+    ensure_schema()
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT msg_id, jid, sender, text, language, duration_s, model, error, "
+            "audio_ts, created_ts FROM rag_wa_voice_transcripts WHERE msg_id = ?",
+            (msg_id,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def set_voice_transcript(
+    msg_id: str,
+    jid: str,
+    *,
+    sender: str | None = None,
+    text: str = "",
+    language: str | None = None,
+    duration_s: float | None = None,
+    model: str | None = None,
+    error: str | None = None,
+    audio_ts: str | None = None,
+) -> None:
+    """Persiste un transcript (o un fail) en cache. Idempotente via PK."""
+    if not msg_id:
+        return
+    ensure_schema()
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT INTO rag_wa_voice_transcripts "
+            "(msg_id, jid, sender, text, language, duration_s, model, error, audio_ts) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(msg_id) DO UPDATE SET "
+            "  text = excluded.text, language = excluded.language, "
+            "  duration_s = excluded.duration_s, model = excluded.model, "
+            "  error = excluded.error",
+            (msg_id, jid, sender, text or "", language, duration_s, model, error, audio_ts),
+        )
     finally:
         conn.close()

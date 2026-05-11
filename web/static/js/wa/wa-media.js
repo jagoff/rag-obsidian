@@ -48,6 +48,53 @@ export function renderInto(container, msg) {
     audio.preload = "metadata";
     audio.src = url;
     wrap.appendChild(audio);
+    // Toggle de transcript: fetch on-demand al endpoint
+    // /api/wa/voice/transcript/{msg_id}. Si hay cache lo trae instant;
+    // si no, corre whisper y devuelve (~3-8s típico).
+    const trBtn = document.createElement("button");
+    trBtn.type = "button";
+    trBtn.className = "wa-voice-transcript-btn";
+    trBtn.textContent = "📝 ver transcript";
+    trBtn.dataset.state = "idle";
+    const trBox = document.createElement("div");
+    trBox.className = "wa-voice-transcript-box";
+    trBox.hidden = true;
+    trBtn.addEventListener("click", async () => {
+      if (trBtn.dataset.state === "loading") return;
+      if (trBtn.dataset.state === "done") {
+        // toggle hide/show
+        trBox.hidden = !trBox.hidden;
+        trBtn.textContent = trBox.hidden ? "📝 ver transcript" : "📝 ocultar transcript";
+        return;
+      }
+      trBtn.dataset.state = "loading";
+      trBtn.textContent = "📝 transcribiendo…";
+      try {
+        const chatJid = msg.chat_jid || msg.jid || "";
+        const resp = await fetch(
+          `/api/wa/voice/transcript/${encodeURIComponent(msg.id)}?jid=${encodeURIComponent(chatJid)}`
+        );
+        const data = await resp.json();
+        if (data.ok && data.text) {
+          trBox.textContent = data.text;
+          trBox.hidden = false;
+          trBtn.dataset.state = "done";
+          trBtn.textContent = "📝 ocultar transcript";
+        } else {
+          trBox.textContent = data.error ? `error: ${data.error}` : "sin transcript";
+          trBox.hidden = false;
+          trBtn.dataset.state = "error";
+          trBtn.textContent = "📝 reintentar";
+        }
+      } catch (e) {
+        trBox.textContent = `error de red: ${e.message}`;
+        trBox.hidden = false;
+        trBtn.dataset.state = "error";
+        trBtn.textContent = "📝 reintentar";
+      }
+    });
+    wrap.appendChild(trBtn);
+    wrap.appendChild(trBox);
     container.appendChild(wrap);
     return wrap;
   }

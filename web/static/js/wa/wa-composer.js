@@ -31,6 +31,7 @@ export function init({ rootEl, onOptimisticInsert }) {
   els.input.addEventListener("input", () => {
     autosize();
     pingTyping();
+    scheduleDraftCheck();
   });
   els.input.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -187,6 +188,7 @@ export function setActiveChat(jid) {
   currentJID = jid;
   pendingReply = null;
   hideReplyBar();
+  clearDraftBadge();
   // El composer usa la class `.idle` (no `disabled` HTML) para que la
   // UI no quede atascada si el JS no carga (ver wa.html — el composer
   // arranca con clase `.idle`). El submit() también guardea sobre
@@ -241,6 +243,102 @@ function autosize() {
   els.input.style.height = `${next}px`;
 }
 
+// ── Contradiction radar (debounced draft_check) ─────────────────────
+// Cada keystroke reseteo un timer de 800ms. Cuando para de tipear,
+// disparo POST /api/wa/draft_check {text, jid}. Si hay conflicts,
+// renderizo un badge sutil arriba del composer con el detalle expandible.
+
+let draftCheckTimer = null;
+let draftCheckCtrl = null;
+let draftBadgeEl = null;
+
+function scheduleDraftCheck() {
+  if (draftCheckTimer) clearTimeout(draftCheckTimer);
+  const text = (els.input && els.input.value || "").trim();
+  if (text.length < 30 || !currentJID) {
+    clearDraftBadge();
+    return;
+  }
+  draftCheckTimer = setTimeout(() => runDraftCheck(text, currentJID), 800);
+}
+
+async function runDraftCheck(text, jid) {
+  // Cancela request en vuelo (el user siguió escribiendo).
+  if (draftCheckCtrl) {
+    try { draftCheckCtrl.abort(); } catch {}
+  }
+  draftCheckCtrl = new AbortController();
+  try {
+    const resp = await fetch("/api/wa/draft_check", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, jid, window_hours: 72 }),
+      signal: draftCheckCtrl.signal,
+    });
+    const data = await resp.json();
+    if (data && data.ok && (data.conflicts || []).length > 0) {
+      renderDraftBadge(data.conflicts);
+    } else {
+      clearDraftBadge();
+    }
+  } catch (e) {
+    if (e.name !== "AbortError") clearDraftBadge();
+  }
+}
+
+function clearDraftBadge() {
+  if (draftBadgeEl) {
+    draftBadgeEl.remove();
+    draftBadgeEl = null;
+  }
+}
+
+function renderDraftBadge(conflicts) {
+  clearDraftBadge();
+  if (!els.root || !els.input) return;
+  const wrap = document.createElement("div");
+  wrap.className = "wa-draft-warn";
+  const summary = document.createElement("button");
+  summary.type = "button";
+  summary.className = "wa-draft-warn-summary";
+  summary.innerHTML = `⚠ <strong>${conflicts.length}</strong> ` +
+    `posible contradicción con tu historial reciente — click para ver`;
+  const list = document.createElement("div");
+  list.className = "wa-draft-warn-list";
+  list.hidden = true;
+  for (const c of conflicts) {
+    const row = document.createElement("div");
+    row.className = "wa-draft-warn-row";
+    const meta = document.createElement("div");
+    meta.className = "wa-draft-warn-meta";
+    meta.textContent = `${c.path || "(unknown)"} · score ${c.score}`;
+    const reason = document.createElement("div");
+    reason.className = "wa-draft-warn-reason";
+    reason.textContent = c.reason || "(sin reason)";
+    const snippet = document.createElement("div");
+    snippet.className = "wa-draft-warn-snippet";
+    snippet.textContent = c.snippet || "";
+    row.appendChild(reason);
+    row.appendChild(snippet);
+    row.appendChild(meta);
+    list.appendChild(row);
+  }
+  summary.addEventListener("click", () => {
+    list.hidden = !list.hidden;
+  });
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "wa-draft-warn-close";
+  close.setAttribute("aria-label", "descartar");
+  close.textContent = "×";
+  close.addEventListener("click", clearDraftBadge);
+  wrap.appendChild(summary);
+  wrap.appendChild(close);
+  wrap.appendChild(list);
+  els.root.insertBefore(wrap, els.input);
+  draftBadgeEl = wrap;
+}
+
 async function submit() {
   if (!els.input || !els.btn) return;
   if (!currentJID) {
@@ -276,6 +374,7 @@ async function submit() {
   els.input.value = "";
   autosize();
   setReply(null);
+  clearDraftBadge();
   stopTyping();
   if (els.btn) els.btn.classList.add("sending");
 

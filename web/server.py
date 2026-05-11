@@ -4171,6 +4171,168 @@ def wa_mark_read(req: _WAMarkReadRequest) -> dict:
     return {"ok": True, "jid": req.jid, "last_seen_ts": ts}
 
 
+class _WADraftCheckRequest(BaseModel):
+    text: str
+    jid: str
+    window_hours: int = 72
+
+
+@app.post("/api/wa/draft_check")
+async def wa_draft_check(req: _WADraftCheckRequest, request: Request) -> dict:
+    """Contradiction radar live para el composer de `/wa`.
+
+    Toma el draft que el user está escribiendo + el `jid` del thread
+    actual, corre `multi_retrieve` con recency=N hours sobre el corpus
+    completo (vault + cross-source), filtra hits del mismo thread (que
+    siempre matchean por ser literalmente la misma conversación), y
+    LLM-judgea (qwen2.5:3b) si cada hit `contradice` el draft. Devuelve
+    solo los que `contradicts: true`.
+
+    Rate limit más laxo que /api/chat porque el endpoint se llama on
+    keystroke debounced — un user activo puede disparar 30+ checks por
+    minuto sin estar abusando.
+
+    Body: `{text: str, jid: str, window_hours: int (default 72)}`
+    Return: `{ok, conflicts: [{snippet, ts, path, score, reason}],
+              elapsed_ms, checked_n}`
+    """
+    client_ip = (request.client.host if request.client else "unknown")
+    _check_rate_limit(_CHAT_BUCKETS, client_ip, limit=120, window=60.0)
+
+    text = (req.text or "").strip()
+    if len(text) < 30:
+        return {"ok": True, "conflicts": [], "elapsed_ms": 0, "reason": "too_short"}
+
+    _t0 = time.perf_counter()
+    vaults = resolve_vault_paths(None)
+    if not vaults:
+        return {"ok": False, "error": "no vault registered"}
+
+    # Recency filter: solo últimos `window_hours`. retrieve() acepta
+    # `date_range=(ts_min, ts_max)` en segundos epoch.
+    now_s = time.time()
+    win_s = max(3600.0, float(req.window_hours) * 3600.0)
+    date_range = (now_s - win_s, now_s + 3600.0)  # +1h slack para mensajes recién entrados
+
+    # Slug del jid actual para excluir hits que sean del mismo thread —
+    # de lo contrario el draft matchearía contra los msgs del propio chat
+    # y todo daría "contradicción" trivial.
+    from rag.integrations.whatsapp.voice_notes import _slug_jid  # noqa: PLC0415
+
+    self_slug = _slug_jid(req.jid)
+    exclude_prefixes = (
+        f"99-obsidian/99-AI/external-ingest/whatsapp-voice/{self_slug}/",
+        f"99-obsidian/99-AI/external-ingest/whatsapp/{self_slug}/",
+    )
+
+    try:
+        result = await asyncio.to_thread(
+            multi_retrieve,
+            vaults, text, 5, None, None, None, False,
+            multi_query=False,
+            auto_filter=False,
+            date_range=date_range,
+            exclude_path_prefixes=exclude_prefixes,
+            rerank_pool=RERANK_POOL_RETRIEVE_ONLY,
+            caller="wa_draft_check",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": _sanitize_error_for_user(exc, phase="retrieve")}
+
+    docs = (result.get("docs") if isinstance(result, dict) else getattr(result, "docs", None)) or []
+    metas = (result.get("metas") if isinstance(result, dict) else getattr(result, "metas", None)) or []
+    scores = (result.get("scores") if isinstance(result, dict) else getattr(result, "scores", None)) or []
+
+    candidates = []
+    for doc, meta, score in zip(docs[:5], metas[:5], scores[:5]):
+        if score is None or float(score) < 0.40:
+            continue
+        snippet = (doc or "")[:400].replace("\n", " ").strip()
+        path = (meta or {}).get("path") or ""
+        ts = (meta or {}).get("ts") or (meta or {}).get("mtime_iso") or ""
+        candidates.append({
+            "snippet": snippet,
+            "path": path,
+            "ts": ts,
+            "score": round(float(score), 3),
+        })
+
+    if not candidates:
+        return {
+            "ok": True,
+            "conflicts": [],
+            "checked_n": 0,
+            "elapsed_ms": int((time.perf_counter() - _t0) * 1000),
+        }
+
+    # LLM judge: una sola call al helper con todos los candidatos.
+    judge_prompt = (
+        "Sos un detector de contradicciones. Dado un DRAFT que el user va a "
+        "mandar por WhatsApp y N CANDIDATOS de su historial reciente "
+        "(últimas 72hs entre notas + otros chats), respondé qué candidatos "
+        "CONTRADICEN el draft. Contradicen = afirman lo opuesto sobre lugar, "
+        "hora, fecha, compromiso, monto o estado. Si solo está relacionado "
+        "pero no choca, NO es contradicción.\n\n"
+        f"DRAFT: {text}\n\n"
+        "CANDIDATOS:\n"
+        + "\n".join(
+            f"[{i}] (path: {c['path']}) {c['snippet']}"
+            for i, c in enumerate(candidates)
+        )
+        + "\n\nRespondé SOLO JSON, sin texto extra:\n"
+        '{"contradicts": [{"idx": <int>, "reason": "<≤80 chars en castellano>"}]}'
+    )
+    try:
+        from rag import _helper_client, HELPER_MODEL, HELPER_OPTIONS  # noqa: PLC0415
+
+        resp = await asyncio.to_thread(
+            lambda: _helper_client().chat(
+                model=HELPER_MODEL,
+                messages=[{"role": "user", "content": judge_prompt}],
+                options={**HELPER_OPTIONS, "num_predict": 256, "num_ctx": 4096},
+                format="json",
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": True,
+            "conflicts": [],
+            "checked_n": len(candidates),
+            "elapsed_ms": int((time.perf_counter() - _t0) * 1000),
+            "judge_error": repr(exc)[:200],
+        }
+
+    # Parse judge output — dual-shape (dict u objeto pydantic).
+    raw = ""
+    if isinstance(resp, dict):
+        raw = ((resp.get("message") or {}).get("content") or "").strip()
+    else:
+        msg = getattr(resp, "message", None)
+        raw = (getattr(msg, "content", None) or "").strip()
+
+    conflicts: list[dict] = []
+    try:
+        import json as _json  # noqa: PLC0415
+
+        data = _json.loads(raw)
+        for hit in (data.get("contradicts") or [])[:5]:
+            idx = int(hit.get("idx", -1))
+            if 0 <= idx < len(candidates):
+                conflicts.append({
+                    **candidates[idx],
+                    "reason": (hit.get("reason") or "")[:200],
+                })
+    except (ValueError, TypeError):
+        pass
+
+    return {
+        "ok": True,
+        "conflicts": conflicts,
+        "checked_n": len(candidates),
+        "elapsed_ms": int((time.perf_counter() - _t0) * 1000),
+    }
+
+
 class _WAReplyTo(BaseModel):
     message_id: str
     original_text: str | None = None
@@ -4521,6 +4683,137 @@ def wa_avatar(jid: str, name: str | None = None) -> FileResponse:
         media_type="image/jpeg",
         headers={"Cache-Control": "private, max-age=604800"},
     )
+
+
+@app.get("/api/wa/voice/transcript/{message_id}")
+def wa_voice_transcript(message_id: str, jid: str) -> dict:
+    """Transcribe (o devuelve cacheado) un voice note inbound de WA.
+
+    Pipeline:
+      1. Cache lookup en `rag_wa_voice_transcripts` por `message_id`.
+      2. Si no hay, resuelve el media via bridge (mismo path que
+         `/api/wa/media/{id}`) y corre `transcribe_audio()` (whisper MLX).
+      3. Persiste cache + (best-effort) escribe nota .md al vault bajo
+         `99-obsidian/99-AI/external-ingest/whatsapp-voice/<jid>/...` para
+         que el indexer del vault la levante y entre al corpus.
+      4. Devuelve `{ok, text, language, duration_s, cached}`.
+
+    Errores se cachean también (fila con `error` set) para no martillar
+    whisper en loop sobre audios que no se pueden decodificar.
+    """
+    import mimetypes  # noqa: PLC0415
+    import sqlite3 as _sqlite3  # noqa: PLC0415
+
+    from rag.integrations.whatsapp import (  # noqa: PLC0415
+        _db_local,
+        bridge_client as _bc,
+        fetch as _wa_fetch,
+    )
+    import rag as _rag  # noqa: PLC0415
+
+    if not jid or "@" not in jid:
+        raise HTTPException(status_code=400, detail="jid inválido")
+    if not message_id:
+        raise HTTPException(status_code=400, detail="message_id requerido")
+
+    # 1) cache lookup.
+    cached = _db_local.get_voice_transcript(message_id)
+    if cached:
+        if cached.get("error"):
+            return {
+                "ok": False,
+                "cached": True,
+                "error_kind": "transcribe_failed",
+                "error": cached.get("error") or "",
+            }
+        return {
+            "ok": True,
+            "cached": True,
+            "text": cached.get("text") or "",
+            "language": cached.get("language"),
+            "duration_s": cached.get("duration_s"),
+            "model": cached.get("model"),
+        }
+
+    # 2) resolve media (mismo flujo que /api/wa/media).
+    db_path = _rag.WHATSAPP_DB_PATH
+    if not db_path.is_file():
+        raise HTTPException(status_code=503, detail="bridge DB no disponible")
+    try:
+        con = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+        row = con.execute(
+            "SELECT filename, media_type, sender, timestamp "
+            "FROM messages WHERE id = ? AND chat_jid = ?",
+            (message_id, jid),
+        ).fetchone()
+        con.close()
+    except _sqlite3.Error:
+        raise HTTPException(status_code=500, detail="error leyendo bridge DB")
+    if not row or not row[0]:
+        raise HTTPException(status_code=404, detail="media no encontrada")
+    filename, media_type, sender_raw, audio_ts = row
+    if (media_type or "").lower() != "audio":
+        raise HTTPException(status_code=400, detail="el mensaje no es audio")
+
+    path = _wa_fetch._bridge_media_path(jid, filename)
+    if path is None or not path.is_file():
+        try:
+            _bc.download_media(message_id, jid)
+            path = _wa_fetch._bridge_media_path(jid, filename)
+        except _bc.BridgeError:
+            path = None
+    if path is None or not path.is_file():
+        raise HTTPException(status_code=404, detail="media no descargada")
+
+    # 3) transcribe.
+    from rag.whisper import transcribe_audio  # noqa: PLC0415
+
+    try:
+        tr = transcribe_audio(path, language="es")
+    except Exception as exc:  # noqa: BLE001
+        err = repr(exc)[:280]
+        _db_local.set_voice_transcript(
+            message_id, jid, sender=sender_raw, error=err, audio_ts=str(audio_ts or ""),
+        )
+        return {"ok": False, "cached": False, "error_kind": "transcribe_failed", "error": err}
+
+    text = (tr or {}).get("text") or ""
+    language = (tr or {}).get("language")
+    duration_s = (tr or {}).get("duration_s")
+    model = (tr or {}).get("model")
+
+    # 4a) persistir cache.
+    _db_local.set_voice_transcript(
+        message_id, jid,
+        sender=sender_raw,
+        text=text,
+        language=language,
+        duration_s=duration_s,
+        model=model,
+        audio_ts=str(audio_ts or ""),
+    )
+
+    # 4b) write vault note best-effort — F1.3 (vault writer).
+    try:
+        from rag.integrations.whatsapp import voice_notes as _voice_notes  # noqa: PLC0415
+        _voice_notes.write_voice_note(
+            msg_id=message_id, jid=jid, sender=sender_raw,
+            text=text, audio_ts=str(audio_ts or ""),
+        )
+    except Exception as exc:  # noqa: BLE001
+        try:
+            _rag._silent_log("wa_voice_note_write_failed", exc)
+        except Exception:
+            pass
+
+    return {
+        "ok": True,
+        "cached": False,
+        "text": text,
+        "language": language,
+        "duration_s": duration_s,
+        "model": model,
+    }
 
 
 @app.post("/api/wa/typing")

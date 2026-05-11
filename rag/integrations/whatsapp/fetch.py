@@ -1018,6 +1018,38 @@ def fetch_thread_for_ui(
             except sqlite3.Error:
                 call_rows = []
 
+        # Pre-fetch del bridge label para cada sender único de grupos: si
+        # el contact note del vault no matchea (no toda persona tiene
+        # nota), igual queremos preferir "Grecia 🩷" que la pone el
+        # bridge sobre "Contacto …8025". El bridge guarda esos nombres
+        # en `chats` con el jid full (bare + @lid o @s.whatsapp.net) —
+        # los buscamos juntos en un solo query.
+        bridge_names: dict[str, str] = {}  # bare_local → bridge display name
+        unique_senders = {
+            (r["sender"] or "").strip() for r in rows if (r["sender"] or "").strip()
+        }
+        if unique_senders:
+            jid_to_bare: dict[str, str] = {}
+            for s in unique_senders:
+                bare = s.split("@")[0] if "@" in s else s
+                jid_to_bare[s] = bare
+                jid_to_bare[f"{bare}@lid"] = bare
+                jid_to_bare[f"{bare}@s.whatsapp.net"] = bare
+            try:
+                placeholders = ",".join("?" * len(jid_to_bare))
+                for cj, cn in con.execute(
+                    f"SELECT jid, name FROM chats WHERE jid IN ({placeholders})",
+                    list(jid_to_bare),
+                ).fetchall():
+                    name = (cn or "").strip()
+                    if not name or not any(ch.isalpha() for ch in name):
+                        continue
+                    bare = jid_to_bare.get(cj)
+                    if bare and bare not in bridge_names:
+                        bridge_names[bare] = name
+            except sqlite3.Error:
+                pass
+
         messages: list[dict] = []
         for r in reversed(rows):  # cronológico asc para lectura natural
             msg_id = r["id"] or ""
@@ -1026,12 +1058,13 @@ def fetch_thread_for_ui(
             if is_from_me:
                 sender_label = "yo"
             elif sender_raw:
-                # Resolver participante del grupo contra contact notes:
-                # antes salía "5493425…" como label; ahora si hay nota
-                # `99-Contacts/<Name>.md` con ese `wa_jid` mostramos el
-                # nombre. `_wa_display_name` ya prueba el bare/lid/s.wa
-                # variants y cae a "Contacto …last4" si nada matchea.
-                sender_label = _wa_display_name(sender_raw, "")
+                # 1) contact note del vault (Mama, Grecia, etc.).
+                # 2) bridge.chats.name (Grecia 🩷, push_name del peer).
+                # 3) "Contacto …<last4>" fallback de _wa_chat_label.
+                bare = sender_raw.split("@")[0] if "@" in sender_raw else sender_raw
+                sender_label = _wa_display_name(
+                    sender_raw, bridge_names.get(bare, ""),
+                )
             else:
                 sender_label = label
             content = (r["content"] or "").strip().replace("\n", " ")

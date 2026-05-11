@@ -757,14 +757,20 @@ button { cursor: pointer; }
   font-weight: 600;
 }
 .wa-reaction-emoji { line-height: 1; }
-.wa-reaction-sep {
-  display: inline-block;
+/* En el picker flotante, el sep separa los presets+more del bloque
+   delete/multi. Va como divisor horizontal sutil. */
+.wa-reaction-menu .wa-reaction-sep {
   width: 1px;
-  height: 18px;
+  height: 22px;
   background: var(--border-divider);
   margin: 0 4px;
+  align-self: center;
 }
-.wa-reaction-more { color: var(--text-secondary); font-size: 11px; }
+.wa-reaction-more { color: var(--text-secondary); font-size: 14px; }
+
+/* Picker flotante (long-press / contextmenu / kebab → menu de
+   reacciones + acciones). Buttons sin background/border default del
+   browser para que se vean como un picker tipo WhatsApp Web. */
 .wa-reaction-menu {
   position: absolute;
   bottom: 100%;
@@ -772,22 +778,48 @@ button { cursor: pointer; }
   margin-bottom: 4px;
   background: var(--bg-panel-header);
   border: 1px solid var(--border-divider);
-  border-radius: var(--radius-pill);
-  padding: 6px 10px;
+  border-radius: 28px;
+  padding: 6px 8px;
   display: inline-flex;
-  gap: 6px;
-  font-size: 18px;
-  box-shadow: var(--shadow-elev);
+  align-items: center;
+  gap: 2px;
+  font-size: 20px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
   z-index: 10;
+  max-width: min(92vw, 480px);
+  flex-wrap: wrap;
+}
+.wa-reaction-menu button {
+  background: transparent;
+  border: 0;
+  padding: 4px 6px;
+  border-radius: 18px;
+  cursor: pointer;
+  color: inherit;
+  font: inherit;
+  line-height: 1;
+  transition: background 0.1s ease, transform 0.1s ease;
+}
+.wa-reaction-menu button:hover {
+  background: rgba(255, 255, 255, 0.08);
+  transform: scale(1.15);
+}
+[data-theme="light"] .wa-reaction-menu button:hover {
+  background: rgba(0, 0, 0, 0.06);
 }
 .wa-reaction-delete {
   background: transparent;
   border: 0;
   color: var(--text-secondary);
-  font-size: 13px;
+  font-size: 13px !important;
   cursor: pointer;
+  padding: 4px 10px !important;
+  white-space: nowrap;
 }
-.wa-reaction-delete:hover { color: var(--red, #f15c6d); }
+.wa-reaction-delete:hover {
+  color: var(--red, #f15c6d) !important;
+  transform: none !important;
+}
 
 /* Kebab `⋮` en burbujas propias — afford visible para abrir el menu
    de acciones (reaccionar / eliminar / seleccionar varios). Siempre

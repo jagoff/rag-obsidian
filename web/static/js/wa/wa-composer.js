@@ -69,24 +69,11 @@ export function init({ rootEl, onOptimisticInsert }) {
     }
   });
 
-  // Drag & drop sobre todo el composer.
-  const root = els.root;
-  const onDragOver = (e) => {
-    if (!currentJID) return;
-    e.preventDefault();
-    root.classList.add("dragging");
-  };
-  const onDragLeave = () => root.classList.remove("dragging");
-  const onDrop = (e) => {
-    e.preventDefault();
-    root.classList.remove("dragging");
-    if (!currentJID || !e.dataTransfer) return;
-    const files = Array.from(e.dataTransfer.files || []);
-    for (const f of files) sendMediaFile(f);
-  };
-  root.addEventListener("dragover", onDragOver);
-  root.addEventListener("dragleave", onDragLeave);
-  root.addEventListener("drop", onDrop);
+  // Drag & drop sobre TODO el thread (no solo el composer chiquito).
+  // El user arrastra desde Finder/desktop → cae en cualquier parte
+  // del thread → mostramos un overlay full-screen "Soltá para enviar
+  // 📎" + dispara sendMediaFile por cada file.
+  setupThreadDnD();
 
   // Voice notes init
   voice.init({
@@ -548,4 +535,74 @@ function undoTone() {
   autosize();
   refreshUndoBtn();
   els.input.focus();
+}
+
+
+// ─────────────────────────────────────────────────────────────
+// Drag & drop full-thread con overlay visible
+// ─────────────────────────────────────────────────────────────
+//
+// User arrastra files desde Finder/desktop a cualquier parte del
+// `.wa-thread` (no solo el composer mini). Mientras drag está
+// active, overlay full-thread con hint visual; al soltar, dispara
+// sendMediaFile por cada file. Counter contra event bubbling
+// asimétrico (dragenter/leave firea por cada child element).
+
+function setupThreadDnD() {
+  const thread = document.querySelector(".wa-thread");
+  if (!thread) return;
+  const overlay = document.createElement("div");
+  overlay.className = "wa-dnd-overlay";
+  overlay.innerHTML = `
+    <div class="wa-dnd-overlay-inner">
+      <svg viewBox="0 0 24 24" width="48" height="48" fill="none"
+           stroke="currentColor" stroke-width="1.5" stroke-linecap="round"
+           stroke-linejoin="round" aria-hidden="true">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+        <polyline points="17 8 12 3 7 8"/>
+        <line x1="12" y1="3" x2="12" y2="15"/>
+      </svg>
+      <div class="wa-dnd-title">Soltá para enviar</div>
+      <div class="wa-dnd-hint">Imagen, video, audio o cualquier archivo</div>
+    </div>
+  `;
+  thread.appendChild(overlay);
+
+  let dragCounter = 0;
+
+  // Solo aceptamos drops cuando hay files (no text). Y solo si
+  // hay chat activo (sino no sabemos a dónde mandar).
+  const hasFiles = (ev) => {
+    const types = ev.dataTransfer?.types;
+    if (!types) return false;
+    return Array.from(types).some((t) => t === "Files");
+  };
+
+  thread.addEventListener("dragenter", (ev) => {
+    if (!currentJID || !hasFiles(ev)) return;
+    ev.preventDefault();
+    dragCounter++;
+    thread.classList.add("dnd-active");
+  });
+  thread.addEventListener("dragover", (ev) => {
+    if (!currentJID || !hasFiles(ev)) return;
+    ev.preventDefault();
+    ev.dataTransfer.dropEffect = "copy";
+  });
+  thread.addEventListener("dragleave", (ev) => {
+    if (!currentJID || !hasFiles(ev)) return;
+    dragCounter--;
+    if (dragCounter <= 0) {
+      dragCounter = 0;
+      thread.classList.remove("dnd-active");
+    }
+  });
+  thread.addEventListener("drop", (ev) => {
+    if (!currentJID || !hasFiles(ev)) return;
+    ev.preventDefault();
+    dragCounter = 0;
+    thread.classList.remove("dnd-active");
+    const files = Array.from(ev.dataTransfer.files || []);
+    for (const f of files) sendMediaFile(f);
+  });
 }

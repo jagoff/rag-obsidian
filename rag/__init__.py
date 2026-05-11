@@ -16970,7 +16970,25 @@ def retrieve(
     #     latency-sensitive (web) sin afectar el comportamiento del CLI.
     # Audit 2026-04-26 (BUG #30): clamp lower bound. `rerank_pool=0`
     # producía empty pool → top_score=-inf → low_conf_bypass siempre.
-    _effective_pool = rerank_pool if rerank_pool is not None else RERANK_POOL_MAX
+    #
+    # Intent-aware pool default (2026-05-11): cuando el caller no pasa
+    # `rerank_pool` explícito Y el `intent` está clasificado, usar el
+    # override de `_RERANK_POOL_BY_INTENT` (synthesis/comparison=30 hoy)
+    # en lugar del global `RERANK_POOL_MAX=25`. El dict estaba definido
+    # desde 2026-04-21 (rag/__init__.py:289) pero nunca cableado al
+    # call site — synthesis/comparison precisan ≥2 fuentes en top-5 y un
+    # pool más amplio sube el techo de candidates antes del rerank cap.
+    # Gate por `RAG_INTENT_POOL=0` por si rompe en un caller específico.
+    _effective_pool = rerank_pool
+    if _effective_pool is None:
+        if (
+            intent
+            and os.environ.get("RAG_INTENT_POOL", "1") == "1"
+            and intent in _RERANK_POOL_BY_INTENT
+        ):
+            _effective_pool = _RERANK_POOL_BY_INTENT[intent]
+        else:
+            _effective_pool = RERANK_POOL_MAX
     if _effective_pool <= 0:
         _effective_pool = 1
 

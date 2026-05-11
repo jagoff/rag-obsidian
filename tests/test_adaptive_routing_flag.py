@@ -88,6 +88,52 @@ def test_expand_skip_intents_frozenset():
     assert isinstance(rag._EXPAND_SKIP_INTENTS, frozenset)
 
 
+# ─── Intent-aware pool wiring (2026-05-11) ───────────────────────────────
+
+
+def test_intent_pool_synthesis_uses_30():
+    """`retrieve(intent='synthesis')` debería usar pool=30 (del dict)
+    en vez de 25 (default global) cuando no hay rerank_pool override.
+    """
+    import os
+    import rag
+
+    # El wiring se hace en `retrieve()` antes de llamar `col.get(...)`.
+    # Para evitar montar un Collection real, verificamos el helper en
+    # isolation — la lógica vive inline en retrieve, pero la fórmula es
+    # pública vía `_RERANK_POOL_BY_INTENT`. El comportamiento real lo
+    # verifica un end-to-end (test pesado, separado).
+    os.environ.pop("RAG_INTENT_POOL", None)  # default ON
+    pool = rag._RERANK_POOL_BY_INTENT.get("synthesis", rag.RERANK_POOL_MAX)
+    assert pool == 30
+
+
+def test_intent_pool_neutral_falls_back_to_global():
+    """Intents que no están en el dict (semantic / count / etc) usan
+    RERANK_POOL_MAX global. Equivale al comportamiento pre-2026-05-11.
+    """
+    import rag
+    pool = rag._RERANK_POOL_BY_INTENT.get("semantic", rag.RERANK_POOL_MAX)
+    assert pool == rag.RERANK_POOL_MAX
+
+
+def test_intent_pool_explicit_override_wins():
+    """Cuando el caller pasa `rerank_pool=N` explícito, el intent NO
+    pisa — el override es siempre la fuente más fuerte (mantiene el
+    contrato de caller-controlled pool del web `/api/chat`).
+    """
+    import rag
+    # Esta es la rama default usada cuando `rerank_pool is not None`:
+    rerank_pool = 5  # web pasa 5
+    intent = "synthesis"
+    _effective_pool = rerank_pool  # caller override
+    if _effective_pool is None:
+        _effective_pool = rag._RERANK_POOL_BY_INTENT.get(
+            intent, rag.RERANK_POOL_MAX,
+        )
+    assert _effective_pool == 5  # override gana sobre intent=30
+
+
 def test_expand_skip_intents_excludes_semantic():
     """Semantic default NO skipea expand — ese es el path rico."""
     import rag

@@ -4377,6 +4377,33 @@ async def wa_send_media(
     }
 
 
+@app.get("/api/wa/search")
+def wa_search(q: str = Query(...), limit: int = 50, jid: str | None = None) -> dict:
+    """Search FTS5 cross-chat sobre `rag_wa_messages_mirror`.
+
+    Devuelve `{hits: [{id, chat_jid, chat_name, ts, sender, snippet}]}`
+    con highlight HTML `<mark>...</mark>` en el snippet. El frontend
+    sanitiza ese HTML solo dejando pasar `<mark>` antes de injectar.
+    """
+    from rag.integrations.whatsapp import search as _wa_search  # noqa: PLC0415
+
+    if not q or not q.strip():
+        return {"hits": []}
+    hits = _wa_search.search(q, jid=jid, limit=limit)
+    return {"hits": hits}
+
+
+@app.post("/api/wa/search/backfill", dependencies=[Depends(_require_admin_token)])
+def wa_search_backfill() -> dict:
+    """Backfill one-shot del mirror search. Requiere admin token porque
+    puede tomar varios segundos en vault grandes.
+    """
+    from rag.integrations.whatsapp import search as _wa_search  # noqa: PLC0415
+
+    inserted = _wa_search.backfill_mirror()
+    return {"ok": True, "inserted": inserted}
+
+
 @app.post("/api/wa/voice")
 async def wa_voice(
     request: Request,

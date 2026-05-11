@@ -317,12 +317,28 @@ def _poll_once(hwm: dict[str, str]) -> tuple[list[dict[str, Any]], dict[str, str
     return events, new_hwm
 
 
+def _sync_search_index(hwm_messages: str) -> None:
+    """Trigger sync incremental al search mirror. Best-effort, silent-fail.
+    Llamado periódicamente desde el loop principal.
+    """
+    try:
+        from .search import sync_recent  # noqa: PLC0415
+
+        # Restar 30s al HWM para tolerar reordenamientos pequeños del bridge.
+        # Como el `INSERT OR IGNORE` deduplica por (id, chat_jid), no hay
+        # double-insert.
+        sync_recent(hwm_messages)
+    except Exception as e:
+        logger.debug("search sync failed: %s", e)
+
+
 async def _tail_loop() -> None:
     """Forever loop: poll → broadcast → sleep."""
     logger.info("wa-tail loop started (poll=%.1fs)", _POLL_INTERVAL)
     hwm = _load_hwm()
     loop = asyncio.get_running_loop()
     save_counter = 0
+    search_sync_counter = 0
     try:
         while True:
             try:
@@ -332,9 +348,13 @@ async def _tail_loop() -> None:
                         await _broadcast(ev)
                 hwm = new_hwm
                 save_counter += 1
-                if save_counter >= 30:  # persistir cada ~30s
+                search_sync_counter += 1
+                if save_counter >= 30:  # persistir HWM cada ~30s
                     _save_hwm(hwm)
                     save_counter = 0
+                if search_sync_counter >= 60:  # sync search mirror cada ~60s
+                    await loop.run_in_executor(None, _sync_search_index, hwm["messages"])
+                    search_sync_counter = 0
             except Exception as e:
                 logger.exception("wa-tail tick error: %s", e)
             await asyncio.sleep(_POLL_INTERVAL)

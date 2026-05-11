@@ -3,6 +3,7 @@
 
 import { fetchChats } from "./wa-api.js";
 import { colorFor, renderInto as renderAvatar } from "./wa-avatars.js";
+import * as search from "./wa-search.js";
 
 const els = {
   list: null,
@@ -25,6 +26,19 @@ export function init({ listEl, loadingEl, searchEl, onSelect }) {
   if (els.search) {
     els.search.addEventListener("input", onSearchInput);
   }
+
+  search.init({
+    inputEl: searchEl,
+    listEl,
+    loadingEl,
+    onSelect: (jid /* , messageId */) => {
+      // Volvemos a modo chats + abrimos el thread.
+      search.exitSearchMode();
+      if (els.search) els.search.value = "";
+      load();
+      if (onSelectCallback) onSelectCallback(jid);
+    },
+  });
 }
 
 export async function load() {
@@ -55,6 +69,9 @@ function onSearchInput() {
   const q = (els.search.value || "").trim();
   clearTimeout(searchTimer);
   searchTimer = setTimeout(() => {
+    // Si la query tiene >=3 chars, search.js intercepta y muestra hits
+    // del FTS5; sino, filter local sobre chats.
+    if (search.maybeHandleSearch(q)) return;
     lastSearchQuery = q;
     load();
   }, 200);

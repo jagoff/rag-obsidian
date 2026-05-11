@@ -1301,6 +1301,68 @@ a:hover { text-decoration: underline; }
   opacity: 0.3;
 }
 
+/* ── Search FTS5 hits ─────────────────────────────────────── */
+
+.wa-search-hit {
+  list-style: none;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  display: block;
+  transition: background 100ms;
+  animation: wa-fade-in 200ms ease-out backwards;
+}
+.wa-search-hit:hover {
+  background: var(--bg-elev-2);
+}
+.wa-search-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.wa-search-chat {
+  font-size: var(--fs-small);
+  color: var(--cyan);
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.wa-search-ts {
+  font-size: 10px;
+  color: var(--text-faint);
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+.wa-search-snippet {
+  font-size: var(--fs-small);
+  color: var(--text-dim);
+  line-height: 1.45;
+  font-family: var(--font-mono);
+}
+.wa-search-snippet mark {
+  background: var(--phosphor-dim);
+  color: var(--phosphor);
+  padding: 0 2px;
+  border-radius: 2px;
+  font-weight: 600;
+}
+:root[data-theme="light"] .wa-search-snippet mark {
+  background: rgba(11, 133, 67, 0.18);
+  color: var(--phosphor);
+}
+.wa-search-empty {
+  list-style: none;
+  padding: 32px 16px;
+  text-align: center;
+  color: var(--text-faint);
+  font-size: var(--fs-small);
+  font-style: italic;
+}
+
 /* ── Voice notes: mic button + record bar + preview modal ──── */
 
 .wa-mic-btn {

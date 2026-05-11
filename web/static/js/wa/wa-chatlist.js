@@ -33,12 +33,22 @@ export async function load() {
     const data = await fetchChats({ limit: 80, q: lastSearchQuery || null });
     allChats = data.chats || [];
     render();
+    updateStats();
   } catch (e) {
     console.error("[wa-chatlist] load failed", e);
     if (els.list) els.list.innerHTML = `<li class="wa-empty-state">Error cargando chats: ${e.message}</li>`;
   } finally {
     if (els.loading) els.loading.classList.add("hidden");
   }
+}
+
+function updateStats() {
+  const total = allChats.length;
+  const unread = allChats.reduce((acc, c) => acc + (c.unread_count || 0), 0);
+  const chatsEl = document.getElementById("wa-stat-chats");
+  const unreadEl = document.getElementById("wa-stat-unread");
+  if (chatsEl) chatsEl.textContent = total > 999 ? "999+" : String(total);
+  if (unreadEl) unreadEl.textContent = unread > 999 ? "999+" : String(unread);
 }
 
 function onSearchInput() {
@@ -122,6 +132,7 @@ export function applyChatUpdate(payload) {
   allChats.splice(idx, 1);
   allChats.unshift(c);
   render();
+  updateStats();
 }
 
 function selectChat(jid) {

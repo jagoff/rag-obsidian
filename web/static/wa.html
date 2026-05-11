@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <title>rag · wa</title>
-  <link rel="stylesheet" href="/static/wa.css?v=3">
+  <link rel="stylesheet" href="/static/wa.css?v=4">
   <link rel="manifest" href="/static/manifest.webmanifest">
   <link rel="icon" type="image/png" sizes="32x32" href="/static/pwa/favicon-32.png">
   <link rel="icon" type="image/png" sizes="16x16" href="/static/pwa/favicon-16.png">
@@ -31,8 +31,16 @@
     <!-- Sidebar: lista de chats -->
     <aside class="wa-sidebar" aria-label="Lista de chats">
       <header class="wa-sidebar-header">
-        <div class="wa-app-title">rag<span class="accent">·</span>wa</div>
-        <div class="wa-conn-indicator" id="wa-conn" title="estado del bridge" aria-live="polite">●</div>
+        <div class="wa-app-title">
+          <span class="wa-brand-rag">rag</span><span class="accent">·</span><span class="wa-brand-wa">wa</span>
+          <span class="wa-brand-version" aria-hidden="true">v.04</span>
+        </div>
+        <div class="wa-conn-indicator" id="wa-conn" title="estado del bridge" aria-live="polite">
+          <span class="wa-signal-bars" aria-hidden="true">
+            <i></i><i></i><i></i><i></i><i></i>
+          </span>
+          <span class="wa-conn-label">ONLINE</span>
+        </div>
       </header>
       <nav class="wa-sidebar-nav" aria-label="otras páginas">
         <a href="/mirror">mirror</a>
@@ -45,7 +53,23 @@
         <input type="search" id="wa-search-input" placeholder="buscar chat..." autocomplete="off">
       </div>
       <ul class="wa-chatlist" id="wa-chatlist" aria-live="polite"></ul>
-      <div class="wa-chatlist-loading" id="wa-chatlist-loading">cargando…</div>
+      <div class="wa-chatlist-loading" id="wa-chatlist-loading">
+        <span class="wa-loader-glyph">◜</span>
+        sincronizando bridge
+      </div>
+      <footer class="wa-sidebar-footer" id="wa-sidebar-footer" aria-live="polite">
+        <span class="wa-stat">
+          <span class="wa-stat-num" id="wa-stat-chats">–</span>
+          <span class="wa-stat-label">CHATS</span>
+        </span>
+        <span class="wa-stat-sep">│</span>
+        <span class="wa-stat">
+          <span class="wa-stat-num" id="wa-stat-unread">–</span>
+          <span class="wa-stat-label">UNREAD</span>
+        </span>
+        <span class="wa-stat-sep">│</span>
+        <span class="wa-stat wa-stat-clock" id="wa-stat-clock" title="hora local">––:––</span>
+      </footer>
     </aside>
 
     <!-- Thread: hilo del chat activo -->
@@ -69,11 +93,23 @@
           placeholder="elegí un chat para escribir"
           rows="1"
         ></textarea>
-        <button class="wa-send-btn" id="wa-send-btn">enviar</button>
+        <div class="wa-composer-kbd" aria-hidden="true">
+          <kbd>↵</kbd> enviar
+          <span class="wa-kbd-sep">·</span>
+          <kbd>⇧↵</kbd> nueva línea
+          <span class="wa-kbd-sep">·</span>
+          <kbd>dbl-click</kbd> responder
+        </div>
+        <button class="wa-send-btn" id="wa-send-btn">
+          <span class="wa-send-label">enviar</span>
+          <span class="wa-send-arrows" aria-hidden="true">
+            <i>▸</i><i>▸</i><i>▸</i>
+          </span>
+        </button>
       </footer>
     </main>
   </div>
 
-  <script type="module" src="/static/js/wa/wa.js?v=2"></script>
+  <script type="module" src="/static/js/wa/wa.js?v=3"></script>
 </body>
 </html>

@@ -938,3 +938,342 @@ a:hover { text-decoration: underline; }
   body[data-pane="sidebar"] .wa-thread { display: none; }
   body[data-pane="thread"] .wa-sidebar { display: none; }
 }
+
+/* ───────────────────────────────────────────────────────────
+   PASS 2 — design language refinement
+   ─────────────────────────────────────────────────────────── */
+
+/* Grain noise overlay sutil sobre toda la app — agrega textura sin
+   distraer. SVG inline data URI con turbulence + opacity 4%. */
+.wa-app::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 3;
+  background-image: url("data:image/svg+xml;utf8,<svg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0.6 0 0 0 0 0.7 0 0 0 0 0.7 0 0 0 0.05 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
+  opacity: 0.5;
+  mix-blend-mode: overlay;
+}
+
+/* Brand reformulado: rag (text-dim) · accent · WA (phosphor) + version chip */
+.wa-app-title {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0;
+  font-weight: 700;
+  font-size: 14px;
+  letter-spacing: 3.5px;
+  text-transform: uppercase;
+  line-height: 1;
+  font-feature-settings: "ss01";
+}
+.wa-brand-rag {
+  color: var(--text-dim);
+}
+.wa-brand-wa {
+  color: var(--phosphor);
+  text-shadow: 0 0 8px rgba(102, 255, 153, 0.35);
+}
+.wa-brand-version {
+  margin-left: 10px;
+  padding: 1px 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 2px;
+  font-size: 8.5px;
+  letter-spacing: 1px;
+  color: var(--text-faint);
+  align-self: center;
+  font-weight: 500;
+}
+
+/* Connection indicator: signal bars 5 segmentos (estilo cel) */
+.wa-conn-indicator {
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: 2px;
+  padding: 4px 8px;
+  gap: 7px;
+}
+.wa-conn-indicator::before,
+.wa-conn-indicator::after { content: none !important; }
+
+.wa-signal-bars {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 12px;
+}
+.wa-signal-bars i {
+  display: inline-block;
+  width: 2px;
+  background: var(--text-faint);
+  border-radius: 1px;
+}
+.wa-signal-bars i:nth-child(1) { height: 3px; }
+.wa-signal-bars i:nth-child(2) { height: 5px; }
+.wa-signal-bars i:nth-child(3) { height: 7px; }
+.wa-signal-bars i:nth-child(4) { height: 9px; }
+.wa-signal-bars i:nth-child(5) { height: 11px; }
+.wa-conn-indicator.ok .wa-signal-bars i {
+  background: var(--phosphor);
+  animation: wa-bar-flicker 1.4s ease-in-out infinite;
+}
+.wa-conn-indicator.ok .wa-signal-bars i:nth-child(1) { animation-delay: 0ms; }
+.wa-conn-indicator.ok .wa-signal-bars i:nth-child(2) { animation-delay: 80ms; }
+.wa-conn-indicator.ok .wa-signal-bars i:nth-child(3) { animation-delay: 160ms; }
+.wa-conn-indicator.ok .wa-signal-bars i:nth-child(4) { animation-delay: 240ms; }
+.wa-conn-indicator.ok .wa-signal-bars i:nth-child(5) { animation-delay: 320ms; }
+.wa-conn-indicator.bad .wa-signal-bars i {
+  background: var(--red);
+  opacity: 0.4;
+}
+.wa-conn-indicator.bad .wa-signal-bars i:nth-child(1) { opacity: 1; }
+
+@keyframes wa-bar-flicker {
+  0%, 80%, 100% { opacity: 0.45; }
+  10%, 30% { opacity: 1; }
+}
+
+.wa-conn-label {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 1.2px;
+  color: var(--text-dim);
+}
+.wa-conn-indicator.ok .wa-conn-label { color: var(--phosphor); }
+.wa-conn-indicator.bad .wa-conn-label { color: var(--red); }
+
+/* Sidebar footer status bar */
+.wa-sidebar-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-around;
+  padding: 6px 8px;
+  background: var(--bg);
+  border-top: 1px solid var(--border-strong);
+  font-size: 10px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.5px;
+  flex-shrink: 0;
+  gap: 6px;
+}
+.wa-stat {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+}
+.wa-stat-num {
+  color: var(--phosphor);
+  font-weight: 700;
+  font-size: 11px;
+}
+.wa-stat-label {
+  font-size: 9px;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+.wa-stat-sep {
+  color: var(--text-faint);
+  opacity: 0.5;
+}
+.wa-stat-clock {
+  color: var(--cyan);
+  font-size: 10px;
+  letter-spacing: 0.5px;
+}
+
+/* Loader glyph rotando — sustituye al "cargando..." plano */
+.wa-chatlist-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--cyan);
+  font-size: 11px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+}
+.wa-loader-glyph {
+  display: inline-block;
+  font-size: 14px;
+  animation: wa-loader-spin 0.9s linear infinite;
+}
+@keyframes wa-loader-spin {
+  0%   { content: "◜"; transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+/* Avatares: squircle subtle + lift on hover (sidebar items) */
+.wa-chat-avatar {
+  border-radius: 6px;
+  position: relative;
+  transition: transform 180ms cubic-bezier(0.22, 0.61, 0.36, 1),
+              box-shadow 180ms;
+}
+.wa-chat-item:hover .wa-chat-avatar {
+  transform: rotate(-2deg) scale(1.05);
+  box-shadow: 4px 4px 0 rgba(121, 221, 255, 0.15);
+}
+.wa-chat-item.active .wa-chat-avatar {
+  transform: rotate(0) scale(1);
+  box-shadow: 4px 4px 0 rgba(102, 255, 153, 0.18);
+}
+
+/* Thread avatar — mismo squircle */
+.wa-thread-avatar { border-radius: 6px; }
+
+/* Composer pasa a layout 2-rows con kbd hints abajo */
+.wa-composer {
+  flex-direction: row;
+  align-items: flex-start;
+  padding: var(--space-3) var(--space-4) var(--space-2);
+  gap: var(--space-3);
+  position: relative;
+}
+.wa-composer textarea { order: 1; }
+.wa-send-btn { order: 2; flex-shrink: 0; }
+.wa-composer-kbd {
+  order: 3;
+  flex-basis: 100%;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-top: 4px;
+  font-size: 9.5px;
+  color: var(--text-faint);
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+.wa-composer-kbd kbd {
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-bottom-width: 2px;
+  border-radius: 2px;
+  padding: 1px 5px;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  color: var(--text-dim);
+  font-weight: 600;
+  text-transform: none;
+}
+.wa-kbd-sep {
+  color: var(--text-faint);
+  opacity: 0.4;
+}
+.wa-composer.idle .wa-composer-kbd { opacity: 0.3; }
+
+/* Send button reformulado con 3 chevrons que cascadean en hover */
+.wa-send-btn {
+  padding: 0 var(--space-3);
+  min-height: 38px;
+  gap: 8px;
+  overflow: hidden;
+}
+.wa-send-btn::after { content: none !important; }
+.wa-send-label {
+  display: inline-block;
+  transition: transform 200ms;
+}
+.wa-send-arrows {
+  display: inline-flex;
+  gap: 1px;
+  font-size: 9px;
+  letter-spacing: 0;
+  width: 0;
+  opacity: 0;
+  overflow: hidden;
+  transition: width 200ms, opacity 200ms;
+}
+.wa-send-arrows i { display: inline-block; opacity: 0; transition: opacity 100ms; }
+.wa-send-btn:hover .wa-send-arrows {
+  width: 22px;
+  opacity: 1;
+}
+.wa-send-btn:hover .wa-send-arrows i:nth-child(1) { opacity: 1; transition-delay: 50ms; }
+.wa-send-btn:hover .wa-send-arrows i:nth-child(2) { opacity: 1; transition-delay: 130ms; }
+.wa-send-btn:hover .wa-send-arrows i:nth-child(3) { opacity: 1; transition-delay: 210ms; }
+.wa-send-btn:hover .wa-send-label {
+  transform: translateX(-2px);
+}
+
+/* Sidebar header con asymmetric slash sutil al borde */
+.wa-sidebar-header {
+  position: relative;
+  overflow: hidden;
+}
+.wa-sidebar-header::after {
+  content: "";
+  position: absolute;
+  right: -8px;
+  top: -8px;
+  width: 24px;
+  height: 24px;
+  background: var(--phosphor);
+  transform: rotate(45deg);
+  opacity: 0.08;
+}
+
+/* Thread header: subtle gradient mesh acumulado en corners */
+.wa-thread {
+  background-image:
+    radial-gradient(circle at 0% 0%, rgba(121, 221, 255, 0.04), transparent 40%),
+    radial-gradient(circle at 100% 100%, rgba(102, 255, 153, 0.035), transparent 40%);
+}
+
+/* Bubble timestamp asymmetric — sale a la derecha del bubble */
+.wa-msg-time {
+  float: none;
+  position: absolute;
+  bottom: 4px;
+  right: 8px;
+  margin: 0;
+  background: var(--bg-elev-1);
+  padding: 0 4px;
+  border-radius: 2px;
+  font-size: 9px;
+  letter-spacing: 0.3px;
+}
+.wa-msg.own .wa-msg-time {
+  background: rgba(102, 255, 153, 0.08);
+}
+.wa-msg {
+  padding-bottom: 20px; /* espacio para el time */
+}
+
+/* Bubble content tiene un fade-out en la esquina del time para no chocar */
+.wa-msg.other > span:not(.wa-msg-time):not(.wa-msg-sender):last-of-type::after,
+.wa-msg.own > span:not(.wa-msg-time):not(.wa-msg-sender):last-of-type::after {
+  content: " ";
+  display: inline-block;
+  width: 50px;
+}
+
+/* Day divider con micro-chip "DÍA" a la izquierda */
+.wa-day-divider {
+  position: relative;
+}
+
+/* Sidebar nav: links separados con `|` sutil */
+.wa-sidebar-nav {
+  font-feature-settings: "ss02";
+}
+.wa-sidebar-nav a + a::before {
+  content: "│";
+  margin-right: var(--space-3);
+  color: var(--text-faint);
+  opacity: 0.3;
+}
+
+/* Reduce motion: respeta preference del user */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

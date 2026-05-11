@@ -38,6 +38,26 @@ function init() {
 
   chatlist.load();
   startSSE();
+  startClock();
+}
+
+function startClock() {
+  const el = document.getElementById("wa-stat-clock");
+  if (!el) return;
+  const tick = () => {
+    const d = new Date();
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mm = String(d.getMinutes()).padStart(2, "0");
+    el.textContent = `${hh}:${mm}`;
+  };
+  tick();
+  // Align al próximo minuto para que el cambio sea exacto.
+  const now = new Date();
+  const ms = (60 - now.getSeconds()) * 1000;
+  setTimeout(() => {
+    tick();
+    setInterval(tick, 60_000);
+  }, ms);
 }
 
 function startSSE() {
@@ -45,14 +65,24 @@ function startSSE() {
 
   sse.onConnectionState((open) => {
     if (!el) return;
-    el.textContent = "●";
-    el.className = open ? "wa-conn-indicator ok" : "wa-conn-indicator bad";
+    const label = el.querySelector(".wa-conn-label");
+    if (open) {
+      el.classList.remove("bad");
+      el.classList.add("ok");
+      if (label) label.textContent = "ONLINE";
+    } else {
+      el.classList.remove("ok");
+      el.classList.add("bad");
+      if (label) label.textContent = "OFFLINE";
+    }
   });
 
   sse.on("hello", () => {
     if (el) {
-      el.textContent = "●";
-      el.className = "wa-conn-indicator ok";
+      const label = el.querySelector(".wa-conn-label");
+      if (label) label.textContent = "ONLINE";
+      el.classList.remove("bad");
+      el.classList.add("ok");
     }
   });
 

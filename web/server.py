@@ -252,6 +252,7 @@ from rag import (  # noqa: E402
     _build_tasks_system_rules as _rag_build_tasks_system_rules,
     _collect_scoped_tasks_evidence_multi as _rag_collect_scoped_tasks_evidence_multi,
     _collect_today_evidence,
+    _is_system_path,
     _fetch_calendar_today,
     _fetch_chrome_bookmarks_used,
     _fetch_drive_evidence,
@@ -7542,16 +7543,23 @@ def _fetch_pagerank_top(col, n: int = 5) -> list[dict]:
 
     Reuses the module-level cache in rag.get_pagerank — cost is a dict sort
     after the first call. Silent-fail via caller suppressor.
+
+    Filtra paths bajo `99-obsidian/**` (regla 2026-05-11): infra del
+    sistema (memoria del agente, ingesters, planning) NUNCA aparece como
+    "nota top del vault" en el home — son artefactos automáticos, no
+    actividad del user.
     """
     pr_map = get_pagerank(col)
     if not pr_map:
         return []
     corpus = _load_corpus(col)
-    ranked = sorted(pr_map.items(), key=lambda kv: -kv[1])[:n]
-    # Defensive: `n <= 0` would make `ranked = []` despite a non-empty map,
-    # and a hypothetical cache-invalidation race between `get_pagerank` and
-    # `sorted` could also narrow it to zero rows. Return early rather than
-    # IndexError-ing on `ranked[0][1]`.
+    # Filtrar system paths antes de ordenar para evitar tomar top-n y
+    # que todos terminen excluidos (peor: lista vacía cuando hay user
+    # notes válidas en posición n+1, n+2…).
+    pr_user = {p: v for p, v in pr_map.items() if not _is_system_path(p)}
+    if not pr_user:
+        return []
+    ranked = sorted(pr_user.items(), key=lambda kv: -kv[1])[:n]
     if not ranked:
         return []
     max_pr = ranked[0][1] or 1.0

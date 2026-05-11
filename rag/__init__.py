@@ -35582,43 +35582,56 @@ MORNING_FOLDER = "99-obsidian/99-AI/reviews"
 # intacto (los daemons siguen siendo retrievable) y aplicamos esta lista
 # solo en `_collect_morning_evidence` y `_fetch_vault_activity`.
 _DAEMON_GENERATED_PREFIXES = (
-    "99-obsidian/99-AI/external-ingest/Calendar/",
-    "99-obsidian/99-AI/external-ingest/Chrome/",
-    "99-obsidian/99-AI/external-ingest/GitHub/",
-    "99-obsidian/99-AI/external-ingest/Gmail/",
-    "99-obsidian/99-AI/external-ingest/Reminders/",
-    "99-obsidian/99-AI/external-ingest/Screentime/",
-    "99-obsidian/99-AI/external-ingest/WhatsApp/",
-    "99-obsidian/99-AI/external-ingest/YouTube/",
-    "99-obsidian/99-AI/external-ingest/GoogleDrive/",
-    "99-obsidian/99-AI/external-ingest/Spotify/",
-    "99-obsidian/99-AI/external-ingest/Claude/",
+    # Regla global del user (2026-05-11): todo `99-obsidian/**` es infra
+    # del sistema, NUNCA se le surface al user crudo. Reformulado (chips,
+    # contadores, narrative LLM) sí, pero el path raw no aparece. Esta
+    # umbrella prefix subsume a TODOS los `99-obsidian/99-AI/...` prefixes
+    # específicos que existían antes (los dejamos abajo como
+    # documentación de cuáles eran los problemáticos originalmente).
+    "99-obsidian/",
+    # Prefixes legacy (pre-migración 2026-05-08) — `03-Resources/X/` solía
+    # alojar ingesters automáticos antes de moverse a `99-obsidian/99-AI/`.
+    # Mantener por compat con vaults sin migrar.
+    "03-Resources/Calendar/",
+    "03-Resources/Chrome/",
+    "03-Resources/GitHub/",
+    "03-Resources/Gmail/",
+    "03-Resources/Reminders/",
+    "03-Resources/Screentime/",
+    "03-Resources/WhatsApp/",
+    "03-Resources/YouTube/",
+    "03-Resources/GoogleDrive/",
+    "03-Resources/Spotify/",
+    "03-Resources/Claude/",
     "00-Inbox/WA-",  # 00-Inbox/WA-YYYY-MM-DD.md (whatsapp listener daily)
-    # mem-vault auto-saves: el agente escribe estas notas al cerrar tareas
-    # no-triviales (decisions, bug patterns, gotchas). Se indexan para
-    # retrieval (`is_excluded` las deja pasar arriba) pero su mtime NO es
-    # actividad del user — es output del agente. Sin este filtro, una
-    # sesión donde el agente guarda 5 memorias inflaba `recent_notes` con
-    # 5 títulos "wa_draft_cjk_leak…", "feedback_runner…", etc. y
-    # el LLM del brief intentaba narrar eso como "tu actividad".
-    "99-obsidian/99-AI/memory/",
-    # MOZE finance ETL: dumps mensuales/diarios de gastos. Ya se surfacean
-    # en su propio bucket (`💸 Finanzas`) con totales calculados — meterlas
-    # también como "notas tocadas" duplica la señal y empuja al LLM a
-    # mezclar nombres de categorías ("House", "Consumibles") en el recap.
-    "99-obsidian/99-AI/external-ingest/Finanzas/",
 )
 
 
 def _is_daemon_generated_path(rel_path: str) -> bool:
     """True si el path lo escribe un daemon/ingester automático y NO es
-    actividad humana. Usado solo para depurar el morning brief — no afecta
-    indexing ni retrieval. Defensivo ante None / paths absolutos.
+    actividad humana. Usado para filtrar paths del output user-facing del
+    home / morning brief / today evidence — no afecta indexing ni retrieval.
+
+    Regla global (2026-05-11): TODO bajo `99-obsidian/**` es infra del
+    sistema (memoria del agente, ingesters externos, system planning,
+    skills, runbooks, conversations, brief reviews, etc.) y se trata como
+    daemon-generated — el user nunca debe ver esos paths crudos en los
+    widgets. Si necesitamos exponer info de ahí, va reformulada (chips,
+    contadores, narrative LLM), no como path raw.
+
+    Defensivo ante None / paths absolutos.
     """
     if not rel_path:
         return False
     rel = rel_path.lstrip("/")
     return any(rel.startswith(p) for p in _DAEMON_GENERATED_PREFIXES)
+
+
+# Alias semántico para call sites donde "system path" comunica mejor la
+# intención que "daemon-generated path" (ej. contradicciones cuyo
+# subject_path apunta a `99-obsidian/...` no fueron "generadas por un
+# daemon", pero igual son del sistema y se ocultan al user).
+_is_system_path = _is_daemon_generated_path
 
 
 # ── Apple integrations (Calendar / Reminders / Mail) ─────────────────────────
@@ -41234,7 +41247,7 @@ def _collect_today_evidence(
                     "modified": mtime.isoformat(timespec="seconds"),
                     "snippet": clean_md(raw)[:220].strip(),
                 })
-            if in_window:
+            if in_window and not _is_system_path(rel):
                 t = fm.get("todo")
                 d = fm.get("due")
                 if t or d:
@@ -41269,12 +41282,23 @@ def _collect_today_evidence(
             entries = e.get("contradicts") or []
             if not entries:
                 continue
+            subject = e.get("subject_path", "") or ""
+            # Si el sujeto vive bajo `99-obsidian/**` es infra del sistema
+            # y no se le muestra al user crudo (regla global 2026-05-11).
+            # Mismo gate aplica a los targets — un contradiction entre dos
+            # system notes es ruido del sistema, no del user.
+            if _is_system_path(subject):
+                continue
+            clean_targets = [
+                {"path": c.get("path", ""), "why": c.get("why", "")}
+                for c in entries
+                if isinstance(c, dict) and not _is_system_path(c.get("path", "") or "")
+            ]
+            if not clean_targets:
+                continue
             new_contrad.append({
-                "subject_path": e.get("subject_path", ""),
-                "targets": [
-                    {"path": c.get("path", ""), "why": c.get("why", "")}
-                    for c in entries if isinstance(c, dict)
-                ],
+                "subject_path": subject,
+                "targets": clean_targets,
             })
 
     low_conf: list[dict] = []

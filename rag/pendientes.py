@@ -164,7 +164,12 @@ def _pendientes_extract_loops_fast(
     """Walk vault for notes modified in last `days`, extract loops via
     `_extract_followup_loops`, attach age_days. No LLM. Silent-fail per note.
     """
-    from rag import _extract_followup_loops, _note_created_ts, is_excluded
+    from rag import (
+        _extract_followup_loops,
+        _is_system_path,
+        _note_created_ts,
+        is_excluded,
+    )
     if not vault.is_dir():
         return []
     now = datetime.now()
@@ -176,6 +181,11 @@ def _pendientes_extract_loops_fast(
         except ValueError:
             continue
         if is_excluded(rel):
+            continue
+        # Regla 2026-05-11: NUNCA surfacear loops desde notas bajo
+        # `99-obsidian/**` — son artefactos del sistema (memorias del
+        # agente, ingesters, planning), no follow-ups del user.
+        if _is_system_path(rel):
             continue
         try:
             st = p.stat()
@@ -215,7 +225,12 @@ def _pendientes_recent_contradictions(
     with jittered backoff, so a brief writer holding the WAL doesn't blank
     the home page's contradictions panel).
     """
-    from rag import _ragvec_state_conn, _sql_query_window, _sql_read_with_retry
+    from rag import (
+        _is_system_path,
+        _ragvec_state_conn,
+        _sql_query_window,
+        _sql_read_with_retry,
+    )
     cutoff = now - timedelta(days=days)
     cutoff_iso = cutoff.isoformat(timespec="seconds")
     out: list[dict] = []
@@ -244,9 +259,21 @@ def _pendientes_recent_contradictions(
             contradicts = []
         if not contradicts:
             continue
+        subject = r["subject_path"] or ""
+        # Regla 2026-05-11: si el sujeto vive bajo `99-obsidian/**` es
+        # ruido del sistema (memorias del agente, system planning, etc.),
+        # no se le muestra al user. Mismo gate aplica a los targets.
+        if _is_system_path(subject):
+            continue
+        clean_targets = [
+            c for c in contradicts[:3]
+            if isinstance(c, dict) and not _is_system_path(c.get("path", "") or "")
+        ]
+        if not clean_targets:
+            continue
         out.append({
-            "subject_path": r["subject_path"] or "",
-            "targets": contradicts[:3],
+            "subject_path": subject,
+            "targets": clean_targets,
             "ts": r["ts"],
         })
         if len(out) >= max_items:

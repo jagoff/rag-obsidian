@@ -4,6 +4,7 @@
 import * as chatlist from "./wa-chatlist.js";
 import * as thread from "./wa-thread.js";
 import * as sse from "./wa-sse.js";
+import * as cmdk from "./wa-cmdk.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -42,6 +43,16 @@ function init() {
   startThemeToggle();
   startChatlistAutoRefresh();
   startThreadReopenOnResume();
+
+  // Command palette Cmd+K — keymap global, abre overlay con search +
+  // acciones. Click sobre un chat result llama el mismo onChatSelect
+  // que la sidebar, así thread.open ejecuta navegación + render.
+  cmdk.init({
+    onChatSelect: (jid /* , messageId */) => {
+      document.body.dataset.pane = "thread";
+      thread.open(jid);
+    },
+  });
 }
 
 // Cada 30s re-fetcheamos el chatlist. SSE entrega chat_update events

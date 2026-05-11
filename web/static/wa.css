@@ -22,6 +22,11 @@
   --bg-bubble-own:     #005c4b;
   --bg-bubble-other:   #202c33;
   --bg-quoted:         rgba(0,0,0,0.18);
+  /* Glass surface — capa translúcida para headers/composer con
+     backdrop-filter blur. Alpha ajustado para dejar pasar shapes
+     debajo sin perder legibilidad del texto en primer plano. */
+  --bg-glass-header:   rgba(32, 44, 51, 0.72);
+  --border-glass:      rgba(255, 255, 255, 0.06);
 
   --border-subtle:     rgba(134,150,160,0.15);
   --border-strong:     rgba(134,150,160,0.28);
@@ -93,6 +98,8 @@ html {
   --bg-bubble-own:     #d9fdd3;
   --bg-bubble-other:   #ffffff;
   --bg-quoted:         rgba(0,0,0,0.06);
+  --bg-glass-header:   rgba(245, 245, 245, 0.72);
+  --border-glass:      rgba(0, 0, 0, 0.08);
   --border-subtle:     rgba(11,20,26,0.08);
   --border-strong:     rgba(11,20,26,0.16);
   --border-divider:    #e9edef;
@@ -170,12 +177,22 @@ button { cursor: pointer; }
 .wa-sidebar-header {
   height: var(--header-h);
   flex-shrink: 0;
-  background: var(--bg-panel-header);
+  /* Glassmorphism: bg semi-transparente + blur del backdrop. La capa
+     translúcida deja ver levemente el contenido scrollable debajo,
+     feel macOS Sequoia / Telegram-modern. saturate(180%) compensa el
+     fade visual que produce el blur. Border-bottom muy sutil para
+     definir el corte sin ser duro. */
+  background: var(--bg-glass-header);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  border-bottom: 1px solid var(--border-glass);
   display: flex;
   align-items: center;
   justify-content: space-between;
   padding: 0 16px;
   gap: 12px;
+  position: relative;
+  z-index: 5;
 }
 
 .wa-app-title {
@@ -666,13 +683,16 @@ button { cursor: pointer; }
 .wa-thread-header {
   height: var(--header-h);
   flex-shrink: 0;
-  background: var(--bg-panel-header);
+  background: var(--bg-glass-header);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
   display: flex;
   align-items: center;
   gap: 14px;
   padding: 0 16px;
-  border-bottom: 1px solid var(--border-divider);
-  z-index: 1;
+  border-bottom: 1px solid var(--border-glass);
+  position: relative;
+  z-index: 5;
 }
 .wa-back-btn {
   background: transparent;
@@ -1258,7 +1278,9 @@ button { cursor: pointer; }
 /* ─── Composer ───────────────────────────────────────────────────── */
 .wa-composer {
   flex-shrink: 0;
-  background: var(--bg-panel-header);
+  background: var(--bg-glass-header);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
   padding: 10px 16px;
   display: grid;
   grid-template-columns: 1fr auto auto;
@@ -1268,8 +1290,9 @@ button { cursor: pointer; }
     "kbd kbd kbd";
   align-items: end;
   gap: 8px 10px;
-  border-top: 1px solid var(--border-divider);
+  border-top: 1px solid var(--border-glass);
   position: relative;
+  z-index: 5;
 }
 .wa-composer.idle { opacity: 0.65; }
 .wa-composer.dragging { outline: 2px dashed var(--accent); outline-offset: -8px; }
@@ -1714,6 +1737,159 @@ button { cursor: pointer; }
   .wa-composer { padding: 8px 10px; }
   .wa-composer-kbd { display: none; }
 }
+
+/* ─── Command palette (Cmd+K) ────────────────────────────────────────
+   Overlay full-screen con search global + acciones rápidas. Diseño
+   inspirado en Linear/Vercel/Raycast: backdrop dim + modal floating
+   con glassmorphism, lista de resultados con secciones y nav por
+   teclado. */
+@keyframes wa-cmdk-overlay-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes wa-cmdk-modal-in {
+  from { opacity: 0; transform: translateY(-10px) scale(0.96); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+.wa-cmdk-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 10vh 16px 16px;
+  animation: wa-cmdk-overlay-in 0.14s ease;
+}
+.wa-cmdk-modal {
+  width: 100%;
+  max-width: 580px;
+  max-height: 70vh;
+  background: var(--bg-glass-header);
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  border: 1px solid var(--border-glass);
+  border-radius: 14px;
+  box-shadow:
+    0 24px 64px rgba(0, 0, 0, 0.45),
+    0 2px 6px rgba(0, 0, 0, 0.25);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  animation: wa-cmdk-modal-in 0.18s cubic-bezier(0.2, 0, 0.2, 1);
+}
+.wa-cmdk-input-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border-glass);
+}
+.wa-cmdk-icon { color: var(--text-secondary); flex-shrink: 0; }
+#wa-cmdk-input {
+  flex: 1;
+  appearance: none;
+  -webkit-appearance: none;
+  background: transparent;
+  border: 0;
+  outline: none;
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 16px;
+  line-height: 1.4;
+  padding: 0;
+  margin: 0;
+}
+#wa-cmdk-input::placeholder { color: var(--text-tertiary); }
+.wa-cmdk-esc {
+  font-size: 11px;
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.06);
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border-glass);
+}
+[data-theme="light"] .wa-cmdk-esc { background: rgba(0, 0, 0, 0.05); }
+.wa-cmdk-list {
+  list-style: none;
+  margin: 0;
+  padding: 6px 0;
+  overflow-y: auto;
+  flex: 1;
+}
+.wa-cmdk-section {
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  padding: 10px 16px 4px;
+  pointer-events: none;
+}
+.wa-cmdk-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 8px 16px;
+  cursor: pointer;
+  color: var(--text-primary);
+  border-radius: 6px;
+  margin: 1px 6px;
+  transition: background 0.08s ease;
+}
+.wa-cmdk-item:hover,
+.wa-cmdk-item.active {
+  background: rgba(255, 255, 255, 0.06);
+}
+[data-theme="light"] .wa-cmdk-item:hover,
+[data-theme="light"] .wa-cmdk-item.active {
+  background: rgba(0, 0, 0, 0.05);
+}
+.wa-cmdk-item-label {
+  font-size: 14px;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+.wa-cmdk-item-hint {
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 40%;
+  text-align: right;
+}
+.wa-cmdk-empty {
+  text-align: center;
+  color: var(--text-secondary);
+  padding: 24px 16px;
+  font-size: 13px;
+}
+.wa-cmdk-hint {
+  display: flex;
+  gap: 14px;
+  justify-content: center;
+  padding: 8px 16px;
+  font-size: 11px;
+  color: var(--text-tertiary);
+  border-top: 1px solid var(--border-glass);
+}
+.wa-cmdk-hint kbd {
+  font-family: inherit;
+  font-size: 10px;
+  background: rgba(255, 255, 255, 0.06);
+  padding: 1px 5px;
+  border-radius: 3px;
+  margin-right: 3px;
+}
+[data-theme="light"] .wa-cmdk-hint kbd { background: rgba(0, 0, 0, 0.06); }
 
 /* ─── Utility ─────────────────────────────────────────────────────── */
 .hidden { display: none !important; }

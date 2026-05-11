@@ -501,6 +501,11 @@ export function appendMessageIfActive(jid, message) {
   }
   const msgEl = renderMsg(message, currentCtx);
   if (message.pending) msgEl.classList.add("pending");
+  // Microinteraction: msgs nuevos via SSE entran con fade+slide. La
+  // class `.fresh` dispara `@keyframes wa-msg-in` y se auto-elimina al
+  // final para que el msg no quede con animation residual.
+  msgEl.classList.add("fresh");
+  msgEl.addEventListener("animationend", () => msgEl.classList.remove("fresh"), { once: true });
   els.body.appendChild(msgEl);
   if (wasAtBottom) {
     els.body.scrollTop = els.body.scrollHeight;

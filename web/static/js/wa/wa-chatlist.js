@@ -139,6 +139,11 @@ function render() {
       pinBtn.addEventListener("click", async (ev) => {
         ev.preventDefault();
         ev.stopPropagation();
+        // Spring pop feedback inmediato (no espera al server).
+        pinBtn.classList.remove("popping");
+        // force reflow para reiniciar la animación si se hace click rápido
+        void pinBtn.offsetWidth;
+        pinBtn.classList.add("popping");
         try {
           const next = !c.pinned;
           if (next) {
@@ -148,9 +153,8 @@ function render() {
           }
           c.pinned = next;
           c.pinned_ts = next ? new Date().toISOString() : "";
-          // Re-sort + re-render para subir/bajar el chat.
-          resortChats();
-          render();
+          // FLIP reorder: snapshot positions → render → animate diff.
+          renderWithFlip();
         } catch (e) {
           console.error("[wa-chatlist] pin toggle failed", e);
         }
@@ -167,6 +171,60 @@ function resortChats() {
     const tsA = a.pinned ? (a.pinned_ts || "") : (a.last_ts || "");
     const tsB = b.pinned ? (b.pinned_ts || "") : (b.last_ts || "");
     return tsB.localeCompare(tsA);
+  });
+}
+
+// FLIP animation: First → Last → Invert → Play.
+// 1. Snapshot del rect de cada chat-item antes de re-render.
+// 2. Re-sort + re-render (positions cambian).
+// 3. Para cada item con jid conocido, computamos delta old→new y
+//    aplicamos `transform: translateY(dy)` con transition: none.
+// 4. requestAnimationFrame → transition + transform: '' → animan a la
+//    posición real.
+// Esto da el efecto de "los chats se deslizan" cuando pineás/despineás
+// o cuando un msg nuevo levanta un chat al tope.
+function renderWithFlip() {
+  if (!els.list) {
+    resortChats();
+    render();
+    return;
+  }
+  // FIRST: capturar rects pre-render por JID.
+  const firstRects = new Map();
+  for (const li of els.list.querySelectorAll(".wa-chat-item")) {
+    const jid = li.dataset.jid;
+    if (jid) firstRects.set(jid, li.getBoundingClientRect());
+  }
+  // LAST: re-sort + re-render.
+  resortChats();
+  render();
+  // INVERT + PLAY: aplicar transform delta + transition.
+  requestAnimationFrame(() => {
+    for (const li of els.list.querySelectorAll(".wa-chat-item")) {
+      const jid = li.dataset.jid;
+      if (!jid) continue;
+      const first = firstRects.get(jid);
+      if (!first) continue; // chat nuevo
+      const last = li.getBoundingClientRect();
+      const dy = first.top - last.top;
+      if (Math.abs(dy) < 1) continue;
+      li.style.transform = `translateY(${dy}px)`;
+      li.style.transition = "none";
+    }
+    // Next frame: clear transform con transition habilitada.
+    requestAnimationFrame(() => {
+      for (const li of els.list.querySelectorAll(".wa-chat-item")) {
+        if (!li.style.transform) continue;
+        li.classList.add("wa-flipping");
+        li.style.transition = "";
+        li.style.transform = "";
+        const cleanup = () => {
+          li.classList.remove("wa-flipping");
+          li.removeEventListener("transitionend", cleanup);
+        };
+        li.addEventListener("transitionend", cleanup);
+      }
+    });
   });
 }
 
@@ -199,8 +257,7 @@ export function applyChatUpdate(payload) {
   // nuevo a un chat unpinned lo movía arriba de los pinned.
   allChats.splice(idx, 1);
   allChats.push(c);
-  resortChats();
-  render();
+  renderWithFlip();
   updateStats();
 }
 

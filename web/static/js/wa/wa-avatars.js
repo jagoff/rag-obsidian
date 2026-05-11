@@ -38,11 +38,49 @@ function cssEscapeAttr(s) {
   return String(s).replace(/"/g, '\\"');
 }
 
+function attachImageDirect(el, jid, url) {
+  // Mete el img al `el` que viene del renderer ANTES de que se appendee
+  // al documento. applyImage no lo puede encontrar vía querySelectorAll
+  // hasta que el LI padre se appenda al `els.list` — y eso pasa después
+  // del renderInto en el loop. Sin esto, los cache hits salían en blanco.
+  if (!el) return;
+  const existing = el.querySelector("img");
+  if (existing && existing.src.endsWith(url.split("/").pop())) return;
+  const img = document.createElement("img");
+  img.alt = "";
+  img.decoding = "async";
+  img.referrerPolicy = "no-referrer";
+  img.style.width = "100%";
+  img.style.height = "100%";
+  img.style.objectFit = "cover";
+  img.onerror = () => {
+    img.remove();
+    _avatarStatus.set(jid, "miss");
+    el.style.background = colorFor(jid);
+    if (!el.querySelector("span")) {
+      const span = document.createElement("span");
+      span.textContent = el.dataset.initials || "?";
+      el.appendChild(span);
+    }
+  };
+  el.innerHTML = "";
+  el.style.background = "transparent";
+  el.appendChild(img);
+  img.src = url;
+}
+
 function applyImage(jid, url) {
   // Busca TODOS los avatar divs vivos con este jid (header del thread +
   // sidebar) y les pone la imagen. El el original del closure puede
   // estar detached por re-renders, pero estos queries siempre traen
   // los actuales del DOM.
+  //
+  // Append el img DIRECTAMENTE en lugar de pre-loadear con Image() y
+  // attachear en onload: el `onload` async perdía la race con el
+  // siguiente re-render del chatlist (cada 30s auto-refresh + cada
+  // SSE update) que wipeaba el el. Ahora el img se mete al DOM
+  // inmediato; con HTTP cache (max-age=604800) el browser lo pinta
+  // sin flicker. Si falla, onerror lo saca y el fallback span reaparece.
   const els = document.querySelectorAll(
     `.wa-chat-avatar[data-jid="${cssEscapeAttr(jid)}"], `
     + `.wa-thread-avatar[data-jid="${cssEscapeAttr(jid)}"]`,
@@ -51,30 +89,43 @@ function applyImage(jid, url) {
     // Si ya tiene img con el src correcto, skip.
     const existing = el.querySelector("img");
     if (existing && existing.src.endsWith(url.split("/").pop())) continue;
-    const img = new Image();
+    const img = document.createElement("img");
     img.alt = "";
     img.decoding = "async";
     img.referrerPolicy = "no-referrer";
     img.style.width = "100%";
     img.style.height = "100%";
     img.style.objectFit = "cover";
-    img.src = url;
-    img.onload = () => {
-      el.innerHTML = "";
-      el.style.background = "transparent";
-      el.appendChild(img);
+    img.onerror = () => {
+      // Fallback graceful: si la URL falla (raro, ya pasó el probe),
+      // saca el img y re-pinta el span fallback.
+      img.remove();
+      el.style.background = colorFor(jid);
+      if (!el.querySelector("span")) {
+        const span = document.createElement("span");
+        span.textContent = el.dataset.initials || "?";
+        el.appendChild(span);
+      }
     };
+    el.innerHTML = "";
+    el.style.background = "transparent";
+    el.appendChild(img);
+    img.src = url; // set después del append para que load fire en DOM
   }
 }
 
 export function renderInto(el, jid, initials, chatName) {
   if (!el) return;
+  const initialsClean = (initials || "?").slice(0, 2);
+  // Persistir las iniciales en el dataset para que `applyImage::onerror`
+  // las pueda restaurar si el img falla mid-flight.
+  if (initialsClean) el.dataset.initials = initialsClean;
   el.innerHTML = "";
   // Marcar el data-jid también en el thread-avatar para que applyImage
   // lo encuentre vía querySelectorAll.
   if (jid && !el.dataset.jid) el.dataset.jid = jid;
   const fallback = document.createElement("span");
-  fallback.textContent = (initials || "?").slice(0, 2);
+  fallback.textContent = initialsClean;
   el.style.background = colorFor(jid);
   el.appendChild(fallback);
 
@@ -83,7 +134,11 @@ export function renderInto(el, jid, initials, chatName) {
   const cached = _avatarStatus.get(jid);
   if (cached === "miss") return;
   if (typeof cached === "string") {
-    // Ya sabemos que carga OK — re-usar la URL sin nuevo fetch.
+    // Ya sabemos que carga OK — append al `el` directo (puede estar
+    // todavía detached durante el chatlist render, querySelectorAll
+    // del document no lo encontraría). Plus applyImage para refrescar
+    // otros avatars del mismo jid que estén ya en el DOM (header).
+    attachImageDirect(el, jid, cached);
     applyImage(jid, cached);
     return;
   }

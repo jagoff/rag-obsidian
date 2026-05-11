@@ -43,6 +43,36 @@ _VENV_PY = _REPO_ROOT / ".venv" / "bin" / "python"
 _UV_TOOL_PY = Path.home() / ".local/share/uv/tools/obsidian-rag/bin/python3"
 
 
+# ── VLM image captioner (Game-Changer G5, 2026-05-11) ──────────────────────
+
+
+@interval(
+    hours=2,
+    label="vault_image_captioner",
+    description="Genera captions VLM (granite-vision MLX) para imágenes del vault + bridge media. Sidecars .caption.md indexables por rag watch.",
+)
+def vault_image_captioner_job() -> dict[str, Any]:
+    """Corre `scripts/vault_image_captioner.py --limit 10` cada 2h.
+
+    Cap pequeño porque cada caption tarda 5-10s en MPS. En 1 día procesa
+    ~120 imágenes — suficiente para empezar a indexar el backlog +
+    seguir el ritmo de imágenes nuevas en WA.
+    """
+    return _run_subprocess(
+        [str(_VENV_PY), str(_REPO_ROOT / "scripts" / "vault_image_captioner.py"),
+         "--limit", "10"],
+        extra_env={
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "PYTHONPATH": str(_REPO_ROOT),
+            "RAG_VLM_CAPTION": "1",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+        },
+        timeout=1800,  # 30min — 10 imgs × 10s típico = 100s, margen amplio
+    )
+
+
 # ── WA voice backfill (Game-Changer G1, 2026-05-11) ────────────────────────
 
 

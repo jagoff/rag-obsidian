@@ -2,6 +2,7 @@
 // Day-dividers entre mensajes de días distintos.
 
 import { fetchThread, markRead } from "./wa-api.js";
+import { tintHeaderFromAvatar } from "./wa-liquid-glass.js";
 import { renderInto as renderAvatar } from "./wa-avatars.js";
 import * as composer from "./wa-composer.js";
 import * as reactions from "./wa-reactions.js";
@@ -82,6 +83,16 @@ export async function open(jid) {
     renderAvatar(els.header.avatar, jid, initialsFromLabel(data.label || ""), data.label);
   }
   if (els.header.presence) els.header.presence.textContent = "";
+
+  // Liquid Glass tint — extraer color dominante del avatar y aplicar
+  // como overlay tinted en el header. Pasamos la URL del endpoint;
+  // el módulo carga la img off-DOM con CORS=anonymous y muestrea
+  // el centro 16x16. Fire-and-forget — si falla, header queda con
+  // tint default verde accent.
+  if (jid) {
+    const avUrl = `/api/wa/avatar/${encodeURIComponent(jid)}?name=${encodeURIComponent(data.label || "")}`;
+    tintHeaderFromAvatar(avUrl).catch(() => {});
+  }
 
   // Render messages
   if (els.body) {

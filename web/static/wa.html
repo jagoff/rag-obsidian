@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <title>rag · wzp</title>
-  <link rel="stylesheet" href="/static/wa.css?v=40">
+  <link rel="stylesheet" href="/static/wa.css?v=41">
   <link rel="manifest" href="/static/manifest.webmanifest">
   <link rel="icon" type="image/png" sizes="32x32" href="/static/pwa/favicon-32.png">
   <link rel="icon" type="image/png" sizes="16x16" href="/static/pwa/favicon-16.png">
@@ -33,6 +33,19 @@
   </script>
 </head>
 <body data-pane="thread">
+  <!-- Liquid Glass refraction filter (Apple WWDC25 inspired). El
+       feTurbulence + feDisplacementMap simulan refracción tipo lente
+       en lugar del plain blur. Aplicado vía `filter: url(#liquid-glass)`
+       en surfaces glass. baseFrequency low + scale moderado → distorsión
+       sutil sin marearse. -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <defs>
+      <filter id="liquid-glass" x="0%" y="0%" width="100%" height="100%">
+        <feTurbulence type="fractalNoise" baseFrequency="0.018 0.012" numOctaves="2" seed="3" result="turb"/>
+        <feDisplacementMap in="SourceGraphic" in2="turb" scale="6" xChannelSelector="R" yChannelSelector="G"/>
+      </filter>
+    </defs>
+  </svg>
   <div class="wa-app">
     <!-- Sidebar: lista de chats -->
     <aside class="wa-sidebar" aria-label="Lista de chats">
@@ -164,6 +177,6 @@
        borrar mensajes propios). Loopback-only — un device LAN/tunnel
        no recibe el token y el delete falla server-side con 401. -->
   <script src="/static/admin-auth.js"></script>
-  <script type="module" src="/static/js/wa/wa.js?v=39"></script>
+  <script type="module" src="/static/js/wa/wa.js?v=40"></script>
 </body>
 </html>

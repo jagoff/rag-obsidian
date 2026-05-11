@@ -2394,5 +2394,146 @@ body.archived-mode .wa-sidebar-header { box-shadow: inset 0 -2px 0 var(--accent,
   background: rgba(0, 0, 0, 0.08);
 }
 
+/* ═════════════════════════════════════════════════════════════════
+   LIQUID GLASS overlay — Apple WWDC25 inspired
+   ─────────────────────────────────────────────────────────────────
+   Capa visual sobre el refresh "Aurora Glass":
+   - Light edges en surfaces glass (specular highlight superior).
+   - Specular spotlight que sigue el mouse en bubbles + composer.
+   - Floating layout (margin + drop-shadow) para que las surfaces
+     "floten" como capas de cristal, no pegadas al edge.
+   - Adaptive tinted glass del thread header — capa de color
+     extraída del avatar dominante via JS.
+   ═════════════════════════════════════════════════════════════════ */
+
+/* Specular light edge top — tipo "luz reflejándose en el borde del
+   cristal". Aplicado en headers + composer + glass pills. */
+.wa-sidebar-header::before,
+.wa-thread-header::before,
+.wa-composer::before,
+.wa-day-divider::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 8%;
+  right: 8%;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.18) 50%,
+    transparent 100%
+  );
+  pointer-events: none;
+  z-index: 6;
+}
+[data-theme="light"] .wa-sidebar-header::before,
+[data-theme="light"] .wa-thread-header::before,
+[data-theme="light"] .wa-composer::before {
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.65) 50%,
+    transparent 100%
+  );
+}
+/* En composer la luz va abajo (borde superior del "cristal" desde
+   donde está el border-top). */
+.wa-composer::before {
+  top: auto;
+  bottom: 0;
+}
+
+/* Specular spotlight — radial-gradient blanco sutil que sigue el
+   mouse. JS settea `--lq-x/--lq-y` en el container, CSS lo renderea
+   como pseudo-element con mix-blend-mode soft-light. */
+.wa-msg.own,
+.wa-msg.other,
+.wa-send-btn,
+.wa-mic-btn {
+  --lq-x: 50%;
+  --lq-y: -20%;
+}
+.wa-msg::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(
+    220px circle at var(--lq-x) var(--lq-y),
+    rgba(255, 255, 255, 0.12) 0%,
+    transparent 60%
+  );
+  border-radius: inherit;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+  mix-blend-mode: soft-light;
+}
+.wa-msg:hover::after { opacity: 1; }
+[data-theme="light"] .wa-msg::after {
+  background: radial-gradient(
+    220px circle at var(--lq-x) var(--lq-y),
+    rgba(255, 255, 255, 0.6) 0%,
+    transparent 60%
+  );
+}
+
+/* Tinted glass del thread header — JS extrae color dominante del
+   avatar del chat activo y lo settea como `--tint-r/g/b`. El header
+   recibe una capa rgba(--tint, 0.12) overlay encima del glass base. */
+.wa-thread-header {
+  --tint-r: 0;
+  --tint-g: 168;
+  --tint-b: 132;
+  position: relative;
+}
+.wa-thread-header::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(
+    ellipse at 20% 50%,
+    rgba(var(--tint-r), var(--tint-g), var(--tint-b), 0.18) 0%,
+    transparent 70%
+  );
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0.7;
+  transition: background 0.5s ease;
+}
+.wa-thread-header > * { position: relative; z-index: 1; }
+
+/* Floating composer — drop-shadow + tiny margin para que se vea
+   como una "lente" suspendida sobre el thread. Más Apple-y que
+   pegado al borde inferior. */
+.wa-composer {
+  margin: 0 8px 8px;
+  border-radius: 16px;
+  border: 1px solid var(--border-glass);
+  box-shadow:
+    0 8px 24px rgba(0, 0, 0, 0.22),
+    0 1px 0 rgba(255, 255, 255, 0.06) inset;
+}
+.wa-composer::before {
+  /* La luz superior va arriba del composer floating, no abajo. */
+  top: 0;
+  bottom: auto;
+  border-radius: 16px 16px 0 0;
+}
+
+/* Liquid morphing borders en floating action buttons (trash + select
+   + pin + archive). Border-radius animado al hover para feel
+   "viviente". */
+@keyframes wa-liquid-morph {
+  0%, 100% { border-radius: 50%; }
+  50%      { border-radius: 42% 58% 50% 50% / 50% 50% 48% 52%; }
+}
+.wa-msg-trash:hover,
+.wa-msg-select:hover,
+.wa-chat-pin:hover,
+.wa-chat-archive:hover {
+  animation: wa-liquid-morph 1.8s ease-in-out infinite;
+}
+
 /* ─── Utility ─────────────────────────────────────────────────────── */
 .hidden { display: none !important; }

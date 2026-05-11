@@ -4733,7 +4733,6 @@ def wa_voice_transcript(message_id: str, jid: str) -> dict:
     Errores se cachean también (fila con `error` set) para no martillar
     whisper en loop sobre audios que no se pueden decodificar.
     """
-    import mimetypes  # noqa: PLC0415
     import sqlite3 as _sqlite3  # noqa: PLC0415
 
     from rag.integrations.whatsapp import (  # noqa: PLC0415

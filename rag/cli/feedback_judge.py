@@ -617,21 +617,32 @@ def active_learning_nudge(
         result["channel_used"] = "(dry-run)"
         return result
 
+    # Re-resolve los senders via `sys.modules.get("rag")` para que
+    # `patch.object(rag, "_send_active_learning_nudge_*", ...)` en tests
+    # propague hasta acá. Mismo shim pattern usado por `_sync_chrome_history`
+    # con `_chrome_history_paths` y por los ETLs con `_CHROME_HISTORY_PATH`.
+    import sys  # noqa: PLC0415
+    _rag = sys.modules.get("rag")
+    _wa_fn = getattr(_rag, "_send_active_learning_nudge_wa",
+                     _send_active_learning_nudge_wa)
+    _macos_fn = getattr(_rag, "_send_active_learning_nudge_macos",
+                        _send_active_learning_nudge_macos)
+
     if channel == "wa":
-        ok = _send_active_learning_nudge_wa(n, since_days)
+        ok = _wa_fn(n, since_days)
         result["fired"] = ok
         result["channel_used"] = "wa" if ok else "wa-failed"
         return result
     if channel == "macos":
-        ok = _send_active_learning_nudge_macos(n, since_days)
+        ok = _macos_fn(n, since_days)
         result["fired"] = ok
         result["channel_used"] = "macos"
         return result
-    if _send_active_learning_nudge_wa(n, since_days):
+    if _wa_fn(n, since_days):
         result["fired"] = True
         result["channel_used"] = "wa"
     else:
-        ok = _send_active_learning_nudge_macos(n, since_days)
+        ok = _macos_fn(n, since_days)
         result["fired"] = ok
         result["channel_used"] = "macos-fallback" if ok else "all-failed"
     return result

@@ -42456,11 +42456,21 @@ def ingest_cross_source(
 
         t0 = time.perf_counter()
         try:
+            # 2026-05-11: `--reset` deprecated → renamed a `--full` (commit
+            # 17973d2). Antes el invoke pasaba `reset=False` que no es
+            # parámetro del comando renombrado → TypeError silenciado por
+            # el `except Exception` de abajo. El supervisor reportaba
+            # exit_code=0 (porque `_silent_log` swallow) pero el cursor
+            # nunca se marcaba y el sub-ingester nunca corría. Síntoma
+            # observado: panel de sleep vacío post-boot porque la tabla
+            # `rag_sleep_sessions` se quedaba en 0 rows. Fix: parámetros
+            # actuales del comando (`full_flag` / `reset_legacy` / etc).
             ctx.invoke(
                 index,
-                reset=False, no_contradict=False,
+                full_flag=False, reset_legacy=False, no_contradict=False,
                 source_opt=source, since_opt=None,
                 dry_run=False, max_chats=None, vault_scope=None,
+                contextual=False, fast=False,
             )
             _ingest_cursors_mark(source)
             dt_s = time.perf_counter() - t0

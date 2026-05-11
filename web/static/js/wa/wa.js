@@ -40,6 +40,32 @@ function init() {
   startSSE();
   startClock();
   startThemeToggle();
+  startChatlistAutoRefresh();
+  startThreadReopenOnResume();
+}
+
+// Cada 30s re-fetcheamos el chatlist. SSE entrega chat_update events
+// en vivo, pero si la conexión SSE muere brevemente (sleep del mac,
+// network blip, web restart) los events de ese gap se pierden. El
+// refresh periódico re-sincroniza el sidebar con la verdad del bridge.
+function startChatlistAutoRefresh() {
+  setInterval(() => {
+    if (document.hidden) return;  // skip si la tab está background
+    try { chatlist.load(); } catch (e) { console.warn("[wa] chatlist refresh failed", e); }
+  }, 30_000);
+}
+
+// Cuando el tab vuelve de background (otro programa, otra tab) o el
+// SSE se reconecta tras un drop, re-fetcheamos el thread activo +
+// chatlist completo para asegurar coherencia con el bridge.
+function startThreadReopenOnResume() {
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) {
+      chatlist.load();
+      const activeJID = thread.getActiveJID();
+      if (activeJID) thread.reload();
+    }
+  });
 }
 
 function startThemeToggle() {
@@ -100,6 +126,11 @@ function startSSE() {
       el.classList.remove("bad");
       el.classList.add("ok");
     }
+    // Cualquier reconnect del SSE (incluído el primero) trae un
+    // `hello`. Forzar reload del chatlist garantiza que cualquier
+    // chat_update que se haya perdido durante el gap se aplique
+    // implícitamente via el listing fresh del backend.
+    try { chatlist.load(); } catch (e) { console.warn("[wa] post-hello reload failed", e); }
   });
 
   sse.on("new_message", (payload) => {

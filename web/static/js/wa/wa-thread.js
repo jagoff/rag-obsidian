@@ -47,6 +47,19 @@ export function init({ bodyEl, emptyEl, nameEl, avatarEl, presenceEl, composerEl
   reactions.attach(els.body);
 }
 
+export function getActiveJID() {
+  return currentJID;
+}
+
+export async function reload() {
+  // Re-fetch del thread activo desde el bridge. Útil cuando volvemos
+  // del background y queremos garantizar coherencia post-gap SSE.
+  if (!currentJID) return;
+  const jid = currentJID;
+  currentJID = null;  // forzar el bypass del early-return en open()
+  await open(jid);
+}
+
 export async function open(jid) {
   if (currentJID === jid) return;
   currentJID = jid;

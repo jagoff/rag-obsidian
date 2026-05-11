@@ -895,17 +895,21 @@ def list_chats_for_ui(
                 """,
                 (jid, r["last_seen_ts"]),
             ).fetchone()
+            is_group = jid.endswith("@g.us")
+            # Pin solo aplica a contactos individuales. Aunque el JID
+            # esté en la tabla por accidente, lo ignoramos.
+            is_pinned = (not is_group) and (jid in pinned_map)
             out.append({
                 "jid": jid,
                 "label": label,
-                "is_group": jid.endswith("@g.us"),
+                "is_group": is_group,
                 "last_ts": _normalize_bridge_ts(r["computed_last_ts"] or ""),
                 "last_preview": preview,
                 "last_from_me": bool(r["last_from_me"]),
                 "unread_count": int(unread["n"]) if unread else 0,
                 "avatar_initials": _avatar_initials(label),
-                "pinned": jid in pinned_map,
-                "pinned_ts": pinned_map.get(jid, ""),
+                "pinned": is_pinned,
+                "pinned_ts": pinned_map.get(jid, "") if is_pinned else "",
             })
         # Sort: pinned primero (más reciente pin arriba), después el resto
         # por last_ts desc igual que antes. WhatsApp Web hace lo mismo.

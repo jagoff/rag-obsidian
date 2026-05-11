@@ -106,15 +106,20 @@ function render() {
       selectChat(c.jid);
     });
 
+    // Pin solo aplica a contactos individuales, no a grupos.
+    const canPin = !c.is_group;
     const pinTitle = c.pinned ? "Despinear" : "Pinear al tope";
     const pinIcon = c.pinned
       // Pinned: tachuela rellena (SVG filled).
       ? `<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M16 3l5 5-4 1-3 7-2-2-4 4-1-1 4-4-2-2 7-3z"/></svg>`
       // Unpinned: outline.
       : `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 3l5 5-4 1-3 7-2-2-4 4-1-1 4-4-2-2 7-3z"/></svg>`;
+    const pinBtnHTML = canPin
+      ? `<button class="wa-chat-pin" type="button" title="${pinTitle}" aria-label="${pinTitle}">${pinIcon}</button>`
+      : "";
 
     li.innerHTML = `
-      <button class="wa-chat-pin" type="button" title="${pinTitle}" aria-label="${pinTitle}">${pinIcon}</button>
+      ${pinBtnHTML}
       <div class="wa-chat-avatar" data-jid="${escapeHtml(c.jid)}"></div>
       <div class="wa-chat-body">
         <div class="wa-chat-name-row">
@@ -130,25 +135,27 @@ function render() {
     const avatarEl = li.querySelector(".wa-chat-avatar");
     renderAvatar(avatarEl, c.jid, c.avatar_initials, c.label);
     const pinBtn = li.querySelector(".wa-chat-pin");
-    pinBtn.addEventListener("click", async (ev) => {
-      ev.preventDefault();
-      ev.stopPropagation();
-      try {
-        const next = !c.pinned;
-        if (next) {
-          await pinChat(c.jid);
-        } else {
-          await unpinChat(c.jid);
+    if (pinBtn) {
+      pinBtn.addEventListener("click", async (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        try {
+          const next = !c.pinned;
+          if (next) {
+            await pinChat(c.jid);
+          } else {
+            await unpinChat(c.jid);
+          }
+          c.pinned = next;
+          c.pinned_ts = next ? new Date().toISOString() : "";
+          // Re-sort + re-render para subir/bajar el chat.
+          resortChats();
+          render();
+        } catch (e) {
+          console.error("[wa-chatlist] pin toggle failed", e);
         }
-        c.pinned = next;
-        c.pinned_ts = next ? new Date().toISOString() : "";
-        // Re-sort + re-render para subir/bajar el chat.
-        resortChats();
-        render();
-      } catch (e) {
-        console.error("[wa-chatlist] pin toggle failed", e);
-      }
-    });
+      });
+    }
     els.list.appendChild(li);
   }
 }

@@ -1063,12 +1063,71 @@
     }
     .cc-meta-value { color: var(--text); font-variant-numeric: tabular-nums; }
     .cc-detail {
-      display: flex; flex-direction: column; gap: 12px;
+      display: flex; flex-direction: column; gap: 16px;
     }
     .cc-detail-title {
       font-size: 12px; color: var(--text-dim);
       text-transform: uppercase; letter-spacing: 0.06em;
     }
+
+    /* ── Sub-secciones dentro de la tarjeta (composición / categorías /
+       recurrentes / cargos extra / consumos). Cada una es un bloque
+       semi-elevado con título small-caps + body. */
+    .cc-section {
+      background: var(--bg-elev);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 14px;
+      display: flex; flex-direction: column; gap: 10px;
+    }
+    .cc-section-title {
+      font-size: 11px; color: var(--text-dim);
+      text-transform: uppercase; letter-spacing: 0.06em;
+      font-weight: 600;
+    }
+    .cc-section-grid-2 {
+      display: grid;
+      grid-template-columns: 160px 1fr;
+      gap: 12px; align-items: center;
+    }
+    @media (max-width: 600px) {
+      .cc-section-grid-2 { grid-template-columns: 1fr; }
+    }
+    .cc-mini-chart-wrap {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 1 / 1;
+      max-height: 160px;
+    }
+    .cc-mini-chart-wrap canvas { max-height: 160px; }
+
+    /* ── Tabs ARS / USD para consumos del ciclo. */
+    .cc-tabs {
+      display: inline-flex;
+      gap: 2px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 2px;
+      align-self: flex-start;
+    }
+    .cc-tab {
+      background: none;
+      border: none;
+      color: var(--text-dim);
+      padding: 5px 12px;
+      font-size: 11px;
+      font-family: inherit;
+      cursor: pointer;
+      border-radius: 4px;
+      font-weight: 500;
+    }
+    .cc-tab:hover { color: var(--text); }
+    .cc-tab.active {
+      background: var(--bg-elev);
+      color: var(--cyan);
+    }
+    .cc-tab-panel { display: block; }
 
     /* ── Transfer feed (avatar + recipient + amount) ───────────────── */
     .transfer-list { display: flex; flex-direction: column; gap: 0; }

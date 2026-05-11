@@ -812,6 +812,125 @@ function renderByAccount(payload) {
 }
 
 // ── Render: tarjetas de crédito (visual real) ────────────────────────────
+// ── Card breakdown helpers ──────────────────────────────────────────────
+//
+// Categorización heurística por description del consumo. Match orden-
+// dependiente (primer match gana) — definí los más específicos primero.
+// El objetivo no es ML, es darle al user un mapa mental rápido del ciclo:
+// "¿cuánto se va en streaming vs servicios vs movilidad?".
+const _CC_CATEGORIES = [
+  { id: "streaming",   label: "Streaming / SaaS",    color: "purple",
+    pat: /(netflix|spotify|disney|hbo|claude|openai|chatgpt|google\s*\*?(?:google|youtube)|apple\.com|apple\s+bill|amazon\s+prime|notion|figma|github|cursor|midjourney|anthropic)/i },
+  { id: "servicios",   label: "Servicios / facturas", color: "yellow",
+    pat: /(epe|edenor|edesur|metrogas|aguas|aysa|claro|movistar|personal|telecom|telecentro|teleplu|fibertel|cablevision|directv|expensas|abl|adventistas)/i },
+  { id: "movilidad",   label: "Movilidad",            color: "cyan",
+    pat: /(uber|cabify|didi|sube|ypf|shell|axion|esso|peaje|tag|estacion)/i },
+  { id: "compras",     label: "Compras / Marketplace", color: "green",
+    pat: /(merpago|mercadopago|mercpago|mercado\s*libre|mercadolibre|tiendanube|amazon|aliexpress|nike|adidas|carrefour|coto|disco|jumbo|vea|dia\s|farmacity)/i },
+  { id: "comida",      label: "Comida / delivery",    color: "orange",
+    pat: /(rappi|pedidos\s*ya|pedidosya|mcdonalds|burger|starbucks|havanna)/i },
+  { id: "salud",       label: "Salud",                color: "pink",
+    pat: /(farmacit|farmacia|farmacy|swiss\s*medical|osde|galeno|medicus|prepaga|odontolog)/i },
+];
+
+function _inferCategory(desc) {
+  const s = String(desc || "");
+  for (const c of _CC_CATEGORIES) {
+    if (c.pat.test(s)) return c;
+  }
+  return { id: "otros", label: "Otros", color: "" };
+}
+
+// Categorización heurística de "otros conceptos" (cargos extra del banco).
+// Sellos / IIBB / IVA / Débitos AFIP / IVA RG / etc.
+const _CC_EXTRA_CATEGORIES = [
+  { id: "sellos",   label: "Impuesto de sellos",    pat: /sellos/i },
+  { id: "iibb",     label: "Ingresos brutos",       pat: /iibb|ing(\.|resos)?\s*brutos/i },
+  { id: "iva",      label: "IVA",                   pat: /^iva\b|rg\s*4240/i },
+  { id: "debitos",  label: "Débitos AFIP / RG",     pat: /db\.?rg|rg\s*5617|d[eé]bito\s*(autom|afip)/i },
+  { id: "interes",  label: "Intereses",             pat: /inter[ée]s|financiaci[oó]n/i },
+  { id: "comision", label: "Comisiones",            pat: /comisi[oó]n|cargo\s*por|mantenimiento/i },
+  { id: "iva_perc", label: "Percepciones IVA",      pat: /percep.*iva|iva.*percep/i },
+];
+
+function _inferExtraCategory(desc) {
+  const s = String(desc || "");
+  for (const c of _CC_EXTRA_CATEGORIES) {
+    if (c.pat.test(s)) return c;
+  }
+  return { id: "otros", label: "Otros cargos" };
+}
+
+// Top comercios — normaliza "PAYU*AR*UBER", "Payu*ar*uber" → "Uber".
+// Conserva el shortest stable token después de strip de prefijos comunes.
+function _normalizeMerchant(desc) {
+  if (!desc) return "—";
+  let s = String(desc).trim();
+  // Strip prefijos típicos: merpago*, payu*ar*, ar*, etc.
+  s = s.replace(/^(merpago\*|mercpago\*|mercpag\*|payu\*ar\*|payu\*|ar\*|sp\*|pp\*|mp\*|google\s*\*)/i, "");
+  // Cortar al primer separador si hay payment id pegado.
+  s = s.split(/\s+\d{8,}/)[0].trim();
+  // Capitalizar palabra inicial — el resto queda como viene (el PDF ya está raro).
+  if (s.length > 0) s = s[0].toUpperCase() + s.slice(1);
+  return s || "—";
+}
+
+// Días entre hoy y una fecha ISO (puede ser negativo si la fecha pasó).
+function _daysUntil(iso) {
+  if (!iso) return null;
+  const target = new Date(iso + "T00:00:00");
+  if (isNaN(target.getTime())) return null;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const ms = target.getTime() - today.getTime();
+  return Math.round(ms / 86_400_000);
+}
+
+function _dueBadge(days) {
+  if (days == null) return "";
+  let cls = "neutral", txt;
+  if (days < 0) { cls = "down"; txt = `venció hace ${Math.abs(days)}d`; }
+  else if (days === 0) { cls = "down"; txt = "vence hoy"; }
+  else if (days <= 3) { cls = "down"; txt = `en ${days}d`; }
+  else if (days <= 7) { cls = "neutral"; txt = `en ${days}d`; }
+  else { cls = "up"; txt = `en ${days}d`; }
+  return `<span class="kpi-delta ${cls}" style="font-size: 11px;">${txt}</span>`;
+}
+
+// Render donut simple usando Chart.js — devuelve canvas id para mount.
+function _renderCardDonut(canvasId, labels, values, colors, centerLabel, centerValue) {
+  destroyChart(canvasId);
+  const ctx = document.getElementById(canvasId);
+  if (!ctx) return;
+  state.charts[canvasId] = new Chart(ctx, {
+    type: "doughnut",
+    data: {
+      labels,
+      datasets: [{
+        data: values,
+        backgroundColor: colors,
+        borderColor: C.card, borderWidth: 2, hoverOffset: 6,
+      }],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false, cutout: "62%",
+      plugins: {
+        legend: { display: true, position: "right", labels: { color: C.dim, font: { size: 11 }, boxWidth: 10, boxHeight: 10 } },
+        tooltip: {
+          callbacks: {
+            label: (ctx) => {
+              const v = ctx.parsed;
+              const total = ctx.dataset.data.reduce((a, b) => a + b, 0);
+              const pct = total > 0 ? ((v / total) * 100).toFixed(1) : "0";
+              return ` ${ctx.label}: ${fmtMoneyARS(v)} (${pct}%)`;
+            },
+          },
+        },
+      },
+    },
+  });
+}
+
 function renderCards(cards) {
   const container = document.getElementById("cards-container");
   if (!container) return;
@@ -828,11 +947,14 @@ function renderCards(cards) {
     return;
   }
 
-  cards.forEach((card) => {
+  const palette = paletteSeries();
+
+  cards.forEach((card, cardIdx) => {
+    const cardKey = `cc-${cardIdx}`;
     const wrap = document.createElement("div");
     wrap.className = "credit-card-wrap";
 
-    // Visual de la tarjeta (gradient + chip + brand).
+    // ── Visual de la tarjeta (gradient + chip + brand). Sin cambios.
     const visual = document.createElement("div");
     visual.className = "credit-card-visual";
     const last4 = card.last4 || "0000";
@@ -859,91 +981,282 @@ function renderCards(cards) {
     `;
     wrap.appendChild(visual);
 
-    // Detalle al lado (totales, fechas, lista).
+    // ── Detalle al lado (totales, fechas, mínimos, días).
     const detail = document.createElement("div");
     detail.className = "cc-detail";
 
-    const totalsHtml = `
-      <div class="cc-totals">
+    const dueDays = _daysUntil(card.due_date);
+    const nextDueDays = _daysUntil(card.next_due_date);
+
+    // Card data
+    const purchasesAR  = (card.all_purchases_ars || []);
+    const purchasesUSD = (card.all_purchases_usd || []);
+    const totalConsumosARS = purchasesAR.reduce((s, p) => s + (p.amount || 0), 0);
+    const totalConsumosUSD = purchasesUSD.reduce((s, p) => s + (p.amount || 0), 0);
+    const otherARS = card.other_charges_total_ars || 0;
+
+    // Header stats — totales + mínimos + due-badge.
+    const headerHtml = `
+      <div class="cc-totals" style="grid-template-columns: 1fr 1fr;">
         <div class="cc-total">
-          <span class="cc-total-label">Total ARS</span>
+          <span class="cc-total-label">Total a pagar · ARS</span>
           <span class="cc-total-value">${fmtMoneyARS(card.total_ars)}</span>
+          ${card.minimum_ars != null && card.minimum_ars !== card.total_ars ? `
+            <span style="font-size: 10px; color: var(--text-faint);">mínimo ${fmtMoneyARS(card.minimum_ars)}</span>` : ""}
         </div>
         <div class="cc-total">
-          <span class="cc-total-label">Total USD</span>
+          <span class="cc-total-label">Total a pagar · USD</span>
           <span class="cc-total-value">${fmtMoneyUSD(card.total_usd)}</span>
+          ${card.minimum_usd != null && card.minimum_usd !== card.total_usd ? `
+            <span style="font-size: 10px; color: var(--text-faint);">mínimo ${fmtMoneyUSD(card.minimum_usd)}</span>` : ""}
         </div>
       </div>
-      <div class="cc-meta">
+      <div class="cc-meta" style="grid-template-columns: repeat(2, 1fr);">
+        <div class="cc-meta-row">
+          <span class="cc-meta-label">Vencimiento</span>
+          <span class="cc-meta-value">
+            ${escapeHtml(fmtDateShort(card.due_date))}
+            ${_dueBadge(dueDays)}
+          </span>
+        </div>
         <div class="cc-meta-row">
           <span class="cc-meta-label">Cierre</span>
           <span class="cc-meta-value">${escapeHtml(fmtDateShort(card.closing_date))}</span>
         </div>
-        <div class="cc-meta-row">
-          <span class="cc-meta-label">Vencimiento</span>
-          <span class="cc-meta-value">${escapeHtml(fmtDateShort(card.due_date))}</span>
-        </div>
-        ${card.next_closing_date ? `
-        <div class="cc-meta-row">
-          <span class="cc-meta-label">Próximo cierre</span>
-          <span class="cc-meta-value">${escapeHtml(fmtDateShort(card.next_closing_date))}</span>
-        </div>` : ""}
         ${card.next_due_date ? `
         <div class="cc-meta-row">
-          <span class="cc-meta-label">Próximo venc.</span>
-          <span class="cc-meta-value">${escapeHtml(fmtDateShort(card.next_due_date))}</span>
+          <span class="cc-meta-label">Próx. vencimiento</span>
+          <span class="cc-meta-value">
+            ${escapeHtml(fmtDateShort(card.next_due_date))}
+            ${_dueBadge(nextDueDays)}
+          </span>
+        </div>` : ""}
+        ${card.next_closing_date ? `
+        <div class="cc-meta-row">
+          <span class="cc-meta-label">Próx. cierre</span>
+          <span class="cc-meta-value">${escapeHtml(fmtDateShort(card.next_closing_date))}</span>
         </div>` : ""}
       </div>
     `;
 
-    const purchasesAR = (card.all_purchases_ars || []);
-    const purchasesUSD = (card.all_purchases_usd || []);
-    const allPurchases = [...purchasesAR, ...purchasesUSD]
-      .sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+    // ── Composición ARS: consumos vs cargos extra (donut).
+    const compoCanvasId = `${cardKey}-compo`;
+    const compoSection = (totalConsumosARS + otherARS) > 0 ? `
+      <div class="cc-section">
+        <div class="cc-section-title">Composición del resumen · ARS</div>
+        <div class="cc-section-grid-2">
+          <div class="cc-mini-chart-wrap">
+            <canvas id="${compoCanvasId}" aria-label="Donut: composición del resumen ARS"></canvas>
+          </div>
+          <ul class="cat-list" style="padding-top: 4px;">
+            <li class="cat-row">
+              <span class="cat-row-swatch" style="background: var(--cyan);"></span>
+              <span class="cat-row-name">Consumos del ciclo</span>
+              <span class="cat-row-amount">${fmtMoneyARS(totalConsumosARS)}</span>
+              <div class="cat-row-bar"><div class="cat-row-bar-fill" style="width: ${((totalConsumosARS / (totalConsumosARS + otherARS)) * 100).toFixed(1)}%;"></div></div>
+            </li>
+            <li class="cat-row">
+              <span class="cat-row-swatch" style="background: var(--yellow);"></span>
+              <span class="cat-row-name">Impuestos / cargos extra</span>
+              <span class="cat-row-amount">${fmtMoneyARS(otherARS)}</span>
+              <div class="cat-row-bar"><div class="cat-row-bar-fill yellow" style="width: ${((otherARS / (totalConsumosARS + otherARS)) * 100).toFixed(1)}%;"></div></div>
+            </li>
+          </ul>
+        </div>
+      </div>
+    ` : "";
 
-    const detailHtml = `
-      ${totalsHtml}
-      ${allPurchases.length ? `
-      <div class="cc-detail-title">Consumos del ciclo · ${allPurchases.length}</div>
-      <div class="tx-scroll" style="max-height: 320px;">
-        <table class="tx-table">
-          <thead>
-            <tr>
-              <th>Fecha</th>
-              <th>Descripción</th>
-              <th>Cuotas</th>
-              <th class="tx-amount">Monto</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${allPurchases.map((p) => `
-              <tr>
-                <td>${escapeHtml(fmtDateShort(p.date))}</td>
-                <td>${escapeHtml(p.description || "—")}</td>
-                <td class="tx-store">${escapeHtml(p.installments || "")}</td>
-                <td class="tx-amount expense">${p.currency === "USD" ? fmtMoneyUSD(p.amount) : fmtMoneyARS(p.amount)}</td>
-              </tr>
-            `).join("")}
-          </tbody>
-        </table>
-      </div>` : ""}
-      ${(card.other_charges && card.other_charges.length) ? `
-      <details>
-        <summary class="muted" style="cursor: pointer; font-size: 12px;">
-          Otros conceptos · ${fmtMoneyARS(card.other_charges_total_ars || 0)} (${card.other_charges.length} ítems)
-        </summary>
-        <ul style="margin-top: 8px; padding-left: 16px; font-size: 12px; color: var(--text-dim);">
-          ${card.other_charges.map((c) => `<li>${escapeHtml(c.description || "—")} · ${fmtMoneyARS(c.amount)}</li>`).join("")}
+    // ── Por categoría inferida (heuristic).
+    const catAggARS = new Map();
+    const catColorMap = new Map();
+    purchasesAR.forEach((p) => {
+      const c = _inferCategory(p.description);
+      catAggARS.set(c.label, (catAggARS.get(c.label) || 0) + (p.amount || 0));
+      catColorMap.set(c.label, c.color || "");
+    });
+    const catSorted = [...catAggARS.entries()].sort((a, b) => b[1] - a[1]);
+    const catSection = catSorted.length ? `
+      <div class="cc-section">
+        <div class="cc-section-title">Por categoría · ARS</div>
+        <ul class="cat-list">
+          ${catSorted.map(([name, amount]) => {
+            const pct = totalConsumosARS > 0 ? (amount / totalConsumosARS) * 100 : 0;
+            const color = catColorMap.get(name) || "";
+            return `
+              <li class="cat-row">
+                <span class="cat-row-swatch" style="background: var(--${color || "cyan"});"></span>
+                <span class="cat-row-name">${escapeHtml(name)}</span>
+                <span class="cat-row-amount">${fmtMoneyARS(amount)} · ${pct.toFixed(0)}%</span>
+                <div class="cat-row-bar"><div class="cat-row-bar-fill ${color}" style="width: ${pct.toFixed(1)}%;"></div></div>
+              </li>`;
+          }).join("")}
         </ul>
-      </details>
-      ` : ""}
+      </div>
+    ` : "";
+
+    // ── Recurrentes detectados (mismo merchant ≥2 veces, ARS o USD).
+    const merchantCount = new Map();
+    [...purchasesAR, ...purchasesUSD].forEach((p) => {
+      const m = _normalizeMerchant(p.description);
+      const cur = p.currency || "ARS";
+      const key = `${m}|${cur}`;
+      const ex = merchantCount.get(key) || { name: m, currency: cur, n: 0, total: 0, items: [] };
+      ex.n += 1;
+      ex.total += p.amount || 0;
+      ex.items.push(p);
+      merchantCount.set(key, ex);
+    });
+    const recurring = [...merchantCount.values()].filter((m) => m.n >= 2)
+      .sort((a, b) => b.total - a.total);
+    const recurringSection = recurring.length ? `
+      <div class="cc-section">
+        <div class="cc-section-title">Recurrentes detectados · ${recurring.length}</div>
+        <ul class="cat-list">
+          ${recurring.map((m) => `
+            <li class="cat-row">
+              <span class="cat-row-swatch" style="background: var(--purple);"></span>
+              <span class="cat-row-name" title="${escapeHtml(m.items.map((i) => i.description).join(' · '))}">
+                ${escapeHtml(m.name)}
+                <small style="color: var(--text-faint); margin-left: 6px;">${m.n} cobros</small>
+              </span>
+              <span class="cat-row-amount">${m.currency === "USD" ? fmtMoneyUSD(m.total) : fmtMoneyARS(m.total)}</span>
+            </li>
+          `).join("")}
+        </ul>
+      </div>
+    ` : "";
+
+    // ── Cargos extra agrupados.
+    const extraAgg = new Map();
+    (card.other_charges || []).forEach((c) => {
+      const ec = _inferExtraCategory(c.description);
+      const ex = extraAgg.get(ec.label) || { label: ec.label, total: 0, items: [] };
+      ex.total += c.amount || 0;
+      ex.items.push(c);
+      extraAgg.set(ec.label, ex);
+    });
+    const extraSorted = [...extraAgg.values()].sort((a, b) => b.total - a.total);
+    const extraSection = extraSorted.length ? `
+      <div class="cc-section">
+        <div class="cc-section-title">Cargos extra · ${fmtMoneyARS(otherARS)} (${(card.other_charges || []).length} ítems)</div>
+        <ul class="cat-list">
+          ${extraSorted.map((e) => {
+            const pct = otherARS > 0 ? (e.total / otherARS) * 100 : 0;
+            return `
+              <li class="cat-row">
+                <span class="cat-row-swatch" style="background: var(--yellow);"></span>
+                <span class="cat-row-name" title="${escapeHtml(e.items.map((i) => i.description).join(' · '))}">
+                  ${escapeHtml(e.label)}
+                  <small style="color: var(--text-faint); margin-left: 6px;">${e.items.length} ítem${e.items.length === 1 ? "" : "s"}</small>
+                </span>
+                <span class="cat-row-amount">${fmtMoneyARS(e.total)} · ${pct.toFixed(0)}%</span>
+                <div class="cat-row-bar"><div class="cat-row-bar-fill yellow" style="width: ${pct.toFixed(1)}%;"></div></div>
+              </li>`;
+          }).join("")}
+        </ul>
+        <details style="margin-top: 8px;">
+          <summary class="muted" style="cursor: pointer; font-size: 11px;">Ver desglose línea por línea</summary>
+          <ul style="margin-top: 6px; padding-left: 16px; font-size: 11px; color: var(--text-dim);">
+            ${(card.other_charges || []).map((c) => `<li>${escapeHtml(c.description || "—")} · ${fmtMoneyARS(c.amount)}</li>`).join("")}
+          </ul>
+        </details>
+      </div>
+    ` : "";
+
+    // ── Consumos: tabs ARS / USD.
+    const tabARSId = `${cardKey}-tab-ars`;
+    const tabUSDId = `${cardKey}-tab-usd`;
+    const consumosSection = (purchasesAR.length + purchasesUSD.length) ? `
+      <div class="cc-section">
+        <div class="cc-section-title">Consumos del ciclo</div>
+        <div class="cc-tabs" role="tablist">
+          <button class="cc-tab active" type="button" role="tab" data-tab="${tabARSId}"
+                  aria-selected="true">ARS · ${purchasesAR.length}</button>
+          <button class="cc-tab" type="button" role="tab" data-tab="${tabUSDId}"
+                  aria-selected="false">USD · ${purchasesUSD.length}</button>
+        </div>
+        <div class="cc-tab-panel" id="${tabARSId}">
+          ${purchasesAR.length ? `
+          <div class="tx-scroll" style="max-height: 280px;">
+            <table class="tx-table">
+              <thead><tr><th>Fecha</th><th>Comercio</th><th>Categoría</th><th class="tx-amount">Monto</th></tr></thead>
+              <tbody>
+                ${purchasesAR.slice().sort((a, b) => (b.date || "").localeCompare(a.date || ""))
+                  .map((p) => {
+                    const cat = _inferCategory(p.description);
+                    return `
+                    <tr>
+                      <td>${escapeHtml(fmtDateShort(p.date))}</td>
+                      <td>${escapeHtml(p.description || "—")}</td>
+                      <td><span class="tx-cat-pill">${escapeHtml(cat.label)}</span></td>
+                      <td class="tx-amount expense">${fmtMoneyARS(p.amount)}</td>
+                    </tr>`;
+                  }).join("")}
+              </tbody>
+            </table>
+          </div>` : `<div class="muted" style="padding: 12px; font-size: 12px;">Sin consumos en ARS este ciclo.</div>`}
+        </div>
+        <div class="cc-tab-panel" id="${tabUSDId}" style="display: none;">
+          ${purchasesUSD.length ? `
+          <div class="tx-scroll" style="max-height: 280px;">
+            <table class="tx-table">
+              <thead><tr><th>Fecha</th><th>Comercio</th><th>Categoría</th><th class="tx-amount">Monto</th></tr></thead>
+              <tbody>
+                ${purchasesUSD.slice().sort((a, b) => (b.date || "").localeCompare(a.date || ""))
+                  .map((p) => {
+                    const cat = _inferCategory(p.description);
+                    return `
+                    <tr>
+                      <td>${escapeHtml(fmtDateShort(p.date))}</td>
+                      <td>${escapeHtml(p.description || "—")}</td>
+                      <td><span class="tx-cat-pill">${escapeHtml(cat.label)}</span></td>
+                      <td class="tx-amount expense">${fmtMoneyUSD(p.amount)}</td>
+                    </tr>`;
+                  }).join("")}
+              </tbody>
+            </table>
+          </div>` : `<div class="muted" style="padding: 12px; font-size: 12px;">Sin consumos en USD este ciclo.</div>`}
+        </div>
+      </div>
+    ` : "";
+
+    detail.innerHTML = `
+      ${headerHtml}
+      ${compoSection}
+      ${catSection}
+      ${recurringSection}
+      ${extraSection}
+      ${consumosSection}
       <div class="muted" style="font-size: 11px;">
         Origen: <code>${escapeHtml(card.source_file || "—")}</code>
       </div>
     `;
-    detail.innerHTML = detailHtml;
     wrap.appendChild(detail);
     container.appendChild(wrap);
+
+    // ── Post-mount: chart + tab handlers.
+    if ((totalConsumosARS + otherARS) > 0) {
+      _renderCardDonut(
+        compoCanvasId,
+        ["Consumos", "Cargos extra"],
+        [totalConsumosARS, otherARS],
+        [palette[0], palette[2]],
+      );
+    }
+
+    // Tab switcher.
+    wrap.querySelectorAll(".cc-tab").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const targetId = btn.dataset.tab;
+        wrap.querySelectorAll(".cc-tab").forEach((b) => {
+          b.classList.toggle("active", b === btn);
+          b.setAttribute("aria-selected", b === btn ? "true" : "false");
+        });
+        wrap.querySelectorAll(".cc-tab-panel").forEach((p) => {
+          p.style.display = p.id === targetId ? "" : "none";
+        });
+      });
+    });
   });
 }
 

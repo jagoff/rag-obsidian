@@ -8527,7 +8527,8 @@ def _fetch_finance(now: datetime | None = None) -> dict | None:
 _CARDS_CACHE: dict = {"key": None, "payload": None}
 # Lock para read-then-write atómico (audit 2026-04-26): pre-fix dos threads
 # concurrentes podían ver pareja inconsistente (key nuevo + payload viejo)
-# si uno leía mientras otro escribía. ThreadSafeCache maneja esto internamente.
+# si uno leía mientras otro escribía.
+_CARDS_CACHE_LOCK = threading.Lock()
 
 # Regex para extraer marca + últimos 4 del nombre de archivo o sheet name.
 # Tolera "Visa Crédito terminada en 1059", "Visa 1059", "Mastercard 5234",

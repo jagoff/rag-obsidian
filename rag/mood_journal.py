@@ -151,7 +151,11 @@ def _journal_sentiment_llm(text: str, *, model: str = "qwen2.5:3b") -> float | N
             messages=[{"role": "user", "content": prompt}],
             options={"temperature": 0.0, "num_predict": 8},
         )
-        raw = (resp.get("message") or {}).get("content", "").strip()
+        if isinstance(resp, dict):
+            raw = ((resp.get("message") or {}).get("content") or "").strip()
+        else:
+            msg = getattr(resp, "message", None)
+            raw = (getattr(msg, "content", None) or "").strip()
     except Exception as exc:
         _silent_log_safe("mood_journal_sentiment_llm_failed", exc)
         return None

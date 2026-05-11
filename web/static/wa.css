@@ -1635,27 +1635,93 @@ button { cursor: pointer; }
 .wa-record-bar {
   position: absolute;
   inset: 0;
-  background: var(--bg-panel-header);
+  background: var(--bg-glass-header);
+  backdrop-filter: blur(16px) saturate(180%);
+  -webkit-backdrop-filter: blur(16px) saturate(180%);
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 0 18px;
+  padding: 0 14px;
   font-size: 13px;
   color: var(--text-primary);
-  z-index: 2;
+  z-index: 4;
+  animation: wa-record-bar-in 0.2s cubic-bezier(0.2, 0, 0.2, 1);
+}
+@keyframes wa-record-bar-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
 }
 .wa-record-bar[hidden] { display: none; }
 .wa-record-dot {
-  width: 10px;
-  height: 10px;
+  width: 12px;
+  height: 12px;
   border-radius: 50%;
   background: var(--red);
-  animation: wa-blink 1s ease-in-out infinite;
+  box-shadow: 0 0 12px rgba(241, 92, 109, 0.6);
+  animation: wa-pulse 1.1s ease-in-out infinite;
 }
-.wa-record-label { font-weight: 600; color: var(--red); letter-spacing: 0.5px; }
-.wa-record-timer { font-variant-numeric: tabular-nums; color: var(--text-secondary); }
-.wa-record-hint { color: var(--text-tertiary); font-size: 12px; margin-left: auto; }
-@keyframes wa-blink { 50% { opacity: 0.3; } }
+@keyframes wa-pulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50%      { transform: scale(1.25); opacity: 0.55; }
+}
+.wa-record-label {
+  font-weight: 600;
+  color: var(--red);
+  letter-spacing: 0.02em;
+}
+.wa-record-timer {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
+  font-weight: 500;
+  margin-right: auto;
+}
+/* Botones claros — Cancelar (gris, X) + Detener (rojo prominente, ■). */
+.wa-record-cancel,
+.wa-record-stop {
+  appearance: none;
+  -webkit-appearance: none;
+  border: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 10px;
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.1s ease, background 0.12s ease;
+}
+.wa-record-cancel {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-primary);
+}
+.wa-record-cancel:hover {
+  background: rgba(255, 255, 255, 0.14);
+  transform: scale(1.04);
+}
+.wa-record-stop {
+  background: linear-gradient(135deg, #ff6b7e, var(--red, #f15c6d));
+  color: #fff;
+  box-shadow:
+    0 2px 10px rgba(241, 92, 109, 0.45),
+    inset 0 0 0 0.5px rgba(255, 255, 255, 0.2);
+}
+.wa-record-stop:hover {
+  background: linear-gradient(135deg, #ff7a8a, #ff5067);
+  transform: scale(1.06);
+  box-shadow:
+    0 4px 14px rgba(241, 92, 109, 0.6),
+    inset 0 0 0 0.5px rgba(255, 255, 255, 0.28);
+}
+.wa-record-cancel:active,
+.wa-record-stop:active { transform: scale(0.94); }
+[data-theme="light"] .wa-record-cancel {
+  background: rgba(0, 0, 0, 0.06);
+}
+[data-theme="light"] .wa-record-cancel:hover {
+  background: rgba(0, 0, 0, 0.1);
+}
 
 /* Reply bar — cuando contestás un mensaje. */
 .wa-reply-bar {

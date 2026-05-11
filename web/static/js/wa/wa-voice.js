@@ -25,16 +25,38 @@ const els = {
   btn: null,
   recordBar: null,
   recordTimer: null,
+  stopBtn: null,
+  cancelBtn: null,
 };
 
 export function init({ btnEl, recordBarEl, recordTimerEl, onSend }) {
   els.btn = btnEl;
   els.recordBar = recordBarEl;
   els.recordTimer = recordTimerEl;
+  els.stopBtn = document.getElementById("wa-record-stop");
+  els.cancelBtn = document.getElementById("wa-record-cancel");
   onSendCallback = onSend;
   if (els.btn) {
     els.btn.addEventListener("click", toggle);
   }
+  if (els.stopBtn) {
+    els.stopBtn.addEventListener("click", (e) => {
+      e.preventDefault();
+      stop();
+    });
+  }
+  if (els.cancelBtn) {
+    els.cancelBtn.addEventListener("click", (e) => {
+      e.preventDefault();
+      cancel();
+    });
+  }
+  // Esc cancela, Enter envía (paridad con el modal preview).
+  document.addEventListener("keydown", (e) => {
+    if (!mediaRecorder || mediaRecorder.state !== "recording") return;
+    if (e.key === "Escape") { e.preventDefault(); cancel(); }
+    else if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); stop(); }
+  });
 }
 
 export function setActiveJID(jid) {

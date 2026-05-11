@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <title>rag · wzp</title>
-  <link rel="stylesheet" href="/static/wa.css?v=37">
+  <link rel="stylesheet" href="/static/wa.css?v=38">
   <link rel="manifest" href="/static/manifest.webmanifest">
   <link rel="icon" type="image/png" sizes="32x32" href="/static/pwa/favicon-32.png">
   <link rel="icon" type="image/png" sizes="16x16" href="/static/pwa/favicon-16.png">
@@ -134,9 +134,26 @@
         </button>
         <div class="wa-record-bar" id="wa-record-bar" hidden>
           <span class="wa-record-dot" aria-hidden="true"></span>
-          <span class="wa-record-label">REC</span>
+          <span class="wa-record-label">Grabando</span>
           <span class="wa-record-timer" id="wa-record-timer">0:00</span>
-          <span class="wa-record-hint">click mic para parar</span>
+          <button class="wa-record-cancel" id="wa-record-cancel" type="button"
+                  title="Cancelar grabación (Esc)" aria-label="Cancelar grabación">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+                 stroke="currentColor" stroke-width="2.5" stroke-linecap="round"
+                 stroke-linejoin="round" aria-hidden="true">
+              <line x1="6" y1="6" x2="18" y2="18"/>
+              <line x1="18" y1="6" x2="6" y2="18"/>
+            </svg>
+            <span>Cancelar</span>
+          </button>
+          <button class="wa-record-stop" id="wa-record-stop" type="button"
+                  title="Detener y enviar (Enter)" aria-label="Detener grabación">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"
+                 aria-hidden="true">
+              <rect x="6" y="6" width="12" height="12" rx="2"/>
+            </svg>
+            <span>Detener</span>
+          </button>
         </div>
       </footer>
     </main>
@@ -147,6 +164,6 @@
        borrar mensajes propios). Loopback-only — un device LAN/tunnel
        no recibe el token y el delete falla server-side con 401. -->
   <script src="/static/admin-auth.js"></script>
-  <script type="module" src="/static/js/wa/wa.js?v=37"></script>
+  <script type="module" src="/static/js/wa/wa.js?v=38"></script>
 </body>
 </html>

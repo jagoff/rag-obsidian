@@ -1,6 +1,9 @@
-// Avatares: primero intenta `/api/wa/avatar/{jid}` (Apple Contacts via
-// AppleScript), si 404 cae al fallback de iniciales + color hash
-// deterministic por JID.
+// Avatares — chain del backend:
+//   1) Apple Contacts (foto que vos pusiste — tu libreta).
+//   2) WhatsApp bridge (foto de perfil pública del peer / grupo).
+//   3) 404 → frontend cae a iniciales + color hash deterministic.
+// Aplica a contactos individuales Y grupos (los grupos tienen foto
+// seteada por el admin, el bridge la sirve en `?jid=...@g.us`).
 
 const PALETTE = [
   "#5b67ce", "#cd5e7c", "#7c8d3b", "#3a8788",
@@ -33,8 +36,9 @@ export function renderInto(el, jid, initials, chatName) {
 
   if (!jid) return;
 
-  // Skip grupos — no aplican.
-  if (jid.endsWith("@g.us")) return;
+  // Antes skipeaba grupos por design. Bug: los grupos también tienen
+  // foto de perfil (set por el admin, bridge la sirve). Ahora pedimos
+  // para todos — si no existe, el `onerror` se queda con iniciales.
 
   const status = _avatarStatus.get(jid);
   if (status === "miss") return;

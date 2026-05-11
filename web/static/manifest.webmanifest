@@ -74,6 +74,13 @@
       "description": "Cola de labeling humano para acelerar learning loops",
       "url": "/fine_tunning",
       "icons": [{ "src": "/static/pwa/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "WhatsApp",
+      "short_name": "wa",
+      "description": "WhatsApp Web propio — chats + voice + search FTS5",
+      "url": "/wa",
+      "icons": [{ "src": "/static/pwa/icon-192.png", "sizes": "192x192" }]
     }
   ]
 }

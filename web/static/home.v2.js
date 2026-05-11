@@ -570,7 +570,7 @@
       if (!s) return "";
       const stem = s.split("/").pop().replace(/\.md$/, "");
       return stem.replace(/_/g, " ")
-        .replace(/^obsidian rag /i, "")     // prefijo común en mem-vault
+        .replace(/^obsidian rag /i, "")     // prefijo común en memo
         .replace(/\b\w/g, (c) => c.toUpperCase())
         .slice(0, 80);
     };

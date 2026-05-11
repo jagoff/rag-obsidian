@@ -822,52 +822,56 @@ button { cursor: pointer; }
 }
 
 /* Affordances hover-only en burbujas propias, apiladas verticalmente
-   en la corner derecha (fuera de la burbuja, right: -28px):
-     1. `.wa-msg-trash` — eliminar mensaje (rojo al hover).
-     2. `.wa-msg-select` — entrar al modo selección múltiple.
-   Reemplazan el kebab `⋮` previo que se superponía con day-dividers
-   y reactions. Para reaccionar: long-press / right-click. */
+   en la corner top-right INSIDE de la burbuja:
+     1. `.wa-msg-trash` — eliminar (rojo al hover).
+     2. `.wa-msg-select` — entrar al modo selección múltiple (verde).
+   Antes los tenía a `right: -28px` (afuera) pero `.wa-thread-body`
+   tiene `overflow-x: hidden`, los clippeaba y no se veían al hover.
+   Adentro de la burbuja con bg semi-opaco para no chocar con el texto. */
 .wa-msg-trash,
 .wa-msg-select {
   position: absolute;
-  right: -28px;
-  width: 24px;
-  height: 24px;
+  right: 4px;
+  width: 22px;
+  height: 22px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   border-radius: 50%;
   border: 0;
-  background: transparent;
-  color: var(--text-secondary);
+  background: rgba(0, 0, 0, 0.32);
+  color: rgba(255, 255, 255, 0.92);
   padding: 0;
   cursor: pointer;
   opacity: 0;
   transition: opacity 0.12s ease, color 0.12s ease, background 0.12s ease;
-  z-index: 2;
+  z-index: 3;
 }
-.wa-msg-trash { top: calc(50% - 14px); transform: translateY(-50%); }
-.wa-msg-select { top: calc(50% + 14px); transform: translateY(-50%); }
+.wa-msg-trash { top: 4px; }
+.wa-msg-select { top: 30px; }
 .wa-msg.own:hover .wa-msg-trash,
 .wa-msg.own:hover .wa-msg-select,
 .wa-msg-trash:focus-visible,
 .wa-msg-select:focus-visible {
-  opacity: 0.7;
+  opacity: 1;
 }
 .wa-msg-trash:hover {
-  opacity: 1;
-  color: var(--red, #f15c6d);
-  background: rgba(241, 92, 109, 0.08);
+  color: #fff;
+  background: rgba(241, 92, 109, 0.85);
 }
 .wa-msg-select:hover {
-  opacity: 1;
-  color: var(--accent, #06d6a0);
-  background: rgba(6, 214, 160, 0.08);
+  color: #fff;
+  background: rgba(6, 214, 160, 0.85);
+}
+[data-theme="light"] .wa-msg-trash,
+[data-theme="light"] .wa-msg-select {
+  background: rgba(0, 0, 0, 0.18);
+  color: rgba(0, 0, 0, 0.72);
 }
 /* Touch devices: hover no se dispara, mantener visible discreto. */
 @media (hover: none) {
   .wa-msg-trash,
-  .wa-msg-select { opacity: 0.5; }
+  .wa-msg-select { opacity: 0.6; }
 }
 
 /* ─── Selection mode (bulk delete) ─────────────────────────────────

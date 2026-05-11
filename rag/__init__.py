@@ -35676,6 +35676,14 @@ _DAEMON_GENERATED_PREFIXES = (
     "03-Resources/Spotify/",
     "03-Resources/Claude/",
     "00-Inbox/WA-",  # 00-Inbox/WA-YYYY-MM-DD.md (whatsapp listener daily)
+    # Legacy del system folder ANTES de la migración 2026-05-08 a
+    # `99-obsidian/99-AI/`. La carpeta `04-Archive/99-obsidian-system/`
+    # ya no existe en disco, pero queda data histórica en tablas
+    # telemetry (rag_contradictions, behavior, etc.) que referencia
+    # estos paths. Filtrarlos evita que el panel "Contradicciones" del
+    # home muestre links que abren un dialog de "create note" en
+    # Obsidian (reportado por user 2026-05-11).
+    "04-Archive/99-obsidian-system/",
 )
 
 

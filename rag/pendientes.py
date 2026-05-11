@@ -226,6 +226,7 @@ def _pendientes_recent_contradictions(
     the home page's contradictions panel).
     """
     from rag import (
+        VAULT_PATH,
         _is_system_path,
         _ragvec_state_conn,
         _sql_query_window,
@@ -234,6 +235,29 @@ def _pendientes_recent_contradictions(
     cutoff = now - timedelta(days=days)
     cutoff_iso = cutoff.isoformat(timespec="seconds")
     out: list[dict] = []
+
+    # Bug 2026-05-11 (user): el panel "Contradicciones" del home mostraba
+    # filas cuyo subject/target apunta a notas que se renombraron o
+    # movieron después del index (caso típico: migración 2026-05-08 del
+    # system folder de `04-Archive/99-obsidian-system/` → `99-obsidian/`).
+    # Filter (cheap stat per path, cap por max_rows=100 arriba):
+    #   - subject: si el .md no existe en vault, skip la fila entera.
+    #   - target: si no existe, omitir ese target; si queda 0, skip fila.
+    # Cache local de un solo call para evitar re-statear el mismo path.
+    _exists_cache: dict[str, bool] = {}
+
+    def _path_exists(rel: str) -> bool:
+        if not rel:
+            return False
+        hit = _exists_cache.get(rel)
+        if hit is not None:
+            return hit
+        try:
+            ok = (VAULT_PATH / rel).is_file()
+        except Exception:
+            ok = False
+        _exists_cache[rel] = ok
+        return ok
 
     def _do_read():
         with _ragvec_state_conn() as conn:
@@ -265,9 +289,17 @@ def _pendientes_recent_contradictions(
         # no se le muestra al user. Mismo gate aplica a los targets.
         if _is_system_path(subject):
             continue
+        # Drop si el .md del sujeto ya no existe en disco (rename/move/
+        # delete posterior al index). El panel del home linkea a estos
+        # paths via `obsidian://open?file=...` y abrirían un dialog de
+        # "create note" si el archivo no existe.
+        if not _path_exists(subject):
+            continue
         clean_targets = [
             c for c in contradicts[:3]
-            if isinstance(c, dict) and not _is_system_path(c.get("path", "") or "")
+            if isinstance(c, dict)
+            and not _is_system_path(c.get("path", "") or "")
+            and _path_exists(c.get("path", "") or "")
         ]
         if not clean_targets:
             continue

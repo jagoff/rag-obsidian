@@ -302,8 +302,19 @@ def test_reader_sql_exception_returns_empty(sql_env):
 
 # ── Extra coverage: contradictions + ambient fallback + flag-off ambient ─────
 
-def test_contradictions_sql_read(sql_env):
+def test_contradictions_sql_read(sql_env, monkeypatch, tmp_path):
     import datetime as _dt
+    # Bug 2026-05-11: `_pendientes_recent_contradictions` ahora valida que
+    # los paths existan en disco (panel del home linkea via obsidian:// y
+    # antes mostraba files muertos). Creamos un mini-vault temporal con
+    # los .md stubs para que el reader los conserve.
+    vault = tmp_path / "vault"
+    (vault / "01-Projects").mkdir(parents=True)
+    (vault / "02-Areas").mkdir(parents=True)
+    (vault / "01-Projects" / "s.md").write_text("subject", encoding="utf-8")
+    (vault / "02-Areas" / "x.md").write_text("target", encoding="utf-8")
+    monkeypatch.setattr(rag, "VAULT_PATH", vault)
+
     now = _dt.datetime.now()
     fresh = (now - _dt.timedelta(days=2)).isoformat(timespec="seconds")
     conn = _open_db(sql_env)
@@ -322,6 +333,33 @@ def test_contradictions_sql_read(sql_env):
         rag.CONTRADICTION_LOG_PATH, now, days=14, max_items=5)
     assert len(out) == 1
     assert out[0]["subject_path"] == "01-Projects/s.md"
+
+
+def test_contradictions_sql_drops_missing_files(sql_env, monkeypatch, tmp_path):
+    """Subject/target con .md borrado/renombrado → fila no surface al user."""
+    import datetime as _dt
+    vault = tmp_path / "vault"
+    vault.mkdir(parents=True)
+    monkeypatch.setattr(rag, "VAULT_PATH", vault)
+
+    now = _dt.datetime.now()
+    fresh = (now - _dt.timedelta(days=1)).isoformat(timespec="seconds")
+    conn = _open_db(sql_env)
+    try:
+        # Subject NO existe — fila descartada incluso si target tampoco.
+        rag._sql_append_event(conn, "rag_contradictions",
+                                rag._map_contradiction_row({
+                                    "ts": fresh,
+                                    "subject_path": "01-Projects/ghost.md",
+                                    "contradicts": [{"path": "02-Areas/y.md",
+                                                      "note": "n", "why": "w"}],
+                                    "helper_raw": "r",
+                                }))
+    finally:
+        conn.close()
+    out = rag._pendientes_recent_contradictions(
+        rag.CONTRADICTION_LOG_PATH, now, days=14, max_items=5)
+    assert out == []
 
 
 def test_ambient_should_skip_sql_only(sql_env):

@@ -759,6 +759,50 @@ button { cursor: pointer; }
   border: 0;
   color: var(--text-secondary);
   font-size: 13px;
+  cursor: pointer;
+}
+.wa-reaction-delete:hover { color: var(--red, #f15c6d); }
+
+/* Kebab `⋮` en burbujas propias — afford visible para abrir el menu
+   de acciones (reaccionar / eliminar) sin tener que hacer long-press.
+   Hidden por default, fade-in al hover sobre la burbuja en desktop;
+   en touch siempre visible (long-press sigue funcionando también). */
+.wa-msg-kebab {
+  position: absolute;
+  top: 2px;
+  right: 4px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 0;
+  background: rgba(0, 0, 0, 0.18);
+  color: rgba(255, 255, 255, 0.85);
+  font-size: 16px;
+  line-height: 18px;
+  padding: 0;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+  z-index: 2;
+}
+.wa-msg.own:hover .wa-msg-kebab,
+.wa-msg-kebab:focus-visible {
+  opacity: 1;
+}
+.wa-msg-kebab:hover {
+  background: rgba(0, 0, 0, 0.32);
+}
+[data-theme="light"] .wa-msg-kebab {
+  background: rgba(0, 0, 0, 0.08);
+  color: rgba(0, 0, 0, 0.65);
+}
+[data-theme="light"] .wa-msg-kebab:hover {
+  background: rgba(0, 0, 0, 0.18);
+}
+/* En touch devices el hover no se dispara — mostrar siempre el kebab
+   para que sea descubrible. */
+@media (hover: none) {
+  .wa-msg-kebab { opacity: 0.55; }
 }
 
 /* ─── Media ──────────────────────────────────────────────────────── */

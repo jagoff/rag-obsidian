@@ -1,10 +1,14 @@
 // Long-press picker + revoke menu para mensajes en el thread.
 //
 // Comportamiento:
-// - mousedown / touchstart sobre `.wa-msg` arranca timer 450ms.
+// - mousedown / touchstart sobre `.wa-msg` arranca timer 450ms (mobile).
 // - Si el user suelta antes → no abre menu.
 // - Si excede el timer → abre picker flotante con 8 emojis comunes +
 //   "más…" (input nativo) y, si la burbuja es own, opción "Eliminar".
+// - Right-click (contextmenu) sobre cualquier `.wa-msg` también abre
+//   el menu (atajo desktop, no requiere mantener apretado).
+// - Botón kebab visible al hover sobre own bubbles abre el menu (más
+//   descubrible que el long-press para usuarios desktop).
 // - Click fuera del picker lo cierra.
 
 import { react, revoke } from "./wa-api.js";
@@ -19,12 +23,6 @@ let suppressClickUntil = 0;
 
 let currentJID = null;
 
-function getAdminToken() {
-  // El repo ya guarda admin-token en localStorage["admin_token"] por
-  // patrón existente de otros endpoints destructive.
-  return localStorage.getItem("admin_token") || "";
-}
-
 export function setActiveJID(jid) {
   currentJID = jid;
   closeMenu();
@@ -36,6 +34,9 @@ export function attach(bodyEl) {
   const startPress = (ev) => {
     const target = ev.target.closest && ev.target.closest(".wa-msg");
     if (!target || target.classList.contains("revoked")) return;
+    // El click sobre el kebab tiene su propio handler; no arrancamos
+    // long-press desde ahí.
+    if (ev.target.closest && ev.target.closest(".wa-msg-kebab")) return;
     activeMsgEl = target;
     clearTimeout(pressTimer);
     pressTimer = setTimeout(() => {
@@ -52,6 +53,30 @@ export function attach(bodyEl) {
   bodyEl.addEventListener("touchend", cancelPress);
   bodyEl.addEventListener("touchcancel", cancelPress);
 
+  // Right-click (contextmenu) — atajo desktop al mismo menu, evita
+  // tener que mantener apretado 450ms.
+  bodyEl.addEventListener("contextmenu", (ev) => {
+    const target = ev.target.closest && ev.target.closest(".wa-msg");
+    if (!target || target.classList.contains("revoked")) return;
+    ev.preventDefault();
+    activeMsgEl = target;
+    openMenu(target, ev);
+  });
+
+  // Click sobre el kebab `⋮` (visible al hover en burbujas own) →
+  // abre el mismo menu. Delegated para que sirva con messages
+  // renderizados después del attach.
+  bodyEl.addEventListener("click", (ev) => {
+    const kebab = ev.target.closest && ev.target.closest(".wa-msg-kebab");
+    if (!kebab) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    const target = kebab.closest(".wa-msg");
+    if (!target || target.classList.contains("revoked")) return;
+    activeMsgEl = target;
+    openMenu(target, ev);
+  }, true);
+
   // Suprimir el siguiente click si el user soltó después de abrir el menu.
   bodyEl.addEventListener("click", (ev) => {
     if (Date.now() < suppressClickUntil) {
@@ -65,6 +90,23 @@ export function attach(bodyEl) {
       closeMenu();
     }
   });
+}
+
+// Inserta el kebab `⋮` en burbujas propias. El renderer (`wa-thread.js`)
+// lo llama después de armar el `.wa-msg.own`. Se separa para que la
+// lógica de "qué affordances tiene cada msg" viva acá y no se duplique
+// en el renderer.
+export function attachOwnMenuAffordance(msgEl) {
+  if (!msgEl || !msgEl.classList || !msgEl.classList.contains("own")) return;
+  if (msgEl.classList.contains("revoked")) return;
+  if (msgEl.querySelector(".wa-msg-kebab")) return;
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "wa-msg-kebab";
+  btn.setAttribute("aria-label", "Acciones del mensaje");
+  btn.title = "Acciones (reaccionar, eliminar)";
+  btn.textContent = "⋮";
+  msgEl.appendChild(btn);
 }
 
 function openMenu(msgEl, originEv) {
@@ -166,13 +208,16 @@ async function doRevoke() {
   const messageId = activeMsgEl.dataset.id || "";
   closeMenu();
   if (!messageId) return;
-  const tok = getAdminToken();
-  if (!tok) {
-    window.alert("Necesitás el admin token guardado en localStorage[\"admin_token\"] para eliminar mensajes. Mirá ~/.config/obsidian-rag/admin_token.txt.");
+  // Confirmación destructiva — el delete-for-everyone es irreversible
+  // (el bridge persiste un revoke event y los peers reciben el tomb).
+  if (!window.confirm("Eliminar este mensaje para todos? No se puede deshacer.")) {
     return;
   }
   try {
-    await revoke(currentJID, messageId, tok);
+    // admin-auth.js inyecta el Bearer del admin_token automáticamente
+    // (loopback-only). Si el browser está en LAN/tunnel, el server
+    // responde 401 — el catch muestra el detail.
+    await revoke(currentJID, messageId);
     // El SSE va a marcar revoked en breve; pero para feedback instant
     // marcamos optimistic.
     const msgEl = document.querySelector(`.wa-msg[data-id="${cssEscape(messageId)}"]`);
@@ -182,7 +227,10 @@ async function doRevoke() {
     }
   } catch (e) {
     console.error("[wa-reactions] revoke failed", e);
-    window.alert(`No se pudo eliminar: ${e.message}`);
+    const msg = /401/.test(e.message)
+      ? "No se pudo eliminar: este device no tiene admin token (solo desde localhost / ra.ai)."
+      : `No se pudo eliminar: ${e.message}`;
+    window.alert(msg);
   }
 }
 

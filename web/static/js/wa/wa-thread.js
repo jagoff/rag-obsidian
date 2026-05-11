@@ -345,6 +345,11 @@ function renderMsg(m, ctx) {
     div.appendChild(r);
   }
 
+  // Kebab `⋮` para acciones (reaccionar / eliminar) en burbujas propias.
+  // Visible al hover en desktop; el long-press + contextmenu siguen
+  // funcionando en mobile/desktop respectivamente.
+  if (m.is_from_me) reactions.attachOwnMenuAffordance(div);
+
   return div;
 }
 

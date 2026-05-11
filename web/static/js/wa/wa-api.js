@@ -1,6 +1,7 @@
 // Wrappers `fetch()` para `/api/wa/*`. Centralizan baseURL + errores.
-// Sin auth en read/send (el repo es local-first); admin-token solo cuando
-// agreguemos revoke en Fase 6.
+// Sin auth en read/send (el repo es local-first); el revoke (delete-for-
+// everyone) requiere admin token, que `admin-auth.js` inyecta vía
+// monkey-patch de `window.fetch` cuando el browser está en loopback.
 
 const BASE = "";
 
@@ -54,17 +55,19 @@ export async function react(jid, messageId, senderJid, fromMe, emoji) {
   });
 }
 
-export async function revoke(jid, messageId, adminToken) {
+export async function revoke(jid, messageId) {
+  // admin-auth.js monkey-patcha fetch() y agrega el Bearer del
+  // admin_token automáticamente para /api/wa/revoke (loopback-only).
   const r = await fetch("/api/wa/revoke", {
     method: "POST",
-    headers: {
-      "content-type": "application/json",
-      ...(adminToken ? { "Authorization": `Bearer ${adminToken}` } : {}),
-    },
+    headers: { "content-type": "application/json" },
     credentials: "same-origin",
     body: JSON.stringify({ jid, message_id: messageId }),
   });
-  if (!r.ok) throw new Error(`POST /api/wa/revoke → ${r.status}`);
+  if (!r.ok) {
+    const txt = await r.text().catch(() => "");
+    throw new Error(`POST /api/wa/revoke → ${r.status}${txt ? ` — ${txt.slice(0, 200)}` : ""}`);
+  }
   return r.json();
 }
 

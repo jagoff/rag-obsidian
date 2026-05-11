@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <title>rag · wa</title>
-  <link rel="stylesheet" href="/static/wa.css?v=15">
+  <link rel="stylesheet" href="/static/wa.css?v=16">
   <link rel="manifest" href="/static/manifest.webmanifest">
   <link rel="icon" type="image/png" sizes="32x32" href="/static/pwa/favicon-32.png">
   <link rel="icon" type="image/png" sizes="16x16" href="/static/pwa/favicon-16.png">
@@ -138,6 +138,11 @@
     </main>
   </div>
 
-  <script type="module" src="/static/js/wa/wa.js?v=15"></script>
+  <!-- admin-auth.js: monkey-patchea fetch() para inyectar Bearer del
+       admin_token en endpoints admin (entre ellos `/api/wa/revoke` para
+       borrar mensajes propios). Loopback-only — un device LAN/tunnel
+       no recibe el token y el delete falla server-side con 401. -->
+  <script src="/static/admin-auth.js"></script>
+  <script type="module" src="/static/js/wa/wa.js?v=16"></script>
 </body>
 </html>

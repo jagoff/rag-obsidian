@@ -29,6 +29,8 @@
     "/api/status/action",
     "/api/diagnose-error/execute",
     "/api/chat/model",
+    "/api/wa/revoke",
+    "/api/wa/search/backfill",
   ];
 
   function isAdminPath(url) {

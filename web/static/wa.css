@@ -917,6 +917,7 @@ button { cursor: pointer; }
   font-size: 13px;
   border-left: 4px solid var(--accent);
 }
+.wa-reply-bar[hidden] { display: none; }
 .wa-reply-bar-preview { color: var(--accent); font-weight: 600; }
 .wa-reply-bar-text {
   flex: 1;
@@ -945,6 +946,7 @@ button { cursor: pointer; }
   align-items: center;
   z-index: 2;
 }
+.wa-voice-preview[hidden] { display: none; }
 .wa-voice-preview-box {
   width: 100%;
   display: grid;

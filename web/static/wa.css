@@ -821,15 +821,16 @@ button { cursor: pointer; }
   transform: none !important;
 }
 
-/* Trash 🗑 en burbujas propias — única afford visible (hover-only)
-   para eliminar mensajes. Reemplaza el kebab `⋮` previo que se
-   superponía con day-dividers y reaction chips. Para reaccionar o
-   seleccionar varios: long-press / right-click. */
-.wa-msg-trash {
+/* Affordances hover-only en burbujas propias, apiladas verticalmente
+   en la corner derecha (fuera de la burbuja, right: -28px):
+     1. `.wa-msg-trash` — eliminar mensaje (rojo al hover).
+     2. `.wa-msg-select` — entrar al modo selección múltiple.
+   Reemplazan el kebab `⋮` previo que se superponía con day-dividers
+   y reactions. Para reaccionar: long-press / right-click. */
+.wa-msg-trash,
+.wa-msg-select {
   position: absolute;
-  top: 50%;
   right: -28px;
-  transform: translateY(-50%);
   width: 24px;
   height: 24px;
   display: inline-flex;
@@ -845,8 +846,12 @@ button { cursor: pointer; }
   transition: opacity 0.12s ease, color 0.12s ease, background 0.12s ease;
   z-index: 2;
 }
+.wa-msg-trash { top: calc(50% - 14px); transform: translateY(-50%); }
+.wa-msg-select { top: calc(50% + 14px); transform: translateY(-50%); }
 .wa-msg.own:hover .wa-msg-trash,
-.wa-msg-trash:focus-visible {
+.wa-msg.own:hover .wa-msg-select,
+.wa-msg-trash:focus-visible,
+.wa-msg-select:focus-visible {
   opacity: 0.7;
 }
 .wa-msg-trash:hover {
@@ -854,9 +859,15 @@ button { cursor: pointer; }
   color: var(--red, #f15c6d);
   background: rgba(241, 92, 109, 0.08);
 }
+.wa-msg-select:hover {
+  opacity: 1;
+  color: var(--accent, #06d6a0);
+  background: rgba(6, 214, 160, 0.08);
+}
 /* Touch devices: hover no se dispara, mantener visible discreto. */
 @media (hover: none) {
-  .wa-msg-trash { opacity: 0.5; }
+  .wa-msg-trash,
+  .wa-msg-select { opacity: 0.5; }
 }
 
 /* ─── Selection mode (bulk delete) ─────────────────────────────────
@@ -894,7 +905,8 @@ button { cursor: pointer; }
   justify-content: center;
   line-height: 1;
 }
-.wa-thread.selecting .wa-msg-trash { display: none; }
+.wa-thread.selecting .wa-msg-trash,
+.wa-thread.selecting .wa-msg-select { display: none; }
 
 .wa-select-bar {
   position: sticky;

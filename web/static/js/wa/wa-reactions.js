@@ -40,7 +40,7 @@ export function attach(bodyEl) {
     if (!target || target.classList.contains("revoked")) return;
     // El click sobre el trash tiene su propio handler; no arrancamos
     // long-press desde ahí.
-    if (ev.target.closest && ev.target.closest(".wa-msg-trash")) return;
+    if (ev.target.closest && (ev.target.closest(".wa-msg-trash") || ev.target.closest(".wa-msg-select"))) return;
     activeMsgEl = target;
     clearTimeout(pressTimer);
     pressTimer = setTimeout(() => {
@@ -69,20 +69,30 @@ export function attach(bodyEl) {
   });
 
   // Click sobre el ícono trash `🗑` (visible al hover en burbujas own)
-  // → directo al delete confirm. NO abre el menu para no superponerse
-  // con otros UI elements (feedback user: el menu se cruzaba con
-  // day-dividers + reactions, era confuso). Para reacciones o
-  // selección múltiple usar long-press / contextmenu / right-click.
+  // → directo al delete (sin confirm). El círculo `◯` justo abajo
+  // entra al modo selección. Ambos visibles solo al hover (default
+  // opacity 0) y posicionados fuera de la burbuja para no chocar con
+  // contenido / day-dividers / reactions.
   bodyEl.addEventListener("click", (ev) => {
     if (_selecting) return;
     const trash = ev.target.closest && ev.target.closest(".wa-msg-trash");
-    if (!trash) return;
-    ev.preventDefault();
-    ev.stopPropagation();
-    const target = trash.closest(".wa-msg");
-    if (!target || target.classList.contains("revoked")) return;
-    activeMsgEl = target;
-    doRevoke();
+    if (trash) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const target = trash.closest(".wa-msg");
+      if (!target || target.classList.contains("revoked")) return;
+      activeMsgEl = target;
+      doRevoke();
+      return;
+    }
+    const select = ev.target.closest && ev.target.closest(".wa-msg-select");
+    if (select) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const target = select.closest(".wa-msg");
+      if (!target || target.classList.contains("revoked")) return;
+      enterSelectionMode(target);
+    }
   }, true);
 
   // Suprimir el siguiente click si el user soltó después de abrir el menu.
@@ -100,22 +110,23 @@ export function attach(bodyEl) {
   });
 }
 
-// Inserta el ícono trash 🗑 en burbujas propias. El renderer
-// (`wa-thread.js`) lo llama después de armar el `.wa-msg.own`. Click
-// va directo al delete confirm — para reacciones / multi-select usar
-// long-press / right-click. Visible solo al hover (default opacity 0).
+// Inserta dos affordances hover-only en burbujas propias:
+//   1) `.wa-msg-trash` arriba — click directo = delete.
+//   2) `.wa-msg-select` justo abajo del trash — círculo que entra al
+//      modo selección múltiple (pedido user 2026-05-11).
+// Para reacciones queda long-press / right-click.
 export function attachOwnMenuAffordance(msgEl) {
   if (!msgEl || !msgEl.classList || !msgEl.classList.contains("own")) return;
   if (msgEl.classList.contains("revoked")) return;
   if (msgEl.querySelector(".wa-msg-trash")) return;
-  const btn = document.createElement("button");
-  btn.type = "button";
-  btn.className = "wa-msg-trash";
-  btn.setAttribute("aria-label", "Eliminar mensaje");
-  btn.title = "Eliminar mensaje";
+  const trash = document.createElement("button");
+  trash.type = "button";
+  trash.className = "wa-msg-trash";
+  trash.setAttribute("aria-label", "Eliminar mensaje");
+  trash.title = "Eliminar mensaje";
   // SVG inline para no depender de fuentes con glyph 🗑️ (en macOS el
   // emoji renderiza colorido y desentona con el resto del UI).
-  btn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" '
+  trash.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" '
     + 'stroke="currentColor" stroke-width="2" stroke-linecap="round" '
     + 'stroke-linejoin="round" aria-hidden="true">'
     + '<polyline points="3 6 5 6 21 6"></polyline>'
@@ -123,7 +134,19 @@ export function attachOwnMenuAffordance(msgEl) {
     + '<path d="M10 11v6"></path><path d="M14 11v6"></path>'
     + '<path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"></path>'
     + '</svg>';
-  msgEl.appendChild(btn);
+  msgEl.appendChild(trash);
+
+  const select = document.createElement("button");
+  select.type = "button";
+  select.className = "wa-msg-select";
+  select.setAttribute("aria-label", "Seleccionar varios mensajes");
+  select.title = "Seleccionar varios";
+  // Círculo vacío (igual al checkmark de selección, pero sin tick).
+  select.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" '
+    + 'stroke="currentColor" stroke-width="2" aria-hidden="true">'
+    + '<circle cx="12" cy="12" r="9"></circle>'
+    + '</svg>';
+  msgEl.appendChild(select);
 }
 
 function openMenu(msgEl, originEv) {

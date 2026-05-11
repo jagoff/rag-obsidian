@@ -729,21 +729,33 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 }
 
 /* Body: 4 columnas en desktop (Lo que pasó / Sin procesar / Preguntas /
-   Para mañana), 2 en tablet, 1 en mobile. Cada sub-card tiene un border-
-   left color-coded por sub-sección para reforzar la jerarquía. */
+   Agenda), 2 en tablet, 1 en mobile. Cada sub-card tiene un border-
+   left color-coded por sub-sección para reforzar la jerarquía.
+   La 4ª columna ("Agenda") combina "Para hoy" + "Para mañana" stacked
+   verticalmente — antes eran 5 cols y los URLs largos rompían la caja
+   estrecha de Para mañana. */
 .today-hero-body {
   display: grid;
-  /* 5 cols desktop: Lo que pasó · Sin procesar · Preguntas · Para hoy ·
-     Para mañana. Antes eran 4 (sin "Para hoy" como sub-sección). */
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   gap: 0;
 }
 .today-hero-body > .hero-section {
   padding: var(--space-3) var(--space-4);
   border-right: 1px solid var(--border);
   min-width: 0;
+  /* URLs largos sin spaces (https://…) excedían el ancho de la columna y
+     se salían del borde. anywhere parte palabras donde sea; word-break
+     refuerza para Safari/iOS que no respeta anywhere todavía. */
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 .today-hero-body > .hero-section:last-child { border-right: none; }
+/* Cuando una hero-section está colapsada, ocultamos la prose + sub-bodies,
+   solo queda el header con su botón ▶/▼ + contador. */
+.today-hero-body > .hero-section[data-collapsed="true"] .prose,
+.today-hero-body > .hero-section[data-collapsed="true"] .hero-sub {
+  display: none;
+}
 .hero-section h3 {
   font-size: var(--fs-mini);
   margin: 0 0 var(--space-2);
@@ -760,8 +772,70 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 .hero-section.s-narrative h3 { color: var(--cyan); }
 .hero-section.s-inbox h3      { color: var(--amber); }
 .hero-section.s-questions h3  { color: var(--magenta); }
-.hero-section.s-today h3      { color: var(--phosphor); }
-.hero-section.s-tomorrow h3   { color: var(--phosphor); }
+.hero-section.s-agenda h3     { color: var(--phosphor); }
+
+/* Drag affordances + collapse btn dentro del header de cada hero-section.
+   El header (h3) ya es flex con count al final; agregamos grip a la
+   izquierda y collapse-btn entre el label y el count. */
+.hero-section h3 .hero-drag-grip {
+  cursor: grab;
+  color: var(--text-faint);
+  font-size: 10px;
+  letter-spacing: 0;
+  user-select: none;
+  padding: 0 2px;
+}
+.hero-section h3 .hero-drag-grip:hover { color: var(--text-dim); }
+.hero-section.is-dragging { opacity: 0.4; }
+.hero-section.drop-before { box-shadow: inset 2px 0 0 var(--cyan); }
+.hero-section.drop-after  { box-shadow: inset -2px 0 0 var(--cyan); }
+.hero-section h3 .hero-collapse-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-faint);
+  cursor: pointer;
+  padding: 0 4px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-mini);
+  /* Sin auto-margin: el collapse-btn se inyecta como último child del h3,
+     justo después del count (que YA tiene margin-left: auto y pushea
+     todo lo demás a la derecha). El btn flota a la derecha pegado al
+     count y a la grip de la derecha — no necesita auto margin propio. */
+}
+.hero-section h3 .hero-collapse-btn:hover { color: var(--cyan); }
+
+/* Sub-block dentro de s-agenda (Para hoy / Para mañana stacked). Mantiene
+   el espaciado del .hero-section .prose original pero con un sub-header
+   más chico para no competir con el h3 padre. */
+.hero-section.s-agenda .hero-sub {
+  padding: var(--space-2) 0;
+  border-bottom: 1px dashed var(--border);
+}
+.hero-section.s-agenda .hero-sub:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+.hero-section.s-agenda .hero-sub:first-child { padding-top: 0; }
+.hero-section.s-agenda h4 {
+  font-size: 11px;
+  margin: 0 0 var(--space-1);
+  color: var(--phosphor);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.hero-section.s-agenda h4 .count {
+  margin-left: auto;
+  font-size: 10px;
+  background: var(--bg-elev-3);
+  padding: 1px 5px;
+  border-radius: 2px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
 .hero-section h3 .count {
   margin-left: auto;
   font-size: var(--fs-mini);
@@ -1010,13 +1084,12 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
   margin-left: auto;
 }
 
-/* Tablet: 2x2 */
+/* Tablet: 2x2 (4 cajas: narrative / inbox / questions / agenda) */
 @media (max-width: 1100px) {
   .today-hero-body { grid-template-columns: repeat(2, 1fr); }
-  .today-hero-body > .hero-section:nth-child(2) { border-right: none; }
-  .today-hero-body > .hero-section:nth-child(3) { border-right: 1px solid var(--border); }
-  .today-hero-body > .hero-section:nth-child(1),
-  .today-hero-body > .hero-section:nth-child(2) {
+  .today-hero-body > .hero-section:nth-child(2n) { border-right: none; }
+  .today-hero-body > .hero-section:nth-child(2n+1) { border-right: 1px solid var(--border); }
+  .today-hero-body > .hero-section:not(:nth-last-child(-n+2)) {
     border-bottom: 1px solid var(--border);
   }
 }

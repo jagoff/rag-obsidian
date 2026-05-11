@@ -522,22 +522,272 @@ export function renderTodayHero(payload) {
   const tomorrowCount = tomorrowEvents.length
     + (signals.reminders || []).filter(dueMatchesTomorrow).length;
 
+  // Agenda combina "Para hoy" + "Para mañana" en una sola hero-section
+  // (col 4 de la grilla). Se renderea como h3 + dos sub-blocks .hero-sub
+  // con su propio h4 + body. El reminder injector matchea `.s-tomorrow
+  // .prose` que sigue válido porque cada hero-sub mantiene su class
+  // s-today / s-tomorrow y su propio .prose adentro.
+  const agendaBody = `
+    <div class="hero-sub s-today">
+      <h4><span>🌅 Para hoy</span>${todayCount != null ? `<span class="count">${todayCount}</span>` : ""}</h4>
+      <div class="prose">${todayHTML || `<div class="empty">agenda libre hoy · día abierto</div>`}</div>
+    </div>
+    <div class="hero-sub s-tomorrow">
+      <h4><span>🌅 Para mañana</span>${tomorrowCount != null ? `<span class="count">${tomorrowCount}</span>` : ""}</h4>
+      <div class="prose">${tomorrowHTML || `<div class="empty">agenda libre mañana · día abierto</div>`}</div>
+    </div>
+  `;
+  const agendaCount = (todayCount || 0) + (tomorrowCount || 0);
+  const agendaHTML = `
+    <div class="hero-section s-agenda">
+      <h3><span>🌅 Agenda</span>${agendaCount ? `<span class="count">${agendaCount}</span>` : ""}</h3>
+      ${agendaBody}
+    </div>
+  `;
+
   bodyEl.innerHTML = [
     sectionHTML("s-narrative", "🪞", "Lo que pasó hoy", null, narrativeHTML, "Aún sin brief — pulsá ↻ arriba para generar"),
     sectionHTML("s-inbox", "📥", "Sin procesar", inboxCount || null, inboxHTML, "todo procesado ✓"),
     sectionHTML("s-questions", "🔍", "Preguntas abiertas", questionsCount || null, questionsHTML, "sin preguntas pendientes"),
-    sectionHTML("s-today", "🌅", "Para hoy", todayCount || null, todayHTML, "agenda libre hoy · día abierto"),
-    sectionHTML("s-tomorrow", "🌅", "Para mañana", tomorrowCount || null, tomorrowHTML, "agenda libre mañana · día abierto"),
+    agendaHTML,
   ].join("");
 
   // Inyectar botones inline "crear reminder" en cada <li> de "Para mañana"
   _injectTomorrowReminderButtons(_createdReminderTexts);
+
+  // Aplicar orden persistido (drag) + estado collapse persistido (LS) y
+  // re-wirear handlers. El hero re-renderiza innerHTML cada refresh, así
+  // que cada render pierde el wiring previo — hay que volver a engancharlo.
+  applyHeroOrder();
+  wireHeroLayout();
+  applyHeroSubCollapse();
+}
+
+// ── Hero subs: persistencia drag-order + collapse ─────────────────────────────
+//
+// El hero-body re-genera innerHTML cada refresh (ver renderTodayHero arriba),
+// así que el orden y el estado de collapse de cada hero-section NO sobreviven
+// el ciclo render por sí solos. La estrategia es:
+//   1. applyHeroOrder()        → reordena los div.hero-section según LS antes
+//                                 de exponerlos al user.
+//   2. wireHeroLayout()        → inyecta grip de drag + botón collapse,
+//                                 attachea handlers HTML5 DnD.
+//   3. applyHeroSubCollapse()  → setea data-collapsed="true" en cajas
+//                                 colapsadas según LS.
+// Estas 3 corren al final de renderTodayHero, por eso son idempotentes y
+// chequean estado previo antes de duplicar nodos / handlers.
+
+const LS_HERO_ORDER = "home.v2.hero-subs.order.v1";
+const LS_HERO_SUB_COLLAPSED = "home.v2.hero-subs.collapsed.v1";
+
+// Clase identificadora estable por hero-section (se persiste en LS).
+const HERO_SECTION_KEYS = ["s-narrative", "s-inbox", "s-questions", "s-agenda"];
+
+function _heroSectionKey(el) {
+  for (const k of HERO_SECTION_KEYS) {
+    if (el.classList.contains(k)) return k;
+  }
+  return null;
+}
+
+function _readHeroOrder() {
+  try {
+    const raw = localStorage.getItem(LS_HERO_ORDER);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : null;
+  } catch { return null; }
+}
+
+function _saveHeroOrder() {
+  const body = document.getElementById("today-hero-body");
+  if (!body) return;
+  const order = Array.from(body.querySelectorAll(":scope > .hero-section"))
+    .map(_heroSectionKey)
+    .filter(Boolean);
+  try {
+    localStorage.setItem(LS_HERO_ORDER, JSON.stringify(order));
+  } catch (e) {
+    console.warn("[home.v2] no pude persistir hero order:", e);
+  }
+  try { window._updateResetButtonVisibility?.(); } catch {}
+}
+
+export function applyHeroOrder() {
+  const body = document.getElementById("today-hero-body");
+  if (!body) return;
+  const saved = _readHeroOrder();
+  if (!saved) return;
+  for (const key of saved) {
+    const el = body.querySelector(`:scope > .hero-section.${key}`);
+    if (el) body.appendChild(el);
+  }
+}
+
+function _readHeroSubCollapsed() {
+  try {
+    const raw = localStorage.getItem(LS_HERO_SUB_COLLAPSED);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return (parsed && typeof parsed === "object") ? parsed : {};
+  } catch { return {}; }
+}
+
+function _writeHeroSubCollapsed(map) {
+  try {
+    const trimmed = {};
+    for (const [k, v] of Object.entries(map)) if (v) trimmed[k] = true;
+    if (Object.keys(trimmed).length === 0) {
+      localStorage.removeItem(LS_HERO_SUB_COLLAPSED);
+    } else {
+      localStorage.setItem(LS_HERO_SUB_COLLAPSED, JSON.stringify(trimmed));
+    }
+  } catch (e) {
+    console.warn("[home.v2] no pude persistir hero sub collapse:", e);
+  }
+  try { window._updateResetButtonVisibility?.(); } catch {}
+}
+
+export function applyHeroSubCollapse() {
+  const map = _readHeroSubCollapsed();
+  const body = document.getElementById("today-hero-body");
+  if (!body) return;
+  body.querySelectorAll(":scope > .hero-section").forEach((sec) => {
+    const key = _heroSectionKey(sec);
+    if (!key) return;
+    const collapsed = !!map[key];
+    sec.setAttribute("data-collapsed", collapsed ? "true" : "false");
+    const btn = sec.querySelector(":scope > h3 > .hero-collapse-btn");
+    if (btn) {
+      btn.setAttribute("aria-expanded", collapsed ? "false" : "true");
+      const icon = btn.querySelector(".toggle-icon");
+      if (icon) icon.textContent = collapsed ? "▶" : "▼";
+    }
+  });
+}
+
+function _toggleHeroSubCollapse(sec) {
+  const key = _heroSectionKey(sec);
+  if (!key) return;
+  const collapsed = sec.getAttribute("data-collapsed") === "true";
+  const next = !collapsed;
+  sec.setAttribute("data-collapsed", next ? "true" : "false");
+  const btn = sec.querySelector(":scope > h3 > .hero-collapse-btn");
+  if (btn) {
+    btn.setAttribute("aria-expanded", next ? "false" : "true");
+    const icon = btn.querySelector(".toggle-icon");
+    if (icon) icon.textContent = next ? "▶" : "▼";
+  }
+  const map = _readHeroSubCollapsed();
+  if (next) map[key] = true;
+  else delete map[key];
+  _writeHeroSubCollapsed(map);
+}
+
+// ── Hero subs: drag & drop ────────────────────────────────────────────────────
+
+let _draggingHero = null;
+
+function _onHeroDragStart(ev) {
+  const sec = ev.currentTarget;
+  _draggingHero = sec;
+  sec.classList.add("is-dragging");
+  try {
+    ev.dataTransfer.effectAllowed = "move";
+    ev.dataTransfer.setData("text/plain", _heroSectionKey(sec) || "");
+  } catch {}
+}
+
+function _onHeroDragEnd() {
+  if (_draggingHero) _draggingHero.classList.remove("is-dragging");
+  _draggingHero = null;
+  document.querySelectorAll(".hero-section.drop-before, .hero-section.drop-after")
+    .forEach((el) => el.classList.remove("drop-before", "drop-after"));
+}
+
+function _onHeroDragOver(ev) {
+  if (!_draggingHero) return;
+  const sec = ev.currentTarget;
+  if (sec === _draggingHero) return;
+  ev.preventDefault();
+  try { ev.dataTransfer.dropEffect = "move"; } catch {}
+  const rect = sec.getBoundingClientRect();
+  const before = (ev.clientX - rect.left) < rect.width / 2;
+  sec.classList.toggle("drop-before", before);
+  sec.classList.toggle("drop-after", !before);
+}
+
+function _onHeroDragLeave(ev) {
+  const sec = ev.currentTarget;
+  if (sec.contains(ev.relatedTarget)) return;
+  sec.classList.remove("drop-before", "drop-after");
+}
+
+function _onHeroDrop(ev) {
+  ev.preventDefault();
+  if (!_draggingHero) return;
+  const target = ev.currentTarget;
+  if (target === _draggingHero) return;
+  const before = target.classList.contains("drop-before");
+  target.classList.remove("drop-before", "drop-after");
+  if (before) {
+    target.parentNode.insertBefore(_draggingHero, target);
+  } else {
+    target.parentNode.insertBefore(_draggingHero, target.nextSibling);
+  }
+  _saveHeroOrder();
+}
+
+export function wireHeroLayout() {
+  const body = document.getElementById("today-hero-body");
+  if (!body) return;
+  body.querySelectorAll(":scope > .hero-section").forEach((sec) => {
+    // Drag grip + collapse btn dentro del h3 — solo si no existen ya.
+    const h3 = sec.querySelector(":scope > h3");
+    if (h3 && !h3.querySelector(".hero-drag-grip")) {
+      const grip = document.createElement("span");
+      grip.className = "hero-drag-grip";
+      grip.setAttribute("aria-hidden", "true");
+      grip.title = "arrastrá para reordenar";
+      grip.textContent = "⋮⋮";
+      h3.insertBefore(grip, h3.firstChild);
+    }
+    if (h3 && !h3.querySelector(".hero-collapse-btn")) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "hero-collapse-btn";
+      btn.setAttribute("aria-label", "Colapsar/expandir caja");
+      btn.setAttribute("aria-expanded", "true");
+      btn.title = "Colapsar/expandir";
+      btn.innerHTML = '<span class="toggle-icon" aria-hidden="true">▼</span>';
+      btn.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        _toggleHeroSubCollapse(sec);
+      });
+      btn.addEventListener("mousedown", (ev) => ev.stopPropagation());
+      // Append al final del h3 — el count (si existe) tiene margin-left: auto
+      // que empuja todo lo demás a la derecha, y el btn queda al final, a la
+      // derecha del count.
+      h3.appendChild(btn);
+    }
+    // Drag handlers — idempotente vía data flag.
+    if (sec.dataset.heroDragInit !== "1") {
+      sec.dataset.heroDragInit = "1";
+      sec.setAttribute("draggable", "true");
+      sec.addEventListener("dragstart", _onHeroDragStart);
+      sec.addEventListener("dragend", _onHeroDragEnd);
+      sec.addEventListener("dragover", _onHeroDragOver);
+      sec.addEventListener("dragleave", _onHeroDragLeave);
+      sec.addEventListener("drop", _onHeroDrop);
+    }
+  });
 }
 
 // ── Botones inline para crear reminders ───────────────────────────────────────
 
 export function _injectTomorrowReminderButtons(createdSet) {
-  const root = document.querySelector(".hero-section.s-tomorrow .prose");
+  const root = document.querySelector(".s-tomorrow .prose");
   if (!root) return;
   const items = root.querySelectorAll("li");
   items.forEach((li) => {
@@ -623,4 +873,4 @@ export function initHeroCollapse() {
   });
 }
 
-export { LS_HERO_COLLAPSED };
+export { LS_HERO_COLLAPSED, LS_HERO_ORDER, LS_HERO_SUB_COLLAPSED };

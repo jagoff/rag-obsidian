@@ -1,7 +1,11 @@
 // layout.mjs — drag & drop de paneles, collapse por panel/sección,
 // botón "↺ layout" reset. Estado persistido en localStorage.
 
-import { LS_HERO_COLLAPSED } from "./panel-today.mjs";
+import {
+  LS_HERO_COLLAPSED,
+  LS_HERO_ORDER,
+  LS_HERO_SUB_COLLAPSED,
+} from "./panel-today.mjs";
 
 // ── Constantes de localStorage ─────────────────────────────────────────────────
 
@@ -58,6 +62,8 @@ function clearSavedOrder() {
   try { localStorage.removeItem(LS_PANELS_ORDER); } catch {}
   try { localStorage.removeItem(LS_PANELS_COLLAPSED); } catch {}
   try { localStorage.removeItem(LS_HERO_COLLAPSED); } catch {}
+  try { localStorage.removeItem(LS_HERO_ORDER); } catch {}
+  try { localStorage.removeItem(LS_HERO_SUB_COLLAPSED); } catch {}
   try { localStorage.removeItem(LS_SECTIONS_COLLAPSED); } catch {}
   // Más simple recargar que reconstruir el orden hard-coded del HTML.
   window.location.reload();
@@ -252,6 +258,8 @@ function hasCustomLayout() {
   if (map && Object.keys(map).length > 0) return true;
   try {
     if (localStorage.getItem(LS_HERO_COLLAPSED) === "1") return true;
+    if (localStorage.getItem(LS_HERO_ORDER)) return true;
+    if (localStorage.getItem(LS_HERO_SUB_COLLAPSED)) return true;
     if (localStorage.getItem(LS_SECTIONS_COLLAPSED)) return true;
   } catch {}
   return false;

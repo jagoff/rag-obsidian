@@ -1360,10 +1360,16 @@ def mirror_page() -> FileResponse:
 
 
 @app.get("/wa")
+@app.get("/wzp")
 def wa_page() -> FileResponse:
     """WhatsApp Web propio. Ver plan completo en
     `~/.claude/plans/kind-floating-melody.md`. Consume `/api/wa/*` para
     leer chats/threads del bridge SQLite + escribir reactions/revokes/typing.
+
+    Rename 2026-05-11: `/wzp` es el path canónico nuevo (pedido user);
+    `/wa` queda como alias permanente para bookmarks. Los `/api/wa/*`
+    endpoints mantienen el prefix viejo — son contract interno, no
+    cosmético, y rehacerlos rompería el listener TS sin valor.
     """
     return FileResponse(STATIC_DIR / "wa.html")
 

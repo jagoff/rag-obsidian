@@ -34,6 +34,7 @@ respetan monkey-patches de tests.
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from pathlib import Path
 
 
 # Bridge guarda `timestamp` como string `YYYY-MM-DD HH:MM:SS-03:00` (Go default
@@ -404,30 +405,76 @@ def _wa_chat_label(raw_name: str, jid: str) -> str:
     return f"Contacto …{tail}" if tail else "Contacto"
 
 
+_SENDER_OVERRIDES_PATH = Path.home() / ".config/obsidian-rag/wa_sender_overrides.json"
+_SENDER_OVERRIDES_CACHE: dict[str, str] = {}
+_SENDER_OVERRIDES_MTIME: float = -1.0
+
+
+def _load_sender_overrides() -> dict[str, str]:
+    """Carga `wa_sender_overrides.json` con cache mtime-aware.
+
+    Estructura:
+        {"<jid>": "<display name forzado>", ...}
+
+    Casos de uso: cuando bridge.chats.name guarda un push_name erróneo
+    o ambiguo (peer puso un nick raro que colisiona con otro contacto),
+    el user puede forzar el display name correcto sin tocar código.
+
+    Silent-fail: file no existe / JSON malformado / IO error → {}.
+    """
+    import json as _json
+    global _SENDER_OVERRIDES_CACHE, _SENDER_OVERRIDES_MTIME
+
+    try:
+        if not _SENDER_OVERRIDES_PATH.is_file():
+            if _SENDER_OVERRIDES_MTIME != -1.0:
+                _SENDER_OVERRIDES_CACHE = {}
+                _SENDER_OVERRIDES_MTIME = -1.0
+            return _SENDER_OVERRIDES_CACHE
+        mt = _SENDER_OVERRIDES_PATH.stat().st_mtime
+        if mt == _SENDER_OVERRIDES_MTIME:
+            return _SENDER_OVERRIDES_CACHE
+        raw = _SENDER_OVERRIDES_PATH.read_text(encoding="utf-8")
+        data = _json.loads(raw) if raw.strip() else {}
+        if isinstance(data, dict):
+            _SENDER_OVERRIDES_CACHE = {
+                str(k): str(v) for k, v in data.items()
+                if isinstance(k, str) and isinstance(v, str) and v.strip()
+            }
+        else:
+            _SENDER_OVERRIDES_CACHE = {}
+        _SENDER_OVERRIDES_MTIME = mt
+        return _SENDER_OVERRIDES_CACHE
+    except Exception:
+        return _SENDER_OVERRIDES_CACHE
+
+
 def _wa_display_name(jid: str, raw_name: str = "") -> str:
     """JID → nombre legible para UI.
 
-    Pedidos user 2026-05-11:
-    (a) "quiero que los nombres se muestren tal cual se ven en los grupos"
-        → bridge push_name primary cuando tiene letras.
-    (b) "sigo viendo los nombres solo en los grupos" → cuando el peer
-        NO setea push_name, el bridge guarda solo dígitos y antes
-        salía "Contacto …8405". Ahora probamos Apple Contacts (que es
-        donde el user tiene a sus contactos saved) por digits del jid
-        — lo mismo que hace WhatsApp en el phone cuando matchea el
-        número con la libreta.
+    Chain final (con override file que gana sobre TODO):
 
-    Chain final:
-      (1) bridge name si tiene letras (alpha) → `Grecia 🩷`, `Juan P.`
-      (2) Apple Contacts por phone digits → `Hikari sushi`, `Oscar F.`
-      (3) contact note del vault (`99-Contacts/<X>.md` con `wa_jid:`)
-      (4) `Contacto …<last4>` fallback final
+      (0) `~/.config/obsidian-rag/wa_sender_overrides.json` →
+          `{"<jid>": "<display>"}`. Permite al user forzar mapeos
+          manuales cuando el bridge guarda un push_name erróneo
+          (caso real 2026-05-11: el LID de Maxi en el grupo Recursos
+          tenía bridge name "Fer F" — confusión con un push_name de
+          otra cuenta).
+      (1) bridge name si tiene letras (alpha) → "Grecia 🩷", "Juan P."
+      (2) Apple Contacts por phone digits → "Hikari sushi"
+      (3) Vault contact note (`99-Contacts/<X>.md` con `wa_jid:`)
+      (4) "Contacto …<last4>" fallback final
 
-    El bridge guarda el `sender` de mensajes de grupo a veces como JID
-    completo (`123@lid` / `123@s.whatsapp.net`) y a veces como bare
-    local-part (`123`); para (3) probamos las 3 variantes para que el
-    lookup matchee `wa_jid: 123@lid` o `wa_jid: 123@s.wa`.
+    Para (3) probamos las 3 variantes del jid (raw, @lid, @s.wa).
     """
+    # (0) Override file — manual mapping del user. Mtime-cached.
+    if jid:
+        try:
+            override = _load_sender_overrides().get(jid)
+            if override:
+                return override
+        except Exception:
+            pass
     name = (raw_name or "").strip()
     if name and any(ch.isalpha() for ch in name):
         return name

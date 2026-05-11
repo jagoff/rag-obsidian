@@ -445,6 +445,55 @@ html, body {
   outline: none;
   max-height: 120px;
 }
+
+.wa-reply-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  background: var(--wa-sidebar-bg);
+  border-left: 4px solid var(--wa-green);
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin-bottom: 4px;
+  flex-basis: 100%;
+  order: -1;
+}
+.wa-reply-bar-text {
+  flex: 1;
+  min-width: 0;
+}
+.wa-reply-bar-text strong {
+  font-size: 12px;
+  color: var(--wa-green);
+  display: block;
+}
+.wa-reply-bar-preview {
+  font-size: 13px;
+  color: var(--wa-text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.wa-reply-bar-close {
+  background: transparent;
+  border: none;
+  color: var(--wa-text-muted);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 6px;
+}
+
+.wa-msg.pending {
+  opacity: 0.55;
+}
+.wa-msg.failed {
+  border: 1px solid #e74c3c;
+}
+.wa-msg.failed .wa-msg-time {
+  color: #e74c3c;
+}
 .wa-send-btn {
   background: var(--wa-green);
   color: #fff;

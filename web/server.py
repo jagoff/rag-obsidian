@@ -4170,6 +4170,52 @@ def wa_mark_read(req: _WAMarkReadRequest) -> dict:
     return {"ok": True, "jid": req.jid, "last_seen_ts": ts}
 
 
+class _WAReplyTo(BaseModel):
+    message_id: str
+    original_text: str | None = None
+    sender_jid: str | None = None
+
+
+class _WASendRequest(BaseModel):
+    jid: str
+    text: str
+    reply_to: _WAReplyTo | None = None
+
+
+@app.post("/api/wa/send")
+def wa_send(req: _WASendRequest) -> dict:
+    """Envía un mensaje de texto via el bridge. Soporta `reply_to` para
+    quotear un mensaje previo (ContextInfo nativo de whatsmeow).
+
+    Sin anti-loop marker (eso es solo para el path de ambient/bot
+    drafts via `_ambient_whatsapp_send`). El user que escribe desde
+    `/wa` quiere que el receptor vea texto plano.
+
+    Devuelve `{ok, error_kind}` — el `new_message` event del SSE va a
+    traer el `message_id` real cuando el bridge lo persista (~1s).
+    """
+    from rag.integrations.whatsapp import send as _wa_send  # noqa: PLC0415
+
+    text = (req.text or "").strip()
+    if not req.jid or "@" not in req.jid:
+        raise HTTPException(status_code=400, detail="jid inválido")
+    if not text:
+        raise HTTPException(status_code=400, detail="text vacío")
+    if len(text) > 4096:
+        raise HTTPException(status_code=400, detail="text excede 4096 chars")
+    reply_to_dict = None
+    if req.reply_to:
+        reply_to_dict = {
+            "message_id": req.reply_to.message_id,
+            "original_text": req.reply_to.original_text or "",
+            "sender_jid": req.reply_to.sender_jid or "",
+        }
+    ok, kind = _wa_send._whatsapp_send_to_jid_detailed(
+        req.jid, text, anti_loop=False, reply_to=reply_to_dict
+    )
+    return {"ok": ok, "error_kind": kind}
+
+
 @app.get("/api/wa/stream")
 async def wa_stream(request: Request) -> StreamingResponse:
     """SSE real-time inbound. Multiplexed por named events:

@@ -38,6 +38,12 @@ export async function markRead(jid, lastSeenTs = null) {
   return jsonPOST("/api/wa/mark_read", { jid, last_seen_ts: lastSeenTs });
 }
 
+export async function sendText(jid, text, replyTo = null) {
+  const body = { jid, text };
+  if (replyTo) body.reply_to = replyTo;
+  return jsonPOST("/api/wa/send", body);
+}
+
 // Health del bridge — usado por el indicador visual del header.
 export async function bridgeHealth() {
   try {

@@ -3,6 +3,7 @@
 
 import { fetchThread, markRead } from "./wa-api.js";
 import { renderInto as renderAvatar } from "./wa-avatars.js";
+import * as composer from "./wa-composer.js";
 
 const els = {
   body: null,
@@ -12,9 +13,11 @@ const els = {
 };
 
 let currentJID = null;
+let currentCtx = { is_group: false };
 let oldestTs = null;     // ts del mensaje más viejo cargado (para reverse-pagination)
 let loadingOlder = false;
 let scrollPositions = new Map(); // jid → scrollTop persistido entre switches
+let pendingByContent = new Map(); // `${jid}|${content}` → tempId (para dedup contra SSE)
 
 export function init({ bodyEl, emptyEl, nameEl, avatarEl, presenceEl, composerEl }) {
   els.body = bodyEl;
@@ -26,7 +29,20 @@ export function init({ bodyEl, emptyEl, nameEl, avatarEl, presenceEl, composerEl
 
   if (els.body) {
     els.body.addEventListener("scroll", onScroll, { passive: true });
+    // Doble-click sobre una burbuja → empieza reply. Fase 6 sumará
+    // long-press picker; por ahora dblclick es atajo barato.
+    els.body.addEventListener("dblclick", (ev) => {
+      const msgEl = ev.target.closest && ev.target.closest(".wa-msg");
+      if (msgEl) startReplyTo(msgEl);
+    });
   }
+  composer.init({
+    rootEl: composerEl,
+    onOptimisticInsert: (jid, message) => {
+      pendingByContent.set(`${jid}|${message.content}`, message.id);
+      appendMessageIfActive(jid, message);
+    },
+  });
 }
 
 export async function open(jid) {
@@ -76,17 +92,8 @@ export async function open(jid) {
     markRead(jid, lastTs).catch(() => {});
   }
 
-  // Habilitar composer (sin send real todavía — Fase 5).
-  if (els.composer) {
-    els.composer.hidden = false;
-    const input = els.composer.querySelector("textarea");
-    const btn = els.composer.querySelector(".wa-send-btn");
-    if (input) {
-      input.placeholder = "Escribí un mensaje… (envío en Fase 5)";
-      input.disabled = true;
-    }
-    if (btn) btn.disabled = true;
-  }
+  currentCtx = { is_group: !!data.is_group };
+  composer.setActiveChat(jid);
 }
 
 async function onScroll() {
@@ -243,11 +250,29 @@ function initialsFromLabel(label) {
 
 /** Append un mensaje nuevo al thread si el chat está activo.
  * Si no es el chat activo, ignoramos (la sidebar lo refleja via chat_update).
+ *
+ * Dedup contra optimistic insert: si ya existe un msg pending con el
+ * mismo content+jid, lo "promovemos" reemplazando su id+pending state
+ * por el real del bridge (cap dedup: 30s para que tickets viejos no
+ * absorban mensajes idénticos posteriores).
  */
 export function appendMessageIfActive(jid, message) {
   if (!els.body || jid !== currentJID) return;
-  // El threadCtx se necesita para `is_group`; mantenemos copia local.
-  const ctx = { is_group: jid.endsWith("@g.us") };
+
+  // Dedup optimistic
+  const dedupKey = `${jid}|${message.content || ""}`;
+  const tempId = pendingByContent.get(dedupKey);
+  if (tempId && !message.pending) {
+    const existing = els.body.querySelector(`.wa-msg[data-id="${cssEscape(tempId)}"]`);
+    if (existing) {
+      existing.dataset.id = message.id || tempId;
+      existing.classList.remove("pending");
+      pendingByContent.delete(dedupKey);
+      return;
+    }
+    pendingByContent.delete(dedupKey);
+  }
+
   const wasAtBottom = els.body.scrollHeight - els.body.scrollTop - els.body.clientHeight < 80;
 
   const day = dayKey(message.ts);
@@ -255,13 +280,34 @@ export function appendMessageIfActive(jid, message) {
   if (day && day !== lastDay) {
     els.body.appendChild(renderDayDivider(day, message.ts));
   }
-  els.body.appendChild(renderMsg(message, ctx));
+  const msgEl = renderMsg(message, currentCtx);
+  if (message.pending) msgEl.classList.add("pending");
+  els.body.appendChild(msgEl);
   if (wasAtBottom) {
     els.body.scrollTop = els.body.scrollHeight;
   }
   // Marca leído contra este ts (el user lo está viendo).
-  import("./wa-api.js").then(({ markRead }) => {
+  if (!message.pending) {
     markRead(jid, message.ts).catch(() => {});
+  }
+}
+
+/** Trigger del long-press / click derecho sobre una burbuja para responder.
+ * Fase 6 va a sumar long-press para reactions; por ahora exponemos el
+ * helper para que la UI lo invoque desde un menú contextual o doble-click.
+ */
+export function startReplyTo(messageEl) {
+  if (!messageEl) return;
+  const id = messageEl.dataset.id || "";
+  const isOwn = messageEl.classList.contains("own");
+  // El sender_label puede no estar en el DOM (own no lo renderea); leemos
+  // del content visible solamente para el preview.
+  const contentEl = messageEl.querySelector("span:not(.wa-msg-time)");
+  const text = contentEl ? contentEl.textContent : "";
+  composer.setReply({
+    message_id: id,
+    original_text: text,
+    sender_jid: isOwn ? "" : "",
   });
 }
 

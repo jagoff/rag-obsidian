@@ -161,6 +161,14 @@ function renderGapSummary(s) {
 }
 
 async function onScroll() {
+  // Dynamic title collapse — iOS Settings.app pattern. Cuando el user
+  // empieza a scrollear hacia abajo (>40px), el thread-name se condensa
+  // de 18px → 15.5px via class `.condensed`. Al volver al top, expand.
+  if (els.header?.name) {
+    const collapsed = (els.body.scrollTop || 0) > 40;
+    els.header.name.classList.toggle("condensed", collapsed);
+  }
+
   if (!els.body || loadingOlder || !oldestTs || !currentJID) return;
   if (els.body.scrollTop > 60) return;
   loadingOlder = true;

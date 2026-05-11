@@ -43,6 +43,36 @@ _VENV_PY = _REPO_ROOT / ".venv" / "bin" / "python"
 _UV_TOOL_PY = Path.home() / ".local/share/uv/tools/obsidian-rag/bin/python3"
 
 
+# ── WA voice backfill (Game-Changer G1, 2026-05-11) ────────────────────────
+
+
+@interval(
+    minutes=15,
+    label="wa_voice_backfill",
+    description="Transcribe en batch los voice notes inbound de WA que el user no haya clickeado en /wa. Pobla rag_wa_voice_transcripts + escribe notas al vault.",
+)
+def wa_voice_backfill_job() -> dict[str, Any]:
+    """Corre `scripts/wa_voice_backfill.py --days 7 --limit 20` cada 15min.
+
+    Es el complemento async del endpoint on-demand
+    /api/wa/voice/transcript/{msg_id}. Sin este job, solo los audios
+    que el user clickea se transcriben — pierde ~80% del contenido WA.
+    """
+    return _run_subprocess(
+        [str(_VENV_PY), str(_REPO_ROOT / "scripts" / "wa_voice_backfill.py"),
+         "--days", "7", "--limit", "20"],
+        extra_env={
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "PYTHONPATH": str(_REPO_ROOT),
+            "RAG_LLM_BACKEND": "mlx",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+        },
+        timeout=900,  # 15min — 20 audios × ~5s típico = 100s, margen amplio
+    )
+
+
 # ── Anticipate ──────────────────────────────────────────────────────────────
 
 

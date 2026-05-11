@@ -89,6 +89,20 @@ export async function unpinChat(jid) {
   return r.json();
 }
 
+export async function translate(msgId, content) {
+  const r = await fetch("/api/wa/translate", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    credentials: "same-origin",
+    body: JSON.stringify({ msg_id: msgId, content, target: "es-AR" }),
+  });
+  if (!r.ok) {
+    const txt = await r.text().catch(() => "");
+    throw new Error(`translate ${r.status}${txt ? " — " + txt.slice(0, 100) : ""}`);
+  }
+  return r.json();
+}
+
 export async function hide(jid, messageId) {
   // "Delete for me" — solo escribe en la tabla `revokes` del bridge
   // local, no envía protocol message. Usado para mensajes inbound

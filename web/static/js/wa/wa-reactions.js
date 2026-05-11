@@ -11,7 +11,7 @@
 //   descubrible que el long-press para usuarios desktop).
 // - Click fuera del picker lo cierra.
 
-import { react, revoke, hide } from "./wa-api.js";
+import { react, revoke, hide, translate } from "./wa-api.js";
 
 const PRESET = ["❤️", "👍", "😂", "😮", "😢", "🙏", "🔥", "👏"];
 const LONGPRESS_MS = 450;
@@ -186,6 +186,25 @@ function openMenu(msgEl, originEv) {
   for (const el of presetEls) menuEl.appendChild(el);
   menuEl.appendChild(more);
 
+  // "Traducir" — disponible para CUALQUIER msg con contenido textual.
+  // El backend tiene su propia heurística (skipea si ya está en
+  // español rioplatense) y cachea por msg_id.
+  if (msgEl.dataset.id && !msgEl.classList.contains("revoked")) {
+    const sepT = document.createElement("div");
+    sepT.className = "wa-reaction-sep";
+    menuEl.appendChild(sepT);
+    const tr = document.createElement("button");
+    tr.className = "wa-reaction-delete";
+    tr.textContent = "Traducir";
+    tr.title = "Traducir al español rioplatense (qwen2.5:3b)";
+    tr.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      doTranslate(msgEl);
+    });
+    menuEl.appendChild(tr);
+  }
+
   const isOwn = msgEl.classList.contains("own");
   if (isOwn) {
     const sep = document.createElement("div");
@@ -289,6 +308,61 @@ async function doRevoke() {
 
 function cssEscape(s) {
   return String(s).replace(/"/g, '\\"');
+}
+
+async function doTranslate(msgEl) {
+  closeMenu();
+  if (!msgEl) return;
+  const msgId = msgEl.dataset.id || "";
+  // Extraer el texto plano del msg — el body es un <span> con
+  // textContent (sin formatting hostil). Excluimos pre-existentes
+  // de gap-pin, quoted, time, sender, etc. que son sibling divs.
+  const body = msgEl.querySelector(":scope > span:not(.wa-msg-time):not(.wa-msg-sender):not(.wa-msg-quoted):not(.wa-msg-reactions)");
+  const content = (body?.textContent || "").trim();
+  if (!content) return;
+
+  // Si ya existe una traducción para este msg, toggle (mostrar/ocultar).
+  const existing = msgEl.querySelector(".wa-msg-translation");
+  if (existing) {
+    existing.remove();
+    return;
+  }
+
+  // Placeholder inmediato — "traduciendo…" mientras el LLM trabaja.
+  const tr = document.createElement("div");
+  tr.className = "wa-msg-translation loading";
+  tr.textContent = "traduciendo…";
+  // Insertar antes del time/reactions para que quede pegado al texto.
+  const timeEl = msgEl.querySelector(".wa-msg-time");
+  if (timeEl) msgEl.insertBefore(tr, timeEl);
+  else msgEl.appendChild(tr);
+
+  try {
+    const data = await translate(msgId, content);
+    tr.classList.remove("loading");
+    if (data.skipped) {
+      tr.textContent = "ya está en español";
+      tr.classList.add("skipped");
+      // Auto-fade después de 2.5s.
+      setTimeout(() => tr.remove(), 2500);
+      return;
+    }
+    tr.innerHTML = "";
+    const tag = document.createElement("span");
+    tag.className = "wa-msg-translation-lang";
+    tag.textContent = (data.source_lang || "?") + " → es-AR";
+    const body = document.createElement("span");
+    body.className = "wa-msg-translation-body";
+    body.textContent = data.translated || "";
+    tr.appendChild(tag);
+    tr.appendChild(body);
+  } catch (e) {
+    console.error("[wa-translate] failed", e);
+    tr.classList.remove("loading");
+    tr.classList.add("error");
+    tr.textContent = "no pude traducir: " + e.message;
+    setTimeout(() => tr.remove(), 3000);
+  }
 }
 
 

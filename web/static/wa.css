@@ -1891,5 +1891,59 @@ button { cursor: pointer; }
 }
 [data-theme="light"] .wa-cmdk-hint kbd { background: rgba(0, 0, 0, 0.06); }
 
+/* ─── Inline translation (long-press / menu → traducir) ─────────────
+   Aparece como un sub-bloque dentro de la burbuja, debajo del texto
+   original y arriba de la hora. Style discreto, no compite con el
+   contenido — fondo levemente diferente + lang tag. */
+.wa-msg-translation {
+  display: block;
+  margin: 6px 0 4px;
+  padding: 6px 8px;
+  background: rgba(255, 255, 255, 0.05);
+  border-left: 2px solid var(--accent, #06d6a0);
+  border-radius: 4px;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--text-primary);
+  animation: wa-msg-in 0.18s cubic-bezier(0.2, 0, 0.2, 1);
+}
+.wa-msg.own .wa-msg-translation {
+  background: rgba(0, 0, 0, 0.18);
+}
+.wa-msg-translation.loading {
+  font-style: italic;
+  color: var(--text-secondary);
+  border-left-color: var(--text-tertiary);
+}
+.wa-msg-translation.skipped {
+  font-style: italic;
+  color: var(--text-secondary);
+  background: transparent;
+  border-left-color: var(--text-tertiary);
+}
+.wa-msg-translation.error {
+  color: var(--red, #f15c6d);
+  border-left-color: var(--red, #f15c6d);
+  font-size: 12px;
+}
+.wa-msg-translation-lang {
+  display: block;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-secondary);
+  margin-bottom: 2px;
+  font-weight: 600;
+}
+.wa-msg-translation-body {
+  display: block;
+}
+[data-theme="light"] .wa-msg-translation {
+  background: rgba(0, 0, 0, 0.05);
+}
+[data-theme="light"] .wa-msg.own .wa-msg-translation {
+  background: rgba(0, 0, 0, 0.08);
+}
+
 /* ─── Utility ─────────────────────────────────────────────────────── */
 .hidden { display: none !important; }

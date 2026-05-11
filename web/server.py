@@ -4180,6 +4180,39 @@ def wa_thread(jid: str, limit: int = 50, before_ts: str | None = None) -> dict:
     return _wa_fetch.fetch_thread_for_ui(jid, limit=limit, before_ts=before_ts)
 
 
+class _WATranslateRequest(BaseModel):
+    msg_id: str | None = ""
+    content: str
+    target: str | None = "es-AR"
+
+
+@app.post("/api/wa/translate")
+def wa_translate(req: _WATranslateRequest) -> dict:
+    """Traduce un mensaje al español rioplatense vía qwen2.5:3b MLX
+    in-process. Cache por `(msg_id, target)` — re-pegar al mismo
+    msg_id devuelve cached instant.
+
+    Devuelve:
+      `{translated, source_lang, skipped: false}` si tradujo.
+      `{skipped: true, reason: "already_spanish"}` si heurística decidió
+        que no hace falta.
+      400 si falta `content`.
+      500 si el LLM falla.
+    """
+    from rag.integrations.whatsapp import translate as _wa_tr  # noqa: PLC0415
+
+    if not (req.content or "").strip():
+        raise HTTPException(status_code=400, detail="content requerido")
+    result = _wa_tr.translate(
+        req.content,
+        msg_id=(req.msg_id or "").strip(),
+        target=(req.target or "es-AR").strip(),
+    )
+    if result is None:
+        raise HTTPException(status_code=500, detail="translate failed")
+    return result
+
+
 @app.get("/api/wa/thread/{jid}/gap-summary")
 def wa_gap_summary(
     jid: str,

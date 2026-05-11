@@ -981,12 +981,20 @@ def fetch_thread_for_ui(
         # el cliente pida siguiente página con ese valor.
         next_before_ts = rows[-1]["ts"] if rows else None
 
+        # `last_seen_ts`: el frontend usa este corte para pintar la línea
+        # roja de "no leído desde acá" arriba del primer inbound nuevo.
+        # `mark_read_for_ui` se llama después del render, así que el corte
+        # corresponde al estado PRE-apertura.
+        from . import _db_local  # noqa: PLC0415
+        last_seen_ts = _db_local.get_last_seen(jid) or ""
+
         return {
             "jid": jid,
             "label": label,
             "is_group": is_group,
             "messages": messages,
             "next_before_ts": next_before_ts,
+            "last_seen_ts": last_seen_ts,
         }
     except sqlite3.Error:
         return empty

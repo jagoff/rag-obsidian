@@ -18,7 +18,6 @@ let currentJID = null;
 let currentCtx = { is_group: false };
 let oldestTs = null;     // ts del mensaje más viejo cargado (para reverse-pagination)
 let loadingOlder = false;
-let scrollPositions = new Map(); // jid → scrollTop persistido entre switches
 let pendingByContent = new Map(); // `${jid}|${content}` → tempId (para dedup contra SSE)
 
 export function init({ bodyEl, emptyEl, nameEl, avatarEl, presenceEl, composerEl }) {
@@ -50,10 +49,6 @@ export function init({ bodyEl, emptyEl, nameEl, avatarEl, presenceEl, composerEl
 
 export async function open(jid) {
   if (currentJID === jid) return;
-  // Persistir scroll del thread saliente.
-  if (currentJID && els.body) {
-    scrollPositions.set(currentJID, els.body.scrollTop);
-  }
   currentJID = jid;
   oldestTs = null;
   if (els.empty) els.empty.style.display = "none";
@@ -80,13 +75,11 @@ export async function open(jid) {
     els.body.innerHTML = "";
     renderMessages(data.messages || [], data, /*prepend=*/ false);
     oldestTs = data.next_before_ts;
-    // Scroll restore: si veníamos de este chat, restaurar; sino al fondo.
-    const restored = scrollPositions.get(jid);
-    if (typeof restored === "number") {
-      els.body.scrollTop = restored;
-    } else {
-      els.body.scrollTop = els.body.scrollHeight;
-    }
+    // Siempre scroll al fondo al abrir un chat (igual que WhatsApp Web).
+    // Si el user paginó hacia arriba durante esta sesión, scrollPositions
+    // se usa solo para volver al mismo punto cuando el mismo chat sigue
+    // abierto entre fetches (no entre clicks distintos).
+    els.body.scrollTop = els.body.scrollHeight;
   }
 
   // Marcar leído contra el último ts visible
@@ -126,11 +119,20 @@ async function onScroll() {
 function renderMessages(messages, threadCtx, prepend) {
   const frag = document.createDocumentFragment();
   let lastDay = prepend ? null : findLastDay();
+  // Unread divider: lo insertamos UNA vez, antes del primer inbound
+  // posterior a `last_seen_ts`. Solo en el render inicial (prepend=false);
+  // los mensajes paginados hacia arriba son todos read por definición.
+  let unreadInserted = !!prepend;
+  const lastSeen = (threadCtx && threadCtx.last_seen_ts) || "";
   for (const m of messages) {
     const day = dayKey(m.ts);
     if (day && day !== lastDay) {
       frag.appendChild(renderDayDivider(day, m.ts));
       lastDay = day;
+    }
+    if (!unreadInserted && lastSeen && !m.is_from_me && m.ts > lastSeen) {
+      frag.appendChild(renderUnreadDivider());
+      unreadInserted = true;
     }
     frag.appendChild(renderMsg(m, threadCtx));
   }
@@ -139,6 +141,13 @@ function renderMessages(messages, threadCtx, prepend) {
   } else {
     els.body.appendChild(frag);
   }
+}
+
+function renderUnreadDivider() {
+  const div = document.createElement("div");
+  div.className = "wa-unread-divider";
+  div.textContent = "no leído";
+  return div;
 }
 
 function renderMsg(m, ctx) {

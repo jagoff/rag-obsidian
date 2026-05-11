@@ -561,6 +561,29 @@ button { cursor: pointer; }
 }
 .wa-empty-state p { margin: 0; }
 
+/* ─── Unread divider ─────────────────────────────────────────────── */
+.wa-unread-divider {
+  align-self: stretch;
+  margin: 14px 0 6px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 10.5px;
+  color: var(--red);
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  font-weight: 600;
+  padding: 0 4px;
+}
+.wa-unread-divider::before,
+.wa-unread-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--red);
+  opacity: 0.55;
+}
+
 /* ─── Day divider ────────────────────────────────────────────────── */
 .wa-day-divider {
   align-self: center;

@@ -1,8 +1,9 @@
-// Entry point de `/wa`. Conecta sidebar + thread + health indicator.
+// Entry point de `/wa`. Conecta sidebar + thread + SSE + health indicator.
 // Estado global mínimo (chat activo); el resto lo manejan los sub-módulos.
 
 import * as chatlist from "./wa-chatlist.js";
 import * as thread from "./wa-thread.js";
+import * as sse from "./wa-sse.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -36,29 +37,48 @@ function init() {
   });
 
   chatlist.load();
-  startHealthIndicator();
+  startSSE();
 }
 
-async function startHealthIndicator() {
+function startSSE() {
   const el = $("wa-conn");
-  if (!el) return;
-  const tick = async () => {
-    try {
-      const r = await fetch("/api/wa/chats?limit=1");
-      if (r.ok) {
-        el.textContent = "●";
-        el.className = "wa-conn-indicator ok";
-      } else {
-        el.textContent = "●";
-        el.className = "wa-conn-indicator bad";
-      }
-    } catch {
+
+  sse.onConnectionState((open) => {
+    if (!el) return;
+    el.textContent = "●";
+    el.className = open ? "wa-conn-indicator ok" : "wa-conn-indicator bad";
+  });
+
+  sse.on("hello", () => {
+    if (el) {
       el.textContent = "●";
-      el.className = "wa-conn-indicator bad";
+      el.className = "wa-conn-indicator ok";
     }
-  };
-  tick();
-  setInterval(tick, 30_000);
+  });
+
+  sse.on("new_message", (payload) => {
+    if (payload && payload.message) {
+      thread.appendMessageIfActive(payload.jid, payload.message);
+    }
+  });
+
+  sse.on("chat_update", (payload) => {
+    chatlist.applyChatUpdate(payload);
+  });
+
+  sse.on("reaction_changed", (payload) => {
+    thread.applyReactionChange(payload);
+  });
+
+  sse.on("message_revoked", (payload) => {
+    thread.applyRevoke(payload);
+  });
+
+  sse.on("presence", (payload) => {
+    thread.applyPresence(payload);
+  });
+
+  sse.connect();
 }
 
 if (document.readyState === "loading") {

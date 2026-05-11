@@ -103,6 +103,28 @@ export function setActive(jid) {
   }
 }
 
+/** SSE callback. Reorder chat al top + update preview + unread badge. */
+export function applyChatUpdate(payload) {
+  if (!payload || !payload.jid) return;
+  const idx = allChats.findIndex((c) => c.jid === payload.jid);
+  if (idx === -1) {
+    // Chat nuevo (no estaba en la lista cargada) → reload completo.
+    load();
+    return;
+  }
+  const c = allChats[idx];
+  c.last_ts = payload.last_ts || c.last_ts;
+  c.last_preview = payload.last_preview ?? c.last_preview;
+  c.last_from_me = !!payload.last_from_me;
+  if (payload.jid !== activeJID && payload.unread_delta) {
+    c.unread_count = (c.unread_count || 0) + payload.unread_delta;
+  }
+  // Mover al top.
+  allChats.splice(idx, 1);
+  allChats.unshift(c);
+  render();
+}
+
 function selectChat(jid) {
   setActive(jid);
   if (onSelectCallback) onSelectCallback(jid);

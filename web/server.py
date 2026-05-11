@@ -4170,6 +4170,57 @@ def wa_mark_read(req: _WAMarkReadRequest) -> dict:
     return {"ok": True, "jid": req.jid, "last_seen_ts": ts}
 
 
+@app.get("/api/wa/stream")
+async def wa_stream(request: Request) -> StreamingResponse:
+    """SSE real-time inbound. Multiplexed por named events:
+
+    - ``new_message``     → mensaje nuevo en algún chat.
+    - ``chat_update``     → side-effect del new_message (preview + unread_delta).
+    - ``reaction_changed``→ reaction inbound (own o de terceros).
+    - ``message_revoked`` → delete-for-everyone.
+    - ``presence``        → typing/recording del otro lado.
+    - ``heartbeat``       → cada 25s para mantener la conexión viva.
+
+    El poller del bridge (`rag.integrations.whatsapp.tail._tail_loop`)
+    arranca lazy con el primer subscriber. Persiste HWM en
+    ``~/.local/share/obsidian-rag/wa-hwm.json`` para no reemitir el
+    historial entero al restart del web.
+    """
+    import asyncio  # noqa: PLC0415
+    import json  # noqa: PLC0415
+
+    from rag.integrations.whatsapp import tail as _wa_tail  # noqa: PLC0415
+
+    queue = await _wa_tail.subscribe()
+
+    async def gen():
+        try:
+            # `hello` inicial — el cliente puede usarlo para confirmar conexión.
+            yield "event: hello\ndata: " + json.dumps({"server_time": _wa_tail._now_bridge_ts()}) + "\n\n"
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=25.0)
+                except asyncio.TimeoutError:
+                    yield "event: heartbeat\ndata: {}\n\n"
+                    continue
+                etype = event.get("type") or "message"
+                edata = event.get("data") or {}
+                yield f"event: {etype}\ndata: {json.dumps(edata, ensure_ascii=False)}\n\n"
+        finally:
+            _wa_tail.unsubscribe(queue)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 class MailSendRequest(BaseModel):
     to: str
     subject: str

@@ -238,3 +238,79 @@ function initialsFromLabel(label) {
   if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
   return (parts[0][0] + parts[1][0]).toUpperCase();
 }
+
+// ── SSE handlers públicos ──────────────────────────────────────────
+
+/** Append un mensaje nuevo al thread si el chat está activo.
+ * Si no es el chat activo, ignoramos (la sidebar lo refleja via chat_update).
+ */
+export function appendMessageIfActive(jid, message) {
+  if (!els.body || jid !== currentJID) return;
+  // El threadCtx se necesita para `is_group`; mantenemos copia local.
+  const ctx = { is_group: jid.endsWith("@g.us") };
+  const wasAtBottom = els.body.scrollHeight - els.body.scrollTop - els.body.clientHeight < 80;
+
+  const day = dayKey(message.ts);
+  const lastDay = findLastDay();
+  if (day && day !== lastDay) {
+    els.body.appendChild(renderDayDivider(day, message.ts));
+  }
+  els.body.appendChild(renderMsg(message, ctx));
+  if (wasAtBottom) {
+    els.body.scrollTop = els.body.scrollHeight;
+  }
+  // Marca leído contra este ts (el user lo está viendo).
+  import("./wa-api.js").then(({ markRead }) => {
+    markRead(jid, message.ts).catch(() => {});
+  });
+}
+
+/** Aplica un reaction_changed al mensaje existente en el DOM (si está). */
+export function applyReactionChange(payload) {
+  if (!els.body || !payload || !payload.message_id) return;
+  const msgEl = els.body.querySelector(`.wa-msg[data-id="${cssEscape(payload.message_id)}"]`);
+  if (!msgEl) return;
+  let rEl = msgEl.querySelector(".wa-msg-reactions");
+  if (payload.removed) {
+    if (rEl) rEl.remove();
+    return;
+  }
+  if (!rEl) {
+    rEl = document.createElement("div");
+    rEl.className = "wa-msg-reactions";
+    msgEl.appendChild(rEl);
+  }
+  rEl.textContent = payload.emoji || "";
+}
+
+/** Marca un mensaje como revocado en el DOM. */
+export function applyRevoke(payload) {
+  if (!els.body || !payload || !payload.message_id) return;
+  const msgEl = els.body.querySelector(`.wa-msg[data-id="${cssEscape(payload.message_id)}"]`);
+  if (!msgEl) return;
+  msgEl.classList.add("revoked");
+  msgEl.innerHTML = "🚫 Este mensaje fue eliminado";
+}
+
+/** Muestra typing indicator si la presence pertenece al chat activo. */
+let presenceTimer = null;
+export function applyPresence(payload) {
+  if (!els.header.presence || !payload || payload.chat_jid !== currentJID) return;
+  const state = payload.state || "";
+  const media = payload.media || "";
+  let text = "";
+  if (state === "composing") text = media === "audio" ? "grabando audio…" : "escribiendo…";
+  els.header.presence.textContent = text;
+  if (presenceTimer) clearTimeout(presenceTimer);
+  if (text) {
+    presenceTimer = setTimeout(() => {
+      if (els.header.presence) els.header.presence.textContent = "";
+    }, 6000);
+  }
+}
+
+function cssEscape(s) {
+  // Minimal escape para selectores — WhatsApp message IDs son hex,
+  // pero por las dudas escapamos comillas dobles.
+  return String(s).replace(/"/g, '\\"');
+}

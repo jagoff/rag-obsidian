@@ -1260,6 +1260,69 @@ function renderCards(cards) {
       </div>
     ` : "";
 
+    // ── Suscripciones (sección dedicada) ────────────────────────────
+    //
+    // Pulled OUT of "Por categoría" — el user las quiere marcadas aparte
+    // porque son los gastos más críticos para forecast (no son discretas,
+    // son contractuales). Agrupa por merchant normalizado, suma totales
+    // por moneda, muestra #cobros del ciclo.
+    //
+    // Heurística: cualquier compra que matchea `_CC_CATEGORIES[streaming]`.
+    // Si el user agrega un servicio nuevo, basta con sumar el regex en
+    // `_CC_CATEGORIES` (top del archivo).
+    const subsRaw = [...purchasesAR, ...purchasesUSD]
+      .filter((p) => _inferCategory(p.description).id === "streaming");
+    const subsByMerchant = new Map();
+    subsRaw.forEach((p) => {
+      const m = _normalizeMerchant(p.description);
+      const cur = p.currency || "ARS";
+      const key = `${m}|${cur}`;
+      const ex = subsByMerchant.get(key) || { name: m, currency: cur, n: 0, total: 0, items: [] };
+      ex.n += 1;
+      ex.total += p.amount || 0;
+      ex.items.push(p);
+      subsByMerchant.set(key, ex);
+    });
+    const subs = [...subsByMerchant.values()]
+      .sort((a, b) => {
+        // USD primero porque suelen ser las pesadas (Claude, Netflix);
+        // luego por total descendente.
+        if (a.currency !== b.currency) return a.currency === "USD" ? -1 : 1;
+        return b.total - a.total;
+      });
+    const subsTotalARS = subs.filter((s) => s.currency === "ARS").reduce((a, b) => a + b.total, 0);
+    const subsTotalUSD = subs.filter((s) => s.currency === "USD").reduce((a, b) => a + b.total, 0);
+    const subsSection = subs.length ? `
+      <div class="cc-section cc-subs">
+        <div class="cc-section-title" style="display: flex; align-items: center; gap: 8px;">
+          <span style="font-size: 14px;">▶</span>
+          Suscripciones · ${subs.length}
+          <span style="margin-left: auto; font-size: 11px; color: var(--text-dim); text-transform: none; letter-spacing: 0; font-weight: 400;">
+            ${subsTotalARS > 0 ? fmtMoneyARS(subsTotalARS) : ""}${subsTotalARS > 0 && subsTotalUSD > 0 ? " · " : ""}${subsTotalUSD > 0 ? fmtMoneyUSD(subsTotalUSD) : ""}
+          </span>
+        </div>
+        <ul class="cat-list cc-subs-list">
+          ${subs.map((s) => {
+            const amount = s.currency === "USD" ? fmtMoneyUSD(s.total) : fmtMoneyARS(s.total);
+            const monthly = s.n > 1 ? ` · ${s.currency === "USD" ? fmtMoneyUSD(s.total / s.n) : fmtMoneyARS(s.total / s.n)}/cobro` : "";
+            return `
+              <li class="cat-row cc-sub-row">
+                <span class="cat-row-swatch cc-sub-dot ${s.currency === "USD" ? "usd" : "ars"}"></span>
+                <span class="cat-row-name" title="${escapeHtml(s.items.map((i) => i.description).join(' · '))}">
+                  ${escapeHtml(s.name)}
+                  <small class="cc-sub-meta">${s.n} cobro${s.n === 1 ? "" : "s"} · ${s.currency}${monthly}</small>
+                </span>
+                <span class="cat-row-amount cc-sub-amount">${amount}</span>
+              </li>`;
+          }).join("")}
+        </ul>
+        <div class="cc-subs-footer">
+          Estos cargos se asumen recurrentes y forman parte del gasto fijo
+          de la proyección. Si cancelaste alguno, restalo del fijo arriba.
+        </div>
+      </div>
+    ` : "";
+
     // ── Daily bars: gasto ARS por día del ciclo.
     const dailyCanvasId = `${cardKey}-daily`;
     const dailySection = purchasesAR.length >= 3 ? `
@@ -1299,10 +1362,14 @@ function renderCards(cards) {
     ` : "";
 
     // ── Por categoría inferida (heuristic).
+    // Streaming/SaaS se excluye acá — vive en su propia sección "Suscripciones"
+    // arriba para que el user las vea como cargos fijos contractuales aparte
+    // del resto del consumo.
     const catAggARS = new Map();
     const catColorMap = new Map();
     purchasesAR.forEach((p) => {
       const c = _inferCategory(p.description);
+      if (c.id === "streaming") return;  // ya está en subsSection
       catAggARS.set(c.label, (catAggARS.get(c.label) || 0) + (p.amount || 0));
       catColorMap.set(c.label, c.color || "");
     });
@@ -1443,6 +1510,7 @@ function renderCards(cards) {
     detail.innerHTML = `
       ${headerHtml}
       ${forecastSection}
+      ${subsSection}
       ${dailySection}
       ${compoSection}
       ${catSection}

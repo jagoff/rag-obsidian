@@ -1227,6 +1227,40 @@
       line-height: 1.5;
     }
 
+    /* ── Suscripciones: sección dedicada (separada de "Por categoría")
+       Visual distinguido porque son gastos contractuales fijos — borde
+       purple izquierdo + bg tinted, dot por moneda (ARS/USD). */
+    .cc-subs {
+      border-left: 3px solid var(--purple);
+      background: color-mix(in oklab, var(--bg-elev) 90%, var(--purple) 4%);
+    }
+    .cc-subs-list { gap: 8px; }
+    .cc-sub-row { grid-template-columns: 12px 1fr auto; }
+    .cc-sub-dot {
+      width: 10px; height: 10px; border-radius: 50%;
+    }
+    .cc-sub-dot.usd { background: var(--green); }
+    .cc-sub-dot.ars { background: var(--cyan); }
+    .cc-sub-meta {
+      display: block;
+      font-size: 10px;
+      color: var(--text-faint);
+      margin-top: 2px;
+      font-variant-numeric: tabular-nums;
+    }
+    .cc-sub-amount {
+      font-weight: 600;
+      color: var(--text);
+    }
+    .cc-subs-footer {
+      font-size: 10px;
+      color: var(--text-faint);
+      font-style: italic;
+      padding-top: 4px;
+      border-top: 1px dashed var(--border);
+      line-height: 1.5;
+    }
+
     /* ── Daily bars wrap ───────────────────────────────────────────── */
     .cc-daily-wrap {
       position: relative;

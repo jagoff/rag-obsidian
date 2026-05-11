@@ -111,7 +111,30 @@ export function renderInto(container, msg) {
     return wrap;
   }
 
-  // document / fallback
+  // PDF inline preview — los browsers modernos renderean PDFs
+  // nativamente via `<embed type="application/pdf">`. Mostramos la
+  // primera página en max-height 320px con scroll interno, header
+  // con filename + botones "abrir" / "descargar". Click sobre el
+  // embed da los controls nativos del PDF viewer del browser
+  // (Chrome/Safari). Si no es PDF, cae al fallback document link.
+  const isPdf = /\.pdf$/i.test(filename || "");
+  if (isPdf) {
+    const wrap = document.createElement("div");
+    wrap.className = "wa-media wa-media-pdf";
+    wrap.innerHTML = `
+      <div class="wa-media-pdf-head">
+        <span class="wa-media-pdf-icon" aria-hidden="true">📄</span>
+        <span class="wa-media-pdf-name" title="${escapeHtml(filename)}">${escapeHtml(filename)}</span>
+        <a class="wa-media-pdf-act" href="${escapeHtml(url)}" target="_blank" rel="noopener" title="Abrir en nueva pestaña">↗</a>
+        <a class="wa-media-pdf-act" href="${escapeHtml(url)}" download="${escapeHtml(filename)}" title="Descargar">↓</a>
+      </div>
+      <embed class="wa-media-pdf-embed" src="${escapeHtml(url)}#view=FitH&toolbar=0" type="application/pdf">
+    `;
+    container.appendChild(wrap);
+    return wrap;
+  }
+
+  // document / fallback (non-PDF: docx, xlsx, zip, etc.)
   const wrap = document.createElement("a");
   wrap.className = "wa-media wa-media-doc";
   wrap.href = url;

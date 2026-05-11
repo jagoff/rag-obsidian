@@ -1239,6 +1239,60 @@ button { cursor: pointer; }
   text-decoration: none;
   font-size: 12px;
 }
+
+/* PDF inline preview — primera página renderizada por el viewer
+   nativo del browser via `<embed type="application/pdf">`. Header
+   compacto con nombre + botones abrir/descargar; embed con altura
+   fija + scroll interno. */
+.wa-media-pdf {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-quoted);
+  border-radius: 6px;
+  overflow: hidden;
+  width: 100%;
+  max-width: 360px;
+}
+.wa-media-pdf-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: rgba(0, 0, 0, 0.18);
+  font-size: 12.5px;
+}
+.wa-media-pdf-icon { font-size: 14px; flex-shrink: 0; }
+.wa-media-pdf-name {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.wa-media-pdf-act {
+  color: var(--link);
+  text-decoration: none;
+  font-size: 14px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  flex-shrink: 0;
+  transition: background 0.1s ease, color 0.1s ease;
+}
+.wa-media-pdf-act:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--accent, #06d6a0);
+}
+.wa-media-pdf-embed {
+  display: block;
+  width: 100%;
+  height: 320px;
+  border: 0;
+  background: #fff;
+}
+[data-theme="light"] .wa-media-pdf-head {
+  background: rgba(0, 0, 0, 0.06);
+}
 .wa-media-missing {
   padding: 8px 12px;
   background: var(--bg-quoted);

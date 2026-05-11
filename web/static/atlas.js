@@ -1489,6 +1489,12 @@ async function askVault(question) {
         session_id: _askSessionId(),
         vault_scope: null,
         mode: "default",
+        // `force=true` deshabilita el low_conf_bypass del backend — el
+        // LLM contesta aunque la confianza del retrieve esté baja. En
+        // /atlas preferimos respuesta tentativa + ver fuentes en el grafo
+        // a un canned "no tengo info" cuando el match es débil pero
+        // existe. Backend: ChatRequest.force (web/server.py).
+        force: true,
       }),
     });
     if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);

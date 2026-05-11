@@ -702,7 +702,8 @@ def memo_api(limit: int = 30, type: str | None = None) -> dict:
 
 @app.get("/api/memo/note")
 def memo_note_api(id: str | None = None, path: str | None = None) -> dict:
-    """Detalle de una memoria — metadata + body markdown.
+    """Detalle de una memoria — metadata + body markdown + vecinos kNN +
+    quality score con breakdown.
 
     Acepta `id` (full o prefijo ≥4 chars) o `path` relativo al vault.
     El body se lee del `.md` (source of truth de memo, no del sqlite).
@@ -710,6 +711,18 @@ def memo_note_api(id: str | None = None, path: str | None = None) -> dict:
     from web.memo_dashboard import note_detail
 
     return note_detail(memo_id=id, path=path)
+
+
+@app.get("/api/memo/search")
+def memo_search_api(q: str = "", limit: int = 20) -> dict:
+    """FTS5 search sobre la tabla `fts` de memo (title + tags + body).
+
+    Cada token se trata como prefix-match (`caddy*`) para usabilidad.
+    Resultados con quality score + body preview, misma shape que `recent`.
+    """
+    from web.memo_dashboard import search
+
+    return search(query=q, limit=limit)
 
 
 @app.get("/mem-vault")
@@ -1460,6 +1473,17 @@ class ChatRequest(BaseModel):
     folder: str | None = Field(None, max_length=500)
     path: str | None = Field(None, max_length=512)
     # ── /Feature H ───────────────────────────────────────────────────────
+
+    # ── Force flag (2026-05-10) ──────────────────────────────────────────
+    # Cuando `force=True`, deshabilita el `low_conf_bypass` — el LLM
+    # contesta aunque la confianza del retrieve esté por debajo del
+    # threshold (`CONFIDENCE_RERANK_MIN=0.015`). Equivalente al
+    # `--force` del CLI. Lo usa `/atlas` para "preguntale al vault"
+    # donde el user prefiere una respuesta tentativa (aún si débil) a
+    # un canned "No tengo info sobre X" — el atlas le sirve además
+    # las fuentes en el grafo, así que el user evalúa relevancia
+    # visualmente. NO afecta el retrieve mismo, solo el gate del LLM.
+    force: bool = False
 
     @field_validator("question")
     @classmethod
@@ -12384,6 +12408,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             not is_propose_intent
             and not _mention_paths
             and not _has_forced_tools
+            and not bool(getattr(req, "force", False))
             and float(result["confidence"]) < _conf_threshold
         )
         if _low_conf_bypass:

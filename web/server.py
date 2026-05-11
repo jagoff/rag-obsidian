@@ -14172,7 +14172,12 @@ def finance_api(months: int = 12, window_days: int = 30) -> dict:
     key = str((months, window_days))
     cached = _FINANCE_DASH_CACHE.get(key)
     if cached:
-        return cached
+        # `ThreadSafeCacheMultiKey.get` retorna (ts, payload). Sin unpack,
+        # FastAPI levantaba ResponseValidationError en cache-hit (response
+        # debería ser dict, no tuple). Mismo bug que tenía atlas_api antes
+        # del fix; replicado acá. Detectado 2026-05-10.
+        _, payload = cached
+        return payload
     from web.finance_dashboard import snapshot
     payload = snapshot(months=months, window_days=window_days)
     _FINANCE_DASH_CACHE.put(key, payload)
@@ -16006,7 +16011,11 @@ def status_errors(nocache: int = 0) -> dict:
         return payload
     cached = _ERRORS_CACHE.get("default")
     if cached:
-        return cached
+        # `ThreadSafeCacheMultiKey.get` retorna (ts, payload). Sin unpack,
+        # FastAPI levantaba ResponseValidationError en cache-hit. Mismo
+        # bug que tenía atlas_api + finance_api antes del fix (2026-05-10).
+        _, payload = cached
+        return payload
     payload = _status_errors_build_payload()
     _ERRORS_CACHE.put("default", payload)
     return payload
@@ -18352,14 +18361,20 @@ def logs_rankings(
     """
     window_s = max(60, min(int(since_seconds), _LOG_GLOBAL_MAX_WINDOW_S))
     n = max(1, min(int(top_n), 50))
-    cache_key = (window_s, n)
-    now_mono = time.monotonic()
-    cached, fresh = _RANKINGS_CACHE.get(cache_key, now_mono)
-    if nocache or not fresh:
-        payload = _build_rankings_payload(window_s, n)
-        _RANKINGS_CACHE.set(cache_key, payload, now_mono)
+    cache_key = str((window_s, n))
+    # `ThreadSafeCacheMultiKey.get(key)` retorna `(ts, payload)` si fresh
+    # (TTL=8s gestionado internamente) o `None` si stale/missing. La
+    # versión previa del código asumía un API distinto (`.get(key, mono)
+    # → (cached, fresh)` + `.set(...)`) que NO existe en
+    # `ThreadSafeCacheMultiKey` — el endpoint tiraba TypeError 500 en
+    # cada hit. Bug detectado 2026-05-10. Fix: usar el API real.
+    cached = _RANKINGS_CACHE.get(cache_key) if not nocache else None
+    if cached is not None:
+        _, payload = cached
         return payload
-    return cached
+    payload = _build_rankings_payload(window_s, n)
+    _RANKINGS_CACHE.put(cache_key, payload)
+    return payload
 
 
 # ── /api/diagnose-error — LLM-powered error diagnosis ─────────────────

@@ -720,24 +720,50 @@ button { cursor: pointer; }
 }
 
 /* ─── Reactions ──────────────────────────────────────────────────── */
+/* Cada reaction es un chip propio (emoji + count). Se layoutean con
+   flex-wrap así múltiples reactions caen en líneas distintas en vez
+   de quedar pegoteadas como una sola string. Igual que WhatsApp Web /
+   Slack — más legible y permite hover por reaction. */
 .wa-msg-reactions {
   position: absolute;
-  bottom: -10px;
+  bottom: -12px;
   right: 6px;
   display: inline-flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 2px;
-  background: var(--bg-panel-header);
-  border-radius: var(--radius-pill);
-  padding: 2px 6px;
-  font-size: 12px;
-  box-shadow: var(--shadow-elev);
-  border: 1px solid var(--border-divider);
+  gap: 3px;
+  max-width: 80%;
   cursor: pointer;
   z-index: 1;
 }
+.wa-reaction-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  background: var(--bg-panel-header);
+  border: 1px solid var(--border-divider);
+  border-radius: 10px;
+  padding: 1px 7px 2px 5px;
+  font-size: 13px;
+  line-height: 1.25;
+  box-shadow: var(--shadow-elev);
+  white-space: nowrap;
+}
+.wa-reaction-chip .wa-reaction-emoji { font-size: 14px; line-height: 1; }
+.wa-reaction-chip .wa-reaction-count {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+  font-weight: 600;
+}
 .wa-reaction-emoji { line-height: 1; }
-.wa-reaction-sep { color: var(--text-tertiary); margin: 0 2px; }
+.wa-reaction-sep {
+  display: inline-block;
+  width: 1px;
+  height: 18px;
+  background: var(--border-divider);
+  margin: 0 4px;
+}
 .wa-reaction-more { color: var(--text-secondary); font-size: 11px; }
 .wa-reaction-menu {
   position: absolute;
@@ -764,45 +790,117 @@ button { cursor: pointer; }
 .wa-reaction-delete:hover { color: var(--red, #f15c6d); }
 
 /* Kebab `⋮` en burbujas propias — afford visible para abrir el menu
-   de acciones (reaccionar / eliminar) sin tener que hacer long-press.
-   Hidden por default, fade-in al hover sobre la burbuja en desktop;
-   en touch siempre visible (long-press sigue funcionando también). */
+   de acciones (reaccionar / eliminar / seleccionar varios). Siempre
+   visible (opacity 0.45 → 1 al hover) para que sea descubrible sin
+   tener que adivinar long-press o right-click. */
 .wa-msg-kebab {
   position: absolute;
-  top: 2px;
-  right: 4px;
+  top: 3px;
+  right: 5px;
   width: 22px;
   height: 22px;
   border-radius: 50%;
   border: 0;
-  background: rgba(0, 0, 0, 0.18);
-  color: rgba(255, 255, 255, 0.85);
+  background: rgba(0, 0, 0, 0.22);
+  color: rgba(255, 255, 255, 0.95);
   font-size: 16px;
   line-height: 18px;
+  font-weight: 700;
   padding: 0;
   cursor: pointer;
-  opacity: 0;
-  transition: opacity 0.12s ease;
+  opacity: 0.45;
+  transition: opacity 0.12s ease, background 0.12s ease;
   z-index: 2;
 }
 .wa-msg.own:hover .wa-msg-kebab,
-.wa-msg-kebab:focus-visible {
+.wa-msg-kebab:focus-visible,
+.wa-msg-kebab:hover {
   opacity: 1;
 }
 .wa-msg-kebab:hover {
-  background: rgba(0, 0, 0, 0.32);
+  background: rgba(0, 0, 0, 0.45);
 }
 [data-theme="light"] .wa-msg-kebab {
-  background: rgba(0, 0, 0, 0.08);
-  color: rgba(0, 0, 0, 0.65);
+  background: rgba(0, 0, 0, 0.12);
+  color: rgba(0, 0, 0, 0.72);
 }
 [data-theme="light"] .wa-msg-kebab:hover {
-  background: rgba(0, 0, 0, 0.18);
+  background: rgba(0, 0, 0, 0.22);
 }
-/* En touch devices el hover no se dispara — mostrar siempre el kebab
-   para que sea descubrible. */
-@media (hover: none) {
-  .wa-msg-kebab { opacity: 0.55; }
+
+/* ─── Selection mode (bulk delete) ─────────────────────────────────
+   Cuando el user entra al modo selección desde el menu kebab, todas
+   las burbujas propias se vuelven clickeables para marcarlas. Un
+   action bar fijo arriba del composer muestra cuántas hay y el botón
+   "Eliminar (N)". */
+.wa-thread.selecting .wa-msg.own {
+  cursor: pointer;
+  user-select: none;
+}
+.wa-thread.selecting .wa-msg.own::before {
+  content: "";
+  position: absolute;
+  left: -28px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 2px solid var(--text-secondary);
+  background: var(--bg-panel-header);
+  box-sizing: border-box;
+  transition: background 0.1s ease, border-color 0.1s ease;
+}
+.wa-thread.selecting .wa-msg.own.selected::before {
+  background: var(--accent, #06d6a0);
+  border-color: var(--accent, #06d6a0);
+  content: "✓";
+  color: #fff;
+  font-size: 13px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
+.wa-thread.selecting .wa-msg-kebab { display: none; }
+
+.wa-select-bar {
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  background: var(--bg-panel-header);
+  border-top: 1px solid var(--border-divider);
+  box-shadow: 0 -2px 8px rgba(0, 0, 0, 0.18);
+  font-size: 13px;
+}
+.wa-select-bar[hidden] { display: none; }
+.wa-select-bar .wa-select-count {
+  flex: 1;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+.wa-select-bar button {
+  background: transparent;
+  border: 1px solid var(--border-divider);
+  color: var(--text-primary);
+  padding: 5px 11px;
+  border-radius: 4px;
+  cursor: pointer;
+  font: inherit;
+}
+.wa-select-bar .wa-select-delete {
+  background: var(--red, #f15c6d);
+  border-color: var(--red, #f15c6d);
+  color: #fff;
+}
+.wa-select-bar .wa-select-delete[disabled] {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 /* ─── Media ──────────────────────────────────────────────────────── */

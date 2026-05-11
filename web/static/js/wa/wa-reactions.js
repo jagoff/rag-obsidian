@@ -26,12 +26,16 @@ let currentJID = null;
 export function setActiveJID(jid) {
   currentJID = jid;
   closeMenu();
+  // Switch de chat cancela el modo selección (evitar revoke crosss-chat
+  // por error si el user cambió de pestaña sin terminar la operación).
+  if (_selecting) exitSelectionMode();
 }
 
 export function attach(bodyEl) {
   if (!bodyEl) return;
 
   const startPress = (ev) => {
+    if (_selecting) return;
     const target = ev.target.closest && ev.target.closest(".wa-msg");
     if (!target || target.classList.contains("revoked")) return;
     // El click sobre el kebab tiene su propio handler; no arrancamos
@@ -56,6 +60,7 @@ export function attach(bodyEl) {
   // Right-click (contextmenu) — atajo desktop al mismo menu, evita
   // tener que mantener apretado 450ms.
   bodyEl.addEventListener("contextmenu", (ev) => {
+    if (_selecting) return;
     const target = ev.target.closest && ev.target.closest(".wa-msg");
     if (!target || target.classList.contains("revoked")) return;
     ev.preventDefault();
@@ -67,6 +72,7 @@ export function attach(bodyEl) {
   // abre el mismo menu. Delegated para que sirva con messages
   // renderizados después del attach.
   bodyEl.addEventListener("click", (ev) => {
+    if (_selecting) return;
     const kebab = ev.target.closest && ev.target.closest(".wa-msg-kebab");
     if (!kebab) return;
     ev.preventDefault();
@@ -156,6 +162,16 @@ function openMenu(msgEl, originEv) {
       doRevoke();
     });
     menuEl.appendChild(del);
+    const multi = document.createElement("button");
+    multi.className = "wa-reaction-delete";
+    multi.textContent = "Seleccionar varios…";
+    multi.title = "Marcar mensajes propios y eliminarlos en bulk";
+    multi.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      enterSelectionMode(msgEl);
+    });
+    menuEl.appendChild(multi);
   }
 
   // Posicionar arriba de la burbuja (o abajo si estamos cerca del top).
@@ -236,4 +252,160 @@ async function doRevoke() {
 
 function cssEscape(s) {
   return String(s).replace(/"/g, '\\"');
+}
+
+
+// ── Selection mode + bulk delete ─────────────────────────────────────
+// Modo "marcar varios y borrar de una". Se activa desde el menu kebab
+// con "Seleccionar varios…". Mientras está activo:
+//   - `.wa-thread.selecting` agrega visual feedback (checkmark a la
+//     izquierda de cada burbuja own).
+//   - Click sobre una burbuja `.wa-msg.own` toggle `.selected`.
+//   - El long-press / contextmenu / kebab quedan desactivados (el
+//     event handler chequea `_selecting`).
+//   - Un action bar fijo abajo del thread muestra "N seleccionados ·
+//     Eliminar (N) · Cancelar".
+// El delete itera `revoke()` (admin-auth.js inyecta el Bearer); en
+// error sigue con los siguientes y reporta al final.
+let _selecting = false;
+let _selectBar = null;
+const _selectedIds = new Set();
+
+export function isSelecting() {
+  return _selecting;
+}
+
+function enterSelectionMode(initialMsgEl) {
+  if (_selecting) return;
+  _selecting = true;
+  _selectedIds.clear();
+  closeMenu();
+  const thread = document.querySelector(".wa-thread");
+  if (thread) thread.classList.add("selecting");
+  // Pre-seleccionar la burbuja que abrió el menu.
+  if (initialMsgEl && initialMsgEl.classList.contains("own")) {
+    const id = initialMsgEl.dataset.id || "";
+    if (id) {
+      _selectedIds.add(id);
+      initialMsgEl.classList.add("selected");
+    }
+  }
+  mountSelectBar();
+  updateSelectBar();
+  // Listener para click sobre own bubbles. Lo bindeamos al body del
+  // thread para sobrevivir re-renders del lazy load.
+  const body = document.getElementById("wa-thread-body");
+  if (body && !body.__waSelectClickBound) {
+    body.addEventListener("click", onSelectClick, true);
+    body.__waSelectClickBound = true;
+  }
+}
+
+function exitSelectionMode() {
+  _selecting = false;
+  const thread = document.querySelector(".wa-thread");
+  if (thread) thread.classList.remove("selecting");
+  for (const el of document.querySelectorAll(".wa-msg.selected")) {
+    el.classList.remove("selected");
+  }
+  _selectedIds.clear();
+  if (_selectBar) _selectBar.hidden = true;
+}
+
+function onSelectClick(ev) {
+  if (!_selecting) return;
+  const target = ev.target.closest && ev.target.closest(".wa-msg.own");
+  if (!target || target.classList.contains("revoked")) return;
+  // Evitamos toggles cuando el user clickea sobre links / media / el
+  // botón delete del action bar (que vive fuera del thread body).
+  if (ev.target.closest(".wa-msg-kebab")) return;
+  ev.preventDefault();
+  ev.stopPropagation();
+  const id = target.dataset.id || "";
+  if (!id) return;
+  if (_selectedIds.has(id)) {
+    _selectedIds.delete(id);
+    target.classList.remove("selected");
+  } else {
+    _selectedIds.add(id);
+    target.classList.add("selected");
+  }
+  updateSelectBar();
+}
+
+function mountSelectBar() {
+  if (_selectBar) {
+    _selectBar.hidden = false;
+    return;
+  }
+  const thread = document.querySelector(".wa-thread");
+  if (!thread) return;
+  const bar = document.createElement("div");
+  bar.className = "wa-select-bar";
+  bar.innerHTML = `
+    <span class="wa-select-count">0 seleccionados</span>
+    <button type="button" class="wa-select-cancel">Cancelar</button>
+    <button type="button" class="wa-select-delete" disabled>Eliminar (0)</button>
+  `;
+  // Insertarlo antes del composer para que quede sobre éste.
+  const composer = thread.querySelector(".wa-composer");
+  if (composer) thread.insertBefore(bar, composer);
+  else thread.appendChild(bar);
+  bar.querySelector(".wa-select-cancel").addEventListener("click", () => {
+    exitSelectionMode();
+  });
+  bar.querySelector(".wa-select-delete").addEventListener("click", () => {
+    bulkRevoke();
+  });
+  _selectBar = bar;
+}
+
+function updateSelectBar() {
+  if (!_selectBar) return;
+  const n = _selectedIds.size;
+  _selectBar.querySelector(".wa-select-count").textContent =
+    `${n} seleccionado${n === 1 ? "" : "s"}`;
+  const del = _selectBar.querySelector(".wa-select-delete");
+  del.textContent = `Eliminar (${n})`;
+  del.disabled = n === 0;
+}
+
+async function bulkRevoke() {
+  if (!currentJID || _selectedIds.size === 0) return;
+  const ids = [..._selectedIds];
+  if (!window.confirm(
+    `Eliminar ${ids.length} mensaje${ids.length === 1 ? "" : "s"} para todos? No se puede deshacer.`,
+  )) return;
+  const delBtn = _selectBar?.querySelector(".wa-select-delete");
+  if (delBtn) {
+    delBtn.disabled = true;
+    delBtn.textContent = `Eliminando…`;
+  }
+  let ok = 0;
+  const errors = [];
+  for (const id of ids) {
+    try {
+      await revoke(currentJID, id);
+      ok += 1;
+      const el = document.querySelector(`.wa-msg[data-id="${cssEscape(id)}"]`);
+      if (el) {
+        el.classList.remove("selected");
+        el.classList.add("revoked");
+        el.innerHTML = "🚫 Este mensaje fue eliminado";
+      }
+    } catch (e) {
+      errors.push(`${id}: ${e.message}`);
+    }
+  }
+  exitSelectionMode();
+  if (errors.length) {
+    const detail = errors.slice(0, 3).join("\n");
+    const extra = errors.length > 3 ? `\n…y ${errors.length - 3} más` : "";
+    const auth = errors.some((e) => /401/.test(e))
+      ? "\n(¿este device sin admin token? probá desde localhost / ra.ai)"
+      : "";
+    window.alert(
+      `Eliminados ${ok}/${ids.length}. Fallaron ${errors.length}:\n${detail}${extra}${auth}`,
+    );
+  }
 }

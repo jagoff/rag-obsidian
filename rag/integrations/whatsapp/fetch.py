@@ -404,6 +404,40 @@ def _wa_chat_label(raw_name: str, jid: str) -> str:
     return f"Contacto …{tail}" if tail else "Contacto"
 
 
+def _wa_display_name(jid: str, raw_name: str = "") -> str:
+    """JID → nombre legible para UI. Prefiere el contact note del vault
+    (`99-obsidian/99-Contacts/<Name>.md`, con frontmatter `wa_jid`) sobre
+    el `push_name` que vino del bridge; muchos peers no setean push_name
+    y el bridge guarda solo el número de teléfono, que termina en la UI
+    como "5493425…" en vez de "Mama".
+
+    Fallback chain: contact note → bridge name (vía `_wa_chat_label`) →
+    `Contacto …<last4>`. Cache mtime-aware del side de `_lookup_contact_name`,
+    no agrega I/O por mensaje en threads grandes.
+
+    El bridge guarda el `sender` de mensajes de grupo a veces como JID
+    completo (`123@lid` / `123@s.whatsapp.net`) y a veces como bare
+    local-part (`123`). Probamos las 3 variantes para que el lookup
+    pegue tanto a contact notes con `wa_jid: 123@lid` como con `wa_jid:
+    123@s.whatsapp.net`.
+    """
+    if jid:
+        try:
+            from rag.integrations.whatsapp.voice_notes import (  # noqa: PLC0415
+                _lookup_contact_name,
+            )
+            candidates = [jid]
+            if "@" not in jid:
+                candidates.extend([f"{jid}@lid", f"{jid}@s.whatsapp.net"])
+            for cand in candidates:
+                name = _lookup_contact_name(cand)
+                if name:
+                    return name
+        except Exception:
+            pass
+    return _wa_chat_label(raw_name, jid)
+
+
 def _fetch_whatsapp_window(
     since_ts: datetime | None,
     now_ts: datetime,
@@ -811,7 +845,7 @@ def list_chats_for_ui(
         for r in chat_rows:
             jid = r["jid"] or ""
             name = (r["name"] or "").strip()
-            label = _wa_chat_label(name, jid)
+            label = _wa_display_name(jid, name)
             if label.startswith("Contacto …") and not any(ch.isalpha() for ch in name):
                 continue
             last_content = (r["last_content"] or "").strip().replace("\n", " ")
@@ -889,7 +923,7 @@ def fetch_thread_for_ui(
             "SELECT name FROM chats WHERE jid = ? LIMIT 1", (jid,)
         ).fetchone()
         chat_name = (chat_row["name"] or "") if chat_row else ""
-        label = _wa_chat_label(chat_name, jid)
+        label = _wa_display_name(jid, chat_name)
         is_group = jid.endswith("@g.us")
 
         where_clauses = ["m.chat_jid = ?", "m.chat_jid != ?"]
@@ -989,7 +1023,17 @@ def fetch_thread_for_ui(
             msg_id = r["id"] or ""
             is_from_me = bool(r["is_from_me"])
             sender_raw = (r["sender"] or "").strip()
-            sender_label = "yo" if is_from_me else (sender_raw.split("@")[0] or label)
+            if is_from_me:
+                sender_label = "yo"
+            elif sender_raw:
+                # Resolver participante del grupo contra contact notes:
+                # antes salía "5493425…" como label; ahora si hay nota
+                # `99-Contacts/<Name>.md` con ese `wa_jid` mostramos el
+                # nombre. `_wa_display_name` ya prueba el bare/lid/s.wa
+                # variants y cae a "Contacto …last4" si nada matchea.
+                sender_label = _wa_display_name(sender_raw, "")
+            else:
+                sender_label = label
             content = (r["content"] or "").strip().replace("\n", " ")
             media = (r["media_type"] or "").strip()
             filename = (r["filename"] or "").strip()
@@ -1046,7 +1090,7 @@ def fetch_thread_for_ui(
                 "id": f"call:{c['call_id']}",
                 "ts": _normalize_bridge_ts(c["sort_ts"] or c["offered_ts"] or ""),
                 "sender": c["from_jid"] or "",
-                "sender_label": (c["from_jid"] or "").split("@")[0] or label,
+                "sender_label": _wa_display_name(c["from_jid"] or "", "") or label,
                 "content": content,
                 "is_from_me": False,
                 "media_type": "call",

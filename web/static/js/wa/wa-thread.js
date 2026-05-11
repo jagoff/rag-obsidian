@@ -331,7 +331,9 @@ function renderMsg(m, ctx) {
   t.textContent = formatTime(m.ts);
   div.appendChild(t);
 
-  // Reactions
+  // Reactions: un chip por emoji con su count. Se wrappean a múltiples
+  // líneas si hay muchas (antes salían pegoteadas como "❤️ 👍 😂 …" en
+  // una sola línea, reportado 2026-05-11 "se ven horribles").
   if (m.reactions && m.reactions.length > 0) {
     const r = document.createElement("div");
     r.className = "wa-msg-reactions";
@@ -339,9 +341,21 @@ function renderMsg(m, ctx) {
     for (const rx of m.reactions) {
       grouped[rx.emoji] = (grouped[rx.emoji] || 0) + 1;
     }
-    r.textContent = Object.entries(grouped)
-      .map(([e, n]) => (n > 1 ? `${e}${n}` : e))
-      .join(" ");
+    for (const [emoji, n] of Object.entries(grouped)) {
+      const chip = document.createElement("span");
+      chip.className = "wa-reaction-chip";
+      const em = document.createElement("span");
+      em.className = "wa-reaction-emoji";
+      em.textContent = emoji;
+      chip.appendChild(em);
+      if (n > 1) {
+        const c = document.createElement("span");
+        c.className = "wa-reaction-count";
+        c.textContent = String(n);
+        chip.appendChild(c);
+      }
+      r.appendChild(chip);
+    }
     div.appendChild(r);
   }
 

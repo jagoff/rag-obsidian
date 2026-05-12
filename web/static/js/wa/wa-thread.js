@@ -1,7 +1,7 @@
 // Render del thread (hilo de un chat). Reverse-pagination on scroll-top.
 // Day-dividers entre mensajes de días distintos.
 
-import { fetchThread, markRead } from "./wa-api.js";
+import { fetchThread, markRead, setSenderOverride } from "./wa-api.js";
 import { tintHeaderFromAvatar } from "./wa-liquid-glass.js";
 import { renderInto as renderAvatar } from "./wa-avatars.js";
 import * as composer from "./wa-composer.js";
@@ -36,6 +36,40 @@ export function init({ bodyEl, emptyEl, nameEl, avatarEl, presenceEl, composerEl
     els.body.addEventListener("dblclick", (ev) => {
       const msgEl = ev.target.closest && ev.target.closest(".wa-msg");
       if (msgEl) startReplyTo(msgEl);
+    });
+    // Click sobre un sender label "Contacto …last4" → prompt para
+    // nombrarlo manualmente. Persistido en wa_sender_overrides.json,
+    // aplica retroactivo a todos los msgs (FE re-fetch).
+    els.body.addEventListener("click", async (ev) => {
+      const senderEl = ev.target.closest && ev.target.closest(".wa-msg-sender-unknown");
+      if (!senderEl) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      const jid = senderEl.dataset.senderJid;
+      if (!jid) return;
+      const current = senderEl.textContent;
+      const name = window.prompt(
+        `¿Quién es este contacto?\n\nJID: ${jid}\nLabel actual: ${current}\n\nEscribí el nombre (o vacío para cancelar):`,
+        "",
+      );
+      if (name === null) return; // Cancel
+      const clean = (name || "").trim();
+      if (!clean) return;
+      try {
+        await setSenderOverride(jid, clean);
+        // Re-fetch del thread para que los nuevos labels surtan efecto.
+        if (currentJID) {
+          const refreshed = await fetchThread(currentJID, { limit: 50 });
+          if (els.body) {
+            els.body.innerHTML = "";
+            renderMessages(refreshed.messages || [], refreshed, false);
+            snapToLastMessage();
+          }
+        }
+      } catch (e) {
+        console.error("[wa-thread] sender override failed", e);
+        window.alert("No se pudo guardar el override: " + e.message);
+      }
     });
   }
   composer.init({
@@ -367,6 +401,13 @@ function renderMsg(m, ctx) {
     const sender = document.createElement("div");
     sender.className = "wa-msg-sender";
     sender.textContent = m.is_from_me ? "Yo" : m.sender_label;
+    // Si el label es "Contacto …last4" (sistema no pudo resolver),
+    // marcar clickeable + tooltip para que el user lo nombre manual.
+    if (!m.is_from_me && /^Contacto …/.test(m.sender_label) && m.sender) {
+      sender.classList.add("wa-msg-sender-unknown");
+      sender.title = `Click para nombrar este contacto (${m.sender})`;
+      sender.dataset.senderJid = m.sender.includes("@") ? m.sender : `${m.sender}@lid`;
+    }
     div.appendChild(sender);
   }
 

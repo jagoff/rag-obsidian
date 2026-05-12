@@ -4148,6 +4148,53 @@ def wa_chats(
     return {"chats": chats, "next_before_ts": next_before_ts}
 
 
+class _WASenderOverrideRequest(BaseModel):
+    jid: str
+    name: str | None = None  # null/empty → remove override
+
+
+@app.post("/api/wa/sender-override")
+def wa_sender_override(req: _WASenderOverrideRequest) -> dict:
+    """Edita `~/.config/obsidian-rag/wa_sender_overrides.json`. El user
+    asigna manualmente un display name a un JID que el sistema no
+    pudo auto-resolver (LIDs sin push_name + sin Apple Contacts match).
+
+    Body `{jid, name}`:
+    - `name` con valor → set/update override.
+    - `name` null/empty → remove override para ese jid.
+
+    Idempotente. Mtime-cache del loader detecta el cambio en el
+    próximo `_wa_display_name` call (sin restart).
+    """
+    import json as _json
+    from pathlib import Path as _Path  # noqa: PLC0415
+
+    if not req.jid or "@" not in req.jid:
+        raise HTTPException(status_code=400, detail="jid inválido")
+    name = (req.name or "").strip()
+
+    path = _Path.home() / ".config/obsidian-rag/wa_sender_overrides.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {}
+    if path.is_file():
+        try:
+            data = _json.loads(path.read_text(encoding="utf-8") or "{}")
+            if not isinstance(data, dict):
+                data = {}
+        except Exception:
+            data = {}
+    if name:
+        data[req.jid] = name
+    else:
+        data.pop(req.jid, None)
+    path.write_text(
+        _json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return {"ok": True, "jid": req.jid, "name": name or None,
+            "total_overrides": len(data)}
+
+
 @app.post("/api/wa/chats/{jid}/archive")
 def wa_chat_archive(jid: str) -> dict:
     """Archiva un chat — sale del sidebar default, accesible solo desde

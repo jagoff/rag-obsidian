@@ -468,11 +468,17 @@ def _wa_display_name(jid: str, raw_name: str = "") -> str:
     Para (3) probamos las 3 variantes del jid (raw, @lid, @s.wa).
     """
     # (0) Override file — manual mapping del user. Mtime-cached.
+    # Probamos 3 variantes del jid (raw, @lid, @s.whatsapp.net) porque
+    # el bridge guarda senders de grupos a veces bare, a veces full.
     if jid:
         try:
-            override = _load_sender_overrides().get(jid)
-            if override:
-                return override
+            ov = _load_sender_overrides()
+            candidates = [jid]
+            if "@" not in jid:
+                candidates.extend([f"{jid}@lid", f"{jid}@s.whatsapp.net"])
+            for cand in candidates:
+                if ov.get(cand):
+                    return ov[cand]
         except Exception:
             pass
     name = (raw_name or "").strip()

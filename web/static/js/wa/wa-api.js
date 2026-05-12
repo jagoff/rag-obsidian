@@ -108,6 +108,17 @@ export async function unarchiveChat(jid) {
   return r.json();
 }
 
+export async function setSenderOverride(jid, name) {
+  const r = await fetch("/api/wa/sender-override", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    credentials: "same-origin",
+    body: JSON.stringify({ jid, name: name || null }),
+  });
+  if (!r.ok) throw new Error(`sender-override ${r.status}`);
+  return r.json();
+}
+
 export async function toneShift(text, tone) {
   const r = await fetch("/api/wa/tone-shift", {
     method: "POST",

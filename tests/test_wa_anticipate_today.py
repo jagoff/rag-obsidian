@@ -29,13 +29,11 @@ from rag.anticipatory import AnticipatoryCandidate  # noqa: E402
 def _reset_cache(monkeypatch):
     """Reset cache in-process antes de cada test. Sin esto, un test que
     cachea candidates filtra al siguiente."""
-    _web_server._WZP_ANTICIPATE_CACHE["ts"] = 0.0
-    _web_server._WZP_ANTICIPATE_CACHE["candidates"] = []
+    _web_server._WZP_ANTICIPATE_CACHE._cache = {"ts": 0.0, "payload": None}
     # Asegurar que el flag de disabled no contamine
     monkeypatch.delenv("RAG_ANTICIPATE_DISABLED", raising=False)
     yield
-    _web_server._WZP_ANTICIPATE_CACHE["ts"] = 0.0
-    _web_server._WZP_ANTICIPATE_CACHE["candidates"] = []
+    _web_server._WZP_ANTICIPATE_CACHE._cache = {"ts": 0.0, "payload": None}
 
 
 @pytest.fixture()

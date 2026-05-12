@@ -444,6 +444,49 @@ function renderMsg(m, ctx) {
     return div;
   }
 
+  // Avatar wrapper para mensajes inbound (no propios)
+  // El avatar ocupa ambas líneas: sender + contenido
+  const avatarWrapper = !m.is_from_me && m.sender ? document.createElement("div") : null;
+  if (avatarWrapper) {
+    avatarWrapper.className = "wa-msg-avatar-wrapper";
+    const avatar = document.createElement("div");
+    avatar.className = "wa-msg-sender-avatar";
+    const initials = m.sender_label ? m.sender_label.slice(0, 2).toUpperCase() : "??";
+    // Usar el JID completo para buscar el avatar en Apple Contacts
+    const jid = m.sender.includes("@") ? m.sender : `${m.sender}@s.whatsapp.net`;
+
+    // Intentar cargar avatar directamente desde el bridge de WhatsApp
+    const img = document.createElement("img");
+    img.style.width = "100%";
+    img.style.height = "100%";
+    img.style.objectFit = "cover";
+    img.style.display = "block";
+    img.alt = m.sender_label || "Avatar";
+    img.referrerPolicy = "no-referrer";
+
+    // Primero intentar desde Apple Contacts
+    img.src = `/api/wa/avatar/${encodeURIComponent(jid)}?name=${encodeURIComponent(m.sender_label || "")}`;
+
+    // Si falla, intentar desde el bridge de WhatsApp
+    img.onerror = () => {
+      img.src = `/api/avatar?jid=${encodeURIComponent(jid)}`;
+      // Fallback a iniciales si ambas fuentes fallan
+      img.onerror = () => {
+        avatar.innerHTML = `<span style="font-size:12px;font-weight:600;color:var(--text-primary)">${initials}</span>`;
+      };
+    };
+
+    avatar.appendChild(img);
+    avatarWrapper.appendChild(avatar);
+  }
+
+  const contentWrapper = avatarWrapper ? document.createElement("div") : div;
+  if (avatarWrapper) {
+    contentWrapper.className = "wa-msg-content";
+    avatarWrapper.appendChild(contentWrapper);
+    div.appendChild(avatarWrapper);
+  }
+
   // Sender label arriba de cada mensaje (inbound + outbound). Pedido
   // user 2026-05-11: en propios va "Yo" como label uniforme; en
   // inbound el nombre resuelto via push_name → Apple Contacts → vault.
@@ -458,7 +501,7 @@ function renderMsg(m, ctx) {
       sender.title = `Click para nombrar este contacto (${m.sender})`;
       sender.dataset.senderJid = m.sender.includes("@") ? m.sender : `${m.sender}@lid`;
     }
-    div.appendChild(sender);
+    contentWrapper.appendChild(sender);
   }
 
   // Quoted reply
@@ -466,33 +509,33 @@ function renderMsg(m, ctx) {
     const q = document.createElement("div");
     q.className = "wa-msg-quoted";
     q.textContent = m.quoted.text || `↩ msg ${m.quoted.id.slice(0, 8)}…`;
-    div.appendChild(q);
+    contentWrapper.appendChild(q);
   }
 
   // Media render (Fase 7) — solo si tenemos `id` real (no pending optimistic).
   if (m.media_type && m.id && !String(m.id).startsWith("tmp-") && !m.pending) {
     const mediaMsg = { ...m, jid: currentJID, chat_jid: currentJID };
-    media.renderInto(div, mediaMsg);
+    media.renderInto(contentWrapper, mediaMsg);
   } else if (m.media_type) {
     // Fallback hint mientras está pending (sin id real).
     const hint = document.createElement("div");
     hint.className = "wa-msg-media-hint";
     hint.textContent = `[${m.media_type}${m.filename ? `: ${m.filename}` : ""}]`;
-    div.appendChild(hint);
+    contentWrapper.appendChild(hint);
   }
 
   // Content
   if (m.content) {
     const body = document.createElement("span");
     body.textContent = m.content;
-    div.appendChild(body);
+    contentWrapper.appendChild(body);
   }
 
   // Time
   const t = document.createElement("span");
   t.className = "wa-msg-time";
   t.textContent = formatTime(m.ts);
-  div.appendChild(t);
+  contentWrapper.appendChild(t);
 
   // Reactions: un chip por emoji con su count. Se wrappean a múltiples
   // líneas si hay muchas (antes salían pegoteadas como "❤️ 👍 😂 …" en
@@ -519,7 +562,7 @@ function renderMsg(m, ctx) {
       }
       r.appendChild(chip);
     }
-    div.appendChild(r);
+    contentWrapper.appendChild(r);
   }
 
   // Affordances hover (trash + select) en CUALQUIER burbuja (own +

@@ -83,7 +83,7 @@
   font-style: normal;
   font-weight: 100 900;
   font-display: swap;
-  src: url("https://fonts.bunny.net/inter/files/inter-latin-wght-normal.woff2") format("woff2-variations");
+  src: url("https://fonts.gstatic.com/s/inter/v13/UcC73FwrK3iLTeHuS_fvQtMwCp50KnMa1ZL7.woff2") format("woff2");
 }
 
 html {
@@ -169,6 +169,9 @@ button { cursor: pointer; }
   /* Banda lateral de marco a cada lado, estilo desktop WA. En mobile
    * la banda se colapsa (ver media query abajo). */
   padding: 0;
+  /* Safe areas para iPhone 16 Pro Max (Dynamic Island + home indicator) */
+  padding-left: env(safe-area-inset-left, 0);
+  padding-right: env(safe-area-inset-right, 0);
 }
 
 /* ─── Sidebar ────────────────────────────────────────────────────── */
@@ -201,6 +204,8 @@ button { cursor: pointer; }
   align-items: center;
   justify-content: space-between;
   padding: 0 16px;
+  /* Safe area para iPhone 16 Pro Max Dynamic Island */
+  padding-top: env(safe-area-inset-top, 0);
   gap: 12px;
   position: relative;
   z-index: 5;
@@ -391,7 +396,7 @@ button { cursor: pointer; }
   padding: 0;
   flex: 1;
   overflow-y: auto;
-  overflow-x: hidden;
+  overflow-x: visible;
 }
 .wa-chatlist-loading {
   flex-shrink: 0;
@@ -644,15 +649,20 @@ body.archived-mode .wa-sidebar-header { box-shadow: inset 0 -2px 0 var(--accent,
   font-weight: 600;
   letter-spacing: -0.01em;
   flex-shrink: 0;
-  overflow: hidden;
   user-select: none;
   position: relative;
   box-shadow:
     0 1px 2px rgba(0, 0, 0, 0.18),
     inset 0 0 0 0.5px rgba(255, 255, 255, 0.08);
-  transition: transform 0.18s cubic-bezier(0.34, 1.56, 0.64, 1);
+  transition: all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+  z-index: 1;
 }
-.wa-chat-item:hover .wa-chat-avatar { transform: scale(1.04); }
+.wa-chat-avatar:hover {
+  box-shadow:
+    0 4px 12px rgba(0, 0, 0, 0.3),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.15);
+  z-index: 10;
+}
 .wa-chat-avatar img {
   width: 100%;
   height: 100%;
@@ -739,6 +749,8 @@ body.archived-mode .wa-sidebar-header { box-shadow: inset 0 -2px 0 var(--accent,
   justify-content: space-between;
   gap: 10px;
   font-size: 11px;
+  /* Safe area para iPhone 16 Pro Max home indicator */
+  padding-bottom: calc(0px + env(safe-area-inset-bottom, 0px));
   color: var(--text-secondary);
   letter-spacing: 0.3px;
   text-transform: uppercase;
@@ -786,6 +798,8 @@ body.archived-mode .wa-sidebar-header { box-shadow: inset 0 -2px 0 var(--accent,
   border-bottom: 1px solid var(--border-glass);
   position: relative;
   z-index: 5;
+  /* Safe area para iPhone 16 Pro Max Dynamic Island */
+  padding-top: env(safe-area-inset-top, 0);
 }
 .wa-back-btn {
   background: transparent;
@@ -821,7 +835,6 @@ body.archived-mode .wa-sidebar-header { box-shadow: inset 0 -2px 0 var(--accent,
     inset 0 0 0 0.5px rgba(255, 255, 255, 0.08);
   transition: transform 0.22s cubic-bezier(0.34, 1.56, 0.64, 1);
 }
-.wa-thread-avatar:hover { transform: scale(1.05); }
 .wa-thread-avatar img {
   width: 100%;
   height: 100%;
@@ -1055,6 +1068,35 @@ body.archived-mode .wa-sidebar-header { box-shadow: inset 0 -2px 0 var(--accent,
   font-weight: 600;
   color: var(--link);
   margin-bottom: 2px;
+}
+.wa-msg-avatar-wrapper {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+}
+.wa-msg-avatar-wrapper .wa-msg-sender-avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
+  background: var(--bg-input);
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+}
+.wa-msg-avatar-wrapper .wa-msg-sender-avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.wa-msg-avatar-wrapper .wa-msg-content {
+  flex: 1;
+  min-width: 0;
 }
 /* "Contacto …last4" → clickeable para nombrar manualmente. Dashed
    underline + cursor pointer + hint visual al hover. */
@@ -1529,6 +1571,8 @@ body.archived-mode .wa-sidebar-header { box-shadow: inset 0 -2px 0 var(--accent,
   border-top: 1px solid var(--border-glass);
   position: relative;
   z-index: 5;
+  /* Safe area para iPhone 16 Pro Max home indicator */
+  padding-bottom: calc(10px + env(safe-area-inset-bottom, 0px));
 }
 .wa-composer.idle { opacity: 0.65; }
 .wa-composer.dragging { outline: 2px dashed var(--accent); outline-offset: -8px; }
@@ -2950,6 +2994,22 @@ body.archived-mode .wa-sidebar-header { box-shadow: inset 0 -2px 0 var(--accent,
   font-style: italic;
   line-height: 1.4;
 }
+.wa-anticipate-source-row {
+  margin: 0 0 8px;
+}
+.wa-anticipate-source {
+  font-size: 11.5px;
+  color: var(--cyan);
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  transition: color 0.15s ease;
+}
+.wa-anticipate-source:hover {
+  color: var(--cyan-hover, #06cf9c);
+  text-decoration: underline;
+}
 
 .wa-anticipate-actions {
   display: flex;
@@ -3477,6 +3537,10 @@ body.archived-mode .wa-sidebar-header { box-shadow: inset 0 -2px 0 var(--accent,
   border: 1px solid rgba(255, 200, 100, 0.30);
   color: var(--text-primary);
   animation: wa-mood-fadein 200ms ease;
+}
+
+.wa-mood-check-banner[hidden] {
+  display: none !important;
 }
 
 .wa-mood-check-banner.sev-high {

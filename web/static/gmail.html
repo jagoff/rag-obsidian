@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="es-AR" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>rag · gmail</title>
+  <link rel="stylesheet" href="/static/style.css?v=2026-04-28-darker-bg">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" type="image/png" sizes="32x32" href="/static/pwa/favicon-32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/static/pwa/favicon-16.png">
+  <link rel="apple-touch-icon" href="/static/pwa/apple-touch-icon.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="rag·gmail">
+  <meta name="theme-color" content="#0a0e14">
+  <script>
+    // Restaurar theme antes del primer paint para evitar flash.
+    (function () {
+      try {
+        var t = localStorage.getItem("rag-theme") || "dark";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {
+        document.documentElement.setAttribute("data-theme", "dark");
+      }
+    })();
+  </script>
+  <script src="/static/pwa/register-sw.js" defer></script>
+  <script src="/static/admin-auth.js"></script>
+  <style>
+    body {
+      overflow-x: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "SF Mono", "Menlo", "Monaco", "JetBrains Mono", ui-monospace, monospace;
+      font-size: 13px;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 80px 20px 60px;
+    }
+
+    header {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 28px;
+      padding: 14px 0 16px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    header h1 {
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--cyan);
+    }
+
+    header h1 span { color: var(--text-faint); font-weight: 400; }
+
+    .header-meta {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      font-size: 12px;
+      color: var(--text-dim);
+    }
+
+    .header-meta a {
+      color: var(--cyan-dim);
+      text-decoration: none;
+    }
+    .header-meta a:hover { color: var(--cyan); }
+
+    .refresh-btn {
+      background: var(--bg-elev);
+      color: var(--text);
+      border: 1px solid var(--border);
+      padding: 6px 12px;
+      font-family: inherit;
+      font-size: 12px;
+      cursor: pointer;
+      border-radius: 4px;
+    }
+    .refresh-btn:hover { border-color: var(--cyan); color: var(--cyan); }
+    .refresh-btn:disabled { opacity: 0.5; cursor: progress; }
+
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+      margin-bottom: 28px;
+    }
+
+    .stat-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .stat-label {
+      font-size: 11px;
+      color: var(--text-faint);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .stat-value {
+      font-size: 28px;
+      font-weight: 700;
+      color: var(--text);
+      line-height: 1.1;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .stat-value.cyan { color: var(--cyan); }
+    .stat-value.yellow { color: var(--yellow); }
+    .stat-value.green { color: var(--green); }
+
+    .section {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 18px;
+      margin-bottom: 16px;
+    }
+
+    .section h2 {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      margin-bottom: 14px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .section h2 .count {
+      background: var(--bg-elev);
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      color: var(--text-faint);
+    }
+
+    .email-list {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+    }
+
+    .email-item {
+      padding: 12px 0;
+      border-bottom: 1px solid var(--sep);
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .email-item:last-child { border-bottom: none; }
+
+    .email-header {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+    }
+
+    .email-subject {
+      font-weight: 600;
+      color: var(--text);
+      flex: 1;
+    }
+
+    .email-from {
+      color: var(--text-dim);
+      font-size: 12px;
+    }
+
+    .email-date {
+      color: var(--text-faint);
+      font-size: 11px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .email-snippet {
+      color: var(--text-dim);
+      font-size: 12px;
+      line-height: 1.4;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+    }
+
+    .email-link {
+      color: var(--cyan);
+      text-decoration: none;
+      font-size: 11px;
+      margin-top: 4px;
+    }
+    .email-link:hover { text-decoration: underline; }
+
+    .empty {
+      color: var(--text-faint);
+      font-size: 12px;
+      padding: 20px 0;
+      text-align: center;
+      font-style: italic;
+    }
+
+    .error {
+      padding: 16px;
+      background: color-mix(in srgb, var(--red) 10%, transparent);
+      border: 1px solid var(--red);
+      border-radius: 4px;
+      color: var(--red);
+      font-size: 13px;
+      margin-bottom: 16px;
+    }
+
+    .loading {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--text-faint);
+      font-size: 12px;
+      padding: 20px 0;
+    }
+    .loading::before {
+      content: "";
+      width: 16px;
+      height: 16px;
+      border: 2px solid var(--border);
+      border-top-color: var(--cyan);
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    @media (max-width: 640px) {
+      .container { padding: 64px 12px 40px; }
+      header { flex-wrap: wrap; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>rag <span>· gmail</span></h1>
+      <div class="header-meta">
+        <a href="/home">home →</a>
+        <a href="/dashboard">dashboard →</a>
+        <a href="/wzp">wzp →</a>
+        <button class="refresh-btn" id="refresh-btn">refresh</button>
+      </div>
+    </header>
+
+    <div id="error-wrap"></div>
+    <div id="loading-wrap" class="loading">cargando…</div>
+
+    <div class="stats" id="stats" hidden>
+      <div class="stat-card">
+        <div class="stat-label">Unread</div>
+        <div class="stat-value cyan" id="unread-count">–</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Starred</div>
+        <div class="stat-value yellow" id="starred-count">–</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Awaiting Reply</div>
+        <div class="stat-value green" id="awaiting-count">–</div>
+      </div>
+    </div>
+
+    <div class="section" id="section-recent" hidden>
+      <h2>Recent <span class="count" id="recent-count">0</span></h2>
+      <ul class="email-list" id="recent-list"></ul>
+    </div>
+
+    <div class="section" id="section-starred" hidden>
+      <h2>Starred <span class="count" id="starred-section-count">0</span></h2>
+      <ul class="email-list" id="starred-list"></ul>
+    </div>
+
+    <div class="section" id="section-awaiting" hidden>
+      <h2>Awaiting Reply <span class="count" id="awaiting-section-count">0</span></h2>
+      <ul class="email-list" id="awaiting-list"></ul>
+    </div>
+  </div>
+
+  <script>
+    const API = '/api/gmail';
+    const refreshBtn = document.getElementById('refresh-btn');
+    const loadingWrap = document.getElementById('loading-wrap');
+    const errorWrap = document.getElementById('error-wrap');
+    const stats = document.getElementById('stats');
+
+    function formatDate(ms) {
+      if (!ms) return '';
+      const d = new Date(parseInt(ms));
+      return d.toLocaleDateString('es-AR', { month: 'short', day: 'numeric' });
+    }
+
+    function formatDaysOld(days) {
+      if (!days) return '';
+      if (days < 1) return 'hoy';
+      if (days < 2) return 'ayer';
+      return `${Math.round(days)}d`;
+    }
+
+    function renderEmailList(items, containerId) {
+      const container = document.getElementById(containerId);
+      if (!items || items.length === 0) {
+        container.innerHTML = '<li class="empty">no hay correos</li>';
+        return;
+      }
+      container.innerHTML = items.map(email => `
+        <li class="email-item">
+          <div class="email-header">
+            <span class="email-subject">${email.subject || '(sin asunto)'}</span>
+            <span class="email-from">${email.from || ''}</span>
+            <span class="email-date">${formatDate(email.internal_date_ms)}</span>
+          </div>
+          <div class="email-snippet">${email.snippet || ''}</div>
+          <a class="email-link" href="https://mail.google.com/mail/#all/${email.thread_id}" target="_blank" rel="noopener">
+            abrir en Gmail →
+          </a>
+        </li>
+      `).join('');
+    }
+
+    async function loadGmail(refresh = false) {
+      loadingWrap.hidden = false;
+      errorWrap.innerHTML = '';
+      stats.hidden = true;
+      
+      try {
+        const url = refresh ? `${API}?refresh=1` : API;
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+
+        loadingWrap.hidden = true;
+        stats.hidden = false;
+
+        // Stats
+        document.getElementById('unread-count').textContent = data.unread_count || 0;
+        document.getElementById('starred-count').textContent = (data.starred || []).length;
+        document.getElementById('awaiting-count').textContent = (data.awaiting_reply || []).length;
+
+        // Recent
+        const recentSection = document.getElementById('section-recent');
+        if (data.recent && data.recent.length > 0) {
+          recentSection.hidden = false;
+          document.getElementById('recent-count').textContent = data.recent.length;
+          renderEmailList(data.recent, 'recent-list');
+        } else {
+          recentSection.hidden = true;
+        }
+
+        // Starred
+        const starredSection = document.getElementById('section-starred');
+        if (data.starred && data.starred.length > 0) {
+          starredSection.hidden = false;
+          document.getElementById('starred-section-count').textContent = data.starred.length;
+          renderEmailList(data.starred, 'starred-list');
+        } else {
+          starredSection.hidden = true;
+        }
+
+        // Awaiting
+        const awaitingSection = document.getElementById('section-awaiting');
+        if (data.awaiting_reply && data.awaiting_reply.length > 0) {
+          awaitingSection.hidden = false;
+          document.getElementById('awaiting-section-count').textContent = data.awaiting_reply.length;
+          renderEmailList(data.awaiting_reply, 'awaiting-list');
+        } else {
+          awaitingSection.hidden = true;
+        }
+
+        // All empty
+        if ((!data.recent || data.recent.length === 0) &&
+            (!data.starred || data.starred.length === 0) &&
+            (!data.awaiting_reply || data.awaiting_reply.length === 0)) {
+          errorWrap.innerHTML = '<div class="error">No se encontraron correos. Verifica que tengas credenciales de Gmail configuradas.</div>';
+        }
+
+      } catch (err) {
+        loadingWrap.hidden = true;
+        errorWrap.innerHTML = `<div class="error">Error: ${err.message}</div>`;
+      }
+    }
+
+    refreshBtn.addEventListener('click', () => loadGmail(true));
+    loadGmail();
+  </script>
+</body>
+</html>

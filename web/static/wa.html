@@ -4,8 +4,8 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <title>rag · wzp</title>
-  <link rel="stylesheet" href="/static/wa.css?v=51">
-  <link rel="manifest" href="/static/manifest.webmanifest">
+  <link rel="stylesheet" href="/static/wa.css?v=53">
+  <link rel="manifest" href="/static/manifest-wzp.webmanifest">
   <link rel="icon" type="image/png" sizes="32x32" href="/static/pwa/favicon-32.png">
   <link rel="icon" type="image/png" sizes="16x16" href="/static/pwa/favicon-16.png">
   <link rel="apple-touch-icon" href="/static/pwa/apple-touch-icon.png">
@@ -116,19 +116,17 @@
         <button class="wa-back-btn" id="wa-back-btn" aria-label="Volver a chats">←</button>
         <div class="wa-thread-avatar" id="wa-thread-avatar" aria-hidden="true"></div>
         <div class="wa-thread-meta">
-          <div class="wa-thread-name" id="wa-thread-name">elegí un chat</div>
+          <div class="wa-thread-name" id="wa-thread-name"></div>
           <div class="wa-thread-presence" id="wa-thread-presence"></div>
         </div>
       </header>
       <div class="wa-thread-body" id="wa-thread-body">
-        <div class="wa-empty-state" id="wa-empty-state">
-          <p>seleccioná un chat del panel izquierdo para empezar a leer.</p>
-        </div>
+        <div class="wa-empty-state" id="wa-empty-state"></div>
       </div>
       <footer class="wa-composer idle" id="wa-composer">
         <textarea
           id="wa-composer-input"
-          placeholder="elegí un chat para escribir"
+          placeholder=""
           rows="1"
         ></textarea>
         <div class="wa-composer-kbd" aria-hidden="true">
@@ -188,6 +186,6 @@
        borrar mensajes propios). Loopback-only — un device LAN/tunnel
        no recibe el token y el delete falla server-side con 401. -->
   <script src="/static/admin-auth.js"></script>
-  <script type="module" src="/static/js/wa/wa.js?v=49"></script>
+  <script type="module" src="/static/js/wa/wa.js?v=50"></script>
 </body>
 </html>

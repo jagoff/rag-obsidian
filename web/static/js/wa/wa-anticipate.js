@@ -175,7 +175,7 @@ function render(data) {
     return;
   }
   if (!_candidates.length) {
-    body.innerHTML = `<div class="wa-anticipate-empty">🌤 sin novedades — revisamos en 10 min</div>`;
+    body.innerHTML = `<div class="wa-anticipate-empty">nada pendiente por ahora</div>`;
     return;
   }
   body.innerHTML = _candidates.map(renderCard).join("");
@@ -191,12 +191,16 @@ function renderCard(c) {
   const friendly = escapeHtml(FRIENDLY_KIND[c.kind] || c.kind || "señal");
   const hasDraft = !!(c.draft && c.target_jid);
   const hasJid = !!c.target_jid;
+  const sourceNote = c.source_note || "";
   let primaryBtn = "";
   if (hasDraft) {
     primaryBtn = `<button class="wa-anticipate-action primary" data-action="draft">✍ borrador</button>`;
   } else if (hasJid) {
     primaryBtn = `<button class="wa-anticipate-action primary" data-action="open">→ abrir chat</button>`;
   }
+  const sourceLink = sourceNote
+    ? `<a href="obsidian://open?file=${encodeURIComponent(sourceNote)}" class="wa-anticipate-source" target="_blank" title="Ver fuente en vault">📄 fuente</a>`
+    : "";
   return `
     <article class="wa-anticipate-card" data-dedup="${escapeAttr(c.dedup_key)}"
              data-jid="${escapeAttr(c.target_jid || "")}"
@@ -208,6 +212,7 @@ function renderCard(c) {
       </header>
       <p class="wa-anticipate-msg">${safeMsg}</p>
       ${safeReason ? `<p class="wa-anticipate-reason">${safeReason}</p>` : ""}
+      ${sourceLink ? `<p class="wa-anticipate-source-row">${sourceLink}</p>` : ""}
       <div class="wa-anticipate-actions">
         ${primaryBtn}
         <button class="wa-anticipate-action" data-action="snooze">snooze 24h</button>
@@ -265,7 +270,7 @@ function dismissCard(card) {
     const remaining = document.querySelectorAll(".wa-anticipate-card").length;
     if (!remaining) {
       const body = $("wa-anticipate-body");
-      if (body) body.innerHTML = `<div class="wa-anticipate-empty">🌤 todo limpio · revisamos en 10 min</div>`;
+      if (body) body.innerHTML = `<div class="wa-anticipate-empty">nada pendiente por ahora</div>`;
     }
     updateCount(remaining, false);
   }, 220);

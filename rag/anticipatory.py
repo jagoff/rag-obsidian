@@ -140,6 +140,7 @@ class AnticipatoryCandidate:
     dedup_key: str       # estable cross-runs (ej. event_uid, source_path)
     snooze_hours: int    # default por kind: cal=2, echo=72, commit=168
     reason: str          # debug — por qué este candidate (mostrado en --explain)
+    source_note: str | None = None      # path de la nota fuente (para link en UI)
     # Proactive draft (Fase 2 — solo signals con target identificable):
     target_jid: str | None = None       # WA jid resuelto desde el signal
     target_name: str | None = None      # display name (para logs human-friendly)
@@ -281,6 +282,7 @@ def _anticipate_signal_calendar(now: datetime) -> list["AnticipatoryCandidate"]:
             continue
         score = max(0.0, min(1.0, 1.0 - (delta_min / float(_ANTICIPATE_CALENDAR_MAX_MIN))))
         msg = _anticipate_format_calendar_brief(title, int(delta_min), metas[0], scores[0])
+        source_note = metas[0].get("file") or None
         # Sin uid disponible desde icalBuddy → dedup por title + start clock-time.
         dedup_key = f"cal:{title[:60]}:{start.strftime('%Y-%m-%dT%H:%M')}"
         out.append(AnticipatoryCandidate(
@@ -293,6 +295,7 @@ def _anticipate_signal_calendar(now: datetime) -> list["AnticipatoryCandidate"]:
                 f"event in {int(delta_min)}min,"
                 f" top_score={scores[0]:.2f}"
             ),
+            source_note=source_note,
         ))
     return out
 
@@ -439,6 +442,7 @@ def _anticipate_signal_echo(now: datetime) -> list["AnticipatoryCandidate"]:
         if old_score < _ANTICIPATE_ECHO_MIN_COSINE:
             continue
         msg = _anticipate_format_echo_brief(note, old_meta, old_score, age)
+        source_note = old_meta.get("file") or None
         dedup_key = f"echo:{today_rel}:{old_meta.get('file','?')}"
         out.append(AnticipatoryCandidate(
             kind="anticipate-echo",
@@ -447,6 +451,7 @@ def _anticipate_signal_echo(now: datetime) -> list["AnticipatoryCandidate"]:
             dedup_key=dedup_key,
             snooze_hours=72,
             reason=f"cosine={old_score:.2f}, age={int(age)}d",
+            source_note=source_note,
         ))
     return out
 
@@ -588,6 +593,7 @@ def _anticipate_signal_commitment(now: datetime) -> list["AnticipatoryCandidate"
         .encode("utf-8")
     ).hexdigest()[:12]
     msg = _anticipate_format_commitment_brief(top)
+    source_note = top.get("source_note") or None
     base = AnticipatoryCandidate(
         kind="anticipate-commitment",
         score=score,
@@ -595,11 +601,83 @@ def _anticipate_signal_commitment(now: datetime) -> list["AnticipatoryCandidate"
         dedup_key=f"commit:{h}",
         snooze_hours=168,
         reason=f"age={int(age)}d, kind={top.get('kind')}",
+        source_note=source_note,
     )
     return [_enrich_commitment_with_draft(base, top)]
 
 
-# ── Orchestrator ─────────────────────────────────────────────────────────────
+# ─── Screen Time signal ───────────────────────────────────────────────────────
+
+def _anticipate_signal_screen_time(now: datetime) -> list["AnticipatoryCandidate"]:
+    """Apps con uso alto en las últimas 24h (threshold: 2h). Lee directamente
+    la DB de Screen Time en ~/Library/Application Support/ScreenTime/MTDatabase.db."""
+    from rag import _silent_log
+    import sqlite3
+    from pathlib import Path
+
+    db_path = Path.home() / "Library/Application Support/ScreenTime/MTDatabase.db"
+    if not db_path.exists():
+        return []
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # La tabla ZUSAGE tiene datos de uso por app
+        # Campos principales: ZBUNDLEID, ZTOTALTIMEINSECONDS, ZDAY
+        # ZTOTALTIMEINSECONDS está en segundos, convertir a horas
+        query = """
+        SELECT ZBUNDLEID, ZTOTALTIMEINSECONDS
+        FROM ZUSAGE
+        WHERE ZDAY >= date('now', '-1 day')
+        ORDER BY ZTOTALTIMEINSECONDS DESC
+        LIMIT 10
+        """
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        conn.close()
+    except Exception as exc:
+        _silent_log("anticipate_screen_time_db", exc)
+        return []
+
+    out: list[AnticipatoryCandidate] = []
+    for row in rows:
+        bundle_id = row["ZBUNDLEID"] or ""
+        total_seconds = row["ZTOTALTIMEINSECONDS"] or 0
+        hours = total_seconds / 3600
+
+        # Threshold: 2 horas
+        if hours < 2.0:
+            continue
+
+        # Score basado en uso (más uso = más urgente)
+        score = min(1.0, hours / 8.0)  # 8h = score 1.0
+
+        # Nombre legible del bundle (simplificado)
+        app_name = bundle_id.split(".")[-1] if "." in bundle_id else bundle_id
+
+        msg = (
+            f"⏱️ Screen Time: usaste {hours:.1f}h en {app_name} en las últimas 24h.\n"
+            f"\n"
+            f"¿Revisar límites de uso o digital wellbeing?"
+        )
+
+        dedup_key = f"screentime:{bundle_id}:{now.strftime('%Y-%m-%d')}"
+
+        out.append(AnticipatoryCandidate(
+            kind="anticipate-screen-time",
+            score=score,
+            message=msg,
+            dedup_key=dedup_key,
+            snooze_hours=24,
+            reason=f"hours={hours:.1f}",
+        ))
+
+    return out
+
+
+# ─── Orchestrator ─────────────────────────────────────────────────────────────
 
 # Tuple de (kind_label_corto, signal_fn). El orden NO importa para el outcome
 # porque después se filtra por score; pero el log respeta este orden.
@@ -613,6 +691,7 @@ _ANTICIPATE_CORE_SIGNALS: tuple[tuple[str, "Callable[[datetime], list[Anticipato
     ("calendar", _anticipate_signal_calendar),
     ("echo", _anticipate_signal_echo),
     ("commitment", _anticipate_signal_commitment),
+    ("screen-time", _anticipate_signal_screen_time),
 )
 
 try:

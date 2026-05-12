@@ -204,7 +204,7 @@ def search(
     ordenados por similarity (más cerca primero).
 
     `jid` opcional acota a un chat. Para hybrid (FTS + semantic + RRF)
-    usar `search_hybrid` (TODO).
+    usar `search_hybrid`.
     """
     q = (q or "").strip()
     if not q:
@@ -274,9 +274,89 @@ def search(
         con.close()
 
 
+def search_hybrid(
+    q: str, jid: str | None = None, limit: int = 20, k: int = 60,
+) -> list[dict[str, Any]]:
+    """Hybrid search FTS + semantic con RRF (Reciprocal Rank Fusion).
+
+    Combina resultados de FTS (búsqueda exacta) y semantic (búsqueda por
+    embeddings) usando RRF para fusionar rankings. RRF es robusto a
+    diferencias de escala entre sistemas y funciona bien sin tuning.
+
+    Fórmula RRF: score(d) = Σ 1 / (k + rank_i(d))
+    Donde k=60 es una constante estándar que suaviza el impacto de rankings extremos.
+
+    Args:
+        q: query string
+        jid: opcional, acota a un chat específico
+        limit: cantidad de resultados a devolver
+        k: constante RRF (default 60, valor estándar en la literatura)
+
+    Returns:
+        Lista de hits ordenados por score RRF descendente, con metadata
+        de ambos sistemas (distance para semantic, snippet para FTS).
+    """
+    q = (q or "").strip()
+    if not q:
+        return []
+
+    # Ejecutar ambas búsquedas con pool más grande para RRF
+    pool_size = limit * 3  # Pool más grande para tener suficientes candidatos
+
+    # FTS search
+    from . import search as _wa_search
+    fts_hits = _wa_search.search(q, jid=jid, limit=pool_size)
+
+    # Semantic search
+    semantic_hits = search(q, jid=jid, limit=pool_size)
+
+    # RRF fusion
+    scores: dict[str, float] = {}
+    fts_by_id: dict[str, dict] = {}
+    semantic_by_id: dict[str, dict] = {}
+
+    # Score FTS results
+    for rank, hit in enumerate(fts_hits, 1):
+        msg_id = hit["id"]
+        scores[msg_id] = scores.get(msg_id, 0) + 1 / (k + rank)
+        fts_by_id[msg_id] = hit
+
+    # Score semantic results
+    for rank, hit in enumerate(semantic_hits, 1):
+        msg_id = hit["id"]
+        scores[msg_id] = scores.get(msg_id, 0) + 1 / (k + rank)
+        semantic_by_id[msg_id] = hit
+
+    # Merge metadata y ordenar por score RRF
+    merged: list[dict[str, Any]] = []
+    for msg_id, rrf_score in sorted(scores.items(), key=lambda x: x[1], reverse=True):
+        fts_hit = fts_by_id.get(msg_id, {})
+        semantic_hit = semantic_by_id.get(msg_id, {})
+
+        # Preferir metadata de semantic (tiene más campos), fallback a FTS
+        base = semantic_hit if semantic_hit else fts_hit
+        if not base:
+            continue
+
+        merged.append({
+            "id": base["id"],
+            "chat_jid": base["chat_jid"],
+            "chat_name": base.get("chat_name", ""),
+            "ts": base["ts"],
+            "sender": base.get("sender", ""),
+            "content": base.get("content", ""),
+            "snippet": fts_hit.get("snippet", ""),  # Snippet solo de FTS
+            "distance": semantic_hit.get("distance"),  # Distance solo de semantic
+            "rrf_score": rrf_score,
+        })
+
+    return merged[:limit]
+
+
 __all__ = [
     "index_pending",
     "index_all_pending",
     "pending_count",
     "search",
+    "search_hybrid",
 ]

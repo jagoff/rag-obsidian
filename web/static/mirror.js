@@ -229,6 +229,25 @@ function renderSpotifyTop(data) {
   }
 }
 
+function renderScreenTime(data) {
+  const el = $("#screen_time .content");
+  clear(el);
+  const apps = data?.apps || [];
+  if (!apps.length) {
+    el.appendChild(emptyState("sin datos de Screen Time"));
+    return;
+  }
+  for (const app of apps.slice(0, 5)) { // Top 5 apps
+    const hours = app.total_hours || 0;
+    const hoursClass = hours > 4 ? "warn" : hours > 2 ? "caution" : "";
+    el.appendChild(makeRow(
+      app.app_name || app.bundle_id || "?",
+      `${hours.toFixed(1)}h`,
+      hoursClass ? "⚠️" : null,
+    ));
+  }
+}
+
 function renderObservations(data) {
   const el = $("#observations .content");
   clear(el);
@@ -312,6 +331,7 @@ async function load(refresh = false) {
     renderMoodTimeline(s.mood_timeline);
     renderDormantNotes(s.dormant_notes);
     renderSpotifyTop(s.spotify_top);
+    renderScreenTime(s.screen_time || {});
     renderObservations(s.observations || {});
     updateHeader(data);
     updateStatus(`última actualización · ${new Date().toLocaleTimeString("es-AR")}`);

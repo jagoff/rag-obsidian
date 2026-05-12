@@ -164,6 +164,14 @@ header #refresh-btn.spinning { animation: spin 1s linear infinite; }
   color: var(--text-dim);
   margin-left: 6px;
 }
+.row .badge.warn {
+  color: var(--accent-warm);
+  border-color: var(--accent-warm);
+}
+.row .badge.caution {
+  color: var(--accent-cool);
+  border-color: var(--accent-cool);
+}
 
 /* ── mood block ─────────────────────────────────────── */
 

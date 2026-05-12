@@ -901,7 +901,7 @@ def list_chats_for_ui(
         params.append(cap)
 
         sql = f"""
-            SELECT
+            SELECT DISTINCT
               c.jid AS jid,
               COALESCE(c.name, '') AS name,
               (
@@ -972,6 +972,7 @@ def list_chats_for_ui(
             out.append({
                 "jid": jid,
                 "label": label,
+                "name_lower": label.lower(),  # Para ranking por match exacto
                 "is_group": is_group,
                 "last_ts": _normalize_bridge_ts(r["computed_last_ts"] or ""),
                 "last_preview": preview,
@@ -982,6 +983,7 @@ def list_chats_for_ui(
                 "pinned_ts": pinned_map.get(jid, "") if is_pinned else "",
                 "archived": is_archived,
             })
+
         # Dedupe: cuando hay 2+ JIDs (típicamente uno `@lid` + uno
         # `@s.whatsapp.net`) que resuelven al MISMO label (Apple
         # Contacts o vault contact note), colapsamos al de actividad
@@ -1017,17 +1019,35 @@ def list_chats_for_ui(
                 keep_new = True
             if keep_new:
                 # Reemplazar in-place en out_dedup.
-                idx = out_dedup.index(existing)
-                out_dedup[idx] = c
+                try:
+                    idx = out_dedup.index(existing)
+                    out_dedup[idx] = c
+                except ValueError:
+                    # Fallback: append si index falla (shouldn't happen)
+                    out_dedup.append(c)
                 by_label[key] = c
 
         # Sort: pinned primero (más reciente pin arriba), después el resto
         # por last_ts desc igual que antes. WhatsApp Web hace lo mismo.
-        out_dedup.sort(key=lambda c: (
-            0 if c.get("pinned") else 1,
-            -1 * _ts_sort_key(c.get("pinned_ts", "")) if c.get("pinned")
-                else -1 * _ts_sort_key(c.get("last_ts", "")),
-        ))
+        # Si hay query `q`, los contactos cuyo nombre matchea exactamente
+        # (case-insensitive) con la query aparecen primero.
+        if q:
+            q_lower = q.lower().strip()
+            out_dedup.sort(key=lambda c: (
+                # Exact match = 0, partial match = 1
+                0 if (c.get("name_lower") or c.get("label", "").lower()) == q_lower else 1,
+                # Pinned siempre arriba
+                0 if c.get("pinned") else 1,
+                # Luego por pinned_ts o last_ts
+                -1 * _ts_sort_key(c.get("pinned_ts", "")) if c.get("pinned")
+                    else -1 * _ts_sort_key(c.get("last_ts", "")),
+            ))
+        else:
+            out_dedup.sort(key=lambda c: (
+                0 if c.get("pinned") else 1,
+                -1 * _ts_sort_key(c.get("pinned_ts", "")) if c.get("pinned")
+                    else -1 * _ts_sort_key(c.get("last_ts", "")),
+            ))
         return out_dedup
     except sqlite3.Error:
         return []

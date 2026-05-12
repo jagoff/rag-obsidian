@@ -324,14 +324,14 @@
     .charts {
       display: grid;
       grid-template-columns: repeat(2, 1fr);
-      gap: 16px;
+      gap: 8px 4px;
     }
 
     .chart-card {
       background: var(--bg-card);
       border: 1px solid var(--border);
       border-radius: 10px;
-      padding: 20px;
+      padding: 16px;
     }
 
     .chart-card.wide {
@@ -942,6 +942,62 @@
       border: 0;
     }
 
+    /* ── Screen Time card ────────────────────────────────────────────── */
+    .st-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 18px;
+    }
+    .st-card h2 {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-dim);
+      margin-bottom: 14px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .st-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    .st-table th {
+      text-align: left;
+      color: var(--text-faint);
+      font-weight: 600;
+      padding: 6px 8px;
+      border-bottom: 1px solid var(--border);
+    }
+    .st-table td {
+      padding: 6px 8px;
+      color: var(--text-dim);
+      border-bottom: 1px solid var(--sep);
+    }
+    .st-table td:last-child {
+      text-align: right;
+      font-weight: 600;
+      color: var(--text);
+      font-variant-numeric: tabular-nums;
+    }
+    .st-table tr:last-child td { border-bottom: none; }
+    .st-table tr:hover td { background: var(--hover); }
+    .st-empty {
+      color: var(--text-faint);
+      text-align: center;
+      padding: 24px 0;
+      font-size: 12px;
+    }
+    .st-app-name {
+      font-weight: 500;
+      color: var(--text);
+    }
+    .st-hours {
+      color: var(--cyan);
+    }
+    .st-hours.warn { color: var(--yellow); }
+    .st-hours.high { color: var(--red); }
+
     /* ── a11y: skip-link + tap targets (audit LOTE 4) ────────────────
        dashboard.html no incluye style.css, así que el bloque global de
        a11y que L1 agregó al CSS compartido NO aplica acá. Re-implementa-
@@ -1511,6 +1567,7 @@
         <a href="/">home</a>
         <a href="/mirror">mirror</a>
         <a href="/chat">chat</a>
+        <a href="/gmail">gmail</a>
         <a href="/learning">learning</a>
         <a href="/finance">finance</a>
         <a href="/atlas">atlas</a>

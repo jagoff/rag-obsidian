@@ -316,6 +316,15 @@ def get_avatar_path(jid: str, chat_name: str | None = None) -> Path | None:
     miss_path = _AVATAR_DIR / f"{safe}.miss"
     now = time.time()
 
+    # Migración: si existe archivo con @ en el nombre (bug anterior), renombrarlo
+    legacy_path = _AVATAR_DIR / f"{jid}.jpg"
+    if legacy_path.is_file() and not out_path.is_file():
+        try:
+            legacy_path.rename(out_path)
+            logger.info("Migrated avatar: %s -> %s", legacy_path.name, out_path.name)
+        except OSError as e:
+            logger.warning("Migration failed for %s: %s", legacy_path, e)
+
     if out_path.is_file():
         try:
             if now - out_path.stat().st_mtime < _CACHE_TTL_S:

@@ -275,6 +275,7 @@ async function load(showSkeleton) {
       waInit();
       vhInit();
       daemonsInit();
+      stInit();
     }
     refresh(d);
     announceStatus(`Datos del dashboard actualizados (${d.kpis.total_queries} queries en ${state.days} días)`);
@@ -489,6 +490,13 @@ function buildLayout(d) {
       <section class="chart-card" aria-labelledby="sec-queries-day">
         <h2 id="sec-queries-day">Queries por dia</h2>
         <div class="chart-wrap"><canvas id="ch-queries-day" aria-label="Gráfico de barras: queries por día en el período seleccionado"></canvas><div class="chart-empty">sin datos en el período</div></div>
+      </section>
+
+      <section class="chart-card st-card" aria-labelledby="sec-screen-time">
+        <h2 id="sec-screen-time">Screen Time <span style="font-size:11px;font-weight:400;color:var(--text-faint);margin-left:6px;">últimos 7 días</span></h2>
+        <div id="st-body">
+          <div class="st-empty">cargando datos de Screen Time…</div>
+        </div>
       </section>
 
       <section class="chart-card wide" aria-labelledby="sec-feedback">
@@ -2687,6 +2695,74 @@ function daemonsInit() {
   }
   daemonsRefresh();
   daemonsSchedule();
+}
+
+// ── Screen Time ─────────────────────────────────────────────────────────────
+const ST = { timer: null, inFlight: false };
+
+function stInit() {
+  stRefresh();
+  stSchedule();
+}
+
+function stSchedule() {
+  if (ST.timer) { clearTimeout(ST.timer); ST.timer = null; }
+  ST.timer = setTimeout(() => {
+    if (!state.paused) stRefresh();
+    stSchedule();
+  }, 300_000); // 5 minutos
+}
+
+async function stRefresh() {
+  if (ST.inFlight) return;
+  ST.inFlight = true;
+  try {
+    const res = await fetch("/api/screen-time?days=7");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    stRender(data);
+  } catch (err) {
+    const body = document.getElementById("st-body");
+    if (body) body.innerHTML = `<div class="st-empty" style="color:var(--red)">Error: ${escapeHtml(err.message)}</div>`;
+  } finally {
+    ST.inFlight = false;
+  }
+}
+
+function stRender(data) {
+  const body = document.getElementById("st-body");
+  if (!body) return;
+
+  const apps = data.apps || [];
+  if (apps.length === 0) {
+    body.innerHTML = `<div class="st-empty">sin datos de Screen Time</div>`;
+    return;
+  }
+
+  const rows = apps.map(app => {
+    const hours = app.total_hours || 0;
+    const hoursClass = hours > 4 ? 'high' : hours > 2 ? 'warn' : '';
+    return `
+      <tr>
+        <td><span class="st-app-name">${escapeHtml(app.app_name || app.bundle_id || '?')}</span></td>
+        <td><span class="st-hours ${hoursClass}">${hours.toFixed(1)}h</span></td>
+      </tr>
+    `;
+  }).join('');
+
+  body.innerHTML = `
+    <table class="st-table">
+      <thead>
+        <tr>
+          <th>App</th>
+          <th>Tiempo total</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows}
+      </tbody>
+    </table>
+  `;
 }
 
 function daemonsSchedule() {

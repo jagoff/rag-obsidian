@@ -32,7 +32,7 @@
 
 // Bump cuando cambie el shell / la estrategia. El activate handler borra
 // todo cache que no matchee esta versión, así no se acumulan huérfanos.
-const CACHE_VERSION = "rag-pwa-v51-2026-05-12-wzp-send-enter-icon";
+const CACHE_VERSION = "rag-pwa-v52-2026-05-12-wzp-pwa-iphone16promax";
 const SHELL_CACHE = `${CACHE_VERSION}-shell`;
 const STATIC_CACHE = `${CACHE_VERSION}-static`;
 
@@ -44,7 +44,9 @@ const SHELL_URLS = [
   "/chat",
   "/dashboard",
   "/fine_tunning",
+  "/wzp",
   "/manifest.webmanifest",
+  "/static/manifest-wzp.webmanifest",
   "/static/pwa/icon-192.png",
   "/static/pwa/icon-512.png",
   "/static/pwa/apple-touch-icon.png",

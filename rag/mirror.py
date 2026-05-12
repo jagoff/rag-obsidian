@@ -8,7 +8,7 @@ Game changer 2026-05-09: NO existe en RAG comercial — combina retrieval +
 mood + entidades + signals + pendientes + spotify + screen time + memoria
 en una sola vista coherente.
 
-Layout (8 sections):
+Layout (9 sections):
 
 1. ``active_projects`` — proyectos en ``01-Projects/`` con mtime
    últimos 30d, count de notas, last touch.
@@ -19,7 +19,8 @@ Layout (8 sections):
 6. ``dormant_notes`` — notas con mtime > 30d que no fueron abiertas
    pero son citadas o tienen alta importancia.
 7. ``spotify_top`` — top 5 artistas/tracks últimos 7d.
-8. ``observations`` — heurísticas LLM-ready (drift, contradicciones,
+8. ``screen_time`` — top 5 apps por uso últimos 7d (macOS Screen Time).
+9. ``observations`` — heurísticas LLM-ready (drift, contradicciones,
    anticipatory feedback).
 
 Cache: 30min TTL in-process. Invalidate por eventos:
@@ -28,7 +29,7 @@ Cache: 30min TTL in-process. Invalidate por eventos:
 - ``wa.message.inbound``
 
 Performance:
-- 8 sources en paralelo via ``ThreadPoolExecutor`` con timeout 3s
+- 9 sources en paralelo via ``ThreadPoolExecutor`` con timeout 3s
   cada una.
 - Source que timea retorna empty + flag ``error``.
 - Total wall < 4s sin LLM (insights se calculan separadamente).
@@ -419,6 +420,58 @@ def _source_spotify_top(date: str) -> dict[str, Any]:
             pass
 
 
+def _source_screen_time(date: str) -> dict[str, Any]:
+    """Top 5 apps por uso en los últimos 7d (Screen Time de macOS)."""
+    db_path = Path.home() / "Library/Application Support/ScreenTime/MTDatabase.db"
+    if not db_path.exists():
+        return {"apps": []}
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # Query para obtener uso por app en los últimos 7 días
+        query = """
+        SELECT ZBUNDLEID, ZTOTALTIMEINSECONDS
+        FROM ZUSAGE
+        WHERE ZDAY >= date('now', '-7 days')
+        ORDER BY ZDAY DESC, ZTOTALTIMEINSECONDS DESC
+        """
+
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        conn.close()
+
+        # Agregar por bundle ID y convertir a horas
+        apps: dict[str, dict] = {}
+        for row in rows:
+            bundle_id = row["ZBUNDLEID"] or ""
+            seconds = row["ZTOTALTIMEINSECONDS"] or 0
+            if bundle_id not in apps:
+                apps[bundle_id] = {"bundle_id": bundle_id, "total_seconds": 0}
+            apps[bundle_id]["total_seconds"] += seconds
+
+        # Convertir a lista y ordenar por uso total
+        apps_list = []
+        for bundle_id, data in apps.items():
+            total_hours = data["total_seconds"] / 3600
+            app_name = bundle_id.split(".")[-1] if "." in bundle_id else bundle_id
+            apps_list.append({
+                "bundle_id": bundle_id,
+                "app_name": app_name,
+                "total_hours": round(total_hours, 2),
+                "total_seconds": data["total_seconds"],
+            })
+
+        apps_list.sort(key=lambda x: x["total_hours"], reverse=True)
+
+        return {"apps": apps_list[:5]}  # Top 5 apps
+    except Exception as exc:
+        logger.warning("mirror: screen_time failed: %s", exc)
+        return {"apps": [], "error": str(exc)}
+
+
 def _source_observations(date: str) -> dict[str, Any]:
     """Observaciones rápidas: drift alerts recientes, contradicciones
     abiertas, anticipatory pushes hoy."""
@@ -490,6 +543,7 @@ _SOURCES: dict[str, Callable[[str], dict[str, Any]]] = {
     "pendientes": _source_pendientes,
     "dormant_notes": _source_dormant_notes,
     "spotify_top": _source_spotify_top,
+    "screen_time": _source_screen_time,
     "observations": _source_observations,
 }
 

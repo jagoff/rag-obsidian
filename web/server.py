@@ -4421,9 +4421,7 @@ def wa_gap_summary(
 # fetch + vault echo + commitment scan en cada F5 es waste. 2min de stale
 # tolerable porque el daemon recompone state cada 10min de todas formas.
 
-_WZP_ANTICIPATE_CACHE_LOCK = _threading.RLock()
-_WZP_ANTICIPATE_CACHE: dict = {"ts": 0.0, "candidates": []}
-_WZP_ANTICIPATE_CACHE_TTL = 120.0  # segundos
+_WZP_ANTICIPATE_CACHE = ThreadSafeCache(ttl=120.0)
 
 
 def _wzp_anticipate_collect(now: datetime) -> list:
@@ -4439,7 +4437,8 @@ def _wzp_anticipate_collect(now: datetime) -> list:
     out = []
     for label, fn in _ANTICIPATE_SIGNALS:
         try:
-            out.extend(fn(now))
+            candidates = fn(now)
+            out.extend(candidates)
         except Exception as exc:
             _silent_log(f"wzp_anticipate_signal_{label}", exc)
     return out
@@ -4456,6 +4455,7 @@ def _wzp_anticipate_serialize(c) -> dict:
         "dedup_key": c.dedup_key,
         "snooze_hours": int(c.snooze_hours),
         "reason": c.reason,
+        "source_note": getattr(c, "source_note", None),
         "target_jid": getattr(c, "target_jid", None),
         "target_name": getattr(c, "target_name", None),
         "draft": getattr(c, "draft", None),
@@ -4505,19 +4505,12 @@ def wa_anticipate_today(limit: int = 3, min_score: float = 0.30) -> dict:
     now = datetime.now()
 
     # Cache lookup
-    cached_ts = 0.0
-    cached: list = []
-    with _WZP_ANTICIPATE_CACHE_LOCK:
-        cached_ts = float(_WZP_ANTICIPATE_CACHE.get("ts", 0.0))
-        cached = list(_WZP_ANTICIPATE_CACHE.get("candidates", []))
-
-    if cached and (time.time() - cached_ts) < _WZP_ANTICIPATE_CACHE_TTL:
-        all_candidates = cached
+    cached = _WZP_ANTICIPATE_CACHE.get()
+    if cached:
+        all_candidates = cached[1]  # (ts, payload) format
     else:
         all_candidates = _wzp_anticipate_collect(now)
-        with _WZP_ANTICIPATE_CACHE_LOCK:
-            _WZP_ANTICIPATE_CACHE["ts"] = time.time()
-            _WZP_ANTICIPATE_CACHE["candidates"] = all_candidates
+        _WZP_ANTICIPATE_CACHE.put(all_candidates)
 
     # Filter + sort + slice
     filtered = [c for c in all_candidates if float(c.score) >= min_score]
@@ -5199,6 +5192,12 @@ def wa_search(
         )
         hits = _wa_sem.search(q, jid=jid, limit=limit)
         return {"hits": hits, "mode": "semantic"}
+    if mode_norm == "hybrid":
+        from rag.integrations.whatsapp import (  # noqa: PLC0415
+            search_semantic as _wa_sem,
+        )
+        hits = _wa_sem.search_hybrid(q, jid=jid, limit=limit)
+        return {"hits": hits, "mode": "hybrid"}
     from rag.integrations.whatsapp import search as _wa_search  # noqa: PLC0415
     hits = _wa_search.search(q, jid=jid, limit=limit)
     return {"hits": hits, "mode": "fts"}
@@ -8808,7 +8807,7 @@ _TODAY_FM_SPLIT = re.compile(r"^---\s*\n.*?\n---\s*\n", re.DOTALL)
 
 
 def _persist_today_brief(date_label: str, narrative: str) -> None:
-    """Write the regenerated brief to `99-obsidian/99-AI/reviews/YYYY-MM-DD-evening.md` so
+    """Write the regenerated brief to `00-Inbox/reviews/YYYY-MM-DD-evening.md` so
     subsequent `/api/home` calls hit the cached path. Mirrors the CLI
     `rag today` write — same frontmatter shape so contradiction detection
     and ambient skip rules treat both files the same. Silent-fail.
@@ -8835,7 +8834,7 @@ def _persist_today_brief(date_label: str, narrative: str) -> None:
 
 
 def _today_cached_narrative(date_label: str) -> str | None:
-    """Return narrative from `99-obsidian/99-AI/reviews/YYYY-MM-DD-evening.md` if present.
+    """Return narrative from `00-Inbox/reviews/YYYY-MM-DD-evening.md` if present.
     CLI `rag today` writes this file, so we avoid re-running the LLM when the
     brief was already generated today.
     """
@@ -11331,7 +11330,7 @@ def _home_compute(
     Per-channel silent-fail: if one source errors (e.g. Gmail OAuth expired,
     icalBuddy not installed), that key is missing/empty but the rest renders.
     `regenerate=true` forces a fresh LLM narrative (~10s); default reuses the
-    cached brief from `99-obsidian/99-AI/reviews/<date>-evening.md` if present.
+    cached brief from `00-Inbox/reviews/<date>-evening.md` if present.
 
     `progress` (optional): callback invoked as
     `progress(stage, status, elapsed_ms, error_message)` where status is one
@@ -16173,6 +16172,46 @@ def finance_api(months: int = 12, window_days: int = 30) -> dict:
     payload = snapshot(months=months, window_days=window_days)
     _FINANCE_DASH_CACHE.put(key, payload)
     return payload
+
+
+# ── /gmail — dashboard de Gmail ───────────────────────────────────────────────
+# Muestra correos recientes, starred, y awaiting reply usando la integración
+# existente en `rag.integrations.gmail`. TTL 90s (match con el cache interno
+# de `_fetch_gmail_evidence`).
+_GMAIL_DASH_CACHE = ThreadSafeCache(ttl=90.0)
+
+
+@app.get("/gmail")
+def gmail_page() -> FileResponse:
+    """HTML del dashboard de Gmail. Hidrata via /api/gmail."""
+    return FileResponse(STATIC_DIR / "gmail.html")
+
+
+@app.get("/api/gmail")
+def gmail_api(refresh: int = 0) -> dict:
+    """Snapshot de Gmail — unread_count, starred, awaiting_reply, recent.
+    
+    Query params:
+    - ``refresh=1``: bypass cache, recompute fresh.
+    
+    TTL 90s (match con `_GMAIL_EVIDENCE_CACHE` en `rag.integrations.gmail`).
+    """
+    if refresh != 1:
+        cached = _GMAIL_DASH_CACHE.get("default")
+        if cached:
+            _, payload = cached
+            return payload
+    
+    from datetime import datetime as _datetime
+    from rag.integrations.gmail import _fetch_gmail_evidence, _clear_gmail_evidence_cache  # noqa: PLC0415
+    
+    if refresh == 1:
+        _clear_gmail_evidence_cache()
+    
+    payload = _fetch_gmail_evidence(_datetime.now())
+    if payload:
+        _GMAIL_DASH_CACHE.put("default", payload)
+    return payload or {}
 
 
 # ── /atlas — dashboard del atlas semántico del vault ────────────────────────
@@ -22282,6 +22321,81 @@ def dashboard_api(days: int = Query(default=30, ge=1, le=365)) -> dict:
     return payload
 
 
+# ── /api/screen-time ─────────────────────────────────────────────────────────
+# Screen Time de macOS: lectura directa de la DB de Screen Time en
+# ~/Library/Application Support/ScreenTime/MTDatabase.db. Expose datos de
+# uso por app para el dashboard.
+
+_SCREEN_TIME_CACHE: dict = {"ts": 0.0, "payload": None}
+_SCREEN_TIME_TTL = 300.0  # 5 min
+
+
+@app.get("/api/screen-time")
+def screen_time_api(days: int = Query(default=7, ge=1, le=30)) -> dict:
+    """Screen Time de macOS: uso por app en las últimas `days` días."""
+    now_ts = time.time()
+    if now_ts - _SCREEN_TIME_CACHE["ts"] < _SCREEN_TIME_TTL:
+        return _SCREEN_TIME_CACHE["payload"] or {"apps": []}
+
+    try:
+        import sqlite3
+        from pathlib import Path
+
+        db_path = Path.home() / "Library/Application Support/ScreenTime/MTDatabase.db"
+        if not db_path.exists():
+            return {"apps": [], "error": "Screen Time DB not found"}
+
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # Query para obtener uso por app en los últimos `days` días
+        query = """
+        SELECT ZBUNDLEID, ZTOTALTIMEINSECONDS, ZDAY
+        FROM ZUSAGE
+        WHERE ZDAY >= date('now', '-{} days')
+        ORDER BY ZDAY DESC, ZTOTALTIMEINSECONDS DESC
+        """.format(days)
+
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        conn.close()
+
+        # Agregar por bundle ID y convertir a horas
+        apps: dict[str, dict] = {}
+        for row in rows:
+            bundle_id = row["ZBUNDLEID"] or ""
+            seconds = row["ZTOTALTIMEINSECONDS"] or 0
+            if bundle_id not in apps:
+                apps[bundle_id] = {"bundle_id": bundle_id, "total_seconds": 0, "days": {}}
+            apps[bundle_id]["total_seconds"] += seconds
+            day = row["ZDAY"] or ""
+            if day not in apps[bundle_id]["days"]:
+                apps[bundle_id]["days"][day] = 0
+            apps[bundle_id]["days"][day] += seconds
+
+        # Convertir a lista y ordenar por uso total
+        apps_list = []
+        for bundle_id, data in apps.items():
+            total_hours = data["total_seconds"] / 3600
+            app_name = bundle_id.split(".")[-1] if "." in bundle_id else bundle_id
+            apps_list.append({
+                "bundle_id": bundle_id,
+                "app_name": app_name,
+                "total_hours": round(total_hours, 2),
+                "total_seconds": data["total_seconds"],
+                "days": {k: round(v / 3600, 2) for k, v in data["days"].items()},
+            })
+
+        apps_list.sort(key=lambda x: x["total_hours"], reverse=True)
+
+        payload = {"apps": apps_list[:20]}  # Top 20 apps
+        _SCREEN_TIME_CACHE = {"ts": now_ts, "payload": payload}
+        return payload
+    except Exception as exc:
+        return {"apps": [], "error": str(exc)}
+
+
 @app.get("/api/status/home")
 def status_home() -> dict:
     """Health del home page compute — surface el threshold actual,
@@ -23475,7 +23589,7 @@ def _stream_payload(kind: str, ev: dict) -> dict:
 # se reescriben 1/día). Sirve directo desde RAM si hay hit warm.
 
 _LEARNING_TTL = 60.0
-_LEARNING_CACHE = ThreadSafeCacheMultiKey(ttl=60.0)
+_LEARNING_CACHE = ThreadSafeCacheMultiKey(ttl=60.0, max_size=10)
 
 
 @app.get("/learning")

@@ -540,6 +540,20 @@ def semantic_cache_store(
                 ),
             )
             conn.commit()
+            # Evict oldest rows to maintain _SEMANTIC_CACHE_MAX_ROWS
+            n_rows = conn.execute(
+                "SELECT COUNT(*) FROM rag_response_cache"
+            ).fetchone()[0]
+            if n_rows > _SEMANTIC_CACHE_MAX_ROWS:
+                # Delete oldest rows (by ts) to stay under the limit
+                excess = n_rows - _SEMANTIC_CACHE_MAX_ROWS
+                conn.execute(
+                    "DELETE FROM rag_response_cache WHERE id IN ("
+                    " SELECT id FROM rag_response_cache ORDER BY ts ASC LIMIT ?"
+                    ")",
+                    (excess,),
+                )
+                conn.commit()
 
     if background:
         _enqueue_background_sql(_do_insert, "semantic_cache_store_failed")

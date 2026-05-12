@@ -711,8 +711,11 @@ def scan_wa_images_for_citas(
     # el budget de este run.
     try:
         rag._vlm_caption_budget_reset()
-    except Exception:
-        pass
+    except Exception as e:
+        try:
+            rag._silent_log("wa_scan_images_budget_reset", e)
+        except Exception:
+            pass
     try:
         last_ts = 0.0 if reset_cursor else _load_media_cursor(state_conn)
     except Exception:

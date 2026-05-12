@@ -480,9 +480,12 @@ def rag_capture(
     # Index immediately so the note is retrievable right away.
     try:
         rag._index_single_file(rag.get_db(), path, skip_contradict=True)
-    except Exception:
+    except Exception as e:
         # Non-fatal — `rag watch` or next `rag index` will catch it.
-        pass
+        try:
+            rag._silent_log("mcp_capture_index", e)
+        except Exception:
+            pass
     rel = path.relative_to(rag.VAULT_PATH)
     return {"path": str(rel), "created": True}
 
@@ -568,8 +571,11 @@ def rag_save_note(
     # Index immediately.
     try:
         rag._index_single_file(rag.get_db(), candidate, skip_contradict=True)
-    except Exception:
-        pass
+    except Exception as e:
+        try:
+            rag._silent_log("mcp_save_note_index", e)
+        except Exception:
+            pass
 
     rel = candidate.relative_to(rag.VAULT_PATH)
     return {"path": str(rel), "created": True}

@@ -429,6 +429,14 @@ Dos databases en `~/.local/share/obsidian-rag/ragvec/`:
 3. Readers SQL: retry + stale-cache fallback, nunca empty default que sobrescriba memo.
 4. Tests con TestClient o writers SQL aíslan `DB_PATH` per-file (snap+restore manual, no `monkeypatch.setattr`).
 
+**Silent-fail logging fixes** (audit 2026-05-12):
+Revisión sistemática del proyecto entero (91 archivos Python) encontró 3 casos de `except Exception: pass` sin logging que fueron migrados a `_silent_log`:
+- `mcp_server.py` línea 483 - `rag._index_single_file()` en `rag_capture` → `rag._silent_log("mcp_capture_index", e)`
+- `mcp_server.py` línea 571 - `rag._index_single_file()` en `rag_save_note` → `rag._silent_log("mcp_save_note_index", e)`
+- `scripts/ingest_whatsapp.py` línea 714 - `rag._vlm_caption_budget_reset()` → `rag._silent_log("wa_scan_images_budget_reset", e)`
+
+Patrón: cuando se encuentre `except Exception: pass` sin logging en código que puede fallar por razones no triviales, migrar a `_silent_log` para observabilidad en `silent_errors.jsonl`. Excepciones aceptables: cleanup en finally blocks, parsing defensivo con fallback default, o casos con contadores/metrics que proveen visibilidad.
+
 **Diagnóstico data-first**: `python scripts/audit_telemetry_health.py --days 7` — PRIMER comando antes de "auditá el sistema". Agrega los 5 queries que reprodujeron audit 2026-04-24 en 1 segundo.
 
 ## Daemons

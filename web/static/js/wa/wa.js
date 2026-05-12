@@ -7,6 +7,7 @@ import * as sse from "./wa-sse.js";
 import * as cmdk from "./wa-cmdk.js";
 import * as liquid from "./wa-liquid-glass.js";
 import * as anticipate from "./wa-anticipate.js";
+import * as memory from "./wa-memory.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -35,7 +36,12 @@ function init() {
     listEl, loadingEl, searchEl,
     onSelect: (jid) => {
       document.body.dataset.pane = "thread";
-      thread.open(jid);
+      thread.open(jid).then(() => {
+        // Después de que el header renderee el nombre, montar el botón 🧠
+        // Recordar para que `wa-memory` apunte al contacto activo.
+        const name = document.getElementById("wa-thread-name")?.textContent || "";
+        memory.mountTrigger(jid, name);
+      });
     },
   });
 
@@ -52,7 +58,10 @@ function init() {
   cmdk.init({
     onChatSelect: (jid /* , messageId */) => {
       document.body.dataset.pane = "thread";
-      thread.open(jid);
+      thread.open(jid).then(() => {
+        const name = document.getElementById("wa-thread-name")?.textContent || "";
+        memory.mountTrigger(jid, name);
+      });
     },
   });
 
@@ -66,9 +75,18 @@ function init() {
   anticipate.init({
     onChatSelect: (jid) => {
       document.body.dataset.pane = "thread";
-      thread.open(jid);
+      thread.open(jid).then(() => {
+        const name = document.getElementById("wa-thread-name")?.textContent || "";
+        memory.mountTrigger(jid, name);
+      });
     },
   });
+
+  // Memoria Universal — drawer "🧠 Recordar" en el thread header. Surface
+  // vault notes + WA history del contacto activo. Endpoint: /api/wa/memory/<jid>.
+  memory.init();
+
+  // Cmd+K también dispara `thread.open` — propagar al memory drawer.
 }
 
 // Cada 30s re-fetcheamos el chatlist. SSE entrega chat_update events

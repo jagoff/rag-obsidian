@@ -4500,6 +4500,169 @@ def wa_anticipate_today(limit: int = 3, min_score: float = 0.30) -> dict:
     }
 
 
+# ── /api/wa/memory/<jid> — Memoria Universal ────────────────────────────────
+# Dado un JID activo del thread, surface todo lo que el sistema sabe sobre
+# ese contacto: top notes del vault que lo mencionan + últimos N mensajes
+# WA + stats simples. UN click reemplaza "buscar a Mariana en obsidian
+# manualmente + scrollear el thread + cruzar con calendar".
+#
+# In-process cache TTL=300s por JID. Notas del vault no cambian con cada
+# F5; los WA recents se invalidan automáticamente cuando llega un msg
+# nuevo (el SSE handler bumpea la cache para ese JID).
+
+_WZP_MEMORY_CACHE_LOCK = _threading.RLock()
+_WZP_MEMORY_CACHE: dict = {}  # jid → {"ts": float, "data": dict}
+_WZP_MEMORY_CACHE_TTL = 300.0
+
+
+def _wzp_memory_invalidate(jid: str) -> None:
+    """Drop el slot del JID. Llamar desde SSE handlers cuando llega un
+    mensaje nuevo para ese chat."""
+    if not jid:
+        return
+    with _WZP_MEMORY_CACHE_LOCK:
+        _WZP_MEMORY_CACHE.pop(jid, None)
+
+
+def _wzp_memory_collect(jid: str, max_notes: int, max_wa: int) -> dict:
+    """Reúne memoria cross-source para `jid`. Silent-fail por source.
+
+    Notes:  `multi_retrieve(query=display_name, k=max_notes)` filtrando los
+            doc con score >= 0.05 (umbral suave — el vault puede no
+            mencionar al contacto y eso es OK).
+    WA:     `fetch_thread_for_ui(jid, limit=max_wa)` — últimos N msgs ya
+            renderizados por el bridge.
+    Stats:  count msgs + last_ts del bridge.
+    """
+    from rag.integrations.whatsapp import fetch as _wa_fetch  # noqa: PLC0415
+    from rag import _silent_log  # noqa: PLC0415
+
+    name = ""
+    try:
+        name = _wa_fetch._wa_display_name(jid, "")
+    except Exception as exc:
+        _silent_log("wzp_memory_resolve_name", exc)
+    name = (name or "").strip() or jid.split("@", 1)[0]
+
+    notes: list[dict] = []
+    if name and name != jid.split("@", 1)[0]:
+        try:
+            vaults = resolve_vault_paths(None)
+            if vaults:
+                result = multi_retrieve(
+                    vaults, name, max_notes, None, None, None, False,
+                    multi_query=False,
+                    auto_filter=False,
+                    date_range=None,
+                    rerank_pool=10,
+                    caller="wzp_memory",
+                )
+                docs = result.get("docs") or []
+                metas = result.get("metas") or []
+                scores = result.get("scores") or []
+                for doc, meta, score in zip(docs, metas, scores):
+                    if float(score) < 0.05:
+                        continue
+                    path = (meta or {}).get("path") or (meta or {}).get("source") or ""
+                    title = (meta or {}).get("title") or (Path(path).stem if path else "(sin título)")
+                    snippet = (doc or "").strip().replace("\n", " ")[:240]
+                    mtime = (meta or {}).get("mtime") or (meta or {}).get("ts") or 0
+                    notes.append({
+                        "path": path,
+                        "title": title,
+                        "snippet": snippet,
+                        "score": round(float(score), 3),
+                        "mtime": int(mtime) if mtime else 0,
+                    })
+        except Exception as exc:
+            _silent_log("wzp_memory_retrieve", exc)
+
+    wa_recent: list[dict] = []
+    last_wa_ts: int | None = None
+    try:
+        thread = _wa_fetch.fetch_thread_for_ui(jid, limit=max_wa, before_ts=None)
+        msgs = (thread or {}).get("messages") or []
+        # Bridge devuelve oldest-first; queremos newest-first para "últimos N".
+        msgs = list(reversed(msgs))[:max_wa]
+        for m in msgs:
+            content = (m.get("content") or "").strip()
+            if not content:
+                continue
+            wa_recent.append({
+                "id": m.get("id") or "",
+                "ts": int(m.get("ts") or 0),
+                "from_me": bool(m.get("from_me")),
+                "content": content[:300],
+            })
+            if wa_recent and wa_recent[0]["ts"]:
+                last_wa_ts = wa_recent[0]["ts"]
+    except Exception as exc:
+        _silent_log("wzp_memory_wa_recent", exc)
+
+    summary_bits: list[str] = []
+    if notes:
+        summary_bits.append(f"{len(notes)} nota{'s' if len(notes) != 1 else ''} en el vault")
+    if last_wa_ts:
+        delta_sec = max(0, int(time.time()) - int(last_wa_ts))
+        if delta_sec < 3600:
+            summary_bits.append(f"último mensaje hace {delta_sec // 60} min")
+        elif delta_sec < 86400:
+            summary_bits.append(f"último mensaje hace {delta_sec // 3600} h")
+        else:
+            summary_bits.append(f"último mensaje hace {delta_sec // 86400} días")
+    if not summary_bits:
+        summary_bits.append("sin contexto reciente — chat nuevo o sin notas en vault")
+    summary = " · ".join(summary_bits)
+
+    return {
+        "jid": jid,
+        "name": name,
+        "summary": summary,
+        "notes": notes,
+        "wa_recent": wa_recent,
+        "stats": {
+            "last_wa_ts": last_wa_ts,
+            "notes_count": len(notes),
+            "wa_recent_count": len(wa_recent),
+        },
+    }
+
+
+@app.get("/api/wa/memory/{jid}")
+def wa_memory(jid: str, max_notes: int = 5, max_wa: int = 5) -> dict:
+    """Memoria cross-source sobre el contacto del thread.
+
+    Query params:
+    - `max_notes` (1-15, default 5) — top notas del vault.
+    - `max_wa` (1-20, default 5) — últimos N mensajes WA.
+
+    Response: `{jid, name, summary, notes[], wa_recent[], stats}`.
+
+    Cache 300s por JID. Invalida automático cuando llega msg nuevo
+    (SSE hook llama `_wzp_memory_invalidate(jid)`).
+    """
+    if not jid or "@" not in jid:
+        raise HTTPException(status_code=400, detail="jid inválido")
+    max_notes = max(1, min(int(max_notes), 15))
+    max_wa = max(1, min(int(max_wa), 20))
+
+    cached_ts = 0.0
+    cached_data: dict | None = None
+    with _WZP_MEMORY_CACHE_LOCK:
+        slot = _WZP_MEMORY_CACHE.get(jid)
+        if slot:
+            cached_ts = float(slot.get("ts", 0.0))
+            cached_data = slot.get("data")
+
+    if cached_data and (time.time() - cached_ts) < _WZP_MEMORY_CACHE_TTL:
+        return {"ok": True, "cached": True, **cached_data}
+
+    data = _wzp_memory_collect(jid, max_notes, max_wa)
+    with _WZP_MEMORY_CACHE_LOCK:
+        _WZP_MEMORY_CACHE[jid] = {"ts": time.time(), "data": data}
+    return {"ok": True, "cached": False, **data}
+
+
 class _WAMarkReadRequest(BaseModel):
     jid: str
     last_seen_ts: str | None = None

@@ -195,6 +195,17 @@ export async function submitAnticipateFeedback(dedupKey, rating, reason = "") {
   });
 }
 
+// ── Memoria Universal ─────────────────────────────────────────────────────
+// GET /api/wa/memory/<jid> — cross-source memory sobre el contacto.
+
+export async function fetchWaMemory(jid, { maxNotes = 5, maxWa = 5 } = {}) {
+  const params = new URLSearchParams({
+    max_notes: String(maxNotes),
+    max_wa: String(maxWa),
+  });
+  return jsonGET(`/api/wa/memory/${encodeURIComponent(jid)}?${params}`);
+}
+
 // Health del bridge — usado por el indicador visual del header.
 export async function bridgeHealth() {
   try {

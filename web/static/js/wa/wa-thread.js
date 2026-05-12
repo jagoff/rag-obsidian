@@ -158,6 +158,56 @@ export async function open(jid) {
   // aparece pinned arriba cuando el LLM termina (2-5s). Si no hay gap
   // o falla el LLM, no hace nada.
   loadGapSummary(jid).catch((e) => console.warn("[wa-thread] gap-summary fail", e));
+
+  // Mood Mirror — banner sutil debajo del header cuando mood + contexto
+  // sugieren cuidar la respuesta. Cheap call (~10ms warm). Fire async.
+  loadMoodHint(jid).catch((e) => console.warn("[wa-thread] mood-hint fail", e));
+}
+
+async function loadMoodHint(jid) {
+  const captureJID = jid;
+  let resp;
+  try {
+    resp = await fetch(
+      `/api/wa/thread/${encodeURIComponent(jid)}/mood-hint`,
+      { credentials: "same-origin" },
+    );
+  } catch (_) { return; }
+  if (!resp.ok) return;
+  const data = await resp.json().catch(() => null);
+  if (!data || !data.hint) {
+    // Clear previous hint si existe (del chat anterior).
+    document.getElementById("wa-mood-hint")?.remove();
+    return;
+  }
+  if (currentJID !== captureJID) return;
+  renderMoodHint(data.hint);
+}
+
+function renderMoodHint(h) {
+  document.getElementById("wa-mood-hint")?.remove();
+  const header = document.querySelector(".wa-thread-header");
+  if (!header) return;
+  const bar = document.createElement("div");
+  bar.id = "wa-mood-hint";
+  bar.className = "wa-mood-hint sev-" + (h.severity || "low");
+  bar.innerHTML = `
+    <span class="wa-mood-hint-icon">${escapeHtml(h.icon || "💭")}</span>
+    <span class="wa-mood-hint-msg">${escapeHtml(h.message || "")}</span>
+    <button class="wa-mood-hint-close" type="button" aria-label="Ocultar">×</button>
+  `;
+  bar.querySelector(".wa-mood-hint-close").addEventListener("click", () => bar.remove());
+  // Insertar después del header en el DOM.
+  header.insertAdjacentElement("afterend", bar);
+}
+
+function escapeHtml(s) {
+  if (s == null) return "";
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 async function loadGapSummary(jid) {

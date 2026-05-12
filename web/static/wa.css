@@ -2553,6 +2553,68 @@ body.archived-mode .wa-sidebar-header { box-shadow: inset 0 -2px 0 var(--accent,
   animation: wa-liquid-morph 1.8s ease-in-out infinite;
 }
 
+/* ─── Mood Mirror banner (heads-up debajo del thread header) ─────
+   Aparece cuando mood + contexto del chat sugieren cuidar la respuesta.
+   3 severities con accent distinto. Botón × para ocultar (no persist). */
+.wa-mood-hint {
+  margin: 6px 12px 0;
+  padding: 8px 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  line-height: 1.35;
+  color: var(--text-primary);
+  border-radius: 10px;
+  background: var(--bg-glass-header);
+  backdrop-filter: blur(12px) saturate(180%);
+  -webkit-backdrop-filter: blur(12px) saturate(180%);
+  border: 1px solid var(--border-glass);
+  border-left-width: 3px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  animation: wa-msg-in 0.22s cubic-bezier(0.2, 0, 0.2, 1);
+}
+.wa-mood-hint.sev-high {
+  border-left-color: var(--red, #f15c6d);
+  background: linear-gradient(135deg,
+    rgba(241, 92, 109, 0.14),
+    var(--bg-glass-header) 70%);
+}
+.wa-mood-hint.sev-medium {
+  border-left-color: var(--amber, #ffb84d);
+  background: linear-gradient(135deg,
+    rgba(255, 184, 77, 0.12),
+    var(--bg-glass-header) 70%);
+}
+.wa-mood-hint.sev-low {
+  border-left-color: var(--accent, #06d6a0);
+}
+.wa-mood-hint-icon {
+  font-size: 18px;
+  flex-shrink: 0;
+}
+.wa-mood-hint-msg {
+  flex: 1;
+  min-width: 0;
+}
+.wa-mood-hint-close {
+  appearance: none;
+  -webkit-appearance: none;
+  background: transparent;
+  border: 0;
+  color: var(--text-secondary);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 6px;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+.wa-mood-hint-close:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-primary);
+}
+
 /* ─── Drag & drop overlay (full thread) ─────────────────────────── */
 .wa-dnd-overlay {
   position: absolute;

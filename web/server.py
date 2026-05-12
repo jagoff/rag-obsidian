@@ -4319,6 +4319,22 @@ def wa_translate(req: _WATranslateRequest) -> dict:
     return result
 
 
+@app.get("/api/wa/thread/{jid}/mood-hint")
+def wa_mood_hint(jid: str) -> dict:
+    """Mood Mirror — heads-up banner para el thread header cuando
+    mood signals + contexto del chat sugieren cuidar la respuesta.
+
+    Devuelve `{hint: {kind, message, severity, icon}}` o
+    `{hint: null}` cuando no aplica. Cheap call (~10ms warm) — un
+    SELECT a rag_mood_score_daily + un SELECT a messages.
+    """
+    from rag.integrations.whatsapp import mood_mirror as _mm  # noqa: PLC0415
+
+    if not jid or "@" not in jid:
+        raise HTTPException(status_code=400, detail="jid inválido")
+    return {"hint": _mm.get_hint(jid)}
+
+
 @app.get("/api/wa/thread/{jid}/gap-summary")
 def wa_gap_summary(
     jid: str,

@@ -53,7 +53,7 @@ Routing por palabra clave (si aparece → llamá la tool):
 - para profundizar en una nota específica → read_note(path)
 - "cuántas notas tengo / qué tan grande es mi vault / stats del rag / qué tengo indexado / cómo está mi vault" → rag_stats(). Devuelve total de chunks, URLs, breakdown por source (vault/whatsapp/gmail/calendar/etc), modelos activos, feedback counts. Resumí en prosa concisa.
 - **NOTA NUEVA EN EL VAULT** ("creá/creame una nota", "anotá/anotame", "guardá/guardame esto en obsidian", "captura/capturame", "agregá una nota") **SIN mencionar contacto/persona ni URL** → `create_note(text='<el texto que el user quiere guardar>', title='<si dijo titulada X>', tags=None)`. Esto NO es WhatsApp ni reminder ni event. Escribe directo a `00-Inbox/` del vault. Confirmá con 1 línea: "Guardado en 00-Inbox/<filename>". **DISAMBIGUACIÓN CRÍTICA**: si el user dice "guardame una nota" / "creá una nota" / "anotame" SIN "a <Persona>" → es `create_note`, NO `propose_whatsapp_send_note`. `propose_whatsapp_send_note` SOLO va cuando hay un destinatario explícito ("mandale a Juan la nota de X"). Sin "a <Contacto>" jamás dispares whatsapp_send_note.
-- **URL → NOTA EN EL VAULT** ("creá nota sobre este link <url>", "leéme esta URL", "ingerí <url>", "guardá esta página <url>", o un URL crudo sin verbo) → `fetch_url(url='<url>', save=true)`. Fetchea + summariza + escribe a `00-Inbox/YYYY-MM-DD-HHMM-read-<slug>.md` con frontmatter type:read + tags auto + wikilinks. Confirmá 1 línea: "Guardé '<title>' como 00-Inbox/<filename>". Si el user dice solo "qué dice esta URL" SIN pedir guardar, pasá `save=false`.
+- **URL → NOTA EN EL VAULT** ("creá nota sobre este link <url>", "leéme esta URL", "ingerí <url>", "guardá esta página <url>", o un URL crudo sin verbo) → `fetch_url(url='<url>', save=true)`. Fetchea + summariza + escribe a `00-Inbox/YYYY-MM-DD-HHMM-read-<slug>.md` con frontmatter type:read + tags auto + wikilinks. Confirmá 1 línea: "Guardé '<title>' como 00-Inbox/<filename>". Si el user dice solo "qué dice esta URL" SIN pedir guardar, pasá `save=false`. **REGLA ABSOLUTA**: si el mensaje contiene un URL (`http://` o `https://`), JAMÁS uses `create_note` con contenido inventado del URL — no sabés qué dice esa página hasta llamar `fetch_url`. El único valid path para URL es `fetch_url`. Inventar contenido de un link que no leíste es ALUCINACIÓN, errors graves.
 - si ninguna aplica y necesitás más contexto del vault → search_vault
 
 **ANTI-PATRÓN CRÍTICO (lookups del vault)**: si la pregunta es de tipo lookup ("cuál es mi X", "dame los datos de Y", "qué es Z", "decime W", "buscá X", "información sobre Y", "password de X", "CBU de Y", "dirección de Z", "teléfono de W"), defaulteala a `search_vault(query=<términos clave>)`. PROHIBIDO llamar `whatsapp_pending` / `reminders_due` / `calendar_ahead` / `gmail_recent` para estas queries — esos tools sirven solo cuando el user pregunta literalmente por "chats pendientes" / "tareas" / "eventos" / "mails". Una query como "cuál es mi iCloud Recovery Password" o "cuál es la password de la wifi" tiene que disparar `search_vault(query='iCloud Recovery Password')` (o el equivalente), NUNCA `whatsapp_pending` ni `reminders_due`. Ante duda entre tool freshness vs lookup → ELEGÍ search_vault, es la fuente canónica para info personal del vault.
@@ -554,13 +554,17 @@ def rag_stats() -> str:
 def create_note(text: str, title: str | None = None, tags: list[str] | None = None) -> str:
     """Crear una nota nueva en `00-Inbox/` del vault Obsidian.
 
-    Usá esto cuando el user pide explícitamente capturar algo como nota
-    ("anotame X", "creá una nota con Y", "guardá esto en obsidian",
-    "captura esto"). Escribe directo, no es una propuesta — el user
-    puede borrar/editar la nota en Obsidian si se equivocó. Para
-    capturar el contenido de un link específico, usá `fetch_url` con
-    `save=True` (que ya escribe la nota con summary + frontmatter
-    estructurado).
+    REGLA DE USO: si el mensaje del user contiene un URL (http:// o
+    https://), JAMÁS llames esta tool con contenido inventado del URL.
+    Para URLs usá `fetch_url(url=..., save=True)` — esa tool fetchea
+    la página real y arma la nota con summary + frontmatter. Inventar
+    contenido de un link sin haberlo leído es ALUCINACIÓN grave.
+
+    Usá esta tool cuando el user pide capturar algo como nota Y NO HAY
+    URL en el mensaje: "anotame X", "creá una nota con Y", "guardá
+    esto en obsidian", "captura esto". Escribe directo, no es
+    propuesta — el user puede borrar/editar en Obsidian si se
+    equivocó.
 
     Args:
         text: Cuerpo de la nota (markdown). Lo que se escribe debajo

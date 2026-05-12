@@ -39,6 +39,51 @@ _DEDUP_MAX = 2000
 
 _HWM_PATH = Path.home() / ".local/share/obsidian-rag/wa-hwm.json"
 
+
+def _persist_inbound_promise_if_match(jid: str, content: str, msg_id: str | None) -> None:
+    """Si `content` matchea el regex hint rioplatense, persiste row en
+    `rag_promises` con direction='inbound'. Silent-fail.
+
+    Anti-dup: NO inserta si el mismo msg_id ya tiene una row inbound
+    (poller puede ver el mismo msg dos veces en un edge case).
+    """
+    from datetime import datetime, timezone
+
+    from rag.integrations.whatsapp import _has_promise_hint  # noqa: PLC0415
+    if not content or not _has_promise_hint(content):
+        return
+    try:
+        from rag import _ragvec_state_conn  # noqa: PLC0415
+        from rag.integrations.whatsapp import fetch as _wa_fetch  # noqa: PLC0415
+
+        name = ""
+        try:
+            name = (_wa_fetch._wa_display_name(jid, "") or "").strip()
+        except Exception:
+            pass
+
+        with _ragvec_state_conn() as conn:
+            # Dedupe por source_msg_id si está provided.
+            if msg_id:
+                existing = conn.execute(
+                    "SELECT id FROM rag_promises"
+                    " WHERE source_msg_id = ? AND direction = 'inbound' LIMIT 1",
+                    (msg_id,),
+                ).fetchone()
+                if existing:
+                    return
+            now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            conn.execute(
+                "INSERT INTO rag_promises("
+                " ts, contact_jid, contact_name, promise_text, direction,"
+                " due_ts, due_confidence, source_msg_id, source_chat_jid, status"
+                ") VALUES (?, ?, ?, ?, 'inbound', NULL, 0.3, ?, ?, 'pending')",
+                (now_iso, jid, name or None, content[:1000], msg_id, jid),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
 # Estado de módulo (un solo poller por proceso).
 _subscribers: list[asyncio.Queue] = []
 _loop_task: asyncio.Task | None = None
@@ -207,6 +252,14 @@ def _poll_once(hwm: dict[str, str]) -> tuple[list[dict[str, Any]], dict[str, str
                 "revoked": False,
             }
             events.append({"type": "new_message", "data": {"jid": jid, "message": msg_payload}})
+            # Promise Tracker inbound — si llega un mensaje del peer y
+            # matchea el regex hint rioplatense, persistimos a rag_promises
+            # con direction='inbound'. Silent-fail. No bloquea el SSE emit.
+            if not is_from_me and content:
+                try:
+                    _persist_inbound_promise_if_match(jid, content, msg_payload.get("id"))
+                except Exception:
+                    pass
             # chat_update — preview + delta unread (frontend lo aplica).
             preview = content or (f"[{media}]" if media else "")
             if len(preview) > 120:

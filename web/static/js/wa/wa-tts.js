@@ -10,6 +10,8 @@
 let _btn = null;
 let _input = null;
 let _activeJid = null;
+let _healthOk = false;
+let _healthMissing = [];
 
 export function init() {
   _btn = document.getElementById("wa-tts-btn");
@@ -18,7 +20,27 @@ export function init() {
   _btn.addEventListener("click", onClick);
   // Toggle disabled según contenido del input.
   _input.addEventListener("input", updateState);
+  // Pre-flight check: si `say` o `ffmpeg` no están instalados, disable
+  // el botón con tooltip diagnóstico — evita confusión del primer click
+  // que devuelve "tts_failed" sin contexto.
+  checkHealth();
   updateState();
+}
+
+async function checkHealth() {
+  try {
+    const r = await fetch("/api/wa/voice/healthcheck", { credentials: "same-origin" });
+    if (!r.ok) return;
+    const data = await r.json();
+    _healthOk = !!data.ok;
+    _healthMissing = data.missing || [];
+    if (!_healthOk && _btn) {
+      _btn.classList.add("unavailable");
+      _btn.title = `Voz Espejo no disponible · falta: ${_healthMissing.join(", ")}`;
+    }
+  } catch (e) {
+    // silent — si el healthcheck falla, dejamos pasar el click normal
+  }
 }
 
 export function setActiveJid(jid) {
@@ -29,7 +51,7 @@ export function setActiveJid(jid) {
 function updateState() {
   if (!_btn) return;
   const text = (_input?.value || "").trim();
-  _btn.disabled = !_activeJid || text.length < 2;
+  _btn.disabled = !_healthOk || !_activeJid || text.length < 2;
 }
 
 async function onClick(ev) {

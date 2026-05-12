@@ -99,6 +99,35 @@ def test_send_voice_bridge_error(client, monkeypatch, tmp_path):
     assert body["error_kind"] == "bridge_error"
 
 
+def test_voice_healthcheck_ok(client, monkeypatch):
+    """Cuando say + ffmpeg están instalados → ok=True, missing=[]."""
+    import shutil
+    monkeypatch.setattr(shutil, "which",
+                        lambda cmd: f"/usr/bin/{cmd}")
+    r = client.get("/api/wa/voice/healthcheck")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["say"] is True
+    assert body["ffmpeg"] is True
+    assert body["voice_default"] == "Mónica"
+    assert body["missing"] == []
+
+
+def test_voice_healthcheck_missing_say(client, monkeypatch):
+    """Cuando say falta → ok=False, missing=['say']."""
+    import shutil
+    def fake_which(cmd):
+        return None if cmd == "say" else "/opt/homebrew/bin/ffmpeg"
+    monkeypatch.setattr(shutil, "which", fake_which)
+    # También bloqueamos el fallback path absoluto de ffmpeg.
+    monkeypatch.setattr(Path, "is_file", lambda self: False)
+    r = client.get("/api/wa/voice/healthcheck")
+    body = r.json()
+    assert body["ok"] is False
+    assert "say" in body["missing"]
+
+
 def test_send_voice_custom_voice(client, monkeypatch, tmp_path):
     """`voice` param se pasa a tts_text_to_opus."""
     from rag.integrations.whatsapp import voice as _voice, bridge_client as _bc

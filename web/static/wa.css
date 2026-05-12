@@ -1712,6 +1712,11 @@ body.archived-mode .wa-sidebar-header { box-shadow: inset 0 -2px 0 var(--accent,
   background: rgba(255, 100, 100, 0.18);
   color: var(--red);
 }
+.wa-tts-btn.unavailable {
+  opacity: 0.25;
+  cursor: help;
+  pointer-events: auto;
+}
 @keyframes wa-tts-pulse {
   0%, 100% { transform: scale(1); }
   50% { transform: scale(1.08); }
@@ -3450,6 +3455,23 @@ body.archived-mode .wa-sidebar-header { box-shadow: inset 0 -2px 0 var(--accent,
   from { opacity: 0; transform: translateY(4px); }
   to { opacity: 1; transform: translateY(0); }
 }
+
+/* ─── Mood Mirror · weekly summary chip en sidebar footer ─────────── */
+
+.wa-stat-mood {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: help;
+  white-space: pre-line;
+}
+.wa-stat-mood-icon {
+  font-size: 12px;
+  line-height: 1;
+}
+.wa-stat-mood.mood-up .wa-stat-label { color: var(--accent, #00a884); }
+.wa-stat-mood.mood-down .wa-stat-label { color: var(--red, #e8a); }
+.wa-stat-mood.mood-flat .wa-stat-label { color: var(--text-tertiary, #888); }
 
 /* ─── Utility ─────────────────────────────────────────────────────── */
 .hidden { display: none !important; }

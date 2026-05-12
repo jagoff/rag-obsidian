@@ -11,6 +11,7 @@ import * as memory from "./wa-memory.js";
 import * as promises from "./wa-promises.js";
 import * as moodCheck from "./wa-mood-check.js";
 import * as tts from "./wa-tts.js";
+import * as moodSummary from "./wa-mood-summary.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -105,6 +106,9 @@ function init() {
 
   // Voz Espejo — botón 🎙 en composer. TTS texto → Mónica → OGG/Opus → PTT.
   tts.init();
+
+  // Mood Mirror weekly summary — chip 7d en sidebar footer.
+  moodSummary.init();
 
   // Cmd+K también dispara `thread.open` — propagar al memory drawer.
 }

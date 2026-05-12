@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <title>rag · wzp</title>
-  <link rel="stylesheet" href="/static/wa.css?v=48">
+  <link rel="stylesheet" href="/static/wa.css?v=49">
   <link rel="manifest" href="/static/manifest.webmanifest">
   <link rel="icon" type="image/png" sizes="32x32" href="/static/pwa/favicon-32.png">
   <link rel="icon" type="image/png" sizes="16x16" href="/static/pwa/favicon-16.png">
@@ -100,6 +100,12 @@
           <span class="wa-stat-label">UNREAD</span>
         </span>
         <span class="wa-stat-sep">│</span>
+        <span class="wa-stat wa-stat-mood" id="wa-stat-mood" hidden
+              title="resumen mood 7d">
+          <span class="wa-stat-mood-icon" id="wa-stat-mood-icon" aria-hidden="true">—</span>
+          <span class="wa-stat-label">7D</span>
+        </span>
+        <span class="wa-stat-sep">│</span>
         <span class="wa-stat wa-stat-clock" id="wa-stat-clock" title="hora local">––:––</span>
       </footer>
     </aside>
@@ -184,6 +190,6 @@
        borrar mensajes propios). Loopback-only — un device LAN/tunnel
        no recibe el token y el delete falla server-side con 401. -->
   <script src="/static/admin-auth.js"></script>
-  <script type="module" src="/static/js/wa/wa.js?v=47"></script>
+  <script type="module" src="/static/js/wa/wa.js?v=48"></script>
 </body>
 </html>

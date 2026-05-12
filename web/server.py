@@ -5338,6 +5338,36 @@ class _WASendVoiceRequest(BaseModel):
     reply_to_id: str | None = None
 
 
+@app.get("/api/wa/voice/healthcheck")
+def wa_voice_healthcheck() -> dict:
+    """Verifica que las deps de Voz Espejo estén disponibles.
+
+    Returns `{ok, say, ffmpeg, voice_default, missing}`. Si `ok=False`,
+    el frontend disabilea el botón 🎙 con tooltip diagnóstico.
+    Cheap (~5ms): solo `shutil.which()` lookups.
+    """
+    import shutil  # noqa: PLC0415
+
+    say_path = shutil.which("say")
+    ffmpeg_path = (
+        shutil.which("ffmpeg") or
+        ("/opt/homebrew/bin/ffmpeg"
+         if Path("/opt/homebrew/bin/ffmpeg").is_file() else None)
+    )
+    missing = []
+    if not say_path:
+        missing.append("say")
+    if not ffmpeg_path:
+        missing.append("ffmpeg")
+    return {
+        "ok": not missing,
+        "say": bool(say_path),
+        "ffmpeg": bool(ffmpeg_path),
+        "voice_default": "Mónica",
+        "missing": missing,
+    }
+
+
 @app.post("/api/wa/send_voice")
 def wa_send_voice(req: _WASendVoiceRequest) -> dict:
     """TTS-to-PTT: convierte `text` a OGG/Opus con `say -v <voice>` y

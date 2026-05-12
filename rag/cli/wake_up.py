@@ -113,9 +113,15 @@ def wake_up_cmd(ctx, dry_run: bool, skip_index: bool, skip_bookmarks: bool,
 
     steps: list[tuple[str, object, dict]] = []
     if not skip_index:
+        # Click param names — `--full` binds `full_flag`, `--reset` (alias
+        # legacy) binds `reset_legacy`. Pasar `reset=False` revienta con
+        # `TypeError: index() got an unexpected keyword argument 'reset'`
+        # — los 7 cross-source ingesters fallan silent y nada se actualiza
+        # post-wake. Mismo patrón que cli/setup.py::catch_up_index().
         steps.append(("rag index", index, dict(
-            reset=False, no_contradict=False, source_opt=None,
-            since_opt=None, dry_run=False, max_chats=None, vault_scope=None,
+            full_flag=False, reset_legacy=False, no_contradict=False,
+            source_opt=None, since_opt=None, dry_run=False, max_chats=None,
+            vault_scope=None, contextual=False, fast=False,
         )))
     if not skip_bookmarks:
         steps.append(("rag bookmarks sync", bookmarks_sync, dict(profile=None)))

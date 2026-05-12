@@ -739,9 +739,15 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
    verticalmente — antes eran 5 cols y los URLs largos rompían la caja
    estrecha de Para mañana. */
 .today-hero-body {
+  /* 2x2 grid en vez de 1x4: LO QUE PASÓ + SIN PROCESAR ocupan row 1
+     (ambos tienden a tener mucho contenido), PREGUNTAS + AGENDA ocupan
+     row 2 (ambos cortos). Cada row dimensiona a su propio max-content,
+     sin cap ni overflow — AGENDA termina como caja independiente del
+     row de LO QUE PASÓ. */
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(2, 1fr);
   gap: 0;
+  align-items: start;
 }
 .today-hero-body > .hero-section {
   padding: var(--space-3) var(--space-4);
@@ -752,11 +758,13 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
      refuerza para Safari/iOS que no respeta anywhere todavía. */
   overflow-wrap: anywhere;
   word-break: break-word;
-  /* Cap row height so PREGUNTAS/AGENDA (short content) and LO QUE PASÓ/
-     SIN PROCESAR (long content) share a uniform row height. Tall cells
-     scroll internally; short cells just sit naturally. */
-  max-height: 320px;
-  overflow-y: auto;
+}
+/* En 2x2, los cells de la columna derecha (índices 2, 4) NO llevan
+   border-right (es el borde de la grilla). Las celdas que NO están en
+   la última fila llevan border-bottom para separar filas. */
+.today-hero-body > .hero-section:nth-child(2n) { border-right: none; }
+.today-hero-body > .hero-section:not(:nth-last-child(-n+2)) {
+  border-bottom: 1px solid var(--border);
 }
 .today-hero-body > .hero-section:last-child { border-right: none; }
 /* Cuando una hero-section está colapsada, ocultamos la prose + sub-bodies,

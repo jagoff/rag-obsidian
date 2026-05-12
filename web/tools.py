@@ -748,3 +748,20 @@ PROPOSAL_TOOL_NAMES: set[str] = {
     "propose_whatsapp_reschedule_scheduled",
     "propose_mail_send",
 }
+
+# Tool names que CREAN cosas directo (no son propuestas) pero que comparten
+# el code path del create-intent narrowing (`is_propose_intent` en
+# web/server.py). El narrowing original a `PROPOSAL_TOOL_NAMES` solamente
+# excluía estas tools, dejándolas inalcanzables cuando el regex
+# `_PROPOSE_INTENT_RE` matcheaba ("creá una nota", URLs crudas, etc.).
+# Distintas de las `propose_*` porque NO emiten SSE `proposal` events:
+# ejecutan directo, sin tarjeta de confirmación.
+CREATE_ACTION_TOOL_NAMES: set[str] = {
+    "create_note",
+    "fetch_url",
+}
+
+# Union — usada por el narrowing en web/server.py:15316-15320.
+PROPOSE_OR_CREATE_TOOL_NAMES: set[str] = (
+    PROPOSAL_TOOL_NAMES | CREATE_ACTION_TOOL_NAMES
+)

@@ -15308,15 +15308,20 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     # with a "cap reached" system message).
                     break
                 # On create-intent turns, narrow the tool surface to JUST
-                # the 2 propose_* tools. With all 9 tools visible qwen2.5:7b
-                # gets decision paralysis and often returns a clarifying
-                # question instead of calling the tool. With only 2 tools
-                # present and the override telling it to call one of them,
-                # the choice is forced.
+                # the propose_* / create_* tools. With all 26 tools visible
+                # qwen2.5:7b gets decision paralysis and often returns a
+                # clarifying question instead of calling the tool. With
+                # solo el subset, la elección es forzada.
+                # `CREATE_ACTION_TOOL_NAMES` (2026-05-12) suma `create_note`
+                # y `fetch_url` al narrowing — antes el regex pegaba pero
+                # las tools no estaban en el subset, así que el LLM caía a
+                # narrar "no puedo crear notas".
+                from web.tools import PROPOSE_OR_CREATE_TOOL_NAMES
                 _round_tools = CHAT_TOOLS
                 if is_propose_intent:
                     _round_tools = [
-                        fn for fn in CHAT_TOOLS if fn.__name__ in PROPOSAL_TOOL_NAMES
+                        fn for fn in CHAT_TOOLS
+                        if fn.__name__ in PROPOSE_OR_CREATE_TOOL_NAMES
                     ]
                 # Tool-decision call via MLX in-process: `_mlx_chat_via_backend`
                 # propagates `tools=` to `tokenizer.apply_chat_template(tools=...)`

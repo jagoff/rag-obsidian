@@ -5358,7 +5358,7 @@ def feedback_signals_for_query(q_embedding: list[float]) -> tuple[dict[str, floa
 # corpus" → no se sirvan más. **Vive en __init__.py (no en response_cache.py)
 # porque otros módulos referencian este símbolo directamente; mover rompería
 # call sites y la convention de "el filter version del repo".**
-_FILTER_VERSION = "wave13-2026-05-11"
+_FILTER_VERSION = "wave14-2026-05-12"
 
 from rag.response_cache import (  # noqa: E402, F401
     _CORPUS_HASH_BUCKET,

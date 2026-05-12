@@ -36,7 +36,7 @@ from rag import (  # noqa: E402
 )
 
 
-_WEB_TOOL_ADDENDUM: str = """Tenés 23 tools para traer datos frescos o registrar acciones. IMPORTANTE: usalas cuando la pregunta las necesita, aunque el CONTEXTO del vault ya tenga algo — el vault puede estar desactualizado o incompleto.
+_WEB_TOOL_ADDENDUM: str = """Tenés 26 tools para traer datos frescos o registrar acciones. IMPORTANTE: usalas cuando la pregunta las necesita, aunque el CONTEXTO del vault ya tenga algo — el vault puede estar desactualizado o incompleto.
 
 Routing por palabra clave (si aparece → llamá la tool):
 - gasto/gasté/gastos/presupuesto/plata/finanza/MOZE → finance_summary
@@ -51,6 +51,9 @@ Routing por palabra clave (si aparece → llamá la tool):
 - "qué hablamos con X / qué quedamos con X / leéme el chat con X / qué dijimos con X / fijate qué charlamos con X" → whatsapp_thread(contact_name='X', max_messages=15, days=7). Trae los últimos N mensajes LITERALES del chat 1:1 con X, en orden cronológico, leídos directo del bridge SQLite (no del corpus indexado). Distinto a `whatsapp_search` (que matchea por contenido) y `whatsapp_pending` (que lista chats sin responder): acá queremos el hilo tal cual para que el LLM parsee contexto (horas propuestas, decisiones, promesas, confirmaciones). Si después de leer el thread ves una fecha/hora clara propuesta para juntarse ("el jueves a las 4pm", "mañana 10hs"), encadená con `propose_calendar_event(title='Reunión con X', start='<fecha parseada>')` en la MISMA ronda — NO pidas confirmación intermedia al user; el propose_calendar_event ya muestra la card con [Crear].
 - "leé/abrí/mostrame/lee la nota <X>" (donde X es nombre o path) → read_note(path='<path>'). Resolvé el path: si el user dice solo el nombre sin ".md", agregalo (ej. "leé CLAUDE" → path='CLAUDE.md'). Esta tool SIEMPRE tiene prioridad cuando el user pide explícitamente leer una nota — NO uses search_vault como fallback.
 - para profundizar en una nota específica → read_note(path)
+- "cuántas notas tengo / qué tan grande es mi vault / stats del rag / qué tengo indexado / cómo está mi vault" → rag_stats(). Devuelve total de chunks, URLs, breakdown por source (vault/whatsapp/gmail/calendar/etc), modelos activos, feedback counts. Resumí en prosa concisa.
+- "anotá/anotame/guardá/capturá/creá una nota con <texto>" SIN url → create_note(text='<texto>', title='<opcional>', tags=['idea']). Escribe a 00-Inbox/ directo (no es propuesta). El user lo edita/borra en Obsidian si se equivocó. Confirmá 1 línea: "Guardado en 00-Inbox/<filename>". NO uses para info sobre contactos (eso es record_contact_observation) ni para URLs (eso es fetch_url).
+- "creá nota sobre este link / leéme esta URL / ingerí <url> / guardá esta página <url>" → fetch_url(url='<url>', save=true). Fetchea + summariza + escribe a 00-Inbox/ con frontmatter type:read + tags + wikilinks a notas relacionadas. Confirmá 1 línea: "Guardé '<title>' como 00-Inbox/<filename>". Si el user dice solo "qué dice esta URL" SIN pedir guardar, pasá save=false (dry: devuelve summary, no escribe).
 - si ninguna aplica y necesitás más contexto del vault → search_vault
 
 **ANTI-PATRÓN CRÍTICO (lookups del vault)**: si la pregunta es de tipo lookup ("cuál es mi X", "dame los datos de Y", "qué es Z", "decime W", "buscá X", "información sobre Y", "password de X", "CBU de Y", "dirección de Z", "teléfono de W"), defaulteala a `search_vault(query=<términos clave>)`. PROHIBIDO llamar `whatsapp_pending` / `reminders_due` / `calendar_ahead` / `gmail_recent` para estas queries — esos tools sirven solo cuando el user pregunta literalmente por "chats pendientes" / "tareas" / "eventos" / "mails". Una query como "cuál es mi iCloud Recovery Password" o "cuál es la password de la wifi" tiene que disparar `search_vault(query='iCloud Recovery Password')` (o el equivalente), NUNCA `whatsapp_pending` ni `reminders_due`. Ante duda entre tool freshness vs lookup → ELEGÍ search_vault, es la fuente canónica para info personal del vault.
@@ -482,6 +485,175 @@ def whatsapp_pending(hours: int = 48, max_chats: int = 10) -> str:
         return "[]"
 
 
+def rag_stats() -> str:
+    """Estado del vault y del índice RAG.
+
+    Devuelve totales de chunks/URLs indexados, breakdown por source
+    (vault, whatsapp, gmail, calendar, etc.), modelos activos y feedback
+    counts. Read-only. Usalo cuando el user pregunta "cuántas notas
+    tengo", "qué tan grande es mi vault", "qué tengo indexado", "stats
+    del rag", "cómo está mi vault".
+
+    Returns:
+        JSON con `{chunks, urls, vault_path, embed_model, chat_model,
+        helper_model, breakdown: [{source, chunks, pct, last_indexed}],
+        feedback: {pos, neg}}`. Errores → campos vacíos + `error`.
+    """
+    try:
+        from rag import (
+            get_db, get_urls_db, _corpus_breakdown_by_source,
+            VAULT_PATH, EMBED_MODEL, HELPER_MODEL, CHAT_MODEL_PREFERENCE,
+            resolve_chat_model, feedback_counts,
+        )
+        col = get_db()
+        chunks = col.count()
+        try:
+            urls = get_urls_db().count()
+        except Exception:
+            urls = 0
+        try:
+            breakdown_raw = _corpus_breakdown_by_source()
+        except Exception:
+            breakdown_raw = []
+        total = sum(cnt for _, cnt, _ in breakdown_raw) or chunks or 1
+        breakdown = [
+            {
+                "source": src or "(null)",
+                "chunks": cnt,
+                "pct": round(100 * cnt / total, 1),
+                "last_indexed": last_ts,
+            }
+            for src, cnt, last_ts in breakdown_raw
+        ]
+        try:
+            chat_model = resolve_chat_model()
+        except Exception as exc:
+            chat_model = f"(error: {exc})"
+        try:
+            pos, neg = feedback_counts()
+        except Exception:
+            pos, neg = 0, 0
+        return json.dumps(
+            {
+                "chunks": chunks,
+                "urls": urls,
+                "vault_path": str(VAULT_PATH),
+                "embed_model": EMBED_MODEL,
+                "chat_model": chat_model,
+                "chat_model_preference": list(CHAT_MODEL_PREFERENCE),
+                "helper_model": HELPER_MODEL,
+                "breakdown": breakdown,
+                "feedback": {"pos": pos, "neg": neg},
+            },
+            ensure_ascii=False,
+        )
+    except Exception as exc:
+        return json.dumps({"chunks": 0, "urls": 0, "error": str(exc)}, ensure_ascii=False)
+
+
+def create_note(text: str, title: str | None = None, tags: list[str] | None = None) -> str:
+    """Crear una nota nueva en `00-Inbox/` del vault Obsidian.
+
+    Usá esto cuando el user pide explícitamente capturar algo como nota
+    ("anotame X", "creá una nota con Y", "guardá esto en obsidian",
+    "captura esto"). Escribe directo, no es una propuesta — el user
+    puede borrar/editar la nota en Obsidian si se equivocó. Para
+    capturar el contenido de un link específico, usá `fetch_url` con
+    `save=True` (que ya escribe la nota con summary + frontmatter
+    estructurado).
+
+    Args:
+        text: Cuerpo de la nota (markdown). Lo que se escribe debajo
+            del frontmatter.
+        title: Título opcional. Si se omite, se usa la primera línea de
+            `text` como slug del filename. Si se pasa, el filename va a
+            ser `YYYY-MM-DD-HHMM-<slug-de-title>.md`.
+        tags: Tags extra además del default "capture". Lista de
+            strings, kebab-case sin `#` (ej. ["idea", "rag"]).
+
+    Returns:
+        JSON `{ok: true, path: "<vault-relative>", filename: "..."}`,
+        o `{ok: false, error: "..."}` si el texto está vacío o el write
+        falló.
+    """
+    try:
+        from rag import capture_note, VAULT_PATH
+        if not (text or "").strip():
+            return json.dumps({"ok": False, "error": "texto vacío"}, ensure_ascii=False)
+        tag_list = list(tags) if tags else None
+        path = capture_note(
+            text=text,
+            tags=tag_list,
+            source="ra-chat",
+            title=title,
+        )
+        rel = str(path.relative_to(VAULT_PATH))
+        return json.dumps(
+            {"ok": True, "path": rel, "filename": path.name},
+            ensure_ascii=False,
+        )
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+
+def fetch_url(url: str, save: bool = True) -> str:
+    """Fetchear una URL externa, extraer markdown limpio + summary.
+
+    Usá esto cuando el user pide ingerir, leer o crear nota sobre un
+    link ("creá una nota sobre este link X", "leéme esta URL", "guardá
+    esta página", "fijate qué dice este artículo"). Internamente fetcha
+    la página, limpia el HTML (readability/defuddle), resume con LLM
+    en 1ra persona, busca notas relacionadas en el vault y arma una
+    nota markdown con frontmatter `type: read`, `source: <url>`, tags
+    auto-derivados, wikilinks a notas relacionadas.
+
+    Args:
+        url: URL completa empezando con http:// o https://.
+        save: Si True (default), escribe la nota a
+            `00-Inbox/YYYY-MM-DD-HHMM-read-<slug>.md` y la indexa al
+            corpus. Si False, fetcha + arma el body pero NO escribe
+            (dry-run; útil cuando el user quiere leer el contenido sin
+            persistir).
+
+    Returns:
+        JSON `{ok: true, title, summary, path?, related: [...],
+        tags: [...], text_len, url}`. `path` solo presente si save=true.
+        Errores (URL inválida, fetch fail, paywall) → `{ok: false,
+        error: "..."}`.
+    """
+    try:
+        from rag import get_db, ingest_read_url, VAULT_PATH
+        if not (url or "").strip():
+            return json.dumps({"ok": False, "error": "url vacía"}, ensure_ascii=False)
+        u = url.strip()
+        if not (u.startswith("http://") or u.startswith("https://")):
+            return json.dumps(
+                {"ok": False, "error": "URL inválida: debe empezar con http:// o https://"},
+                ensure_ascii=False,
+            )
+        col = get_db()
+        result = ingest_read_url(col, u, save=bool(save))
+        out: dict = {
+            "ok": True,
+            "title": result.get("title", ""),
+            "summary": result.get("summary", ""),
+            "tags": list(result.get("tags") or []),
+            "related": list(result.get("related") or []),
+            "text_len": int(result.get("text_len") or 0),
+            "url": u,
+        }
+        if save and result.get("path"):
+            try:
+                out["path"] = str(result["path"].relative_to(VAULT_PATH))
+            except Exception:
+                out["path"] = str(result["path"])
+        return json.dumps(out, ensure_ascii=False)
+    except RuntimeError as exc:
+        return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": f"fetch fail: {exc}"}, ensure_ascii=False)
+
+
 # Chat-exposed tool wrappers for reminder/event creation. Real logic
 # lives in rag.py so the CLI rag chat loop can reuse it without the
 # web → rag → web circular import. These re-exports keep the ollama
@@ -515,6 +687,9 @@ CHAT_TOOLS: list[Callable] = [
     whatsapp_thread,
     whatsapp_list_scheduled,
     record_contact_observation,
+    rag_stats,
+    create_note,
+    fetch_url,
     propose_reminder,
     propose_calendar_event,
     propose_whatsapp_send,
@@ -540,6 +715,11 @@ PARALLEL_SAFE: set[str] = {
     "whatsapp_search",
     "whatsapp_thread",
     "whatsapp_list_scheduled",  # query-only contra SQLite local — safe.
+    "rag_stats",  # read-only contra ragvec/telemetry DBs.
+    # create_note + fetch_url NO van acá: hacen file writes (capture_note
+    # → 00-Inbox/) o LLM-blocking calls (ingest_read_url → summary +
+    # tag-derivation con qwen2.5:7b). Mejor serializarlos para que el
+    # debugging sea claro si algo falla.
     "propose_reminder",
     "propose_calendar_event",
     # `propose_whatsapp_send` intencionalmente NO está acá: aunque el tool

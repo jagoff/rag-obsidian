@@ -1,8 +1,16 @@
 # obsidian-rag
 
-RAG local sobre el vault de Obsidian, fully local: sqlite-vec + MLX + sentence-transformers. Sin cloud, sin telemetría.
+Sistema de búsqueda inteligente para tu vault de Obsidian. Todo corre localmente en tu Mac: usa sqlite-vec para buscar en tus notas, MLX para procesar lenguaje natural, y sentence-transformers para entender el significado de lo que escribís. No envía nada a la nube, no tiene telemetría.
 
-> **Para la guía de arquitectura interna y decisiones de diseño, ver [CLAUDE.md](./CLAUDE.md).** Este README es la **referencia operativa**: comandos, flags, paths, schemas, recetas — lo que se olvida y hay que poder buscar.
+**¿Qué hace?**
+- Busca en tus notas usando lenguaje natural (ej: "qué ideas tengo sobre ikigai")
+- Genera respuestas con citas a las notas originales
+- Detecta contradicciones entre notas
+- Sugiere dónde archivar notas del Inbox
+- Envía briefs diarios y resúmenes semanales
+- Integra con WhatsApp, Gmail, Calendar, Reminders, Spotify
+
+> **Para detalles técnicos avanzados**, ver [CLAUDE.md](./CLAUDE.md). Este README es la guía práctica: comandos, configuración, troubleshooting — lo que necesitás recordar para usar el sistema día a día.
 
 ---
 
@@ -21,19 +29,21 @@ RAG local sobre el vault de Obsidian, fully local: sqlite-vec + MLX + sentence-t
 11. [Frontmatter conventions](#frontmatter-conventions)
 12. [MCP tools](#mcp-tools)
 13. [Automation (launchd)](#automation-launchd)
-14. [WhatsApp listener](#whatsapp-listener)
-15. [Recetas comunes](#recetas-comunes)
-16. [Troubleshooting](#troubleshooting)
-17. [Findings empíricos clave](#findings-empíricos-clave-no-olvidar)
-18. [Suite de tests](#suite-de-tests)
+14. [Módulos de aprendizaje (learning modules)](#módulos-de-aprendizaje-learning-modules)
+15. [WhatsApp listener](#whatsapp-listener)
+16. [Web UI (dashboard)](#web-ui-dashboard)
+17. [Recetas comunes](#recetas-comunes)
+18. [Troubleshooting](#troubleshooting)
+19. [Findings empíricos clave](#findings-empíricos-clave-no-olvidar)
+20. [Suite de tests](#suite-de-tests)
 
 ---
 
 ## Qué es y cómo se compone
 
-Una sola CLI (`rag`) sobre el paquete `~/repositories/obsidian-rag/rag/` (`__init__.py` ~64k LOC core + sub-módulos especializados, post-split 2026-05-04) + un MCP server (`obsidian-rag-mcp`) sobre `mcp_server.py`.
+Una sola herramienta de línea de comandos (`rag`) que vive en `/Users/fer/repos/rag/rag/` (el código principal) + un servidor MCP (`obsidian-rag-mcp`) para integración con Claude.
 
-> **Nota MLX (Olas 0-8 cerradas 2026-05-06)**: stack 100% [MLX](https://github.com/ml-explore/mlx-lm) — chat, embed (in-process via SentenceTransformer + MPS), VLM (granite via mlx-vlm) y reranker. Default `RAG_LLM_BACKEND=mlx` (único backend disponible). Las tablas y diagramas de abajo aún muestran nombres `qwen2.5:Xb` / `command-r` como aliases cortos — bajo MLX se resuelven a sus equivalentes 4bit ([`Qwen2.5-3B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-3B-Instruct-4bit), [`Qwen2.5-7B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-7B-Instruct-4bit), [`Qwen3-30B-A3B-Instruct-2507-4bit`](https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit)). Detalle en [`docs/mlx-migration.md`](./docs/mlx-migration.md) y [CLAUDE.md](./CLAUDE.md).
+> **Nota sobre los modelos de IA**: El sistema usa modelos de Apple Silicon (MLX) que corren 100% en tu Mac. Los modelos principales son Qwen2.5-3B (para tareas rápidas), Qwen2.5-7B (para respuestas principales), y Qwen3-30B (para tareas complejas). Todo corre localmente, sin nube. Detalles técnicos en [`docs/mlx-migration.md`](./docs/mlx-migration.md).
 
 ```mermaid
 graph TD
@@ -93,37 +103,27 @@ Quickstart end-to-end (asumiendo macOS + Homebrew + `uv` ya instalado):
 ls ~/.cache/huggingface/hub/ | grep mlx-community
 # Si falta:
 huggingface-cli download mlx-community/Qwen2.5-7B-Instruct-4bit
-# Los modelos chat (Qwen2.5-3B/7B-Instruct-4bit, Qwen3-30B-A3B-Instruct-2507-4bit)
-# se descargan automáticamente del Hugging Face Hub al primer uso vía mlx-lm.
-# Para pre-pullear: huggingface-cli download mlx-community/Qwen2.5-7B-Instruct-4bit
 
 # 2. Instalar el CLI (binarios: rag, obsidian-rag-mcp)
-# Los extras `entities` (gliner NER, RAG_ENTITY_LOOKUP=ON default) y `stt`
-# (faster-whisper, whisper learning loop) son default-on en producción —
-# sin ellos los ingesters loggean warnings y las features quedan
-# silenciosamente desactivadas. `spotify` queda como opt-in real (requiere
-# config OAuth).
-cd ~/repositories/obsidian-rag
+cd /Users/fer/repos/rag
 uv tool install --reinstall --editable '.[entities,stt]'
 
-# 3. Primer indexado del vault (10-30 min según vault size + Mac)
+# 3. Primer indexado del vault (10-30 min según tamaño del vault + Mac)
 rag index
 
-# 4. Levantar el sistema completo: daemons obsidian-rag-* + RagNet + catch-up
-#    incremental al último minuto de uso. Idempotente. Para parar todo:
-#    `rag stop` (default ON RagNet, OFF qdrant).
+# 4. Levantar el sistema completo (daemons + servicios)
 rag start
 
 # 5. Verificar que el sistema está sano
-rag health                       # snapshot unificado: corpus, latencia, feedback, calibration
-launchctl list | grep obsidian-rag    # los 35 servicios deben aparecer
+rag health
+launchctl list | grep obsidian-rag
 ```
 
-**Dependencias del sistema** (Homebrew):
-- Modelos MLX descargados (`mlx-community/Qwen2.5-3B-Instruct-4bit`, `mlx-community/Qwen2.5-7B-Instruct-4bit`, `Qwen/Qwen3-Embedding-0.6B`) — `huggingface-cli download <model-id>`.
-- Python 3.13 vía [`uv`](https://docs.astral.sh/uv/).
-- Para integraciones cross-source opcionales (Gmail/Calendar): credenciales OAuth en `~/.gmail-mcp/` (ver [`docs/design-cross-source-corpus.md`](./docs/design-cross-source-corpus.md)).
-- Para WhatsApp ingest: el bridge `~/whatsapp-listener/` corriendo en `localhost:8080`.
+**Dependencias del sistema**:
+- Modelos MLX descargados (se descargan automáticamente al primer uso)
+- Python 3.13 vía [`uv`](https://docs.astral.sh/uv/)
+- Para integraciones opcionales (Gmail/Calendar): credenciales OAuth en `~/.gmail-mcp/`
+- Para WhatsApp: el bridge `~/whatsapp-listener/` corriendo en `localhost:8080`
 
 **Para correr tests**:
 ```bash
@@ -132,7 +132,7 @@ launchctl list | grep obsidian-rag    # los 35 servicios deben aparecer
 .venv/bin/python -m pytest tests/test_X.py::test_Y    # un caso
 ```
 
-**Si algo se rompió durante el setup** (corpus corrupto, daemon que no arranca, dir lleno): ver [`docs/recovery.md`](./docs/recovery.md) — runbook de los 7 modos de falla más probables.
+**Si algo se rompió durante el setup**: ver [`docs/recovery.md`](./docs/recovery.md) — guía de troubleshooting para los problemas más comunes.
 
 ---
 
@@ -816,6 +816,47 @@ rag surface --sim-threshold 0.82 --top 10 --no-llm   # más estricto y sin gener
 
 ---
 
+## Módulos de aprendizaje (learning modules)
+
+El sistema tiene varios módulos que aprenden de tu uso y mejoran con el tiempo:
+
+### Anticipatory Agent (`rag_anticipate/`)
+
+Agente proactivo que sugiere tareas basadas en patrones en tu vault. Corre como daemon y genera candidates con diferentes signals:
+
+- **Calendar**: detecta eventos próximos y genera briefs de preparación
+- **Echo**: detecta notas repetidas o similares que podrían necesitar consolidación
+- **Commitment**: detecta compromisos en notas y genera recordatorios
+- **Screen Time**: monitorea uso de apps y genera alertas de digital wellbeing
+- **Voice**: procesa notas de voz y extrae action items
+
+Los candidates se muestran en el dashboard y se pueden enviar a WhatsApp. El sistema aprende de tu feedback (thumbs up/down) para ajustar los pesos de cada signal.
+
+### Implicit Learning (`rag_implicit_learning/`)
+
+Aprendizaje implícito de patrones de uso sin intervención explícita:
+
+- **Auto-rollback**: detecta cuando una query falla y ajusta parámetros automáticamente
+- **Corrective paths**: aprende qué correcciones funcionan para ciertos tipos de queries
+- **LLM judge ensemble**: usa múltiples modelos para juzgar la calidad de respuestas
+- **Requery detection**: detecta cuando re-hacés la misma query con diferente phrasing
+- **Reward shaping**: ajusta el reward signal para el learning loop
+- **Session outcome**: aprende qué sesiones fueron útiles vs frustrantes
+
+### Ranker Learning (`rag_ranker_lgbm/`)
+
+Entrena un modelo LightGBM para rerank chunks basándose en features de tu vault. Aprende qué tipo de contenido es más relevante para tus queries específicas.
+
+### Routing Learning (`rag_routing_learning/`)
+
+Aprende qué tipo de queries deberían ir a qué pipeline (ej: queries de facts vs queries de synthesis vs queries de brainstorming).
+
+### Whisper Learning (`rag_whisper_learning/`)
+
+Aprende de tus transcripciones de voz para mejorar el reconocimiento de términos específicos de tu dominio.
+
+---
+
 ## WhatsApp listener
 
 Single-bot consolidado en `~/whatsapp-listener/listener.ts` (Bun + TypeScript). Polls la SQLite del `whatsapp-bridge` cada 3s; un solo grupo de WhatsApp ("RagNet", JID `120363426178035051@g.us`) es el thread de in/out. Anti-loop: cada respuesta del bot se prefija con un U+200B invisible y los mensajes con ese marcador se ignoran.
@@ -842,78 +883,119 @@ Single-bot consolidado en `~/whatsapp-listener/listener.ts` (Bun + TypeScript). 
 - **Sesiones**: `wa:<jid>` como session_id literal → un solo thread por bot (un grupo). TTL 30 días.
 - **Tests**: `~/whatsapp-listener/listener.test.ts` cubre URL regexes, `ragRead/Followup/Today`, `enableAmbient`. `bun test listener.test.ts`.
 
+---
+
+## Web UI (dashboard)
+
+El sistema incluye una interfaz web accesible en `http://localhost:8765` (corre como daemon `com.fer.obsidian-rag-web`). La UI tiene múltiples páginas para diferentes aspectos del sistema:
+
+### Páginas principales
+
+- **`/` (home)**: Dashboard principal con overview del sistema
+- **`/dashboard`**: Analytics de queries, latencias, paths más consultados
+- **`/atlas`**: Visualización del grafo de notas
+- **`/finance`**: Dashboard de finanzas personales
+- **`/mirror`**: Vista personal con 9 secciones (proyectos, entidades, mood, timeline, pendientes, notas dormidas, spotify, screen time, observaciones)
+- **`/learning`**: Panel de aprendizaje del sistema
+- **`/logs`**: Viewer de logs del sistema
+- **`/fine_tunning`**: Panel de fine-tuning de modelos
+- **`/gmail`**: Integración con Gmail
+- **`/memo`**: Vista de memos
+- **`/status`**: Estado del sistema
+- **`/wa`**: Interface de WhatsApp
+- **`/scheduled`**: Mensajes de WhatsApp programados
+
+### Características
+
+- **PWA**: La UI es una Progressive Web App (instalable como app)
+- **Dark mode**: Tema oscuro por defecto
+- **Responsive**: Funciona en desktop y mobile
+- **Real-time**: Updates en tiempo real via WebSocket
+- **Offline**: Funciona sin conexión (con cache)
+
+### Acceso
+
+```bash
+# Levantar el web server
+rag web
+# O como parte de rag start
+rag start
+
+# Acceder en el browser
+open http://localhost:8765
+```
+
+---
+
 ## Troubleshooting
 
-> Para **runbook de los 7 modos de falla destructivos** (DBs borradas, daemon `wa-scheduled-send` que no envía, web colgado, cloudflare tunnel a desactivar, `chat-uploads/` lleno, tests rotos post-pull, restaurar de backup): ver [`docs/recovery.md`](./docs/recovery.md). Para problemas comunes de uso diario (queries lentas, alucinaciones, reranker en CPU, sesiones que no resumen): ver [`docs/problemas-comunes.md`](./docs/problemas-comunes.md). La tabla de abajo es el quick-lookup de una línea.
+> Para **guía detallada de problemas destructivos** (DBs borradas, daemons que no arrancan, etc.) ver [`docs/recovery.md`](./docs/recovery.md). Para problemas comunes de uso diario ver [`docs/problemas-comunes.md`](./docs/problemas-comunes.md).
 
 | Síntoma | Causa probable | Fix |
 |---|---|---|
-| `rag query` cuelga o tarda 60s+ | Modelo cold-loaded (idle-unload watchdog evictó MLX) | Setear `RAG_MLX_IDLE_TTL=0` para disable idle-unload. Verificar `RAG_MLX_IDLE_TTL` en plist. |
-| Reranker tardando ~3× lo normal | Sentence-transformers cayó a CPU en uv venv | Verificar `get_reranker()` fuerza `device="mps"+fp16`. NO remover esa línea. |
-| `rag chat --counter` da false positives | Query-time detector usa command-r ya, debería estar bien | Si pasa, mirar `helper_raw` en `queries.jsonl`. Tunear el prompt en `find_contradictions`. |
-| Phase 2 contradictions ruidosas en frontmatter | command-r flagueando matices como contradicción | Bajar verbosidad: `rag index --no-contradict` para una corrida; o tunear el prompt. |
-| `rag links` devuelve solo imágenes | Filtro de media no está actualizado | Revisar `_IMAGE_EXT_RE`. Re-correr `rag links --rebuild`. |
-| Tests fallan con `sqlite-vec` errors | Tmp path conflicts o cache stale | Borrar `tests/__pycache__/`, re-correr. |
-| URL collection vacía después de upgrade | Auto-backfill aún no disparó | `rag links "anything"` lo trigerea, o forzar con `rag links --rebuild`. |
-| Sesión no se reanuda con `--resume` | `last_session` pointer apunta a una sesión borrada | `rag session list` para ver vivas, `--session <id>` explícito. |
-| `rag setup` falla al cargar | Plist ya cargado o sintaxis inválida | `launchctl unload <path>` manual + ver `launchctl error`. |
-| `rag watch` no re-indexa | El servicio puede haber crasheado | `tail ~/.local/share/obsidian-rag/watch.error.log`; `launchctl kickstart -k gui/$(id -u)/com.fer.obsidian-rag-watch`. |
-| Eval baseline cae | Schema bump (v6→v7 = -5%) o cambio en pipeline | `rag eval --no-multi` para aislar el efecto del multi-query. Comparar contra el baseline en CLAUDE.md. |
-| `rag wikilinks suggest --apply` rompió un archivo | La regex no debería pero por las dudas | `git diff` en el vault si está versionado. Sino, re-escribir desde Obsidian (los `[[wrap]]` son no-destructivos). |
-| `rag dead` devuelve 0 candidatos con vault viejo | iCloud sync bumpea los mtimes constantemente | `rag dead` usa frontmatter `created:` cuando existe. Si tus notas no tienen ese campo, agregarlo (o aceptar que mtime no discrimina edad en iCloud). |
-| `rag morning` auto-fire no aparece en el vault | Servicio launchd no corrió (Mac apagado, suspendido, o error) | `tail ~/.local/share/obsidian-rag/morning.error.log`; re-disparar manual con `rag morning`. |
-| WhatsApp `/note` error "capture timeout" | `rag capture` está llamando al indexer y demora | Aumentar `RAG_TIMEOUT_MS` en `~/whatsapp-listener/listener.ts` o hacer el index async. |
+| `rag query` cuelga o tarda 60s+ | Modelo se descargó de memoria | Setear `RAG_MLX_IDLE_TTL=0` para evitar que se descargue |
+| Reranker tardando ~3× lo normal | Cayó a CPU en vez de GPU | Verificar configuración de GPU en el código |
+| `rag chat --counter` da falsos positivos | Detector de contradicciones muy sensible | Ajustar el prompt en `find_contradictions` |
+| Contradicciones ruidosas en frontmatter | Modelo marca matices como contradicciones | Usar `rag index --no-contradict` temporalmente |
+| `rag links` devuelve solo imágenes | Filtro de medios desactualizado | Correr `rag links --rebuild` |
+| Tests fallan | Cache corrupta | Borrar `tests/__pycache__/` y re-correr |
+| Sesión no se reanuda | Pointer a sesión borrada | Usar `rag session list` para ver sesiones vivas |
+| `rag watch` no re-indexa | Servicio crasheado | Revisar logs: `tail ~/.local/share/obsidian-rag/watch.error.log` |
+| `rag morning` no aparece | Servicio no corrió | Revisar logs: `tail ~/.local/share/obsidian-rag/morning.error.log` |
+| WhatsApp `/note` timeout | Indexado demora mucho | Aumentar timeout en configuración |
 
 ---
 
 ## Findings empíricos clave (no olvidar)
 
-1. **HyDE con qwen2.5:3b empeora hit@5 (95→90 en queries.yaml)**. El modelo chico drift-ea el hipotético del fraseo real. Default OFF. Re-medir solo si el helper sube de tier (≥7B).
-2. **qwen2.5:3b es no-determinista incluso con `temp=0 seed=42`** sobre judgment tasks (contradicciones). Mismo caso da FP primera vez, empty segunda. Y emite JSON malformado con frecuencia. Por eso los detectores de contradicción usan **command-r**, no helper.
-3. **Reranker pierde 3× performance si cae a CPU**. La línea `device="mps"+fp16` en `get_reranker()` es crítica en uv venvs (donde el auto-detect falla).
-4. **sqlite-vec + BM25 sobre el GIL están serializados**. ThreadPoolExecutor sobre los retrievals los hizo 3× MÁS LENTOS en M3 Max. NO paralelizar.
-5. **Cache del corpus invalidado por `col.count()` delta**. Update de chunks que no cambia el count NO invalida — aceptable para chat dentro del mismo proceso (cold→warm: 341ms → 2ms).
-6. **CONFIDENCE_RERANK_MIN = 0.015** calibrado para `bge-reranker-v2-m3` sobre este vault. Irrelevantes ~0.005-0.015, borderline 0.02-0.10, claramente relevantes > 0.2. Re-calibrar si el reranker cambia.
-7. **Per-file cap en `find_urls` = 2**. Sin esto, una sola nota domina los top-K (descubierto al ver 10 imágenes del mismo archivo en la primera versión).
-8. **Wikilink suggester con `min_title_len=4`** filtra colisiones de títulos cortos (TDD/AI/X).
-9. **Phase 2 (index-time contradiction) skipea en `--reset`** automáticamente: full reindex con LLM call por nota = O(n²) inaceptable. Se asume que los contradicts viejos sobreviven al reset si quedaron en el frontmatter.
-10. **El URL sub-index embebe el CONTEXTO (±240 chars), no la URL**. Match semántico contra prosa, no contra el string http://...
-11. **Session memory + WhatsApp**: el listener pasa `wa:<jid>` como session_id literal. Validador `SESSION_ID_RE` lo permite. TTL 30 días. Sesiones pre-migración bajo `tg:<chat_id>` siguen leíbles (TTL las barre).
+1. **HyDE con modelo chico empeora resultados** - El modo HyDE (generar respuesta hipotética para buscar) funciona mejor con modelos grandes. Con el modelo chico (3B) empeora la precisión de 95% a 90%. Default OFF.
+2. **Modelo chico es inconsistente** - qwen2.5:3B da resultados diferentes incluso con configuración idéntica. Por eso las tareas de juicio (como detectar contradicciones) usan modelos más grandes.
+3. **Reranker debe usar GPU** - Si el reranker cae a CPU pierde 3× de performance. La configuración de GPU es crítica.
+4. **No paralelizar búsquedas** - sqlite-vec + BM25 están serializados por el GIL de Python. Paralelizar hace las búsquedas 3× más lentas en M3 Max.
+5. **Cache inteligente** - El cache solo se invalida cuando cambia la cantidad de chunks, no por cada update individual. Esto hace el chat más rápido (341ms → 2ms).
+6. **Threshold de confianza = 0.015** - Calibrado para este vault. Scores < 0.015 son irrelevantes, 0.02-0.10 son borderline, > 0.2 son claramente relevantes.
+7. **Límite de URLs por nota = 2** - Sin este límite, una sola nota con muchas URLs dominaría los resultados.
+8. **Mínimo 4 caracteres para wikilinks** - Filtra colisiones de títulos cortos como "TDD", "AI", "X".
+9. **Detección de contradicciones en index-time** - Se skipea en `--reset` porque sería O(n²) LLM calls (demasiado lento). Se asume que las contradicciones viejas sobreviven en el frontmatter.
+10. **URLs indexan por contexto, no por URL** - El sistema embebe el contexto alrededor de la URL (±240 chars), no el string http://... Esto permite match semántico contra la prosa.
+11. **Sesiones de WhatsApp** - Usan `wa:<jid>` como session_id. TTL 30 días. Sesiones viejas de Telegram (pre-migración) siguen leíbles hasta que expire el TTL.
 
 ---
 
 ## Suite de tests
 
-| Archivo | Cubre |
-|---|---|
-| `tests/test_sessions.py` | Persistencia + IDs + window + TTL + cleanup |
-| `tests/test_contradictions.py` | `find_contradictions` + render + edge cases (mocks de embed/chat/reranker) |
-| `tests/test_digest.py` | Week label/parse + `_collect_week_evidence` + digest dry-run/write |
-| `tests/test_urls.py` | Extracción URLs + `find_urls` + `_index_urls` idempotencia + `detect_link_intent` |
-| `tests/test_wikilinks.py` | Skip mask + suggester + `apply_wikilink_suggestions` + stale-offset defense |
-| `tests/test_dupes.py` | Pairwise sims + threshold + folder filter + centroid |
-| `tests/test_inbox.py` | Folder/tag suggester + frontmatter rewrite + triage compose |
-| `tests/test_ambient.py` | Config gate + frontmatter opt-out + dedup window + auto-apply + whatsapp send (stub) |
-| `tests/test_auto_index.py` | Watcher state + debounce + hash-based skip |
-| `tests/test_capture_morning_dead.py` | `capture` atomic write + `morning` brief + `dead` criteria |
-| `tests/test_expand_queries.py` | Helper LLM expansion (mocked) + paraphrase shape |
-| `tests/test_filing.py` | Destino PARA + upward-link + apply/undo batches |
-| `tests/test_folder_filter.py` | `infer_filters` + explicit folder/tag scoping |
-| `tests/test_render_response.py` | `NOTE_LINK_RE` + OSC 8 rendering + `verify_citations` |
-| `tests/test_surface.py` | Centroides + graph distance + pair filtering |
-| `tests/test_vaults.py` | Registry add/use/remove + precedence (env > registry > default) + per-vault collection |
+El sistema tiene una suite de tests para verificar que todo funcione correctamente.
 
-Correr: `.venv/bin/python -m pytest tests/ -q`. pytest está en `[project.optional-dependencies].dev`. Los modelos se monkeypatchean donde hace falta (no se llama el LLM ni se carga el reranker de verdad).
+| Archivo | Qué prueba |
+|---|---|
+| `tests/test_sessions.py` | Persistencia de sesiones, IDs, TTL, cleanup |
+| `tests/test_contradictions.py` | Detección de contradicciones y renderizado |
+| `tests/test_digest.py` | Digests semanales y recolección de evidencia |
+| `tests/test_urls.py` | Extracción e indexado de URLs |
+| `tests/test_wikilinks.py` | Sugerencias de wikilinks y aplicación |
+| `tests/test_dupes.py` | Detección de notas duplicadas |
+| `tests/test_inbox.py` | Triage del Inbox (folder, tags, wikilinks) |
+| `tests/test_ambient.py` | Ambient Agent y notificaciones |
+| `tests/test_auto_index.py` | Watcher y re-indexado automático |
+| `tests/test_capture_morning_dead.py` | Capture, morning brief y dead notes |
+| `tests/test_filing.py` | Filing asistido (destino PARA, upward-links) |
+| `tests/test_vaults.py` | Multi-vault registry y switching |
+
+### Correr tests
+
+```bash
+.venv/bin/python -m pytest tests/ -q             # full suite (~100s)
+.venv/bin/python -m pytest tests/test_X.py -q    # un módulo
+.venv/bin/python -m pytest tests/test_X.py::test_Y    # un caso
+```
 
 ### Targets rápidos
 
-| Target | Qué corre | Tiempo aprox |
+| Comando | Qué corre | Tiempo |
 |---|---|---|
-| `make test` | Suite secuencial `-m "not slow"` | ~100s |
-| `make test-fast` | Paralelo con `pytest-xdist -n auto` (skip slow) | ~47s (2.1× speedup) |
-| `make test-all` | Suite completa, incluyendo `@pytest.mark.slow` | ~110s |
-| `make coverage` | `pytest-cov` sobre `rag.py + web + mcp_server` (HTML en `htmlcov/`) | ~50s |
+| `make test` | Suite secuencial (skip slow) | ~100s |
+| `make test-fast` | Paralelo con pytest-xdist | ~47s |
+| `make test-all` | Suite completa (incluyendo slow) | ~110s |
+| `make coverage` | Reporte de cobertura HTML | ~50s |
 
-Cobertura actual (2026-04-20): total 54% (rag.py 55%, web/server.py 38%, mcp_server.py 85%, web/conversation_writer.py 95%). El gap está concentrado en `web/server.py` (endpoints que requieren MLX + vault real — la mayoría no están ejercitados por unit tests).
-
-`pytest-xdist` y `pytest-cov` son opcionales: `uv pip install pytest-xdist pytest-cov` dentro del venv local (ya están listadas en `[project.optional-dependencies].dev`).
+Cobertura actual: total 54% (rag.py 55%, web/server.py 38%, mcp_server.py 85%).

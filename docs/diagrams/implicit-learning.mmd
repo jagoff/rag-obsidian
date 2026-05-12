@@ -1,0 +1,74 @@
+graph TD
+    subgraph Queries["User Queries"]
+        Q1["Query 1"]
+        Q2["Query 2"]
+        Q3["Query 3"]
+    end
+
+    subgraph Retrieval["Retrieval Pipeline"]
+        Embed["Embeddings"]
+        Search["Vector Search"]
+        Rerank["Reranker"]
+    end
+
+    subgraph Learning["Learning Modules"]
+        AutoRollback["auto_rollback.py<br/>Detecta fallas y ajusta"]
+        Corrective["corrective_paths.py<br/>Aprende correcciones"]
+        Requery["requery_detection.py<br/>Detecta re-queries"]
+        Reward["reward_shaping.py<br/>Ajusta rewards"]
+        Session["session_outcome.py<br/>Evalúa sesiones"]
+        Judge["llm_judge_ensemble.py<br/>Juzga calidad"]
+    end
+
+    subgraph Feedback["Feedback Loop"]
+        Success["Queries exitosas"]
+        Failure["Queries fallidas"]
+        Requeries["Re-queries"]
+        Outcomes["Outcomes de sesión"]
+    end
+
+    subgraph Improvement["System Improvement"]
+        BetterParams["Mejores parámetros"]
+        BetterRanking["Mejor ranking"]
+        BetterRouting["Mejor routing"]
+        BetterModels["Mejores modelos"]
+    end
+
+    Q1 --> Embed
+    Q2 --> Embed
+    Q3 --> Embed
+
+    Embed --> Search
+    Search --> Rerank
+    Rerank --> Success
+    Rerank --> Failure
+
+    Failure --> AutoRollback
+    Success --> Reward
+    Q1 --> Requery
+    Q2 --> Requery
+    Q3 --> Requery
+    Requery --> Requeries
+    Requeries --> Corrective
+
+    Success --> Session
+    Failure --> Session
+    Session --> Outcomes
+    Outcomes --> Judge
+
+    AutoRollback --> BetterParams
+    Corrective --> BetterParams
+    Reward --> BetterRanking
+    Requeries --> BetterRouting
+    Judge --> BetterModels
+
+    BetterParams --> Retrieval
+    BetterRanking --> Retrieval
+    BetterRouting --> Retrieval
+    BetterModels --> Retrieval
+
+    style Queries fill:#e1f5ff
+    style Retrieval fill:#fff4e1
+    style Learning fill:#e8f5e9
+    style Feedback fill:#fce4ec
+    style Improvement fill:#f3e5f5

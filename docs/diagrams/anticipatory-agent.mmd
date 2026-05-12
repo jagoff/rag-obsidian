@@ -1,0 +1,60 @@
+graph TD
+    subgraph Inputs["Inputs"]
+        Vault["Vault de Obsidian"]
+        Calendar["Calendar Events"]
+        ScreenTime["Screen Time DB"]
+        Voice["Voice Notes"]
+        Echo["Notas similares"]
+        Commit["Compromisos"]
+    end
+
+    subgraph Signals["Signals"]
+        CalSig["calendar signal"]
+        EchoSig["echo signal"]
+        CommitSig["commitment signal"]
+        STSig["screen time signal"]
+        VoiceSig["voice signal"]
+    end
+
+    subgraph Engine["Anticipatory Engine"]
+        Dashboard["dashboard.py"]
+        Feedback["feedback.py"]
+        Tuning["feedback_tuning.py"]
+        Weights["weights.py"]
+        Quiet["quiet_hours.py"]
+    end
+
+    subgraph Output["Output"]
+        Candidates["Candidates"]
+        DashboardUI["Dashboard UI"]
+        WhatsApp["WhatsApp"]
+        FeedbackLoop["Feedback Loop"]
+    end
+
+    Vault --> EchoSig
+    Vault --> CommitSig
+    Calendar --> CalSig
+    ScreenTime --> STSig
+    Voice --> VoiceSig
+
+    CalSig --> Dashboard
+    EchoSig --> Dashboard
+    CommitSig --> Dashboard
+    STSig --> Dashboard
+    VoiceSig --> Dashboard
+
+    Dashboard --> Candidates
+    Weights --> Dashboard
+    Quiet --> Dashboard
+    Tuning --> Weights
+
+    Candidates --> DashboardUI
+    Candidates --> WhatsApp
+    WhatsApp --> FeedbackLoop
+    FeedbackLoop --> Feedback
+    Feedback --> Tuning
+
+    style Inputs fill:#e1f5ff
+    style Signals fill:#fff4e1
+    style Engine fill:#e8f5e9
+    style Output fill:#f3e5f5

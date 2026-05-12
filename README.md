@@ -832,6 +832,8 @@ Agente proactivo que sugiere tareas basadas en patrones en tu vault. Corre como 
 
 Los candidates se muestran en el dashboard y se pueden enviar a WhatsApp. El sistema aprende de tu feedback (thumbs up/down) para ajustar los pesos de cada signal.
 
+![Anticipatory Agent](./docs/diagrams/anticipatory-agent.svg)
+
 ### Implicit Learning (`rag_implicit_learning/`)
 
 Aprendizaje implícito de patrones de uso sin intervención explícita:
@@ -842,6 +844,8 @@ Aprendizaje implícito de patrones de uso sin intervención explícita:
 - **Requery detection**: detecta cuando re-hacés la misma query con diferente phrasing
 - **Reward shaping**: ajusta el reward signal para el learning loop
 - **Session outcome**: aprende qué sesiones fueron útiles vs frustrantes
+
+![Implicit Learning](./docs/diagrams/implicit-learning.svg)
 
 ### Ranker Learning (`rag_ranker_lgbm/`)
 

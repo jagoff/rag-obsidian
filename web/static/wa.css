@@ -1776,11 +1776,11 @@ body.archived-mode .wa-sidebar-header { box-shadow: inset 0 -2px 0 var(--accent,
 .wa-send-arrows {
   display: inline-flex;
   align-items: center;
-  font-size: 14px;
+  justify-content: center;
+  font-size: 18px;
   line-height: 1;
-  letter-spacing: -2px;
+  font-weight: 600;
 }
-.wa-send-arrows i { font-style: normal; }
 
 /* Record bar — aparece cuando grabás. */
 .wa-record-bar {

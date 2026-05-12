@@ -3432,6 +3432,50 @@ _HELPER_SEM: threading.Semaphore = threading.Semaphore(
 )
 
 
+def _hide_internal_tool_args(fn):
+    """Devuelve un wrapper que oculta params `_*` (server-injected) del
+    JSON schema que deriva `transformers.apply_chat_template` para
+    los tool calls del Qwen chat template. La función real sigue
+    aceptando esos args via **kwargs — el server los inyecta después
+    del LLM, así que nunca caen en el tool-call payload.
+
+    Sin este wrapper, transformers raise `Cannot generate JSON schema
+    for <fn> because the docstring has no description for the argument
+    '_original_query'` y rompe la ronda entera de tool-decide.
+
+    Override doble necesario:
+    - `__signature__`: lo usa `inspect.signature(fn)` para el orden +
+      defaults de los params.
+    - `__annotations__`: lo lee `get_type_hints(fn)` directo (no sigue
+      `__wrapped__`), y de ahí salen las propiedades del schema.
+
+    Sin tocar `__annotations__`, `@wraps` copia el dict original y el
+    schema gen sigue viendo `_original_query` aunque la signature lo
+    oculte.
+    """
+    import inspect
+    from functools import wraps
+    sig = inspect.signature(fn)
+    public_params = [
+        p for name, p in sig.parameters.items() if not name.startswith("_")
+    ]
+    if len(public_params) == len(sig.parameters):
+        return fn  # no underscore args → nothing to hide.
+    new_sig = sig.replace(parameters=public_params)
+
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        return fn(*args, **kwargs)
+    wrapper.__signature__ = new_sig  # type: ignore[attr-defined]
+    # Filtrar __annotations__: get_type_hints() las usa directo.
+    orig_anns = dict(getattr(fn, "__annotations__", {}) or {})
+    filtered_anns = {
+        k: v for k, v in orig_anns.items() if not k.startswith("_")
+    }
+    wrapper.__annotations__ = filtered_anns
+    return wrapper
+
+
 def _mlx_chat_via_backend(**kwargs):
     """Traduce un call MLX-shape `chat(**kwargs)` al MLX backend.
 
@@ -3455,13 +3499,16 @@ def _mlx_chat_via_backend(**kwargs):
         top_p=float(options_dict.get("top_p", 1.0)),
         stop=tuple(options_dict.get("stop", ()) or ()),
     )
+    tools = kwargs.get("tools")
+    if tools:
+        tools = [_hide_internal_tool_args(t) for t in tools]
     return get_backend().chat(
         model=kwargs["model"],
         messages=kwargs.get("messages") or [],
         options=opts,
         keep_alive=kwargs.get("keep_alive", -1),
         format=kwargs.get("format"),
-        tools=kwargs.get("tools"),
+        tools=tools,
     )
 
 

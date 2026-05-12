@@ -8,6 +8,7 @@ import * as cmdk from "./wa-cmdk.js";
 import * as liquid from "./wa-liquid-glass.js";
 import * as anticipate from "./wa-anticipate.js";
 import * as memory from "./wa-memory.js";
+import * as promises from "./wa-promises.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -61,6 +62,7 @@ function init() {
       thread.open(jid).then(() => {
         const name = document.getElementById("wa-thread-name")?.textContent || "";
         memory.mountTrigger(jid, name);
+        promises.mountTrigger(jid, name);
       });
     },
   });
@@ -78,6 +80,7 @@ function init() {
       thread.open(jid).then(() => {
         const name = document.getElementById("wa-thread-name")?.textContent || "";
         memory.mountTrigger(jid, name);
+        promises.mountTrigger(jid, name);
       });
     },
   });
@@ -85,6 +88,10 @@ function init() {
   // Memoria Universal — drawer "🧠 Recordar" en el thread header. Surface
   // vault notes + WA history del contacto activo. Endpoint: /api/wa/memory/<jid>.
   memory.init();
+
+  // Promise Tracker — chip "🪨 N" en thread header. Lista pending de
+  // promesas con el contacto + acciones resolver/cancelar.
+  promises.init();
 
   // Cmd+K también dispara `thread.open` — propagar al memory drawer.
 }

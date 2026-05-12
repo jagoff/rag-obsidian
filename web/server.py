@@ -5536,7 +5536,164 @@ def wa_send(req: _WASendRequest) -> dict:
     ok, kind = _wa_send._whatsapp_send_to_jid_detailed(
         req.jid, text, anti_loop=False, reply_to=reply_to_dict
     )
+    # Hook Promise Tracker: si el msg outbound matchea el regex hint
+    # rioplatense, persistimos una row en rag_promises (silent-fail).
+    if ok:
+        try:
+            _detect_outbound_promise(req.jid, text)
+        except Exception:
+            pass
     return {"ok": ok, "error_kind": kind}
+
+
+# ── Promise Tracker ─────────────────────────────────────────────────────────
+# Cableo runtime para `rag_promises` (tabla pre-existente, scaffold 2026-04).
+# Hookeo:
+#   · Outbound: post-send en /api/wa/send → regex hint match → INSERT.
+#   · LLM refine (inbound + due_ts): batch via _wa_extract_combined ya corre
+#     por el listener TS; no lo cableamos acá para no duplicar.
+# UI: chip "🪨 N" en thread header + drawer lista pending por JID.
+
+def _detect_outbound_promise(jid: str, text: str) -> int | None:
+    """Si `text` matchea `_has_promise_hint`, inserta en `rag_promises`.
+    Devuelve el rowid insertado o None. Silent-fail.
+    """
+    try:
+        from rag.integrations.whatsapp import _has_promise_hint  # noqa: PLC0415
+    except Exception:
+        return None
+    if not text or not _has_promise_hint(text):
+        return None
+    try:
+        from rag import _ragvec_state_conn, _silent_log  # noqa: PLC0415
+        from rag.integrations.whatsapp import fetch as _wa_fetch  # noqa: PLC0415
+    except Exception:
+        return None
+
+    name = ""
+    try:
+        name = (_wa_fetch._wa_display_name(jid, "") or "").strip()
+    except Exception:
+        pass
+
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    try:
+        with _ragvec_state_conn() as conn:
+            cur = conn.execute(
+                "INSERT INTO rag_promises("
+                " ts, contact_jid, contact_name, promise_text, direction,"
+                " due_ts, due_confidence, source_chat_jid, status"
+                ") VALUES (?, ?, ?, ?, 'outbound', NULL, 0.3, ?, 'pending')",
+                (now_iso, jid, name or None, text[:1000], jid),
+            )
+            promise_id = cur.lastrowid
+            conn.commit()
+        return int(promise_id)
+    except Exception as exc:
+        try:
+            _silent_log("promise_tracker_insert", exc)
+        except Exception:
+            pass
+        return None
+
+
+def _promise_row_to_dict(row) -> dict:
+    """Map sqlite Row a dict UI."""
+    return {
+        "id": int(row["id"]),
+        "ts": row["ts"],
+        "contact_jid": row["contact_jid"],
+        "contact_name": row["contact_name"],
+        "promise_text": row["promise_text"],
+        "direction": row["direction"],
+        "due_ts": row["due_ts"],
+        "due_confidence": float(row["due_confidence"] or 0.0),
+        "status": row["status"],
+        "closed_ts": row["closed_ts"],
+        "closed_reason": row["closed_reason"],
+    }
+
+
+@app.get("/api/wa/promises")
+def wa_promises_list(
+    jid: str | None = None,
+    status: str = "pending",
+    limit: int = 20,
+) -> dict:
+    """Lista promesas. Por default `status='pending'` + `limit=20`.
+
+    Query params:
+    - `jid`: filtra por contact_jid (drawer del thread header).
+    - `status`: pending | done | cancelled | all.
+    - `limit`: cap 100.
+    """
+    from rag import _ragvec_state_conn  # noqa: PLC0415
+
+    limit = max(1, min(int(limit), 100))
+    where = []
+    params: list = []
+    if jid and "@" in jid:
+        where.append("contact_jid = ?")
+        params.append(jid)
+    if status and status != "all":
+        where.append("status = ?")
+        params.append(status)
+    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+    sql = (
+        "SELECT id, ts, contact_jid, contact_name, promise_text, direction,"
+        " due_ts, due_confidence, status, closed_ts, closed_reason"
+        f" FROM rag_promises{where_sql}"
+        " ORDER BY ts DESC LIMIT ?"
+    )
+    params.append(limit)
+    import sqlite3 as _sqlite3  # noqa: PLC0415
+    try:
+        with _ragvec_state_conn() as conn:
+            conn.row_factory = _sqlite3.Row
+            rows = conn.execute(sql, params).fetchall()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"db error: {exc}")
+    return {"ok": True, "promises": [_promise_row_to_dict(r) for r in rows]}
+
+
+def _promise_update_status(promise_id: int, new_status: str, reason: str) -> dict:
+    from rag import _ragvec_state_conn  # noqa: PLC0415
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    import sqlite3 as _sqlite3  # noqa: PLC0415
+    try:
+        with _ragvec_state_conn() as conn:
+            conn.row_factory = _sqlite3.Row
+            cur = conn.execute(
+                "UPDATE rag_promises SET status=?, closed_ts=?, closed_reason=?"
+                " WHERE id=?",
+                (new_status, now_iso, reason, promise_id),
+            )
+            if cur.rowcount == 0:
+                raise HTTPException(status_code=404, detail="promise no encontrada")
+            row = conn.execute(
+                "SELECT id, ts, contact_jid, contact_name, promise_text, direction,"
+                " due_ts, due_confidence, status, closed_ts, closed_reason"
+                " FROM rag_promises WHERE id=?",
+                (promise_id,),
+            ).fetchone()
+            conn.commit()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"db error: {exc}")
+    return {"ok": True, "promise": _promise_row_to_dict(row)}
+
+
+@app.post("/api/wa/promises/{promise_id}/resolve")
+def wa_promises_resolve(promise_id: int) -> dict:
+    """Marca la promesa como cumplida."""
+    return _promise_update_status(promise_id, "done", "manual_resolve")
+
+
+@app.post("/api/wa/promises/{promise_id}/cancel")
+def wa_promises_cancel(promise_id: int) -> dict:
+    """Cancela la promesa (ya no aplica / falsa positivo del regex)."""
+    return _promise_update_status(promise_id, "cancelled", "manual_cancel")
 
 
 @app.get("/api/wa/stream")

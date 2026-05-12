@@ -206,6 +206,22 @@ export async function fetchWaMemory(jid, { maxNotes = 5, maxWa = 5 } = {}) {
   return jsonGET(`/api/wa/memory/${encodeURIComponent(jid)}?${params}`);
 }
 
+// ── Promise Tracker ───────────────────────────────────────────────────────
+
+export async function fetchWaPromises({ jid = null, status = "pending", limit = 20 } = {}) {
+  const params = new URLSearchParams({ status, limit: String(limit) });
+  if (jid) params.set("jid", jid);
+  return jsonGET(`/api/wa/promises?${params}`);
+}
+
+export async function resolveWaPromise(id) {
+  return jsonPOST(`/api/wa/promises/${id}/resolve`, {});
+}
+
+export async function cancelWaPromise(id) {
+  return jsonPOST(`/api/wa/promises/${id}/cancel`, {});
+}
+
 // Health del bridge — usado por el indicador visual del header.
 export async function bridgeHealth() {
   try {

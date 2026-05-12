@@ -4606,20 +4606,51 @@ class _WARevokeRequest(BaseModel):
 def wa_revoke(req: _WARevokeRequest) -> dict:
     """Borra un mensaje propio para todos (delete-for-everyone).
 
-    Requiere admin-token — operación destructiva. El bridge persiste
-    en `revokes` y SSE emite `message_revoked`.
+    Requiere admin-token — operación destructiva. El bridge envía el
+    protocol message a WhatsApp. Además, escribimos al `revokes` table
+    local con `revoked_by="local-only"` — el bridge solo persiste
+    revokes INBOUND (cuando recibe el protocol message de otro device),
+    no los outbound del user mismo. Sin esta escritura, el next
+    `fetch_thread_for_ui` re-pinta el msg desde `messages` table.
+    Bug reportado 2026-05-11: "borro mensajes pero vuelven a aparecer".
     """
+    import sqlite3 as _sqlite3  # noqa: PLC0415
+    import time as _time  # noqa: PLC0415
+
+    import rag as _rag  # noqa: PLC0415
     from rag.integrations.whatsapp import bridge_client as _bc  # noqa: PLC0415
 
     if not req.jid or "@" not in req.jid:
         raise HTTPException(status_code=400, detail="jid inválido")
     if not req.message_id:
         raise HTTPException(status_code=400, detail="message_id requerido")
+
+    # Step 1: enviar protocol revoke al bridge.
     try:
         _bc.revoke(req.jid, req.message_id)
-        return {"ok": True}
     except _bc.BridgeError as e:
         return {"ok": False, "error": str(e), "status": e.status}
+
+    # Step 2: persistir local — sin esto, el msg vuelve al next fetch.
+    db_path = _rag.WHATSAPP_DB_PATH
+    if db_path.is_file():
+        try:
+            con = _sqlite3.connect(str(db_path), timeout=5.0)
+            try:
+                now_iso = _time.strftime("%Y-%m-%dT%H:%M:%S")
+                con.execute(
+                    "INSERT OR IGNORE INTO revokes (message_id, chat_jid, "
+                    "revoked_by, ts) VALUES (?, ?, ?, ?)",
+                    (req.message_id, req.jid, "local-only", now_iso),
+                )
+                con.commit()
+            finally:
+                con.close()
+        except _sqlite3.Error:
+            # No critical: el protocol revoke ya fue. Si la persist
+            # local falla, el msg reaparece pero el peer ya lo ve borrado.
+            pass
+    return {"ok": True}
 
 
 @app.post("/api/wa/hide", dependencies=[Depends(_require_admin_token)])

@@ -9,6 +9,7 @@ import * as liquid from "./wa-liquid-glass.js";
 import * as anticipate from "./wa-anticipate.js";
 import * as memory from "./wa-memory.js";
 import * as promises from "./wa-promises.js";
+import * as moodCheck from "./wa-mood-check.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -63,6 +64,7 @@ function init() {
         const name = document.getElementById("wa-thread-name")?.textContent || "";
         memory.mountTrigger(jid, name);
         promises.mountTrigger(jid, name);
+        moodCheck.setActiveJid(jid);
       });
     },
   });
@@ -81,6 +83,7 @@ function init() {
         const name = document.getElementById("wa-thread-name")?.textContent || "";
         memory.mountTrigger(jid, name);
         promises.mountTrigger(jid, name);
+        moodCheck.setActiveJid(jid);
       });
     },
   });
@@ -92,6 +95,10 @@ function init() {
   // Promise Tracker — chip "🪨 N" en thread header. Lista pending de
   // promesas con el contacto + acciones resolver/cancelar.
   promises.init();
+
+  // Mood Mirror tonal check — banner inline encima del composer cuando el
+  // draft actual + mood actual sugieren cuidar el tono.
+  moodCheck.init();
 
   // Cmd+K también dispara `thread.open` — propagar al memory drawer.
 }

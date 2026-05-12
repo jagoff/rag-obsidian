@@ -4335,6 +4335,38 @@ def wa_mood_hint(jid: str) -> dict:
     return {"hint": _mm.get_hint(jid)}
 
 
+@app.get("/api/wa/mood/weekly")
+def wa_mood_weekly() -> dict:
+    """Weekly mood summary para card del thread header / dashboard.
+
+    Devuelve `{summary: {avg_7d, low_days, high_days, delta_vs_prev_week,
+    has_data}}`. Si `rag_mood_score_daily` está vacía → has_data=false.
+    """
+    from rag.integrations.whatsapp import mood_mirror as _mm  # noqa: PLC0415
+    return {"summary": _mm.get_weekly_summary()}
+
+
+class _WAToneCheckRequest(BaseModel):
+    jid: str
+    draft: str = Field(..., max_length=4096)
+
+
+@app.post("/api/wa/thread/check-tone")
+def wa_check_tone(req: _WAToneCheckRequest) -> dict:
+    """Pre-send tone check para el composer.
+
+    Dado un `draft` outbound, devuelve `{warning: {kind, message,
+    severity, suggestion}}` si combina mal con el mood/hora actual.
+    Si no aplica → `{warning: null}`.
+
+    Cheap: regex + lookup mood. No LLM, no DB heavy.
+    """
+    from rag.integrations.whatsapp import mood_mirror as _mm  # noqa: PLC0415
+    if not req.jid or "@" not in req.jid:
+        raise HTTPException(status_code=400, detail="jid inválido")
+    return {"warning": _mm.check_outbound_tone(req.jid, req.draft)}
+
+
 @app.get("/api/wa/thread/{jid}/gap-summary")
 def wa_gap_summary(
     jid: str,

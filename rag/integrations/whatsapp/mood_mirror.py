@@ -183,4 +183,115 @@ def get_hint(jid: str) -> dict[str, Any] | None:
     return None
 
 
-__all__ = ["get_hint"]
+def get_weekly_summary() -> dict[str, Any]:
+    """Resumen mood últimos 7 días: avg + count días bajos/altos + delta
+    vs. semana anterior. Para card en Personal Mirror o dashboard.
+
+    Returns `{avg_7d, low_days, high_days, delta_vs_prev_week, has_data}`.
+    Silent-fail: `has_data=False` si la tabla está vacía o no existe.
+    """
+    try:
+        from rag import _ragvec_state_conn  # noqa: PLC0415
+        from datetime import timedelta  # noqa: PLC0415
+
+        today = datetime.now().date()
+        d7_iso = (today - timedelta(days=7)).isoformat()
+        d14_iso = (today - timedelta(days=14)).isoformat()
+
+        with _ragvec_state_conn() as conn:
+            rows_7d = conn.execute(
+                "SELECT score FROM rag_mood_score_daily"
+                " WHERE date >= ? AND n_signals > 0",
+                (d7_iso,),
+            ).fetchall()
+            rows_prev = conn.execute(
+                "SELECT score FROM rag_mood_score_daily"
+                " WHERE date >= ? AND date < ? AND n_signals > 0",
+                (d14_iso, d7_iso),
+            ).fetchall()
+
+        if not rows_7d:
+            return {"has_data": False, "avg_7d": None, "low_days": 0,
+                    "high_days": 0, "delta_vs_prev_week": None}
+
+        scores = [float(r[0]) for r in rows_7d]
+        avg_7d = sum(scores) / len(scores)
+        low_days = sum(1 for s in scores if s < _LOW_THRESHOLD)
+        high_days = sum(1 for s in scores if s > _HIGH_THRESHOLD)
+
+        delta = None
+        if rows_prev:
+            prev_avg = sum(float(r[0]) for r in rows_prev) / len(rows_prev)
+            delta = round(avg_7d - prev_avg, 3)
+
+        return {
+            "has_data": True,
+            "avg_7d": round(avg_7d, 3),
+            "low_days": int(low_days),
+            "high_days": int(high_days),
+            "delta_vs_prev_week": delta,
+            "n_days_with_data": len(scores),
+        }
+    except Exception:
+        return {"has_data": False, "avg_7d": None, "low_days": 0,
+                "high_days": 0, "delta_vs_prev_week": None}
+
+
+def check_outbound_tone(jid: str, draft_text: str) -> dict[str, Any] | None:
+    """Pre-send check: si mood bajo Y el draft outbound matchea tense
+    pattern → warning. Distinto de `get_hint()`: ese mira inbound,
+    este mira lo que VOS estás a punto de mandar.
+
+    Returns `{kind, message, severity, suggestion}` o None.
+
+    Logic:
+    1. Si draft NO tense → None (no warning).
+    2. Si mood neutral/alto + draft tense → warning suave (recordatorio).
+    3. Si mood bajo + draft tense → warning fuerte + suggestion para
+       releer / esperar / suavizar.
+    4. Late night + draft tense → warning para programar.
+    """
+    if not draft_text or len(draft_text.strip()) < 10:
+        return None
+    if not _matches_tense(draft_text):
+        return None
+
+    score = _today_mood_score()
+    hour = datetime.now().hour
+    is_late = hour in _LATE_NIGHT_HOURS
+    is_low = score is not None and score < _LOW_THRESHOLD
+
+    if is_late and is_low:
+        return {
+            "kind": "outbound_tone_late_low",
+            "severity": "high",
+            "message": "Tarde + bajón + mensaje tenso. Mejor programalo o releelo mañana.",
+            "suggestion": "programar",
+            "icon": "🌙",
+        }
+    if is_low:
+        return {
+            "kind": "outbound_tone_low",
+            "severity": "high",
+            "message": "Hoy estás con el ánimo bajo. Releelo antes de mandar — puede sonar más duro de lo que querés.",
+            "suggestion": "releer",
+            "icon": "⚠️",
+        }
+    if is_late:
+        return {
+            "kind": "outbound_tone_late",
+            "severity": "medium",
+            "message": "Hora tardía + mensaje cargado. Si no es urgente, programalo para mañana.",
+            "suggestion": "programar",
+            "icon": "🌙",
+        }
+    return {
+        "kind": "outbound_tone",
+        "severity": "low",
+        "message": "Mensaje con tono fuerte. Si querés, releelo antes de mandar.",
+        "suggestion": "releer",
+        "icon": "💭",
+    }
+
+
+__all__ = ["get_hint", "get_weekly_summary", "check_outbound_tone"]

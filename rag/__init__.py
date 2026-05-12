@@ -36646,7 +36646,25 @@ _PROPOSE_INTENT_RE = re.compile(
     r"\s+(?:[^.?!]{0,60})?"
     r"(?:el\s+(?:mensaje|[uú]ltimo|wzp|wsp|whats.?app)"
     r"|al\s+(?:mensaje|wzp|wsp)"
-    r"|a\s+[A-ZÁÉÍÓÚÑ][\wáéíóúñ]+)",
+    r"|a\s+[A-ZÁÉÍÓÚÑ][\wáéíóúñ]+)"
+    # Note creation triggers (2026-05-12, `create_note` tool). El verbo solo
+    # no alcanza ("creá" matchea calendar también) — requiere objeto "nota"
+    # o "obsidian/vault" mencionado explícitamente para diferenciar de
+    # event/reminder. Cubre:
+    #   - "creá una nota con X" / "crear nota"
+    #   - "guardá esto en obsidian" / "guardame en vault"
+    #   - "captur(á|ame) esto" / "captura como nota"
+    r"|\b(?:cre[aá]|crear|guard[aá](?:me)?|capt[uú]r(?:[aá]|ar|ame))"
+    r"\s+(?:[^.?!]{0,40})?"
+    r"(?:una?\s+)?(?:nota|note|en\s+obsidian|en\s+(?:el\s+|mi\s+)?vault)\b"
+    # URL-ingest triggers (2026-05-12, `fetch_url` tool). Verbos de "leer
+    # / guardar / ingerir un link". El URL en sí también dispara (un
+    # mensaje que arranca con http:// o https://) — fallback genérico.
+    r"|\b(?:le[eé](?:me)?|fetche[aá]r?|inger[ií]r?|"
+    r"guard[aá](?:me)?\s+(?:esta?|este?))"
+    r"\s+(?:[^.?!]{0,40})?"
+    r"(?:url|link|p[aá]gina|art[ií]culo|sitio|web)\b"
+    r"|\bhttps?://\S+",
     re.IGNORECASE,
 )
 

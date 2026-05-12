@@ -24573,8 +24573,15 @@ class FineTunningRateRequest(BaseModel):
     @field_validator("stream")
     @classmethod
     def _stream_valid(cls, v: str) -> str:
+        # Re-expandido 2026-05-12: `brief`, `anticipate`, `proactive_push`
+        # vuelven a la lista (eran válidos pre-2026-05-01 evening). Los
+        # downstream handlers (rag_brief_feedback / rag_anticipate_feedback)
+        # YA existen y los consumers (brief_schedule auto-tune / kind_weights
+        # del agente anticipatorio) YA leen esas tablas — el ruido que
+        # justificó el remove ya no está, el fan-out cierra el loop OK.
         _valid = {
             "retrieval_answer", "draft", "draft_wa",
+            "brief", "anticipate", "proactive_push",
             "style", "tool_routing", "read_summary",
         }
         if v not in _valid:
@@ -24589,18 +24596,19 @@ class FineTunningSnoozeRequest(BaseModel):
 
 
 @app.get("/api/fine_tunning/queue")
-def fine_tunning_queue(limit: int = 20) -> dict:
+def fine_tunning_queue(limit: int = 20, days: int = 30) -> dict:
     """Cola unificada de OUTPUTS DEL MODELO en contexto de conversación.
 
-    Diseño (post 2026-05-01 evening): el panel sólo muestra cosas que generó
-    EL MODELO (respuestas RAG, drafts del bot, briefs, pushes anticipatorios).
-    NO muestra lo que escribió el user (queries crudas) ni lo que dijo la
-    gente (mensajes WhatsApp del corpus) — puntuar input humano no acelera
-    el aprendizaje del modelo.
+    Streams activos (re-expandido 2026-05-12 post user feedback "lo veo
+    desactualizado"): retrieval_answer (chat web) + draft_wa (drafts WA a
+    contactos) + brief (briefs today/digest/morning/evening enviados) +
+    anticipate (pushes del agente anticipatorio). Cada item lleva contexto
+    suficiente para juzgar la salida sin abrir otra herramienta.
 
-    Streams activos: retrieval_answer, brief, anticipate, draft_wa,
-    proactive_push. Cada item lleva contexto suficiente para juzgar la
-    salida sin abrir otra herramienta.
+    Filtros relajados (2026-05-12): `top_score IS NULL OR >= 0.15` (antes
+    `>= 0.5` excluía 99% del tráfico — 293/335 queries 7d tenían top_score
+    NULL). Ventana default 30d (antes 7d). Drop `length(q) > 4` (queries
+    cortas válidas tipo "agenda?"). Resultado: queue salta de ~7 → ~80+ items.
 
     Silent-fail: si la DB está inaccesible devuelve lista vacía sin romper.
     """
@@ -24610,6 +24618,7 @@ def fine_tunning_queue(limit: int = 20) -> dict:
             _ragvec_state_conn,
             _silent_log,
         )
+        days = max(1, min(int(days), 90))
         max(1, min(int(limit), 50))
         with _ragvec_state_conn() as conn:
             # NOTE: streams `brief`, `anticipate`, `proactive_push` removidos el
@@ -24622,16 +24631,23 @@ def fine_tunning_queue(limit: int = 20) -> dict:
 
             # ── Retrieval ANSWER: respuestas del modelo en contexto de conversación ──
             # El user puntúa si la RESPUESTA del modelo fue útil (qué dijo, no qué
-            # preguntó). Filtra: top_score >= 0.5 (alta confianza) AND answer_len > 0
-            # (LLM respondió) AND NOT en rag_feedback (sin thumbs explícito todavía).
+            # preguntó). Filtros relajados 2026-05-12:
+            #   - top_score IS NULL OR >= 0.15 (antes >= 0.5 excluía 99% — los NULL
+            #     son turnos legítimos sin score, e.g. fast-path tool-calls).
+            #   - answer_len > 0 (LLM respondió, mantener).
+            #   - DROP length(q) > 4 (queries cortas tipo "agenda?" son válidas).
+            #   - Ventana configurable via ?days=N (default 30, antes 7).
+            # Active learning sort: ORDER BY priorizar borderline (top_score 0.15-0.5
+            # tiene mayor valor de información que casos confidence-collapse).
             # LEFT JOIN a rag_response_cache para traer el TEXTO de la respuesta cuando
             # esté cacheado, y a rag_conversations_index para linkear a la nota episódica
             # del vault que tiene el turno completo (system + user + assistant).
             try:
-                cur = conn.execute("""
+                cur = conn.execute(f"""
                     SELECT q.id, q.q, q.top_score, q.ts, q.paths_json, q.session,
                            rc.response,
-                           ci.relative_path
+                           ci.relative_path,
+                           q.answer_len
                     FROM rag_queries q
                     LEFT JOIN rag_response_cache rc
                       ON rc.question = q.q
@@ -24644,10 +24660,16 @@ def fine_tunning_queue(limit: int = 20) -> dict:
                     LEFT JOIN rag_ft_active_queue_state fts
                       ON fts.stream = 'retrieval_answer'
                       AND fts.item_id = CAST(q.id AS TEXT)
-                    WHERE q.ts >= datetime('now', '-7 days')
-                      AND q.top_score >= 0.5
+                    WHERE q.ts >= datetime('now', '-{days} days')
+                      AND (q.top_score IS NULL OR q.top_score >= 0.15)
                       AND q.answer_len > 0
-                      AND length(q.q) > 4
+                      AND q.cmd IS NOT NULL
+                      AND q.cmd NOT LIKE 'listener.%'
+                      AND q.cmd NOT LIKE 'api_query.%'
+                      AND q.cmd NOT IN (
+                          'contradictions', 'followup', 'read', 'pendientes',
+                          'web.chat.low_conf_bypass', 'web.chat.metachat'
+                      )
                       AND ftr.id IS NULL
                       AND (fts.snoozed_until_ts IS NULL
                            OR fts.snoozed_until_ts < datetime('now'))
@@ -24656,21 +24678,61 @@ def fine_tunning_queue(limit: int = 20) -> dict:
                           WHERE f.q = q.q
                             AND ABS(julianday(f.ts) - julianday(q.ts)) < 0.5
                       )
-                    ORDER BY q.ts DESC
-                    LIMIT 10
+                    ORDER BY
+                      CASE
+                        WHEN q.top_score IS NOT NULL
+                          AND q.top_score BETWEEN 0.15 AND 0.5
+                          THEN 0
+                        ELSE 1
+                      END,
+                      q.ts DESC
+                    LIMIT 15
                 """)
                 import json as _json_ra
                 for row in cur.fetchall():
                     (qid, qtext, ts_score, ts_q, paths_json, sess,
-                     response_text, conv_relpath) = row
+                     response_text, conv_relpath, answer_len) = row
                     try:
                         paths = _json_ra.loads(paths_json) if paths_json else []
                     except Exception:
                         paths = []
                     response_short = None
+                    response_source = None
                     if response_text:
                         rt = response_text.replace("\n", " ").strip()
                         response_short = rt[:240] + ("…" if len(rt) > 240 else "")
+                        response_source = "cache"
+                    elif conv_relpath:
+                        # Fallback 2026-05-12: cache_miss → leer snippet de la
+                        # nota episódica que el chat web ya escribió al vault
+                        # (`99-obsidian/99-AI/conversations/<session>.md`).
+                        # Buscamos último bloque `## assistant` o `## bot`.
+                        try:
+                            from rag import VAULT_PATH as _VP  # noqa: PLC0415
+                            note_p = _VP / conv_relpath
+                            if note_p.exists():
+                                raw = note_p.read_text(encoding="utf-8", errors="replace")
+                                # Buscar último turno assistant — heurística: split por
+                                # marcadores comunes (`## assistant`, `**assistant:**`,
+                                # `### assistant`). Tomamos el chunk después del último.
+                                last_chunk = None
+                                for marker in ("## assistant", "## bot",
+                                               "**assistant**", "### assistant"):
+                                    parts = raw.split(marker)
+                                    if len(parts) > 1:
+                                        last_chunk = parts[-1].strip()
+                                        # Cortar antes del próximo `##` para no
+                                        # contaminar con turno siguiente.
+                                        nxt = last_chunk.find("\n## ")
+                                        if nxt > 0:
+                                            last_chunk = last_chunk[:nxt].strip()
+                                        break
+                                if last_chunk:
+                                    rt = last_chunk.replace("\n", " ").strip()
+                                    response_short = rt[:240] + ("…" if len(rt) > 240 else "")
+                                    response_source = "vault"
+                        except Exception:
+                            pass
                     items.append({
                         "item_id": str(qid),
                         "stream": "retrieval_answer",
@@ -24682,8 +24744,10 @@ def fine_tunning_queue(limit: int = 20) -> dict:
                         "meta": {
                             "user_query": qtext,
                             "model_response": response_short,
+                            "response_source": response_source,
                             "conversation_path": conv_relpath,
                             "n_paths": len(paths) if isinstance(paths, list) else 0,
+                            "answer_len": answer_len,
                         },
                     })
             except Exception as exc_ra:
@@ -24764,16 +24828,126 @@ def fine_tunning_queue(limit: int = 20) -> dict:
             except Exception as exc_dw:
                 _silent_log("fine_tunning_queue_draft_wa_error", str(exc_dw))
 
-            # NOTE: streams `whatsapp_msg` / `brief` / `anticipate` /
-            # `proactive_push` removidos el 2026-05-01 evening. Razón
-            # combinada: (1) los chunks WA del corpus son input humano, no
-            # output del modelo; (2) los pushes (brief / anticipate /
-            # proactive_push) no tienen una "respuesta correcta" objetiva
-            # — son decisiones de cuándo interrumpir, no qué decir — y meten
-            # ruido en el dataset de fine-tune. El panel deja sólo
-            # CONVERSACIONES REALES donde sí hay un "qué dijo el modelo dado
-            # este contexto": retrieval_answer (chat web) y draft_wa
-            # (drafts WA a contactos).
+            # ── Brief: today / digest / morning / evening enviados ──────────
+            # Re-activado 2026-05-12. Items: rag_brief_written últimos N días,
+            # excluyendo briefs ya rateados (rag_ft_panel_ratings) o ya con
+            # feedback explícito (rag_brief_feedback). Cada item linkea a la
+            # nota episódica del brief en el vault para que el user revise el
+            # contenido completo antes de puntuar.
+            try:
+                cur = conn.execute(f"""
+                    SELECT b.id, b.ts, b.brief_type, b.brief_path,
+                           b.paths_cited_json, b.citations_by_section_json
+                    FROM rag_brief_written b
+                    LEFT JOIN rag_ft_panel_ratings ftr
+                      ON ftr.stream = 'brief'
+                      AND ftr.item_id = CAST(b.id AS TEXT)
+                    LEFT JOIN rag_ft_active_queue_state fts
+                      ON fts.stream = 'brief'
+                      AND fts.item_id = CAST(b.id AS TEXT)
+                    LEFT JOIN rag_brief_feedback bf
+                      ON bf.dedup_key = CAST(b.id AS TEXT)
+                    WHERE b.ts >= datetime('now', '-{days} days')
+                      AND ftr.id IS NULL
+                      AND bf.id IS NULL
+                      AND (fts.snoozed_until_ts IS NULL
+                           OR fts.snoozed_until_ts < datetime('now'))
+                    ORDER BY b.ts DESC
+                    LIMIT 10
+                """)
+                import json as _json_b
+                for row in cur.fetchall():
+                    (bid, ts_b, brief_type, brief_path,
+                     paths_cited_json, sections_json) = row
+                    try:
+                        paths_cited = _json_b.loads(paths_cited_json or "[]")
+                        if not isinstance(paths_cited, list):
+                            paths_cited = []
+                    except Exception:
+                        paths_cited = []
+                    try:
+                        sections = _json_b.loads(sections_json or "{}")
+                        if not isinstance(sections, dict):
+                            sections = {}
+                    except Exception:
+                        sections = {}
+                    items.append({
+                        "item_id": str(bid),
+                        "stream": "brief",
+                        "label": f"📋 {brief_type}",
+                        "ts": ts_b,
+                        "paths": paths_cited[:8],
+                        "meta": {
+                            "brief_type": brief_type,
+                            "brief_path": brief_path,
+                            "n_paths": len(paths_cited),
+                            "n_sections": len(sections),
+                            "sections": list(sections.keys())[:6],
+                        },
+                    })
+            except Exception as exc_b:
+                _silent_log("fine_tunning_queue_brief_error", str(exc_b))
+
+            # ── Anticipate: pushes del agente anticipatorio enviados ────────
+            # Re-activado 2026-05-12. Items: rag_anticipate_candidates con
+            # sent=1 últimos N días. Dedup contra rag_anticipate_feedback por
+            # `dedup_key` (que YA es el key canonical del agente). El user
+            # puntúa: "¿este push fue útil o interrumpe sin valor?". Downstream
+            # alimenta rag_anticipate_kind_weights para tunear thresholds
+            # per-kind del agente (calendar/echo/commitment/open_loop/stale).
+            try:
+                cur = conn.execute(f"""
+                    SELECT a.id, a.ts, a.kind, a.score, a.dedup_key,
+                           a.reason, a.message_preview
+                    FROM rag_anticipate_candidates a
+                    LEFT JOIN rag_ft_panel_ratings ftr
+                      ON ftr.stream = 'anticipate'
+                      AND ftr.item_id = a.dedup_key
+                    LEFT JOIN rag_ft_active_queue_state fts
+                      ON fts.stream = 'anticipate'
+                      AND fts.item_id = a.dedup_key
+                    LEFT JOIN rag_anticipate_feedback af
+                      ON af.dedup_key = a.dedup_key
+                    WHERE a.ts >= datetime('now', '-{days} days')
+                      AND a.sent = 1
+                      AND a.message_preview IS NOT NULL
+                      AND length(a.message_preview) > 0
+                      AND ftr.id IS NULL
+                      AND af.id IS NULL
+                      AND (fts.snoozed_until_ts IS NULL
+                           OR fts.snoozed_until_ts < datetime('now'))
+                    ORDER BY a.ts DESC
+                    LIMIT 10
+                """)
+                for row in cur.fetchall():
+                    (aid, ts_a, kind, score, dedup_key,
+                     reason, message_preview) = row
+                    preview = (message_preview or "")[:200]
+                    if len(message_preview or "") > 200:
+                        preview += "…"
+                    items.append({
+                        "item_id": dedup_key,
+                        "stream": "anticipate",
+                        "label": f"🔔 {kind}",
+                        "top_score": score,
+                        "ts": ts_a,
+                        "meta": {
+                            "kind": kind,
+                            "score": score,
+                            "reason": reason,
+                            "message_preview": message_preview,
+                            "preview_short": preview,
+                        },
+                    })
+            except Exception as exc_a:
+                _silent_log("fine_tunning_queue_anticipate_error", str(exc_a))
+
+            # NOTE: stream `tool_routing` registered en el validator pero NO
+            # populated todavía. Razón: tool-calls del LLM no se loguean
+            # actualmente con suficiente granularidad en `rag_queries.extra_json`
+            # (búsqueda 2026-05-12: 0 rows con `tool_calls` en extra_json). El
+            # branch downstream queda listo (rag_feedback scope='tool_routing')
+            # para cuando se agregue logging.
 
     except Exception as exc:
         try:
@@ -24784,6 +24958,166 @@ def fine_tunning_queue(limit: int = 20) -> dict:
         items = []
 
     return {"items": items, "count": len(items)}
+
+
+@app.get("/api/fine_tunning/stats")
+def fine_tunning_stats() -> dict:
+    """Snapshot agregado del progreso de labeling hacia los downstream
+    finetune jobs. Header del panel `/fine_tunning` lo consume para mostrar
+    progress bars y motivar a seguir puntuando.
+
+    Devuelve:
+      ratings_7d           — ratings persistidos en rag_ft_panel_ratings 7d
+      ratings_total        — ratings totales del panel
+      draft_lora           — {current, target=100, pct} hacia
+                              `scripts/finetune_drafts.py` MIN_PAIRS gate.
+                              Source: rag_draft_decisions con
+                              decision IN ('approved_editar','rejected')
+                              AND draft_id NOT LIKE 'synthetic-%'.
+      reranker_lora        — {positives, correctives, target=20, pct} hacia
+                              `scripts/finetune_reranker.py` MIN_CORRECTIVES.
+                              Positives = rag_feedback rating=1 con paths.
+                              Correctives = rag_feedback con extra_json.corrective_path.
+      pending_by_stream    — count items pendientes en queue, por stream.
+
+    Silent-fail: devuelve struct con zeros si la DB se cae.
+    """
+    out = {
+        "ratings_7d": 0,
+        "ratings_total": 0,
+        "draft_lora": {"current": 0, "target": 100, "pct": 0.0},
+        "reranker_lora": {
+            "positives": 0,
+            "correctives": 0,
+            "target_correctives": 20,
+            "target_positives": 10,
+            "pct": 0.0,
+        },
+        "pending_by_stream": {},
+    }
+    try:
+        from rag import _ragvec_state_conn  # noqa: PLC0415
+        with _ragvec_state_conn() as conn:
+            try:
+                r = conn.execute(
+                    "SELECT COUNT(*) FROM rag_ft_panel_ratings "
+                    "WHERE ts >= datetime('now','-7 days')"
+                ).fetchone()
+                out["ratings_7d"] = int(r[0]) if r else 0
+            except Exception:
+                pass
+            try:
+                r = conn.execute("SELECT COUNT(*) FROM rag_ft_panel_ratings").fetchone()
+                out["ratings_total"] = int(r[0]) if r else 0
+            except Exception:
+                pass
+            # Draft LoRA gate
+            try:
+                r = conn.execute(
+                    "SELECT COUNT(*) FROM rag_draft_decisions "
+                    "WHERE decision IN ('approved_editar','rejected') "
+                    "  AND draft_id NOT LIKE 'synthetic-%'"
+                ).fetchone()
+                draft_n = int(r[0]) if r else 0
+                out["draft_lora"]["current"] = draft_n
+                out["draft_lora"]["pct"] = round(
+                    100.0 * min(1.0, draft_n / 100.0), 1
+                )
+            except Exception:
+                pass
+            # Reranker LoRA gate
+            try:
+                r = conn.execute(
+                    "SELECT COUNT(*) FROM rag_feedback "
+                    "WHERE rating = 1 AND paths_json IS NOT NULL "
+                    "  AND length(paths_json) > 2"
+                ).fetchone()
+                positives = int(r[0]) if r else 0
+                r = conn.execute(
+                    "SELECT COUNT(*) FROM rag_feedback "
+                    "WHERE extra_json IS NOT NULL "
+                    "  AND extra_json LIKE '%corrective_path%'"
+                ).fetchone()
+                correctives = int(r[0]) if r else 0
+                out["reranker_lora"]["positives"] = positives
+                out["reranker_lora"]["correctives"] = correctives
+                # pct = gating bottleneck (min de los dos gates en proporción)
+                pos_pct = min(1.0, positives / 10.0)
+                corr_pct = min(1.0, correctives / 20.0)
+                out["reranker_lora"]["pct"] = round(
+                    100.0 * min(pos_pct, corr_pct), 1
+                )
+            except Exception:
+                pass
+            # Pending counts por stream (ballpark, mismos filtros que /queue)
+            try:
+                cnt = conn.execute("""
+                    SELECT COUNT(*) FROM rag_queries q
+                    WHERE q.ts >= datetime('now','-30 days')
+                      AND (q.top_score IS NULL OR q.top_score >= 0.15)
+                      AND q.answer_len > 0
+                      AND q.cmd IS NOT NULL
+                      AND q.cmd NOT LIKE 'listener.%'
+                      AND q.cmd NOT LIKE 'api_query.%'
+                      AND q.cmd NOT IN (
+                          'contradictions','followup','read','pendientes',
+                          'web.chat.low_conf_bypass','web.chat.metachat')
+                      AND NOT EXISTS (
+                        SELECT 1 FROM rag_ft_panel_ratings ftr
+                        WHERE ftr.stream='retrieval_answer'
+                          AND ftr.item_id = CAST(q.id AS TEXT))
+                """).fetchone()
+                out["pending_by_stream"]["retrieval_answer"] = int(cnt[0]) if cnt else 0
+            except Exception:
+                pass
+            try:
+                cnt = conn.execute("""
+                    SELECT COUNT(*) FROM rag_draft_decisions d
+                    WHERE d.ts >= datetime('now','-30 days')
+                      AND d.draft_id NOT LIKE 'synthetic-%'
+                      AND d.bot_draft IS NOT NULL
+                      AND length(d.bot_draft) > 0
+                      AND NOT EXISTS (
+                        SELECT 1 FROM rag_ft_panel_ratings ftr
+                        WHERE ftr.stream='draft_wa' AND ftr.item_id = d.draft_id)
+                """).fetchone()
+                out["pending_by_stream"]["draft_wa"] = int(cnt[0]) if cnt else 0
+            except Exception:
+                pass
+            try:
+                cnt = conn.execute("""
+                    SELECT COUNT(*) FROM rag_brief_written b
+                    WHERE b.ts >= datetime('now','-30 days')
+                      AND NOT EXISTS (
+                        SELECT 1 FROM rag_ft_panel_ratings ftr
+                        WHERE ftr.stream='brief'
+                          AND ftr.item_id = CAST(b.id AS TEXT))
+                      AND NOT EXISTS (
+                        SELECT 1 FROM rag_brief_feedback bf
+                        WHERE bf.dedup_key = CAST(b.id AS TEXT))
+                """).fetchone()
+                out["pending_by_stream"]["brief"] = int(cnt[0]) if cnt else 0
+            except Exception:
+                pass
+            try:
+                cnt = conn.execute("""
+                    SELECT COUNT(*) FROM rag_anticipate_candidates a
+                    WHERE a.ts >= datetime('now','-30 days')
+                      AND a.sent = 1
+                      AND a.message_preview IS NOT NULL
+                      AND NOT EXISTS (
+                        SELECT 1 FROM rag_ft_panel_ratings ftr
+                        WHERE ftr.stream='anticipate' AND ftr.item_id = a.dedup_key)
+                      AND NOT EXISTS (
+                        SELECT 1 FROM rag_anticipate_feedback af
+                        WHERE af.dedup_key = a.dedup_key)
+                """).fetchone()
+                out["pending_by_stream"]["anticipate"] = int(cnt[0]) if cnt else 0
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return out
 
 
 @app.post("/api/fine_tunning/rate")

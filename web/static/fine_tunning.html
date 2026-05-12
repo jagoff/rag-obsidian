@@ -477,6 +477,88 @@
       .ft-card { padding: 12px; margin-bottom: 10px; }
       .ft-actions button { padding: 10px 16px; font-size: 18px; }
     }
+
+    /* Stats header — progreso hacia finetune jobs */
+    .ft-stats {
+      max-width: 720px;
+      margin: 0 auto 18px auto;
+      padding: 12px 14px;
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-size: 12px;
+    }
+    .ft-stats-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px 20px;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+    .ft-stats-row:last-child { margin-bottom: 0; }
+    .ft-stats-item {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 130px;
+      flex: 1 1 auto;
+    }
+    .ft-stats-label {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--muted);
+    }
+    .ft-stats-value {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--fg);
+    }
+    .ft-stats-bar {
+      height: 6px;
+      background: var(--bg);
+      border-radius: 3px;
+      overflow: hidden;
+      margin-top: 4px;
+    }
+    .ft-stats-bar-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--cyan, #06b6d4), var(--green, #10b981));
+      transition: width 400ms ease;
+    }
+    .ft-stats-bar-fill.warn { background: linear-gradient(90deg, var(--yellow, #eab308), var(--orange, #fb923c)); }
+    .ft-stream-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      font-size: 11px;
+    }
+    .ft-stream-chip {
+      padding: 2px 8px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      color: var(--muted);
+    }
+    .ft-stream-chip strong { color: var(--fg); font-weight: 600; }
+    .ft-keyboard-hint {
+      font-size: 10px;
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      margin-top: 4px;
+    }
+    .ft-keyboard-hint kbd {
+      display: inline-block;
+      padding: 1px 5px;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      background: var(--bg);
+      font-size: 9px;
+      margin: 0 1px;
+    }
+    .ft-card.ft-focused {
+      outline: 2px solid var(--accent, #06b6d4);
+      outline-offset: 1px;
+    }
   </style>
 </head>
 <body>
@@ -506,6 +588,30 @@
   </header>
 
   <main id="content" tabindex="-1">
+    <div id="ft-stats" class="ft-stats" hidden>
+      <div class="ft-stats-row">
+        <div class="ft-stats-item">
+          <span class="ft-stats-label">ratings 7d</span>
+          <span class="ft-stats-value" id="ft-stats-ratings-7d">—</span>
+        </div>
+        <div class="ft-stats-item" style="flex: 2 1 200px;">
+          <span class="ft-stats-label">draft LoRA</span>
+          <span class="ft-stats-value" id="ft-stats-draft-text">—</span>
+          <div class="ft-stats-bar"><div class="ft-stats-bar-fill" id="ft-stats-draft-bar" style="width:0%"></div></div>
+        </div>
+        <div class="ft-stats-item" style="flex: 2 1 200px;">
+          <span class="ft-stats-label">reranker LoRA</span>
+          <span class="ft-stats-value" id="ft-stats-rerank-text">—</span>
+          <div class="ft-stats-bar"><div class="ft-stats-bar-fill warn" id="ft-stats-rerank-bar" style="width:0%"></div></div>
+        </div>
+      </div>
+      <div class="ft-stats-row">
+        <div class="ft-stream-chips" id="ft-stream-chips"></div>
+      </div>
+      <div class="ft-keyboard-hint">
+        atajos: <kbd>j</kbd>/<kbd>k</kbd> navegar · <kbd>1</kbd> 👍 · <kbd>2</kbd> 👎 · <kbd>s</kbd> snooze · <kbd>b</kbd> 👍 todos los drafts aprobados
+      </div>
+    </div>
     <div id="ft-queue"></div>
     <div id="ft-empty" hidden>🎉 Sin pendientes — volvé mañana</div>
   </main>
@@ -538,13 +644,17 @@
       const emptyEl   = document.getElementById('ft-empty');
       const subtitleEl = document.getElementById('ft-count');
 
-      /* Sólo CONVERSACIONES REALES. Pushes (brief/anticipate/proactive_push)
-       * removidos post 2026-05-01 evening — no tienen respuesta correcta
-       * objetiva y meten ruido en el dataset. */
+      /* Streams 2026-05-12 (re-expansión): retrieval_answer + draft_wa
+       * (outputs en contexto de conversación) + brief + anticipate
+       * (pushes con loop cerrado vía rag_brief_feedback +
+       *  rag_anticipate_feedback → auto-tune). */
       const STREAM_COLORS = {
         retrieval_answer: 'var(--badge-retrieval_answer, #2563eb)',
         draft:            'var(--badge-draft, #10b981)',
         draft_wa:         'var(--badge-draft_wa, #059669)',
+        brief:            'var(--badge-brief, #8b5cf6)',
+        anticipate:       'var(--badge-anticipate, #f59e0b)',
+        proactive_push:   'var(--badge-proactive_push, #fb923c)',
         style:            'var(--badge-style, #ec4899)',
         tool_routing:     'var(--badge-tool_routing, #eab308)',
         read_summary:     'var(--badge-read_summary, #06b6d4)',
@@ -554,6 +664,9 @@
         retrieval_answer: '💬 respuesta',
         draft:            '✉️ draft',
         draft_wa:         '💚 wa-draft',
+        brief:            '📋 brief',
+        anticipate:       '🔔 anticipate',
+        proactive_push:   '⚡ proactive',
         style:            '🎨 estilo',
         tool_routing:     '🛠 tool',
         read_summary:     '📄 read',
@@ -590,10 +703,23 @@
         const parts = [];
         if (item.stream === 'retrieval_answer') {
           if (item.top_score != null) parts.push(`score=${item.top_score.toFixed(3)}`);
+          else parts.push('score=null');
           if (item.paths && item.paths.length) parts.push(`${item.paths.length} paths`);
+          if (item.meta && item.meta.response_source === 'vault') {
+            parts.push('respuesta: vault');
+          } else if (item.meta && item.meta.response_source === 'cache') {
+            parts.push('respuesta: cache');
+          }
         } else if (item.stream === 'draft' || item.stream === 'draft_wa') {
           if (item.meta && item.meta.contact) parts.push(`a ${item.meta.contact}`);
           if (item.meta && item.meta.decision) parts.push(`decisión: ${item.meta.decision}`);
+        } else if (item.stream === 'brief') {
+          if (item.meta && item.meta.brief_type) parts.push(item.meta.brief_type);
+          if (item.meta && item.meta.n_paths) parts.push(`${item.meta.n_paths} citaciones`);
+          if (item.meta && item.meta.n_sections) parts.push(`${item.meta.n_sections} secciones`);
+        } else if (item.stream === 'anticipate') {
+          if (item.meta && item.meta.kind) parts.push(item.meta.kind);
+          if (item.top_score != null) parts.push(`score=${item.top_score.toFixed(2)}`);
         }
         return parts.join(' · ');
       }
@@ -637,9 +763,35 @@
             blocks.push(bubble('vos enviaste', escapeHtml(m.sent_text), 'correction'));
           }
 
+        } else if (item.stream === 'brief') {
+          // Brief enviado: link a la nota episódica del vault + paths citados
+          title = `Brief ${escapeHtml(m.brief_type || '?')}`;
+          if (m.sections && m.sections.length) {
+            blocks.push(bubble(
+              'secciones',
+              escapeHtml(m.sections.join(' · ')),
+              'model faded'));
+          }
+          if (m.brief_path) {
+            blocks.push(vaultLink(m.brief_path, 'abrir brief en Obsidian'));
+          }
+          if (item.paths && item.paths.length) {
+            const list = item.paths.slice(0, 5).map(p => escapeHtml(p)).join('<br>');
+            blocks.push(`<div class="ft-conv ft-conv-faded">
+              <span class="ft-conv-role">citados</span>
+              <span class="ft-conv-text">${list}</span></div>`);
+          }
+
+        } else if (item.stream === 'anticipate' || item.stream === 'proactive_push') {
+          // Push enviado: kind + score + texto que vió el user
+          title = m.kind ? `Push: ${escapeHtml(m.kind)}` : 'Push anticipatorio';
+          if (m.message_preview) {
+            blocks.push(bubble('agente envió', escapeHtml(m.message_preview), 'model'));
+          }
+          if (m.reason) {
+            blocks.push(bubble('razón', escapeHtml(m.reason), 'model faded'));
+          }
         }
-        // NOTE: branches anticipate / proactive_push / brief removidas
-        // post 2026-05-01 evening (pushes meten ruido — no se puntúan).
 
         const bodyHtml = blocks.length
           ? `<div class="ft-conversation">${blocks.join('')}</div>`
@@ -668,6 +820,7 @@
         const card = document.createElement('div');
         card.className = 'ft-card';
         card.dataset.uid = uid;
+        card._itemMeta = item.meta || {};
 
         const color = STREAM_COLORS[item.stream] || '#888';
         const badgeText = STREAM_LABELS[item.stream] || item.stream;
@@ -752,6 +905,7 @@
           });
           if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
           fadeRemove(card);
+          fetchStats();  // refresh contadores tras cada rating
         } catch (err) {
           btns.forEach(b => { b.disabled = false; });
           alert('Error al guardar — reintentá');
@@ -789,7 +943,7 @@
       /* ── fetch + render ── */
       async function fetchQueue() {
         try {
-          const resp = await fetch('/api/fine_tunning/queue?limit=20');
+          const resp = await fetch('/api/fine_tunning/queue?limit=40&days=30');
           if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
           const data = await resp.json();
           const items = data.items || [];
@@ -805,16 +959,133 @@
 
           updateSubtitle();
           updateEmpty();
+          updateFocus();
         } catch (err) {
           const loader = queueEl.querySelector('.ft-loading');
           if (loader) loader.textContent = 'Error al cargar — reintentando…';
         }
       }
 
+      /* ── stats header ── */
+      async function fetchStats() {
+        try {
+          const resp = await fetch('/api/fine_tunning/stats');
+          if (!resp.ok) return;
+          const s = await resp.json();
+          const statsEl = document.getElementById('ft-stats');
+          statsEl.hidden = false;
+
+          document.getElementById('ft-stats-ratings-7d').textContent = s.ratings_7d ?? 0;
+
+          const dl = s.draft_lora || {};
+          document.getElementById('ft-stats-draft-text').textContent =
+            `${dl.current ?? 0}/${dl.target ?? 100} pares`;
+          document.getElementById('ft-stats-draft-bar').style.width = `${dl.pct ?? 0}%`;
+
+          const rl = s.reranker_lora || {};
+          document.getElementById('ft-stats-rerank-text').textContent =
+            `${rl.correctives ?? 0}/${rl.target_correctives ?? 20} correctives` +
+            ` · ${rl.positives ?? 0}/${rl.target_positives ?? 10} pos`;
+          document.getElementById('ft-stats-rerank-bar').style.width = `${rl.pct ?? 0}%`;
+
+          const chipsEl = document.getElementById('ft-stream-chips');
+          chipsEl.innerHTML = '';
+          const pbs = s.pending_by_stream || {};
+          for (const [k, v] of Object.entries(pbs)) {
+            if (v <= 0) continue;
+            const chip = document.createElement('span');
+            chip.className = 'ft-stream-chip';
+            const label = (STREAM_LABELS[k] || k).replace(/^.{2}\s/, '');
+            chip.innerHTML = `${label}: <strong>${v}</strong>`;
+            chipsEl.appendChild(chip);
+          }
+        } catch (e) { /* silent */ }
+      }
+
+      /* ── keyboard navigation ── */
+      let focusedIdx = -1;
+      function visibleCards() {
+        return Array.from(queueEl.querySelectorAll('.ft-card:not(.fading)'));
+      }
+      function updateFocus() {
+        const cards = visibleCards();
+        cards.forEach(c => c.classList.remove('ft-focused'));
+        if (focusedIdx < 0 || focusedIdx >= cards.length) {
+          focusedIdx = cards.length > 0 ? 0 : -1;
+        }
+        if (focusedIdx >= 0) {
+          cards[focusedIdx].classList.add('ft-focused');
+          cards[focusedIdx].scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+        }
+      }
+      document.addEventListener('keydown', (e) => {
+        // Ignorar si el foco está en input/textarea
+        if (e.target && /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
+        if (e.metaKey || e.ctrlKey || e.altKey) return;
+        const cards = visibleCards();
+        if (cards.length === 0) return;
+        const cur = cards[focusedIdx];
+        switch (e.key) {
+          case 'j':
+          case 'ArrowDown':
+            focusedIdx = Math.min(focusedIdx + 1, cards.length - 1);
+            updateFocus();
+            e.preventDefault();
+            break;
+          case 'k':
+          case 'ArrowUp':
+            focusedIdx = Math.max(focusedIdx - 1, 0);
+            updateFocus();
+            e.preventDefault();
+            break;
+          case '1':
+            if (cur) cur.querySelector('.btn-pos')?.click();
+            e.preventDefault();
+            break;
+          case '2':
+            if (cur) cur.querySelector('.btn-neg')?.click();
+            e.preventDefault();
+            break;
+          case 's':
+            if (cur) cur.querySelector('.btn-snooze')?.click();
+            e.preventDefault();
+            break;
+          case 'b':
+            bulkApproveDrafts();
+            e.preventDefault();
+            break;
+        }
+      });
+
+      /* ── bulk approve drafts (b key) ──
+       * Marca 👍 a todos los drafts WA visibles con decision='approved_si'
+       * (vos los mandaste tal cual los drafteó el bot → 👍 implícito).
+       * Útil después de un día normal donde el bot acertó la mayoría. */
+      async function bulkApproveDrafts() {
+        const cards = visibleCards();
+        const targets = cards.filter(c => {
+          const uid = c.dataset.uid || '';
+          if (!uid.startsWith('draft_wa::')) return false;
+          const meta = c._itemMeta || {};
+          return meta.decision === 'approved_si';
+        });
+        if (targets.length === 0) {
+          alert('No hay drafts approved_si visibles para bulk-approve.');
+          return;
+        }
+        if (!confirm(`Marcar 👍 a ${targets.length} drafts approved_si?`)) return;
+        for (const card of targets) {
+          card.querySelector('.btn-pos')?.click();
+          await new Promise(r => setTimeout(r, 60));
+        }
+      }
+
       /* ── init ── */
       queueEl.innerHTML = '<div class="ft-loading">cargando…</div>';
       fetchQueue();
+      fetchStats();
       setInterval(fetchQueue, 60000);
+      setInterval(fetchStats, 60000);
     })();
   </script>
 </body>

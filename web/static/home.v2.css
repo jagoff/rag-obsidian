@@ -350,6 +350,10 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 .section-ambient .section-body {
   display: grid;
   gap: var(--space-3);
+  /* Each panel sizes to its natural content height — no stretch-to-row.
+     Grid columns stay intact; rows become ragged but cells stop holding
+     empty space when one panel in the row has much more content. */
+  align-items: start;
 }
 
 .section-accionable .section-body {
@@ -748,6 +752,11 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
      refuerza para Safari/iOS que no respeta anywhere todavía. */
   overflow-wrap: anywhere;
   word-break: break-word;
+  /* Cap row height so PREGUNTAS/AGENDA (short content) and LO QUE PASÓ/
+     SIN PROCESAR (long content) share a uniform row height. Tall cells
+     scroll internally; short cells just sit naturally. */
+  max-height: 320px;
+  overflow-y: auto;
 }
 .today-hero-body > .hero-section:last-child { border-right: none; }
 /* Cuando una hero-section está colapsada, ocultamos la prose + sub-bodies,
@@ -1263,7 +1272,6 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 
 .panel-patterns {
   border-left-color: var(--magenta-dim) !important;
-  grid-column: span 2;  /* ocupa 2 cols cuando hay patrones */
 }
 .panel-patterns:hover { border-left-color: var(--magenta) !important; }
 .panel-patterns .panel-head .count {

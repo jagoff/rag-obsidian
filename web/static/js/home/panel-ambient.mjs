@@ -63,7 +63,7 @@ export function renderWeather(payload) {
     } catch { return dateStr.slice(5); }
   };
 
-  const rows = days.slice(0, 4).map((d) => {
+  const rows = days.slice(0, 1).map((d) => {
     const icon = dayIcon(d.description);
     const tempRange = (d.minC != null && d.maxC != null)
       ? `${d.minC}°–${d.maxC}°`

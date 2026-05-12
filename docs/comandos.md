@@ -39,6 +39,29 @@ rag index --since 2026-04-01        # solo desde esta fecha (cross-source)
 rag index --dry-run                 # no escribe (solo cross-source)
 ```
 
+**Nota (2026-05-12)**: `rag index` **fuerza `RAG_VLM_CAPTION=0`** durante el loop (override en `_run_index`). Cargar granite-vision (~3 GB Metal) en simultáneo con el embedder + reranker + daemon web disparaba swap NAND y reboot de la Mac. Para captionar imágenes embebidas usar el pase aparte `rag vlm-backfill` (abajo).
+
+### `rag vlm-backfill`
+Captionar imágenes embebidas en notas vía granite-vision (mlx-vlm), pase aislado del index principal.
+
+```bash
+rag vlm-backfill                    # captionar imágenes sin caché (budget default 500)
+rag vlm-backfill --dry-run          # listar pendientes sin tocar el VLM
+rag vlm-backfill --max 50           # cap explícito de captions este run
+rag vlm-backfill --force            # continuar aunque el web daemon esté activo (riesgoso)
+rag vlm-backfill --vault work       # otro vault
+```
+
+Recomendado correr con el daemon web bajado para tener toda la RAM unificada disponible:
+
+```bash
+launchctl bootout gui/$(id -u)/com.fer.obsidian-rag-web
+rag vlm-backfill
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fer.obsidian-rag-web.plist
+```
+
+Las notas afectadas se re-embeben automáticamente en el próximo `rag index` (el hash de la nota cambia vía `_file_hash_with_images`).
+
 ### `rag query "tu pregunta"`
 Hacé una pregunta y te devuelve la respuesta + links a las notas.
 

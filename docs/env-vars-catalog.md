@@ -33,6 +33,9 @@ Para cambiar cualquier default: setear el env var en el shell antes de invocar e
 | `RAG_NLI_CONTRADICTS_THRESHOLD` | `0.7` | `rag/__init__.py:238` | Score de la clase "contradiction" de mDeBERTa-NLI por encima del cual el claim se flagea. |
 | `RAG_NLI_MAX_CLAIMS` | `20` | `rag/__init__.py:250` | Cap de claims extraídos del LLM response para chequear NLI. |
 | `RAG_NLI_NEVER_UNLOAD` | `""` (off) | `rag/__init__.py:63171` | Setear `1` para pinear el NLI model en memoria (evita idle-unload). Análogo a `RAG_RERANKER_NEVER_UNLOAD`. |
+| `RAG_MEMORY_PRESSURE_SWAP_GB` | `1.5` (CLI) / `8.0` (web plist) | `rag/_memory_pressure_watchdog.py:363` | Swap (GB) usado por el kernel que dispara `_handle_memory_pressure` (unload chat + reranker). Default bajado de `4.0`→`1.5` el 2026-05-12: Mac 16GB ya thrashea NAND con 2GB swap, esperar 4GB era muy tarde. El daemon web preserva 8.0 (long-running, más tolerante). |
+| `RAG_MEMORY_PRESSURE_COOLDOWN_S` | `300` (default) / `60` (override en `rag index`) | `rag/_memory_pressure_watchdog.py:367` | Segundos entre acciones del watchdog (evita unload→reload→unload thrash). `rag index` baja el override a 60s en `_run_index` porque el indexer no re-carga modelos inmediato — preferible 10 acciones en 30min que 3. |
+| `RAG_CONTRADICTION_MAX_WORKERS` | `2` | `rag/__init__.py` (`_CONTRA_MAX_WORKERS`) | Cap de daemon threads que corren contradiction check concurrentemente. Pre-fix (2026-05-12): unbounded — 681 archivos = potencial 681 threads cada uno cargando reranker bge MPS (~600MB). Semaphore adquirido DENTRO del wrapper, threads pendientes esperan (~1MB stack c/u sin presión GPU). |
 | `RAG_PPR_SEED_K` | `5` | `rag/__init__.py:22432` | Cantidad de top-k candidates usados como seeds del Personalized PageRank (opt-in via `RAG_PPR_TOPIC=1`). |
 | `RAG_SILENT_LOG_ALERT_THRESHOLD` | `20` | `rag/__init__.py:1048` | N silent-errors / ventana que dispara el alert a stderr (evita que los logs SQL fail queden invisible). |
 | `RAG_TEMPORAL_LOOKUP_BOOST` | `3.0` | `rag/__init__.py:22399` | Multiplier de recency para queries con anchor temporal detectado (`hoy`, `esta semana`). |
@@ -54,7 +57,7 @@ Para cambiar cualquier default: setear el env var en el shell antes de invocar e
 | `RAG_PPR_TOPIC` | `1` | `rag/__init__.py:22479` | Activa Personalized PageRank sobre el grafo de wikilinks usando los top-k results como seeds. Experimental. |
 | `RAG_SCORE_CALIBRATION` | `1` | `rag/__init__.py:58608` | Activa el isotonic regression per-source (usa `rag_score_calibration`). Mejora rerank bajo mixed-source retrieval. |
 | `RAG_UNIFIED_CHAT` | `1` | `rag/__init__.py:21121` | Activa el unified chat pipeline (`run_chat_turn`) para CLI `rag chat` — alineación con web/serve. |
-| `RAG_VLM_CAPTION` | `1` | `rag/__init__.py` | Activa captioning de imágenes embebidas via VLM (qwen2.5-vl). OCR via Apple Vision sigue siendo el path default — VLM es complementario. |
+| `RAG_VLM_CAPTION` | `1` (queries) / **`0` durante `rag index`** | `rag/__init__.py`, `rag/ocr.py:413` | Activa captioning de imágenes embebidas via VLM granite-vision. Apple Vision OCR sigue siendo el path default — VLM es fallback. **Default OFF durante `rag index`** (override en `_run_index` 2026-05-12 audit): cargar granite (~3 GB Metal) en simultáneo con embedder MLX + reranker + web daemon dispara swap NAND y reboot. Para captionar vault completo correr [`rag vlm-backfill`](../rag/__init__.py) en pase aislado (web daemon bajado recomendado). |
 | `RAG_WIKILINK_EXPANSION` | `1` | `rag/__init__.py:11397` | Expande wikilinks en el CONTEXT del retrieve (resolver link targets a body). Experimental. |
 
 ## MLX backend

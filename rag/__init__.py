@@ -19552,6 +19552,20 @@ _CONTRA_WRITERS: "set[threading.Thread]" = set()
 # `contradiction_shutdown_timeout` errors (~18/week pre-fix) where a chat
 # call mid-flight outlived the 10s drain budget.
 _CONTRA_SHUTDOWN_EVENT = threading.Event()
+# Cap concurrent contradiction workers (2026-05-12 audit). Pre-fix:
+# `_dispatch_contradiction_check` spawn-eaba 1 daemon thread por archivo sin
+# bound — 681 archivos => potencialmente 681 threads concurrentes, cada uno
+# cargando reranker bge MPS (~600MB), LLM helper, embed call. El `_MLX_FORWARD_LOCK`
+# secuencializa forwards Metal pero NO previene que 681 threads carguen el
+# reranker PyTorch MPS en paralelo. Este semaphore se adquiere DENTRO del
+# wrapper (no en el spawn) — el spawn sigue siendo non-blocking, las threads
+# quedan en queue dormida (~1MB stack c/u) hasta que el slot abre. Default 2
+# = mismo orden de magnitud que `_HELPER_SEM`.
+try:
+    _CONTRA_MAX_WORKERS = max(1, int(os.environ.get("RAG_CONTRADICTION_MAX_WORKERS", "2")))
+except ValueError:
+    _CONTRA_MAX_WORKERS = 2
+_CONTRA_WORKER_SEM = threading.BoundedSemaphore(_CONTRA_MAX_WORKERS)
 # Env knob: set to "0" in tests that assert on post-index frontmatter state.
 # Default enabled — production code benefits from non-blocking index.
 _CONTRADICTION_ASYNC_ENV = os.environ.get("_CONTRADICTION_ASYNC", "1")
@@ -19603,6 +19617,26 @@ def _contradiction_worker_wrapper(
             with _CONTRA_WRITERS_LOCK:
                 _CONTRA_WRITERS.discard(threading.current_thread())
         return
+    # Adquirir el slot ANTES de tocar reranker/embed/LLM. Con cap N=2 default,
+    # solo 2 workers hacen forward concurrentemente — el resto duerme aquí
+    # (~1MB stack c/u, sin presión GPU). Si el shutdown event se setea mientras
+    # esperamos, abortamos cooperativamente al pending JSONL.
+    _slot_acquired = False
+    while not _slot_acquired:
+        if _CONTRA_SHUTDOWN_EVENT.is_set():
+            try:
+                _append_pending_contradiction({
+                    "ts": datetime.now().isoformat(timespec="seconds"),
+                    "path": str(path),
+                    "text": text,
+                    "doc_id_prefix": doc_id_prefix,
+                    "error": "deferred-shutdown-while-queued",
+                })
+            finally:
+                with _CONTRA_WRITERS_LOCK:
+                    _CONTRA_WRITERS.discard(threading.current_thread())
+            return
+        _slot_acquired = _CONTRA_WORKER_SEM.acquire(timeout=1.0)
     try:
         _check_and_flag_contradictions(col, path, text, doc_id_prefix)
     except Exception as exc:
@@ -19615,6 +19649,12 @@ def _contradiction_worker_wrapper(
             "error": repr(exc),
         })
     finally:
+        try:
+            _CONTRA_WORKER_SEM.release()
+        except ValueError:
+            # BoundedSemaphore raises if released more times than acquired;
+            # defensive guard against double-finally bugs.
+            pass
         with _CONTRA_WRITERS_LOCK:
             _CONTRA_WRITERS.discard(threading.current_thread())
 
@@ -23157,6 +23197,24 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
     # 2-3GB VRAM ocupados que aceleran el OOM acumulado.
     _orig_reranker_never_unload = os.environ.get("RAG_RERANKER_NEVER_UNLOAD", "")
     os.environ["RAG_RERANKER_NEVER_UNLOAD"] = "0"
+    # Override temporal `RAG_VLM_CAPTION=0` durante el indexer (2026-05-12):
+    # granite-vision-3.2-2b-4bit ocupa ~3GB Metal VRAM y se carga POR archivo
+    # con imagen embebida cuyo OCR macOS devuelve <20 chars. Coexiste in-process
+    # con embedder Qwen3-MLX (~1.5GB) + reranker bge (~600MB pre-eviction) +
+    # daemon web (otro proceso, ~6-9GB Metal compartiendo RAM unificada). En
+    # Mac 16GB esto fuerza swap NAND → kernel panic / reboot manual. El
+    # captioning queda para `rag vlm-backfill` (pase aparte con web bajado).
+    # Override explícito (`RAG_VLM_CAPTION=1` en el entorno) sigue ganando si
+    # el user opt-inea conscientemente — pero el default del indexer es OFF.
+    _orig_vlm_caption = os.environ.get("RAG_VLM_CAPTION", "")
+    if not _orig_vlm_caption:
+        os.environ["RAG_VLM_CAPTION"] = "0"
+    # Cooldown del watchdog 300s default es muy largo para el indexer: si
+    # actúa una vez al minuto 5, no vuelve a actuar hasta minuto 10 aunque
+    # la presión persista. En run de 15-30min queremos hasta 10 acciones, no 3.
+    _orig_pressure_cooldown = os.environ.get("RAG_MEMORY_PRESSURE_COOLDOWN_S", "")
+    if not _orig_pressure_cooldown:
+        os.environ["RAG_MEMORY_PRESSURE_COOLDOWN_S"] = "60"
     try:
         return _run_index_inner(reset, no_contradict, col)
     finally:
@@ -23164,6 +23222,14 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
             os.environ["RAG_RERANKER_NEVER_UNLOAD"] = _orig_reranker_never_unload
         else:
             os.environ.pop("RAG_RERANKER_NEVER_UNLOAD", None)
+        if _orig_vlm_caption:
+            os.environ["RAG_VLM_CAPTION"] = _orig_vlm_caption
+        else:
+            os.environ.pop("RAG_VLM_CAPTION", None)
+        if _orig_pressure_cooldown:
+            os.environ["RAG_MEMORY_PRESSURE_COOLDOWN_S"] = _orig_pressure_cooldown
+        else:
+            os.environ.pop("RAG_MEMORY_PRESSURE_COOLDOWN_S", None)
 
 
 def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
@@ -24226,6 +24292,247 @@ def _watch_drain_once(
             rel = p
         out.append((vstate["name"], status, rel, err_s))
     return out
+
+
+@cli.command(name="vlm-backfill")
+@click.option("--vault", "vault_scope", default=None,
+              help="Nombre de vault registrado (override per-invocación). Default: vault activo.")
+@click.option("--max", "max_captions", type=int, default=None,
+              help="Cap de captions nuevos a ejecutar en este run. Default: RAG_VLM_CAPTION_MAX_PER_RUN.")
+@click.option("--dry-run", is_flag=True,
+              help="Listar imágenes pendientes de captionar sin tocar el VLM.")
+@click.option("--force", "force_run", is_flag=True,
+              help="Continuar aunque el daemon web esté activo (no recomendado — "
+                   "ambos procesos comparten RAM unificada del chip).")
+@click.option("--min-ocr", "min_ocr_chars", type=int, default=20,
+              help="Mínimo de chars que devolvió OCR macOS para considerar la imagen como "
+                   "ya cubierta y skippear el VLM. Default: 20 (mismo threshold que `_image_text_or_caption`).")
+def vlm_backfill(vault_scope: str | None, max_captions: int | None, dry_run: bool,
+                 force_run: bool, min_ocr_chars: int):
+    """Captioning de imágenes embebidas vía granite-vision (mlx-vlm) — pase aparte del `rag index`.
+
+    Diseño post-audit 2026-05-12: `rag index` setea `RAG_VLM_CAPTION=0` durante
+    el loop porque cargar granite (~3 GB Metal) en simultáneo con el embedder
+    Qwen3 + reranker + daemon web fuerza swap NAND y reboot de la Mac. Este
+    comando corre el captioning en un pase aislado, idealmente con el daemon
+    web bajado para tener todo el RAM unificada disponible para granite.
+
+    Recomendado:
+
+        launchctl bootout gui/$(id -u)/com.fer.obsidian-rag-web
+        rag vlm-backfill
+        launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fer.obsidian-rag-web.plist
+
+    El comando honra:
+      - Cache existente (`rag_vlm_captions` SQL table, key abs_path+mtime) —
+        solo procesa imágenes sin caption cacheado o con mtime cambiada.
+      - Budget `_VLM_CAPTION_MAX_PER_RUN` (default 500, override `--max`).
+      - `_MLX_FORWARD_LOCK` (serializa el forward MLX in-process).
+      - Memory pressure watchdog (idle-unload del modelo al terminar).
+
+    Las notas no se reindexan acá — el siguiente `rag index` (incremental)
+    detecta que la imagen tiene caption nuevo (hash de la nota cambia vía
+    `_file_hash_with_images`) y re-embede solo esas notas.
+    """
+    import rag as _rag
+
+    # Detectar si el daemon web está corriendo. No es bloqueante salvo --force,
+    # pero el warning explícito evita que el user dispare un OOM por accidente.
+    try:
+        import subprocess as _sp
+        _out = _sp.run(
+            ["launchctl", "print", f"gui/{os.getuid()}/com.fer.obsidian-rag-web"],
+            capture_output=True, text=True, timeout=5,
+        )
+        _web_running = _out.returncode == 0 and "state = running" in _out.stdout
+    except Exception:
+        _web_running = False
+    if _web_running and not force_run:
+        console.print(
+            "[yellow]⚠️  El daemon `com.fer.obsidian-rag-web` está corriendo.[/yellow]\n"
+            "Granite-vision (~3 GB Metal) + web daemon (~6-9 GB Metal) compiten por "
+            "RAM unificada y pueden disparar swap thrashing.\n\n"
+            "Opciones:\n"
+            "  1. Bajá el web temporalmente:\n"
+            "     [cyan]launchctl bootout gui/$(id -u)/com.fer.obsidian-rag-web && "
+            "rag vlm-backfill && launchctl bootstrap gui/$(id -u) "
+            "~/Library/LaunchAgents/com.fer.obsidian-rag-web.plist[/cyan]\n"
+            "  2. Continuar igual (no recomendado): [cyan]rag vlm-backfill --force[/cyan]\n"
+        )
+        return
+
+    # Resolver vault activo (mismo pattern que `rag index`):
+    _vault_ctx = None
+    if vault_scope:
+        names = [n.strip() for n in vault_scope.split(",") if n.strip()]
+        if len(names) != 1 or names[0] == "all":
+            console.print("[red]--vault acepta solo UN vault por invocación.[/red]")
+            return
+        resolved = resolve_vault_paths(names)
+        if not resolved:
+            console.print(f"[red]--vault '{vault_scope}' no resolvió ningún vault registrado.[/red]")
+            return
+        _, _vault_path = resolved[0]
+        _vault_ctx = _with_vault(_vault_path)
+        _vault_ctx.__enter__()
+
+    vault_root = VAULT_PATH
+    if not vault_root.is_dir():
+        console.print(f"[red]Vault path no existe: {vault_root}[/red]")
+        return
+
+    # Override budget si --max viene en CLI. Modificamos el módulo `rag` directo
+    # (no env var) porque `_vlm_caption_budget_available` lee `_rag._VLM_CAPTION_MAX_PER_RUN`.
+    if max_captions is not None and max_captions > 0:
+        _orig_budget = _rag._VLM_CAPTION_MAX_PER_RUN
+        _rag._VLM_CAPTION_MAX_PER_RUN = max_captions
+    else:
+        _orig_budget = None
+
+    # Reset del contador per-run (paridad con `rag index`).
+    try:
+        _vlm_caption_budget_reset()
+    except Exception:
+        pass
+
+    # Watchdog ON para que el idle-unload + memory pressure response funcionen
+    # mientras procesamos imágenes.
+    try:
+        start_memory_pressure_watchdog()
+    except Exception as exc:
+        _silent_log("vlm_backfill_watchdog_start", exc)
+
+    md_files = [
+        p for p in vault_root.rglob("*.md")
+        if not is_excluded(str(p.relative_to(vault_root)))
+    ]
+    console.print(f"[cyan]Escaneando {len(md_files)} notas por imágenes embebidas...[/cyan]")
+
+    # Construir set de (abs_path, mtime) ya cacheado para skippear sin tocar SQL
+    # por imagen. Una sola query upfront, listado de hasta ~10k imágenes — manejable.
+    cached: dict[str, float] = {}
+    try:
+        with _ragvec_state_conn() as conn:
+            for row in conn.execute(
+                "SELECT image_path, mtime FROM rag_vlm_captions"
+            ):
+                cached[str(row[0])] = float(row[1])
+    except Exception as exc:
+        _silent_log("vlm_backfill_cache_scan", exc)
+
+    pending: list[Path] = []
+    seen_images: set[str] = set()
+    for path in md_files:
+        try:
+            raw = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        images = _extract_embedded_images(raw, path, vault_root)
+        for img in images:
+            key = str(img.resolve())
+            if key in seen_images:
+                continue
+            seen_images.add(key)
+            try:
+                mtime = img.stat().st_mtime
+            except OSError:
+                continue
+            prev = cached.get(key)
+            if prev is not None and abs(prev - mtime) < 1e-6:
+                continue
+            pending.append(img)
+
+    console.print(
+        f"[cyan]Pendientes: {len(pending)} imágenes "
+        f"({len(seen_images)} embeds totales, {len(seen_images) - len(pending)} ya cacheados)[/cyan]"
+    )
+
+    def _release_vault_ctx() -> None:
+        if _vault_ctx is not None:
+            try:
+                _vault_ctx.__exit__(None, None, None)
+            except Exception:
+                pass
+
+    if dry_run:
+        for p in pending[:30]:
+            console.print(f"  [dim]{p}[/dim]")
+        if len(pending) > 30:
+            console.print(f"  [dim]... +{len(pending) - 30} más[/dim]")
+        if _orig_budget is not None:
+            _rag._VLM_CAPTION_MAX_PER_RUN = _orig_budget
+        _release_vault_ctx()
+        return
+
+    if not pending:
+        console.print("[green]No hay imágenes pendientes. Cache al día.[/green]")
+        if _orig_budget is not None:
+            _rag._VLM_CAPTION_MAX_PER_RUN = _orig_budget
+        _release_vault_ctx()
+        return
+
+    # Forzar `RAG_VLM_CAPTION=1` en el entorno del proceso aunque el plist global
+    # lo haya seteado a 0. Esto NO afecta a otros procesos — solo a este run.
+    _orig_vlm = os.environ.get("RAG_VLM_CAPTION", "")
+    os.environ["RAG_VLM_CAPTION"] = "1"
+
+    captioned = 0
+    skipped_budget = 0
+    failed = 0
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[cyan]Captioning[/cyan]"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TextColumn("•"),
+        TimeElapsedColumn(),
+        TextColumn("•"),
+        TimeRemainingColumn(),
+        console=Console(force_terminal=True, stderr=True),
+        transient=False,
+    )
+    task_id = progress.add_task("captioning", total=len(pending))
+    progress.start()
+    try:
+        for img in pending:
+            progress.advance(task_id)
+            if not _vlm_caption_budget_available():
+                skipped_budget = len(pending) - captioned - failed
+                console.print(
+                    f"[yellow]Budget agotado (_VLM_CAPTION_MAX_PER_RUN="
+                    f"{_rag._VLM_CAPTION_MAX_PER_RUN}). "
+                    f"Quedan {skipped_budget} pendientes para el próximo run.[/yellow]"
+                )
+                break
+            try:
+                cap = _caption_image(img)
+                if cap:
+                    captioned += 1
+                else:
+                    # Caption vacío también se cachea (no re-intentamos). Cuenta como skip.
+                    failed += 1
+            except Exception as exc:
+                failed += 1
+                _silent_log(f"vlm_backfill_caption:{img}", exc)
+    finally:
+        progress.stop()
+        if _orig_vlm:
+            os.environ["RAG_VLM_CAPTION"] = _orig_vlm
+        else:
+            os.environ.pop("RAG_VLM_CAPTION", None)
+        if _orig_budget is not None:
+            _rag._VLM_CAPTION_MAX_PER_RUN = _orig_budget
+        _release_vault_ctx()
+
+    console.print(
+        f"[green]Listo:[/green] {captioned} captionadas · "
+        f"{failed} fallidas/vacías · "
+        f"{skipped_budget} skip-budget"
+    )
+    console.print(
+        "[dim]Las notas afectadas se re-embeben en el próximo `rag index` "
+        "(hash cambia por `_file_hash_with_images`).[/dim]"
+    )
 
 
 @cli.command()

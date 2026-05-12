@@ -456,6 +456,13 @@ def _vlm_describe(image_path: "str | Path", prompt: str = "") -> str:
     como `<|system|>\\n...\\n<|user|>\\n<image>\\n{prompt}\\n<|assistant|>\\n`.
     """
     from mlx_vlm import generate as _mlx_generate  # noqa: PLC0415
+    # Serializar el forward MLX con el resto del proceso (embedder, chat,
+    # helper) vía `_MLX_FORWARD_LOCK`. Sin esto, un caption disparado durante
+    # `_flush_batch()` del indexer colisiona Metal command buffers con el
+    # forward del embedder Qwen3 → `kIOGPUCommandBufferCallbackErrorHang` /
+    # `InnocentVictim` reproducible. Mismo patrón que `MLXEmbedder._encode_batch`
+    # (rag/mlx_embed.py:187) y `MLXBackend.chat` (rag/llm_backend.py).
+    from rag.llm_backend import _MLX_FORWARD_LOCK  # noqa: PLC0415
     actual_prompt = prompt or _VLM_CAPTION_PROMPT
     try:
         model, processor = _vlm_load()
@@ -468,12 +475,13 @@ def _vlm_describe(image_path: "str | Path", prompt: str = "") -> str:
         formatted = processor.tokenizer.apply_chat_template(
             messages, add_generation_prompt=True, tokenize=False,
         )
-        out = _mlx_generate(
-            model, processor, formatted,
-            image=[str(image_path)],
-            verbose=False,
-            max_tokens=256,
-        )
+        with _MLX_FORWARD_LOCK:
+            out = _mlx_generate(
+                model, processor, formatted,
+                image=[str(image_path)],
+                verbose=False,
+                max_tokens=256,
+            )
         text = out if isinstance(out, str) else getattr(out, "text", str(out))
         return (text or "").strip()
     except Exception as exc:

@@ -38,7 +38,7 @@ Solo long-running daemons (`rag serve`, web server) lo arrancan.
 - `RAG_MEMORY_PRESSURE_DISABLE=1`   → no arrancar watchdog (testing / CI)
 - `RAG_MEMORY_PRESSURE_THRESHOLD=N` → umbral % (default 85)
 - `RAG_MEMORY_PRESSURE_INTERVAL=N`  → sampling cada N segundos (default 60)
-- `RAG_MEMORY_PRESSURE_SWAP_GB=N`   → trigger por swap activo (default 4.0 GB)
+- `RAG_MEMORY_PRESSURE_SWAP_GB=N`   → trigger por swap activo (default 1.5 GB)
 - `RAG_MEMORY_PRESSURE_COOLDOWN_S=N` → cooldown post-acción (default 300s)
 - `RAG_MPS_CACHE_DROP_INTERVAL=N`   → loop periódico empty_cache (default 60s,
                                        auto-skip cuando backend full-MLX)
@@ -360,9 +360,9 @@ def _memory_pressure_watchdog_loop(threshold: float, interval: int) -> None:
     """
     from rag import _daemon_shutdown_event, _ragvec_state_conn, _silent_log, _sql_append_event  # noqa: PLC0415
     try:
-        swap_gb_threshold = float(os.environ.get("RAG_MEMORY_PRESSURE_SWAP_GB", "4.0"))
+        swap_gb_threshold = float(os.environ.get("RAG_MEMORY_PRESSURE_SWAP_GB", "1.5"))
     except ValueError:
-        swap_gb_threshold = 4.0
+        swap_gb_threshold = 1.5
     try:
         cooldown_s = float(os.environ.get("RAG_MEMORY_PRESSURE_COOLDOWN_S", "300"))
     except ValueError:

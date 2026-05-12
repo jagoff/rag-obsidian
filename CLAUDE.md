@@ -26,7 +26,7 @@ Python 3.13, `uv`. Runtime venv: `.venv/bin/python`. Global tool: `~/.local/shar
 - `rag` — CLI indexing/querying/chat/productivity/automation.
 - `obsidian-rag-mcp` — MCP server (`rag_query`, `rag_read_note`, `rag_list_notes`, `rag_links`, `rag_stats`).
 
-**Extras default**: `entities` (gliner NER, **MLX-compat por design** — CPU only, opt-in via `RAG_EXTRACT_ENTITIES`), `stt` ([`mlx-whisper`](https://github.com/ml-explore/mlx-examples/tree/main/whisper)), `mlx` (LLM + embedder backend activo). `spotify` opt-in: `'.[entities,stt,mlx,spotify]'`. **VLM**: granite vía [`mlx-vlm`](https://github.com/Blaizzy/mlx-vlm) en [`rag/ocr.py`](rag/ocr.py) (opt-in para imágenes embebidas cuando `ocrmac` no alcanza).
+**Extras default**: `entities` (gliner NER, **MLX-compat por design** — CPU only, opt-in via `RAG_EXTRACT_ENTITIES`), `stt` ([`mlx-whisper`](https://github.com/ml-explore/mlx-examples/tree/main/whisper)), `mlx` (LLM + embedder backend activo). `spotify` opt-in: `'.[entities,stt,mlx,spotify]'`. **VLM**: granite vía [`mlx-vlm`](https://github.com/Blaizzy/mlx-vlm) en [`rag/ocr.py`](rag/ocr.py). **Default ON en queries, OFF durante `rag index`** (audit 2026-05-12) — coexistir con embedder + reranker + web daemon dispara swap NAND y reboot. Captioning vault completo via `rag vlm-backfill` (pase aislado). Forward serializado bajo `_MLX_FORWARD_LOCK`.
 
 ## Docs detalle (cargar bajo demanda)
 
@@ -70,7 +70,7 @@ NO regresar default a non-MLX. NO introducir dep `ollama>=0.x`.
 | STT (Whisper) | **MLX** ([`mlx-whisper`](https://github.com/ml-explore/mlx-examples/tree/main/whisper)) | n/a |
 | Reranker | **PyTorch+MPS+fp32** (`BAAI/bge-reranker-v2-m3`, default `RAG_RERANKER_BACKEND=torch` por invariante A/B documentado) | `RAG_RERANKER_BACKEND=mlx` activa MLX (opt-in, no default) |
 | NLI grounding | **LLM-as-judge** (`qwen2.5:3b` MLX, default `RAG_NLI_BACKEND=llm`) | `RAG_NLI_BACKEND=mdeberta` cae a CrossEncoder + mDeBERTa (requiere PyTorch) |
-| VLM (OCR) | **MLX** ([`mlx-vlm`](https://github.com/Blaizzy/mlx-vlm)) opt-in cuando `ocrmac` no alcanza | n/a |
+| VLM (OCR) | **MLX** ([`mlx-vlm`](https://github.com/Blaizzy/mlx-vlm)) fallback cuando `ocrmac` devuelve <20 chars. Default ON queries / **OFF durante `rag index`** (audit 2026-05-12). Captioning vault via `rag vlm-backfill`. | n/a |
 | NER (entities) | **CPU only** (`gliner`, MLX-incompat por design, gated por `RAG_EXTRACT_ENTITIES`) | n/a |
 
 **Por qué reranker NO es MLX default**: 2 A/Bs failed (collapse 2026-04-13 con fp16, overhead 2x con calidad equivalente 2026-04-22). Invariante: `device="mps"+float32` forced. MLX reranker existe (`mlx-community/Qwen3-Reranker-*`) y se activa con `RAG_RERANKER_BACKEND=mlx`, pero NO es default hasta nuevo A/B win. Documentado en [`rag/mlx_reranker.py:285-292`](rag/mlx_reranker.py).

@@ -2669,5 +2669,304 @@ body.archived-mode .wa-sidebar-header { box-shadow: inset 0 -2px 0 var(--accent,
   background: rgba(0, 168, 132, 0.12);
 }
 
+/* ─── Anticipador (drawer "✨ hoy") ─────────────────────────────────
+   Trigger en sidebar header (a la izquierda del theme toggle) + drawer
+   flotante anchored top-left que muestra top-3 candidates del daemon. */
+
+.wa-anticipate-trigger {
+  position: relative;
+  background: transparent;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-pill);
+  color: var(--text-secondary);
+  cursor: pointer;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s ease, color 0.15s ease,
+              border-color 0.15s ease, transform 0.15s ease;
+}
+.wa-anticipate-trigger:hover {
+  background: var(--bg-panel-active);
+  color: var(--text-primary);
+  border-color: var(--border-strong);
+}
+.wa-anticipate-trigger:active { transform: scale(0.94); }
+.wa-anticipate-sparkle {
+  font-size: 15px;
+  line-height: 1;
+  filter: grayscale(0.4);
+  transition: filter 0.2s ease;
+}
+.wa-anticipate-trigger.has-candidates .wa-anticipate-sparkle {
+  filter: grayscale(0);
+  animation: wa-anticipate-pulse 2.4s ease-in-out infinite;
+}
+@keyframes wa-anticipate-pulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50%      { transform: scale(1.12); opacity: 0.82; }
+}
+.wa-anticipate-count {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  background: var(--accent);
+  color: var(--text-on-accent);
+  border-radius: var(--radius-pill);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+  box-shadow: 0 0 0 2px var(--bg-panel-header);
+}
+
+/* Drawer flotante — anchored a la esquina top-left de la viewport.
+   Glass effect con backdrop-filter; cae con slide + fade. */
+.wa-anticipate-drawer {
+  position: fixed;
+  top: 12px;
+  left: 12px;
+  width: min(380px, calc(100vw - 24px));
+  max-height: min(72vh, 640px);
+  background: var(--bg-glass-header);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  border: 1px solid var(--border-glass);
+  border-radius: 14px;
+  box-shadow: 0 12px 48px rgba(0, 0, 0, 0.45),
+              0 2px 8px rgba(0, 0, 0, 0.25);
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  opacity: 0;
+  transform: translateY(-8px) scale(0.985);
+  transition: opacity 0.18s ease, transform 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+  pointer-events: none;
+}
+.wa-anticipate-drawer.is-open {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  pointer-events: auto;
+}
+
+.wa-anticipate-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px 8px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.wa-anticipate-header h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--text-primary);
+}
+.wa-anticipate-close {
+  background: transparent;
+  border: 0;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 14px;
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.wa-anticipate-close:hover {
+  background: var(--bg-panel-active);
+  color: var(--text-primary);
+}
+
+.wa-anticipate-body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 8px 10px 4px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+.wa-anticipate-body::-webkit-scrollbar { width: 6px; }
+.wa-anticipate-body::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 999px;
+}
+
+.wa-anticipate-loading,
+.wa-anticipate-empty,
+.wa-anticipate-error {
+  padding: 26px 14px;
+  text-align: center;
+  font-size: var(--fs-sm);
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+.wa-anticipate-loading { font-style: italic; }
+.wa-anticipate-empty code {
+  font-size: 11px;
+  background: var(--bg-panel-active);
+  padding: 1px 6px;
+  border-radius: 4px;
+  color: var(--text-tertiary);
+}
+.wa-anticipate-error { color: var(--red); }
+
+/* Card por candidate */
+.wa-anticipate-card {
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  padding: 11px 12px 9px;
+  margin: 6px 0;
+  transition: transform 0.18s ease, opacity 0.22s ease,
+              border-color 0.15s ease, background 0.15s ease;
+}
+.wa-anticipate-card:hover {
+  border-color: var(--border-strong);
+  background: var(--bg-panel-hover);
+}
+.wa-anticipate-card.dismissed {
+  opacity: 0;
+  transform: translateX(40px);
+}
+.wa-anticipate-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 6px;
+}
+.wa-anticipate-icon {
+  font-size: 15px;
+  line-height: 1;
+}
+.wa-anticipate-kind {
+  flex: 1 1 auto;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 12.5px;
+}
+.wa-anticipate-score {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  background: var(--bg-panel-active);
+  color: var(--text-secondary);
+  padding: 1px 7px;
+  border-radius: var(--radius-pill);
+  font-weight: 600;
+}
+.wa-anticipate-msg {
+  margin: 0 0 4px;
+  font-size: var(--fs-md);
+  line-height: 1.45;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.wa-anticipate-reason {
+  margin: 0 0 8px;
+  font-size: 11.5px;
+  color: var(--text-tertiary);
+  font-style: italic;
+  line-height: 1.4;
+}
+
+.wa-anticipate-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+.wa-anticipate-action {
+  background: var(--bg-panel-active);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-primary);
+  border-radius: var(--radius-pill);
+  font-size: 12px;
+  font-weight: 500;
+  padding: 4px 11px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 0.15s ease, border-color 0.15s ease,
+              transform 0.1s ease, color 0.15s ease;
+}
+.wa-anticipate-action:hover {
+  background: var(--bg-panel-hover);
+  border-color: var(--border-strong);
+}
+.wa-anticipate-action:active { transform: scale(0.96); }
+.wa-anticipate-action.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--text-on-accent);
+}
+.wa-anticipate-action.primary:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+.wa-anticipate-action.subtle {
+  background: transparent;
+  color: var(--text-tertiary);
+  border-color: transparent;
+}
+.wa-anticipate-action.subtle:hover {
+  color: var(--red);
+  background: transparent;
+  border-color: var(--border-subtle);
+}
+
+.wa-anticipate-footer {
+  padding: 8px 14px 10px;
+  border-top: 1px solid var(--border-subtle);
+  font-size: 11px;
+  color: var(--text-tertiary);
+  text-align: center;
+}
+.wa-anticipate-hint kbd {
+  display: inline-block;
+  padding: 0 5px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 3px;
+  font-size: 10px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  color: var(--text-secondary);
+  background: var(--bg-panel-active);
+}
+
+/* Marker visual cuando el composer recibió un draft del anticipador.
+   Glow sutil 2.5s, no roba foco al user. */
+.wa-prefilled-from-anticipator {
+  box-shadow: 0 0 0 2px rgba(0, 168, 132, 0.35),
+              0 0 18px 4px rgba(0, 168, 132, 0.18) !important;
+  transition: box-shadow 0.4s ease;
+}
+
+/* Mobile: drawer ocupa casi todo el viewport */
+@media (max-width: 720px) {
+  .wa-anticipate-drawer {
+    left: 8px;
+    right: 8px;
+    width: auto;
+    max-height: 80vh;
+  }
+}
+
 /* ─── Utility ─────────────────────────────────────────────────────── */
 .hidden { display: none !important; }

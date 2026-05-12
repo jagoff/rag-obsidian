@@ -4378,6 +4378,128 @@ def wa_gap_summary(
     return {"summary": summary}
 
 
+# ── /api/wa/anticipate/today ─────────────────────────────────────────────────
+# Surface el top-N de candidates anticipatory dentro del cliente wzp. El daemon
+# `com.fer.obsidian-rag-anticipate` corre cada 10min y pushea top-1 a RagNet;
+# este endpoint expone el ranking completo para que el wzp lo muestre como
+# drawer de "✨ hoy". Feedback (snooze/ignore/sent) reusa
+# `/api/anticipate/feedback` ya existente.
+#
+# In-process cache TTL=120s: los signals son cheap-ish pero correr calendar
+# fetch + vault echo + commitment scan en cada F5 es waste. 2min de stale
+# tolerable porque el daemon recompone state cada 10min de todas formas.
+
+_WZP_ANTICIPATE_CACHE_LOCK = _threading.RLock()
+_WZP_ANTICIPATE_CACHE: dict = {"ts": 0.0, "candidates": []}
+_WZP_ANTICIPATE_CACHE_TTL = 120.0  # segundos
+
+
+def _wzp_anticipate_collect(now: datetime) -> list:
+    """Corre todas las signals registradas y devuelve la lista completa de
+    candidates (sin filtrar, sin sortear). Silent-fail por signal — si una
+    rompe (ej. calendar fetch timeout), el resto sigue.
+
+    Distinto de `anticipate_run_impl`: no toca el lockfile del daemon, no
+    loguea a `rag_anticipate_candidates`, no aplica dedup ni quiet_hours
+    (porque el endpoint es read-only / info, no push).
+    """
+    from rag import _ANTICIPATE_SIGNALS, _silent_log
+    out = []
+    for label, fn in _ANTICIPATE_SIGNALS:
+        try:
+            out.extend(fn(now))
+        except Exception as exc:
+            _silent_log(f"wzp_anticipate_signal_{label}", exc)
+    return out
+
+
+def _wzp_anticipate_serialize(c) -> dict:
+    """Serializa un AnticipatoryCandidate al shape UI. Incluye los campos
+    de enrichment (target_jid/draft) que `_anticipate_candidate_to_dict`
+    omite — el wzp los necesita para el botón [borrador]."""
+    return {
+        "kind": c.kind,
+        "score": round(float(c.score), 3),
+        "message": c.message,
+        "dedup_key": c.dedup_key,
+        "snooze_hours": int(c.snooze_hours),
+        "reason": c.reason,
+        "target_jid": getattr(c, "target_jid", None),
+        "target_name": getattr(c, "target_name", None),
+        "draft": getattr(c, "draft", None),
+        "draft_meta": getattr(c, "draft_meta", None),
+    }
+
+
+@app.get("/api/wa/anticipate/today")
+def wa_anticipate_today(limit: int = 3, min_score: float = 0.30) -> dict:
+    """Top-N candidates anticipatory para el drawer ✨ hoy del wzp.
+
+    Read-only: no pushea, no dedup, no afecta el daemon. Cache in-process
+    120s para evitar re-correr calendar fetch + vault scan en cada F5.
+
+    Query params:
+    - `limit` (1-10, default 3) — cuántos candidates devolver.
+    - `min_score` (0.0-1.0, default 0.30) — threshold; usar 0.30 (más bajo
+      que el daemon 0.35) para que aparezcan candidates "casi-pushables"
+      como info útil aunque el daemon no los hubiera pusheado.
+
+    Response:
+    ```
+    {
+      "ok": true,
+      "now": "2026-05-11T15:42:00",
+      "disabled": false,
+      "candidates": [
+        {kind, score, message, dedup_key, snooze_hours, reason,
+         target_jid, target_name, draft, draft_meta}
+      ]
+    }
+    ```
+
+    Si `RAG_ANTICIPATE_DISABLED=1` → `{disabled: true, candidates: []}`.
+    Si todas las signals fallan / no hay candidates → `candidates: []`
+    (no error). El frontend muestra empty state.
+    """
+    if os.environ.get("RAG_ANTICIPATE_DISABLED", "").strip() in ("1", "true", "yes"):
+        return {
+            "ok": True,
+            "disabled": True,
+            "now": datetime.now().isoformat(timespec="seconds"),
+            "candidates": [],
+        }
+    limit = max(1, min(int(limit), 10))
+    min_score = max(0.0, min(float(min_score), 1.0))
+    now = datetime.now()
+
+    # Cache lookup
+    cached_ts = 0.0
+    cached: list = []
+    with _WZP_ANTICIPATE_CACHE_LOCK:
+        cached_ts = float(_WZP_ANTICIPATE_CACHE.get("ts", 0.0))
+        cached = list(_WZP_ANTICIPATE_CACHE.get("candidates", []))
+
+    if cached and (time.time() - cached_ts) < _WZP_ANTICIPATE_CACHE_TTL:
+        all_candidates = cached
+    else:
+        all_candidates = _wzp_anticipate_collect(now)
+        with _WZP_ANTICIPATE_CACHE_LOCK:
+            _WZP_ANTICIPATE_CACHE["ts"] = time.time()
+            _WZP_ANTICIPATE_CACHE["candidates"] = all_candidates
+
+    # Filter + sort + slice
+    filtered = [c for c in all_candidates if float(c.score) >= min_score]
+    filtered.sort(key=lambda c: float(c.score), reverse=True)
+    top = filtered[:limit]
+
+    return {
+        "ok": True,
+        "disabled": False,
+        "now": now.isoformat(timespec="seconds"),
+        "candidates": [_wzp_anticipate_serialize(c) for c in top],
+    }
+
+
 class _WAMarkReadRequest(BaseModel):
     jid: str
     last_seen_ts: str | None = None

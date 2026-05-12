@@ -6,6 +6,7 @@ import * as thread from "./wa-thread.js";
 import * as sse from "./wa-sse.js";
 import * as cmdk from "./wa-cmdk.js";
 import * as liquid from "./wa-liquid-glass.js";
+import * as anticipate from "./wa-anticipate.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -58,6 +59,16 @@ function init() {
   // Liquid Glass — mouse-tracked specular spotlight sobre bubbles +
   // tinted glass del thread header desde el avatar dominante.
   liquid.init();
+
+  // Anticipador — drawer "✨ hoy" en sidebar header. Surface los top-N
+  // candidates del daemon `com.fer.obsidian-rag-anticipate` para que el
+  // user actúe sin abrir RagNet ni CLI. Endpoint: /api/wa/anticipate/today.
+  anticipate.init({
+    onChatSelect: (jid) => {
+      document.body.dataset.pane = "thread";
+      thread.open(jid);
+    },
+  });
 }
 
 // Cada 30s re-fetcheamos el chatlist. SSE entrega chat_update events

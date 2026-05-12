@@ -174,6 +174,27 @@ export async function typing(jid, state) {
   }
 }
 
+// ── Anticipador ────────────────────────────────────────────────────────────
+// Top-N candidates anticipatorios para el drawer "✨ hoy" del sidebar.
+
+export async function fetchAnticipateToday({ limit = 3, minScore = 0.30 } = {}) {
+  const params = new URLSearchParams({
+    limit: String(limit),
+    min_score: String(minScore),
+  });
+  return jsonGET(`/api/wa/anticipate/today?${params}`);
+}
+
+export async function submitAnticipateFeedback(dedupKey, rating, reason = "") {
+  // Reusa el endpoint que ya consume el listener TS. `rating` ∈
+  // {positive, negative, mute}. `source` lo setea el server.
+  return jsonPOST("/api/anticipate/feedback", {
+    dedup_key: dedupKey,
+    rating,
+    reason: reason || "",
+  });
+}
+
 // Health del bridge — usado por el indicador visual del header.
 export async function bridgeHealth() {
   try {

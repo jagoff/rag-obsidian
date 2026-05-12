@@ -165,19 +165,64 @@ function renderCard(p) {
   const text = escapeHtml(p.promise_text || "");
   const when = formatRelative(p.ts);
   const dir = p.direction === "outbound" ? "⬆ vos" : "⬇ él/ella";
+  const dueStatus = computeDueStatus(p.due_ts);
+  const dueBadge = dueStatus
+    ? `<span class="wa-promises-due ${dueStatus.cls}" title="${escapeHtml(dueStatus.fullText)}">${escapeHtml(dueStatus.shortText)}</span>`
+    : "";
   return `
-    <article class="wa-promises-card ${p.direction}" data-id="${p.id}">
+    <article class="wa-promises-card ${p.direction} ${dueStatus ? dueStatus.cls : ""}" data-id="${p.id}">
       <header>
         <span class="wa-promises-dir">${dir}</span>
         <span class="wa-promises-when">${when}</span>
       </header>
       <p class="wa-promises-text">"${text}"</p>
+      ${dueBadge ? `<div class="wa-promises-meta">${dueBadge}</div>` : ""}
       <div class="wa-promises-actions">
         <button class="wa-promises-action primary" data-action="resolve">✓ cumplida</button>
         <button class="wa-promises-action subtle" data-action="cancel">✗ cancelar</button>
       </div>
     </article>
   `;
+}
+
+function computeDueStatus(dueTs) {
+  if (!dueTs) return null;
+  let due;
+  try {
+    due = new Date(dueTs).getTime();
+    if (Number.isNaN(due)) return null;
+  } catch {
+    return null;
+  }
+  const now = Date.now();
+  const delta = due - now;
+  const absHours = Math.abs(delta) / 3600000;
+  const fullText = new Date(due).toLocaleString("es-AR", {
+    weekday: "short", day: "numeric", month: "short",
+    hour: "2-digit", minute: "2-digit",
+  });
+  if (delta < 0) {
+    // overdue
+    const txt = absHours < 24
+      ? `⏰ vencida hace ${Math.round(absHours)}h`
+      : `⏰ vencida hace ${Math.round(absHours / 24)}d`;
+    return { cls: "due-overdue", shortText: txt, fullText };
+  }
+  if (absHours < 24) {
+    return {
+      cls: "due-soon",
+      shortText: `⏳ vence en ${Math.round(absHours)}h`,
+      fullText,
+    };
+  }
+  if (absHours < 168) {
+    return {
+      cls: "due-future",
+      shortText: `📅 ${Math.round(absHours / 24)}d`,
+      fullText,
+    };
+  }
+  return { cls: "due-future", shortText: `📅 ${fullText}`, fullText };
 }
 
 function wireCardActions(root) {

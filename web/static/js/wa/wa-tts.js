@@ -7,11 +7,14 @@
 // Trade-off: latencia 2-5s (say synthesis + ffmpeg encode + bridge send).
 // Por eso el botón muestra estado pending mientras procesa.
 
+const VOICE_STORAGE_KEY = "wzp-tts-voice";
+
 let _btn = null;
 let _input = null;
 let _activeJid = null;
 let _healthOk = false;
 let _healthMissing = [];
+let _voicesLoaded = false;
 
 export function init() {
   _btn = document.getElementById("wa-tts-btn");
@@ -38,9 +41,59 @@ async function checkHealth() {
       _btn.classList.add("unavailable");
       _btn.title = `Voz Espejo no disponible · falta: ${_healthMissing.join(", ")}`;
     }
+    if (_healthOk) await loadVoices();
   } catch (e) {
     // silent — si el healthcheck falla, dejamos pasar el click normal
   }
+}
+
+async function loadVoices() {
+  if (_voicesLoaded) return;
+  _voicesLoaded = true;
+  try {
+    const r = await fetch("/api/wa/voice/list", { credentials: "same-origin" });
+    if (!r.ok) return;
+    const data = await r.json();
+    if (!data.ok) return;
+    // Filtrar solo voces es_*. Si no hay ninguna, fallback al listado completo.
+    let voices = (data.voices || []).filter((v) => /^es[-_]/.test(v.lang));
+    if (!voices.length) voices = data.voices || [];
+    if (voices.length < 2) return;  // 1 voz: no vale la pena mostrar picker
+    mountPicker(voices);
+  } catch (e) {
+    // silent
+  }
+}
+
+function mountPicker(voices) {
+  if (!_btn || !_btn.parentNode) return;
+  if (document.getElementById("wa-tts-voice-select")) return;
+  const select = document.createElement("select");
+  select.id = "wa-tts-voice-select";
+  select.className = "wa-tts-voice-select";
+  select.title = "elegir voz para TTS";
+  const stored = (() => {
+    try { return localStorage.getItem(VOICE_STORAGE_KEY); } catch { return null; }
+  })();
+  const defaultVoice = stored || "Mónica";
+  for (const v of voices) {
+    const opt = document.createElement("option");
+    opt.value = v.name;
+    opt.textContent = `${v.name} · ${v.lang}`;
+    if (v.name === defaultVoice) opt.selected = true;
+    select.appendChild(opt);
+  }
+  select.addEventListener("change", () => {
+    try { localStorage.setItem(VOICE_STORAGE_KEY, select.value); } catch {}
+  });
+  _btn.parentNode.insertBefore(select, _btn);
+}
+
+function getSelectedVoice() {
+  const sel = document.getElementById("wa-tts-voice-select");
+  if (sel && sel.value) return sel.value;
+  try { return localStorage.getItem(VOICE_STORAGE_KEY) || "Mónica"; }
+  catch { return "Mónica"; }
 }
 
 export function setActiveJid(jid) {
@@ -71,7 +124,7 @@ async function onClick(ev) {
       method: "POST",
       headers: { "content-type": "application/json" },
       credentials: "same-origin",
-      body: JSON.stringify({ jid: _activeJid, text }),
+      body: JSON.stringify({ jid: _activeJid, text, voice: getSelectedVoice() }),
     });
     const data = await r.json().catch(() => ({}));
     if (!r.ok || !data.ok) {

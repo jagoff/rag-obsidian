@@ -5338,6 +5338,52 @@ class _WASendVoiceRequest(BaseModel):
     reply_to_id: str | None = None
 
 
+@app.get("/api/wa/voice/list")
+def wa_voice_list() -> dict:
+    """Lista voces disponibles para `say` (macOS TTS).
+
+    Parsea el output de `say -v ?` y filtra por idioma. Por default
+    devuelve solo voces es_* (rioplatense, español neutro, mexicano,
+    etc.). Pasar `lang=all` para listado completo.
+
+    Returns `{ok, voices: [{name, lang, sample}]}`. Cache in-process 1h.
+    """
+    import subprocess  # noqa: PLC0415
+    import shutil  # noqa: PLC0415
+
+    if not shutil.which("say"):
+        return {"ok": False, "voices": [], "error": "say not available"}
+    try:
+        proc = subprocess.run(
+            ["say", "-v", "?"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if proc.returncode != 0:
+            return {"ok": False, "voices": [], "error": "say failed"}
+    except Exception as exc:
+        return {"ok": False, "voices": [], "error": str(exc)[:200]}
+
+    voices: list[dict] = []
+    for line in (proc.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Formato: "Mónica              es_MX    # Hola, me llamo Mónica."
+        # name (espacios) lang_REGION (espacios) # sample
+        try:
+            name_part, rest = line.split(None, 1)
+            lang_part, sample_part = rest.split("#", 1)
+            voices.append({
+                "name": name_part.strip(),
+                "lang": lang_part.strip(),
+                "sample": sample_part.strip(),
+            })
+        except (ValueError, IndexError):
+            continue
+
+    return {"ok": True, "voices": voices}
+
+
 @app.get("/api/wa/voice/healthcheck")
 def wa_voice_healthcheck() -> dict:
     """Verifica que las deps de Voz Espejo estén disponibles.
@@ -5703,13 +5749,20 @@ def _detect_outbound_promise(jid: str, text: str) -> int | None:
 
     now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
     try:
+        from rag.integrations.whatsapp.tail import try_parse_due_from_text  # noqa: PLC0415
+        due_iso = try_parse_due_from_text(text)
+    except Exception:
+        due_iso = None
+    due_conf = 0.7 if due_iso else 0.3
+    try:
         with _ragvec_state_conn() as conn:
             cur = conn.execute(
                 "INSERT INTO rag_promises("
                 " ts, contact_jid, contact_name, promise_text, direction,"
                 " due_ts, due_confidence, source_chat_jid, status"
-                ") VALUES (?, ?, ?, ?, 'outbound', NULL, 0.3, ?, 'pending')",
-                (now_iso, jid, name or None, text[:1000], jid),
+                ") VALUES (?, ?, ?, ?, 'outbound', ?, ?, ?, 'pending')",
+                (now_iso, jid, name or None, text[:1000],
+                 due_iso, due_conf, jid),
             )
             promise_id = cur.lastrowid
             conn.commit()
@@ -5744,6 +5797,8 @@ def wa_promises_list(
     jid: str | None = None,
     status: str = "pending",
     limit: int = 20,
+    due_within_hours: int | None = None,
+    overdue_only: bool = False,
 ) -> dict:
     """Lista promesas. Por default `status='pending'` + `limit=20`.
 
@@ -5751,6 +5806,8 @@ def wa_promises_list(
     - `jid`: filtra por contact_jid (drawer del thread header).
     - `status`: pending | done | cancelled | all.
     - `limit`: cap 100.
+    - `due_within_hours`: solo promises con due_ts <= now + N horas.
+    - `overdue_only`: solo promises con due_ts < now (ya vencieron).
     """
     from rag import _ragvec_state_conn  # noqa: PLC0415
 
@@ -5763,12 +5820,23 @@ def wa_promises_list(
     if status and status != "all":
         where.append("status = ?")
         params.append(status)
+    if overdue_only:
+        now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        where.append("due_ts IS NOT NULL AND due_ts < ?")
+        params.append(now_iso)
+    elif due_within_hours is not None and due_within_hours >= 0:
+        until_iso = (datetime.now(timezone.utc) +
+                     timedelta(hours=int(due_within_hours))).isoformat(timespec="seconds")
+        where.append("due_ts IS NOT NULL AND due_ts <= ?")
+        params.append(until_iso)
     where_sql = (" WHERE " + " AND ".join(where)) if where else ""
     sql = (
         "SELECT id, ts, contact_jid, contact_name, promise_text, direction,"
         " due_ts, due_confidence, status, closed_ts, closed_reason"
         f" FROM rag_promises{where_sql}"
-        " ORDER BY ts DESC LIMIT ?"
+        " ORDER BY"
+        " CASE WHEN due_ts IS NULL THEN 1 ELSE 0 END,"
+        " due_ts ASC, ts DESC LIMIT ?"
     )
     params.append(limit)
     import sqlite3 as _sqlite3  # noqa: PLC0415

@@ -40,6 +40,55 @@ _DEDUP_MAX = 2000
 _HWM_PATH = Path.home() / ".local/share/obsidian-rag/wa-hwm.json"
 
 
+# Time phrases para extraer due_ts del promise_text. Regex rioplatense
+# conservador — extrae substring que pasamos a `_parse_natural_datetime`.
+_TIME_PHRASE_RE = None  # lazy compile
+
+
+def _time_phrase_re():
+    global _TIME_PHRASE_RE
+    if _TIME_PHRASE_RE is None:
+        import re as _re
+        _TIME_PHRASE_RE = _re.compile(
+            r"\b("
+            r"pasado\s+ma[ñn]ana|"
+            r"ma[ñn]ana(?:\s+(?:a\s+las?\s+\d{1,2}(?::\d{2})?))?|"
+            r"esta\s+(?:tarde|noche|ma[ñn]ana)|"
+            r"hoy\s+a\s+las?\s+\d{1,2}(?::\d{2})?|"
+            r"en\s+\d+\s*(?:min(?:utos?)?|hs?|horas?|d[ií]as?)|"
+            r"el\s+(?:lunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo)"
+            r")\b",
+            _re.I,
+        )
+    return _TIME_PHRASE_RE
+
+
+def try_parse_due_from_text(text: str) -> str | None:
+    """Extrae un due_ts ISO de un promise_text si la regex matchea una
+    time phrase + el parser nativo la convierte a datetime futuro.
+
+    Returns ISO string en UTC o None. Silent-fail.
+    """
+    if not text:
+        return None
+    m = _time_phrase_re().search(text)
+    if not m:
+        return None
+    phrase = m.group(0)
+    try:
+        from rag import _parse_natural_datetime  # noqa: PLC0415
+        from datetime import datetime as _dt, timezone as _tz  # noqa: PLC0415
+        now = _dt.now()
+        parsed = _parse_natural_datetime(phrase, now=now)
+        if parsed is None or parsed <= now:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=_tz.utc)
+        return parsed.astimezone(_tz.utc).isoformat(timespec="seconds")
+    except Exception:
+        return None
+
+
 def _persist_inbound_promise_if_match(jid: str, content: str, msg_id: str | None) -> None:
     """Si `content` matchea el regex hint rioplatense, persiste row en
     `rag_promises` con direction='inbound'. Silent-fail.
@@ -73,12 +122,15 @@ def _persist_inbound_promise_if_match(jid: str, content: str, msg_id: str | None
                 if existing:
                     return
             now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            due_iso = try_parse_due_from_text(content)
+            due_conf = 0.7 if due_iso else 0.3
             conn.execute(
                 "INSERT INTO rag_promises("
                 " ts, contact_jid, contact_name, promise_text, direction,"
                 " due_ts, due_confidence, source_msg_id, source_chat_jid, status"
-                ") VALUES (?, ?, ?, ?, 'inbound', NULL, 0.3, ?, ?, 'pending')",
-                (now_iso, jid, name or None, content[:1000], msg_id, jid),
+                ") VALUES (?, ?, ?, ?, 'inbound', ?, ?, ?, ?, 'pending')",
+                (now_iso, jid, name or None, content[:1000],
+                 due_iso, due_conf, msg_id, jid),
             )
             conn.commit()
     except Exception:

@@ -417,8 +417,10 @@ def test_is_excluded_indexes_mem_vault_memories():
     ) is False
     # ✅ 99-Mentions sigue indexado (regression guard, este caso es histórico)
     assert rag.is_excluded("99-obsidian/99-Mentions/Maria.md") is False
+    # ✅ reviews/ ahora vive en 00-Inbox/ → indexable (decision 2026-05-12:
+    # resumenes del sistema son data util para el user, no system noise)
+    assert rag.is_excluded("00-Inbox/reviews/2026-04-29.md") is False
     # ❌ Otras subcarpetas de 99-AI/ siguen excluidas
-    assert rag.is_excluded("99-obsidian/99-AI/reviews/2026-04-29.md") is True
     assert rag.is_excluded("99-obsidian/99-AI/conversations/x.md") is True
     assert rag.is_excluded("99-obsidian/99-AI/system/foo/plan.md") is True
     # ❌ Otras carpetas de system siguen excluidas

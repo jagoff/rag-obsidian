@@ -21,7 +21,7 @@ def tmp_vault_with_convs(tmp_path, monkeypatch, fake_embed):
         "02-Areas",
         "03-Resources",
         "99-obsidian/99-AI/conversations",
-        "99-obsidian/99-AI/reviews",
+        "00-Inbox/reviews",
     ):
         (vault / d).mkdir(parents=True)
     monkeypatch.setattr(rag, "VAULT_PATH", vault)

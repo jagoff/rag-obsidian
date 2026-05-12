@@ -21,7 +21,7 @@ from rag import _is_daemon_generated_path, _is_system_path
     "99-obsidian/99-AI/external-ingest/Calendar/today.md",
     "99-obsidian/99-AI/external-ingest/Finanzas/MOZE/2026-05.md",
     "99-obsidian/99-AI/Wiki/Categoria.md",
-    "99-obsidian/99-AI/reviews/2026-05-11-evening.md",
+    "00-Inbox/reviews/2026-05-11-evening.md",
     "99-obsidian/99-AI/plans/strategy.md",
     "99-obsidian/99-Templates/daily.md",
     "99-obsidian/99-Daily routine/2026-05-11.md",

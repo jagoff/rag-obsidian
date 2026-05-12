@@ -30,7 +30,7 @@ def test_folder_matches_widens_to_inbox():
 
 def test_folder_matches_inbox_is_always_in():
     # Cualquier folder como filtro + file en Inbox → match.
-    for folder in ["02-Areas", "03-Resources/Tech", "99-obsidian/99-AI/reviews", "04-Archive/foo"]:
+    for folder in ["02-Areas", "03-Resources/Tech", "00-Inbox/reviews", "04-Archive/foo"]:
         assert rag._folder_matches("00-Inbox/capture.md", folder) is True
 
 

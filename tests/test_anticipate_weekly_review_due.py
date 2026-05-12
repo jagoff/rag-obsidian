@@ -28,7 +28,7 @@ _WED = datetime(2026, 5, 13, 10, 0, 0)
 @pytest.fixture
 def mock_vault(tmp_path, monkeypatch):
     vault = tmp_path / "vault"
-    (vault / "99-obsidian/99-AI/reviews").mkdir(parents=True)
+    (vault / "00-Inbox/reviews").mkdir(parents=True)
     monkeypatch.setattr(rag, "_resolve_vault_path", lambda: vault)
     return vault
 
@@ -42,7 +42,7 @@ def empty_vault(tmp_path, monkeypatch):
 
 
 def _write_digest(vault: Path, week: str) -> Path:
-    p = vault / "99-obsidian/99-AI/reviews" / f"{week}.md"
+    p = vault / "00-Inbox/reviews" / f"{week}.md"
     p.write_text(f"# Weekly digest {week}\n", encoding="utf-8")
     return p
 

@@ -3,7 +3,7 @@
 Detecta cuando es domingo o lunes y el user NO tiró `rag digest` para
 cerrar la semana que terminó. Push: "¿cerramos la semana con un digest?".
 
-Source: filesystem `99-obsidian/99-AI/reviews/YYYY-WNN.md` (donde
+Source: filesystem `00-Inbox/reviews/YYYY-WNN.md` (donde
 `rag digest` escribe los weekly narratives — ver `rag/__init__.py
 ::digest`). Filename ISO week format (`2026-W19.md`).
 
@@ -12,7 +12,7 @@ Diseño:
 - Solo dispara domingo (weekday=6) o lunes (weekday=0). Otros días =
   silencio (no es momento para weekly review).
 - Mira el ISO week que termina HOY (domingo) o que terminó ayer (lunes).
-- Si existe `<vault>/99-obsidian/99-AI/reviews/<isoweek>.md` → silent
+- Si existe `<vault>/00-Inbox/reviews/<isoweek>.md` → silent
   (ya hay digest, todo bien).
 - Si NO existe → push.
 - Score fijo 0.6 — claro signal pero no urgente como overdue deadline.
@@ -33,7 +33,7 @@ from rag_anticipate.signals.base import register_signal
 
 
 # Carpeta canónica donde `rag digest` escribe weekly narratives.
-_REVIEWS_FOLDER = "99-obsidian/99-AI/reviews"
+_REVIEWS_FOLDER = "00-Inbox/reviews"
 
 # Score fijo — el user "ya sabe" que tendría que tirar digest si es
 # domingo/lunes; el push es un nudge, no una urgencia.

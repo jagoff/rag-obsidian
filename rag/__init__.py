@@ -30837,14 +30837,14 @@ def _generate_digest_narrative(prompt: str) -> str:
         keep_alive=chat_keep_alive(),
     )
     # 2026-04-29: filter PT→ES post-gen — el digest semanal se guarda en
-    # `99-obsidian/99-AI/reviews/` y se le pushea al
+    # `00-Inbox/reviews/` y se le pushea al
     # user. El prompt inline (línea 32400+) no incluye `language_es_AR.v1`
     # por ahora; el filter es safety net.
     from rag.iberian_leak_filter import replace_iberian_leaks
     return replace_iberian_leaks((resp.message.content or "").strip())
 
 
-DIGEST_FOLDER = "99-obsidian/99-AI/reviews"
+DIGEST_FOLDER = "00-Inbox/reviews"
 
 
 @cli.command()
@@ -30860,7 +30860,7 @@ def digest(week_opt: str | None, days: int, dry_run: bool):
     Consume notas modificadas, frontmatter `contradicts:`, el sidecar log
     de contradicciones index-time, las contradicciones query-time y las
     queries low-confidence. Genera prosa narrativa con command-r y la
-    guarda en `99-obsidian/99-AI/reviews/YYYY-WNN.md` (auto-indexado).
+    guarda en `00-Inbox/reviews/YYYY-WNN.md` (auto-indexado).
     """
     from datetime import timedelta as _td
     if week_opt:
@@ -35681,10 +35681,10 @@ def read_cmd(url: str, save: bool, plain: bool):
 # ── MORNING BRIEF (rag morning) ──────────────────────────────────────────────
 # Proactive daily brief: what happened yesterday + what's pending + what to
 # focus today. Composes recent-notes / inbox / todo-frontmatter / new
-# contradictions / low-conf queries. Writes to 99-obsidian/99-AI/reviews/YYYY-MM-DD.md.
+# contradictions / low-conf queries. Writes to 00-Inbox/reviews/YYYY-MM-DD.md.
 # Auto-fires via launchd weekday mornings.
 
-MORNING_FOLDER = "99-obsidian/99-AI/reviews"
+MORNING_FOLDER = "00-Inbox/reviews"
 
 
 # ── Daemon-generated paths ─────────────────────────────────────────────────
@@ -35723,6 +35723,11 @@ _DAEMON_GENERATED_PREFIXES = (
     "03-Resources/Spotify/",
     "03-Resources/Claude/",
     "00-Inbox/WA-",  # 00-Inbox/WA-YYYY-MM-DD.md (whatsapp listener daily)
+    # 00-Inbox/reviews/ — desde 2026-05-12 los briefs (morning/today/digest)
+    # viven en el inbox (decision user: son resumenes utiles, deben quedar
+    # visibles bajo `00-Inbox/` y no en `99-obsidian/99-AI/`). Igual son
+    # daemon-generated → se filtran de surface (home / activity widgets).
+    "00-Inbox/reviews/",
     # Legacy del system folder ANTES de la migración 2026-05-08 a
     # `99-obsidian/99-AI/`. La carpeta `04-Archive/99-obsidian-system/`
     # ya no existe en disco, pero queda data histórica en tablas
@@ -40778,7 +40783,7 @@ def _yesterday_evening_link(target: datetime, vault: Path) -> str:
     previous `rag today` left off.
     """
     yesterday = target - timedelta(days=1)
-    rel = f"99-obsidian/99-AI/reviews/{yesterday.strftime('%Y-%m-%d')}-evening.md"
+    rel = f"00-Inbox/reviews/{yesterday.strftime('%Y-%m-%d')}-evening.md"
     if not (vault / rel).is_file():
         return ""
     title = f"{yesterday.strftime('%Y-%m-%d')}-evening"
@@ -41029,7 +41034,7 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int,
     Consume notas modificadas, 00-Inbox/ pending, todo/due frontmatter,
     contradicciones index-time del sidecar y queries low-confidence.
     command-r arma un brief de 120-280 palabras. Escribe a
-    `99-obsidian/99-AI/reviews/YYYY-MM-DD.md` (auto-indexado) salvo --dry-run.
+    `00-Inbox/reviews/YYYY-MM-DD.md` (auto-indexado) salvo --dry-run.
 
     `--voice` (o env ``RAG_MORNING_VOICE=1``, configurable desde el plist):
     además del texto, sintetiza el brief a OGG/Opus via macOS ``say`` (voz
@@ -41242,7 +41247,7 @@ def voice_brief_generate(date_opt: str | None, text_override: str | None,
        Ideal para testing: ``rag voice-brief generate --text "hola mundo"``.
 
     2. ``--date YYYY-MM-DD`` (sin ``--text``) — busca el brief en disco
-       (``99-obsidian/99-AI/reviews/<date>.md`` para
+       (``00-Inbox/reviews/<date>.md`` para
        morning, ``-evening.md`` para evening, etc.) y lo sintetiza.
 
     Por default solo guarda el ``.ogg`` en el cache. Con ``--apply``
@@ -41319,7 +41324,7 @@ def voice_brief_generate(date_opt: str | None, text_override: str | None,
 # ── EVENING BRIEF (rag today) ────────────────────────────────────────────────
 # End-of-day closure: mirrors morning's structure but looks BACK at the day
 # that just closed. Evidence window is [today 00:00 local, now]. Writes to
-# 99-obsidian/99-AI/reviews/YYYY-MM-DD-evening.md so it doesn't collide with morning's file.
+# 00-Inbox/reviews/YYYY-MM-DD-evening.md so it doesn't collide with morning's file.
 
 
 def _today_window(now: datetime) -> tuple[datetime, datetime]:
@@ -43370,7 +43375,7 @@ def today(dry_run: bool, plain: bool, date_opt: str | None):
     Ventana: hoy 00:00 → ahora. Evidencia: notas modificadas hoy, capturas del
     día en 00-Inbox/, todos/due tocados, contradicciones nuevas, queries
     low-confidence. command-r arma un brief de 150-250 palabras. Escribe a
-    `99-obsidian/99-AI/reviews/YYYY-MM-DD-evening.md` (auto-indexado) salvo --dry-run. Si no
+    `00-Inbox/reviews/YYYY-MM-DD-evening.md` (auto-indexado) salvo --dry-run. Si no
     hay actividad, imprime "sin actividad hoy" y termina.
     """
     _diff_brief_signal()  # compare yesterday's brief vs on-disk state → behavior events
@@ -43765,7 +43770,7 @@ def distill_conversations_cmd(apply: bool, min_confidence: float,
 @click.option("--notify/--no-notify", default=True,
               help="Push a WhatsApp si ambient está configurado")
 @click.option("--report/--no-report", default=True,
-              help="Escribe reporte a 99-obsidian/99-AI/reviews/YYYY-MM-archive.md")
+              help="Escribe reporte a 00-Inbox/reviews/YYYY-MM-archive.md")
 @click.option("--plain", is_flag=True, help="Salida plana (src\\tdst por línea)")
 def archive(min_age_days: int, query_window_days: int, folder: str | None,
             limit: int, gate: int, apply: bool, force: bool,

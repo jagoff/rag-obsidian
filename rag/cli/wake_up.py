@@ -4,7 +4,7 @@ Phase 3 cont de modularización (audit perf 2026-05-08, ROI 220).
 
 Cuando el user se despierta, todo está fresco — ETLs corridos, vault
 reindexado, caches limpios, radares actualizados, brief matutino
-pre-renderizado en `99-obsidian/99-AI/reviews/`, y el chat model cargado
+pre-renderizado en `00-Inbox/reviews/`, y el chat model cargado
 en RAM con `keep_alive=-1` para que el primer `rag chat` responda sin
 cold-start.
 
@@ -79,7 +79,7 @@ def wake_up_cmd(ctx, dry_run: bool, skip_index: bool, skip_bookmarks: bool,
       4. `rag maintenance`     — WAL checkpoint, rotación de logs, cleanup.
       5. `rag patterns`        — radar de feedback dominante.
       6. `rag emergent`        — radar de temas emergentes en queries.
-      7. `rag morning`         — brief matutino pre-renderizado a 99-obsidian/99-AI/reviews/.
+      7. `rag morning`         — brief matutino pre-renderizado a 00-Inbox/reviews/.
       8. LLM warmup            — carga el chat model con keep_alive=-1.
 
     Nota sobre bookmarks: `rag index` ya los sincroniza automáticamente

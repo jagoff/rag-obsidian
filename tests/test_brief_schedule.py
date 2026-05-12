@@ -72,7 +72,7 @@ def _insert_feedback_row(state_db: Path, ts: str, dedup_key: str, rating: str):
 
 def _morning_brief_path(date_str: str) -> str:
     """Mimic the actual vault layout used by `rag morning`."""
-    return f"99-obsidian/99-AI/reviews/{date_str}.md"
+    return f"00-Inbox/reviews/{date_str}.md"
 
 
 # ── 1) analyze sin data ────────────────────────────────────────────────────

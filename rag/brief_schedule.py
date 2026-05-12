@@ -92,9 +92,9 @@ SHIFT_STEP_MINUTES = 30
 # Brief vault paths follow one of three patterns (observed in production
 # 2026-04-29):
 #
-#   morning: 99-obsidian/99-AI/reviews/YYYY-MM-DD.md
-#   today:   99-obsidian/99-AI/reviews/YYYY-MM-DD-evening.md
-#   digest:  99-obsidian/99-AI/reviews/YYYY-WNN.md
+#   morning: 00-Inbox/reviews/YYYY-MM-DD.md
+#   today:   00-Inbox/reviews/YYYY-MM-DD-evening.md
+#   digest:  00-Inbox/reviews/YYYY-WNN.md
 #
 # Tests (and earlier docs) sometimes use explicit `-morning.md` /
 # `-digest.md` suffixes — the matcher below handles both naming styles.

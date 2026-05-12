@@ -280,7 +280,7 @@ rag prep "X" --plain
 ## Briefs automáticos
 
 ### `rag morning`
-Brief matutino: qué pasó ayer + qué enfocar hoy. Escribe a `99-obsidian/99-AI/reviews/YYYY-MM-DD.md`.
+Brief matutino: qué pasó ayer + qué enfocar hoy. Escribe a `00-Inbox/reviews/YYYY-MM-DD.md`.
 
 ```bash
 rag morning                                # escribe
@@ -293,7 +293,7 @@ rag morning --lookback-hours 36            # ventana hacia atrás
 Cierre del día: qué pasó hoy + cabos sueltos + semillas para mañana.
 
 ```bash
-rag today                                  # escribe 99-obsidian/99-AI/reviews/YYYY-MM-DD-evening.md
+rag today                                  # escribe 00-Inbox/reviews/YYYY-MM-DD-evening.md
 rag today --dry-run
 rag today --date 2026-04-22
 rag today --plain
@@ -359,7 +359,7 @@ rag archive --gate 20                      # límite de notas que requiere --for
 rag archive --min-age-days 365
 rag archive --folder / --limit
 rag archive --notify / --no-notify         # push a WhatsApp si ambient está on
-rag archive --report / --no-report         # reporte a 99-obsidian/99-AI/reviews/
+rag archive --report / --no-report         # reporte a 00-Inbox/reviews/
 rag archive --plain
 ```
 

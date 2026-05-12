@@ -101,3 +101,41 @@ def to_opus(in_path: Path) -> Path | None:
     if not out_path.is_file() or out_path.stat().st_size < 200:
         return None
     return out_path
+
+
+def tts_text_to_opus(text: str, voice: str = "Mónica") -> Path | None:
+    """TTS-to-OGG/Opus para "Voz Espejo" (Feature #5).
+
+    Pipeline: ``say -v <voice>`` → AIFF temp → ``to_opus()`` → ``.ogg``.
+    Para "enviar como voz" desde el composer de /wzp.
+
+    Voz default ``Mónica`` (rioplatense). El user puede tener voces
+    cloned instaladas — ``say -v ?`` para listar.
+
+    Returns ``Path`` al ``.ogg`` o ``None`` si TTS / ffmpeg fallan.
+    El caller es responsable de borrarlo post-send con ``cleanup()``.
+    """
+    if not text or not text.strip():
+        return None
+    if len(text) > 2000:
+        text = text[:2000]
+
+    aiff_path = _temp_dir() / f"{uuid.uuid4().hex}.aiff"
+    try:
+        proc = subprocess.run(
+            ["say", "-v", voice, "--file-format=AIFF", "-o", str(aiff_path), text],
+            capture_output=True, text=True, timeout=180,
+        )
+        if proc.returncode != 0 or not aiff_path.is_file():
+            logger.warning("say -v %s failed: rc=%s stderr=%s",
+                           voice, proc.returncode, (proc.stderr or "")[:200])
+            return None
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        logger.warning("say not available or timed out: %s", exc)
+        return None
+
+    try:
+        ogg = to_opus(aiff_path)
+        return ogg
+    finally:
+        cleanup(aiff_path)

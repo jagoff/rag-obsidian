@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <title>rag · wzp</title>
-  <link rel="stylesheet" href="/static/wa.css?v=47">
+  <link rel="stylesheet" href="/static/wa.css?v=48">
   <link rel="manifest" href="/static/manifest.webmanifest">
   <link rel="icon" type="image/png" sizes="32x32" href="/static/pwa/favicon-32.png">
   <link rel="icon" type="image/png" sizes="16x16" href="/static/pwa/favicon-16.png">
@@ -139,6 +139,13 @@
                 disabled>
           <span class="wa-mic-icon" aria-hidden="true">●</span>
         </button>
+        <button class="wa-tts-btn" id="wa-tts-btn"
+                type="button"
+                title="enviar como voz · TTS Mónica + opus PTT"
+                aria-label="enviar texto como voz"
+                disabled>
+          <span aria-hidden="true">🎙</span>
+        </button>
         <button class="wa-send-btn" id="wa-send-btn">
           <span class="wa-send-label">enviar</span>
           <span class="wa-send-arrows" aria-hidden="true">
@@ -177,6 +184,6 @@
        borrar mensajes propios). Loopback-only — un device LAN/tunnel
        no recibe el token y el delete falla server-side con 401. -->
   <script src="/static/admin-auth.js"></script>
-  <script type="module" src="/static/js/wa/wa.js?v=46"></script>
+  <script type="module" src="/static/js/wa/wa.js?v=47"></script>
 </body>
 </html>

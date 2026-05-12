@@ -5326,6 +5326,69 @@ async def wa_voice(
         _voice.cleanup(tmp_in)
 
 
+# ── Voz Espejo — TTS reply ──────────────────────────────────────────────────
+# "Enviar como voz" desde el composer de /wzp. El user escribe texto, dispara
+# este endpoint, el server genera OGG/Opus PTT via `say -v Mónica` + ffmpeg y
+# manda al bridge. Reusa el path del voice note pero arrancando desde texto.
+
+class _WASendVoiceRequest(BaseModel):
+    jid: str
+    text: str = Field(..., min_length=1, max_length=2000)
+    voice: str | None = Field(None, max_length=80)
+    reply_to_id: str | None = None
+
+
+@app.post("/api/wa/send_voice")
+def wa_send_voice(req: _WASendVoiceRequest) -> dict:
+    """TTS-to-PTT: convierte `text` a OGG/Opus con `say -v <voice>` y
+    lo envía como audio PTT.
+
+    - `voice`: default `Mónica` (rioplatense, macOS built-in). Si tenés
+      voz cloned instalada, pasala explícita.
+    - `reply_to_id`: optional quote.
+
+    Devuelve `{ok, message_id?, error_kind}`. Errores:
+    - `tts_failed`: `say` no disponible o devolvió error.
+    - `encode_failed`: ffmpeg no pudo encodear el OGG.
+    - `bridge_error`: el bridge rechazó el send.
+    """
+    from rag.integrations.whatsapp import bridge_client as _bc, voice as _voice  # noqa: PLC0415
+
+    if not req.jid or "@" not in req.jid:
+        raise HTTPException(status_code=400, detail="jid inválido")
+    text = (req.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text vacío")
+
+    voice_name = (req.voice or "Mónica").strip() or "Mónica"
+    opus_path = _voice.tts_text_to_opus(text, voice=voice_name)
+    if opus_path is None:
+        return {"ok": False, "error_kind": "tts_failed", "text": text}
+
+    reply_to = None
+    if req.reply_to_id:
+        reply_to = {
+            "message_id": req.reply_to_id,
+            "original_text": "",
+            "sender_jid": "",
+        }
+    try:
+        resp = _bc.send_ptt(req.jid, str(opus_path), reply_to=reply_to)
+    except _bc.BridgeError as e:
+        return {"ok": False, "error_kind": "bridge_error",
+                "error": str(e), "text": text}
+    finally:
+        _voice.cleanup(opus_path)
+
+    return {
+        "ok": True,
+        "error_kind": "sent",
+        "message_id": resp.get("message_id"),
+        "text": text,
+        "voice": voice_name,
+    }
+
+
 @app.get("/api/wa/avatar/{jid}")
 async def wa_avatar(jid: str, name: str | None = None):
     """Devuelve la foto del contacto extraída de Apple Contacts.app.

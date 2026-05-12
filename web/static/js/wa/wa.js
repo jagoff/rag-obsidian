@@ -10,6 +10,7 @@ import * as anticipate from "./wa-anticipate.js";
 import * as memory from "./wa-memory.js";
 import * as promises from "./wa-promises.js";
 import * as moodCheck from "./wa-mood-check.js";
+import * as tts from "./wa-tts.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -65,6 +66,7 @@ function init() {
         memory.mountTrigger(jid, name);
         promises.mountTrigger(jid, name);
         moodCheck.setActiveJid(jid);
+        tts.setActiveJid(jid);
       });
     },
   });
@@ -84,6 +86,7 @@ function init() {
         memory.mountTrigger(jid, name);
         promises.mountTrigger(jid, name);
         moodCheck.setActiveJid(jid);
+        tts.setActiveJid(jid);
       });
     },
   });
@@ -99,6 +102,9 @@ function init() {
   // Mood Mirror tonal check — banner inline encima del composer cuando el
   // draft actual + mood actual sugieren cuidar el tono.
   moodCheck.init();
+
+  // Voz Espejo — botón 🎙 en composer. TTS texto → Mónica → OGG/Opus → PTT.
+  tts.init();
 
   // Cmd+K también dispara `thread.open` — propagar al memory drawer.
 }

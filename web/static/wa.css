@@ -1518,12 +1518,12 @@ body.archived-mode .wa-sidebar-header { box-shadow: inset 0 -2px 0 var(--accent,
   -webkit-backdrop-filter: blur(20px) saturate(180%);
   padding: 10px 16px;
   display: grid;
-  grid-template-columns: 1fr auto auto;
+  grid-template-columns: 1fr auto auto auto;
   grid-template-rows: auto auto auto;
   grid-template-areas:
-    "input mic send"
-    "tone tone tone"
-    "kbd kbd kbd";
+    "input mic tts send"
+    "tone tone tone tone"
+    "kbd kbd kbd kbd";
   align-items: end;
   gap: 8px 10px;
   border-top: 1px solid var(--border-glass);
@@ -1680,6 +1680,42 @@ body.archived-mode .wa-sidebar-header { box-shadow: inset 0 -2px 0 var(--accent,
   flex-shrink: 0;
 }
 .wa-mic-btn { grid-area: mic; }
+.wa-tts-btn {
+  grid-area: tts;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  border: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease, transform 0.08s ease, opacity 0.18s ease;
+  flex-shrink: 0;
+}
+.wa-tts-btn:hover { background: var(--bg-panel-active); color: var(--text-primary); }
+.wa-tts-btn:active { transform: scale(0.94); }
+.wa-tts-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+.wa-tts-btn.pending {
+  opacity: 1;
+  color: var(--accent);
+  animation: wa-tts-pulse 1s ease-in-out infinite;
+}
+.wa-tts-btn.sent {
+  background: rgba(0, 168, 132, 0.18);
+  color: var(--accent);
+}
+.wa-tts-btn.failed {
+  background: rgba(255, 100, 100, 0.18);
+  color: var(--red);
+}
+@keyframes wa-tts-pulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.08); }
+}
 .wa-send-btn {
   grid-area: send;
   /* Gradient accent + glow halo cuando tiene texto. Hover sube

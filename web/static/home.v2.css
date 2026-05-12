@@ -2866,3 +2866,148 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
     transition: none;
   }
 }
+
+/* ╔═══════════ Gridstack layout libre — overrides ═══════════╗
+   Activado por layout.mjs cuando aplana los paneles dentro de
+   `#ra-grid.grid-stack`. Los `.section` originales quedan vacíos
+   y se ocultan via `hidden`. El user mueve y redimensiona cada
+   `.grid-stack-item` libremente; layout persistido en
+   localStorage por panel ID. */
+
+#ra-grid {
+  margin-top: var(--space-3);
+}
+
+#ra-grid .grid-stack-item-content {
+  inset: 0;
+  display: flex;
+  /* Pisar el padding que mete Gridstack para que el panel ocupe todo
+     el slot. El margin entre items lo da la opción `margin` del init. */
+}
+
+#ra-grid .grid-stack-item-content > .panel {
+  flex: 1 1 auto;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+}
+
+/* Edit mode: borde y handle visibles para indicar que se puede mover.
+   En lock-mode (default), todo se ve idéntico al layout anterior. */
+body.ra-layout-editing #ra-grid .grid-stack-item {
+  outline: 1px dashed color-mix(in srgb, var(--cyan, #5ec4ff) 60%, transparent);
+  outline-offset: -1px;
+}
+body.ra-layout-editing #ra-grid .grid-stack-item:hover {
+  outline-color: var(--cyan, #5ec4ff);
+}
+body.ra-layout-editing #ra-grid .panel-head {
+  cursor: grab;
+}
+body.ra-layout-editing #ra-grid .panel-head:active {
+  cursor: grabbing;
+}
+body.ra-layout-editing #ra-grid .panel-head::before {
+  content: "⋮⋮";
+  font-size: 12px;
+  color: var(--cyan, #5ec4ff);
+  margin-right: var(--space-2);
+  letter-spacing: -2px;
+  flex-shrink: 0;
+}
+
+/* Resize handles: Gridstack los pone con `ui-resizable-autohide` (visible
+   solo en hover). Cuando estamos en edit mode los queremos SIEMPRE
+   visibles para que el user sepa que puede resize. */
+body.ra-layout-editing #ra-grid .ui-resizable-handle {
+  opacity: 1 !important;
+  background: color-mix(in srgb, var(--cyan, #5ec4ff) 35%, transparent);
+  border: 1px solid var(--cyan, #5ec4ff);
+  z-index: 90;
+  display: block !important;
+}
+body.ra-layout-editing #ra-grid .ui-resizable-handle:hover {
+  background: var(--cyan, #5ec4ff);
+}
+/* Tamaños custom por dirección para que sean fáciles de agarrar (mouse + touch). */
+body.ra-layout-editing #ra-grid .ui-resizable-e,
+body.ra-layout-editing #ra-grid .ui-resizable-w {
+  width: 8px;
+}
+body.ra-layout-editing #ra-grid .ui-resizable-s {
+  height: 8px;
+}
+body.ra-layout-editing #ra-grid .ui-resizable-se,
+body.ra-layout-editing #ra-grid .ui-resizable-sw {
+  width: 16px;
+  height: 16px;
+  border-radius: 3px;
+}
+/* Default lock state: handles ocultos. */
+body:not(.ra-layout-editing) #ra-grid .ui-resizable-handle {
+  display: none !important;
+}
+
+/* Banner de ayuda cuando se activa edit mode primera vez en la sesión. */
+.ra-edit-hint {
+  position: fixed;
+  bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--bg-elev-2, #1a1e26);
+  color: var(--text, #ececed);
+  border: 1px solid var(--cyan, #5ec4ff);
+  border-radius: 6px;
+  padding: 10px 16px;
+  font-size: var(--fs-mini, 12px);
+  z-index: 9999;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, .4);
+  animation: ra-hint-in .25s ease-out;
+}
+.ra-edit-hint code {
+  background: rgba(94, 196, 255, 0.15);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-family: var(--font-mono, ui-monospace, monospace);
+}
+@keyframes ra-hint-in {
+  from { opacity: 0; transform: translate(-50%, 20px); }
+  to { opacity: 1; transform: translate(-50%, 0); }
+}
+
+/* Botón lock/unlock en la topbar. Estilo idéntico al reset-order-btn. */
+.layout-edit-btn,
+.reset-order-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: var(--fs-mini, 11px);
+  padding: 4px 8px;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: border-color var(--dur-base) var(--ease-out),
+              color var(--dur-base) var(--ease-out);
+}
+.layout-edit-btn:hover,
+.reset-order-btn:hover {
+  border-color: var(--cyan, #5ec4ff);
+  color: var(--cyan, #5ec4ff);
+}
+.layout-edit-btn[aria-pressed="true"] {
+  border-color: var(--cyan, #5ec4ff);
+  color: var(--cyan, #5ec4ff);
+  background: color-mix(in srgb, var(--cyan, #5ec4ff) 8%, transparent);
+}
+
+/* Mobile: Gridstack default a 1 columna abajo de 768px. Esto colapsa
+   todo a stack vertical sin breakpoints custom. */
+@media (max-width: 768px) {
+  #ra-grid {
+    /* Gridstack maneja la transición con su prop `column-options` o el
+       evento resize; por defecto v12 hace 1-col bajo 768px. */
+  }
+  body.ra-layout-editing #ra-grid .panel-head::before {
+    display: none;
+  }
+}

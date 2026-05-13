@@ -351,9 +351,16 @@ def _capture_with_meta(
     if proc.returncode != 0:
         tmp_path.unlink(missing_ok=True)
         stderr = (proc.stderr or "").strip()
-        if "permission" in stderr.lower() or "screen recording" in stderr.lower():
-            return None, meta, f"tcc_denied: {stderr}"
-        return None, meta, f"peekaboo_failed (exit {proc.returncode}): {stderr[:300]}"
+        stdout = (proc.stdout or "").strip()
+        # En modo `--json`, Peekaboo emite errores en stdout como
+        # `{"success": false, "error": "..."}` y deja stderr vacío. Hay que
+        # mirar ambos para detectar TCC.
+        combined = (stderr + " " + stdout).lower()
+        if "permission" in combined or "screen recording" in combined:
+            detail = stderr or stdout
+            return None, meta, f"tcc_denied: {detail[:300]}"
+        detail = stderr or stdout
+        return None, meta, f"peekaboo_failed (exit {proc.returncode}): {detail[:300]}"
 
     if not tmp_path.exists() or tmp_path.stat().st_size == 0:
         tmp_path.unlink(missing_ok=True)

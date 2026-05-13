@@ -539,6 +539,66 @@ def test_observe_capture_tcc_denied(monkeypatch, tmp_path):
     assert out["observation_id"] is None
 
 
+# --- state-file opt-in pattern (Fase 2g) ---
+
+
+def test_observe_state_disabled_default(monkeypatch, tmp_path):
+    """State file no existe → _observe_state_enabled() False."""
+    fake_state = tmp_path / "screen_observe_enabled"
+    monkeypatch.setattr(pk, "_OBSERVE_STATE_FILE", fake_state)
+    assert pk._observe_state_enabled() is False
+
+
+def test_observe_state_set_creates_file(monkeypatch, tmp_path):
+    fake_state = tmp_path / "subdir" / "screen_observe_enabled"
+    monkeypatch.setattr(pk, "_OBSERVE_STATE_FILE", fake_state)
+    pk._observe_state_set(True)
+    assert fake_state.is_file()
+    assert pk._observe_state_enabled() is True
+
+
+def test_observe_state_set_idempotent(monkeypatch, tmp_path):
+    fake_state = tmp_path / "screen_observe_enabled"
+    monkeypatch.setattr(pk, "_OBSERVE_STATE_FILE", fake_state)
+    pk._observe_state_set(True)
+    pk._observe_state_set(True)  # no-op, no error
+    assert fake_state.is_file()
+    pk._observe_state_set(False)
+    pk._observe_state_set(False)  # no-op, no error
+    assert not fake_state.is_file()
+
+
+def test_observe_state_set_false_removes(monkeypatch, tmp_path):
+    fake_state = tmp_path / "screen_observe_enabled"
+    fake_state.write_text("")
+    monkeypatch.setattr(pk, "_OBSERVE_STATE_FILE", fake_state)
+    assert pk._observe_state_enabled() is True
+    pk._observe_state_set(False)
+    assert not fake_state.exists()
+    assert pk._observe_state_enabled() is False
+
+
+def test_supervisor_plist_injects_env_when_enabled(monkeypatch, tmp_path):
+    """Plist generator agrega RAG_PEEKABOO_ENABLE+RAG_SCREEN_OBSERVE
+    cuando el state file existe."""
+    fake_state = tmp_path / "screen_observe_enabled"
+    fake_state.write_text("")
+    monkeypatch.setattr(pk, "_OBSERVE_STATE_FILE", fake_state)
+    from rag.plists.persistent import _supervisor_plist
+    out = _supervisor_plist("/usr/local/bin/rag")
+    assert "RAG_PEEKABOO_ENABLE" in out
+    assert "RAG_SCREEN_OBSERVE" in out
+
+
+def test_supervisor_plist_skips_env_when_disabled(monkeypatch, tmp_path):
+    fake_state = tmp_path / "screen_observe_enabled_NOT_THERE"
+    monkeypatch.setattr(pk, "_OBSERVE_STATE_FILE", fake_state)
+    from rag.plists.persistent import _supervisor_plist
+    out = _supervisor_plist("/usr/local/bin/rag")
+    assert "RAG_PEEKABOO_ENABLE" not in out
+    assert "RAG_SCREEN_OBSERVE" not in out
+
+
 def test_query_last_observation_within_window(monkeypatch, tmp_path):
     """Verifica el helper _query_last_observation contra una DB con rows."""
     con = _mock_telemetry(monkeypatch, tmp_path)

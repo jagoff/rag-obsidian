@@ -58,26 +58,38 @@ def _supervisor_plist(rag_bin: str) -> str:
     repo_root = _repo_root()
     venv_python = repo_root / ".venv" / "bin" / "python"
     out, err = _logs("supervisor")
+    env: dict[str, str] = {
+        "PYTHONUNBUFFERED": "1",
+        "RAG_LLM_BACKEND": "mlx",
+        "RAG_LOCAL_EMBED": "1",
+        "RAG_SUPERVISOR_MLX_WARMUP": "0",
+        "RAG_MLX_IDLE_TTL": "1800",
+        "RAG_MEMORY_PRESSURE_DISABLE": "0",
+        "RAG_MEMORY_PRESSURE_THRESHOLD": "75",
+        "RAG_MEMORY_PRESSURE_SWAP_GB": "4.0",
+        "RAG_MEMORY_PRESSURE_INTERVAL": "30",
+        "RAG_STATE_SQL": "1",
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+    }
+    # Peekaboo observer opt-in via state file (Fase 2g, 2026-05-13). Si el
+    # user corrió `rag screen enable`, el state file existe y acá inyectamos
+    # las dos env vars que necesita el `screen_observer_job` (cada 15min).
+    # Sin el file, el job hace early-return en `observe_disabled` sin costo.
+    try:
+        from rag.integrations.peekaboo import _observe_state_enabled  # noqa: PLC0415
+        if _observe_state_enabled():
+            env["RAG_PEEKABOO_ENABLE"] = "1"
+            env["RAG_SCREEN_OBSERVE"] = "1"
+    except Exception:
+        pass
     return _render_plist({
         "label": "com.fer.obsidian-rag-supervisor",
         "program_arguments": [
             str(venv_python),
             "-m", "rag.runtime.supervisor",
         ],
-        "env": {
-            "PYTHONUNBUFFERED": "1",
-            "RAG_LLM_BACKEND": "mlx",
-            "RAG_LOCAL_EMBED": "1",
-            "RAG_SUPERVISOR_MLX_WARMUP": "0",
-            "RAG_MLX_IDLE_TTL": "1800",
-            "RAG_MEMORY_PRESSURE_DISABLE": "0",
-            "RAG_MEMORY_PRESSURE_THRESHOLD": "75",
-            "RAG_MEMORY_PRESSURE_SWAP_GB": "4.0",
-            "RAG_MEMORY_PRESSURE_INTERVAL": "30",
-            "RAG_STATE_SQL": "1",
-            "HF_HUB_OFFLINE": "1",
-            "TRANSFORMERS_OFFLINE": "1",
-        },
+        "env": env,
         "run_at_load": True,
         "keep_alive": True,
         "throttle_s": 30,

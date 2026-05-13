@@ -55,6 +55,14 @@ _SCREEN_QUIET_HOURS_ENV = "RAG_SCREEN_QUIET_HOURS"  # ej. "22:00-07:00"
 _SCREEN_APP_DENY_ENV = "RAG_SCREEN_APP_DENY"        # CSV: "1Password,Banking"
 _SCREEN_DEDUP_WINDOW_SECS = 60
 
+# State-file pattern (mimic mood_poll): si el archivo existe, `rag setup`
+# inyecta RAG_PEEKABOO_ENABLE=1 + RAG_SCREEN_OBSERVE=1 en el supervisor plist
+# y los jobs corren. Toggle con `rag screen enable / disable`. La gate de
+# runtime sigue siendo env var — la state file solo controla la INYECCIÓN
+# de env por el plist generator. Permite a otros agents/integraciones
+# saber "está activado o no" sin leer el plist (`_observe_state_enabled()`).
+_OBSERVE_STATE_FILE = Path.home() / ".local/share/obsidian-rag/screen_observe_enabled"
+
 _VALID_MODES = {"frontmost", "window", "screen", "multi", "menubar"}
 
 
@@ -247,6 +255,42 @@ def _is_observe_enabled() -> bool:
     return os.environ.get(_SCREEN_OBSERVE_ENV, "0").strip().lower() in (
         "1", "true", "yes", "on",
     )
+
+
+def _observe_state_enabled() -> bool:
+    """True si el user activó el observer via `rag screen enable`
+    (existence-check del state file). Mimics el patrón de `mood_enabled`.
+
+    NO es la misma cosa que `_is_observe_enabled()` — ese mira la env var
+    `RAG_SCREEN_OBSERVE` (lo que ve `observe_once()` en runtime). El state
+    file existe en disco para que el plist generator decida si inyectar
+    la env al supervisor, y para que otros componentes (mirror, briefs)
+    sepan "el user lo activó" sin parsear plists.
+
+    Patrón paralelo: `~/.local/share/obsidian-rag/mood_enabled`.
+    """
+    try:
+        return _OBSERVE_STATE_FILE.is_file()
+    except OSError:
+        return False
+
+
+def _observe_state_set(enabled: bool) -> None:
+    """Toggle del state file. Idempotente — múltiples enables/disables
+    seguidos no rompen. Crea el directorio padre si falta.
+
+    Llamado desde `rag screen enable / disable` CLI. NO recarga el
+    supervisor — el caller debe correr `rag setup` o `launchctl kickstart`
+    para que el cambio surta efecto.
+    """
+    if enabled:
+        _OBSERVE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _OBSERVE_STATE_FILE.touch(exist_ok=True)
+    else:
+        try:
+            _OBSERVE_STATE_FILE.unlink(missing_ok=True)
+        except (OSError, AttributeError):
+            pass
 
 
 def _parse_quiet_hours(spec: str | None) -> tuple[int, int] | None:
@@ -613,7 +657,10 @@ __all__ = [
     "_caption",
     "capture_and_caption",
     # Fase 2:
+    "_OBSERVE_STATE_FILE",
     "_is_observe_enabled",
+    "_observe_state_enabled",
+    "_observe_state_set",
     "_parse_quiet_hours",
     "_in_quiet_hours",
     "_app_denylist",

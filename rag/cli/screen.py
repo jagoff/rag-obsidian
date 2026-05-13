@@ -225,3 +225,128 @@ def screen_observe_once(
         sys.exit(1)
     click.echo(f"[unknown] {out}", err=True)
     sys.exit(1)
+
+
+@screen_cli.command("enable")
+def screen_enable() -> None:
+    """Activar el observer pasivo del Peekaboo (Fase 2g).
+
+    Toca el state file `~/.local/share/obsidian-rag/screen_observe_enabled`.
+    El plist generator del supervisor (`_supervisor_plist`) lo detecta en el
+    próximo `rag setup` e inyecta `RAG_PEEKABOO_ENABLE=1` +
+    `RAG_SCREEN_OBSERVE=1` al supervisor.
+
+    Después de correr este comando:
+        1. `rag setup` regenera el plist con las env vars.
+        2. `launchctl kickstart -k gui/$(id -u)/com.fer.obsidian-rag-supervisor`
+           recarga el supervisor.
+        3. El `screen_observer_job` empieza a capturar cada 15min.
+
+    Equivalente al opt-in de mood: `rag mood enable`.
+    """
+    from rag.integrations.peekaboo import (  # noqa: PLC0415
+        _OBSERVE_STATE_FILE, _observe_state_set,
+    )
+    _observe_state_set(True)
+    click.echo(f"✓ Screen observer activado. State file: {_OBSERVE_STATE_FILE}")
+    click.echo(
+        "\nProximos pasos:\n"
+        "  1. rag setup     # regenerá el plist del supervisor con las env vars\n"
+        "  2. launchctl kickstart -k gui/$(id -u)/com.fer.obsidian-rag-supervisor\n"
+        "                   # recargá el supervisor\n"
+        "  3. rag screen observe-once --force --json\n"
+        "                   # smoke manual antes del primer tick automático\n"
+    )
+
+
+@screen_cli.command("disable")
+def screen_disable() -> None:
+    """Desactivar el observer pasivo (Fase 2g).
+
+    Borra el state file. Próximo `rag setup` regenerá el plist del
+    supervisor SIN las env vars Peekaboo — el `screen_observer_job` corre
+    pero sale en `observe_disabled` sin tocar Peekaboo ni granite.
+
+    Las rows existentes en `rag_screen_observations` NO se borran
+    automáticamente — quedan disponibles para el último `mirror` /
+    `today` / `digest` mientras se rotan via `run_maintenance` (retention 7d).
+    """
+    from rag.integrations.peekaboo import (  # noqa: PLC0415
+        _OBSERVE_STATE_FILE, _observe_state_set,
+    )
+    existed = _OBSERVE_STATE_FILE.is_file()
+    _observe_state_set(False)
+    if existed:
+        click.echo(f"✓ Screen observer desactivado. Borré: {_OBSERVE_STATE_FILE}")
+    else:
+        click.echo(f"(ya estaba desactivado — {_OBSERVE_STATE_FILE} no existía)")
+    click.echo(
+        "\nProximos pasos:\n"
+        "  1. rag setup     # regenerá el plist del supervisor sin las env vars\n"
+        "  2. launchctl kickstart -k gui/$(id -u)/com.fer.obsidian-rag-supervisor\n"
+        "                   # recargá el supervisor\n"
+    )
+
+
+@screen_cli.command("status")
+def screen_status() -> None:
+    """Estado del observer pasivo + smoke checks rápidos.
+
+    Muestra:
+        - State file path + existencia.
+        - Env vars RAG_PEEKABOO_ENABLE / RAG_SCREEN_OBSERVE / RAG_SCREEN_QUIET_HOURS /
+          RAG_SCREEN_APP_DENY en el proceso actual.
+        - Última row en rag_screen_observations + age.
+        - Count de rows últimos 24h / 7d.
+        - Peekaboo binary path (resolved).
+    """
+    import os  # noqa: PLC0415
+    import sqlite3  # noqa: PLC0415
+    import time  # noqa: PLC0415
+    from rag.integrations.peekaboo import (  # noqa: PLC0415
+        _OBSERVE_STATE_FILE, _observe_state_enabled, _resolve_binary,
+    )
+
+    click.echo("=== Peekaboo screen observer status ===")
+    click.echo(f"  state_file       {_OBSERVE_STATE_FILE}")
+    click.echo(f"  state_enabled    {_observe_state_enabled()}")
+    click.echo(f"  peekaboo bin     {_resolve_binary() or '(not installed)'}")
+    click.echo("  env vars (en este proceso):")
+    for k in ("RAG_PEEKABOO_ENABLE", "RAG_SCREEN_OBSERVE",
+              "RAG_SCREEN_QUIET_HOURS", "RAG_SCREEN_APP_DENY"):
+        click.echo(f"    {k:24} {os.environ.get(k) or '(unset)'}")
+
+    try:
+        from rag import DB_PATH  # noqa: PLC0415
+        db = DB_PATH / "telemetry.db"
+        con = sqlite3.connect(str(db), timeout=5.0)
+        try:
+            now_ts = int(time.time())
+            cnt_24h = con.execute(
+                "SELECT COUNT(*) FROM rag_screen_observations WHERE ts >= ?",
+                (now_ts - 24 * 3600,),
+            ).fetchone()[0]
+            cnt_7d = con.execute(
+                "SELECT COUNT(*) FROM rag_screen_observations WHERE ts >= ?",
+                (now_ts - 7 * 86400,),
+            ).fetchone()[0]
+            row = con.execute(
+                "SELECT id, ts, app_name, window_title, substr(caption,1,80) "
+                "FROM rag_screen_observations ORDER BY ts DESC LIMIT 1",
+            ).fetchone()
+            click.echo(f"  rows last 24h    {cnt_24h}")
+            click.echo(f"  rows last 7d     {cnt_7d}")
+            if row:
+                rid, ts, app, title, cap = row
+                age_min = max(0, (now_ts - int(ts)) // 60)
+                click.echo(
+                    f"  last row         #{rid} app={app or '-'} "
+                    f"title={title or '-'!r} age={age_min}min"
+                )
+                click.echo(f"                   caption: {(cap or '').strip()}")
+            else:
+                click.echo("  last row         (none)")
+        finally:
+            con.close()
+    except Exception as exc:
+        click.echo(f"  (db query failed: {exc})", err=True)

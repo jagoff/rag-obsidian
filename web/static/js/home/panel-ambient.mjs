@@ -247,3 +247,120 @@ export function renderSpotify(payload) {
     count.classList.add("has-items");
   }
 }
+
+// ── Health panel (Apple Health ETL) ──────────────────────────────────────
+
+function _sparklineSVG(values, opts = {}) {
+  // ASCII-like SVG sparkline, 100×24px, nulls = gap. Same dimensions as
+  // mood sparkline so the panels line up visually when stacked.
+  const vals = values || [];
+  const numeric = vals.filter((v) => v != null && Number.isFinite(v));
+  if (numeric.length < 2) return "";
+  const min = Math.min(...numeric);
+  const max = Math.max(...numeric);
+  const range = max - min || 1;
+  const w = 100;
+  const h = 24;
+  const stepX = vals.length > 1 ? w / (vals.length - 1) : 0;
+  const points = vals.map((v, i) => {
+    if (v == null || !Number.isFinite(v)) return null;
+    const x = i * stepX;
+    const y = h - ((v - min) / range) * (h - 2) - 1;
+    return { x, y };
+  });
+  // Build path skipping nulls.
+  let path = "";
+  let pen = "M";
+  for (const p of points) {
+    if (p == null) { pen = "M"; continue; }
+    path += `${pen}${p.x.toFixed(1)},${p.y.toFixed(1)} `;
+    pen = "L";
+  }
+  const stroke = opts.stroke || "currentColor";
+  return `<svg class="health-spark" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" aria-hidden="true"><path d="${path.trim()}" fill="none" stroke="${stroke}" stroke-width="1.5"/></svg>`;
+}
+
+function _ringPct(value, goal) {
+  if (!value || !goal) return null;
+  return Math.min(100, Math.round((value / goal) * 100));
+}
+
+export function renderHealth(payload) {
+  const h = payload.signals?.health;
+  const panel = document.getElementById("p-health");
+  if (!panel) return;
+  if (!h) {
+    // Sin export: surface placeholder accionable (mismo patrón que
+    // Spotify cuando spotify_log está vacío).
+    panel.hidden = false;
+    const body = panel.querySelector("[data-body]");
+    const count = panel.querySelector("[data-count]");
+    if (count) count.textContent = "—";
+    if (body) {
+      body.innerHTML = `<div class="empty">Sin export Apple Health · correr <code>rag health-import</code> después de Export Health Data desde iPhone</div>`;
+    }
+    return;
+  }
+  panel.hidden = false;
+
+  const fmt = (n, d = 0) => n == null ? "—" : Number(n).toLocaleString("es-AR", {maximumFractionDigits: d});
+  const steps = h.steps;
+  const kcal = h.active_kcal;
+  const exMin = h.exercise_min;
+  const standH = h.stand_hours;
+  const hrRest = h.resting_hr;
+  const hrv = h.hrv_sdnn;
+  const dist = h.distance_km;
+  const flights = h.flights_climbed;
+  const nW = h.n_workouts;
+
+  const kcalPct = _ringPct(kcal, h.active_kcal_goal);
+  const exPct = _ringPct(exMin, h.exercise_goal);
+  const standPct = _ringPct(standH, h.stand_goal);
+
+  const ringHTML = (label, pct, val, goal, unit) => {
+    if (pct == null) return "";
+    const cls = pct >= 100 ? "ring-done" : pct >= 60 ? "ring-on" : "ring-low";
+    return `<div class="health-ring ${cls}" title="${escapeHTML(label)} ${val}/${goal} ${unit}">
+      <div class="health-ring-bar"><div class="health-ring-fill" style="width:${pct}%"></div></div>
+      <div class="health-ring-meta">${escapeHTML(label)} · ${fmt(val)}/${fmt(goal)} ${unit} · ${pct}%</div>
+    </div>`;
+  };
+
+  const stalePill = h.stale
+    ? `<span class="health-stale" title="último día con data">stale · ${escapeHTML(h.date || "")}</span>`
+    : "";
+
+  const sparkSteps = _sparklineSVG(h.spark_steps_14d, {stroke: "var(--cyan)"});
+  const sparkKcal  = _sparklineSVG(h.spark_kcal_14d,  {stroke: "var(--amber)"});
+  const sparkHrv   = _sparklineSVG(h.spark_hrv_14d,   {stroke: "var(--green, #1db954)"});
+
+  const wTypes = (h.workout_types || "").split(",").filter(Boolean).slice(0, 3).join(", ");
+  const workoutLine = nW
+    ? `<div class="health-workouts">🏃 ${nW} workout${nW > 1 ? "s" : ""}${wTypes ? " · " + escapeHTML(wTypes) : ""}</div>`
+    : "";
+
+  const body = panel.querySelector("[data-body]");
+  const count = panel.querySelector("[data-count]");
+  if (count) {
+    count.textContent = fmt(steps);
+    count.classList.remove("has-warning", "has-critical");
+    if (steps && steps > 5000) count.classList.add("has-items");
+  }
+
+  body.innerHTML = `
+    <div class="health-summary">
+      <div class="health-kv"><span class="kv-label">pasos</span><span class="kv-val">${fmt(steps)}</span>${sparkSteps}</div>
+      <div class="health-kv"><span class="kv-label">kcal</span><span class="kv-val">${fmt(kcal)}</span>${sparkKcal}</div>
+      <div class="health-kv"><span class="kv-label">HRV</span><span class="kv-val">${fmt(hrv, 1)}</span>${sparkHrv}</div>
+      <div class="health-kv"><span class="kv-label">HR rest</span><span class="kv-val">${fmt(hrRest)}</span></div>
+      <div class="health-kv"><span class="kv-label">distancia</span><span class="kv-val">${fmt(dist, 2)} km</span></div>
+      ${flights ? `<div class="health-kv"><span class="kv-label">pisos</span><span class="kv-val">${fmt(flights)}</span></div>` : ""}
+    </div>
+    ${ringHTML("activity", kcalPct, kcal, h.active_kcal_goal, "kcal")}
+    ${ringHTML("ejercicio", exPct, exMin, h.exercise_goal, "min")}
+    ${ringHTML("stand", standPct, standH, h.stand_goal, "hr")}
+    ${workoutLine}
+    ${stalePill}
+  `;
+}

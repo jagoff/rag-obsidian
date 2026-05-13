@@ -9449,6 +9449,102 @@ def _fetch_sleep() -> dict | None:
     }
 
 
+def _fetch_health() -> dict | None:
+    """Apple Health daily metrics — steps / kcal / exercise / stand /
+    HR / HRV / workouts. Read-only desde `rag_apple_health_daily`,
+    poblada por `rag health-import` (manual o cron via supervisor).
+
+    Devuelve today + 14d sparklines + week_avgs. Cuando today no tiene
+    datos (export del día no se hizo aún), fallback al último día con
+    data + `stale=True` (mismo patrón que mood y spotify).
+
+    Returns:
+      `{date, stale, steps, distance_km, active_kcal, ..., spark_*,
+        week_avg_*, n_workouts, workout_types}` o None si la tabla
+      está vacía / inaccesible.
+    """
+    try:
+        from rag.integrations.apple_health import (
+            daily_summary, recent_summaries,
+        )
+    except Exception:
+        return None
+    try:
+        from datetime import datetime as _dt
+        today = _dt.now().strftime("%Y-%m-%d")
+        row = daily_summary(today)
+        recent = recent_summaries(days=14)
+    except Exception:
+        return None
+    if not recent:
+        return None
+
+    is_stale = False
+    if row is None or all(
+        row.get(k) in (None, 0)
+        for k in ("steps", "active_kcal", "exercise_min")
+    ):
+        # Pick the most recent non-empty row.
+        stale = next(
+            (r for r in reversed(recent)
+             if r.get("steps") or r.get("active_kcal")),
+            None,
+        )
+        if stale is None:
+            return None
+        row = stale
+        is_stale = True
+
+    # Sparklines (chronological): pad missing dates with None.
+    by_date = {r["date"]: r for r in recent}
+    spark_steps: list[int | None] = []
+    spark_kcal: list[float | None] = []
+    spark_hrv: list[float | None] = []
+    spark_dates: list[str] = []
+    today_dt = _dt.strptime(row["date"] if is_stale else today, "%Y-%m-%d")
+    from datetime import timedelta as _td
+    for offset in range(13, -1, -1):
+        d = (today_dt - _td(days=offset)).strftime("%Y-%m-%d")
+        r = by_date.get(d) or {}
+        spark_dates.append(d)
+        spark_steps.append(r.get("steps") if r.get("steps") else None)
+        spark_kcal.append(r.get("active_kcal") if r.get("active_kcal") else None)
+        spark_hrv.append(r.get("hrv_sdnn") if r.get("hrv_sdnn") else None)
+
+    # Week averages — exclude empty days.
+    def _avg(key: str) -> float | None:
+        vals = [r[key] for r in recent[-7:] if r.get(key)]
+        return round(sum(vals) / len(vals), 1) if vals else None
+
+    return {
+        "date": row.get("date"),
+        "stale": is_stale,
+        "steps": row.get("steps"),
+        "distance_km": row.get("distance_km"),
+        "flights_climbed": row.get("flights_climbed"),
+        "active_kcal": row.get("active_kcal"),
+        "active_kcal_goal": row.get("active_kcal_goal"),
+        "exercise_min": row.get("exercise_min"),
+        "exercise_goal": row.get("exercise_goal"),
+        "stand_hours": row.get("stand_hours"),
+        "stand_goal": row.get("stand_goal"),
+        "resting_hr": row.get("resting_hr"),
+        "hr_avg": row.get("hr_avg"),
+        "hrv_sdnn": row.get("hrv_sdnn"),
+        "vo2_max": row.get("vo2_max"),
+        "body_mass_kg": row.get("body_mass_kg"),
+        "n_workouts": row.get("n_workouts"),
+        "workout_types": row.get("workout_types"),
+        "week_avg_steps": _avg("steps"),
+        "week_avg_kcal": _avg("active_kcal"),
+        "week_avg_hrv": _avg("hrv_sdnn"),
+        "spark_steps_14d": spark_steps,
+        "spark_kcal_14d": spark_kcal,
+        "spark_hrv_14d": spark_hrv,
+        "spark_dates_14d": spark_dates,
+    }
+
+
 def _fetch_mood() -> dict | None:
     """Score diario de mood + sparkline 14d + drift status.
 
@@ -11763,6 +11859,11 @@ def _home_compute(
         # sin score hoy → frontend hidea el panel `p-mood`. Hot path
         # ~5ms (2 SELECTs + agg en memoria).
         fut_mood        = pool.submit(_timed, "mood", _fetch_mood)
+        # Apple Health: read-only desde `rag_apple_health_daily`,
+        # poblada por `rag health-import` (manual o cron F4-followup).
+        # Returns None cuando la tabla está vacía → frontend hidea
+        # `p-health`. Hot path ~5ms (1 SELECT today + 1 SELECT 14d).
+        fut_health      = pool.submit(_timed, "health", _fetch_health)
 
         # Helper: wait on a future with budget, return default on timeout
         # or worker exception. Emits "timeout" progress event so the UI
@@ -11849,6 +11950,7 @@ def _home_compute(
         spotify = _await("spotify", fut_spotify, 8, default=None)
         sleep = _await("sleep", fut_sleep, 3, default=None)
         mood = _await("mood", fut_mood, 3, default=None)
+        health = _await("health", fut_health, 3, default=None)
 
         signals["pagerank_top"] = pagerank_top
         signals["chrome_top_week"] = chrome_top_week
@@ -11864,6 +11966,7 @@ def _home_compute(
         signals["spotify"] = spotify
         signals["sleep"] = sleep
         signals["mood"] = mood
+        signals["health"] = health
     finally:
         # Detach stragglers; they continue warming caches for the next call.
         # On SSE-client disconnect (cancel_event set), drop pending

@@ -33,7 +33,7 @@
         media="(device-width: 402px) and (device-height: 874px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
   <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-16-pro-max.png"
         media="(device-width: 440px) and (device-height: 956px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
-  <link rel="stylesheet" href="/static/home.v2.css?v=72">
+  <link rel="stylesheet" href="/static/home.v2.css?v=74">
   <!-- marked@18 vendored — same SRI as the v1 home. Used to parse the
        today/tomorrow narrative which has 4 H2 sub-sections that need
        real markdown rendering (lists, headers) — not the regex hack. -->
@@ -252,6 +252,19 @@
           </div>
           <footer class="panel-foot" data-foot></footer>
         </article>
+        <!-- Apple Health · daily aggregates desde export.xml iCloud Drive.
+             Source: rag_apple_health_daily (poblada por `rag health-import`,
+             manual o cron F4-followup). Métricas: pasos, kcal activas,
+             ejercicio min, stand hours, HR resting, HRV, workouts. Hidden
+             via JS si signals.health es null (export nunca corrió). -->
+        <article class="panel panel-health" id="p-health" hidden>
+          <header class="panel-head">
+            <span class="title">Salud · hoy + 14d</span>
+            <span class="count" data-count></span>
+          </header>
+          <div class="panel-body" data-body><div class="empty">cargando…</div></div>
+          <footer class="panel-foot" data-foot></footer>
+        </article>
         <!-- Cross-source correlations · top Pearson + lag analysis.
              OJO: nombre `p-correlations` (no `p-patterns`) para evitar
              colisión con el panel pre-existente "Patrones · cross-source"
@@ -425,7 +438,7 @@
     </div>
   </dialog>
 
-  <script type="module" src="/static/js/home/app.mjs?v=72"></script>
+  <script type="module" src="/static/js/home/app.mjs?v=74"></script>
   <!-- Registra el SW + auto-reload on update. Sin esto, los fixes que
        deployamos al frontend no se propagan: el SW viejo sirve assets
        cacheados y el JS viejo sigue corriendo aunque haya versión

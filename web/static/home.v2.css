@@ -610,6 +610,90 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 .spotify-hero-text .row-meta .spotify-state-paused  { color: var(--text-dim); }
 .spotify-recent .row { padding: var(--space-2) 0; }
 
+/* ── Apple Health panel ───────────────────────────────────────
+   Layout vertical compacto: 3-4 lines de "metric · value · sparkline"
+   + 3 activity rings (kcal/exercise/stand) tipo progress bars finos.
+   Cabe en data-h=half. Si user lo agranda manual a full/xl, los rings
+   se expanden y el grid se ve más aireado. */
+.panel-health .panel-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+}
+.health-summary {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 4px 12px;
+  font-size: var(--fs-mini);
+}
+.health-kv {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-variant-numeric: tabular-nums;
+  min-width: 0;
+}
+.health-kv .kv-label {
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 9px;
+}
+.health-kv .kv-val {
+  color: var(--text);
+  font-weight: 600;
+  flex-shrink: 0;
+}
+.health-spark {
+  flex: 1;
+  min-width: 0;
+  height: 18px;
+  color: var(--text-dim);
+}
+.health-ring {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 2px;
+}
+.health-ring-bar {
+  height: 5px;
+  background: var(--bg-elev-2);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.health-ring-fill {
+  height: 100%;
+  background: var(--cyan);
+  border-radius: 3px;
+  transition: width var(--dur-base) var(--ease-out);
+}
+.health-ring.ring-low .health-ring-fill { background: var(--amber); }
+.health-ring.ring-on  .health-ring-fill { background: var(--cyan); }
+.health-ring.ring-done .health-ring-fill { background: var(--green, #1db954); }
+.health-ring-meta {
+  font-size: 9px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+.health-workouts {
+  font-size: var(--fs-mini);
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+.health-stale {
+  display: inline-block;
+  font-size: 9px;
+  color: var(--amber);
+  padding: 1px 6px;
+  border: 1px solid var(--amber);
+  border-radius: 8px;
+  margin-top: var(--space-1);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
 /* ── ASCII / SVG mini-charts (signature) ─────────────────── */
 
 /* Stacked bar — para Loops Aging (0-7d / 8-30d / STALE) */

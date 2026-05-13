@@ -19996,6 +19996,41 @@ def _cluster_queries(qs: list[str], threshold: float = 0.75) -> list[list[int]]:
     return [c["indices"] for c in clusters]
 
 
+@cli.command(name="health-import")
+@click.option("--days", default=30, show_default=True,
+              help="Ventana en días a importar desde export.xml")
+@click.option("--export-path", default=None,
+              help="Override path al export.xml (default: env "
+                   "OBSIDIAN_RAG_HEALTH_EXPORT o iCloud Drive)")
+def health_import_cmd(days: int, export_path: str | None):
+    """Importar Apple Health daily aggregates desde iCloud Drive
+    (`export.xml`) a `rag_apple_health_daily`. SAX streaming —
+    constant memory aunque el file pese ~2GB.
+
+    Idempotente: re-correr sobre el mismo file produce el mismo estado
+    final. Setup: en iPhone → Health → tap profile → "Export Health Data"
+    → "Save to Files" → iCloud Drive/Health/.
+    """
+    from rag.integrations.apple_health import import_export_xml
+    from pathlib import Path as _Path
+    p = _Path(export_path) if export_path else None
+    result = import_export_xml(days=days, export_path=p)
+    if result.get("skipped_reason"):
+        console.print(f"[red]Skip:[/red] {result['skipped_reason']}")
+        raise SystemExit(1)
+    console.print(
+        f"[green]✓[/green] {result['imported']} días importados "
+        f"({result.get('records_scanned', 0):,} records scanned, "
+        f"{result.get('records_kept', 0):,} kept · "
+        f"{result.get('elapsed_s', 0)}s)"
+    )
+    days_seen = result.get("days_seen") or []
+    if days_seen:
+        console.print(
+            f"[dim]{days_seen[0]} → {days_seen[-1]}[/dim]"
+        )
+
+
 @cli.command(name="spotify-auth")
 def spotify_auth_cmd():
     """One-shot Spotify OAuth bootstrap. Opens browser for consent, caches

@@ -18,7 +18,7 @@ import {
 } from "./panel-monitoring.mjs";
 import {
   renderWeather, renderWeb, renderBookmarks,
-  renderYouTube, renderDrive, renderSpotify,
+  renderYouTube, renderDrive, renderSpotify, renderHealth,
 } from "./panel-ambient.mjs";
 import { renderSleep } from "./panel-sleep.mjs";
 import { renderMood, renderCorrelations } from "./panel-mood.mjs";
@@ -71,6 +71,7 @@ function render(payload) {
   renderSpotify(payload);
   renderSleep(payload);
   renderMood(payload);
+  renderHealth(payload);
   // renderCorrelations: panel `p-correlations` (Pearson cross-source entre métricas).
   // Distinto de renderPatterns que rendea `p-patterns` (entidades cross-source).
   renderCorrelations(payload);

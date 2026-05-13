@@ -22,6 +22,12 @@ const STATE = {
   onlyDupes: false,
   searchQuery: "",
   snapshot: null,
+  // Time-machine: si tmDate=null, vista "hoy" (comportamiento normal).
+  // Si tmDate=YYYY-MM-DD, vista historical: tabla viene del snapshot,
+  // ocultamos verdict/dupes/recall/dead (no aplican a corpus pasado).
+  tmDate: null,
+  tmSnapshot: null,
+  tmDiff: null,
 };
 
 const TYPE_ORDER = ["bug", "decision", "preference", "fact", "note"];
@@ -325,9 +331,11 @@ function renderDupePairs(s) {
   if (pairs.length === 0) {
     $("#dupe-pairs").innerHTML = `<div class="loading">Sin pares cercanos. 👍</div>`;
     $("#dupes-meta").textContent = "0 pares · sin dupes detectados";
+    $("#merge-all-btn").style.display = "none";
     return;
   }
   $("#dupes-meta").textContent = `${pairs.length} pares con embedding dist < 0.12`;
+  $("#merge-all-btn").style.display = "block";
   $("#dupe-pairs").innerHTML = pairs
     .map(
       (p) => `
@@ -352,15 +360,121 @@ function renderDupePairs(s) {
   }
 }
 
+// 3D rotating tag cloud — Fibonacci sphere lattice + perspective projection.
+// Cada tag se posiciona uniforme sobre la esfera; tamaño escala con count;
+// rotación auto + drag manual; depth → opacity + scale para sensación 3D.
 function renderTags(s) {
   const tags = s.tags_top || [];
+  const wrap = $("#tags-cloud");
   if (tags.length === 0) {
-    $("#tags-cloud").innerHTML = `<div class="loading">Sin tags.</div>`;
+    wrap.innerHTML = `<div class="loading" style="padding:14px 16px;">Sin tags.</div>`;
     return;
   }
-  $("#tags-cloud").innerHTML = tags
-    .map((t) => `<span class="tag-cloud-item">${escapeHTML(t.tag)}<span class="count">${t.count}</span></span>`)
-    .join("");
+  if (wrap._tagCloud) {
+    wrap._tagCloud.update(tags);
+    return;
+  }
+  wrap.innerHTML = `<div class="stage" id="tag-stage"></div>`;
+  const stage = $("#tag-stage");
+  const radius = 130;
+  let rotX = -0.25, rotY = 0;
+  let velX = 0.002, velY = 0.006;
+  let dragging = false, lastX = 0, lastY = 0;
+  let nodes = [];
+
+  function layout(tagsArr) {
+    stage.innerHTML = "";
+    const N = Math.min(tagsArr.length, 60);
+    const phi = Math.PI * (3 - Math.sqrt(5)); // golden angle
+    const max = tagsArr[0]?.count || 1;
+    nodes = [];
+    for (let i = 0; i < N; i++) {
+      const t = tagsArr[i];
+      const y = 1 - (i / (N - 1 || 1)) * 2;       // -1..1
+      const r = Math.sqrt(1 - y * y);
+      const theta = phi * i;
+      const x = Math.cos(theta) * r;
+      const z = Math.sin(theta) * r;
+      const fontSize = 10 + Math.min(18, Math.sqrt(t.count / max) * 16);
+      const el = document.createElement("span");
+      el.className = "t3d";
+      el.style.fontSize = `${fontSize}px`;
+      el.innerHTML = `${escapeHTML(t.tag)}<span class="c">${t.count}</span>`;
+      el.addEventListener("click", () => {
+        // Click un tag → filtra busqueda FTS
+        $("#search-input").value = t.tag;
+        STATE.searchQuery = t.tag;
+        refresh();
+      });
+      stage.appendChild(el);
+      nodes.push({ x, y, z, el });
+    }
+  }
+
+  function tick() {
+    if (!dragging) {
+      rotX += velX;
+      rotY += velY;
+    }
+    const cx = Math.cos(rotX), sx = Math.sin(rotX);
+    const cy = Math.cos(rotY), sy = Math.sin(rotY);
+    for (const n of nodes) {
+      // Rotación Y → rotación X
+      const x1 = n.x * cy + n.z * sy;
+      const z1 = -n.x * sy + n.z * cy;
+      const y1 = n.y * cx - z1 * sx;
+      const z2 = n.y * sx + z1 * cx;
+      const px = x1 * radius;
+      const py = y1 * radius;
+      const depth = (z2 + 1) / 2; // 0=back, 1=front
+      const scale = 0.55 + depth * 0.65;
+      const opacity = 0.30 + depth * 0.70;
+      n.el.style.transform = `translate3d(${px}px, ${py}px, 0) scale(${scale})`;
+      n.el.style.opacity = String(opacity);
+      n.el.style.zIndex = String(Math.round(depth * 100));
+    }
+    requestAnimationFrame(tick);
+  }
+
+  wrap.addEventListener("mousedown", (e) => {
+    dragging = true;
+    lastX = e.clientX; lastY = e.clientY;
+  });
+  window.addEventListener("mouseup", () => { dragging = false; });
+  window.addEventListener("mousemove", (e) => {
+    if (!dragging) return;
+    const dx = e.clientX - lastX;
+    const dy = e.clientY - lastY;
+    lastX = e.clientX; lastY = e.clientY;
+    rotY += dx * 0.008;
+    rotX += -dy * 0.008;
+    velX = -dy * 0.0008;
+    velY = dx * 0.0008;
+  });
+  // Touch — mobile/iPad swipe support
+  wrap.addEventListener("touchstart", (e) => {
+    if (!e.touches[0]) return;
+    dragging = true;
+    lastX = e.touches[0].clientX;
+    lastY = e.touches[0].clientY;
+  }, { passive: true });
+  wrap.addEventListener("touchmove", (e) => {
+    if (!dragging || !e.touches[0]) return;
+    const dx = e.touches[0].clientX - lastX;
+    const dy = e.touches[0].clientY - lastY;
+    lastX = e.touches[0].clientX;
+    lastY = e.touches[0].clientY;
+    rotY += dx * 0.008;
+    rotX += -dy * 0.008;
+    velX = -dy * 0.0008;
+    velY = dx * 0.0008;
+  }, { passive: true });
+  wrap.addEventListener("touchend", () => { dragging = false; });
+
+  layout(tags);
+  requestAnimationFrame(tick);
+  wrap._tagCloud = { update: (t) => layout(t) };
+  return;
 }
 
 function renderScoreBreakdown(breakdown) {
@@ -531,4 +645,505 @@ $("#search-input").addEventListener("input", (e) => {
   }, 200);
 });
 
+// ── Merge all dupe pairs
+$("#merge-all-btn").addEventListener("click", async () => {
+  if (!STATE.snapshot || !STATE.snapshot.dupe_pairs || STATE.snapshot.dupe_pairs.length === 0) {
+    return;
+  }
+  if (!confirm(`¿Fusionar ${STATE.snapshot.dupe_pairs.length} pares de near-dupes?`)) {
+    return;
+  }
+
+  const btn = $("#merge-all-btn");
+  btn.disabled = true;
+  btn.textContent = "Fusionando...";
+
+  try {
+    const pairs = STATE.snapshot.dupe_pairs.map((p) => ({ a: p.a.id, b: p.b.id }));
+    const r = await fetch("/api/memo/merge", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(pairs),
+    });
+    const result = await r.json();
+    if (result.ok) {
+      alert(`Fusionados ${result.merged.length} pares. ${result.errors.length} errores.`);
+    } else {
+      alert("Error al fusionar pares");
+    }
+  } catch (e) {
+    alert(`Error: ${e.message}`);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Fusionar todos";
+    refresh(); // Recargar para actualizar la lista
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// Time-machine (v0.6 differenciador): scrubber temporal + diff panel.
+// ─────────────────────────────────────────────────────────────────────
+
+function todayISO() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+function daysAgoISO(n) {
+  const d = new Date();
+  d.setDate(d.getDate() - n);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+async function fetchTimeMachine(date) {
+  const r = await api(`/api/memo/timemachine/snapshot?date=${date}&limit=200`);
+  return r;
+}
+
+async function fetchDiff(fromDate, toDate) {
+  const params = new URLSearchParams({ from_date: fromDate });
+  if (toDate) params.set("to_date", toDate);
+  return api(`/api/memo/timemachine/diff?${params}`);
+}
+
+function renderHistoricalTable(snap) {
+  const rows = (snap.rows || []).map((r) => {
+    const ago = r.updated ? r.updated.slice(0, 10) : "—";
+    const tags = (r.tags || []).slice(0, 4).map((t) =>
+      `<span class="tag-chip">${escapeHTML(t)}</span>`).join("");
+    return `
+      <tr data-id="${escapeHTML(r.id_full)}">
+        <td><span class="type-tag" data-type="${escapeHTML(r.type)}">${escapeHTML(r.type)}</span></td>
+        <td class="title-cell">
+          <div class="title">${escapeHTML(r.title)}${r.body_unavailable ? ' <span class="flag-chip flag-tiny">body n/a</span>' : ''}</div>
+          <div class="flags">${tags}</div>
+        </td>
+        <td class="score-cell"><span style="color: var(--text-faint)">—</span></td>
+        <td class="score-cell"><span style="color: var(--text-faint)">—</span></td>
+        <td class="ago">${escapeHTML(ago)}</td>
+      </tr>`;
+  }).join("");
+  $("#memos-tbody").innerHTML = rows ||
+    `<tr><td colspan="5" class="loading">Snapshot vacío en esa fecha.</td></tr>`;
+  bindRowClicks();
+}
+
+function renderHistoricalStats(snap) {
+  const counts = snap.type_counts || {};
+  const cards = [
+    `<div class="stat-card"><div class="label">Total al ${escapeHTML(snap.as_of_date)}</div><div class="value">${snap.total}</div></div>`,
+    ...TYPE_ORDER.filter(t => counts[t]).map(t =>
+      `<div class="stat-card"><div class="label">${t}</div><div class="value">${counts[t]}</div></div>`),
+  ];
+  $("#stats-grid").innerHTML = cards.join("");
+}
+
+function renderDiff(d) {
+  if (!d || !d.ok) {
+    $("#diff-panel").style.display = "none";
+    return;
+  }
+  $("#diff-panel").style.display = "";
+  $("#diff-range").textContent = `${d.from_date} → ${d.to_date}`;
+  $("#diff-meta").textContent = d.summary;
+  $("#diff-stats").innerHTML = `
+    <div class="diff-stat added"><span class="n">+${d.added.length}</span><span class="l">added</span></div>
+    <div class="diff-stat removed"><span class="n">−${d.removed.length}</span><span class="l">removed</span></div>
+    <div class="diff-stat updated"><span class="n">~${d.updated.length}</span><span class="l">updated</span></div>
+  `;
+  const rowHTML = (sign, cls, r, extra = "") => `
+    <div class="diff-row ${cls}" data-id="${escapeHTML(r.id_full)}">
+      <span class="sign">${sign}</span>
+      <span class="type-tag" data-type="${escapeHTML(r.type || 'note')}">${escapeHTML(r.type || '—')}</span>
+      <span class="t">${escapeHTML(r.title || '(untitled)')}</span>
+      ${extra}
+    </div>`;
+  const added = d.added.slice(0, 100).map(r => rowHTML("+", "added", r)).join("");
+  const removed = d.removed.slice(0, 100).map(r => rowHTML("−", "removed", r)).join("");
+  const updated = d.updated.slice(0, 100).map(u => rowHTML(
+    "~", "updated", u,
+    `<span class="changed-fields">${escapeHTML(u.changed_fields.join(","))}</span>`,
+  )).join("");
+  $("#diff-rows").innerHTML = added + removed + updated;
+  for (const row of document.querySelectorAll("#diff-rows .diff-row")) {
+    row.addEventListener("click", () => selectMemo(row.dataset.id));
+  }
+}
+
+async function applyTimeMachine() {
+  const date = STATE.tmDate;
+  const tmBar = $("#tm-bar");
+  if (!date || date === todayISO()) {
+    STATE.tmDate = null;
+    STATE.tmSnapshot = null;
+    STATE.tmDiff = null;
+    tmBar.classList.remove("historical");
+    $("#tm-summary").textContent = "Snapshot del corpus en cualquier fecha pasada (memo v0.6 time-machine).";
+    $("#diff-panel").style.display = "none";
+    $("#verdict-banner").style.display = "";
+    refresh();
+    return;
+  }
+  tmBar.classList.add("historical");
+  $("#tm-summary").innerHTML =
+    `Viendo memoria al <strong>${escapeHTML(date)}</strong> — verdict/dupes/recall son live, ocultos en vista histórica.`;
+  $("#verdict-banner").style.display = "none";
+
+  const [snap, diff] = await Promise.all([
+    fetchTimeMachine(date),
+    fetchDiff(date, todayISO()),
+  ]);
+  if (!snap.ok) {
+    renderError(snap.error || "time-machine snapshot failed");
+    return;
+  }
+  STATE.tmSnapshot = snap;
+  STATE.tmDiff = diff;
+  $("#results-title").innerHTML =
+    `Snapshot al <span class="search-mode-tag">${escapeHTML(snap.as_of_date)}</span>`;
+  $("#recent-meta").textContent = `${snap.total} memorias`;
+  renderHistoricalStats(snap);
+  renderHistoricalTable(snap);
+  renderDiff(diff);
+}
+
+$("#tm-date").addEventListener("change", (e) => {
+  STATE.tmDate = e.target.value || null;
+  applyTimeMachine();
+});
+$("#tm-today").addEventListener("click", () => {
+  STATE.tmDate = null;
+  $("#tm-date").value = "";
+  applyTimeMachine();
+});
+$("#tm-7d").addEventListener("click", () => {
+  const d = daysAgoISO(7);
+  STATE.tmDate = d;
+  $("#tm-date").value = d;
+  applyTimeMachine();
+});
+$("#tm-30d").addEventListener("click", () => {
+  const d = daysAgoISO(30);
+  STATE.tmDate = d;
+  $("#tm-date").value = d;
+  applyTimeMachine();
+});
+$("#tm-diff").addEventListener("click", async () => {
+  const from = STATE.tmDate || daysAgoISO(30);
+  const diff = await fetchDiff(from, todayISO());
+  STATE.tmDiff = diff;
+  renderDiff(diff);
+  $("#diff-panel").scrollIntoView({ behavior: "smooth", block: "start" });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// Knowledge graph — force-directed con velocity-verlet, vanilla SVG.
+// ─────────────────────────────────────────────────────────────────────
+
+const NODE_COLOR_BY_TYPE = {
+  person: "#f778ba",
+  project: "#79c0ff",
+  technology: "#ffa657",
+  file: "#7ee787",
+  org: "#d2a8ff",
+  concept: "#e3c27a",
+};
+
+function nodeRadius(count) {
+  return 4 + Math.min(20, Math.sqrt(count) * 2.2);
+}
+
+async function fetchGraph() {
+  return api(`/api/memo/graph?limit_nodes=80&min_count=1`);
+}
+
+function renderGraph(data) {
+  const wrap = $("#graph-wrap");
+  if (!data || !data.ok) {
+    wrap.innerHTML = `<div class="graph-empty-state">graph error: ${escapeHTML((data && data.error) || "?")}</div>`;
+    return;
+  }
+  if (!data.nodes || data.nodes.length === 0) {
+    wrap.innerHTML = `
+      <div class="graph-empty-state">
+        Graph vacío. Corré <code>memo extract-entities --all</code><br>
+        para extraer entidades del corpus y poblar el grafo.
+      </div>`;
+    return;
+  }
+  $("#graph-meta").textContent =
+    `${data.nodes.length} entidades · ${data.edges.length} edges · ${data.stats.entities} total`;
+
+  const W = wrap.clientWidth || 700;
+  const H = 460;
+  const nodes = data.nodes.map((n) => ({
+    ...n,
+    x: W / 2 + (Math.random() - 0.5) * 200,
+    y: H / 2 + (Math.random() - 0.5) * 200,
+    vx: 0, vy: 0,
+    r: nodeRadius(n.count),
+  }));
+  const edges = data.edges;
+
+  wrap.innerHTML = `
+    <svg class="graph-svg" id="gsvg" viewBox="0 0 ${W} ${H}">
+      <g id="g-edges"></g>
+      <g id="g-nodes"></g>
+      <g id="g-labels"></g>
+    </svg>
+    <div class="graph-legend">
+      ${Object.entries(NODE_COLOR_BY_TYPE).map(([k, c]) =>
+    `<div class="row"><span class="sw" style="background:${c}"></span>${k}</div>`).join("")}
+    </div>
+  `;
+  const svg = $("#gsvg");
+  const gEdges = $("#g-edges");
+  const gNodes = $("#g-nodes");
+  const gLabels = $("#g-labels");
+
+  const adj = new Map();
+  for (const e of edges) {
+    if (!adj.has(e.source)) adj.set(e.source, []);
+    if (!adj.has(e.target)) adj.set(e.target, []);
+    adj.get(e.source).push(e.target);
+    adj.get(e.target).push(e.source);
+  }
+
+  const edgeElems = edges.map((e) => {
+    const el = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    el.setAttribute("class", "gedge");
+    el.setAttribute("stroke-width", String(0.4 + Math.min(2.5, e.weight * 0.4)));
+    el.setAttribute("stroke-opacity", String(0.25 + Math.min(0.55, e.weight * 0.12)));
+    gEdges.appendChild(el);
+    return el;
+  });
+  const nodeElems = nodes.map((n, i) => {
+    const el = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    el.setAttribute("class", "gnode");
+    el.setAttribute("r", String(n.r));
+    el.setAttribute("fill", NODE_COLOR_BY_TYPE[n.type] || "#aaa");
+    el.setAttribute("stroke", "var(--bg)");
+    el.setAttribute("stroke-width", "1.5");
+    el.dataset.idx = String(i);
+    gNodes.appendChild(el);
+    el.addEventListener("mouseenter", () => highlight(i, true));
+    el.addEventListener("mouseleave", () => highlight(i, false));
+    return el;
+  });
+  const labelElems = nodes.map((n, i) => {
+    const el = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    el.setAttribute("class", "glabel");
+    el.textContent = n.name;
+    el.dataset.idx = String(i);
+    gLabels.appendChild(el);
+    return el;
+  });
+
+  function highlight(idx, on) {
+    const neighbors = new Set(adj.get(idx) || []);
+    neighbors.add(idx);
+    nodeElems.forEach((el, i) => {
+      el.setAttribute("opacity", on && !neighbors.has(i) ? "0.18" : "1");
+    });
+    labelElems.forEach((el, i) => {
+      el.classList.toggle("focused", on && neighbors.has(i));
+      el.setAttribute("opacity", on && !neighbors.has(i) ? "0.18" : "1");
+    });
+    edgeElems.forEach((el, i) => {
+      const e = edges[i];
+      const touched = e.source === idx || e.target === idx;
+      el.classList.toggle("focused", on && touched);
+      el.setAttribute("opacity", on && !touched ? "0.08" : "1");
+    });
+  }
+
+  const repulse = 1800;
+  const linkLen = 80;
+  const linkK = 0.04;
+  const center = 0.005;
+  const damping = 0.82;
+  let cooling = 1.0;
+
+  function step() {
+    cooling *= 0.992;
+    for (let i = 0; i < nodes.length; i++) {
+      let fx = 0, fy = 0;
+      for (let j = 0; j < nodes.length; j++) {
+        if (i === j) continue;
+        const dx = nodes[i].x - nodes[j].x;
+        const dy = nodes[i].y - nodes[j].y;
+        const d2 = dx * dx + dy * dy + 0.01;
+        const f = repulse / d2;
+        fx += dx * f / Math.sqrt(d2);
+        fy += dy * f / Math.sqrt(d2);
+      }
+      fx += (W / 2 - nodes[i].x) * center;
+      fy += (H / 2 - nodes[i].y) * center;
+      nodes[i].vx = (nodes[i].vx + fx * 0.001) * damping;
+      nodes[i].vy = (nodes[i].vy + fy * 0.001) * damping;
+    }
+    for (const e of edges) {
+      const a = nodes[e.source], b = nodes[e.target];
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const d = Math.sqrt(dx * dx + dy * dy) + 0.01;
+      const k = linkK * (1 + Math.log(1 + e.weight));
+      const f = (d - linkLen) * k;
+      const fx = (dx / d) * f, fy = (dy / d) * f;
+      a.vx += fx; a.vy += fy;
+      b.vx -= fx; b.vy -= fy;
+    }
+    for (const n of nodes) {
+      n.x += n.vx * cooling;
+      n.y += n.vy * cooling;
+      n.x = Math.max(n.r + 4, Math.min(W - n.r - 4, n.x));
+      n.y = Math.max(n.r + 12, Math.min(H - n.r - 4, n.y));
+    }
+    edges.forEach((e, i) => {
+      const a = nodes[e.source], b = nodes[e.target];
+      edgeElems[i].setAttribute("x1", a.x);
+      edgeElems[i].setAttribute("y1", a.y);
+      edgeElems[i].setAttribute("x2", b.x);
+      edgeElems[i].setAttribute("y2", b.y);
+    });
+    nodes.forEach((n, i) => {
+      nodeElems[i].setAttribute("cx", n.x);
+      nodeElems[i].setAttribute("cy", n.y);
+      labelElems[i].setAttribute("x", n.x);
+      labelElems[i].setAttribute("y", n.y - n.r - 3);
+    });
+    if (cooling > 0.05) {
+      requestAnimationFrame(step);
+    }
+  }
+  requestAnimationFrame(step);
+
+  let dragIdx = null;
+  let dragOff = [0, 0];
+  svg.addEventListener("mousedown", (e) => {
+    const target = e.target;
+    if (target.classList.contains("gnode")) {
+      dragIdx = +target.dataset.idx;
+      const pt = svg.createSVGPoint();
+      pt.x = e.clientX; pt.y = e.clientY;
+      const lp = pt.matrixTransform(svg.getScreenCTM().inverse());
+      dragOff = [lp.x - nodes[dragIdx].x, lp.y - nodes[dragIdx].y];
+      cooling = Math.max(cooling, 0.4);
+    }
+  });
+  svg.addEventListener("mousemove", (e) => {
+    if (dragIdx == null) return;
+    const pt = svg.createSVGPoint();
+    pt.x = e.clientX; pt.y = e.clientY;
+    const lp = pt.matrixTransform(svg.getScreenCTM().inverse());
+    nodes[dragIdx].x = lp.x - dragOff[0];
+    nodes[dragIdx].y = lp.y - dragOff[1];
+    nodes[dragIdx].vx = 0; nodes[dragIdx].vy = 0;
+    cooling = Math.max(cooling, 0.3);
+    requestAnimationFrame(step);
+  });
+  svg.addEventListener("mouseup", () => { dragIdx = null; });
+  svg.addEventListener("mouseleave", () => { dragIdx = null; });
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Timeline temporal — saves/updates/deletes per día (SVG stacked bars).
+// ─────────────────────────────────────────────────────────────────────
+
+async function fetchTimeline(days = 30) {
+  return api(`/api/memo/temporal/timeline?days=${days}`);
+}
+
+function renderTimeline(data) {
+  if (!data || !data.ok || !data.series || data.series.length === 0) {
+    $("#timeline-svg").innerHTML = "";
+    $("#timeline-totals").innerHTML = '<span style="color:var(--text-faint)">sin datos</span>';
+    return;
+  }
+  const series = data.series;
+  const W = 800, H = 110, pad = 8;
+  const bw = (W - pad * 2) / series.length - 1.2;
+  const max = Math.max(1, ...series.map((s) => s.saves + s.updates + s.deletes));
+  const sy = (H - pad * 2) / max;
+
+  const svg = $("#timeline-svg");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+
+  let html = "";
+  series.forEach((s, i) => {
+    const x = pad + i * (bw + 1.2);
+    let yCursor = H - pad;
+    if (s.saves) {
+      const h = s.saves * sy;
+      html += `<rect x="${x}" y="${yCursor - h}" width="${bw}" height="${h}" fill="var(--green)" opacity="0.85"><title>${s.date} · saves ${s.saves}</title></rect>`;
+      yCursor -= h;
+    }
+    if (s.updates) {
+      const h = s.updates * sy;
+      html += `<rect x="${x}" y="${yCursor - h}" width="${bw}" height="${h}" fill="var(--yellow)" opacity="0.85"><title>${s.date} · updates ${s.updates}</title></rect>`;
+      yCursor -= h;
+    }
+    if (s.deletes) {
+      const h = s.deletes * sy;
+      html += `<rect x="${x}" y="${yCursor - h}" width="${bw}" height="${h}" fill="var(--red)" opacity="0.85"><title>${s.date} · deletes ${s.deletes}</title></rect>`;
+    }
+  });
+  const labelIdx = [0, Math.floor(series.length / 2), series.length - 1];
+  for (const i of labelIdx) {
+    const x = pad + i * (bw + 1.2);
+    html += `<text x="${x}" y="${H - 1}" font-size="9" fill="var(--text-faint)">${series[i].date.slice(5)}</text>`;
+  }
+  svg.innerHTML = html;
+  const t = data.total;
+  $("#timeline-totals").innerHTML = `
+    <span><strong>${t.saves}</strong> saves</span>
+    <span><strong>${t.updates}</strong> updates</span>
+    <span><strong>${t.deletes}</strong> deletes</span>
+    <span style="color:var(--text-faint)">en ${data.days}d</span>
+  `;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Stale memorias.
+// ─────────────────────────────────────────────────────────────────────
+
+async function fetchStale(days = 90) {
+  return api(`/api/memo/temporal/stale?days=${days}&limit=30`);
+}
+
+function renderStale(data) {
+  if (!data || !data.ok) {
+    $("#stale-list").innerHTML = `<div class="loading">sin datos</div>`;
+    return;
+  }
+  $("#stale-meta").textContent = `${data.total_stale} total · sin update > ${data.threshold_days}d`;
+  if (!data.rows.length) {
+    $("#stale-list").innerHTML = `<div class="loading">🎉 sin memorias stale (corpus joven o todas frescas)</div>`;
+    return;
+  }
+  $("#stale-list").innerHTML = data.rows.map((r) => `
+    <div class="stale-row" data-id="${escapeHTML(r.id_full)}">
+      <span class="days ${r.days_old > 180 ? 'old' : ''}">${r.days_old}d</span>
+      <span class="type-tag" data-type="${escapeHTML(r.type)}">${escapeHTML(r.type)}</span>
+      <span class="t">${escapeHTML(r.title)}</span>
+    </div>
+  `).join("");
+  for (const el of document.querySelectorAll("#stale-list .stale-row")) {
+    el.addEventListener("click", () => selectMemo(el.dataset.id));
+  }
+}
+
+async function loadV06Features() {
+  try {
+    const [g, t, s] = await Promise.all([
+      fetchGraph(), fetchTimeline(30), fetchStale(90),
+    ]);
+    renderGraph(g);
+    renderTimeline(t);
+    renderStale(s);
+  } catch (e) {
+    console.warn("memo v0.6 features load failed:", e);
+  }
+}
+
 refresh();
+loadV06Features();

@@ -323,6 +323,50 @@
     }
     .tag-cloud-item .count { color: var(--text-faint); margin-left: 4px; }
 
+    /* ── 3D tag cloud (rotating sphere) ─────────────────────────── */
+    .tags-cloud-3d {
+      position: relative;
+      width: 100%;
+      height: 360px;
+      perspective: 900px;
+      perspective-origin: 50% 50%;
+      cursor: grab;
+      user-select: none;
+      overflow: hidden;
+    }
+    .tags-cloud-3d:active { cursor: grabbing; }
+    .tags-cloud-3d .stage {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform-style: preserve-3d;
+      will-change: transform;
+    }
+    .tags-cloud-3d .t3d {
+      position: absolute;
+      top: 0;
+      left: 0;
+      transform-style: preserve-3d;
+      white-space: nowrap;
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+      font-weight: 500;
+      color: var(--cyan);
+      cursor: pointer;
+      transition: color 80ms;
+      padding: 1px 4px;
+      border-radius: 3px;
+    }
+    .tags-cloud-3d .t3d:hover {
+      color: var(--text);
+      background: var(--hover);
+    }
+    .tags-cloud-3d .t3d .c {
+      color: var(--text-faint);
+      font-size: 0.78em;
+      margin-left: 3px;
+      font-variant-numeric: tabular-nums;
+    }
+
     .detail { padding: 16px 18px; max-height: 60vh; overflow-y: auto; }
     .detail .empty { color: var(--text-faint); font-size: 13px; text-align: center; padding: 30px 10px; }
     .detail h2 { margin: 0 0 6px; font-size: 15px; font-weight: 600; line-height: 1.35; }
@@ -492,6 +536,224 @@
       font-size: 11px;
       margin-left: 8px;
     }
+
+    /* ── Time-machine scrubber ──────────────────────────────────── */
+    .timemachine-bar {
+      background: linear-gradient(135deg, rgba(210,168,255,0.08), rgba(121,192,255,0.04));
+      border: 1px solid var(--border);
+      border-left: 4px solid var(--purple);
+      border-radius: 10px;
+      padding: 12px 16px;
+      margin-bottom: 16px;
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .timemachine-bar .icon { font-size: 18px; }
+    .timemachine-bar .label {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-faint);
+    }
+    .timemachine-bar input[type="date"] {
+      background: var(--bg);
+      border: 1px solid var(--border-strong);
+      color: var(--text);
+      padding: 6px 10px;
+      border-radius: 6px;
+      font-size: 13px;
+      font-family: inherit;
+      color-scheme: dark;
+    }
+    .timemachine-bar input[type="date"]:focus { outline: none; border-color: var(--purple); }
+    :root[data-theme="light"] .timemachine-bar input[type="date"] { color-scheme: light; }
+    .timemachine-bar .tm-btn {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+      padding: 5px 11px;
+      border-radius: 6px;
+      font-size: 12px;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .timemachine-bar .tm-btn:hover { border-color: var(--purple); color: var(--text); }
+    .timemachine-bar .tm-btn.primary {
+      background: var(--purple);
+      color: #0a0a0f;
+      border-color: var(--purple);
+      font-weight: 600;
+    }
+    .timemachine-bar .tm-summary {
+      flex: 1;
+      font-size: 12.5px;
+      color: var(--text-dim);
+    }
+    .timemachine-bar .tm-summary strong { color: var(--text); font-variant-numeric: tabular-nums; }
+    .timemachine-bar.historical { border-left-color: var(--yellow); }
+
+    .historical-banner {
+      background: rgba(227,194,122,0.10);
+      border: 1px solid rgba(227,194,122,0.30);
+      color: var(--yellow);
+      padding: 10px 14px;
+      border-radius: 6px;
+      margin-bottom: 14px;
+      font-size: 12.5px;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    /* ── Diff panel ─────────────────────────────────────────────── */
+    .diff-stats {
+      display: flex;
+      gap: 14px;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border);
+      font-size: 12px;
+    }
+    .diff-stats .diff-stat {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+    }
+    .diff-stats .diff-stat .n { font-weight: 600; font-variant-numeric: tabular-nums; font-size: 14px; }
+    .diff-stat.added .n { color: var(--green); }
+    .diff-stat.removed .n { color: var(--red); }
+    .diff-stat.updated .n { color: var(--yellow); }
+    .diff-stats .diff-stat .l {
+      font-size: 10.5px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-faint);
+    }
+    .diff-row {
+      padding: 7px 14px;
+      border-bottom: 1px solid var(--border);
+      font-size: 12.5px;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      cursor: pointer;
+    }
+    .diff-row:hover { background: var(--hover); }
+    .diff-row .sign {
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-weight: 700;
+      font-size: 13px;
+      min-width: 14px;
+    }
+    .diff-row.added .sign { color: var(--green); }
+    .diff-row.removed .sign { color: var(--red); }
+    .diff-row.updated .sign { color: var(--yellow); }
+    .diff-row .t { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .diff-row .changed-fields {
+      font-size: 10.5px;
+      color: var(--text-faint);
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    }
+
+    /* ── Knowledge graph ────────────────────────────────────────── */
+    .graph-wrap {
+      position: relative;
+      height: 460px;
+      background: var(--bg);
+      overflow: hidden;
+    }
+    .graph-svg { width: 100%; height: 100%; cursor: grab; display: block; }
+    .graph-svg:active { cursor: grabbing; }
+    .graph-svg .gnode { cursor: pointer; }
+    .graph-svg .glabel {
+      font-size: 11px;
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      fill: var(--text-dim);
+      pointer-events: none;
+      text-anchor: middle;
+    }
+    .graph-svg .glabel.focused { fill: var(--text); font-weight: 600; }
+    .graph-svg .gedge { stroke: var(--border-strong); fill: none; pointer-events: none; }
+    .graph-svg .gedge.focused { stroke: var(--cyan); stroke-opacity: 0.8; }
+    .graph-legend {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 10px;
+      font-size: 11px;
+      color: var(--text-dim);
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      pointer-events: none;
+    }
+    .graph-legend .row { display: flex; gap: 6px; align-items: center; }
+    .graph-legend .sw { width: 10px; height: 10px; border-radius: 50%; }
+    .graph-empty-state {
+      padding: 30px 20px;
+      text-align: center;
+      color: var(--text-faint);
+      font-size: 13px;
+    }
+    .graph-empty-state code {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      padding: 2px 6px;
+      border-radius: 3px;
+      font-size: 12px;
+      color: var(--cyan);
+    }
+
+    /* ── Timeline ───────────────────────────────────────────────── */
+    .timeline-wrap {
+      padding: 14px 16px;
+    }
+    .timeline-svg { width: 100%; height: 130px; display: block; }
+    .timeline-legend {
+      display: flex;
+      gap: 14px;
+      font-size: 11px;
+      color: var(--text-dim);
+      margin-top: 8px;
+      justify-content: center;
+    }
+    .timeline-legend .row { display: flex; gap: 5px; align-items: center; }
+    .timeline-legend .sw { width: 11px; height: 11px; border-radius: 2px; }
+    .timeline-totals {
+      display: flex;
+      gap: 18px;
+      font-size: 12px;
+      color: var(--text-dim);
+      padding: 0 16px 8px;
+    }
+    .timeline-totals strong {
+      color: var(--text);
+      font-variant-numeric: tabular-nums;
+      font-weight: 600;
+    }
+
+    /* ── Stale row reuse de .recall-row pero con color decay ───── */
+    .stale-row { padding: 7px 14px; border-bottom: 1px solid var(--border);
+                 display: flex; gap: 10px; align-items: center; font-size: 12.5px;
+                 cursor: pointer; }
+    .stale-row:hover { background: var(--hover); }
+    .stale-row .days {
+      background: rgba(227,194,122,0.15);
+      color: var(--yellow);
+      border-radius: 4px;
+      padding: 2px 7px;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+      font-size: 11px;
+      min-width: 50px;
+      text-align: center;
+    }
+    .stale-row .days.old { background: rgba(255,123,114,0.15); color: var(--red); }
+    .stale-row .t { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   </style>
 </head>
 <body>
@@ -506,6 +768,18 @@
 
   <div class="container">
     <div id="error-banner"></div>
+
+    <!-- TIME-MACHINE — THE diferenciador de memo v0.6 — scrubber temporal -->
+    <div class="timemachine-bar" id="tm-bar">
+      <span class="icon">🕰️</span>
+      <span class="label">Memoria al</span>
+      <input type="date" id="tm-date" />
+      <button class="tm-btn" id="tm-today">hoy</button>
+      <button class="tm-btn" id="tm-7d">−7d</button>
+      <button class="tm-btn" id="tm-30d">−30d</button>
+      <button class="tm-btn primary" id="tm-diff">diff vs hoy</button>
+      <span class="tm-summary" id="tm-summary">Snapshot del corpus en cualquier fecha pasada (memo v0.6 time-machine).</span>
+    </div>
 
     <!-- VERDICT — la pregunta que importa de un vistazo: ¿vale la pena? -->
     <div class="verdict-banner" id="verdict-banner">
@@ -569,8 +843,58 @@
           <div class="panel-header">
             <span>⚠️ Candidatos a fusionar</span>
             <span class="small" id="dupes-meta">pares con embedding distance &lt; 0.12</span>
+            <button id="merge-all-btn" style="margin-left: auto; padding: 4px 12px; font-size: 11px; background: var(--cyan); color: #0a0a0f; border: none; border-radius: 6px; cursor: pointer; font-weight: 600;">Fusionar todos</button>
           </div>
           <div class="dupe-pairs-list" id="dupe-pairs">
+            <div class="loading">…</div>
+          </div>
+        </div>
+
+        <!-- DIFF (visible solo cuando hay 2 fechas comparadas) -->
+        <div class="panel" id="diff-panel" style="margin-top: 16px; display: none;">
+          <div class="panel-header">
+            <span>🔀 Diff <span id="diff-range" class="small"></span></span>
+            <span class="small" id="diff-meta"></span>
+          </div>
+          <div class="diff-stats" id="diff-stats"></div>
+          <div id="diff-rows" style="max-height: 50vh; overflow-y: auto;"></div>
+        </div>
+
+        <!-- KNOWLEDGE GRAPH — entidades + co-ocurrencia -->
+        <div class="panel" style="margin-top: 16px;">
+          <div class="panel-header">
+            <span>🕸️ Knowledge graph</span>
+            <span class="small" id="graph-meta">entidades extraídas + co-ocurrencia</span>
+          </div>
+          <div class="graph-wrap" id="graph-wrap">
+            <div class="loading">…</div>
+          </div>
+        </div>
+
+        <!-- TIMELINE — saves / updates / deletes per día -->
+        <div class="panel" style="margin-top: 16px;">
+          <div class="panel-header">
+            <span>📈 Timeline 30d</span>
+            <span class="small" id="timeline-meta">eventos por día</span>
+          </div>
+          <div class="timeline-wrap">
+            <svg class="timeline-svg" id="timeline-svg" preserveAspectRatio="none"></svg>
+            <div class="timeline-totals" id="timeline-totals"></div>
+            <div class="timeline-legend">
+              <div class="row"><span class="sw" style="background: var(--green)"></span>saves</div>
+              <div class="row"><span class="sw" style="background: var(--yellow)"></span>updates</div>
+              <div class="row"><span class="sw" style="background: var(--red)"></span>deletes</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- STALE — memorias sin update > N días -->
+        <div class="panel" style="margin-top: 16px;">
+          <div class="panel-header">
+            <span>🪦 Stale (candidatas archive)</span>
+            <span class="small" id="stale-meta">sin update &gt; 90d</span>
+          </div>
+          <div id="stale-list" style="max-height: 40vh; overflow-y: auto;">
             <div class="loading">…</div>
           </div>
         </div>
@@ -592,8 +916,8 @@
             <span>Tags más usados</span>
             <span class="small">top 20</span>
           </div>
-          <div class="tags-cloud" id="tags-cloud">
-            <div class="loading">…</div>
+          <div class="tags-cloud-3d" id="tags-cloud">
+            <div class="loading" style="padding:14px 16px;">…</div>
           </div>
         </div>
       </div>

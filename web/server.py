@@ -726,6 +726,133 @@ def memo_search_api(q: str = "", limit: int = 20) -> dict:
     return search(query=q, limit=limit)
 
 
+@app.get("/api/memo/timemachine/snapshot")
+def memo_timemachine_snapshot_api(date: str | None = None, type: str | None = None,
+                                  limit: int = 200) -> dict:
+    """Time-machine: corpus reconstruct al `date` (YYYY-MM-DD o ISO).
+
+    Replaya `history.db` en reverso desde "now" hasta T para devolver
+    los records que existían en ese momento. Memo v0.6.0 single feature
+    diferenciadora vs mem0/letta/cognee/supermemory/mem-vault.
+    """
+    from web.memo_v06 import snapshot
+    return snapshot(date=date, type_=type, limit=limit)
+
+
+@app.get("/api/memo/timemachine/diff")
+def memo_timemachine_diff_api(from_date: str, to_date: str | None = None) -> dict:
+    """Time-machine diff: added/removed/updated entre `from_date` y `to_date`."""
+    from web.memo_v06 import timemachine_diff
+    return timemachine_diff(from_date=from_date, to_date=to_date)
+
+
+@app.get("/api/memo/graph")
+def memo_graph_api(limit_nodes: int = 80, min_count: int = 2,
+                   type: str | None = None) -> dict:
+    """Knowledge graph: nodos (entidades) + edges (co-ocurrencia)."""
+    from web.memo_v06 import graph
+    return graph(limit_nodes=limit_nodes, min_count=min_count, type_filter=type)
+
+
+@app.get("/api/memo/temporal/timeline")
+def memo_temporal_timeline_api(days: int = 30) -> dict:
+    """Timeline saves/updates/deletes per día sobre últimos N días."""
+    from web.memo_v06 import temporal_timeline
+    return temporal_timeline(days=days)
+
+
+@app.get("/api/memo/temporal/stale")
+def memo_temporal_stale_api(days: int = 90, limit: int = 30) -> dict:
+    """Memorias sin update >N días — candidatas a archive."""
+    from web.memo_v06 import temporal_stale
+    return temporal_stale(days_threshold=days, limit=limit)
+
+
+@app.post("/api/memo/merge")
+def memo_merge_api(pairs: list[dict[str, str]]) -> dict:
+    """Fusiona pares de near-dupes de memo.
+
+    Para cada par (id_a, id_b):
+    1. Lee ambas memorias
+    2. Elige cuál mantener (más reciente, mejor score)
+    3. Fusiona tags del borrado al mantenido
+    4. Borra el duplicado con `memo delete`
+
+    Request body: [{"a": "id1", "b": "id2"}, ...]
+    """
+    import subprocess
+    from pathlib import Path
+
+    merged = []
+    errors = []
+
+    for pair in pairs:
+        a_id = pair.get("a")
+        b_id = pair.get("b")
+        if not a_id or not b_id:
+            errors.append({"pair": pair, "error": "missing id"})
+            continue
+
+        try:
+            # Leer ambas memorias para decidir cuál mantener
+            from web.memo_dashboard import note_detail
+
+            a_detail = note_detail(memo_id=a_id)
+            b_detail = note_detail(memo_id=b_id)
+
+            if not a_detail.get("ok") or not b_detail.get("ok"):
+                errors.append({"pair": pair, "error": "failed to read memo"})
+                continue
+
+            a_memo = a_detail.get("memo", {})
+            b_memo = b_detail.get("memo", {})
+
+            # Elegir cuál mantener: más reciente o mejor score
+            a_score = a_memo.get("score", 0)
+            b_score = b_memo.get("score", 0)
+            a_updated = a_memo.get("updated", "")
+            b_updated = b_memo.get("updated", "")
+
+            keep_id = a_id
+            delete_id = b_id
+
+            # Mantener la de mejor score, o la más reciente si empate
+            if b_score > a_score:
+                keep_id, delete_id = b_id, a_id
+            elif b_score == a_score and b_updated > a_updated:
+                keep_id, delete_id = b_id, a_id
+
+            # Fusionar tags
+            keep_tags = set(a_memo.get("tags", []) if keep_id == a_id else b_memo.get("tags", []))
+            delete_tags = set(b_memo.get("tags", []) if keep_id == a_id else a_memo.get("tags", []))
+            merged_tags = sorted(list(keep_tags | delete_tags))
+
+            # Actualizar la memoria que se mantiene con los tags fusionados
+            if merged_tags:
+                tags_str = ",".join(merged_tags)
+                subprocess.run(
+                    ["memo", "update", keep_id, "--tags", tags_str],
+                    capture_output=True,
+                    timeout=30,
+                )
+
+            # Borrar la duplicada
+            result = subprocess.run(
+                ["memo", "delete", delete_id],
+                capture_output=True,
+                timeout=30,
+            )
+
+            if result.returncode == 0:
+                merged.append({"kept": keep_id, "deleted": delete_id})
+            else:
+                errors.append({"pair": pair, "error": result.stderr.decode()})
+        except Exception as e:
+            errors.append({"pair": pair, "error": str(e)})
+
+    return {"ok": True, "merged": merged, "errors": errors}
+
+
 @app.get("/mem-vault")
 @app.get("/mem-vault/{path:path}")
 async def _mem_vault_legacy_redirect(request: Request, path: str = ""):
@@ -8933,7 +9060,7 @@ def _fetch_chrome_top_week(n: int = 5) -> list[dict]:
             except OSError:
                 continue
             try:
-                conn = sqlite3.connect(f"file:{tmp.name}?mode=ro", uri=True)
+                conn = sqlite3.connect(f"file:{tmp.name}?mode=ro", uri=True, timeout=10.0)
             except sqlite3.Error:
                 continue
             try:
@@ -9284,7 +9411,7 @@ def _fetch_youtube_watched(n: int = 5, hours: int = 168) -> list[dict]:
             except OSError:
                 continue
             try:
-                conn = sqlite3.connect(f"file:{tmp.name}?mode=ro", uri=True)
+                conn = sqlite3.connect(f"file:{tmp.name}?mode=ro", uri=True, timeout=10.0)
             except sqlite3.Error:
                 continue
             try:
@@ -18331,7 +18458,7 @@ def status_freshness(nocache: int = 0) -> dict:
 _LOGS_CACHE_TTL = 15.0  # más corto que errors (30s) porque queremos
                           # ver eventos nuevos rápido — log-tail debería
                           # sentirse "live"
-_LOGS_CACHE = ThreadSafeCacheMultiKey(ttl=15.0)
+_LOGS_CACHE = ThreadSafeCacheMultiKey(ttl=15.0, max_size=100)
 
 # Allowed values para los query params; sirven también para el contract
 # tests + el frontend pickea de acá.
@@ -19621,7 +19748,7 @@ _LOG_GLOBAL_DEFAULT_WINDOW_S = 3600  # 1h
 _LOG_GLOBAL_MAX_WINDOW_S = 7 * 86400  # 7 días
 _LOG_GLOBAL_MAX_LINES = 1000
 
-_LOG_GLOBAL_CACHE = ThreadSafeCacheMultiKey(ttl=8.0)
+_LOG_GLOBAL_CACHE = ThreadSafeCacheMultiKey(ttl=8.0, max_size=100)
 
 
 def _build_global_errors_payload(window_s: int, level_filter: str) -> dict:
@@ -19833,7 +19960,7 @@ def logs_global_errors(
 #   el log level o investigar por qué loggea tanto).
 
 _RANKINGS_CACHE_TTL = 8.0
-_RANKINGS_CACHE = ThreadSafeCacheMultiKey(ttl=8.0)
+_RANKINGS_CACHE = ThreadSafeCacheMultiKey(ttl=8.0, max_size=100)
 
 
 # Signature normalizer para clustering de error lines. Estrategia: strip
@@ -22345,7 +22472,7 @@ def screen_time_api(days: int = Query(default=7, ge=1, le=30)) -> dict:
         if not db_path.exists():
             return {"apps": [], "error": "Screen Time DB not found"}
 
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(db_path, timeout=10.0)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 

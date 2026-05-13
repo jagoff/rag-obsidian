@@ -53195,6 +53195,9 @@ cli.add_command(hygiene_cli)  # `rag hygiene` (Phase 3 cont 2026-05-09)
 from rag.cli.trends import trends_cli  # noqa: E402, F401
 cli.add_command(trends_cli)  # `rag trends` (Phase 3 cont 2026-05-09)
 
+from rag.cli.screen import screen_cli  # noqa: E402, F401
+cli.add_command(screen_cli)  # `rag screen` (Peekaboo Fase 1, 2026-05-13)
+
 from rag.cli.wake_up import wake_up_cmd  # noqa: E402, F401
 cli.add_command(wake_up_cmd, name="wake-up")  # `rag wake-up` (Phase 3 cont 2026-05-09)
 wake_up = wake_up_cmd  # back-compat con tests que importen rag.wake_up

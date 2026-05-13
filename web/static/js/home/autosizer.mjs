@@ -32,12 +32,21 @@ function readOverrides() {
 }
 
 function measureBodyContent(panel) {
-  // Solo medimos el content del .panel-body. head + foot tienen tamaño
-  // fijo (no son señal de si el content "quiere más espacio"). Si el
-  // body real cabe en la altura disponible del half (~190px tras
-  // descontar head 50 + foot 30 del cell 280), usamos half. Si no, full.
+  // OJO: `.panel-body` tiene `flex: 1` → scrollHeight devuelve el alto de
+  // la celda del grid (~528 en full, ~190 en half), NO el content real.
+  // Para medir content natural sumamos offsetHeight de cada child del
+  // body. offsetHeight de un block-level child refleja el alto que
+  // ocuparía sin restricción del padre flex.
   const body = panel.querySelector(".panel-body");
-  return body ? body.scrollHeight : 0;
+  if (!body) return 0;
+  let total = 0;
+  for (const child of body.children) {
+    // marginTop/bottom se computan via getComputedStyle si interesa, pero
+    // typicamente los children son <ul>/<table>/<div> sin margenes
+    // verticales fuertes (los items tienen gap interno).
+    total += child.offsetHeight || 0;
+  }
+  return total;
 }
 
 function classifyByContent(panel) {

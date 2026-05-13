@@ -743,16 +743,27 @@ $("#merge-all-btn").addEventListener("click", async () => {
     });
     const result = await r.json();
     if (result.ok) {
-      alert(`Fusionados ${result.merged.length} pares. ${result.errors.length} errores.`);
+      const m = result.merged?.length || 0;
+      const e = result.errors?.length || 0;
+      const w = result.warnings?.length || 0;
+      const parts = [`✓ ${m} fusionados`];
+      if (e) parts.push(`❌ ${e} errores`);
+      if (w) parts.push(`⚠️ ${w} warnings (tag merge falló, dupe igual borrado)`);
+      let msg = parts.join("  ·  ");
+      if (e && result.errors[0]) {
+        msg += `\n\nPrimer error:\n${(result.errors[0].error || "").slice(0, 300)}`;
+      }
+      alert(msg);
     } else {
-      alert("Error al fusionar pares");
+      alert("Error al fusionar pares: " + (result.error || "?"));
     }
   } catch (e) {
     alert(`Error: ${e.message}`);
   } finally {
     btn.disabled = false;
     btn.textContent = "Fusionar todos";
-    refresh(); // Recargar para actualizar la lista
+    refresh();
+    loadV06Features();
   }
 });
 

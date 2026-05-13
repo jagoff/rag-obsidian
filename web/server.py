@@ -827,8 +827,9 @@ def memo_merge_api(pairs: list[dict[str, str]]) -> dict:
     import subprocess
     from pathlib import Path
 
-    merged = []
-    errors = []
+    merged: list[dict] = []
+    errors: list[dict] = []
+    warnings: list[dict] = []
 
     for pair in pairs:
         a_id = pair.get("a")
@@ -871,18 +872,29 @@ def memo_merge_api(pairs: list[dict[str, str]]) -> dict:
             delete_tags = set(b_memo.get("tags", []) if keep_id == a_id else a_memo.get("tags", []))
             merged_tags = sorted(list(keep_tags | delete_tags))
 
-            # Actualizar la memoria que se mantiene con los tags fusionados
+            # Actualizar la memoria que se mantiene con los tags fusionados.
+            # Flag correcto: `-t TAG` repetido (NO `--tags csv`). Si falla,
+            # NO abortar el delete — perder los tags fusionados es mejor
+            # que dejar el dupe sin borrar.
             if merged_tags:
-                tags_str = ",".join(merged_tags)
-                subprocess.run(
-                    ["memo", "update", keep_id, "--tags", tags_str],
+                tag_args: list[str] = []
+                for t in merged_tags:
+                    tag_args.extend(["-t", t])
+                upd = subprocess.run(
+                    ["memo", "update", keep_id, *tag_args],
                     capture_output=True,
                     timeout=30,
                 )
+                if upd.returncode != 0:
+                    # Non-fatal: tags se pierden pero el delete sigue.
+                    warnings.append({
+                        "pair": pair,
+                        "warning": f"tag merge failed: {upd.stderr.decode()[:1500]}",
+                    })
 
-            # Borrar la duplicada
+            # Borrar la duplicada (--yes skip confirm, sin TTY abortaría)
             result = subprocess.run(
-                ["memo", "delete", delete_id],
+                ["memo", "delete", "--yes", delete_id],
                 capture_output=True,
                 timeout=30,
             )
@@ -894,7 +906,7 @@ def memo_merge_api(pairs: list[dict[str, str]]) -> dict:
         except Exception as e:
             errors.append({"pair": pair, "error": str(e)})
 
-    return {"ok": True, "merged": merged, "errors": errors}
+    return {"ok": True, "merged": merged, "errors": errors, "warnings": warnings}
 
 
 @app.get("/mem-vault")

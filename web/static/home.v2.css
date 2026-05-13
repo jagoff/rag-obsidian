@@ -763,31 +763,45 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
    verticalmente — antes eran 5 cols y los URLs largos rompían la caja
    estrecha de Para mañana. */
 .today-hero-body {
-  /* 3 cols: LO QUE PASÓ HOY se achica a 1/3 del ancho. Con 4 hero
-     sections (narrative, inbox, questions, agenda), row 1 ocupa 3,
-     row 2 cae el cuarto. Cada row dimensiona a su propio max-content. */
+  /* Grid 4-col + auto-rows fijos (mismo sistema que las .section-body),
+     para que cada hero-section sea resizable independiente snap a
+     half/full ancho y alto. grid-auto-flow: dense rellena huecos. */
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 0;
-  align-items: start;
+  grid-template-columns: repeat(4, 1fr);
+  grid-auto-rows: 220px;
+  gap: var(--space-2);
+  align-items: stretch;
+  grid-auto-flow: dense;
 }
 .today-hero-body > .hero-section {
   padding: var(--space-3) var(--space-4);
-  border-right: 1px solid var(--border);
+  border: 1px solid var(--border);
+  border-radius: 4px;
   min-width: 0;
+  overflow: hidden;
+  position: relative;
+  background: var(--bg-elev-1);
   /* URLs largos sin spaces (https://…) excedían el ancho de la columna y
      se salían del borde. anywhere parte palabras donde sea; word-break
      refuerza para Safari/iOS que no respeta anywhere todavía. */
   overflow-wrap: anywhere;
   word-break: break-word;
 }
-/* En 3 cols, el cell en la posición 3 (col derecha) NO lleva border-right.
-   Las celdas que NO están en la última fila llevan border-bottom. */
-.today-hero-body > .hero-section:nth-child(3n) { border-right: none; }
-.today-hero-body > .hero-section:not(:nth-last-child(-n+3)) {
-  border-bottom: 1px solid var(--border);
+/* Data-w/data-h: misma lógica que panels. Hero arranca con narrative
+   en full ancho + full alto (LO QUE PASÓ), demás en half/half. */
+.today-hero-body > .hero-section[data-w="half"] { grid-column: span 2; }
+.today-hero-body > .hero-section[data-w="full"] { grid-column: span 4; }
+.today-hero-body > .hero-section[data-h="half"] { grid-row: span 1; }
+.today-hero-body > .hero-section[data-h="full"] { grid-row: span 2; }
+.today-hero-body > .hero-section:not([data-w]) { grid-column: span 2; }
+.today-hero-body > .hero-section:not([data-h]) { grid-row: span 1; }
+@media (max-width: 720px) {
+  .today-hero-body { grid-template-columns: 1fr; grid-auto-rows: auto; }
+  .today-hero-body > .hero-section[data-w],
+  .today-hero-body > .hero-section:not([data-w]) { grid-column: span 1; }
+  .today-hero-body > .hero-section[data-h],
+  .today-hero-body > .hero-section:not([data-h]) { grid-row: auto; }
 }
-.today-hero-body > .hero-section:last-child { border-right: none; }
 /* Cuando una hero-section está colapsada, ocultamos la prose + sub-bodies,
    solo queda el header con su botón ▶/▼ + contador. */
 .today-hero-body > .hero-section[data-collapsed="true"] .prose,
@@ -1918,7 +1932,15 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 /* ── Resize handles (drag bordes para snap half/full) ────────────
    3 handles por panel: right edge (W), bottom edge (H), bottom-right
    corner (XY). Invisibles default, visibles en :hover del panel. */
-.panel { position: relative; }
+.panel, .hero-section { position: relative; }
+.hero-section .panel-resize-handle { z-index: 5; }
+.hero-section:hover .panel-resize-handle { opacity: 0.6; }
+.hero-section.is-resizing {
+  user-select: none;
+  outline: 2px dashed var(--cyan);
+  outline-offset: -2px;
+}
+.hero-section:hover .panel-resize-xy { opacity: 0.8; }
 .panel-resize-handle {
   position: absolute;
   background: transparent;

@@ -501,6 +501,28 @@ export function initLayout() {
     injectResizeHandles(panel);
     injectCollapseButton(panel);
   });
+  // 2b. Mismo tratamiento para las .hero-section (LO QUE PASÓ / SIN PROCESAR
+  //     / PREGUNTAS / AGENDA) — son los 4 sub-bloques del today-hero-body
+  //     y el user los quiere resizables individualmente como las panels.
+  //     Skip drag/collapse — esos ya tienen su propio sistema en panel-today.mjs.
+  const heroBody = document.getElementById("today-hero-body");
+  if (heroBody) {
+    heroBody.querySelectorAll(":scope > .hero-section").forEach((sec) => {
+      injectResizeHandles(sec);
+    });
+    // El hero-body se re-renderiza cuando llega el brief — watch nuevas
+    // hero-sections para aplicar handles también.
+    const heroMo = new MutationObserver((muts) => {
+      for (const m of muts) {
+        for (const n of m.addedNodes) {
+          if (n.nodeType === 1 && n.classList?.contains("hero-section")) {
+            injectResizeHandles(n);
+          }
+        }
+      }
+    });
+    heroMo.observe(heroBody, { childList: true });
+  }
   // 3. Aplicar estado de collapse persistido
   applySavedCollapse();
   // 4. Hacer cada section-body un drop zone para "soltar al final"

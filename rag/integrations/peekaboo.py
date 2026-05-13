@@ -551,6 +551,15 @@ def observe_once(
         except Exception:
             pass
 
+    # Invalidá el cache del mirror para que la próxima request a
+    # `/api/mirror` vea la observación recién insertada. Si mirror no está
+    # cargado o falla, no aborta la observación — best-effort hook.
+    try:
+        from rag.mirror import cache_invalidate as _mirror_cache_invalidate  # noqa: PLC0415
+        _mirror_cache_invalidate()
+    except Exception:
+        pass
+
     return _finalize(
         ok=True,
         observation_id=observation_id,

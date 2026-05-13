@@ -472,6 +472,86 @@ def _source_screen_time(date: str) -> dict[str, Any]:
         return {"apps": [], "error": str(exc)}
 
 
+def _source_screen_context(date: str) -> dict[str, Any]:
+    """Últimas 3 observaciones de pantalla del Peekaboo observer (Fase 2).
+
+    Fuente: `rag_screen_observations` poblada por `screen_observer_job`
+    cada 15min cuando `RAG_SCREEN_OBSERVE=1`. Da contexto **live** de qué
+    está mirando el user — complementa screen_time (cuánto tiempo en cada
+    app) con contenido (qué pantalla concretamente).
+
+    Retorna `{recent: [{ts, app_name, window_title, caption, age_minutes}, ...],
+    count_today, count_7d}`. Empty `recent` si:
+    - El feature está OFF (tabla vacía).
+    - Última observación >4h atrás (probablemente sleep/AFK — no contexto live).
+
+    Cap recent=3 para mantener el response liviano. El caption se trunca a
+    140 chars (suficiente para preview, full body queda en la tabla).
+    """
+    conn = _open_telemetry_ro()
+    if conn is None:
+        return {"recent": [], "count_today": 0, "count_7d": 0}
+    try:
+        # Verificá que la tabla existe — feature recién agregado, DB viejas
+        # pueden no tenerla todavía.
+        try:
+            conn.execute("SELECT 1 FROM rag_screen_observations LIMIT 0")
+        except sqlite3.Error:
+            return {"recent": [], "count_today": 0, "count_7d": 0}
+
+        now_ts = int(time.time())
+        cutoff_live = now_ts - 4 * 3600  # ventana "live": últimas 4h
+        cutoff_today = now_ts - 24 * 3600
+        cutoff_7d = now_ts - 7 * 86400
+
+        cur = conn.execute(
+            "SELECT ts, app_name, window_title, caption "
+            "FROM rag_screen_observations "
+            "WHERE ts >= ? "
+            "ORDER BY ts DESC LIMIT 3",
+            (cutoff_live,),
+        )
+        recent: list[dict[str, Any]] = []
+        for row in cur.fetchall():
+            ts, app, title, caption = row
+            cap = (caption or "").strip()
+            if len(cap) > 140:
+                cap = cap[:137] + "…"
+            recent.append({
+                "ts": int(ts),
+                "app_name": app or "",
+                "window_title": title or "",
+                "caption": cap,
+                "age_minutes": max(0, (now_ts - int(ts)) // 60),
+            })
+
+        try:
+            count_today = int(conn.execute(
+                "SELECT COUNT(*) FROM rag_screen_observations WHERE ts >= ?",
+                (cutoff_today,),
+            ).fetchone()[0])
+        except sqlite3.Error:
+            count_today = 0
+        try:
+            count_7d = int(conn.execute(
+                "SELECT COUNT(*) FROM rag_screen_observations WHERE ts >= ?",
+                (cutoff_7d,),
+            ).fetchone()[0])
+        except sqlite3.Error:
+            count_7d = 0
+
+        return {
+            "recent": recent,
+            "count_today": count_today,
+            "count_7d": count_7d,
+        }
+    except Exception as exc:
+        logger.warning("mirror: screen_context failed: %s", exc)
+        return {"recent": [], "count_today": 0, "count_7d": 0, "error": str(exc)[:200]}
+    finally:
+        conn.close()
+
+
 def _source_observations(date: str) -> dict[str, Any]:
     """Observaciones rápidas: drift alerts recientes, contradicciones
     abiertas, anticipatory pushes hoy."""
@@ -544,6 +624,7 @@ _SOURCES: dict[str, Callable[[str], dict[str, Any]]] = {
     "dormant_notes": _source_dormant_notes,
     "spotify_top": _source_spotify_top,
     "screen_time": _source_screen_time,
+    "screen_context": _source_screen_context,
     "observations": _source_observations,
 }
 

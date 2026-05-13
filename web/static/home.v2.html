@@ -33,7 +33,7 @@
         media="(device-width: 402px) and (device-height: 874px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
   <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-16-pro-max.png"
         media="(device-width: 440px) and (device-height: 956px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
-  <link rel="stylesheet" href="/static/home.v2.css?v=74">
+  <link rel="stylesheet" href="/static/home.v2.css?v=76">
   <!-- marked@18 vendored — same SRI as the v1 home. Used to parse the
        today/tomorrow narrative which has 4 H2 sub-sections that need
        real markdown rendering (lists, headers) — not the regex hack. -->
@@ -253,6 +253,18 @@
           </div>
           <footer class="panel-foot" data-foot></footer>
         </article>
+        <!-- Peekaboo · screen observations cada 15min (granite VLM
+             caption del frontmost app). Source: rag_screen_observations
+             poblada por supervisor job `screen_observer`. PNG sirve via
+             /api/screen-capture/<id>. Hidden via JS si tabla vacía. -->
+        <article class="panel panel-peekaboo" id="p-peekaboo" hidden>
+          <header class="panel-head">
+            <span class="title">Peekaboo · captures</span>
+            <span class="count" data-count></span>
+          </header>
+          <div class="panel-body" data-body><div class="empty">cargando…</div></div>
+          <footer class="panel-foot" data-foot></footer>
+        </article>
         <!-- Apple Health · daily aggregates desde export.xml iCloud Drive.
              Source: rag_apple_health_daily (poblada por `rag health-import`,
              manual o cron F4-followup). Métricas: pasos, kcal activas,
@@ -439,7 +451,7 @@
     </div>
   </dialog>
 
-  <script type="module" src="/static/js/home/app.mjs?v=74"></script>
+  <script type="module" src="/static/js/home/app.mjs?v=76"></script>
   <!-- Registra el SW + auto-reload on update. Sin esto, los fixes que
        deployamos al frontend no se propagan: el SW viejo sirve assets
        cacheados y el JS viejo sigue corriendo aunque haya versión

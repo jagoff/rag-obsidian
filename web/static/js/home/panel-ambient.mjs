@@ -285,6 +285,69 @@ function _ringPct(value, goal) {
   return Math.min(100, Math.round((value / goal) * 100));
 }
 
+// ── Peekaboo screen observations ──────────────────────────────────────────
+
+function _fmtAgo(tsEpoch) {
+  if (!tsEpoch) return "";
+  const sec = Math.max(0, Math.floor(Date.now() / 1000 - tsEpoch));
+  if (sec < 60) return "ahora";
+  if (sec < 3600) return `${Math.floor(sec / 60)}m`;
+  if (sec < 86400) return `${Math.floor(sec / 3600)}h`;
+  return `${Math.floor(sec / 86400)}d`;
+}
+
+export function renderPeekaboo(payload) {
+  const obs = payload.signals?.screen_observations || [];
+  const panel = document.getElementById("p-peekaboo");
+  if (!panel) return;
+  if (!obs.length) {
+    panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+  const body = panel.querySelector("[data-body]");
+  const count = panel.querySelector("[data-count]");
+  if (count) {
+    count.textContent = obs.length;
+    count.classList.add("has-items");
+  }
+
+  // Layout: hero (latest) + grid de thumbnails compactos.
+  const latest = obs[0];
+  const rest = obs.slice(1, 6);
+
+  const heroCaption = (latest.caption || "").trim();
+  const isNoAnswer = !heroCaption || heroCaption === "<no answer>";
+  const captionText = isNoAnswer ? "— sin caption —" : heroCaption;
+
+  const heroHTML = `
+    <a class="peekaboo-hero" href="${escapeHTML(latest.thumb_url || "")}" target="_blank" rel="noopener">
+      ${latest.thumb_url
+        ? `<img class="peekaboo-art" src="${escapeHTML(latest.thumb_url)}" alt="${escapeHTML(latest.app_name || "")}" loading="lazy">`
+        : `<div class="peekaboo-art peekaboo-art-placeholder" aria-hidden="true">👁</div>`}
+      <div class="peekaboo-text">
+        <div class="row-title">${escapeHTML(latest.app_name || "?")} <span class="peekaboo-ago">· ${escapeHTML(_fmtAgo(latest.ts))}</span></div>
+        <div class="row-meta peekaboo-caption ${isNoAnswer ? "is-empty" : ""}">${escapeHTML(captionText)}</div>
+      </div>
+    </a>`;
+
+  const thumbsHTML = rest.length ? `
+    <div class="peekaboo-thumbs">
+      ${rest.map(o => `
+        <a class="peekaboo-thumb" href="${escapeHTML(o.thumb_url || "")}" target="_blank" rel="noopener" title="${escapeHTML((o.app_name || "?") + " · " + (o.caption || "").slice(0, 80))}">
+          ${o.thumb_url
+            ? `<img src="${escapeHTML(o.thumb_url)}" alt="" loading="lazy">`
+            : `<div class="peekaboo-thumb-placeholder">👁</div>`}
+          <span class="peekaboo-thumb-meta">${escapeHTML(o.app_name || "?")} · ${escapeHTML(_fmtAgo(o.ts))}</span>
+        </a>
+      `).join("")}
+    </div>
+  ` : "";
+
+  body.innerHTML = heroHTML + thumbsHTML;
+}
+
+
 export function renderHealth(payload) {
   const h = payload.signals?.health;
   const panel = document.getElementById("p-health");

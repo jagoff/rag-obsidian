@@ -9449,6 +9449,43 @@ def _fetch_sleep() -> dict | None:
     }
 
 
+def _fetch_screen_observations(limit: int = 6) -> list[dict]:
+    """Peekaboo screen captions — últimas N rows de `rag_screen_observations`
+    poblada cada 15min por el supervisor job `screen_observer` (in-process
+    granite VLM). Read-only.
+
+    Returns list ordered desc by ts (most recent first). Empty list cuando
+    la tabla no existe o el daemon nunca corrió. Thumbnails servidas via
+    `/api/screen-capture/<id>` endpoint pre-existente.
+    """
+    try:
+        from rag import _ragvec_state_conn  # noqa: PLC0415
+    except Exception:
+        return []
+    try:
+        with _ragvec_state_conn() as conn:
+            cur = conn.execute(
+                "SELECT id, ts, app_name, window_title, caption, image_path "
+                "FROM rag_screen_observations "
+                "ORDER BY ts DESC LIMIT ?",
+                (int(limit),),
+            )
+            cols = [c[0] for c in cur.description]
+            rows = cur.fetchall()
+    except Exception:
+        return []
+    out = []
+    for r in rows:
+        d = dict(zip(cols, r))
+        # No queremos surfacear el path real al frontend — usar /api/screen-capture/<id>.
+        d["thumb_url"] = (
+            f"/api/screen-capture/{d['id']}" if d.get("image_path") else None
+        )
+        d.pop("image_path", None)
+        out.append(d)
+    return out
+
+
 def _fetch_health() -> dict | None:
     """Apple Health daily metrics — steps / kcal / exercise / stand /
     HR / HRV / workouts. Read-only desde `rag_apple_health_daily`,
@@ -11864,6 +11901,11 @@ def _home_compute(
         # Returns None cuando la tabla está vacía → frontend hidea
         # `p-health`. Hot path ~5ms (1 SELECT today + 1 SELECT 14d).
         fut_health      = pool.submit(_timed, "health", _fetch_health)
+        # Peekaboo screen observations: last 6 frontmost captures + granite
+        # captions. Tabla poblada por supervisor job `screen_observer` cada
+        # 15min (gated por RAG_PEEKABOO_ENABLE + RAG_SCREEN_OBSERVE).
+        # Read-only desde `rag_screen_observations`. ~5ms.
+        fut_screen      = pool.submit(_timed, "screen", _fetch_screen_observations, 6)
 
         # Helper: wait on a future with budget, return default on timeout
         # or worker exception. Emits "timeout" progress event so the UI
@@ -11951,6 +11993,7 @@ def _home_compute(
         sleep = _await("sleep", fut_sleep, 3, default=None)
         mood = _await("mood", fut_mood, 3, default=None)
         health = _await("health", fut_health, 3, default=None)
+        screen_obs = _await("screen", fut_screen, 3, default=[])
 
         signals["pagerank_top"] = pagerank_top
         signals["chrome_top_week"] = chrome_top_week
@@ -11967,6 +12010,7 @@ def _home_compute(
         signals["sleep"] = sleep
         signals["mood"] = mood
         signals["health"] = health
+        signals["screen_observations"] = screen_obs
     finally:
         # Detach stragglers; they continue warming caches for the next call.
         # On SSE-client disconnect (cancel_event set), drop pending

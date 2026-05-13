@@ -682,6 +682,105 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
   color: var(--text-dim);
   margin-top: 2px;
 }
+/* ── Peekaboo panel (screen observations) ──────────────────────
+   Hero con thumbnail grande (último capture) + grid de thumbs
+   compactos abajo. Mismo language visual que Spotify hero pero
+   acomodado para 16:10 screens (más wide aspect ratio). */
+.panel-peekaboo .panel-body {
+  padding: var(--space-2) var(--space-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.peekaboo-hero {
+  display: flex;
+  gap: var(--space-3);
+  align-items: flex-start;
+  padding-bottom: var(--space-2);
+  border-bottom: 1px solid var(--border);
+  text-decoration: none;
+  color: inherit;
+}
+.peekaboo-hero:hover .row-title { color: var(--cyan); }
+.peekaboo-art {
+  width: 128px;
+  height: 80px;
+  object-fit: cover;
+  border-radius: 3px;
+  flex-shrink: 0;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+}
+.peekaboo-art-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 32px;
+  color: var(--text-faint);
+}
+.peekaboo-text {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.peekaboo-ago {
+  color: var(--text-faint);
+  font-weight: normal;
+  font-size: var(--fs-mini);
+}
+.peekaboo-caption {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  font-size: var(--fs-mini);
+  line-height: 1.35;
+  color: var(--text-dim);
+}
+.peekaboo-caption.is-empty { color: var(--text-faint); font-style: italic; }
+.peekaboo-thumbs {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(80px, 1fr));
+  gap: 4px;
+}
+.peekaboo-thumb {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-decoration: none;
+  color: inherit;
+}
+.peekaboo-thumb img {
+  width: 100%;
+  aspect-ratio: 16 / 10;
+  object-fit: cover;
+  border-radius: 2px;
+  border: 1px solid var(--border);
+  background: var(--bg-elev-2);
+}
+.peekaboo-thumb-placeholder {
+  width: 100%;
+  aspect-ratio: 16 / 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  color: var(--text-faint);
+  font-size: 18px;
+}
+.peekaboo-thumb:hover img { border-color: var(--cyan); }
+.peekaboo-thumb-meta {
+  font-size: 9px;
+  color: var(--text-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .health-stale {
   display: inline-block;
   font-size: 9px;

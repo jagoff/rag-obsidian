@@ -91,11 +91,3 @@ CLAUDE.original.md
 .devin/mcp-profiles/.active
 .devin/mcp-profiles/.default
 .devin/mcp-profiles/**/*.bak-harness-*
-
-# caveman skill (https://github.com/JuliusBrussee/caveman) — installer
-# writes universal copies por agente. El plugin global en
-# ~/.claude/plugins/marketplaces/caveman ya cubre Claude Code, estas
-# copias son redundantes para el repo y no deben commitearse.
-/.agents/
-/.devin/skills/
-/.windsurf/skills/

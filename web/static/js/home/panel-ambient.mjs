@@ -148,9 +148,19 @@ export function renderSpotify(payload) {
   const sp = payload.signals?.spotify;
   const panel = document.getElementById("p-spotify");
   if (!panel) return;
-  // Ocultar panel si no hay nada — Spotify cerrado + sin historial del día.
-  if (!sp || (!sp.now_playing && !(sp.recent_today || []).length)) {
-    panel.hidden = true;
+  // Caso "empty" (server siempre devuelve payload desde 2026-05-13):
+  // tabla `rag_spotify_log` vacía + Spotify cerrado. Mostrar placeholder
+  // accionable en vez de hidear (UX previo era confuso — user no sabía
+  // si el panel estaba roto o feature off).
+  if (!sp || sp.state === "empty" || (!sp.now_playing && !(sp.recent_today || []).length)) {
+    panel.hidden = false;
+    const body = panel.querySelector("[data-body]");
+    const count = panel.querySelector("[data-count]");
+    if (count) count.textContent = "—";
+    if (body) {
+      const msg = sp?.message || "Sin historial — daemon spotify-poll no corriendo.";
+      body.innerHTML = `<div class="empty">${escapeHTML(msg)}</div>`;
+    }
     return;
   }
   panel.hidden = false;

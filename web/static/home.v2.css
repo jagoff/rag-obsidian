@@ -344,29 +344,53 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 
 /* Section bodies — different layouts per section */
 
+/* ── Grid 4-col fijo + size discreto por panel ───────────────────────
+   2 widths (data-w): half = span 2 cols, full = span 4 cols.
+   2 heights (data-h): half = span 1 row (~280px), full = span 2 rows (~580px).
+   Tamaño asignado por autosizer.mjs según scrollHeight del content.
+   `align-items: stretch` (default del grid) hace que el panel llene la
+   celda — sin huecos verticales raros. Si el content es chico, el
+   autosizer marca data-h=half para evitar desperdicio. */
 .section-accionable .section-body,
 .section-briefs .section-body,
 .section-monitoring .section-body,
 .section-ambient .section-body {
   display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  grid-auto-rows: 280px;
   gap: var(--space-3);
-  /* Each panel sizes to its natural content height — no stretch-to-row.
-     Grid columns stay intact; rows become ragged but cells stop holding
-     empty space when one panel in the row has much more content. */
-  align-items: start;
+  align-items: stretch;
+  /* `dense` permite que cajas chicas (half×half) rellenen huecos que
+     dejarían cajas grandes (half×full) si estuvieran solas. Sin esto,
+     el grid deja huecos en filas con un panel full y otro half. */
+  grid-auto-flow: dense;
 }
 
-.section-accionable .section-body {
-  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-}
-.section-briefs .section-body {
-  grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
-}
-.section-monitoring .section-body {
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-}
-.section-ambient .section-body {
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+.section-body > .panel[data-w="half"] { grid-column: span 2; }
+.section-body > .panel[data-w="full"] { grid-column: span 4; }
+.section-body > .panel[data-h="half"] { grid-row: span 1; }
+.section-body > .panel[data-h="full"] { grid-row: span 2; }
+
+/* Default antes que el autosizer corra: half×full evita layout shift
+   feo (los paneles arrancan medianos, luego promote/demote según
+   content). */
+.section-body > .panel:not([data-w]) { grid-column: span 2; }
+.section-body > .panel:not([data-h]) { grid-row: span 2; }
+
+/* Mobile: 1-col, force span 1 — cada panel ocupa todo el ancho y
+   altura natural. */
+@media (max-width: 720px) {
+  .section-accionable .section-body,
+  .section-briefs .section-body,
+  .section-monitoring .section-body,
+  .section-ambient .section-body {
+    grid-template-columns: 1fr;
+    grid-auto-rows: auto;
+  }
+  .section-body > .panel[data-w],
+  .section-body > .panel:not([data-w]) { grid-column: span 1; }
+  .section-body > .panel[data-h],
+  .section-body > .panel:not([data-h]) { grid-row: auto; }
 }
 
 /* ── Panel (componente base) ─────────────────────────────── */
@@ -739,31 +763,45 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
    verticalmente — antes eran 5 cols y los URLs largos rompían la caja
    estrecha de Para mañana. */
 .today-hero-body {
-  /* 3 cols: LO QUE PASÓ HOY se achica a 1/3 del ancho. Con 4 hero
-     sections (narrative, inbox, questions, agenda), row 1 ocupa 3,
-     row 2 cae el cuarto. Cada row dimensiona a su propio max-content. */
+  /* Grid 4-col + auto-rows fijos (mismo sistema que las .section-body),
+     para que cada hero-section sea resizable independiente snap a
+     half/full ancho y alto. grid-auto-flow: dense rellena huecos. */
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 0;
-  align-items: start;
+  grid-template-columns: repeat(4, 1fr);
+  grid-auto-rows: 220px;
+  gap: var(--space-2);
+  align-items: stretch;
+  grid-auto-flow: dense;
 }
 .today-hero-body > .hero-section {
   padding: var(--space-3) var(--space-4);
-  border-right: 1px solid var(--border);
+  border: 1px solid var(--border);
+  border-radius: 4px;
   min-width: 0;
+  overflow: hidden;
+  position: relative;
+  background: var(--bg-elev-1);
   /* URLs largos sin spaces (https://…) excedían el ancho de la columna y
      se salían del borde. anywhere parte palabras donde sea; word-break
      refuerza para Safari/iOS que no respeta anywhere todavía. */
   overflow-wrap: anywhere;
   word-break: break-word;
 }
-/* En 3 cols, el cell en la posición 3 (col derecha) NO lleva border-right.
-   Las celdas que NO están en la última fila llevan border-bottom. */
-.today-hero-body > .hero-section:nth-child(3n) { border-right: none; }
-.today-hero-body > .hero-section:not(:nth-last-child(-n+3)) {
-  border-bottom: 1px solid var(--border);
+/* Data-w/data-h: misma lógica que panels. Hero arranca con narrative
+   en full ancho + full alto (LO QUE PASÓ), demás en half/half. */
+.today-hero-body > .hero-section[data-w="half"] { grid-column: span 2; }
+.today-hero-body > .hero-section[data-w="full"] { grid-column: span 4; }
+.today-hero-body > .hero-section[data-h="half"] { grid-row: span 1; }
+.today-hero-body > .hero-section[data-h="full"] { grid-row: span 2; }
+.today-hero-body > .hero-section:not([data-w]) { grid-column: span 2; }
+.today-hero-body > .hero-section:not([data-h]) { grid-row: span 1; }
+@media (max-width: 720px) {
+  .today-hero-body { grid-template-columns: 1fr; grid-auto-rows: auto; }
+  .today-hero-body > .hero-section[data-w],
+  .today-hero-body > .hero-section:not([data-w]) { grid-column: span 1; }
+  .today-hero-body > .hero-section[data-h],
+  .today-hero-body > .hero-section:not([data-h]) { grid-row: auto; }
 }
-.today-hero-body > .hero-section:last-child { border-right: none; }
 /* Cuando una hero-section está colapsada, ocultamos la prose + sub-bodies,
    solo queda el header con su botón ▶/▼ + contador. */
 .today-hero-body > .hero-section[data-collapsed="true"] .prose,
@@ -1844,6 +1882,122 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
   .panel-collapse-btn .toggle-icon { transition: none; }
 }
 
+/* ── Chips de tamaño manual (↔ ancho, ↕ alto) ─────────────────
+   Override del autosizer. Click → setPanelSize() persiste en
+   localStorage["home.v2.panel-sizes.v1"]. Hover muy sutil porque
+   son secundarios — el autosizer hace lo correcto 90% del tiempo. */
+.panel-size-chip {
+  flex-shrink: 0;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 2px 7px;
+  font-size: 10px;
+  font-family: var(--font-mono);
+  letter-spacing: 0.04em;
+  line-height: 1;
+  border-radius: 3px;
+  white-space: nowrap;
+  transition: color var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out),
+              background var(--dur-fast) var(--ease-out);
+}
+.panel-size-chip:hover {
+  color: var(--cyan);
+  border-color: var(--cyan);
+  background: var(--bg-elev-1);
+}
+.panel-size-chip:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 1px var(--border-focus);
+}
+/* Indicador estado: panel ya está en full en esa dimensión → chip
+   pintado cyan tenue (informa "esto se puede achicar"). */
+.panel[data-w="full"] .panel-size-chip-w,
+.panel[data-h="full"] .panel-size-chip-h {
+  color: var(--cyan);
+  border-color: var(--cyan);
+}
+.panel-size-chip:focus-visible {
+  outline: none;
+  opacity: 1;
+  box-shadow: 0 0 0 1px var(--border-focus);
+}
+/* Mobile: ocultar chips (1-col grid, no tiene sentido toggle). */
+@media (max-width: 720px) {
+  .panel-size-chip { display: none; }
+}
+
+/* ── Resize handles (drag bordes para snap half/full) ────────────
+   3 handles por panel: right edge (W), bottom edge (H), bottom-right
+   corner (XY). Invisibles default, visibles en :hover del panel. */
+.panel, .hero-section { position: relative; }
+.hero-section .panel-resize-handle { z-index: 5; }
+.hero-section:hover .panel-resize-handle { opacity: 0.6; }
+.hero-section.is-resizing {
+  user-select: none;
+  outline: 2px dashed var(--cyan);
+  outline-offset: -2px;
+}
+.hero-section:hover .panel-resize-xy { opacity: 0.8; }
+.panel-resize-handle {
+  position: absolute;
+  background: transparent;
+  opacity: 0;
+  z-index: 5;
+  transition: opacity var(--dur-fast) var(--ease-out),
+              background var(--dur-fast) var(--ease-out);
+}
+.panel:hover .panel-resize-handle { opacity: 0.6; }
+.panel-resize-handle:hover {
+  opacity: 1 !important;
+  background: var(--cyan);
+}
+.panel.is-resizing .panel-resize-handle { opacity: 1; background: var(--cyan); }
+
+/* Right edge — drag horizontal */
+.panel-resize-x {
+  top: 8px; bottom: 8px; right: -2px; width: 6px;
+  cursor: ew-resize;
+  border-radius: 2px;
+}
+/* Bottom edge — drag vertical */
+.panel-resize-y {
+  left: 8px; right: 8px; bottom: -2px; height: 6px;
+  cursor: ns-resize;
+  border-radius: 2px;
+}
+/* Bottom-right corner — drag both */
+.panel-resize-xy {
+  width: 14px; height: 14px;
+  right: -2px; bottom: -2px;
+  cursor: nwse-resize;
+  border-radius: 2px;
+  /* Sutil indicador visual de "corner draggable" — 2 líneas diagonales */
+  background:
+    linear-gradient(135deg, transparent 50%, var(--text-faint) 50%, var(--text-faint) 60%, transparent 60%, transparent 70%, var(--text-faint) 70%, var(--text-faint) 80%, transparent 80%);
+  opacity: 0.35;
+}
+.panel:hover .panel-resize-xy { opacity: 0.8; }
+.panel-resize-xy:hover {
+  opacity: 1 !important;
+  background:
+    linear-gradient(135deg, transparent 50%, var(--cyan) 50%, var(--cyan) 60%, transparent 60%, transparent 70%, var(--cyan) 70%, var(--cyan) 80%, transparent 80%);
+}
+
+/* Durante resize, prevenir selección de texto + ghost outline cyan */
+.panel.is-resizing {
+  user-select: none;
+  outline: 2px dashed var(--cyan);
+  outline-offset: -2px;
+}
+
+/* Mobile: handles ocultos (no aplica el grid). */
+@media (max-width: 720px) {
+  .panel-resize-handle { display: none; }
+}
+
 
 /* ────────────────────────────────────────────────────────────
    Wikilinks en el narrative del LLM y prose en general — el
@@ -2864,150 +3018,5 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
   .patterns-cov-row .cov-bar,
   .patterns-history-btn {
     transition: none;
-  }
-}
-
-/* ╔═══════════ Gridstack layout libre — overrides ═══════════╗
-   Activado por layout.mjs cuando aplana los paneles dentro de
-   `#ra-grid.grid-stack`. Los `.section` originales quedan vacíos
-   y se ocultan via `hidden`. El user mueve y redimensiona cada
-   `.grid-stack-item` libremente; layout persistido en
-   localStorage por panel ID. */
-
-#ra-grid {
-  margin-top: var(--space-3);
-}
-
-#ra-grid .grid-stack-item-content {
-  inset: 0;
-  display: flex;
-  /* Pisar el padding que mete Gridstack para que el panel ocupe todo
-     el slot. El margin entre items lo da la opción `margin` del init. */
-}
-
-#ra-grid .grid-stack-item-content > .panel {
-  flex: 1 1 auto;
-  width: 100%;
-  height: 100%;
-  margin: 0;
-}
-
-/* Edit mode: borde y handle visibles para indicar que se puede mover.
-   En lock-mode (default), todo se ve idéntico al layout anterior. */
-body.ra-layout-editing #ra-grid .grid-stack-item {
-  outline: 1px dashed color-mix(in srgb, var(--cyan, #5ec4ff) 60%, transparent);
-  outline-offset: -1px;
-}
-body.ra-layout-editing #ra-grid .grid-stack-item:hover {
-  outline-color: var(--cyan, #5ec4ff);
-}
-body.ra-layout-editing #ra-grid .panel-head {
-  cursor: grab;
-}
-body.ra-layout-editing #ra-grid .panel-head:active {
-  cursor: grabbing;
-}
-body.ra-layout-editing #ra-grid .panel-head::before {
-  content: "⋮⋮";
-  font-size: 12px;
-  color: var(--cyan, #5ec4ff);
-  margin-right: var(--space-2);
-  letter-spacing: -2px;
-  flex-shrink: 0;
-}
-
-/* Resize handles: Gridstack los pone con `ui-resizable-autohide` (visible
-   solo en hover). Cuando estamos en edit mode los queremos SIEMPRE
-   visibles para que el user sepa que puede resize. */
-body.ra-layout-editing #ra-grid .ui-resizable-handle {
-  opacity: 1 !important;
-  background: color-mix(in srgb, var(--cyan, #5ec4ff) 35%, transparent);
-  border: 1px solid var(--cyan, #5ec4ff);
-  z-index: 90;
-  display: block !important;
-}
-body.ra-layout-editing #ra-grid .ui-resizable-handle:hover {
-  background: var(--cyan, #5ec4ff);
-}
-/* Tamaños custom por dirección para que sean fáciles de agarrar (mouse + touch). */
-body.ra-layout-editing #ra-grid .ui-resizable-e,
-body.ra-layout-editing #ra-grid .ui-resizable-w {
-  width: 8px;
-}
-body.ra-layout-editing #ra-grid .ui-resizable-s {
-  height: 8px;
-}
-body.ra-layout-editing #ra-grid .ui-resizable-se,
-body.ra-layout-editing #ra-grid .ui-resizable-sw {
-  width: 16px;
-  height: 16px;
-  border-radius: 3px;
-}
-/* Default lock state: handles ocultos. */
-body:not(.ra-layout-editing) #ra-grid .ui-resizable-handle {
-  display: none !important;
-}
-
-/* Banner de ayuda cuando se activa edit mode primera vez en la sesión. */
-.ra-edit-hint {
-  position: fixed;
-  bottom: calc(16px + env(safe-area-inset-bottom, 0px));
-  left: 50%;
-  transform: translateX(-50%);
-  background: var(--bg-elev-2, #1a1e26);
-  color: var(--text, #ececed);
-  border: 1px solid var(--cyan, #5ec4ff);
-  border-radius: 6px;
-  padding: 10px 16px;
-  font-size: var(--fs-mini, 12px);
-  z-index: 9999;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, .4);
-  animation: ra-hint-in .25s ease-out;
-}
-.ra-edit-hint code {
-  background: rgba(94, 196, 255, 0.15);
-  padding: 1px 5px;
-  border-radius: 3px;
-  font-family: var(--font-mono, ui-monospace, monospace);
-}
-@keyframes ra-hint-in {
-  from { opacity: 0; transform: translate(-50%, 20px); }
-  to { opacity: 1; transform: translate(-50%, 0); }
-}
-
-/* Botón lock/unlock en la topbar. Estilo idéntico al reset-order-btn. */
-.layout-edit-btn,
-.reset-order-btn {
-  background: transparent;
-  border: 1px solid var(--border);
-  color: var(--text-dim);
-  font-family: inherit;
-  font-size: var(--fs-mini, 11px);
-  padding: 4px 8px;
-  border-radius: 3px;
-  cursor: pointer;
-  transition: border-color var(--dur-base) var(--ease-out),
-              color var(--dur-base) var(--ease-out);
-}
-.layout-edit-btn:hover,
-.reset-order-btn:hover {
-  border-color: var(--cyan, #5ec4ff);
-  color: var(--cyan, #5ec4ff);
-}
-.layout-edit-btn[aria-pressed="true"] {
-  border-color: var(--cyan, #5ec4ff);
-  color: var(--cyan, #5ec4ff);
-  background: color-mix(in srgb, var(--cyan, #5ec4ff) 8%, transparent);
-}
-
-/* Mobile: Gridstack default a 1 columna abajo de 768px. Esto colapsa
-   todo a stack vertical sin breakpoints custom. */
-@media (max-width: 768px) {
-  #ra-grid {
-    /* Gridstack maneja la transición con su prop `column-options` o el
-       evento resize; por defecto v12 hace 1-col bajo 768px. */
-  }
-  body.ra-layout-editing #ra-grid .panel-head::before {
-    display: none;
   }
 }

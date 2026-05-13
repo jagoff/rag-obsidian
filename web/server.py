@@ -9324,19 +9324,37 @@ def _fetch_spotify(limit: int = 10) -> dict | None:
     # Fallback "lo último que se escuchó" (regla 2026-05-11): si el user
     # no tuvo Spotify abierto hoy pero sí días previos, surface la
     # actividad histórica reciente en vez de hidear el panel completo.
-    fallback_used = False
+    fallback_used = "today"
     if not np and not recent:
-        try:
-            recent = recent_tracks_lookback(days=7, limit=limit)
-            fallback_used = bool(recent)
-        except Exception:
-            recent = []
+        for window_days in (7, 30, 365):
+            try:
+                recent = recent_tracks_lookback(days=window_days, limit=limit)
+                if recent:
+                    fallback_used = f"lookback_{window_days}d"
+                    break
+            except Exception:
+                recent = []
+    # Regla 2026-05-13: nunca devolver None. Si la tabla está completamente
+    # vacía (daemon nunca corrió), igual devolvemos un payload con
+    # `state=empty` así el frontend puede mostrar un placeholder con
+    # instrucción de setup en vez de hidear silenciosamente el panel
+    # (UX confuso — el user no sabía si era un bug o feature off).
     if not np and not recent:
-        return None
+        return {
+            "now_playing": None,
+            "recent_today": [],
+            "fallback": "none",
+            "state": "empty",
+            "message": (
+                "Sin historial · daemon spotify-poll inactivo. "
+                "Activar con `rag start --full` (incluye spotify-poll)."
+            ),
+        }
     return {
         "now_playing": np,
         "recent_today": recent,
-        "fallback": "lookback_7d" if fallback_used else "today",
+        "fallback": fallback_used,
+        "state": "playing" if np else "history",
     }
 
 

@@ -1915,6 +1915,67 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
   .panel-size-chip { display: none; }
 }
 
+/* ── Resize handles (drag bordes para snap half/full) ────────────
+   3 handles por panel: right edge (W), bottom edge (H), bottom-right
+   corner (XY). Invisibles default, visibles en :hover del panel. */
+.panel { position: relative; }
+.panel-resize-handle {
+  position: absolute;
+  background: transparent;
+  opacity: 0;
+  z-index: 5;
+  transition: opacity var(--dur-fast) var(--ease-out),
+              background var(--dur-fast) var(--ease-out);
+}
+.panel:hover .panel-resize-handle { opacity: 0.6; }
+.panel-resize-handle:hover {
+  opacity: 1 !important;
+  background: var(--cyan);
+}
+.panel.is-resizing .panel-resize-handle { opacity: 1; background: var(--cyan); }
+
+/* Right edge — drag horizontal */
+.panel-resize-x {
+  top: 8px; bottom: 8px; right: -2px; width: 6px;
+  cursor: ew-resize;
+  border-radius: 2px;
+}
+/* Bottom edge — drag vertical */
+.panel-resize-y {
+  left: 8px; right: 8px; bottom: -2px; height: 6px;
+  cursor: ns-resize;
+  border-radius: 2px;
+}
+/* Bottom-right corner — drag both */
+.panel-resize-xy {
+  width: 14px; height: 14px;
+  right: -2px; bottom: -2px;
+  cursor: nwse-resize;
+  border-radius: 2px;
+  /* Sutil indicador visual de "corner draggable" — 2 líneas diagonales */
+  background:
+    linear-gradient(135deg, transparent 50%, var(--text-faint) 50%, var(--text-faint) 60%, transparent 60%, transparent 70%, var(--text-faint) 70%, var(--text-faint) 80%, transparent 80%);
+  opacity: 0.35;
+}
+.panel:hover .panel-resize-xy { opacity: 0.8; }
+.panel-resize-xy:hover {
+  opacity: 1 !important;
+  background:
+    linear-gradient(135deg, transparent 50%, var(--cyan) 50%, var(--cyan) 60%, transparent 60%, transparent 70%, var(--cyan) 70%, var(--cyan) 80%, transparent 80%);
+}
+
+/* Durante resize, prevenir selección de texto + ghost outline cyan */
+.panel.is-resizing {
+  user-select: none;
+  outline: 2px dashed var(--cyan);
+  outline-offset: -2px;
+}
+
+/* Mobile: handles ocultos (no aplica el grid). */
+@media (max-width: 720px) {
+  .panel-resize-handle { display: none; }
+}
+
 
 /* ────────────────────────────────────────────────────────────
    Wikilinks en el narrative del LLM y prose en general — el

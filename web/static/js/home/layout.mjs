@@ -212,6 +212,70 @@ export function injectSizeChips(panel) {
   mo.observe(panel, { attributes: true, attributeFilter: ["data-w", "data-h"] });
 }
 
+// ── Resize handles (drag bordes → snap a half/full) ───────────────────
+
+const RESIZE_SNAP_PX = 100; // delta mínimo del drag para cambiar snap.
+
+function startResize(ev, panel, axis) {
+  ev.preventDefault();
+  ev.stopPropagation();
+  const startX = ev.clientX;
+  const startY = ev.clientY;
+  const startW = panel.dataset.w || "half";
+  const startH = panel.dataset.h || "half";
+  panel.classList.add("is-resizing");
+  document.body.style.cursor = axis === "x" ? "ew-resize"
+    : axis === "y" ? "ns-resize" : "nwse-resize";
+
+  function onMove(e) {
+    // Ghost overlay opcional — por ahora solo mostramos el cursor.
+    // Preview en vivo: actualizamos data-w/data-h cuando el delta cruza
+    // el umbral, así el user ve el panel resize antes de soltar.
+    const dx = e.clientX - startX;
+    const dy = e.clientY - startY;
+    if (axis === "x" || axis === "xy") {
+      const w = dx > RESIZE_SNAP_PX ? "full"
+        : dx < -RESIZE_SNAP_PX ? "half" : startW;
+      if (panel.dataset.w !== w) panel.dataset.w = w;
+    }
+    if (axis === "y" || axis === "xy") {
+      const h = dy > RESIZE_SNAP_PX ? "full"
+        : dy < -RESIZE_SNAP_PX ? "half" : startH;
+      if (panel.dataset.h !== h) panel.dataset.h = h;
+    }
+  }
+
+  function onUp() {
+    document.removeEventListener("mousemove", onMove);
+    document.removeEventListener("mouseup", onUp);
+    panel.classList.remove("is-resizing");
+    document.body.style.cursor = "";
+    // Persistir el final state como override manual.
+    setPanelSize(panel.id, panel.dataset.w || "half", panel.dataset.h || "half");
+    try { updateResetButtonVisibility(); } catch {}
+  }
+
+  document.addEventListener("mousemove", onMove);
+  document.addEventListener("mouseup", onUp);
+}
+
+export function injectResizeHandles(panel) {
+  if (panel.dataset.resizeInit === "1") return;
+  panel.dataset.resizeInit = "1";
+  for (const axis of ["x", "y", "xy"]) {
+    const h = document.createElement("div");
+    h.className = `panel-resize-handle panel-resize-${axis}`;
+    h.dataset.axis = axis;
+    h.title = axis === "x" ? "arrastrá horizontal: half ↔ full"
+      : axis === "y" ? "arrastrá vertical: half ↕ full"
+      : "arrastrá: half/full ancho + alto";
+    h.addEventListener("mousedown", (ev) => startResize(ev, panel, axis));
+    // Evitar que el handle inicie HTML5 drag del panel padre.
+    h.addEventListener("dragstart", (ev) => ev.preventDefault());
+    panel.appendChild(h);
+  }
+}
+
 // ── Drag & drop de paneles ─────────────────────────────────────────────────────
 
 let _draggingPanel = null;
@@ -430,10 +494,11 @@ export function initLayout() {
   window._updateResetButtonVisibility = updateResetButtonVisibility;
   // 1. Aplicar orden persistido ANTES de que los renderers escriban.
   applySavedOrder();
-  // 2. Hacer cada panel draggable + insertar grip + chips de tamaño + botón collapse
+  // 2. Hacer cada panel draggable + insertar grip + chips + handles + collapse
   document.querySelectorAll(".section-body > .panel").forEach((panel) => {
     makePanelDraggable(panel);
     injectSizeChips(panel);
+    injectResizeHandles(panel);
     injectCollapseButton(panel);
   });
   // 3. Aplicar estado de collapse persistido
@@ -456,6 +521,7 @@ export function initLayout() {
         const panel = m.target;
         if (panel?.classList?.contains("panel") && !panel.hidden) {
           injectSizeChips(panel);
+          injectResizeHandles(panel);
           observePanel(panel);
         }
       }

@@ -35981,7 +35981,12 @@ def ingest_read_url(
               help="Escribir la nota en 00-Inbox/ (default: dry-run)")
 @click.option("--plain", is_flag=True,
               help="Salida plana sin ANSI (para bots)")
-def read_cmd(url: str, save: bool, plain: bool):
+@click.option("--brief", is_flag=True,
+              help="Solo título + summary (1-2 frases), sin frontmatter ni "
+                   "sections. Para que un bot/listener pueda appendear a una "
+                   "nota links.md compartida sin parsear el body completo. "
+                   "Implica --plain. NO guarda nota separada.")
+def read_cmd(url: str, save: bool, plain: bool, brief: bool):
     """Ingerir una URL externa como nota estructurada en el vault.
 
     Fetchea la página, resume con command-r en 1ra persona, busca notas
@@ -35991,20 +35996,26 @@ def read_cmd(url: str, save: bool, plain: bool):
     """
     if not (url.startswith("http://") or url.startswith("https://")):
         msg = "URL inválida: debe empezar con http:// o https://"
-        click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
+        click.echo(msg) if (plain or brief) else console.print(f"[red]{msg}[/red]")
         raise SystemExit(1)
+
+    # `--brief` fuerza dry-run + plain, ignora --save.
+    if brief:
+        plain = True
+        save = False
 
     col = get_db()
     t0 = time.perf_counter()
     try:
         result = ingest_read_url(col, url, save=save)
     except RuntimeError as e:
-        click.echo(str(e)) if plain else console.print(f"[red]{e}[/red]")
+        click.echo(str(e)) if (plain or brief) else console.print(f"[red]{e}[/red]")
         raise SystemExit(1)
 
     _total_s = time.perf_counter() - t0
     log_query_event({
         "cmd": "read", "url": url, "saved": bool(save),
+        "brief": bool(brief),
         "title": result.get("title", ""),
         "text_len": result.get("text_len", 0),
         "n_related": len(result.get("related") or []),
@@ -36012,6 +36023,17 @@ def read_cmd(url: str, save: bool, plain: bool):
         "t_retrieve": round(_total_s, 3),
         "timing": _round_timing_ms({"total_ms": _total_s * 1000}),
     })
+
+    if brief:
+        # Output format estable: línea 1 = title (puede estar vacío, retornar
+        # url como fallback), línea 2+ = summary trimeado. El listener TS
+        # parsea con `lines[0]` + `lines.slice(1).join('\n').trim()`.
+        title = (result.get("title") or url).strip()
+        summary = (result.get("summary") or "").strip()
+        click.echo(title)
+        if summary:
+            click.echo(summary)
+        return
 
     if plain:
         if save and result.get("path"):

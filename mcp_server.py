@@ -732,6 +732,53 @@ def rag_followup(
     return items[: max(1, int(limit))]
 
 
+@_maybe_tool
+def rag_screen_capture(
+    mode: str = "frontmost",
+    app: str | None = None,
+    prompt: str | None = None,
+    retina: bool = False,
+    keep_image: bool = False,
+) -> dict:
+    """Capture the current screen/window and describe it with the local
+    granite vision model (MLX-VLM). Pull-only, no daemon.
+
+    Useful when the user asks "qué tengo en pantalla?", "leé esta ventana",
+    "qué app estoy usando ahora?", or when context about the live UI would
+    sharpen a follow-up answer.
+
+    Backed by the Peekaboo CLI (https://github.com/openclaw/Peekaboo).
+    Requires `RAG_PEEKABOO_ENABLE=1` env (default OFF) and macOS Screen
+    Recording permission granted to the responsible terminal app.
+
+    Args:
+        mode: One of "frontmost" (default), "window", "screen", "multi",
+            "menubar". `window` requires `app`.
+        app: App name filter (e.g. "Safari", "Code"). Used with mode="window".
+        prompt: Override caption prompt. Default: standard caption prompt
+            (Spanish, grep-friendly, ≤80 words, with literal text transcription).
+        retina: Capture at 2x density.
+        keep_image: If True, keep the PNG on disk under /tmp and return its
+            path. If False (default), delete after captioning.
+
+    Returns:
+        Dict with `ok`, `caption`, `mode`, `app`, `retina`, `image_path`
+        (only when `keep_image=True`), `took_ms`, `error`. On failure,
+        `error` is one of: "peekaboo_disabled", "peekaboo_not_installed",
+        "tcc_denied: ...", "peekaboo_timeout", "peekaboo_failed: ...",
+        "vlm_empty", "vlm_error: ...".
+    """
+    _touch()
+    from rag.integrations.peekaboo import capture_and_caption  # noqa: PLC0415
+    return capture_and_caption(
+        mode=mode,
+        app=app,
+        prompt=prompt,
+        retina=retina,
+        keep_image=keep_image,
+    )
+
+
 def main() -> None:
     # Log al stderr qué tools quedaron registradas. Útil para debug del
     # harness: si `RAG_MCP_TOOLS` está mal escrito todas las tools quedan

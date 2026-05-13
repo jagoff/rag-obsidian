@@ -699,13 +699,16 @@ rag weather "va a llover mañana en BA?"
 One-shot para autorizar Spotify. Después, `rag index` sincroniza automáticamente.
 
 ### `rag screen`
+Click group con 2 subcomandos para integración Peekaboo (captura on-demand + observer pasivo). Sin subcomando = alias a `rag screen capture` por back-compat.
+
+#### `rag screen capture`
 Captura la pantalla / ventana activa con [Peekaboo CLI](https://github.com/openclaw/Peekaboo) y la describe con granite (MLX-VLM in-process). Pull-only — sin daemon. La PNG va a `/tmp` con `chmod 0600` y se borra al terminar (salvo `--keep`).
 
 ```bash
-rag screen                                  # frontmost + caption en español
-rag screen --app Safari --mode window       # ventana específica de Safari
-rag screen --retina --keep                  # 2x density, conservar la PNG
-rag screen --prompt "describí solo el código" --json
+rag screen capture                                # frontmost + caption en español
+rag screen capture --app Safari --mode window     # ventana específica de Safari
+rag screen capture --retina --keep                # 2x density, conservar la PNG
+rag screen capture --prompt "describí solo el código" --json
 ```
 
 Requiere:
@@ -714,6 +717,24 @@ Requiere:
 - Screen Recording permission concedido al terminal en System Settings → Privacy & Security → Screen & System Audio Recording (reiniciar el terminal después del toggle).
 
 Si algo falla, el mensaje incluye un fix accionable (`Fix: export RAG_PEEKABOO_ENABLE=1`, `Fix: brew install steipete/tap/peekaboo`, etc.). La misma capability vive como tool MCP `rag_screen_capture` — usable directo desde el chat.
+
+#### `rag screen observe-once`
+Tick único del observer pasivo (Fase 2): captura el frontmost, captiona con granite, dedupea por `(app, window_title)` en últimos 60s, e inserta una row en `rag_screen_observations`. Pensado para invocación desde el supervisor job `screen_observer` (cada 15min, auto-discoverable) o para test manual con `--force`.
+
+```bash
+rag screen observe-once                       # tick estándar (necesita RAG_SCREEN_OBSERVE=1)
+rag screen observe-once --force --json        # bypass gate para test manual
+rag screen observe-once --dedup-seconds 300   # ventana de dedup más laxa
+```
+
+Requiere (además de los requisitos de `capture`):
+- `RAG_SCREEN_OBSERVE=1` — opt-in al daemon (default OFF). `--force` lo bypassa para test.
+- `RAG_SCREEN_QUIET_HOURS="22:00-07:00"` — ventana sin captura (default vacío).
+- `RAG_SCREEN_APP_DENY="1Password,Banking"` — apps que NUNCA se observan.
+
+Skip codes (exit 0, no error): `observe_disabled`, `peekaboo_disabled`, `quiet_hours`, `app_denied`, `dedup_title`, `vlm_empty`. Fail codes (exit 1): `tcc_denied`, `peekaboo_timeout`, `peekaboo_failed`, etc.
+
+La tabla `rag_screen_observations` se consume desde `/mirror` (bloque "En pantalla · live"), `/api/mirror` (key `screen_context`), y la signal anticipatory `active_context` (sugiere retomar proyectos dormant cuando matchea la caption). Retention 7d aplicada por `run_maintenance`.
 
 ```bash
 rag spotify-auth

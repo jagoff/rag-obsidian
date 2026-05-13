@@ -159,6 +159,22 @@ function togglePanelDim(panel, dim) {
   try { updateResetButtonVisibility(); } catch {}
 }
 
+function chipLabel(dim, panel) {
+  // Etiqueta dinámica que refleja el estado actual + lo que el click va
+  // a hacer. Ej: panel está en data-w=half → chip dice "↔ wide" (click
+  // lo expande). data-w=full → "↔ small". Mismo para alto.
+  const cur = panel.dataset[dim] || "half";
+  if (dim === "w") return cur === "half" ? "↔ wide" : "↔ small";
+  return cur === "half" ? "↕ tall" : "↕ short";
+}
+
+function refreshChipLabels(panel) {
+  for (const dim of ["w", "h"]) {
+    const chip = panel.querySelector(`.panel-size-chip-${dim}`);
+    if (chip) chip.textContent = chipLabel(dim, panel);
+  }
+}
+
 export function injectSizeChips(panel) {
   const head = panel.querySelector(".panel-head");
   if (!head || head.querySelector(".panel-size-chip")) return;
@@ -172,7 +188,7 @@ export function injectSizeChips(panel) {
     chip.dataset.dim = dim;
     chip.setAttribute("aria-label", dim === "w" ? "Toggle ancho" : "Toggle alto");
     chip.title = dim === "w" ? "ancho: half ↔ full" : "alto: half ↕ full";
-    chip.textContent = dim === "w" ? "↔" : "↕";
+    chip.textContent = chipLabel(dim, panel);
     // Prevenir interferencia del drag handler del panel padre. Sin esto
     // el browser inicia drag sobre el botón antes de disparar click.
     chip.setAttribute("draggable", "false");
@@ -180,6 +196,7 @@ export function injectSizeChips(panel) {
       ev.preventDefault();
       ev.stopPropagation();
       togglePanelDim(panel, dim);
+      refreshChipLabels(panel);
     });
     chip.addEventListener("mousedown", (ev) => ev.stopPropagation());
     chip.addEventListener("dragstart", (ev) => {
@@ -189,6 +206,10 @@ export function injectSizeChips(panel) {
     if (ref) head.insertBefore(chip, ref);
     else head.appendChild(chip);
   }
+  // Observar cambios de data-w / data-h (autosizer puede cambiarlos) para
+  // mantener las etiquetas sincronizadas.
+  const mo = new MutationObserver(() => refreshChipLabels(panel));
+  mo.observe(panel, { attributes: true, attributeFilter: ["data-w", "data-h"] });
 }
 
 // ── Drag & drop de paneles ─────────────────────────────────────────────────────

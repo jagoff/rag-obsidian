@@ -13,13 +13,12 @@
 const LS_PANEL_SIZES = "home.v2.panel-sizes.v1";
 const RESIZE_DEBOUNCE_MS = 200;
 
-// Altura disponible en cada celda (descontando .panel-head ~52px + gap):
-//   data-h=half (1 row, 280px) → body ~228px disponibles
-//   data-h=full (2 rows, 580px) → body ~528px disponibles
-// Si scrollHeight (content real, sin clip) supera el disponible de "half",
-// promote a "full". Si excede full también, mantiene full + el overflow
-// se scrollea dentro del .panel-body.
-const HEIGHT_HALF_FITS_PX = 228;
+// Altura del .panel-body disponible en un cell de data-h=half:
+//   cell = 280px (1 row del grid-auto-rows)
+//   .panel-head ~50px + .panel-foot ~30px (cuando hay) + padding ~16px
+//   → body real disponible ~184px. Margen de 6px para anti-jitter.
+// Si scrollHeight del body excede esto, promote a data-h=full (~528px body).
+const HEIGHT_HALF_FITS_PX = 190;
 
 const _pending = new Map(); // panelId -> timeoutId
 
@@ -32,26 +31,22 @@ function readOverrides() {
   } catch { return {}; }
 }
 
-function measureNaturalHeight(panel) {
-  // scrollHeight de un elemento con overflow:hidden y altura limitada por
-  // el grid SIGUE devolviendo el content height real (no el visible). Es
-  // exactamente lo que queremos: cuántos px ocuparía el content si no
-  // hubiera clip. Sumamos las alturas de head + body + foot.
-  let total = 0;
-  for (const sel of [".panel-head", ".panel-body", ".panel-foot"]) {
-    const el = panel.querySelector(sel);
-    if (!el) continue;
-    total += el.scrollHeight;
-  }
-  return total;
+function measureBodyContent(panel) {
+  // Solo medimos el content del .panel-body. head + foot tienen tamaño
+  // fijo (no son señal de si el content "quiere más espacio"). Si el
+  // body real cabe en la altura disponible del half (~190px tras
+  // descontar head 50 + foot 30 del cell 280), usamos half. Si no, full.
+  const body = panel.querySelector(".panel-body");
+  return body ? body.scrollHeight : 0;
 }
 
 function classifyByContent(panel) {
-  const natural = measureNaturalHeight(panel);
-  // Solo decidimos height por content. Width queda half default
-  // (override manual via chip ↔). Esto evita que panels con poco content
-  // pero texto wide se promuevan a full ancho innecesariamente.
-  const h = natural > HEIGHT_HALF_FITS_PX + 40 ? "full" : "half";
+  const bodyH = measureBodyContent(panel);
+  // Threshold conservador: solo promote a full si el content body
+  // realmente excede lo que cabe en half (~190px disponibles + buffer).
+  // Esto deja la mayoría de panels en half×half (compacto) y solo
+  // panels con tablas largas o listas grandes saltan a half×full.
+  const h = bodyH > HEIGHT_HALF_FITS_PX ? "full" : "half";
   return { w: panel.dataset.w || "half", h };
 }
 

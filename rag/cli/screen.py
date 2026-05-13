@@ -228,35 +228,122 @@ def screen_observe_once(
 
 
 @screen_cli.command("enable")
-def screen_enable() -> None:
+@click.option(
+    "--no-setup", is_flag=True,
+    help="Saltea `rag setup` + kickstart automáticos. Util para test.",
+)
+@click.option(
+    "--no-tcc-helper", is_flag=True,
+    help="Saltea apertura automática de System Settings (TCC Screen Recording).",
+)
+def screen_enable(no_setup: bool, no_tcc_helper: bool) -> None:
     """Activar el observer pasivo del Peekaboo (Fase 2g).
 
-    Toca el state file `~/.local/share/obsidian-rag/screen_observe_enabled`.
-    El plist generator del supervisor (`_supervisor_plist`) lo detecta en el
-    próximo `rag setup` e inyecta `RAG_PEEKABOO_ENABLE=1` +
-    `RAG_SCREEN_OBSERVE=1` al supervisor.
+    Todo en un comando:
+        1. Toca el state file `screen_observe_enabled`.
+        2. Corre `rag setup` para regenerar el plist con las env vars.
+        3. Hace `launchctl kickstart -k` del supervisor para recargarlo.
+        4. Abre System Settings en Screen & System Audio Recording + copia
+           al clipboard el path del Python que el supervisor usa, para que
+           lo pegues en el "+ Files..." con un Cmd+V (1 click + 1 paste).
 
-    Después de correr este comando:
-        1. `rag setup` regenera el plist con las env vars.
-        2. `launchctl kickstart -k gui/$(id -u)/com.fer.obsidian-rag-supervisor`
-           recarga el supervisor.
-        3. El `screen_observer_job` empieza a capturar cada 15min.
+    TCC requirement (macOS SIP-protected, sin API automatable):
+        El supervisor launchd invoca `peekaboo` como subprocess de
+        `.venv/bin/python`. macOS TCC chequea el responsible-process chain
+        y NO hereda el grant de Ghostty. Hay que agregar manualmente el
+        binario Python (resolviendo el symlink al cpython real) a Screen
+        Recording. Una sola vez — después corre cada 15min sin intervención.
 
     Equivalente al opt-in de mood: `rag mood enable`.
     """
+    import os  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
     from rag.integrations.peekaboo import (  # noqa: PLC0415
         _OBSERVE_STATE_FILE, _observe_state_set,
     )
+
     _observe_state_set(True)
     click.echo(f"✓ Screen observer activado. State file: {_OBSERVE_STATE_FILE}")
+
+    if no_setup:
+        click.echo(
+            "\n(--no-setup) Saltea regeneración del plist + kickstart. Correr "
+            "después:\n"
+            "  rag setup && launchctl kickstart -k gui/$(id -u)/com.fer.obsidian-rag-supervisor\n"
+        )
+    else:
+        click.echo("\n→ Corriendo `rag setup` (regenera plist con env vars Peekaboo)...")
+        rc = subprocess.run(["rag", "setup"], check=False).returncode
+        if rc != 0:
+            click.echo(f"  [warn] rag setup exit={rc} — revisar manualmente.", err=True)
+        else:
+            click.echo("  ✓ plist regenerado.")
+
+        uid = os.getuid()
+        click.echo(f"\n→ Reload del supervisor (launchctl kickstart -k gui/{uid}/com.fer.obsidian-rag-supervisor)...")
+        rc = subprocess.run(
+            ["launchctl", "kickstart", "-k", f"gui/{uid}/com.fer.obsidian-rag-supervisor"],
+            check=False, capture_output=True, text=True,
+        ).returncode
+        if rc != 0:
+            click.echo(f"  [warn] kickstart exit={rc} — revisar `launchctl print`.", err=True)
+        else:
+            click.echo("  ✓ supervisor reloaded.")
+
+    if no_tcc_helper:
+        click.echo(
+            "\n(--no-tcc-helper) Saltea apertura de System Settings. "
+            "Agregar manualmente a Screen Recording:\n"
+            f"  {_resolve_supervisor_python()}"
+        )
+        return
+
+    python_real = _resolve_supervisor_python()
     click.echo(
-        "\nProximos pasos:\n"
-        "  1. rag setup     # regenerá el plist del supervisor con las env vars\n"
-        "  2. launchctl kickstart -k gui/$(id -u)/com.fer.obsidian-rag-supervisor\n"
-        "                   # recargá el supervisor\n"
-        "  3. rag screen observe-once --force --json\n"
-        "                   # smoke manual antes del primer tick automático\n"
+        "\n=== Último paso — TCC Screen Recording ===\n"
+        "macOS no permite agregar binarios al TCC programáticamente (SIP-protected).\n"
+        "Te abro System Settings en el pane correcto y copio el path al clipboard.\n"
+        "Pegalo con Cmd+V en el diálogo 'Files...' después del '+'.\n"
+        f"\nPath del Python del supervisor:\n  {python_real}\n"
     )
+
+    # Copy path to clipboard (pbcopy is macOS-native + no-deps).
+    try:
+        subprocess.run(["pbcopy"], input=python_real.encode(), check=False)
+        click.echo("✓ Path copiado al clipboard (Cmd+V para pegar).")
+    except FileNotFoundError:
+        click.echo("[warn] pbcopy no disponible — copialo a mano.", err=True)
+
+    # Open System Settings at the Screen Recording pane.
+    settings_url = "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+    try:
+        subprocess.run(["open", settings_url], check=False, timeout=5)
+        click.echo("✓ System Settings abierto en Screen Recording.")
+        click.echo(
+            "\nFlow esperado (1 vez, ~30s):\n"
+            "  1. En el pane, click '+' (o 'Add' → Files...).\n"
+            "  2. Cmd+Shift+G, pegar (Cmd+V), Enter.\n"
+            "  3. Seleccionar python3.13 → click 'Open'.\n"
+            "  4. Toggle ON.\n"
+            "  5. (Opcional) re-kickstart si te pide: launchctl kickstart -k gui/$(id -u)/com.fer.obsidian-rag-supervisor\n"
+            "\nVerificación final (debería retornar ok: true):\n"
+            "  echo '{\"action\":\"run\",\"job\":\"screen_observer\"}' | nc -U ~/.local/share/obsidian-rag/supervisor.sock"
+        )
+    except Exception as exc:
+        click.echo(f"[warn] no pude abrir System Settings: {exc}", err=True)
+
+
+def _resolve_supervisor_python() -> str:
+    """Path absoluto del binario Python real que launchd ejecuta para el
+    supervisor (resuelve symlinks del venv). Es el path que TCC necesita
+    en su allowlist — TCC chequea el inode final, no el symlink."""
+    import os  # noqa: PLC0415
+    from pathlib import Path  # noqa: PLC0415
+    venv_python = Path(__file__).resolve().parent.parent.parent / ".venv" / "bin" / "python"
+    try:
+        return os.path.realpath(venv_python)
+    except OSError:
+        return str(venv_python)
 
 
 @screen_cli.command("disable")

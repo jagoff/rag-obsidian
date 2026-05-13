@@ -573,15 +573,12 @@ _VLM_RECEIPT_PROMPT = (
 # A/B-tee contra el general, queda el escape: el caller (observe_once)
 # pasa prompt=None → cae al default `_VLM_CAPTION_PROMPT`.
 _VLM_SCREEN_OBSERVE_PROMPT = (
-    "Esta es una captura de pantalla de macOS. "
-    "Identificá en 1-2 oraciones (≤60 palabras): "
-    "(a) qué aplicación está activa (Safari, Code, Terminal, etc.), "
-    "(b) qué actividad parece hacer el user (codeando, leyendo, "
-    "escribiendo, navegando). "
-    "NO transcribas texto literal de la pantalla — describí contexto. "
-    "Si no podés identificar la app, decí 'app no identificada'. "
-    "Sin markdown, sin comillas, sin preámbulos. "
-    "Respondé en español rioplatense."
+    "Describí esta captura de pantalla en 2 oraciones (≤80 palabras). "
+    "Si hay texto visible (títulos de ventana, nombres de archivo, URLs, "
+    "títulos de tabs, headings), transcribilo literal al principio. "
+    "Después indicá qué aplicación está activa y qué hace el usuario. "
+    "Sé específico — evitá 'una imagen' o 'no puedo identificar'. "
+    "Sin markdown, sin comillas, sin preámbulos. Respondé en español."
 )
 
 

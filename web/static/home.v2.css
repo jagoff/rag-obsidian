@@ -1871,23 +1871,33 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 .panel-size-chip {
   flex-shrink: 0;
   background: transparent;
-  border: 0;
-  color: var(--text-faint);
+  border: 1px solid transparent;
+  color: var(--text-dim);
   cursor: pointer;
-  padding: 0 4px;
-  font-size: 11px;
+  padding: 1px 5px;
+  font-size: 12px;
   line-height: 1;
   border-radius: 2px;
-  opacity: 0.4;
+  opacity: 0.65;
   transition: opacity var(--dur-fast) var(--ease-out),
               color var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out),
               background var(--dur-fast) var(--ease-out);
 }
-.panel:hover .panel-size-chip { opacity: 0.7; }
+.panel:hover .panel-size-chip { opacity: 1; }
 .panel-size-chip:hover {
   opacity: 1;
   color: var(--cyan);
+  border-color: var(--border-strong);
   background: var(--bg-elev-2);
+}
+/* Indicador del estado actual: si el panel es full en esa dimensión,
+   el chip se ve "activo" (cyan sutil) para que el user sepa que un
+   click lo va a achicar. Si half, neutral. */
+.panel[data-w="full"] .panel-size-chip-w,
+.panel[data-h="full"] .panel-size-chip-h {
+  color: var(--cyan);
+  opacity: 0.85;
 }
 .panel-size-chip:focus-visible {
   outline: none;

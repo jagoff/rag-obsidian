@@ -173,12 +173,19 @@ export function injectSizeChips(panel) {
     chip.setAttribute("aria-label", dim === "w" ? "Toggle ancho" : "Toggle alto");
     chip.title = dim === "w" ? "ancho: half ↔ full" : "alto: half ↕ full";
     chip.textContent = dim === "w" ? "↔" : "↕";
+    // Prevenir interferencia del drag handler del panel padre. Sin esto
+    // el browser inicia drag sobre el botón antes de disparar click.
+    chip.setAttribute("draggable", "false");
     chip.addEventListener("click", (ev) => {
       ev.preventDefault();
       ev.stopPropagation();
       togglePanelDim(panel, dim);
     });
     chip.addEventListener("mousedown", (ev) => ev.stopPropagation());
+    chip.addEventListener("dragstart", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+    });
     if (ref) head.insertBefore(chip, ref);
     else head.appendChild(chip);
   }
@@ -189,6 +196,13 @@ export function injectSizeChips(panel) {
 let _draggingPanel = null;
 
 function onPanelDragStart(ev) {
+  // Si el drag se origina en un control interactivo del header (chips
+  // de resize, botón collapse), cancelar — el browser propaga dragstart
+  // desde el child al panel padre cuando el child no es draggable.
+  if (ev.target && ev.target.closest(".panel-size-chip, .panel-collapse-btn")) {
+    ev.preventDefault();
+    return;
+  }
   const panel = ev.currentTarget;
   _draggingPanel = panel;
   panel.classList.add("is-dragging");

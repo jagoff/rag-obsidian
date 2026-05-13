@@ -33,17 +33,7 @@
         media="(device-width: 402px) and (device-height: 874px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
   <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-16-pro-max.png"
         media="(device-width: 440px) and (device-height: 956px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
-  <link rel="stylesheet" href="/static/home.v2.css?v=47">
-  <!-- Gridstack.js v12.6.0 vendored. Powers el grid libre de paneles:
-       cada caja se puede mover y redimensionar libremente, con snap-to-grid
-       12-col. Layout persistido en localStorage. Init en layout.mjs. -->
-  <link rel="stylesheet" href="/static/vendor/gridstack.min.css"
-        integrity="sha384-v0+pyCGvaIDMe1HS4sAK/N5W4dvvEUFvTvAW9CmGumaXgHxaYO56Ow3DULWhd/kO"
-        crossorigin="anonymous">
-  <script src="/static/vendor/gridstack-all.js"
-          integrity="sha384-1/7H0y8C8vVEG2on7YuZQxUTtB+qMc+96SMFWVVl+0T6UVSVkgHg16yRwYVTFFoP"
-          crossorigin="anonymous"
-          defer></script>
+  <link rel="stylesheet" href="/static/home.v2.css?v=43">
   <!-- marked@18 vendored — same SRI as the v1 home. Used to parse the
        today/tomorrow narrative which has 4 H2 sub-sections that need
        real markdown rendering (lists, headers) — not the regex hack. -->
@@ -443,7 +433,7 @@
     </div>
   </dialog>
 
-  <script type="module" src="/static/js/home/app.mjs?v=55"></script>
+  <script type="module" src="/static/js/home/app.mjs?v=51"></script>
   <!-- Registra el SW + auto-reload on update. Sin esto, los fixes que
        deployamos al frontend no se propagan: el SW viejo sirve assets
        cacheados y el JS viejo sigue corriendo aunque haya versión

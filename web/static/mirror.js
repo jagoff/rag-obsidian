@@ -248,6 +248,44 @@ function renderScreenTime(data) {
   }
 }
 
+function renderScreenContext(data) {
+  const el = $("#screen_context .content");
+  clear(el);
+  const recent = data?.recent || [];
+  if (!recent.length) {
+    const today = data?.count_today ?? 0;
+    el.appendChild(emptyState(today > 0
+      ? `sin captura reciente (hoy: ${today})`
+      : "sin captura reciente"));
+    return;
+  }
+  for (const obs of recent) {
+    const card = document.createElement("div");
+    card.className = "screen-obs";
+    const ageMin = obs.age_minutes ?? 0;
+    const ageLabel = ageMin === 0 ? "ahora" : `hace ${ageMin}m`;
+    const app = obs.app_name || "?";
+    const title = (obs.window_title || "").trim();
+    const caption = (obs.caption || "").trim();
+    card.innerHTML = `
+      <div class="screen-obs-head">
+        <span class="screen-obs-app">${app}</span>
+        <span class="screen-obs-age">${ageLabel}</span>
+      </div>
+      ${title ? `<div class="screen-obs-title">${title}</div>` : ""}
+      ${caption ? `<div class="screen-obs-caption">${caption}</div>` : ""}
+    `;
+    el.appendChild(card);
+  }
+  const counts = data?.count_today;
+  if (counts && counts > recent.length) {
+    const foot = document.createElement("div");
+    foot.className = "screen-obs-foot";
+    foot.textContent = `+${counts - recent.length} más hoy · ${data?.count_7d ?? counts} esta semana`;
+    el.appendChild(foot);
+  }
+}
+
 function renderObservations(data) {
   const el = $("#observations .content");
   clear(el);
@@ -332,6 +370,7 @@ async function load(refresh = false) {
     renderDormantNotes(s.dormant_notes);
     renderSpotifyTop(s.spotify_top);
     renderScreenTime(s.screen_time || {});
+    renderScreenContext(s.screen_context || {});
     renderObservations(s.observations || {});
     updateHeader(data);
     updateStatus(`última actualización · ${new Date().toLocaleTimeString("es-AR")}`);

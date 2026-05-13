@@ -130,11 +130,13 @@ def test_assemble_mirror_per_date_cache_namespace(monkeypatch):
 # ── _SOURCES estructura ────────────────────────────────────────────────
 
 
-def test_sources_registry_has_8_blocks():
-    """El frontend asume estos 8 nombres exactos."""
+def test_sources_registry_has_expected_blocks():
+    """El frontend asume estos nombres exactos. screen_time + screen_context
+    agregados post-Fase 2e Peekaboo."""
     expected = {
         "active_projects", "top_entities", "mood_today", "mood_timeline",
-        "pendientes", "dormant_notes", "spotify_top", "observations",
+        "pendientes", "dormant_notes", "spotify_top",
+        "screen_time", "screen_context", "observations",
     }
     assert set(_SOURCES.keys()) == expected
 

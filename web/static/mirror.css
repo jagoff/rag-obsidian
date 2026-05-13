@@ -281,6 +281,54 @@ header #refresh-btn.spinning { animation: spin 1s linear infinite; }
   margin-top: 2px;
 }
 
+/* ── screen_context (Peekaboo Fase 2e) ──────────────── */
+
+.screen-obs {
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+.screen-obs:last-child { border-bottom: none; }
+
+.screen-obs-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 4px;
+}
+.screen-obs-app {
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--text);
+}
+.screen-obs-age {
+  font-size: 10px;
+  color: var(--text-muted);
+  letter-spacing: 0.04em;
+}
+.screen-obs-title {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.screen-obs-caption {
+  font-size: 12px;
+  color: var(--text);
+  line-height: 1.4;
+}
+.screen-obs-foot {
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px dotted var(--border-soft);
+  font-size: 10px;
+  color: var(--text-muted);
+  text-align: right;
+  letter-spacing: 0.04em;
+}
+
 /* ── footer ──────────────────────────────────────────── */
 
 footer {

@@ -877,6 +877,21 @@ def whisper_stats():
             corrections_by_source = dict(conn.execute(
                 "SELECT source, COUNT(*) FROM rag_audio_corrections GROUP BY source"
             ).fetchall())
+            # Reaction-thumbs breakdown — la fuente `reaction_thumbs` solo se
+            # popula desde el listener TS cuando el user reacciona 👍/👎 sobre
+            # el echo `🎙 <transcript>` en RagNet. `rating` queda en +1/-1;
+            # contar por signo da la tasa de calidad subjetiva por-audio.
+            thumbs_up = conn.execute(
+                "SELECT COUNT(*) FROM rag_audio_corrections "
+                "WHERE source = 'reaction_thumbs' AND rating > 0"
+            ).fetchone()[0]
+            thumbs_down = conn.execute(
+                "SELECT COUNT(*) FROM rag_audio_corrections "
+                "WHERE source = 'reaction_thumbs' AND rating < 0"
+            ).fetchone()[0]
+            n_echo_mappings = conn.execute(
+                "SELECT COUNT(*) FROM rag_whisper_echo_messages"
+            ).fetchone()[0]
             n_vocab = conn.execute(
                 "SELECT COUNT(*) FROM rag_whisper_vocab"
             ).fetchone()[0]
@@ -899,6 +914,17 @@ def whisper_stats():
     console.print(f"  correcciones acumuladas:   [cyan]{n_corrections}[/cyan]")
     for src, n in sorted(corrections_by_source.items()):
         console.print(f"    [dim]{src:12s}: {n}[/dim]")
+    if thumbs_up or thumbs_down:
+        ratio = thumbs_up / (thumbs_up + thumbs_down) if (thumbs_up + thumbs_down) else 0.0
+        console.print(
+            f"  reactions:                 "
+            f"[green]👍 {thumbs_up}[/green] · [red]👎 {thumbs_down}[/red] "
+            f"[dim](ratio={ratio:.1%}, {n_echo_mappings} echo mappings)[/dim]"
+        )
+    elif n_echo_mappings:
+        console.print(
+            f"  reactions:                 [dim]0 (de {n_echo_mappings} echo mappings)[/dim]"
+        )
     console.print(f"  vocab terms:               [cyan]{n_vocab}[/cyan]")
     for src, n in sorted(vocab_by_source.items()):
         console.print(f"    [dim]{src:12s}: {n}[/dim]")

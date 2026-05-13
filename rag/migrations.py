@@ -463,6 +463,68 @@ def migrate_006_create_sleep_sessions_table(conn: sqlite3.Connection) -> None:
     )
 
 
+@migration(7, "whisper_reaction_feedback")
+def migrate_007_whisper_reaction_feedback(conn: sqlite3.Connection) -> None:
+    """Whisper reaction-feedback loop (2026-05-13).
+
+    Dos cambios coordinados para que reactions 👍/👎 que el user pone
+    sobre el echo `🎙 <transcript>` en RagNet alimenten
+    `rag_audio_corrections` con un signal de calidad por-audio:
+
+    1. `rag_audio_corrections` ADD COLUMN `rating INTEGER` — +1 (👍) /
+       -1 (👎). Sólo poblado cuando source='reaction_thumbs';
+       explicit/llm/vault_diff quedan NULL como antes.
+
+    2. CREATE TABLE `rag_whisper_echo_messages` — mapping
+       (`echo_msg_id` → `audio_hash`) que el listener TS persiste al
+       mandar el echo `🎙 …` post-transcribe. La poller de reactions
+       resuelve `target_id` → `audio_hash` y escribe la corrección
+       sin texto correcto (rating sólo, `corrected`/`original` vacío).
+
+    Idempotente: ALTER usa `_alter_add_column_if_missing` y el CREATE
+    TABLE es IF NOT EXISTS.
+
+    Ver `CLAUDE.md` sección Feedback loops + comentario inline en
+    `_TELEMETRY_DDL` para racional largo.
+    """
+    _alter_add_column_if_missing(
+        conn, "rag_audio_corrections", "rating", "rating INTEGER"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS rag_whisper_echo_messages ("
+        " echo_msg_id TEXT PRIMARY KEY,"
+        " audio_hash TEXT NOT NULL,"
+        " audio_path TEXT,"
+        " chat_id TEXT,"
+        " sent_ts REAL NOT NULL"
+        ")"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS ix_echo_messages_hash "
+        "ON rag_whisper_echo_messages(audio_hash)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS ix_echo_messages_sent "
+        "ON rag_whisper_echo_messages(sent_ts)"
+    )
+    # Partial unique index para que el listener pueda UPSERT cuando la
+    # reaction cambia (user reacciona 👎, después cambia a 👍, o la quita).
+    # WHERE source='reaction_thumbs' aísla a las otras sources (explicit/llm/
+    # vault_diff) — ellas tienen múltiples filas legítimas por audio_hash.
+    #
+    # Guard: en DBs muy viejas o entornos de test que aplican migraciones sin
+    # haber corrido `_TELEMETRY_DDL` primero, la tabla `rag_audio_corrections`
+    # puede no existir. El CREATE INDEX explotaría con "no such table". El
+    # próximo `_ensure_telemetry_tables()` boot creará la tabla CON el partial
+    # index (ya está en el CREATE block de `_TELEMETRY_DDL`), así que skipear
+    # acá es seguro.
+    if _table_exists(conn, "rag_audio_corrections"):
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_corrections_reaction_thumbs"
+            " ON rag_audio_corrections(audio_hash, chat_id) WHERE source = 'reaction_thumbs'"
+        )
+
+
 __all__ = [
     "migration",
     "current_version",

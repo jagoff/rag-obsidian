@@ -6459,11 +6459,41 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             " source TEXT NOT NULL,"
             " ts REAL NOT NULL,"
             " chat_id TEXT,"
-            " context TEXT"
+            " context TEXT,"
+            " rating INTEGER"
             ")",
             "CREATE INDEX IF NOT EXISTS ix_corrections_ts ON rag_audio_corrections(ts)",
             "CREATE INDEX IF NOT EXISTS ix_corrections_hash ON rag_audio_corrections(audio_hash)",
             "CREATE INDEX IF NOT EXISTS ix_corrections_source_ts ON rag_audio_corrections(source, ts)",
+            # Unique constraint para que el listener pueda UPSERT cuando una
+            # reaction 👍/👎 cambia (user reacciona, luego cambia la emoji o la
+            # quita). source='reaction_thumbs' usa este index; los otros sources
+            # (explicit/llm/vault_diff) tienen `original` no-vacío y caen fuera
+            # del WHERE — el partial index los ignora.
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_corrections_reaction_thumbs"
+            " ON rag_audio_corrections(audio_hash, chat_id) WHERE source = 'reaction_thumbs'",
+        ),
+    ),
+    (
+        # Echo-message → audio mapping para que las reactions 👍/👎 que el user
+        # pone sobre el mensaje "🎙 <transcript>" que el listener manda al RagNet
+        # puedan resolverse al audio original. Lookup keyed por `echo_msg_id` =
+        # `message_id` que devuelve el bridge en `/api/send`.
+        #
+        # TTL implícito: filas viejas (>30d) se pueden vacuum-ear con un job de
+        # maintenance, pero no es crítico — la tabla crece ~1 row por audio
+        # entrante a RagNet, growth bounded.
+        "rag_whisper_echo_messages",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_whisper_echo_messages ("
+            " echo_msg_id TEXT PRIMARY KEY,"
+            " audio_hash TEXT NOT NULL,"
+            " audio_path TEXT,"
+            " chat_id TEXT,"
+            " sent_ts REAL NOT NULL"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_echo_messages_hash ON rag_whisper_echo_messages(audio_hash)",
+            "CREATE INDEX IF NOT EXISTS ix_echo_messages_sent ON rag_whisper_echo_messages(sent_ts)",
         ),
     ),
     (

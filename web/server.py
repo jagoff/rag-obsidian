@@ -9485,10 +9485,24 @@ def _fetch_mood() -> dict | None:
     try:
         today = _mood._today_local()
         score_row = _mood.get_score_for_date(today)
-        if score_row is None or score_row.get("n_signals", 0) == 0:
-            return None
         recent = _mood.get_recent_scores(days=14)
         drift = _mood.recent_drift(days=7)
+        # Fallback "lo último que se midió" (regla 2026-05-13): si today
+        # tiene n_signals=0 (mood-poll todavía no corrió hoy, o no encontró
+        # señales fresh), surface el último día con data en vez de hidear
+        # el panel. UX equivalente al fallback de Spotify "lo último que
+        # se escuchó". El frontend muestra `stale=true` para señalar que
+        # no es de hoy.
+        is_stale = False
+        if score_row is None or score_row.get("n_signals", 0) == 0:
+            stale_row = next(
+                (r for r in recent if r.get("n_signals", 0) > 0),
+                None,
+            )
+            if stale_row is None:
+                return None
+            score_row = stale_row
+            is_stale = True
     except Exception:
         return None
 
@@ -9559,6 +9573,8 @@ def _fetch_mood() -> dict | None:
         "top_evidence": top_evidence,
         "spark_score_14d": spark,
         "spark_dates_14d": dates,
+        "date": score_row.get("date") or today,
+        "stale": is_stale,
     }
 
 

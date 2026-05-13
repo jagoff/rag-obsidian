@@ -474,6 +474,34 @@ def _capture_with_meta(
     return tmp_path, meta, None
 
 
+def _query_last_simhash_match(
+    con,
+    app_name: str | None,
+    simhash: int,
+    within_seconds: int,
+) -> int | None:
+    """Returns observation_id de un row reciente same-app con simhash idéntico,
+    o None si no hay match. Para dedup fallback cuando `window_title` está
+    vacío (Ghostty case) y el dedup titular no aplica.
+
+    Window típicamente más amplio que el titular (5× = ~300s) porque mismo
+    contenido on-screen 5 minutos sigue siendo "misma sesión", no señal nueva.
+    """
+    if not app_name or simhash is None:
+        return None
+    cutoff = int(time.time()) - max(1, within_seconds)
+    try:
+        row = con.execute(
+            "SELECT id FROM rag_screen_observations "
+            "WHERE app_name = ? AND caption_simhash = ? AND ts >= ? "
+            "ORDER BY ts DESC LIMIT 1",
+            (app_name, simhash, cutoff),
+        ).fetchone()
+    except Exception:
+        return None
+    return row[0] if row else None
+
+
 def _query_last_observation(
     con,
     app_name: str | None,
@@ -582,11 +610,11 @@ def observe_once(
         try:
             _rag._ensure_telemetry_tables(con)
             last = _query_last_observation(con, app_name, within_seconds=dedup_seconds)
-            # Dedup tupla (app_name, window_title). Window_title vacío es
-            # válido — muchas apps no setean title (Ghostty, alguna PWA,
-            # menubar items). Si la última observación del mismo app tenía
-            # el mismo title (empty o no), skipear pre-VLM.
-            if last and last.get("window_title") == window_title:
+            # Dedup tupla (app_name, window_title) PRE-VLM cuando hay signal
+            # titular. Si `window_title` está vacío (Ghostty case, GPU-rendered
+            # apps), NO usamos titular dedup — el fallback simhash POST-VLM
+            # más abajo cubre ese caso (Fase 2g, 2026-05-13).
+            if last and last.get("window_title") == window_title and window_title:
                 con.close()
                 png_path.unlink(missing_ok=True)
                 return _finalize(skipped_reason="dedup_title")
@@ -598,7 +626,16 @@ def observe_once(
         png_path.unlink(missing_ok=True)
         return _finalize(error=f"rag_import_error: {exc}")
 
-    caption_text, caption_err = _caption(png_path)
+    # Fase 2g: usar prompt screen-observer dedicado (bias contexto vs
+    # transcripción literal). Si falla import del prompt (rag.ocr no
+    # disponible), `_caption` cae al `_VLM_CAPTION_PROMPT` default.
+    _screen_prompt: str | None = None
+    try:
+        from rag.ocr import _VLM_SCREEN_OBSERVE_PROMPT  # noqa: PLC0415
+        _screen_prompt = _VLM_SCREEN_OBSERVE_PROMPT
+    except ImportError:
+        _screen_prompt = None
+    caption_text, caption_err = _caption(png_path, prompt=_screen_prompt)
     png_path.unlink(missing_ok=True)  # PNG efímera — ya tenemos caption.
 
     # vlm_empty no es error — el VLM corrió pero no devolvió texto útil
@@ -613,6 +650,27 @@ def observe_once(
 
     ts_epoch = int(now_local.timestamp())
     simhash = _simhash64(caption_text)
+
+    # Fase 2g: dedup fallback via simhash cuando el dedup titular no aplicó.
+    # Caso típico: Ghostty + otras apps GPU-rendered que no exponen
+    # window_title via `peekaboo image --json`. Sin esto, ese tipo de apps
+    # generan 1 row cada 15min sin dedup → ~96 rows/día solo de terminal.
+    # Window 5× el titular porque mismo contenido on-screen 5min sigue siendo
+    # "misma sesión", no señal nueva. Si Item 2's mode=screen produce caption
+    # variations triviales entre ticks, simhash las separará — esto es un
+    # exact-match dedup, no near-dupe. Para near-dupe necesitaríamos cosine
+    # sobre embedding de caption — Fase 2h si las simhash dejan pasar mucho.
+    if not window_title:
+        match_id = _query_last_simhash_match(
+            con,
+            app_name=app_name,
+            simhash=simhash,
+            within_seconds=dedup_seconds * 5,
+        )
+        if match_id is not None:
+            con.close()
+            return _finalize(skipped_reason="dedup_simhash")
+
     try:
         cur = con.execute(
             "INSERT INTO rag_screen_observations "
@@ -667,5 +725,6 @@ __all__ = [
     "_simhash64",
     "_capture_with_meta",
     "_query_last_observation",
+    "_query_last_simhash_match",
     "observe_once",
 ]

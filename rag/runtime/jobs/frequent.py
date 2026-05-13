@@ -312,34 +312,84 @@ def wa_tasks_job() -> dict[str, Any]:
     description="Peekaboo screen capture + caption granite → rag_screen_observations (opt-in via RAG_SCREEN_OBSERVE).",
 )
 def screen_observer_job() -> dict[str, Any]:
-    """Equivalente a ``rag screen observe-once`` cada 15min.
+    """Tick in-process del observer Peekaboo cada 15min.
 
     **Doble opt-in** (ambos en env del supervisor o shell del user):
         - ``RAG_PEEKABOO_ENABLE=1`` — binario activado.
         - ``RAG_SCREEN_OBSERVE=1`` — daemon activado.
 
     Si cualquiera falta, observe_once retorna `skipped_reason:
-    observe_disabled` o `peekaboo_disabled` y el job termina exit 0
-    en <100ms (sin tocar Peekaboo CLI ni granite). Costo idle: spawn
-    subprocess + import rag = ~1s.
+    observe_disabled` o `peekaboo_disabled` y el job termina en
+    <10ms (sin tocar Peekaboo CLI ni granite).
 
-    Cuando ambos opt-in están ON y TCC concedido al supervisor:
-    captura frontmost + caption granite + INSERT en
-    ``rag_screen_observations``. Dedup titular por (app, window_title)
-    en últimos 60s evita VLM call cuando la ventana no cambió. Quiet
-    hours (default 22:00-07:00) + app denylist (``RAG_SCREEN_APP_DENY``)
-    aplican adentro de observe_once.
+    ## In-process (Fase 2g optimization, 2026-05-13)
 
-    Retention 7d se aplica en `run_maintenance` (housekeeping daily).
+    Llamada directa a `observe_once()` — NO subprocess. Razón:
+    cada subprocess fresh re-importaba `rag` + re-cargaba granite
+    MLX-VLM (~14s cold load per tick). In-process reusa el granite
+    YA warm en el supervisor (cargado por el primer tick + idle TTL
+    > 15min mantiene el modelo residente).
+
+    Trade-off:
+        - Win: -14s wall-time por tick (5s warm vs 19s cold).
+        - Risk: si granite crashea (Metal cmd buffer hang, OOM),
+          mata el supervisor entero. Mitigación: launchd
+          `KeepAlive=true` respawna; `try/except Exception` envuelve
+          la call para que cualquier excepción del VLM se reporte
+          como `exit_code != 0` sin propagar.
+
+    ## Mode: screen (Fase 2g, 2026-05-13)
+
+    Cambiamos default de `frontmost` → `screen` (display completo).
+    Razón: `--mode frontmost` con Ghostty (GPU-rendered terminal)
+    devuelve PNG 500x500 mayormente blanca — el bounding box de la
+    ventana no captura su pixel content via CGWindowList APIs.
+    `--mode screen` captura el display real (~2048x858) con todas
+    las ventanas visibles. Costo: PNG más grande (~400KB vs 7KB),
+    granite caption ~30s vs ~5s warm. Tradeoff aceptable porque
+    sin ese fix las captures son inútiles para granite.
+
+    ## Retention
+
+    7d via `run_maintenance` (housekeeping daily a las 04:00).
     """
-    return _run_subprocess(
-        [_RAG_BIN, "screen", "observe-once"],
-        extra_env={
-            "NO_COLOR": "1",
-            "TERM": "dumb",
-            "RAG_LLM_BACKEND": "mlx",
-            "HF_HUB_OFFLINE": "1",
-            "TRANSFORMERS_OFFLINE": "1",
-        },
-        timeout=120,  # capture ~300ms + caption granite warm ~5s + overhead
-    )
+    import time  # noqa: PLC0415
+    started = time.time()
+    try:
+        from rag.integrations.peekaboo import observe_once  # noqa: PLC0415
+        out = observe_once(mode="screen")
+        wall_ms = int((time.time() - started) * 1000)
+        ok = bool(out.get("ok"))
+        reason = out.get("skipped_reason")
+        err = out.get("error")
+        # Mapeo al shape esperado por `rag_supervisor_jobs.signals`:
+        # - skipped_reason ≠ None → exit_code=0 (skip es operación normal).
+        # - error ≠ None → exit_code=1 + last_stderr.
+        # - ok=True → exit_code=0.
+        if err and not ok:
+            return {
+                "exit_code": 1,
+                "stdout_lines": 1,
+                "stderr_lines": 1,
+                "last_stderr": str(err)[:200],
+                "duration_ms": wall_ms,
+                "observation_id": out.get("observation_id"),
+            }
+        return {
+            "exit_code": 0,
+            "stdout_lines": 1,
+            "stderr_lines": 0,
+            "last_stderr": None,
+            "duration_ms": wall_ms,
+            "observation_id": out.get("observation_id"),
+            "skipped_reason": reason,
+        }
+    except Exception as exc:  # noqa: BLE001 — observer error NO debe matar supervisor
+        logger.exception("screen_observer_job crashed: %s", exc)
+        return {
+            "exit_code": 1,
+            "stdout_lines": 0,
+            "stderr_lines": 1,
+            "last_stderr": f"{type(exc).__name__}: {exc}"[:200],
+            "duration_ms": int((time.time() - started) * 1000),
+        }

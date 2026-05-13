@@ -628,3 +628,135 @@ def test_query_last_observation_within_window(monkeypatch, tmp_path):
     assert miss_app is None
 
     con.close()
+
+
+# --- Fase 2g: dedup_simhash fallback (Item 3) ---
+
+
+def test_query_last_simhash_match_in_window(monkeypatch, tmp_path):
+    """Match cuando hay row reciente same-app con simhash exacto."""
+    con = _mock_telemetry(monkeypatch, tmp_path)
+    import time as _time
+    now_ts = int(_time.time())
+    con.execute(
+        "INSERT INTO rag_screen_observations "
+        "(ts, app_name, window_title, caption, caption_simhash, took_ms, capture_mode) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (now_ts - 60, "Ghostty", "", "screen content X", 999, 100, "screen"),
+    )
+    con.commit()
+    obs_id = pk._query_last_simhash_match(con, "Ghostty", 999, within_seconds=300)
+    assert obs_id is not None
+    con.close()
+
+
+def test_query_last_simhash_match_outside_window(monkeypatch, tmp_path):
+    """Mismo simhash pero fuera de la ventana → None."""
+    con = _mock_telemetry(monkeypatch, tmp_path)
+    import time as _time
+    now_ts = int(_time.time())
+    con.execute(
+        "INSERT INTO rag_screen_observations "
+        "(ts, app_name, window_title, caption, caption_simhash, took_ms, capture_mode) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (now_ts - 600, "Ghostty", "", "cap", 1, 100, "screen"),
+    )
+    con.commit()
+    assert pk._query_last_simhash_match(con, "Ghostty", 1, within_seconds=60) is None
+    con.close()
+
+
+def test_query_last_simhash_match_different_app(monkeypatch, tmp_path):
+    """Mismo simhash pero app diferente → None."""
+    con = _mock_telemetry(monkeypatch, tmp_path)
+    import time as _time
+    now_ts = int(_time.time())
+    con.execute(
+        "INSERT INTO rag_screen_observations "
+        "(ts, app_name, window_title, caption, caption_simhash, took_ms, capture_mode) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (now_ts - 10, "Safari", "", "cap", 42, 100, "screen"),
+    )
+    con.commit()
+    assert pk._query_last_simhash_match(con, "Ghostty", 42, within_seconds=3600) is None
+    con.close()
+
+
+def test_observe_dedup_simhash_when_title_empty(monkeypatch, tmp_path):
+    """Ghostty case: window_title empty → simhash dedup aplica."""
+    monkeypatch.setenv("RAG_SCREEN_OBSERVE", "1")
+    monkeypatch.setenv("RAG_PEEKABOO_ENABLE", "1")
+
+    con = _mock_telemetry(monkeypatch, tmp_path)
+    import time as _time
+    now_ts = int(_time.time())
+    # Seed: row reciente same-app, mismo caption → mismo simhash.
+    caption = "Visual Studio Code editando server.py"
+    seed_simhash = pk._simhash64(caption)
+    con.execute(
+        "INSERT INTO rag_screen_observations "
+        "(ts, app_name, window_title, caption, caption_simhash, took_ms, capture_mode) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (now_ts - 30, "Ghostty", "", caption, seed_simhash, 100, "screen"),
+    )
+    con.commit()
+    con.close()
+
+    fake_png = tmp_path / "fake.png"
+    fake_png.write_bytes(b"\x89PNG")
+
+    def fake_capture(**kw):
+        return (fake_png, {"app_name": "Ghostty", "window_title": ""}, None)
+
+    monkeypatch.setattr(pk, "_capture_with_meta", fake_capture)
+    # VLM devuelve el MISMO caption — simhash matchea el seed → skip insert.
+    monkeypatch.setattr("rag.ocr._vlm_describe", lambda *a, **k: caption)
+
+    out = pk.observe_once(mode="screen", dedup_seconds=60)
+    assert out["skipped_reason"] == "dedup_simhash"
+    assert out["observation_id"] is None
+
+    # Verificá que NO se insertó row nueva.
+    import sqlite3
+    con2 = sqlite3.connect(str(tmp_path / "telemetry.db"))
+    count = con2.execute("SELECT COUNT(*) FROM rag_screen_observations").fetchone()[0]
+    con2.close()
+    assert count == 1  # solo la seed
+
+
+def test_observe_simhash_dedup_skipped_when_title_present(monkeypatch, tmp_path):
+    """Si window_title NO está vacío, el dedup_simhash NO se activa
+    (el dedup titular pre-VLM ya hace su trabajo). Mismo simhash con
+    title diferente → row nueva insertada."""
+    monkeypatch.setenv("RAG_SCREEN_OBSERVE", "1")
+    monkeypatch.setenv("RAG_PEEKABOO_ENABLE", "1")
+
+    con = _mock_telemetry(monkeypatch, tmp_path)
+    import time as _time
+    now_ts = int(_time.time())
+    caption = "Mismo caption A"
+    sh = pk._simhash64(caption)
+    con.execute(
+        "INSERT INTO rag_screen_observations "
+        "(ts, app_name, window_title, caption, caption_simhash, took_ms, capture_mode) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (now_ts - 30, "Code", "file_A.py", caption, sh, 100, "screen"),
+    )
+    con.commit()
+    con.close()
+
+    fake_png = tmp_path / "fake.png"
+    fake_png.write_bytes(b"\x89PNG")
+
+    # Ventana DIFERENTE (file_B), mismo caption (simhash coincide).
+    def fake_capture(**kw):
+        return (fake_png, {"app_name": "Code", "window_title": "file_B.py"}, None)
+
+    monkeypatch.setattr(pk, "_capture_with_meta", fake_capture)
+    monkeypatch.setattr("rag.ocr._vlm_describe", lambda *a, **k: caption)
+
+    out = pk.observe_once(mode="screen", dedup_seconds=60)
+    # No es dedup_title (titles diferentes); no es dedup_simhash (title presente
+    # → simhash check skipped); inserts.
+    assert out["ok"] is True
+    assert out["observation_id"] is not None

@@ -551,6 +551,40 @@ _VLM_RECEIPT_PROMPT = (
 )
 
 
+# Prompt especializado para screen observer (Fase 2 Peekaboo, 2026-05-13).
+# Bias hacia "qué app + qué actividad" sobre "transcribir literal" — el use
+# case del observer es enriquecer contexto del user (anticipatory, mirror,
+# brief), NO indexar texto on-screen. La versión literal-transcription del
+# `_VLM_CAPTION_PROMPT` general dispara que granite copie snippets de chat
+# / código / output cuando hay terminales abiertos, lo cual contamina
+# rag_screen_observations sin agregar señal útil.
+#
+# Diseño del prompt:
+#   1. Frame explícito ("captura de pantalla macOS") para que granite no
+#      interprete la imagen como input conversacional.
+#   2. Pide identificación app + actividad ANTES de detalles.
+#   3. Cap a 1-2 oraciones cortas para mantener simhash dedup útil
+#      (captions largas con variación trivial → simhashes distintos → no
+#      dedupean aunque sean "la misma" sesión).
+#   4. Explícitamente "NO transcribas texto literal" — corta la rama que
+#      explota con terminales / chats / docs visibles.
+#
+# Si granite no respeta este prompt (output broken, "un", etc.) cuando se
+# A/B-tee contra el general, queda el escape: el caller (observe_once)
+# pasa prompt=None → cae al default `_VLM_CAPTION_PROMPT`.
+_VLM_SCREEN_OBSERVE_PROMPT = (
+    "Esta es una captura de pantalla de macOS. "
+    "Identificá en 1-2 oraciones (≤60 palabras): "
+    "(a) qué aplicación está activa (Safari, Code, Terminal, etc.), "
+    "(b) qué actividad parece hacer el user (codeando, leyendo, "
+    "escribiendo, navegando). "
+    "NO transcribas texto literal de la pantalla — describí contexto. "
+    "Si no podés identificar la app, decí 'app no identificada'. "
+    "Sin markdown, sin comillas, sin preámbulos. "
+    "Respondé en español rioplatense."
+)
+
+
 # Prompt especializado para gráficos / charts / dashboards. Caption-style
 # (no JSON) pero chart-aware: identifica tipo (bar, line, pie, scatter),
 # ejes, rango de valores, y la métrica principal con su valor. Útil para

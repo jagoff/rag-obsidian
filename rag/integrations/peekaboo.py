@@ -368,28 +368,63 @@ def _capture_with_meta(
 
     # Best-effort parse del JSON stdout. No crítico — si falla, meta queda
     # vacío y observe_once igual escribe la observación sin app/title.
+    #
+    # Shape real de Peekaboo 3.0.0-beta3 con `--mode frontmost --json`:
+    #
+    #   {"success": true,
+    #    "data": {
+    #        "files": [{"path": "...", "window_title": "...",
+    #                   "window_id": 252, "window_index": 0,
+    #                   "mime_type": "image/png", "item_label": "frontmost"}]
+    #    },
+    #    "debug_logs": [...]}
+    #
+    # `app_name` no viene en este payload — requiere call separado a
+    # `peekaboo list apps --json` filtrando por `isActive=true`. Lo hacemos
+    # como best-effort post-capture porque cuesta ~50ms más (otro subprocess);
+    # si falla, meta["app_name"] queda None y dedup baja de granularidad.
     try:
         parsed = _json.loads((proc.stdout or "").strip())
-        # El shape exacto depende de la versión de Peekaboo; navegamos
-        # defensivamente sobre las keys más comunes.
         if isinstance(parsed, dict):
-            data = parsed.get("data", parsed)  # algunos shapes envuelven en `data`
-            if isinstance(data, dict):
-                app_name = (
-                    data.get("app_name")
-                    or data.get("application")
-                    or data.get("app")
-                )
-                window_title = (
-                    data.get("window_title")
-                    or data.get("title")
-                    or data.get("window")
-                )
-                if isinstance(app_name, str):
-                    meta["app_name"] = app_name.strip()
+            data = parsed.get("data", parsed) if isinstance(parsed.get("data"), dict) else parsed
+            files = data.get("files") if isinstance(data, dict) else None
+            if isinstance(files, list) and files:
+                file0 = files[0]
+                if isinstance(file0, dict):
+                    window_title = file0.get("window_title")
+                    if isinstance(window_title, str):
+                        meta["window_title"] = window_title.strip()
+            # Fallback histórico — algunos shapes legacy llevan title arriba.
+            if "window_title" not in meta and isinstance(data, dict):
+                window_title = data.get("window_title") or data.get("title") or data.get("window")
                 if isinstance(window_title, str):
                     meta["window_title"] = window_title.strip()
     except (_json.JSONDecodeError, AttributeError, TypeError):
+        pass
+
+    # Best-effort app_name lookup via `peekaboo list apps --json` →
+    # entry con `isActive=true`. Coste: ~50ms extra subprocess. Si falla,
+    # app_name queda None y observe_once dedupea solo por window_title.
+    try:
+        list_proc = subprocess.run(
+            [bin_path, "list", "apps", "--json"],
+            capture_output=True, text=True,
+            timeout=min(_resolve_timeout(), 5.0), check=False,
+        )
+        if list_proc.returncode == 0:
+            list_parsed = _json.loads((list_proc.stdout or "").strip())
+            apps = (
+                list_parsed.get("data", {}).get("applications")
+                if isinstance(list_parsed, dict) else None
+            )
+            if isinstance(apps, list):
+                for entry in apps:
+                    if isinstance(entry, dict) and entry.get("isActive"):
+                        name = entry.get("name")
+                        if isinstance(name, str) and name.strip():
+                            meta["app_name"] = name.strip()
+                        break
+    except (subprocess.TimeoutExpired, _json.JSONDecodeError, OSError, AttributeError, TypeError):
         pass
 
     return tmp_path, meta, None
@@ -503,7 +538,11 @@ def observe_once(
         try:
             _rag._ensure_telemetry_tables(con)
             last = _query_last_observation(con, app_name, within_seconds=dedup_seconds)
-            if last and last.get("window_title") == window_title and window_title:
+            # Dedup tupla (app_name, window_title). Window_title vacío es
+            # válido — muchas apps no setean title (Ghostty, alguna PWA,
+            # menubar items). Si la última observación del mismo app tenía
+            # el mismo title (empty o no), skipear pre-VLM.
+            if last and last.get("window_title") == window_title:
                 con.close()
                 png_path.unlink(missing_ok=True)
                 return _finalize(skipped_reason="dedup_title")

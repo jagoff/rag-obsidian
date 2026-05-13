@@ -1876,6 +1876,22 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
   border-bottom: 0;
   padding-bottom: var(--space-3);  /* mismo padding que top, queda balanceado */
 }
+/* Collapsed = "queda sólo el título". Hide drag-grip, count, size chips,
+   resize handles — todo lo que estorba cuando la caja está minimizada.
+   El botón collapse (▶) se mantiene para poder re-expandir. */
+.panel[data-collapsed="true"] .drag-grip,
+.panel[data-collapsed="true"] .count,
+.panel[data-collapsed="true"] .panel-size-chip,
+.panel[data-collapsed="true"] .panel-resize-handle {
+  display: none !important;
+}
+/* Forzar grid-row: span 1 — overrides manual data-h="full" que dejaba
+   la celda en 560px (2 rows) con la caja chiquita arriba y gap gigante
+   abajo. Con span 1, la celda es 280px y la caja colapsada queda
+   compacta gracias a `align-self: start`. */
+.section-body > .panel[data-collapsed="true"] {
+  grid-row: span 1 !important;
+}
 
 /* Reduce-motion friendliness para el toggle icon */
 @media (prefers-reduced-motion: reduce) {

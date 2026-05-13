@@ -698,6 +698,23 @@ rag weather "va a llover mañana en BA?"
 ### `rag spotify-auth`
 One-shot para autorizar Spotify. Después, `rag index` sincroniza automáticamente.
 
+### `rag screen`
+Captura la pantalla / ventana activa con [Peekaboo CLI](https://github.com/openclaw/Peekaboo) y la describe con granite (MLX-VLM in-process). Pull-only — sin daemon. La PNG va a `/tmp` con `chmod 0600` y se borra al terminar (salvo `--keep`).
+
+```bash
+rag screen                                  # frontmost + caption en español
+rag screen --app Safari --mode window       # ventana específica de Safari
+rag screen --retina --keep                  # 2x density, conservar la PNG
+rag screen --prompt "describí solo el código" --json
+```
+
+Requiere:
+- `brew install steipete/tap/peekaboo`.
+- `RAG_PEEKABOO_ENABLE=1` (default OFF — gate explícito).
+- Screen Recording permission concedido al terminal en System Settings → Privacy & Security → Screen & System Audio Recording (reiniciar el terminal después del toggle).
+
+Si algo falla, el mensaje incluye un fix accionable (`Fix: export RAG_PEEKABOO_ENABLE=1`, `Fix: brew install steipete/tap/peekaboo`, etc.). La misma capability vive como tool MCP `rag_screen_capture` — usable directo desde el chat.
+
 ```bash
 rag spotify-auth
 ```

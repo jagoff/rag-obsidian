@@ -768,6 +768,50 @@ def memo_temporal_stale_api(days: int = 90, limit: int = 30) -> dict:
     return temporal_stale(days_threshold=days, limit=limit)
 
 
+_memo_cleanup_lock = __import__("threading").Lock()
+
+
+@app.post("/api/memo/cleanup")
+def memo_cleanup_api(apply_dead: bool = True, apply_dupes: bool = False) -> dict:
+    """Cleanup periódico: borra dead memorias (nunca usadas + creadas
+    hace >30d + score <40). Wraps `scripts/memo_cleanup.py:run_cleanup`.
+
+    Sync — toma ~5-30s según cantidad. Lock global: dos requests
+    concurrentes devuelven 409.
+    """
+    if not _memo_cleanup_lock.acquire(blocking=False):
+        return {"ok": False, "error": "cleanup ya está corriendo"}
+    try:
+        import sys
+        from pathlib import Path
+        repo = Path(__file__).resolve().parent.parent
+        scripts_dir = repo / "scripts"
+        if str(scripts_dir) not in sys.path:
+            sys.path.insert(0, str(scripts_dir))
+        from memo_cleanup import run_cleanup  # type: ignore
+        results = run_cleanup(
+            dry_run=False, verbose=False,
+            apply_dead=apply_dead, apply_dupes=apply_dupes,
+        )
+        # Invalidate snapshot cache para que el frontend vea estado actualizado
+        try:
+            from web.memo_dashboard import _snapshot_cache  # may not exist
+            if hasattr(_snapshot_cache, "clear"):
+                _snapshot_cache.clear()
+        except Exception:
+            pass
+        try:
+            from web.memo_v06 import cache_invalidate
+            cache_invalidate()
+        except Exception:
+            pass
+        return {"ok": True, "results": results}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    finally:
+        _memo_cleanup_lock.release()
+
+
 @app.post("/api/memo/merge")
 def memo_merge_api(pairs: list[dict[str, str]]) -> dict:
     """Fusiona pares de near-dupes de memo.

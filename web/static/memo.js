@@ -106,6 +106,17 @@ function renderVerdict(v) {
     )
     .join("");
 
+  // Mostrar botón cuando el summary menciona cleanup (outcomes "yes" + "cleanup")
+  const showCleanupBtn = outcome === "cleanup" || outcome === "yes";
+  const cleanupBtnHTML = showCleanupBtn ? `
+    <div class="verdict-actions">
+      <button id="cleanup-btn" class="cleanup-btn">
+        <span class="btn-icon">🧹</span>
+        <span class="btn-label">Hacer cleanup ahora</span>
+      </button>
+      <span class="cleanup-hint">Borra dead memorias (score &lt; 40 + sin recall + creadas &gt; 30d)</span>
+    </div>` : "";
+
   $("#verdict-banner").className = `verdict-banner ${outcome}`;
   $("#verdict-banner").innerHTML = `
     <div class="verdict-headline">
@@ -113,7 +124,72 @@ function renderVerdict(v) {
       <span class="verdict-summary">${escapeHTML(v.summary)}</span>
     </div>
     <div class="verdict-criteria">${criteriaHTML}</div>
+    ${cleanupBtnHTML}
   `;
+
+  if (showCleanupBtn) {
+    $("#cleanup-btn").addEventListener("click", runCleanup);
+  }
+}
+
+async function runCleanup() {
+  const btn = $("#cleanup-btn");
+  if (!btn || btn.disabled) return;
+  if (!confirm("Borrar memorias dead (nunca usadas + creadas hace >30d + score <40). Acción irreversible. ¿Seguir?")) {
+    return;
+  }
+  btn.disabled = true;
+  btn.classList.add("running");
+  const label = btn.querySelector(".btn-label");
+  const icon = btn.querySelector(".btn-icon");
+  const t0 = Date.now();
+  let dotTick = 0;
+  const dotInterval = setInterval(() => {
+    dotTick = (dotTick + 1) % 4;
+    const dots = ".".repeat(dotTick);
+    const secs = Math.floor((Date.now() - t0) / 1000);
+    label.textContent = `Limpiando${dots} ${secs}s`;
+  }, 400);
+  icon.textContent = "⏳";
+
+  try {
+    const r = await fetch("/api/memo/cleanup", { method: "POST" });
+    const j = await r.json();
+    clearInterval(dotInterval);
+    if (!j.ok) {
+      icon.textContent = "❌";
+      label.textContent = j.error || "error";
+      btn.classList.remove("running");
+      btn.classList.add("error");
+      setTimeout(() => {
+        btn.disabled = false;
+        btn.classList.remove("error");
+        icon.textContent = "🧹";
+        label.textContent = "Hacer cleanup ahora";
+      }, 4000);
+      return;
+    }
+    const dead = j.results.dead || {};
+    const dupes = j.results.dupes || {};
+    icon.textContent = "✓";
+    label.textContent = `Listo · ${dead.deleted || 0} dead borradas, ${dead.preserved || 0} preservadas`;
+    btn.classList.remove("running");
+    btn.classList.add("done");
+    if (dupes.detected) {
+      $("#cleanup-btn").insertAdjacentHTML("afterend",
+        `<span class="cleanup-extra"> · ${dupes.detected} near-dupes detectados (revisar manual)</span>`);
+    }
+    // Auto-refresh after 1.5s
+    setTimeout(() => {
+      refresh();
+      loadV06Features();
+    }, 1500);
+  } catch (e) {
+    clearInterval(dotInterval);
+    icon.textContent = "❌";
+    label.textContent = `error: ${e.message}`;
+    btn.classList.add("error");
+  }
 }
 
 function renderTopRecalled(usage) {

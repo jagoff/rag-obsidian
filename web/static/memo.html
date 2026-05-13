@@ -500,6 +500,68 @@
     .verdict-criterion .detail { color: var(--text-dim); }
     .verdict-criterion .threshold { color: var(--text-faint); margin-top: 4px; font-size: 10.5px; }
 
+    /* ── Cleanup button + spinner ────────────────────────────────── */
+    .verdict-actions {
+      margin-top: 14px;
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .cleanup-btn {
+      background: linear-gradient(135deg, #79c0ff, #4a90d9);
+      color: #0a0a0f;
+      border: none;
+      padding: 9px 18px;
+      border-radius: 7px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      gap: 7px;
+      align-items: center;
+      font-family: inherit;
+      letter-spacing: 0.01em;
+      transition: transform 80ms, box-shadow 80ms, opacity 200ms;
+      box-shadow: 0 1px 3px rgba(74,144,217,0.4);
+    }
+    .cleanup-btn:hover:not(:disabled) {
+      transform: translateY(-1px);
+      box-shadow: 0 3px 9px rgba(74,144,217,0.55);
+    }
+    .cleanup-btn:active:not(:disabled) { transform: translateY(0); }
+    .cleanup-btn:disabled { cursor: progress; opacity: 0.85; }
+    .cleanup-btn.running {
+      background: linear-gradient(135deg, #d2a8ff, #9a6cd9);
+      animation: cleanup-pulse 1.4s ease-in-out infinite;
+    }
+    .cleanup-btn.done {
+      background: linear-gradient(135deg, var(--green), #4caf50);
+    }
+    .cleanup-btn.error {
+      background: linear-gradient(135deg, var(--red), #c54a42);
+    }
+    .cleanup-btn .btn-icon { font-size: 14px; line-height: 1; }
+    .cleanup-btn.running .btn-icon { animation: spin 1.2s linear infinite; display: inline-block; }
+    @keyframes spin {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
+    }
+    @keyframes cleanup-pulse {
+      0%, 100% { box-shadow: 0 1px 3px rgba(210,168,255,0.3); }
+      50% { box-shadow: 0 3px 14px rgba(210,168,255,0.65); }
+    }
+    .cleanup-hint {
+      font-size: 11.5px;
+      color: var(--text-dim);
+      font-style: italic;
+    }
+    .cleanup-extra {
+      font-size: 11.5px;
+      color: var(--yellow);
+      margin-left: 8px;
+    }
+
     /* ── Top recalled + dead lists ───────────────────────────── */
     .recall-row {
       padding: 8px 14px;

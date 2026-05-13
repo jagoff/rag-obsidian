@@ -1864,6 +1864,41 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
   .panel-collapse-btn .toggle-icon { transition: none; }
 }
 
+/* ── Chips de tamaño manual (↔ ancho, ↕ alto) ─────────────────
+   Override del autosizer. Click → setPanelSize() persiste en
+   localStorage["home.v2.panel-sizes.v1"]. Hover muy sutil porque
+   son secundarios — el autosizer hace lo correcto 90% del tiempo. */
+.panel-size-chip {
+  flex-shrink: 0;
+  background: transparent;
+  border: 0;
+  color: var(--text-faint);
+  cursor: pointer;
+  padding: 0 4px;
+  font-size: 11px;
+  line-height: 1;
+  border-radius: 2px;
+  opacity: 0.4;
+  transition: opacity var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out),
+              background var(--dur-fast) var(--ease-out);
+}
+.panel:hover .panel-size-chip { opacity: 0.7; }
+.panel-size-chip:hover {
+  opacity: 1;
+  color: var(--cyan);
+  background: var(--bg-elev-2);
+}
+.panel-size-chip:focus-visible {
+  outline: none;
+  opacity: 1;
+  box-shadow: 0 0 0 1px var(--border-focus);
+}
+/* Mobile: ocultar chips (1-col grid, no tiene sentido toggle). */
+@media (max-width: 720px) {
+  .panel-size-chip { display: none; }
+}
+
 
 /* ────────────────────────────────────────────────────────────
    Wikilinks en el narrative del LLM y prose en general — el

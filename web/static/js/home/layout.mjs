@@ -6,7 +6,7 @@ import {
   LS_HERO_ORDER,
   LS_HERO_SUB_COLLAPSED,
 } from "./panel-today.mjs";
-import { observeAllPanels, observePanel, clearPanelSizeOverrides } from "./autosizer.mjs";
+import { observeAllPanels, observePanel, clearPanelSizeOverrides, setPanelSize } from "./autosizer.mjs";
 
 // ── Constantes de localStorage ─────────────────────────────────────────────────
 
@@ -146,6 +146,42 @@ export function injectCollapseButton(panel) {
   // Evitar que el click inicie un drag (el panel padre tiene draggable=true)
   btn.addEventListener("mousedown", (ev) => ev.stopPropagation());
   head.appendChild(btn);
+}
+
+// ── Chips de tamaño manual (override del autosizer) ───────────────────
+
+function togglePanelDim(panel, dim) {
+  const cur = panel.dataset[dim] || (dim === "w" ? "half" : "half");
+  const next = cur === "half" ? "full" : "half";
+  const w = dim === "w" ? next : (panel.dataset.w || "half");
+  const h = dim === "h" ? next : (panel.dataset.h || "half");
+  setPanelSize(panel.id, w, h);
+  try { updateResetButtonVisibility(); } catch {}
+}
+
+export function injectSizeChips(panel) {
+  const head = panel.querySelector(".panel-head");
+  if (!head || head.querySelector(".panel-size-chip")) return;
+  // Insertar ANTES del botón collapse (que queda al final).
+  const collapseBtn = head.querySelector(".panel-collapse-btn");
+  const ref = collapseBtn || null;
+  for (const dim of ["w", "h"]) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = `panel-size-chip panel-size-chip-${dim}`;
+    chip.dataset.dim = dim;
+    chip.setAttribute("aria-label", dim === "w" ? "Toggle ancho" : "Toggle alto");
+    chip.title = dim === "w" ? "ancho: half ↔ full" : "alto: half ↕ full";
+    chip.textContent = dim === "w" ? "↔" : "↕";
+    chip.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      togglePanelDim(panel, dim);
+    });
+    chip.addEventListener("mousedown", (ev) => ev.stopPropagation());
+    if (ref) head.insertBefore(chip, ref);
+    else head.appendChild(chip);
+  }
 }
 
 // ── Drag & drop de paneles ─────────────────────────────────────────────────────
@@ -359,9 +395,10 @@ export function initLayout() {
   window._updateResetButtonVisibility = updateResetButtonVisibility;
   // 1. Aplicar orden persistido ANTES de que los renderers escriban.
   applySavedOrder();
-  // 2. Hacer cada panel draggable + insertar grip + botón collapse
+  // 2. Hacer cada panel draggable + insertar grip + chips de tamaño + botón collapse
   document.querySelectorAll(".section-body > .panel").forEach((panel) => {
     makePanelDraggable(panel);
+    injectSizeChips(panel);
     injectCollapseButton(panel);
   });
   // 3. Aplicar estado de collapse persistido
@@ -383,6 +420,7 @@ export function initLayout() {
         if (m.type !== "attributes" || m.attributeName !== "hidden") continue;
         const panel = m.target;
         if (panel?.classList?.contains("panel") && !panel.hidden) {
+          injectSizeChips(panel);
           observePanel(panel);
         }
       }

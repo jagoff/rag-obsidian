@@ -12,8 +12,14 @@
 
 const LS_PANEL_SIZES = "home.v2.panel-sizes.v1";
 const RESIZE_DEBOUNCE_MS = 200;
-const THRESHOLD_TINY_PX = 150;
-const THRESHOLD_LARGE_PX = 450;
+
+// Altura disponible en cada celda (descontando .panel-head ~52px + gap):
+//   data-h=half (1 row, 280px) → body ~228px disponibles
+//   data-h=full (2 rows, 580px) → body ~528px disponibles
+// Si scrollHeight (content real, sin clip) supera el disponible de "half",
+// promote a "full". Si excede full también, mantiene full + el overflow
+// se scrollea dentro del .panel-body.
+const HEIGHT_HALF_FITS_PX = 228;
 
 const _pending = new Map(); // panelId -> timeoutId
 
@@ -26,21 +32,27 @@ function readOverrides() {
   } catch { return {}; }
 }
 
+function measureNaturalHeight(panel) {
+  // scrollHeight de un elemento con overflow:hidden y altura limitada por
+  // el grid SIGUE devolviendo el content height real (no el visible). Es
+  // exactamente lo que queremos: cuántos px ocuparía el content si no
+  // hubiera clip. Sumamos las alturas de head + body + foot.
+  let total = 0;
+  for (const sel of [".panel-head", ".panel-body", ".panel-foot"]) {
+    const el = panel.querySelector(sel);
+    if (!el) continue;
+    total += el.scrollHeight;
+  }
+  return total;
+}
+
 function classifyByContent(panel) {
-  const body = panel.querySelector(".panel-body");
-  if (!body) return { w: "half", h: "full" };
-  // scrollHeight = full content height (incluye overflow).
-  // clientHeight = visible viewport (clipped por overflow:hidden).
-  const sh = body.scrollHeight;
-  const ch = body.clientHeight;
-  const overflowing = sh > ch + 8; // tolerancia anti-1px jitter
-  if (overflowing || sh > THRESHOLD_LARGE_PX) {
-    return { w: "full", h: "full" };
-  }
-  if (sh < THRESHOLD_TINY_PX) {
-    return { w: "half", h: "half" };
-  }
-  return { w: "half", h: "full" };
+  const natural = measureNaturalHeight(panel);
+  // Solo decidimos height por content. Width queda half default
+  // (override manual via chip ↔). Esto evita que panels con poco content
+  // pero texto wide se promuevan a full ancho innecesariamente.
+  const h = natural > HEIGHT_HALF_FITS_PX + 40 ? "full" : "half";
+  return { w: panel.dataset.w || "half", h };
 }
 
 function applySize(panel, w, h) {

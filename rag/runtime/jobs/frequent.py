@@ -301,3 +301,45 @@ def wa_tasks_job() -> dict[str, Any]:
         },
         timeout=900,  # 15min — 12 chats × ~30s LLM call worst case
     )
+
+
+# ── Peekaboo screen observer (Fase 2c, 2026-05-13) ─────────────────────────
+
+
+@interval(
+    minutes=15,
+    label="screen_observer",
+    description="Peekaboo screen capture + caption granite → rag_screen_observations (opt-in via RAG_SCREEN_OBSERVE).",
+)
+def screen_observer_job() -> dict[str, Any]:
+    """Equivalente a ``rag screen observe-once`` cada 15min.
+
+    **Doble opt-in** (ambos en env del supervisor o shell del user):
+        - ``RAG_PEEKABOO_ENABLE=1`` — binario activado.
+        - ``RAG_SCREEN_OBSERVE=1`` — daemon activado.
+
+    Si cualquiera falta, observe_once retorna `skipped_reason:
+    observe_disabled` o `peekaboo_disabled` y el job termina exit 0
+    en <100ms (sin tocar Peekaboo CLI ni granite). Costo idle: spawn
+    subprocess + import rag = ~1s.
+
+    Cuando ambos opt-in están ON y TCC concedido al supervisor:
+    captura frontmost + caption granite + INSERT en
+    ``rag_screen_observations``. Dedup titular por (app, window_title)
+    en últimos 60s evita VLM call cuando la ventana no cambió. Quiet
+    hours (default 22:00-07:00) + app denylist (``RAG_SCREEN_APP_DENY``)
+    aplican adentro de observe_once.
+
+    Retention 7d se aplica en `run_maintenance` (housekeeping daily).
+    """
+    return _run_subprocess(
+        [_RAG_BIN, "screen", "observe-once"],
+        extra_env={
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "RAG_LLM_BACKEND": "mlx",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+        },
+        timeout=120,  # capture ~300ms + caption granite warm ~5s + overhead
+    )

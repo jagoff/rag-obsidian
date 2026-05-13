@@ -49695,6 +49695,38 @@ def run_maintenance(
     except Exception:
         results["dead_notes"] = 0
 
+    # 14c. Screen observations retention — borra rows > 7 días.
+    # Tabla rag_screen_observations es append-only del screen_observer job
+    # (Fase 2 Peekaboo, 2026-05-13). Cada captura útil = ~1 row cada 15min
+    # cuando user activo. En 7d acumula ~672 rows worst case (sin dedup);
+    # con dedup titular típico baja a 50-100 rows/día. Retention 7d es
+    # ventana de uso (mirror enriquecimiento, today/brief context) — más
+    # viejo no se consume.
+    try:
+        import sqlite3 as _sqlite3_ret  # noqa: PLC0415
+        _ret_con = _sqlite3_ret.connect(
+            str(DB_PATH / "telemetry.db"), timeout=10.0,
+        )
+        try:
+            _ensure_telemetry_tables(_ret_con)
+            if dry_run:
+                cnt = _ret_con.execute(
+                    "SELECT COUNT(*) FROM rag_screen_observations "
+                    "WHERE ts < strftime('%s','now','-7 days')",
+                ).fetchone()[0]
+                results["screen_obs_deleted"] = f"dry-run: would delete {cnt}"
+            else:
+                cur = _ret_con.execute(
+                    "DELETE FROM rag_screen_observations "
+                    "WHERE ts < strftime('%s','now','-7 days')",
+                )
+                results["screen_obs_deleted"] = cur.rowcount
+                _ret_con.commit()
+        finally:
+            _ret_con.close()
+    except Exception as exc:
+        results["screen_obs_retention_error"] = str(exc)
+
     # 15. Background SQL queue health — drops son signal de overload.
     # El counter es module-level; leerlo desde maintenance lo expone en
     # el JSON de salida para alerting externo (cron, healthcheck).

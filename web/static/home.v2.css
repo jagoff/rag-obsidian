@@ -1893,6 +1893,11 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
   grid-row: span 1 !important;
 }
 
+/* YouTube panel — título en rojo (acento brand YT) */
+.panel#p-youtube .panel-head .title {
+  color: var(--red);
+}
+
 /* Reduce-motion friendliness para el toggle icon */
 @media (prefers-reduced-motion: reduce) {
   .panel-collapse-btn .toggle-icon { transition: none; }

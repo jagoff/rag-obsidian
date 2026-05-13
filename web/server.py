@@ -1628,6 +1628,62 @@ def api_mirror(date: str | None = None, refresh: int = 0) -> dict:
     return assemble_mirror(date=date, use_cache=(refresh != 1))
 
 
+@app.get("/api/screen-capture/{obs_id}")
+def api_screen_capture(obs_id: int) -> "Response":  # noqa: F821
+    """Sirve la PNG de una rag_screen_observations row (Peekaboo Fase 3).
+
+    Lookup por id, valida que el archivo existe y está bajo el dir esperado
+    (`~/.local/share/obsidian-rag/screen_captures/`) para evitar path traversal.
+    404 si no existe la row, la image_path es NULL, o el archivo se borró.
+
+    NO requiere admin token — el server es local-only y la lista de IDs
+    válidos sale del mirror que es también read-only. Cache-Control inmutable
+    1h porque las PNGs nunca cambian (retention 7d las borra).
+    """
+    from fastapi import HTTPException  # noqa: PLC0415
+    from fastapi.responses import FileResponse  # noqa: PLC0415
+    from pathlib import Path  # noqa: PLC0415
+    import sqlite3 as _sqlite3  # noqa: PLC0415
+
+    try:
+        import rag as _rag  # noqa: PLC0415
+        db_path = _rag.DB_PATH / "telemetry.db"
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"rag import failed: {exc}")
+
+    try:
+        con = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+        try:
+            row = con.execute(
+                "SELECT image_path FROM rag_screen_observations WHERE id = ?",
+                (int(obs_id),),
+            ).fetchone()
+        finally:
+            con.close()
+    except _sqlite3.Error as exc:
+        raise HTTPException(status_code=500, detail=f"db error: {exc}")
+
+    if not row or not row[0]:
+        raise HTTPException(status_code=404, detail="image not found")
+
+    img_path = Path(row[0])
+    # Path-traversal guard: image_path debe estar bajo el dir canonical.
+    canonical_dir = Path.home() / ".local/share/obsidian-rag/screen_captures"
+    try:
+        img_path.resolve().relative_to(canonical_dir.resolve())
+    except (ValueError, OSError):
+        raise HTTPException(status_code=403, detail="image outside allowed dir")
+
+    if not img_path.exists():
+        raise HTTPException(status_code=404, detail="image file missing")
+
+    return FileResponse(
+        path=str(img_path),
+        media_type="image/png",
+        headers={"Cache-Control": "private, max-age=3600, immutable"},
+    )
+
+
 @app.get("/api/mirror/insights")
 def api_mirror_insights(date: str | None = None) -> dict:
     """Insights LLM-generated. Se calcula sync (timeout ~8s); el

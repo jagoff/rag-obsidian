@@ -63,6 +63,12 @@ _SCREEN_DEDUP_WINDOW_SECS = 60
 # saber "está activado o no" sin leer el plist (`_observe_state_enabled()`).
 _OBSERVE_STATE_FILE = Path.home() / ".local/share/obsidian-rag/screen_observe_enabled"
 
+# Fase 3 (2026-05-13): PNG storage for browsable mirror gallery.
+# Cada captura se persiste en YYYY-MM-DD/<obs_id>.png. Retention 7d via
+# run_maintenance — cuando se borra la row, se borra el archivo también.
+# Permisos 0700 en el dir, 0600 en cada PNG.
+_OBSERVE_IMAGE_DIR = Path.home() / ".local/share/obsidian-rag/screen_captures"
+
 _VALID_MODES = {"frontmost", "window", "screen", "multi", "menubar"}
 
 
@@ -566,6 +572,7 @@ def observe_once(
         "app_name": None,
         "window_title": None,
         "caption": "",
+        "image_path": None,
         "took_ms": 0,
         "skipped_reason": None,
         "error": None,
@@ -636,15 +643,20 @@ def observe_once(
     except ImportError:
         _screen_prompt = None
     caption_text, caption_err = _caption(png_path, prompt=_screen_prompt)
-    png_path.unlink(missing_ok=True)  # PNG efímera — ya tenemos caption.
+    # NOTA Fase 3: NO borramos la PNG todavía. Si la observación entra a
+    # rag_screen_observations, la movemos al storage permanente para que
+    # /mirror la pueda mostrar. Si se skipea por vlm_empty / dedup_simhash,
+    # borramos al final del path correspondiente.
 
     # vlm_empty no es error — el VLM corrió pero no devolvió texto útil
     # (imagen oscura, blank, etc.). Skipear sin escribir row evita ruido.
     # Otros vlm_err (excepción del modelo) sí son error real.
     if caption_err == "vlm_empty" or (not caption_text and not caption_err):
+        png_path.unlink(missing_ok=True)
         con.close()
         return _finalize(skipped_reason="vlm_empty")
     if caption_err and not caption_text:
+        png_path.unlink(missing_ok=True)
         con.close()
         return _finalize(error=caption_err)
 
@@ -668,14 +680,19 @@ def observe_once(
             within_seconds=dedup_seconds * 5,
         )
         if match_id is not None:
+            png_path.unlink(missing_ok=True)
             con.close()
             return _finalize(skipped_reason="dedup_simhash")
 
+    # INSERT first with image_path=NULL para obtener el observation_id, después
+    # mové la PNG a su path final (que incluye el id) y UPDATE el row.
+    observation_id: int | None = None
+    final_image_path: Path | None = None
     try:
         cur = con.execute(
             "INSERT INTO rag_screen_observations "
-            "(ts, app_name, window_title, caption, caption_simhash, took_ms, capture_mode) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "(ts, app_name, window_title, caption, caption_simhash, took_ms, capture_mode, image_path) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
             (
                 ts_epoch, app_name, window_title, caption_text,
                 simhash, int((time.time() - started) * 1000), mode,
@@ -683,7 +700,41 @@ def observe_once(
         )
         observation_id = cur.lastrowid
         con.commit()
+
+        # Fase 3: mover la PNG al storage permanente bajo YYYY-MM-DD/<id>.png.
+        # Si falla el move (disk full, perms), seguimos sin imagen — el row
+        # ya existe con caption útil. image_path queda NULL y mirror skip.
+        if observation_id is not None and png_path.exists():
+            try:
+                day_dir = _OBSERVE_IMAGE_DIR / now_local.strftime("%Y-%m-%d")
+                day_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    day_dir.chmod(0o700)
+                except OSError:
+                    pass
+                target = day_dir / f"{observation_id}.png"
+                # os.replace es atómico en mismo fs (tmp y target ambos en
+                # ~/.local/share/, mismo APFS volume).
+                os.replace(str(png_path), str(target))
+                try:
+                    target.chmod(0o600)
+                except OSError:
+                    pass
+                final_image_path = target
+                con.execute(
+                    "UPDATE rag_screen_observations SET image_path = ? WHERE id = ?",
+                    (str(target), observation_id),
+                )
+                con.commit()
+            except Exception as exc:
+                try:
+                    from rag import _silent_log  # noqa: PLC0415
+                    _silent_log("screen_obs_image_persist", exc)
+                except Exception:
+                    pass
+                png_path.unlink(missing_ok=True)
     except Exception as exc:
+        png_path.unlink(missing_ok=True)
         con.close()
         return _finalize(error=f"db_insert_error: {exc}")
     finally:
@@ -705,6 +756,7 @@ def observe_once(
         ok=True,
         observation_id=observation_id,
         caption=caption_text,
+        image_path=str(final_image_path) if final_image_path else None,
     )
 
 

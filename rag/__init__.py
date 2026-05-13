@@ -7049,7 +7049,8 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             " caption TEXT NOT NULL,"
             " caption_simhash INTEGER,"
             " took_ms INTEGER,"
-            " capture_mode TEXT NOT NULL DEFAULT 'frontmost'"
+            " capture_mode TEXT NOT NULL DEFAULT 'frontmost',"
+            " image_path TEXT"
             ")",
             "CREATE INDEX IF NOT EXISTS ix_rag_screen_obs_ts"
             " ON rag_screen_observations(ts)",
@@ -49704,24 +49705,58 @@ def run_maintenance(
     # viejo no se consume.
     try:
         import sqlite3 as _sqlite3_ret  # noqa: PLC0415
+        from pathlib import Path as _Path_ret  # noqa: PLC0415
         _ret_con = _sqlite3_ret.connect(
             str(DB_PATH / "telemetry.db"), timeout=10.0,
         )
         try:
             _ensure_telemetry_tables(_ret_con)
+            cutoff_sql = "strftime('%s','now','-7 days')"
             if dry_run:
                 cnt = _ret_con.execute(
-                    "SELECT COUNT(*) FROM rag_screen_observations "
-                    "WHERE ts < strftime('%s','now','-7 days')",
+                    f"SELECT COUNT(*) FROM rag_screen_observations WHERE ts < {cutoff_sql}",
                 ).fetchone()[0]
                 results["screen_obs_deleted"] = f"dry-run: would delete {cnt}"
             else:
+                # Fase 3 (2026-05-13): borrar también los PNG files antes de
+                # borrar las rows. Si el INSERT seteó image_path pero el
+                # archivo ya no está (manual rm, retention previa parcial),
+                # silent-fail por archivo.
+                stale_paths = _ret_con.execute(
+                    "SELECT image_path FROM rag_screen_observations "
+                    f"WHERE ts < {cutoff_sql} AND image_path IS NOT NULL",
+                ).fetchall()
+                files_deleted = 0
+                canonical_dir = (
+                    _Path_ret.home() / ".local/share/obsidian-rag/screen_captures"
+                ).resolve()
+                for (img_path,) in stale_paths:
+                    if not img_path:
+                        continue
+                    try:
+                        target = _Path_ret(img_path).resolve()
+                        target.relative_to(canonical_dir)  # path-traversal guard
+                        target.unlink(missing_ok=True)
+                        files_deleted += 1
+                    except (ValueError, OSError):
+                        pass
                 cur = _ret_con.execute(
-                    "DELETE FROM rag_screen_observations "
-                    "WHERE ts < strftime('%s','now','-7 days')",
+                    f"DELETE FROM rag_screen_observations WHERE ts < {cutoff_sql}",
                 )
                 results["screen_obs_deleted"] = cur.rowcount
+                results["screen_obs_files_deleted"] = files_deleted
                 _ret_con.commit()
+                # Best-effort: limpiar dirs YYYY-MM-DD vacíos.
+                try:
+                    if canonical_dir.exists():
+                        for day_dir in canonical_dir.iterdir():
+                            if day_dir.is_dir():
+                                try:
+                                    day_dir.rmdir()  # falla si non-empty, OK
+                                except OSError:
+                                    pass
+                except OSError:
+                    pass
         finally:
             _ret_con.close()
     except Exception as exc:

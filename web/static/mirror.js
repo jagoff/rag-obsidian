@@ -248,42 +248,82 @@ function renderScreenTime(data) {
   }
 }
 
+function escapeHtml(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
 function renderScreenContext(data) {
   const el = $("#screen_context .content");
   clear(el);
   const recent = data?.recent || [];
-  if (!recent.length) {
-    const today = data?.count_today ?? 0;
-    el.appendChild(emptyState(today > 0
-      ? `sin captura reciente (hoy: ${today})`
+  const today = data?.today || [];
+  if (!recent.length && !today.length) {
+    const todayCount = data?.count_today ?? 0;
+    el.appendChild(emptyState(todayCount > 0
+      ? `sin captura reciente (hoy: ${todayCount})`
       : "sin captura reciente"));
     return;
   }
+  // Live ticker — últimas 3 con thumbnails grandes.
   for (const obs of recent) {
     const card = document.createElement("div");
     card.className = "screen-obs";
     const ageMin = obs.age_minutes ?? 0;
     const ageLabel = ageMin === 0 ? "ahora" : `hace ${ageMin}m`;
-    const app = obs.app_name || "?";
-    const title = (obs.window_title || "").trim();
-    const caption = (obs.caption || "").trim();
+    const app = escapeHtml(obs.app_name || "?");
+    const title = escapeHtml((obs.window_title || "").trim());
+    const caption = escapeHtml((obs.caption || "").trim());
+    const imgUrl = obs.image_url;
     card.innerHTML = `
       <div class="screen-obs-head">
         <span class="screen-obs-app">${app}</span>
         <span class="screen-obs-age">${ageLabel}</span>
       </div>
+      ${imgUrl ? `<a href="${imgUrl}" target="_blank" rel="noopener"><img class="screen-obs-img" loading="lazy" src="${imgUrl}" alt="${app}"></a>` : ""}
       ${title ? `<div class="screen-obs-title">${title}</div>` : ""}
       ${caption ? `<div class="screen-obs-caption">${caption}</div>` : ""}
     `;
     el.appendChild(card);
   }
-  const counts = data?.count_today;
-  if (counts && counts > recent.length) {
-    const foot = document.createElement("div");
-    foot.className = "screen-obs-foot";
-    foot.textContent = `+${counts - recent.length} más hoy · ${data?.count_7d ?? counts} esta semana`;
-    el.appendChild(foot);
+  // Today gallery — grid de thumbs.
+  const galleryItems = today.filter(obs => !recent.some(r => r.id === obs.id));
+  if (galleryItems.length) {
+    const heading = document.createElement("div");
+    heading.className = "screen-gallery-heading";
+    heading.textContent = `Hoy (${today.length} captura${today.length === 1 ? "" : "s"})`;
+    el.appendChild(heading);
+    const grid = document.createElement("div");
+    grid.className = "screen-gallery";
+    for (const obs of galleryItems) {
+      const cell = document.createElement("a");
+      cell.className = "screen-gallery-cell";
+      cell.href = obs.image_url;
+      cell.target = "_blank";
+      cell.rel = "noopener";
+      const ageMin = obs.age_minutes ?? 0;
+      const ageHr = Math.floor(ageMin / 60);
+      const ageLabel = ageHr > 0 ? `${ageHr}h` : `${ageMin}m`;
+      const app = escapeHtml(obs.app_name || "?");
+      const caption = escapeHtml((obs.caption || "").trim().slice(0, 80));
+      cell.innerHTML = `
+        <img class="screen-gallery-img" loading="lazy" src="${obs.image_url}" alt="${app}">
+        <div class="screen-gallery-meta">
+          <span class="screen-gallery-app">${app}</span>
+          <span class="screen-gallery-age">${ageLabel}</span>
+        </div>
+        ${caption ? `<div class="screen-gallery-caption" title="${caption}">${caption}</div>` : ""}
+      `;
+      grid.appendChild(cell);
+    }
+    el.appendChild(grid);
   }
+  const counts = data?.count_today;
+  const foot = document.createElement("div");
+  foot.className = "screen-obs-foot";
+  foot.textContent = `${counts ?? today.length} hoy · ${data?.count_7d ?? counts ?? 0} esta semana`;
+  el.appendChild(foot);
 }
 
 function renderObservations(data) {

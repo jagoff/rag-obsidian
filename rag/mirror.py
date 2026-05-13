@@ -504,8 +504,13 @@ def _source_screen_context(date: str) -> dict[str, Any]:
         cutoff_today = now_ts - 24 * 3600
         cutoff_7d = now_ts - 7 * 86400
 
+        # Fase 3 (2026-05-13): incluir `image_url` por row para que el mirror
+        # frontend renderice thumbnail. `recent` = últimas 3 en últimas 4h
+        # (live ticker, comportamiento original). `today` = todas las
+        # observations con image_path NOT NULL del día calendar local (gallery
+        # browsable). Cap today=200 para no inflar el payload.
         cur = conn.execute(
-            "SELECT ts, app_name, window_title, caption "
+            "SELECT id, ts, app_name, window_title, caption, image_path "
             "FROM rag_screen_observations "
             "WHERE ts >= ? "
             "ORDER BY ts DESC LIMIT 3",
@@ -513,17 +518,51 @@ def _source_screen_context(date: str) -> dict[str, Any]:
         )
         recent: list[dict[str, Any]] = []
         for row in cur.fetchall():
-            ts, app, title, caption = row
+            obs_id, ts, app, title, caption, img_path = row
             cap = (caption or "").strip()
             if len(cap) > 140:
                 cap = cap[:137] + "…"
             recent.append({
+                "id": int(obs_id),
                 "ts": int(ts),
                 "app_name": app or "",
                 "window_title": title or "",
                 "caption": cap,
                 "age_minutes": max(0, (now_ts - int(ts)) // 60),
+                "image_url": (f"/api/screen-capture/{int(obs_id)}" if img_path else None),
             })
+
+        # Today gallery — todas las obs del día calendar local con imagen.
+        import datetime as _dt  # noqa: PLC0415
+        today_start = int(_dt.datetime.combine(
+            _dt.date.today(), _dt.time.min,
+        ).timestamp())
+        try:
+            today_cur = conn.execute(
+                "SELECT id, ts, app_name, window_title, caption, image_path "
+                "FROM rag_screen_observations "
+                "WHERE ts >= ? AND image_path IS NOT NULL "
+                "ORDER BY ts DESC LIMIT 200",
+                (today_start,),
+            )
+            today_gallery: list[dict[str, Any]] = []
+            for row in today_cur.fetchall():
+                obs_id, ts, app, title, caption, img_path = row
+                cap = (caption or "").strip()
+                if len(cap) > 140:
+                    cap = cap[:137] + "…"
+                today_gallery.append({
+                    "id": int(obs_id),
+                    "ts": int(ts),
+                    "app_name": app or "",
+                    "window_title": title or "",
+                    "caption": cap,
+                    "age_minutes": max(0, (now_ts - int(ts)) // 60),
+                    "image_url": f"/api/screen-capture/{int(obs_id)}",
+                })
+        except sqlite3.Error as exc:
+            logger.warning("mirror: today gallery query failed: %s", exc)
+            today_gallery = []
 
         try:
             count_today = int(conn.execute(
@@ -542,12 +581,13 @@ def _source_screen_context(date: str) -> dict[str, Any]:
 
         return {
             "recent": recent,
+            "today": today_gallery,
             "count_today": count_today,
             "count_7d": count_7d,
         }
     except Exception as exc:
         logger.warning("mirror: screen_context failed: %s", exc)
-        return {"recent": [], "count_today": 0, "count_7d": 0, "error": str(exc)[:200]}
+        return {"recent": [], "today": [], "count_today": 0, "count_7d": 0, "error": str(exc)[:200]}
     finally:
         conn.close()
 

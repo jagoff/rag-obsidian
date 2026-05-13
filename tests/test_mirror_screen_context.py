@@ -66,7 +66,7 @@ def test_source_registered_in_aggregator():
 
 def test_empty_table_returns_zeros(isolated_telemetry):
     out = _source_screen_context("2026-05-13")
-    assert out == {"recent": [], "count_today": 0, "count_7d": 0}
+    assert out == {"recent": [], "today": [], "count_today": 0, "count_7d": 0}
 
 
 def test_missing_table_handled_gracefully(tmp_path, monkeypatch):

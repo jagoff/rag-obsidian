@@ -275,6 +275,28 @@ def _migrate_trace_id_columns(conn) -> None:
                 pass
 
 
+def _migrate_screen_obs_add_image_path(conn) -> None:
+    """Idempotent ALTER para agregar `image_path TEXT` a `rag_screen_observations`
+    (Peekaboo Fase 3, 2026-05-13).
+
+    DBs pre-Fase-3 tienen la tabla sin la columna. Fresh installs ya la tienen
+    via DDL. Tragamos `duplicate column` silenciosamente; cualquier otro error
+    se loguea pero no aborta el bootstrap.
+    """
+    import sqlite3 as _sqlite3  # noqa: PLC0415
+
+    from rag import _silent_log  # noqa: PLC0415
+
+    try:
+        conn.execute("ALTER TABLE rag_screen_observations ADD COLUMN image_path TEXT")
+    except _sqlite3.OperationalError as exc:
+        if "duplicate column" not in str(exc).lower() and "no such table" not in str(exc).lower():
+            try:
+                _silent_log("migration_screen_obs_image_path_failed", exc)
+            except Exception:
+                pass
+
+
 def _ensure_telemetry_tables(conn) -> None:
     """Create all rag_* telemetry tables + indexes + schema_version rows.
 
@@ -457,6 +479,13 @@ def _ensure_telemetry_tables(conn) -> None:
         except Exception as _migrate_exc:
             try:
                 _silent_log("migration_trace_id_failed", _migrate_exc)
+            except Exception:  # pragma: no cover
+                pass
+        try:
+            _migrate_screen_obs_add_image_path(conn)
+        except Exception as _migrate_exc:
+            try:
+                _silent_log("migration_screen_obs_image_path_failed", _migrate_exc)
             except Exception:  # pragma: no cover
                 pass
         # Versioned schema migrations (2026-04-29). Single source of truth para

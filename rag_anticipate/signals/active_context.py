@@ -78,6 +78,19 @@ _STOPWORDS: frozenset[str] = frozenset({
 _ACTIVE_WINDOW_SECS = 30 * 60            # captura reciente <= 30min
 _DORMANT_MIN_DAYS = 5                    # proyecto dormant cuando >5d sin tocar
 _PROJECTS_CAP = 20                       # cap para evitar walks largos
+_DORMANT_CACHE_TTL_SECS = 1800           # rglob result cached 30min — la lista
+                                          # de proyectos dormant no cambia entre
+                                          # ticks del anticipate (15min).
+
+# Cache module-level: (vault_path_str, min_days) → (computed_at, result).
+# Audit perf 2026-05-13 finding #3: sin cache, cada tick hace iterdir +
+# rglob("*.md") sobre cada subdir de 01-Projects/ (1k-4k stat syscalls por
+# vault típico). TTL 30min: el listado de dormant projects es estable en
+# esa ventana, mtime cambia cuando user toca el proyecto y eso ya rompe
+# el dormancy (el proyecto deja de ser dormant). Test-friendly: el cache
+# se key-ea por `(vault_path_str, min_days)`, así monkeypatches que
+# cambian VAULT_PATH (e.g. tmp_path por test) NO ven el cache de otro test.
+_DORMANT_CACHE: dict[tuple[str, int], tuple[float, list[tuple[Path, int]]]] = {}
 
 
 def _tokenize(text: str) -> set[str]:
@@ -119,9 +132,23 @@ def _dormant_projects(vault_path: Path, now_ts: float, min_days: int = _DORMANT_
 
     Retorna [(path, days_dormant), ...] ordenado desc por recencia
     (más recientemente activo primero). Cap PROJECTS_CAP.
+
+    Cached por 30min (audit perf 2026-05-13 #3): el walk + rglob sobre
+    `01-Projects/*` cuesta 1k-4k stat syscalls en vault típico. Llamar
+    en cada tick del anticipate (15min) es overkill — la lista cambia
+    lento. TTL 30min, keyed por (vault, min_days) para que tests con
+    `monkeypatch.setattr(rag, 'VAULT_PATH', tmp_path)` NO compartan cache.
     """
+    cache_key = (str(vault_path), int(min_days))
+    cached = _DORMANT_CACHE.get(cache_key)
+    if cached is not None:
+        ts, result = cached
+        if now_ts - ts <= _DORMANT_CACHE_TTL_SECS:
+            return result
+
     projects_dir = vault_path / "01-Projects"
     if not projects_dir.is_dir():
+        _DORMANT_CACHE[cache_key] = (now_ts, [])
         return []
     cutoff = now_ts - min_days * 86400
     results: list[tuple[Path, int, float]] = []
@@ -146,10 +173,18 @@ def _dormant_projects(vault_path: Path, now_ts: float, min_days: int = _DORMANT_
             days = int((now_ts - latest) / 86400)
             results.append((sub, days, latest))
     except OSError:
+        _DORMANT_CACHE[cache_key] = (now_ts, [])
         return []
     # Más recientemente activo (mtime mayor) primero.
     results.sort(key=lambda r: r[2], reverse=True)
-    return [(p, d) for (p, d, _m) in results[:_PROJECTS_CAP]]
+    final = [(p, d) for (p, d, _m) in results[:_PROJECTS_CAP]]
+    _DORMANT_CACHE[cache_key] = (now_ts, final)
+    return final
+
+
+def _clear_dormant_cache() -> None:
+    """Test helper — borra el cache TTL. NO usar en producción."""
+    _DORMANT_CACHE.clear()
 
 
 @register_signal(name="active_context", snooze_hours=24)

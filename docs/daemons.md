@@ -48,6 +48,7 @@ Aplicado a TODOS los plists managed:
 | `vault-cleanup` | nightly | | |
 | `whisper-vocab` | 03:15 | | Vocab WA refresh |
 | `mood-poll` | 30min | | UI no cableada (signals NO en home.v2) |
+| `screen_observer` (supervisor job, 2026-05-13) | 15min | `rag screen observe-once` | Peekaboo screen capture pasiva → `rag_screen_observations`. Doble opt-in: `RAG_PEEKABOO_ENABLE=1` + `RAG_SCREEN_OBSERVE=1`. Consumers: `/mirror` (bloque "En pantalla · live"), signal anticipatory `active_context`. |
 
 ## Control plane `rag daemons`
 

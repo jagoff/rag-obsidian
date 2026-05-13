@@ -24,9 +24,20 @@ import pytest
 import rag
 from rag_anticipate.signals.active_context import (
     _DORMANT_MIN_DAYS,
+    _clear_dormant_cache,
     _tokenize,
     active_context_signal,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_dormant_cache():
+    """Cada test arranca con cache limpio (cache_key incluye vault_path
+    pero tmp_path varía por test, así no debería haber overlap — esto
+    es belt-and-suspenders por si el cache se ensucia entre runs)."""
+    _clear_dormant_cache()
+    yield
+    _clear_dormant_cache()
 
 _REF_NOW = datetime(2026, 5, 13, 14, 0, 0)
 
@@ -214,6 +225,42 @@ def test_no_projects_returns_empty(isolated):
     )
     # No projects creados — solo el dir 01-Projects vacío.
     assert active_context_signal(_REF_NOW) == []
+
+
+def test_dormant_cache_avoids_repeat_rglob(isolated, monkeypatch):
+    """Audit perf #3: _dormant_projects cachea TTL 30min para evitar
+    walks repetidos. Verificá que el rglob NO se ejecuta dos veces si
+    la signal corre dos veces dentro del TTL."""
+    _seed_obs(
+        isolated / "ragvec", "Code", "fastapi.py",
+        "código fastapi en pantalla",
+        age_seconds=60,
+    )
+    _make_project(isolated / "vault", "fastapi-cached", days_dormant=10)
+
+    # Spy: contar invocaciones de rglob.
+    from pathlib import Path as _P
+    original_rglob = _P.rglob
+    rglob_count = {"n": 0}
+
+    def counting_rglob(self, pattern):
+        rglob_count["n"] += 1
+        return original_rglob(self, pattern)
+
+    monkeypatch.setattr(_P, "rglob", counting_rglob)
+
+    out1 = active_context_signal(_REF_NOW)
+    first_count = rglob_count["n"]
+    assert len(out1) == 1, "primera pasada debe emitir candidate"
+    assert first_count >= 1, "rglob debe correr en la primera pasada"
+
+    out2 = active_context_signal(_REF_NOW)
+    second_count = rglob_count["n"]
+    assert len(out2) == 1, "segunda pasada también emite (mismo proyecto)"
+    assert second_count == first_count, (
+        f"rglob no debe re-correr dentro del TTL "
+        f"(esperado {first_count}, got {second_count})"
+    )
 
 
 def test_just_under_min_days_not_dormant(isolated):

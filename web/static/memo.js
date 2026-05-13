@@ -59,6 +59,61 @@ function formatSize(bytes) {
   return (bytes / 1024).toFixed(1) + "K";
 }
 
+// ── Toast + inline-confirm helpers (reemplazan alert/confirm de chrome) ──
+
+const TOAST_ICONS = { success: "✓", error: "✕", warn: "⚠", info: "ℹ" };
+
+function toast({ title, detail = "", kind = "info", ttl = 5000 }) {
+  const stack = $("#toast-stack");
+  if (!stack) return;
+  const el = document.createElement("div");
+  el.className = `toast ${kind}`;
+  el.innerHTML = `
+    <span class="toast-icon">${TOAST_ICONS[kind] || "ℹ"}</span>
+    <div class="toast-body">
+      <div class="title">${escapeHTML(title)}</div>
+      ${detail ? `<div class="detail">${escapeHTML(detail)}</div>` : ""}
+    </div>
+    <button class="toast-close" aria-label="cerrar">×</button>
+  `;
+  stack.appendChild(el);
+  const dismiss = () => {
+    if (el.parentNode) {
+      el.classList.add("removing");
+      setTimeout(() => el.remove(), 220);
+    }
+  };
+  el.querySelector(".toast-close").addEventListener("click", dismiss);
+  if (ttl > 0) setTimeout(dismiss, ttl);
+  return { dismiss };
+}
+
+// Confirm inline en lugar del modal del navegador. Reemplaza el botón
+// `btn` por un span con "¿Seguro? [sí] [no]". Resuelve true/false.
+function inlineConfirm(btn, question) {
+  return new Promise((resolve) => {
+    const orig = btn.innerHTML;
+    const wasDisabled = btn.disabled;
+    const wrap = document.createElement("span");
+    wrap.className = "inline-confirm";
+    wrap.innerHTML = `
+      <span>${escapeHTML(question)}</span>
+      <button class="yes">sí, hacelo</button>
+      <button class="no">cancelar</button>
+    `;
+    btn.replaceWith(wrap);
+    const restore = (val) => {
+      const newBtn = btn;
+      newBtn.innerHTML = orig;
+      newBtn.disabled = wasDisabled;
+      wrap.replaceWith(newBtn);
+      resolve(val);
+    };
+    wrap.querySelector(".yes").addEventListener("click", () => restore(true));
+    wrap.querySelector(".no").addEventListener("click", () => restore(false));
+  });
+}
+
 async function api(path) {
   const r = await fetch(path);
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -135,7 +190,12 @@ function renderVerdict(v) {
 async function runCleanup() {
   const btn = $("#cleanup-btn");
   if (!btn || btn.disabled) return;
-  if (!confirm("Borrar memorias dead (nunca usadas + creadas hace >30d + score <40). Acción irreversible. ¿Seguir?")) {
+  // Inline confirm reemplaza el btn por "¿sí? / cancelar" + lo restaura
+  // al elegir. Event listener original sobre btn persiste porque
+  // replaceWith mueve el nodo sin clonarlo.
+  const ok = await inlineConfirm(btn, "Borrar dead memories — irreversible.");
+  if (!ok) {
+    toast({ title: "Cleanup cancelado", kind: "info", ttl: 2500 });
     return;
   }
   btn.disabled = true;
@@ -220,6 +280,8 @@ function renderTopRecalled(usage) {
   }
 }
 
+const DEAD_SELECTION = new Set();
+
 function renderDeadList(usage) {
   const list = usage.dead_memorias || [];
   $("#dead-meta").textContent = `${usage.dead_count} memorias`;
@@ -227,23 +289,151 @@ function renderDeadList(usage) {
     $("#dead-list").innerHTML = `<div class="loading">Sin dead memorias. Todo lo que tiene &gt; 2d se está usando. 👍</div>`;
     return;
   }
-  $("#dead-list").innerHTML = list
-    .map(
-      (m) => `
-      <div class="recall-row" data-id="${escapeHTML(m.id)}">
-        <span class="count-badge" style="color: var(--red);">0×</span>
-        <div style="flex: 1; min-width: 0;">
-          <div class="title">${escapeHTML(m.title)}</div>
-          <div class="meta-line">
-            <span class="type-tag" data-type="${escapeHTML(m.type)}">${escapeHTML(m.type)}</span>
-            · creado ${escapeHTML(m.age)} atrás · nunca matcheó un prompt
-          </div>
+
+  // Filter selection to ids still present
+  const presentIds = new Set(list.map((m) => m.id));
+  for (const id of [...DEAD_SELECTION]) {
+    if (!presentIds.has(id)) DEAD_SELECTION.delete(id);
+  }
+
+  const header = `
+    <div class="dead-toolbar">
+      <label class="dead-select-all">
+        <input type="checkbox" id="dead-select-all-cb">
+        <span>seleccionar todo</span>
+      </label>
+      <span class="dead-count" id="dead-selected-count">0 seleccionadas</span>
+      <span style="flex:1"></span>
+      <button class="dead-btn dead-btn-bulk" id="dead-delete-bulk" disabled>
+        🗑 Borrar seleccionadas
+      </button>
+      <button class="dead-btn dead-btn-all" id="dead-delete-all">
+        💥 Borrar todas (${list.length})
+      </button>
+    </div>
+  `;
+  const rows = list.map((m) => `
+    <div class="dead-row" data-id="${escapeHTML(m.id)}">
+      <label class="dead-check">
+        <input type="checkbox" class="dead-cb" data-id="${escapeHTML(m.id)}" ${DEAD_SELECTION.has(m.id) ? 'checked' : ''}>
+      </label>
+      <span class="count-badge" style="color: var(--red);">0×</span>
+      <div class="dead-body" data-id="${escapeHTML(m.id)}">
+        <div class="title">${escapeHTML(m.title)}</div>
+        <div class="meta-line">
+          <span class="type-tag" data-type="${escapeHTML(m.type)}">${escapeHTML(m.type)}</span>
+          · creado ${escapeHTML(m.age)} atrás · nunca matcheó un prompt
         </div>
-      </div>`
-    )
-    .join("");
-  for (const r of document.querySelectorAll("#dead-list .recall-row")) {
-    r.addEventListener("click", () => selectMemo(r.dataset.id));
+      </div>
+      <button class="dead-btn-row" data-id="${escapeHTML(m.id)}" title="Borrar esta memoria">🗑</button>
+    </div>
+  `).join("");
+
+  $("#dead-list").innerHTML = header + rows;
+  attachDeadHandlers(list);
+  updateDeadSelectionUI();
+}
+
+function updateDeadSelectionUI() {
+  const n = DEAD_SELECTION.size;
+  const countEl = $("#dead-selected-count");
+  const bulkBtn = $("#dead-delete-bulk");
+  const allCb = $("#dead-select-all-cb");
+  if (countEl) countEl.textContent = `${n} seleccionada${n === 1 ? '' : 's'}`;
+  if (bulkBtn) bulkBtn.disabled = n === 0;
+  if (allCb) {
+    const totalCbs = document.querySelectorAll(".dead-cb").length;
+    allCb.checked = n > 0 && n === totalCbs;
+    allCb.indeterminate = n > 0 && n < totalCbs;
+  }
+}
+
+function attachDeadHandlers(list) {
+  // Click body → ver detalle
+  for (const el of document.querySelectorAll("#dead-list .dead-body")) {
+    el.addEventListener("click", () => selectMemo(el.dataset.id));
+  }
+  // Checkbox individual
+  for (const cb of document.querySelectorAll("#dead-list .dead-cb")) {
+    cb.addEventListener("change", () => {
+      if (cb.checked) DEAD_SELECTION.add(cb.dataset.id);
+      else DEAD_SELECTION.delete(cb.dataset.id);
+      updateDeadSelectionUI();
+    });
+  }
+  // Select-all
+  const allCb = $("#dead-select-all-cb");
+  if (allCb) {
+    allCb.addEventListener("change", () => {
+      const checked = allCb.checked;
+      DEAD_SELECTION.clear();
+      for (const cb of document.querySelectorAll("#dead-list .dead-cb")) {
+        cb.checked = checked;
+        if (checked) DEAD_SELECTION.add(cb.dataset.id);
+      }
+      updateDeadSelectionUI();
+    });
+  }
+  // Botón row individual
+  for (const btn of document.querySelectorAll("#dead-list .dead-btn-row")) {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const id = btn.dataset.id;
+      const row = list.find((m) => m.id === id);
+      deleteMemoIds([id], row?.title || id);
+    });
+  }
+  // Bulk
+  $("#dead-delete-bulk")?.addEventListener("click", async () => {
+    const ids = [...DEAD_SELECTION];
+    if (!ids.length) return;
+    const btn = $("#dead-delete-bulk");
+    const ok = await inlineConfirm(btn, `Borrar ${ids.length} seleccionada${ids.length === 1 ? '' : 's'}.`);
+    if (!ok) return;
+    deleteMemoIds(ids, `${ids.length} seleccionadas`);
+  });
+  // All
+  $("#dead-delete-all")?.addEventListener("click", async () => {
+    const ids = list.map((m) => m.id);
+    const btn = $("#dead-delete-all");
+    const ok = await inlineConfirm(btn, `Borrar las ${ids.length} dead memorias — irreversible.`);
+    if (!ok) return;
+    deleteMemoIds(ids, `${ids.length} dead memorias`);
+  });
+}
+
+async function deleteMemoIds(ids, label) {
+  const progress = toast({
+    title: `Borrando ${label}...`,
+    detail: ids.length > 1 ? `${ids.length} memorias en cola` : undefined,
+    kind: "info",
+    ttl: 0,
+  });
+  try {
+    const r = await fetch("/api/memo/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(ids),
+    });
+    const result = await r.json();
+    progress.dismiss();
+    if (!result.ok) {
+      toast({ title: "Borrado falló", detail: result.error || "?", kind: "error", ttl: 6000 });
+      return;
+    }
+    const d = result.deleted?.length || 0;
+    const e = result.errors?.length || 0;
+    const kind = e > 0 ? (d > 0 ? "warn" : "error") : "success";
+    const summary = `${d} borrada${d === 1 ? '' : 's'}` + (e ? ` · ${e} errores` : "");
+    const detail = e && result.errors[0] ? `${result.errors[0].error?.slice(0, 120)}` : undefined;
+    toast({ title: summary, detail, kind, ttl: 5000 });
+    // Limpiar selección de los efectivamente borrados
+    for (const id of (result.deleted || [])) DEAD_SELECTION.delete(id);
+    refresh();
+    loadV06Features();
+  } catch (e) {
+    progress.dismiss();
+    toast({ title: "Borrado falló", detail: e.message, kind: "error", ttl: 6000 });
   }
 }
 
@@ -721,18 +911,28 @@ $("#search-input").addEventListener("input", (e) => {
   }, 200);
 });
 
-// ── Merge all dupe pairs
+// ── Merge all dupe pairs (toast feedback, sin alert/confirm chrome) ──
 $("#merge-all-btn").addEventListener("click", async () => {
   if (!STATE.snapshot || !STATE.snapshot.dupe_pairs || STATE.snapshot.dupe_pairs.length === 0) {
+    toast({ title: "Nada para fusionar", kind: "info", ttl: 2500 });
     return;
   }
-  if (!confirm(`¿Fusionar ${STATE.snapshot.dupe_pairs.length} pares de near-dupes?`)) {
+  const btn = $("#merge-all-btn");
+  const n = STATE.snapshot.dupe_pairs.length;
+  const ok = await inlineConfirm(btn, `Fusionar ${n} pares — irreversible.`);
+  if (!ok) {
+    toast({ title: "Fusión cancelada", kind: "info", ttl: 2500 });
     return;
   }
 
-  const btn = $("#merge-all-btn");
   btn.disabled = true;
   btn.textContent = "Fusionando...";
+  const progress = toast({
+    title: `Fusionando ${n} pares...`,
+    detail: "esto puede tardar unos segundos",
+    kind: "info",
+    ttl: 0,
+  });
 
   try {
     const pairs = STATE.snapshot.dupe_pairs.map((p) => ({ a: p.a.id, b: p.b.id }));
@@ -742,23 +942,35 @@ $("#merge-all-btn").addEventListener("click", async () => {
       body: JSON.stringify(pairs),
     });
     const result = await r.json();
+    progress.dismiss();
     if (result.ok) {
       const m = result.merged?.length || 0;
       const e = result.errors?.length || 0;
       const w = result.warnings?.length || 0;
-      const parts = [`✓ ${m} fusionados`];
-      if (e) parts.push(`❌ ${e} errores`);
-      if (w) parts.push(`⚠️ ${w} warnings (tag merge falló, dupe igual borrado)`);
-      let msg = parts.join("  ·  ");
+      const sk = result.skipped?.length || 0;
+      const kind = e > 0 ? "warn" : (m > 0 ? "success" : "info");
+      const summary = `${m} fusionados`
+        + (e ? ` · ${e} errores` : "")
+        + (w ? ` · ${w} warnings` : "")
+        + (sk ? ` · ${sk} skipped` : "");
+      let detail = "";
+      if (sk) detail += `${sk} pares saltados (overlap con otros ya borrados). `;
+      if (w) detail += `${w} sin merge de tags (bug del CLI). `;
       if (e && result.errors[0]) {
-        msg += `\n\nPrimer error:\n${(result.errors[0].error || "").slice(0, 300)}`;
+        detail += `Primer error: ${(result.errors[0].error || "").slice(0, 120)}`;
       }
-      alert(msg);
+      toast({ title: summary, detail: detail.trim() || undefined, kind, ttl: 7000 });
     } else {
-      alert("Error al fusionar pares: " + (result.error || "?"));
+      toast({
+        title: "Fusión falló",
+        detail: result.error || "?",
+        kind: "error",
+        ttl: 7000,
+      });
     }
   } catch (e) {
-    alert(`Error: ${e.message}`);
+    progress.dismiss();
+    toast({ title: "Fusión falló", detail: e.message, kind: "error", ttl: 7000 });
   } finally {
     btn.disabled = false;
     btn.textContent = "Fusionar todos";

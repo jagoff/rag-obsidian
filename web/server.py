@@ -771,6 +771,40 @@ def memo_temporal_stale_api(days: int = 90, limit: int = 30) -> dict:
 _memo_cleanup_lock = __import__("threading").Lock()
 
 
+@app.post("/api/memo/delete")
+def memo_delete_api(ids: list[str]) -> dict:
+    """Borra una o más memorias por id. Llama `memo delete --yes` per id.
+
+    Request body: `["id1", "id2", ...]` (full ids o prefijos ≥4 chars).
+    Response: `{ok, deleted: [...], errors: [...]}`.
+    """
+    import subprocess
+    deleted: list[str] = []
+    errors: list[dict] = []
+    for mid in ids:
+        if not mid or len(mid) < 4:
+            errors.append({"id": mid, "error": "id muy corto"})
+            continue
+        try:
+            r = subprocess.run(
+                ["memo", "delete", "--yes", mid],
+                capture_output=True, timeout=30,
+            )
+            if r.returncode == 0:
+                deleted.append(mid)
+            else:
+                errors.append({"id": mid, "error": r.stderr.decode()[:300]})
+        except Exception as exc:
+            errors.append({"id": mid, "error": f"{type(exc).__name__}: {exc}"})
+    # Invalidate caches post-batch
+    try:
+        from web.memo_v06 import cache_invalidate
+        cache_invalidate()
+    except Exception:
+        pass
+    return {"ok": True, "deleted": deleted, "errors": errors}
+
+
 @app.post("/api/memo/cleanup")
 def memo_cleanup_api(apply_dead: bool = True, apply_dupes: bool = False) -> dict:
     """Cleanup periódico: borra dead memorias (nunca usadas + creadas
@@ -830,12 +864,26 @@ def memo_merge_api(pairs: list[dict[str, str]]) -> dict:
     merged: list[dict] = []
     errors: list[dict] = []
     warnings: list[dict] = []
+    skipped: list[dict] = []
+    # Track ids ya borrados en este batch para evitar "failed to read memo"
+    # cuando dos pares comparten una memoria (ej. (A,B) + (B,C) → B se borra
+    # en el primero y el segundo no la encuentra).
+    deleted_in_batch: set[str] = set()
 
     for pair in pairs:
         a_id = pair.get("a")
         b_id = pair.get("b")
         if not a_id or not b_id:
             errors.append({"pair": pair, "error": "missing id"})
+            continue
+
+        # Skip si alguno de los dos ids ya fue borrado en este batch
+        # (par overlapping con uno anterior). NO es error — es esperado.
+        if a_id in deleted_in_batch or b_id in deleted_in_batch:
+            skipped.append({
+                "pair": pair,
+                "reason": "una memoria del par ya fue borrada en otro par overlapping",
+            })
             continue
 
         try:
@@ -846,7 +894,12 @@ def memo_merge_api(pairs: list[dict[str, str]]) -> dict:
             b_detail = note_detail(memo_id=b_id)
 
             if not a_detail.get("ok") or not b_detail.get("ok"):
-                errors.append({"pair": pair, "error": "failed to read memo"})
+                # Memoria ya no existe (raceada con cleanup u otro proceso).
+                # Tratar como skip, no error fatal.
+                skipped.append({
+                    "pair": pair,
+                    "reason": "memoria no encontrada (probablemente borrada por otro proceso)",
+                })
                 continue
 
             a_memo = a_detail.get("memo", {})
@@ -901,12 +954,14 @@ def memo_merge_api(pairs: list[dict[str, str]]) -> dict:
 
             if result.returncode == 0:
                 merged.append({"kept": keep_id, "deleted": delete_id})
+                deleted_in_batch.add(delete_id)
             else:
                 errors.append({"pair": pair, "error": result.stderr.decode()})
         except Exception as e:
             errors.append({"pair": pair, "error": str(e)})
 
-    return {"ok": True, "merged": merged, "errors": errors, "warnings": warnings}
+    return {"ok": True, "merged": merged, "errors": errors,
+            "warnings": warnings, "skipped": skipped}
 
 
 @app.get("/mem-vault")

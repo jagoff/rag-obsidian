@@ -32,7 +32,7 @@
 
 // Bump cuando cambie el shell / la estrategia. El activate handler borra
 // todo cache que no matchee esta versión, así no se acumulan huérfanos.
-const CACHE_VERSION = "rag-pwa-v71-2026-05-13-grid-6col-3panels-per-row";
+const CACHE_VERSION = "rag-pwa-v72-2026-05-13-panel-h-xl-span-3";
 const SHELL_CACHE = `${CACHE_VERSION}-shell`;
 const STATIC_CACHE = `${CACHE_VERSION}-static`;
 

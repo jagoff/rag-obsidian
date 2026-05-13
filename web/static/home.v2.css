@@ -373,6 +373,11 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 .section-body > .panel[data-w="full"] { grid-column: span 6; }
 .section-body > .panel[data-h="half"] { grid-row: span 1; }
 .section-body > .panel[data-h="full"] { grid-row: span 2; }
+/* xl = 3 filas (3a "medida de largo" pedida 2026-05-13). Solo opt-in
+   manual via chip cycle half → full → xl → half. Autosizer no
+   promotea a xl automáticamente — el threshold de content height
+   topea en full. */
+.section-body > .panel[data-h="xl"] { grid-row: span 3; }
 
 /* Default antes que el autosizer corra: half×full evita layout shift
    feo (los paneles arrancan medianos, luego promote/demote según
@@ -848,6 +853,7 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 .today-hero-body > .hero-section[data-w="full"] { grid-column: span 6; }
 .today-hero-body > .hero-section[data-h="half"] { grid-row: span 1; }
 .today-hero-body > .hero-section[data-h="full"] { grid-row: span 2; }
+.today-hero-body > .hero-section[data-h="xl"]   { grid-row: span 3; }
 .today-hero-body > .hero-section:not([data-w]) { grid-column: span 2; }
 .today-hero-body > .hero-section:not([data-h]) { grid-row: span 1; }
 @media (max-width: 720px) {

@@ -151,21 +151,33 @@ export function injectCollapseButton(panel) {
 // ── Chips de tamaño manual (override del autosizer) ───────────────────
 
 function togglePanelDim(panel, dim) {
-  const cur = panel.dataset[dim] || (dim === "w" ? "half" : "half");
-  const next = cur === "half" ? "full" : "half";
-  const w = dim === "w" ? next : (panel.dataset.w || "half");
-  const h = dim === "h" ? next : (panel.dataset.h || "half");
-  setPanelSize(panel.id, w, h);
+  if (dim === "w") {
+    // ancho: half ↔ full (2 estados, sin cambios).
+    const cur = panel.dataset.w || "half";
+    const next = cur === "half" ? "full" : "half";
+    setPanelSize(panel.id, next, panel.dataset.h || "half");
+  } else {
+    // alto: half → full → xl → half (3 estados, regla 2026-05-13 ask
+    // user "3 medidas de largo"). xl = grid-row span 3.
+    const cur = panel.dataset.h || "half";
+    const next = cur === "half" ? "full" : cur === "full" ? "xl" : "half";
+    setPanelSize(panel.id, panel.dataset.w || "half", next);
+  }
   try { updateResetButtonVisibility(); } catch {}
 }
 
 function chipLabel(dim, panel) {
-  // Etiqueta dinámica que refleja el estado actual + lo que el click va
-  // a hacer. Ej: panel está en data-w=half → chip dice "↔ wide" (click
-  // lo expande). data-w=full → "↔ small". Mismo para alto.
-  const cur = panel.dataset[dim] || "half";
-  if (dim === "w") return cur === "half" ? "↔ wide" : "↔ small";
-  return cur === "half" ? "↕ tall" : "↕ short";
+  // Etiqueta dinámica que refleja lo que el click va a hacer next.
+  // Ancho: half → "↔ wide" → full → "↔ small" → half.
+  // Alto:  half → "↕ tall" → full → "↕ taller" → xl → "↕ short" → half.
+  if (dim === "w") {
+    const cur = panel.dataset.w || "half";
+    return cur === "half" ? "↔ wide" : "↔ small";
+  }
+  const cur = panel.dataset.h || "half";
+  if (cur === "half") return "↕ tall";
+  if (cur === "full") return "↕ taller";
+  return "↕ short";
 }
 
 function refreshChipLabels(panel) {
@@ -239,8 +251,13 @@ function startResize(ev, panel, axis) {
       if (panel.dataset.w !== w) panel.dataset.w = w;
     }
     if (axis === "y" || axis === "xy") {
-      const h = dy > RESIZE_SNAP_PX ? "full"
-        : dy < -RESIZE_SNAP_PX ? "half" : startH;
+      // 3 medidas de largo (regla 2026-05-13): half / full / xl.
+      // dy > 2*SNAP → xl (span 3), SNAP < dy ≤ 2*SNAP → full (span 2),
+      // dy < -SNAP → half (span 1). Mismas distancias para shrink.
+      const h = dy > RESIZE_SNAP_PX * 2 ? "xl"
+        : dy > RESIZE_SNAP_PX ? "full"
+        : dy < -RESIZE_SNAP_PX ? "half"
+        : startH;
       if (panel.dataset.h !== h) panel.dataset.h = h;
     }
   }

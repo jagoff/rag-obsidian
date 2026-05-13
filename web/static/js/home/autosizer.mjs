@@ -68,7 +68,7 @@ function resizePanel(panel) {
   if (!panel || !panel.id) return;
   const overrides = readOverrides();
   const ov = overrides[panel.id];
-  if (ov && (ov.w === "half" || ov.w === "full") && (ov.h === "half" || ov.h === "full")) {
+  if (ov && (ov.w === "half" || ov.w === "full") && (ov.h === "half" || ov.h === "full" || ov.h === "xl")) {
     applySize(panel, ov.w, ov.h);
     return;
   }

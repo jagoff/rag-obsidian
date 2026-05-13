@@ -551,6 +551,57 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
   font-variant-numeric: tabular-nums;
 }
 
+/* Spotify hero — tapa del álbum prominent. Diferente al row estándar
+   porque el cuadro es grande (data-h="full" típico) y la tapa merece
+   espacio. Click sobre el bloque entero abre spotify:track. */
+.spotify-hero {
+  display: flex;
+  gap: var(--space-3);
+  align-items: center;
+  padding: var(--space-2) 0 var(--space-3);
+  border-bottom: 1px solid var(--border);
+  margin-bottom: var(--space-2);
+  text-decoration: none;
+  color: inherit;
+}
+.spotify-hero.row--linked { cursor: pointer; }
+.spotify-hero.row--linked:hover .row-title { color: var(--cyan); }
+.spotify-art {
+  width: 96px;
+  height: 96px;
+  object-fit: cover;
+  border-radius: 4px;
+  flex-shrink: 0;
+  background: var(--bg-elev-2);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+}
+.spotify-art-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 36px;
+  color: var(--text-faint);
+}
+.spotify-hero-text {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.spotify-hero-text .row-title {
+  font-size: var(--fs-base);
+  font-weight: 600;
+  color: var(--text);
+}
+.spotify-hero-text .row-meta {
+  color: var(--text-dim);
+  font-size: var(--fs-mini);
+}
+.spotify-hero-text .row-meta .spotify-state-playing { color: var(--green, #1db954); }
+.spotify-hero-text .row-meta .spotify-state-paused  { color: var(--text-dim); }
+.spotify-recent .row { padding: var(--space-2) 0; }
+
 /* ── ASCII / SVG mini-charts (signature) ─────────────────── */
 
 /* Stacked bar — para Loops Aging (0-7d / 8-30d / STALE) */

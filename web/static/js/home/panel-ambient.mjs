@@ -176,42 +176,74 @@ export function renderSpotify(payload) {
 
   const np = sp.now_playing;
   const recent = sp.recent_today || [];
-  const rows = [];
+
+  // Custom render — hero album-art block for np + compact list for recent.
+  // Bypass renderPanelList porque el hero con tapa grande no encaja en el
+  // row template estándar; el resto sigue siendo una lista normal.
+  const body = panel.querySelector("[data-body]");
+  const count = panel.querySelector("[data-count]");
+
+  let html = "";
 
   if (np) {
     const isPlaying = np.state === "playing";
     const stateBadge = isPlaying ? "▶ ahora" : "⏸ pausado";
     const stateClass = isPlaying ? "spotify-state-playing" : "spotify-state-paused";
-    const meta = [{ cls: stateClass, text: stateBadge }, np.artist];
-    if (np.album) meta.push(np.album);
-    rows.push({
-      title: np.name,
-      meta,
-      href: trackHref(np.track_id),
-    });
+    const art = np.art_url
+      ? `<img class="spotify-art" src="${escapeHTML(np.art_url)}" alt="${escapeHTML(np.album || np.name || "")}" loading="lazy">`
+      : `<div class="spotify-art spotify-art-placeholder" aria-hidden="true">🎧</div>`;
+    const href = trackHref(np.track_id);
+    const meta = [
+      `<span class="${stateClass}">${escapeHTML(stateBadge)}</span>`,
+      escapeHTML(np.artist),
+      np.album ? escapeHTML(np.album) : null,
+    ].filter(Boolean).join(" · ");
+    const heroInner = `
+      ${art}
+      <div class="spotify-hero-text">
+        <div class="row-title">${escapeHTML(np.name)}</div>
+        <div class="row-meta">${meta}</div>
+      </div>`;
+    html += href
+      ? `<a class="spotify-hero row--linked" href="${escapeHTML(href)}">${heroInner}</a>`
+      : `<div class="spotify-hero">${heroInner}</div>`;
   }
 
   const npId = np?.track_id;
   const rest = recent.filter((t) => t.track_id !== npId).slice(0, 4);
-  for (const t of rest) {
-    const meta = [t.artist];
-    const ago = fmtTimeAgo(new Date(t.first_seen * 1000).toISOString());
-    if (ago && ago !== "ahora") meta.push(ago);
-    rows.push({
-      title: t.name,
-      meta,
-      aside: t.duration_played_s > 30 ? fmtSecs(t.duration_played_s) : null,
-      href: trackHref(t.track_id),
-    });
+  if (rest.length) {
+    html += `<div class="spotify-recent">`;
+    for (const t of rest) {
+      const ago = fmtTimeAgo(new Date(t.first_seen * 1000).toISOString());
+      const metaParts = [escapeHTML(t.artist)];
+      if (ago && ago !== "ahora") metaParts.push(escapeHTML(ago));
+      const aside = t.duration_played_s > 30
+        ? `<span class="row-aside">${escapeHTML(fmtSecs(t.duration_played_s))}</span>`
+        : "";
+      const inner = `<div class="row-main">
+        <div class="row-title">${escapeHTML(t.name)}</div>
+        <div class="row-meta">${metaParts.join(" · ")}</div>
+      </div>${aside}`;
+      const href = trackHref(t.track_id);
+      html += href
+        ? `<a class="row row--linked" href="${escapeHTML(href)}">${inner}</a>`
+        : `<div class="row">${inner}</div>`;
+    }
+    html += `</div>`;
   }
-  renderPanelList("p-spotify", rows, {
-    emptyText: "sin actividad hoy",
-    showCount: true,
-  });
-  // Override count para mostrar el total de hoy incluyendo el np.
-  const countEl = panel.querySelector("[data-count]");
-  if (countEl) {
+
+  if (!html) {
+    html = `<div class="empty">sin actividad hoy</div>`;
+    panel.classList.add("is-empty");
+  } else {
+    panel.classList.remove("is-empty");
+  }
+  body.innerHTML = html;
+
+  if (count) {
     const totalToday = recent.length + (np && !recent.some((t) => t.track_id === npId) ? 1 : 0);
-    countEl.textContent = totalToday;
+    count.textContent = totalToday;
+    count.classList.remove("has-warning", "has-critical");
+    count.classList.add("has-items");
   }
 }

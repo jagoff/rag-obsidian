@@ -7031,6 +7031,32 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             " ON rag_proactive_drafts(target_jid)",
         ),
     ),
+    (
+        # Peekaboo screen observations (Fase 2 design 2026-05-13).
+        # Cada row = una captura on-tick del frontmost window + caption granite.
+        # Daemon `com.fer.obsidian-rag-screen-observer` (no shipped yet) inserta
+        # cuando RAG_SCREEN_OBSERVE=1 + fuera de quiet hours + app no denied.
+        # Retention 7d via run_maintenance. Consumers: mirror, anticipatory,
+        # today/brief para enrich live screen context. NO indexable al corpus
+        # principal — tabla separada para evitar contaminar embedder space.
+        "rag_screen_observations",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_screen_observations ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts INTEGER NOT NULL,"
+            " app_name TEXT,"
+            " window_title TEXT,"
+            " caption TEXT NOT NULL,"
+            " caption_simhash INTEGER,"
+            " took_ms INTEGER,"
+            " capture_mode TEXT NOT NULL DEFAULT 'frontmost'"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_screen_obs_ts"
+            " ON rag_screen_observations(ts)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_screen_obs_app_ts"
+            " ON rag_screen_observations(app_name, ts)",
+        ),
+    ),
 )
 
 

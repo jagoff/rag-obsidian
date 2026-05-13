@@ -360,6 +360,10 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
   grid-auto-rows: 280px;
   gap: var(--space-3);
   align-items: stretch;
+  /* `dense` permite que cajas chicas (half×half) rellenen huecos que
+     dejarían cajas grandes (half×full) si estuvieran solas. Sin esto,
+     el grid deja huecos en filas con un panel full y otro half. */
+  grid-auto-flow: dense;
 }
 
 .section-body > .panel[data-w="half"] { grid-column: span 2; }

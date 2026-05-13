@@ -344,29 +344,49 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 
 /* Section bodies — different layouts per section */
 
+/* ── Grid 4-col fijo + size discreto por panel ───────────────────────
+   2 widths (data-w): half = span 2 cols, full = span 4 cols.
+   2 heights (data-h): half = span 1 row (~280px), full = span 2 rows (~580px).
+   Tamaño asignado por autosizer.mjs según scrollHeight del content.
+   `align-items: stretch` (default del grid) hace que el panel llene la
+   celda — sin huecos verticales raros. Si el content es chico, el
+   autosizer marca data-h=half para evitar desperdicio. */
 .section-accionable .section-body,
 .section-briefs .section-body,
 .section-monitoring .section-body,
 .section-ambient .section-body {
   display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  grid-auto-rows: 280px;
   gap: var(--space-3);
-  /* Each panel sizes to its natural content height — no stretch-to-row.
-     Grid columns stay intact; rows become ragged but cells stop holding
-     empty space when one panel in the row has much more content. */
-  align-items: start;
+  align-items: stretch;
 }
 
-.section-accionable .section-body {
-  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-}
-.section-briefs .section-body {
-  grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
-}
-.section-monitoring .section-body {
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-}
-.section-ambient .section-body {
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+.section-body > .panel[data-w="half"] { grid-column: span 2; }
+.section-body > .panel[data-w="full"] { grid-column: span 4; }
+.section-body > .panel[data-h="half"] { grid-row: span 1; }
+.section-body > .panel[data-h="full"] { grid-row: span 2; }
+
+/* Default antes que el autosizer corra: half×full evita layout shift
+   feo (los paneles arrancan medianos, luego promote/demote según
+   content). */
+.section-body > .panel:not([data-w]) { grid-column: span 2; }
+.section-body > .panel:not([data-h]) { grid-row: span 2; }
+
+/* Mobile: 1-col, force span 1 — cada panel ocupa todo el ancho y
+   altura natural. */
+@media (max-width: 720px) {
+  .section-accionable .section-body,
+  .section-briefs .section-body,
+  .section-monitoring .section-body,
+  .section-ambient .section-body {
+    grid-template-columns: 1fr;
+    grid-auto-rows: auto;
+  }
+  .section-body > .panel[data-w],
+  .section-body > .panel:not([data-w]) { grid-column: span 1; }
+  .section-body > .panel[data-h],
+  .section-body > .panel:not([data-h]) { grid-row: auto; }
 }
 
 /* ── Panel (componente base) ─────────────────────────────── */

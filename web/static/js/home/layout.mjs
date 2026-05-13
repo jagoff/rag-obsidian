@@ -6,6 +6,7 @@ import {
   LS_HERO_ORDER,
   LS_HERO_SUB_COLLAPSED,
 } from "./panel-today.mjs";
+import { observeAllPanels, observePanel, clearPanelSizeOverrides } from "./autosizer.mjs";
 
 // ── Constantes de localStorage ─────────────────────────────────────────────────
 
@@ -65,6 +66,7 @@ function clearSavedOrder() {
   try { localStorage.removeItem(LS_HERO_ORDER); } catch {}
   try { localStorage.removeItem(LS_HERO_SUB_COLLAPSED); } catch {}
   try { localStorage.removeItem(LS_SECTIONS_COLLAPSED); } catch {}
+  clearPanelSizeOverrides();
   // Más simple recargar que reconstruir el orden hard-coded del HTML.
   window.location.reload();
 }
@@ -261,6 +263,7 @@ function hasCustomLayout() {
     if (localStorage.getItem(LS_HERO_ORDER)) return true;
     if (localStorage.getItem(LS_HERO_SUB_COLLAPSED)) return true;
     if (localStorage.getItem(LS_SECTIONS_COLLAPSED)) return true;
+    if (localStorage.getItem("home.v2.panel-sizes.v1")) return true;
   } catch {}
   return false;
 }
@@ -367,4 +370,25 @@ export function initLayout() {
   SECTION_BODY_IDS.forEach(makeSectionDroppable);
   // 5. Inyectar botón reset en la topbar
   injectResetButton();
+  // 6. Auto-sizing por content (4-col grid + 2 alturas).
+  observeAllPanels();
+  // 6b. Watcher para paneles hidden que aparecen tarde (p-mood, p-sleep,
+  //     p-spotify, p-correlations, p-patterns) — se enganchan cuando el
+  //     renderer correspondiente los unhide.
+  SECTION_BODY_IDS.forEach((secId) => {
+    const sec = document.getElementById(secId);
+    if (!sec) return;
+    const mo = new MutationObserver((mutations) => {
+      for (const m of mutations) {
+        if (m.type !== "attributes" || m.attributeName !== "hidden") continue;
+        const panel = m.target;
+        if (panel?.classList?.contains("panel") && !panel.hidden) {
+          observePanel(panel);
+        }
+      }
+    });
+    sec.querySelectorAll(":scope > .panel").forEach((p) => {
+      mo.observe(p, { attributes: true, attributeFilter: ["hidden"] });
+    });
+  });
 }

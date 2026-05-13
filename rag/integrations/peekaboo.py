@@ -51,7 +51,7 @@ _VALID_MODES = {"frontmost", "window", "screen", "multi", "menubar"}
 
 def _is_enabled() -> bool:
     """True si el feature está activado por env."""
-    return os.environ.get(_PEEKABOO_ENABLE_ENV, "0").strip() in ("1", "true", "yes", "on")
+    return os.environ.get(_PEEKABOO_ENABLE_ENV, "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _resolve_binary() -> str | None:

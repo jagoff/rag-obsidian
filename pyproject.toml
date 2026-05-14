@@ -66,6 +66,9 @@ dependencies = [
     # pypdf extrae texto de PDFs para el ingester finances (resúmenes
     # de tarjeta de crédito en iCloud). Wheel ~2MB, sin deps pesadas.
     "pypdf>=5.0",
+    # xlrd lee archivos .xls (viejo formato Excel) para el ingester
+    # finances. Wheel ~1MB, sin deps pesadas.
+    "xlrd>=2.0",
 ]
 
 [project.optional-dependencies]

@@ -69,31 +69,65 @@ def _extract_text_from_pdf(path: Path) -> str:
 
 
 def _extract_text_from_excel(path: Path) -> str:
-    """Extract text from Excel using openpyxl (.xlsx only, not .xls)."""
-    if path.suffix.lower() == ".xls":
-        logger.warning("Skipping old .xls format (openpyxl only supports .xlsx): %s", path)
-        return ""
+    """Extract text from Excel using xlrd (.xls) or openpyxl (.xlsx).
 
-    try:
-        import openpyxl
-    except ImportError:
-        logger.warning("openpyxl not available for Excel extraction")
-        return ""
+    Some .xls files are actually HTML exports from banking systems.
+    Falls back to text extraction if xlrd fails.
+    """
+    suffix = path.suffix.lower()
 
-    try:
-        wb = openpyxl.load_workbook(path, data_only=True)
-        text_parts = []
-        for sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
-            text_parts.append(f"## Hoja: {sheet_name}\n")
-            for row in ws.iter_rows(values_only=True):
-                row_text = " | ".join(str(cell) if cell is not None else "" for cell in row)
-                if row_text.strip():
-                    text_parts.append(row_text)
-        return "\n".join(text_parts).strip()
-    except Exception as exc:
-        logger.warning("Failed to extract Excel text: %s", exc)
-        return ""
+    if suffix == ".xls":
+        try:
+            import xlrd
+        except ImportError:
+            logger.warning("xlrd not available for .xls extraction")
+            return ""
+
+        try:
+            wb = xlrd.open_workbook(path)
+            text_parts = []
+            for sheet_idx in range(wb.nsheets):
+                sheet = wb.sheet_by_index(sheet_idx)
+                text_parts.append(f"## Hoja: {sheet.name}\n")
+                for row_idx in range(sheet.nrows):
+                    row = sheet.row(row_idx)
+                    row_text = " | ".join(str(cell.value) if cell.value else "" for cell in row)
+                    if row_text.strip():
+                        text_parts.append(row_text)
+            return "\n".join(text_parts).strip()
+        except Exception as exc:
+            logger.warning("Failed to extract .xls text with xlrd (trying fallback): %s", exc)
+            # Fallback: try to read as text (some .xls are HTML exports)
+            try:
+                return path.read_text(encoding="utf-8", errors="replace")
+            except Exception as exc2:
+                logger.warning("Text fallback also failed: %s", exc2)
+                return ""
+
+    if suffix == ".xlsx":
+        try:
+            import openpyxl
+        except ImportError:
+            logger.warning("openpyxl not available for .xlsx extraction")
+            return ""
+
+        try:
+            wb = openpyxl.load_workbook(path, data_only=True)
+            text_parts = []
+            for sheet_name in wb.sheetnames:
+                ws = wb[sheet_name]
+                text_parts.append(f"## Hoja: {sheet_name}\n")
+                for row in ws.iter_rows(values_only=True):
+                    row_text = " | ".join(str(cell) if cell is not None else "" for cell in row)
+                    if row_text.strip():
+                        text_parts.append(row_text)
+            return "\n".join(text_parts).strip()
+        except Exception as exc:
+            logger.warning("Failed to extract .xlsx text with openpyxl: %s", exc)
+            return ""
+
+    logger.warning("Unsupported Excel format: %s", suffix)
+    return ""
 
 
 def _simple_chunks(text: str, max_chars: int = _CHUNK_MAX_CHARS,

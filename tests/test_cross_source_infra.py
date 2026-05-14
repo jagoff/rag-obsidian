@@ -22,7 +22,7 @@ import rag
 def test_valid_sources_contains_expected():
     # Phase 1 registered 6 sources + Phase 1e/f added contacts + calls
     # + Phase 2 added safari + drive (Google Docs/Sheets/Slides corpus,
-    # commit de03db1 2026-04-23) + 2026-05-05 added `memory` (mem-vault
+    # commit de03db1 2026-04-23) + 2026-05-05 added `memory` (memo
     # carve-out from `source=vault`, see `_infer_vault_source`)
     # + 2026-05-07 added `pillow` (PIL image OCR ingester, despacho ad-hoc
     # ANTES del check VALID_SOURCES en `_run_index_inner`). Anchor test
@@ -40,7 +40,7 @@ def test_source_weights_dict_covers_every_valid_source():
     assert rag.SOURCE_WEIGHTS["vault"] == 1.00
     assert rag.SOURCE_WEIGHTS["contacts"] == 0.95
     assert rag.SOURCE_WEIGHTS["calendar"] == 0.95
-    # memory: agent-curated mem-vault, softly down-weighted so user-authored
+    # memory: agent-curated memo, softly down-weighted so user-authored
     # vault notes win ties. See `_infer_vault_source` for the path-prefix
     # carve-out (2026-05-05).
     assert rag.SOURCE_WEIGHTS["memory"] == 0.90

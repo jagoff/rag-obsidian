@@ -403,8 +403,8 @@ def test_is_excluded_covers_archived_conversations():
     assert rag.is_excluded("99-obsidian/99-AI/conversations/foo.md") is True
 
 
-def test_is_excluded_indexes_mem_vault_memories():
-    """Las memorias persistentes del MCP `mem-vault` viven bajo
+def test_is_excluded_indexes_memo_memories():
+    """Las memorias persistentes del MCP `memo` viven bajo
     `99-obsidian/99-AI/memory/` y son la única excepción
     (junto con `99-Mentions/`) al exclude del prefix de system folders.
     Las queremos indexadas para que `rag query` recupere bug patterns,

@@ -733,7 +733,7 @@ def memo_timemachine_snapshot_api(date: str | None = None, type: str | None = No
 
     Replaya `history.db` en reverso desde "now" hasta T para devolver
     los records que existían en ese momento. Memo v0.6.0 single feature
-    diferenciadora vs mem0/letta/cognee/supermemory/mem-vault.
+    diferenciadora vs mem0/letta/cognee/supermemory.
     """
     from web.memo_v06 import snapshot
     return snapshot(date=date, type_=type, limit=limit)
@@ -14409,7 +14409,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     # Nueva ubicación canónica desde 2026-04-25 — sistema vive
                     # bajo 99-AI/, fuera del PARA del user.
                     "99-obsidian/99-AI/conversations/",
-                    # mem-vault: memorias del agente sobre bugs/decisiones del
+                    # memo: memorias del agente sobre bugs/decisiones del
                     # sistema. Son metadata interna, no contenido del user.
                     # Sin este filtro, una memoria recién guardada puede volver
                     # como source de la próxima query (observado 2026-05-01:
@@ -19517,7 +19517,7 @@ _LOG_RE_ERROR_QUEUE_META = re.compile(
 # Cloudflared reconnection / DNS / update-check noise. Per usuario:
 # "Los errores típicos del tunnel `com.fer.obsidian-rag-cloudflare-tunnel`
 # son ruido normal y se auto-recuperan. NO accionar a menos que la
-# verificación falle." (memoria mem-vault `pattern_cloudflared_quic_
+# verificación falle." (memoria memo `pattern_cloudflared_quic_
 # reconnection_noise_es_self_healing_no_a`).
 #
 # Estos patrones cubren TODOS los ERR del cloudflared.error.log que son
@@ -20179,7 +20179,7 @@ def _build_global_errors_payload(window_s: int, level_filter: str) -> dict:
                     # y reaparecían en el feed de errores eternamente.
                     # Bug observado 2026-04-29 con `Failed to load spaCy
                     # lemma model` que ya no era real (spaCy fixeado en
-                    # mem-vault commit 735e969) pero seguía mostrándose
+                    # memo commit 735e969) pero seguía mostrándose
                     # en /logs cada vez que el web daemon escribía algo.
                     continue
                 # Filter por window — si el ts (real o sintético) cae

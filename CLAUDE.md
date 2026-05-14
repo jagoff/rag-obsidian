@@ -52,7 +52,7 @@ Python 3.13, `uv`. Runtime venv: `.venv/bin/python`. Global tool: `~/.local/shar
 
 1. **Rollback path explícito** detrás de env var (ej. `RAG_EMBED_BACKEND=pytorch`, `RAG_NLI_BACKEND=mdeberta`) cuando MLX tiene bug abierto reproducible.
 2. **Path opt-in NO-MLX-compat por design** (ej. `gliner` NER → CPU only, gated por `RAG_EXTRACT_ENTITIES`).
-3. **Dependency externa de un MCP / integración no-RAG** que el user usa por separado (ej. daemon Ollama corriendo para `mem-vault` — no para obsidian-rag).
+3. **Dependency externa de un MCP / integración no-RAG** que el user usa por separado (ej. daemon Ollama corriendo para otros sistemas — no para obsidian-rag).
 
 **Antes de agregar dep nueva** (modelo, librería, runtime):
 - ¿Hay versión [`mlx-community/...`](https://huggingface.co/mlx-community)? Si sí → usar esa.
@@ -95,7 +95,7 @@ Detalle migración en [`docs/mlx-migration.md`](docs/mlx-migration.md).
 
 **Rollback emergencia**: requiere `git revert` de Ola 7+ commits + `uv pip install ollama>=0.6.1` + re-pull modelos chat. NO se soporta vía env var — `RAG_LLM_BACKEND=ollama` loguea warning + cae a MLX. Para embedder, rollback PyTorch SentenceTransformer disponible vía `RAG_EMBED_BACKEND=pytorch`.
 
-`ollama>=0.6.1` removido de `pyproject.toml`. Daemon Ollama (`com.ollama.ollama`) puede seguir corriendo para integraciones externas (mem-vault), no para obsidian-rag.
+`ollama>=0.6.1` removido de `pyproject.toml`. Daemon Ollama (`com.ollama.ollama`) puede seguir corriendo para integraciones externas, no para obsidian-rag.
 
 ## Idioma
 
@@ -466,7 +466,7 @@ Default: `~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes`. Overri
 - `02-Areas/`, `03-Resources/`, `04-Archive/` — resto PARA.
 - `99-obsidian/99-AI/<feature>/` — **toda infra del sistema RAG / agentes / mis artefactos** (memory, external-ingest, system/<slug>, conversations, plans). Heurística: contenido user → `01-Projects/`; sistema/automation → `99-AI/`.
 
-**Memorias del MCP [`mem-vault`](https://github.com/jagoff/mem-vault)** viven en `99-obsidian/99-AI/memory/`. Configurado via env vars del web server plist: `MEM_VAULT_PATH=Notes/`, `MEM_VAULT_MEMORY_SUBDIR=99-obsidian/99-AI/memory`. NO está excluido por `is_excluded()` — `rag index` lo scanea, los `.md` entran al index del vault `home`. MCP `mem-vault` es writer canónico, `rag` reader adicional.
+**Memorias del MCP [`memo`](https://github.com/jagoff/memo)** viven en `99-obsidian/99-AI/memory/`. Configurado via env vars del web server plist: `MEMO_VAULT_PATH=Notes/`, `MEMO_MEMORY_SUBDIR=99-obsidian/99-AI/memory`. NO está excluido por `is_excluded()` — `rag index` lo scanea, los `.md` entran al index del vault `home`. MCP `memo` es writer canónico, `rag` reader adicional.
 
 ## Referencias
 

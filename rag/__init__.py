@@ -2013,7 +2013,7 @@ SOURCE_WEIGHTS: dict[str, float] = {
     "vault":     1.00,
     "contacts":  0.95,   # editorial trust — user-curated metadata
     "calendar":  0.95,
-    "memory":    0.90,   # mem-vault facts/decisions/gotchas — curated by the agent,
+    "memory":    0.90,   # memo facts/decisions/gotchas — curated by the agent,
                          # softly down-weighted so user-authored vault notes win ties
                          # on queries that match both. See feedback-loop guard in
                          # `is_excluded()` rationale.
@@ -2072,7 +2072,7 @@ SOURCE_RECENCY_HALFLIFE_DAYS: dict[str, float | None] = {
 # (vault retention is manual).
 SOURCE_RETENTION_DAYS: dict[str, int | None] = {
     "vault":     None,
-    "memory":    None,   # never auto-purge mem-vault entries
+    "memory":    None,   # never auto-purge memo entries
     "contacts":  None,
     "calendar":  None,
     "reminders": None,
@@ -2100,9 +2100,9 @@ def normalize_source(value: object, *, default: str = "vault") -> str:
 
 # Path-prefix discriminator: chunks whose vault-relative path starts with
 # `99-obsidian/99-AI/memory/` belong to the agent-curated
-# mem-vault. They get `source="memory"` (weight=0.90) instead of
+# memo. They get `source="memory"` (weight=0.90) instead of
 # `source="vault"` (weight=1.00), so user-authored notes win ties on
-# overlapping queries. The carve-out exists because mem-vault entries
+# overlapping queries. The carve-out exists because memo entries
 # describe THE SYSTEM ITSELF (bug patterns, decisions, gotchas) and were
 # previously dominating retrieval at >50% of top-k for technical queries.
 # See `is_excluded()` for why memories stay indexed at all.
@@ -2110,7 +2110,7 @@ _MEMORY_PATH_PREFIX = "99-obsidian/99-AI/memory/"
 
 
 def _infer_vault_source(rel_path: str) -> str:
-    """`memory` for mem-vault entries, `vault` otherwise. Called from the
+    """`memory` for memo entries, `vault` otherwise. Called from the
     indexer (`_index_single_file` + the rglob path in `_run_index`) so the
     discriminator is set at write time. Cheap path-prefix check."""
     return "memory" if (rel_path or "").startswith(_MEMORY_PATH_PREFIX) else "vault"
@@ -3051,7 +3051,7 @@ def is_excluded(rel_path: str) -> bool:
       because they're high-signal user-curated content that enriches retrieval:
       (1) 99-Mentions: per-person dossiers consumed by `build_person_context()`
       and surfaced through normal search; (2) 99-AI/memory: persistent memories
-      written by the `mem-vault` MCP server (decisions, bug patterns, conventions
+      written by the `memo` MCP server (decisions, bug patterns, conventions
       the user accumulates across sessions). Indexing 99-AI/memory lets `rag query`
       surface those alongside regular notes. Risk: feedback-loop-like behavior if
       the agent answers a question primarily from a memory it saved itself, but
@@ -3281,7 +3281,7 @@ CONFIDENCE_RERANK_MIN = 0.35
 # baseline 0.015 (no regression intended for the dominant source).
 CONFIDENCE_RERANK_MIN_PER_SOURCE: dict[str, float] = {
     "vault":     0.015,   # baseline (vault-prose calibrated)
-    "memory":    0.015,   # mem-vault prose: structured Contexto/Problema/Solución,
+    "memory":    0.015,   # memo prose: structured Contexto/Problema/Solución,
                           # similar body length to vault → reuse vault threshold
     "whatsapp":  0.008,   # bodies ~143 chars, scores 0.02-0.10 normales
     "calendar":  0.008,   # eventos cortos, mismo problema que WA
@@ -22960,7 +22960,7 @@ def _index_single_file(
         # default to "vault" via `normalize_source` at read time, so this is
         # pure forward-compat — no re-embed required on upgrade.
         # `_infer_vault_source` carves out `99-AI/memory/` → source="memory"
-        # so mem-vault entries don't dominate top-k via vault's weight=1.00.
+        # so memo entries don't dominate top-k via vault's weight=1.00.
         "source": _infer_vault_source(doc_id_prefix),
     }
     # Aliases → `extra_json` (list form preserved). Downstream readers

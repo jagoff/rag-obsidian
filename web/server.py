@@ -5576,8 +5576,13 @@ async def wa_voice(
 
     try:
         # 1) Transcribe (con cache SQL).
+        # Whisper (MLX) + ffmpeg son CPU/IO blocking — se corren en el
+        # threadpool del event loop para no bloquear otros handlers async
+        # mientras procesan (audit 2026-05-14 A6).
         try:
-            tr = _voice.transcribe_blob(body, language=language, suffix=suffix)
+            tr = await asyncio.to_thread(
+                _voice.transcribe_blob, body, language=language, suffix=suffix
+            )
         except Exception as e:
             # Limpiar y reportar — Whisper puede fallar por modelo no descargado.
             return {"ok": False, "error_kind": "transcribe_failed", "error": repr(e)[:200]}
@@ -5593,18 +5598,18 @@ async def wa_voice(
                 "cached": (tr or {}).get("cached", False),
             }
 
-        # 2) Encode a ogg/opus PTT.
-        opus_path = _voice.to_opus(tmp_in)
+        # 2) Encode a ogg/opus PTT (ffmpeg — blocking).
+        opus_path = await asyncio.to_thread(_voice.to_opus, tmp_in)
         if opus_path is None:
             return {"ok": False, "error_kind": "encode_failed", "text": text}
 
-        # 3) Send al bridge — para PTT, el bridge ya hardcodea
-        # `Audio.PTT = true` cuando es .ogg/opus.
+        # 3) Send al bridge — HTTP bloqueante al bridge local.
+        # Para PTT, el bridge ya hardcodea `Audio.PTT = true` cuando es .ogg/opus.
         reply_to = None
         if reply_to_id:
             reply_to = {"message_id": reply_to_id, "original_text": "", "sender_jid": ""}
         try:
-            resp = _bc.send_ptt(jid, str(opus_path), reply_to=reply_to)
+            resp = await asyncio.to_thread(_bc.send_ptt, jid, str(opus_path), reply_to=reply_to)
         except _bc.BridgeError as e:
             return {"ok": False, "error_kind": "bridge_error", "error": str(e), "text": text}
         finally:

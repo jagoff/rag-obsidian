@@ -5152,14 +5152,31 @@ def _rebuild_feedback_golden_from_sql_feedback(conn) -> dict:
     Mirrors _rebuild_feedback_golden's logic but pulls from the SQL feedback
     table instead of feedback.jsonl. Persists the result into rag_feedback_golden
     + meta so subsequent reads hit the table directly.
+
+    Window: only the most recent RAG_FEEDBACK_REBUILD_DAYS days (default 365)
+    are loaded. Older feedback has diminishing ranker signal and the full
+    unbounded scan becomes expensive as the table grows (audit 2026-05-14 C1).
+    Set RAG_FEEDBACK_REBUILD_DAYS=0 to disable the window and load everything
+    (opt-in, not recommended for large tables).
     """
     import sqlite3 as _sqlite3
+    import time as _time
+
+    _days = int(os.environ.get("RAG_FEEDBACK_REBUILD_DAYS", "365"))
+    if _days > 0:
+        _cutoff = datetime.fromtimestamp(
+            _time.time() - _days * 86400, tz=timezone.utc
+        ).isoformat()
+        _where = f"WHERE ts >= '{_cutoff}'"
+    else:
+        _where = ""
+
     prev_factory = conn.row_factory
     try:
         conn.row_factory = _sqlite3.Row
         rows = list(conn.execute(
             "SELECT ts, rating, q, paths_json, extra_json, turn_id "
-            "FROM rag_feedback ORDER BY ts"
+            f"FROM rag_feedback {_where} ORDER BY ts"
         ).fetchall())
     finally:
         conn.row_factory = prev_factory
@@ -45933,23 +45950,24 @@ def _enrich_terms(entities: dict, min_len: int = 3) -> list[str]:
     return out
 
 
-_CONTACT_NAME_CACHE: dict[str, str] = {}
-
-
+@functools.lru_cache(maxsize=4096)
 def _apple_contact_name(phone: str) -> str | None:
     """Look up a phone number in macOS Contacts via osascript. Returns the
-    contact's name or None. Cached in-process — Contacts isn't going to
-    change mid-process and osascript is ~200ms per call. `phone` is
-    normalised to digits-only before query (Contacts stores formatted
-    numbers, the `whose ... contains` predicate matches substrings).
+    contact's name or None. Cached in-process via lru_cache(4096) — Contacts
+    isn't going to change mid-process and osascript is ~200ms per call.
+    `phone` is normalised to digits-only before query (Contacts stores
+    formatted numbers, the `whose ... contains` predicate matches substrings).
+
+    lru_cache replaces the hand-rolled unbounded dict (_CONTACT_NAME_CACHE)
+    that could grow without bound in long-running daemons with many unique JIDs
+    (audit 2026-05-14 C3). maxsize=4096 covers any realistic address book size
+    while bounding process memory.
     """
     if not _apple_enabled() or not phone:
         return None
     digits = "".join(ch for ch in phone if ch.isdigit())
     if len(digits) < 8:
         return None
-    if digits in _CONTACT_NAME_CACHE:
-        return _CONTACT_NAME_CACHE[digits] or None
     import subprocess
     script = (
         'tell application "Contacts" to '
@@ -45965,7 +45983,6 @@ def _apple_contact_name(phone: str) -> str | None:
         name = (res.stdout or "").strip()
     except Exception:
         name = ""
-    _CONTACT_NAME_CACHE[digits] = name
     return name or None
 
 

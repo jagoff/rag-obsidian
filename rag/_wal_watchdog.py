@@ -63,13 +63,17 @@ _wal_checkpointer_started = False
 _wal_checkpointer_lock = threading.Lock()
 
 
-def _wal_checkpoint_once(path: str) -> tuple[bool, int]:
+def _wal_checkpoint_once(path: str, conn=None) -> tuple[bool, int]:
     """Ejecuta `PRAGMA wal_checkpoint(PASSIVE)` sobre una DB.
 
     Returns `(ok, pages_checkpointed)`. `ok=False` con `pages=0` indica
     que la DB no existe (o el archivo es pre-WAL) — silencioso.
     Cualquier otra excepción se swallowea + logea para no tumbar el
     loop del watchdog.
+
+    Si se pasa `conn`, reutiliza esa conexión (evita el overhead de
+    connect+close en cada tick del watchdog — audit 2026-05-14 A7).
+    Si `conn` falla, se abre una conexión temporal como fallback.
     """
     import sqlite3 as _sqlite3  # noqa: PLC0415
 
@@ -77,19 +81,34 @@ def _wal_checkpoint_once(path: str) -> tuple[bool, int]:
 
     if not os.path.exists(path):
         return (False, 0)
-    try:
-        conn = _sqlite3.connect(path, isolation_level=None,
-                                check_same_thread=False, timeout=10.0)
+
+    def _run_checkpoint(c) -> tuple[bool, int]:
+        cur = c.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        row = cur.fetchone()
+        # row = (busy, log_pages, checkpointed_pages)
+        pages = int(row[2]) if row and row[2] is not None else 0
+        return (True, pages)
+
+    # Fast path: reuse the persistent connection passed by the loop.
+    if conn is not None:
         try:
-            conn.execute("PRAGMA busy_timeout=10000")
-            cur = conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            row = cur.fetchone()
-            # row = (busy, log_pages, checkpointed_pages)
-            pages = int(row[2]) if row and row[2] is not None else 0
-            return (True, pages)
+            return _run_checkpoint(conn)
+        except Exception:
+            # Connection may have gone stale (e.g. DB file replaced by
+            # rag index --reset). Fall through to open a fresh one and
+            # let the loop re-open its persistent conn on the next tick.
+            pass
+
+    # Fallback: one-shot connection (legacy behaviour / first call).
+    try:
+        tmp = _sqlite3.connect(path, isolation_level=None,
+                               check_same_thread=False, timeout=10.0)
+        try:
+            tmp.execute("PRAGMA busy_timeout=10000")
+            return _run_checkpoint(tmp)
         finally:
             try:
-                conn.close()
+                tmp.close()
             except Exception:
                 pass
     except Exception as exc:
@@ -98,7 +117,15 @@ def _wal_checkpoint_once(path: str) -> tuple[bool, int]:
 
 
 def _wal_checkpointer_loop(interval: int) -> None:
-    """Loop del thread daemon. PASSIVE checkpoint cada `interval` segundos."""
+    """Loop del thread daemon. PASSIVE checkpoint cada `interval` segundos.
+
+    Mantiene una conexión SQLite persistente por DB para evitar el overhead
+    de connect+close en cada tick (4 open+close/min con intervalo=30s —
+    audit 2026-05-14 A7). Si la conexión se rompe (ej. DB reemplazada por
+    rag index --reset), se reabre en el siguiente tick.
+    """
+    import sqlite3 as _sqlite3  # noqa: PLC0415
+
     # Import tardío: DB_PATH se settea al importar el módulo, pero
     # resolvemos los paths acá para tolerar reconfigs futuras.
     from rag import (  # noqa: PLC0415
@@ -108,14 +135,52 @@ def _wal_checkpointer_loop(interval: int) -> None:
         _silent_log,
     )
 
+    db_names = ("ragvec.db", _TELEMETRY_DB_FILENAME)
+    # Persistent connections keyed by DB path. None = not yet opened or
+    # needs re-open after a failure.
+    conns: dict[str, "_sqlite3.Connection | None"] = {
+        str(DB_PATH / name): None for name in db_names
+    }
+
+    def _open_conn(path: str) -> "_sqlite3.Connection | None":
+        if not os.path.exists(path):
+            return None
+        try:
+            c = _sqlite3.connect(path, isolation_level=None,
+                                 check_same_thread=False, timeout=10.0)
+            c.execute("PRAGMA busy_timeout=10000")
+            return c
+        except Exception as exc:
+            _silent_log(f"wal_conn_open:{os.path.basename(path)}", exc)
+            return None
+
     while True:
         try:
             # `wait()` retorna True si el event fue set (shutdown solicitado),
             # False si timeout — equivalente a sleep pero interruptible.
             if _daemon_shutdown_event.wait(timeout=interval):
+                # Clean shutdown: close persistent connections.
+                for c in conns.values():
+                    if c is not None:
+                        try:
+                            c.close()
+                        except Exception:
+                            pass
                 return
-            for name in ("ragvec.db", _TELEMETRY_DB_FILENAME):
-                _wal_checkpoint_once(str(DB_PATH / name))
+            for path, conn in list(conns.items()):
+                # Lazy-open on first tick or after a failure.
+                if conn is None:
+                    conn = _open_conn(path)
+                    conns[path] = conn
+                ok, _ = _wal_checkpoint_once(path, conn=conn)
+                if not ok and conn is not None:
+                    # Checkpoint failed with the persistent conn — drop it
+                    # so the next tick re-opens fresh.
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    conns[path] = None
         except Exception as exc:
             _silent_log("wal_checkpointer_loop", exc)
 

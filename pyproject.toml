@@ -63,6 +63,9 @@ dependencies = [
     # pesadas. Lo dejamos core (no opt-in) porque es el único parser
     # nativo de xlsx y el overhead es ínfimo.
     "openpyxl>=3.1",
+    # pypdf extrae texto de PDFs para el ingester finances (resúmenes
+    # de tarjeta de crédito en iCloud). Wheel ~2MB, sin deps pesadas.
+    "pypdf>=5.0",
 ]
 
 [project.optional-dependencies]

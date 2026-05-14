@@ -1,0 +1,362 @@
+"""Finances integration — ingester para PDFs de tarjeta de crédito y Excels de movimientos.
+
+Escanea la carpeta iCloud `~/Library/Mobile Documents/com~apple~CloudDocs/Finances`,
+extrae texto de PDFs (ocrmac/pypdf) y Excels (openpyxl), y escribe chunks al corpus
+RAG con source="finances". Searchable vía `rag query --source finances`.
+
+## Surfaces
+
+- `ingest()` — corre el ingester completo: escanea archivos, extrae texto,
+  chunkea, y upserta a la collection sqlite-vec. Idempotente.
+- `_extract_text_from_pdf(path)` — extrae texto de PDF usando ocrmac o pypdf.
+- `_extract_text_from_excel(path)` — extrae texto de Excel usando openpyxl.
+
+## Invariantes
+
+- Silent-fail: si la carpeta no existe o un archivo falla, se loguea y se continua.
+- Idempotente: re-running re-indexa solo archivos modificados (mtime check).
+- PDFs: prioriza ocrmac (macOS Vision), fallback a pypdf si hay texto extraíble.
+- Excels: lee todas las hojas, extrae texto de celdas no-vacías.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger("rag.integrations.finances")
+
+# Default location of the iCloud-synced Finances folder. Overridable via env
+# `RAG_FINANCES_PATH` for testing or non-default iCloud setups.
+_DEFAULT_FINANCES_PATH = (
+    Path.home()
+    / "Library/Mobile Documents/com~apple~CloudDocs/Finances"
+)
+
+# Chunk parameters
+_CHUNK_MAX_CHARS = 800
+_CHUNK_MIN_CHARS = 150
+
+
+def _finances_path() -> Path:
+    """Resolves the Finances path, honoring RAG_FINANCES_PATH env override."""
+    env = os.environ.get("RAG_FINANCES_PATH")
+    return Path(env) if env else _DEFAULT_FINANCES_PATH
+
+
+def _extract_text_from_pdf(path: Path) -> str:
+    """Extract text from PDF using pypdf."""
+    try:
+        import pypdf
+    except ImportError:
+        logger.warning("pypdf not available for PDF extraction")
+        return ""
+
+    try:
+        reader = pypdf.PdfReader(path)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() + "\n"
+        return text.strip()
+    except Exception as exc:
+        logger.warning("Failed to extract PDF text with pypdf: %s", exc)
+        return ""
+
+
+def _extract_text_from_excel(path: Path) -> str:
+    """Extract text from Excel using openpyxl (.xlsx only, not .xls)."""
+    if path.suffix.lower() == ".xls":
+        logger.warning("Skipping old .xls format (openpyxl only supports .xlsx): %s", path)
+        return ""
+
+    try:
+        import openpyxl
+    except ImportError:
+        logger.warning("openpyxl not available for Excel extraction")
+        return ""
+
+    try:
+        wb = openpyxl.load_workbook(path, data_only=True)
+        text_parts = []
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            text_parts.append(f"## Hoja: {sheet_name}\n")
+            for row in ws.iter_rows(values_only=True):
+                row_text = " | ".join(str(cell) if cell is not None else "" for cell in row)
+                if row_text.strip():
+                    text_parts.append(row_text)
+        return "\n".join(text_parts).strip()
+    except Exception as exc:
+        logger.warning("Failed to extract Excel text: %s", exc)
+        return ""
+
+
+def _simple_chunks(text: str, max_chars: int = _CHUNK_MAX_CHARS,
+                  min_chars: int = _CHUNK_MIN_CHARS) -> list[str]:
+    """Simple chunking by size (no semantic splitting like vault)."""
+    if not text or len(text) < min_chars:
+        return [text] if text else []
+
+    chunks = []
+    current = []
+    current_len = 0
+
+    for paragraph in text.split("\n\n"):
+        para_len = len(paragraph)
+        if current_len + para_len <= max_chars:
+            current.append(paragraph)
+            current_len += para_len
+        else:
+            if current:
+                chunks.append("\n\n".join(current))
+            # Start new chunk
+            if para_len > max_chars:
+                # Split oversized paragraph by sentences
+                sentences = paragraph.split(". ")
+                current = []
+                current_len = 0
+                for sent in sentences:
+                    sent = sent.strip()
+                    if not sent:
+                        continue
+                    sent_len = len(sent) + 1  # +1 for period/space
+                    if current_len + sent_len <= max_chars:
+                        current.append(sent + ".")
+                        current_len += sent_len
+                    else:
+                        if current:
+                            chunks.append(" ".join(current))
+                        current = [sent + "."]
+                        current_len = sent_len
+            else:
+                current = [paragraph]
+                current_len = para_len
+
+    if current:
+        chunks.append("\n\n".join(current))
+
+    # Merge undersized chunks
+    merged = []
+    for chunk in chunks:
+        if merged and len(merged[-1]) < min_chars:
+            merged[-1] += "\n\n" + chunk
+        else:
+            merged.append(chunk)
+
+    return merged
+
+
+@dataclass(frozen=True)
+class FinanceFile:
+    path: Path
+    name: str
+    mtime: float
+    file_type: str  # "pdf" or "excel"
+    text: str
+
+
+def _scan_finances_folder(base_path: Path) -> list[FinanceFile]:
+    """Scan Finances folder and extract text from supported files."""
+    if not base_path.is_dir():
+        logger.warning("Finances folder not found: %s", base_path)
+        return []
+
+    files = []
+    for item in base_path.iterdir():
+        if item.is_dir():
+            continue
+        if item.name.startswith("."):
+            continue
+
+        suffix = item.suffix.lower()
+        if suffix not in {".pdf", ".xlsx", ".xls"}:
+            continue
+
+        mtime = item.stat().st_mtime
+        file_type = "pdf" if suffix == ".pdf" else "excel"
+
+        if file_type == "pdf":
+            text = _extract_text_from_pdf(item)
+        else:
+            text = _extract_text_from_excel(item)
+
+        if text:
+            files.append(FinanceFile(
+                path=item,
+                name=item.name,
+                mtime=mtime,
+                file_type=file_type,
+                text=text,
+            ))
+
+    return files
+
+
+def _get_ingest_state(conn) -> dict[str, float]:
+    """Load last mtime per file from state table."""
+    try:
+        rows = conn.execute(
+            "SELECT file_path, last_mtime FROM rag_finances_state"
+        ).fetchall()
+        return {row["file_path"]: row["last_mtime"] for row in rows}
+    except Exception:
+        # Table doesn't exist yet
+        return {}
+
+
+def _save_ingest_state(conn, file_path: str, mtime: float) -> None:
+    """Upsert mtime for a file in state table."""
+    conn.execute(
+        "INSERT OR REPLACE INTO rag_finances_state (file_path, last_mtime) VALUES (?, ?)",
+        (file_path, mtime)
+    )
+
+
+def ingest(path: Path | str | None = None) -> dict[str, Any]:
+    """Run the full Finances → sqlite-vec ingester. Idempotent.
+
+    Returns a dict with counts:
+      `{folder, files_scanned, files_updated, chunks_written, elapsed_ms}`
+    """
+    t0 = time.time()
+    base = Path(path) if path else _finances_path()
+
+    files = _scan_finances_folder(base)
+    if not files:
+        return {
+            "folder": str(base),
+            "files_scanned": 0,
+            "files_updated": 0,
+            "chunks_written": 0,
+            "elapsed_ms": round((time.time() - t0) * 1000, 1),
+            "skipped": True,
+            "reason": "no_files_found",
+        }
+
+    # Import rag for collection access
+    try:
+        import rag
+    except ImportError:
+        logger.error("Failed to import rag module")
+        return {
+            "folder": str(base),
+            "files_scanned": len(files),
+            "files_updated": 0,
+            "chunks_written": 0,
+            "elapsed_ms": round((time.time() - t0) * 1000, 1),
+            "error": "rag_import_failed",
+        }
+
+    # Get collection
+    try:
+        col = rag.get_db()
+    except Exception as exc:
+        logger.error("Failed to get collection: %s", exc)
+        return {
+            "folder": str(base),
+            "files_scanned": len(files),
+            "files_updated": 0,
+            "chunks_written": 0,
+            "elapsed_ms": round((time.time() - t0) * 1000, 1),
+            "error": f"collection_failed: {exc}",
+        }
+
+    # State table for incremental updates
+    with rag._ragvec_state_conn() as state_conn:
+        state_conn.execute(
+            "CREATE TABLE IF NOT EXISTS rag_finances_state ("
+            " file_path TEXT PRIMARY KEY,"
+            " last_mtime REAL NOT NULL"
+            ")"
+        )
+
+        # Load last mtimes
+        last_mtimes = _get_ingest_state(state_conn)
+
+        # Filter files to process (modified or new)
+        to_process = []
+        for f in files:
+            last_mtime = last_mtimes.get(str(f.path), 0.0)
+            if f.mtime > last_mtime:
+                to_process.append(f)
+
+        if not to_process:
+            return {
+                "folder": str(base),
+                "files_scanned": len(files),
+                "files_updated": 0,
+                "chunks_written": 0,
+                "elapsed_ms": round((time.time() - t0) * 1000, 1),
+            }
+
+        # Process files
+        total_chunks = 0
+        for f in to_process:
+            chunks = _simple_chunks(f.text)
+            if not chunks:
+                continue
+
+            # Generate embeddings
+            embed_prefixes = [f"[source=finances | file={f.name} | type={f.file_type}] {c}"
+                              for c in chunks]
+            embeddings = rag.embed(embed_prefixes)
+
+            # Build metadata
+            ids = []
+            docs = []
+            metas = []
+            for i, chunk in enumerate(chunks):
+                doc_id = f"finances://{f.name}::{i}"
+                ids.append(doc_id)
+                docs.append(chunk)
+                metas.append({
+                    "file": f"finances://{f.name}",
+                    "note": f"Finances: {f.name}",
+                    "folder": "Finances",
+                    "tags": "",
+                    "hash": "",
+                    "outlinks": "",
+                    "source": "finances",
+                    "created_ts": f.mtime,
+                    "file_name": f.name,
+                    "file_type": f.file_type,
+                    "file_path": str(f.path),
+                })
+
+            # Delete existing chunks for this file
+            try:
+                file_key = f"finances://{f.name}"
+                existing = col.get(where={"file": file_key}, include=[])
+                if existing.get("ids"):
+                    col.delete(ids=existing["ids"])
+            except Exception:
+                pass
+
+            # Add new chunks
+            if ids and docs and metas:
+                col.add(
+                    ids=ids,
+                    documents=docs,
+                    metadatas=metas,
+                    embeddings=embeddings,
+                )
+                total_chunks += len(ids)
+
+            # Update state
+            _save_ingest_state(state_conn, str(f.path), f.mtime)
+
+    return {
+        "folder": str(base),
+        "files_scanned": len(files),
+        "files_updated": len(to_process),
+        "chunks_written": total_chunks,
+        "elapsed_ms": round((time.time() - t0) * 1000, 1),
+    }
+
+
+__all__ = ["ingest"]

@@ -1998,7 +1998,7 @@ _COLLECTION_BASE = "obsidian_notes_v12"  # v12: 1024-dim, qwen3-embedding:0.6b +
 # in docs/design-cross-source-corpus.md §10.6.
 VALID_SOURCES: frozenset[str] = frozenset(
     {"vault", "memory", "calendar", "gmail", "whatsapp", "reminders", "messages",
-     "contacts", "calls", "safari", "drive", "pillow"}
+     "contacts", "calls", "safari", "drive", "pillow", "finances"}
 )
 # `pillow` (iOS sleep tracker) tiene un ingester propio en
 # `rag index --source pillow`. Sus datos viven en `rag_sleep_sessions`
@@ -2020,6 +2020,7 @@ SOURCE_WEIGHTS: dict[str, float] = {
     "reminders": 0.90,
     "gmail":     0.85,
     "drive":     0.85,   # Docs/Sheets/Slides: user-authored, high trust like email
+    "finances":  0.85,   # PDFs de resúmenes de tarjeta + Excels de movimientos: oficial
     "safari":    0.80,   # browsing signal: rich titles + URLs, same band as calls
     "calls":     0.80,   # log entries: factual but semantically thin
     "whatsapp":  0.75,
@@ -2048,6 +2049,7 @@ SOURCE_RECENCY_HALFLIFE_DAYS: dict[str, float | None] = {
     "reminders":   90.0,
     "gmail":      180.0,
     "drive":       90.0,   # Google Docs age between email (180d) and chat (30d)
+    "finances":   180.0,   # resúmenes de tarjeta relevantes ~6 meses
     "safari":      90.0,   # browsing context ages mid-term
     # WhatsApp/Messages/Calls bumpeados de 30→60 días (audit 2026-04-25
     # R2-Cross-source #5). 30d era muy agresivo: una conversación de
@@ -2076,6 +2078,7 @@ SOURCE_RETENTION_DAYS: dict[str, int | None] = {
     "reminders": None,
     "gmail":      365,
     "drive":      365,   # user's Drive docs — keep a year like email
+    "finances":   None,   # documentos financieros útiles histórico
     "safari":     180,
     "whatsapp":   180,
     "messages":   180,
@@ -24209,6 +24212,21 @@ def _do_index(reset: bool, no_contradict: bool, source_opt: str | None,
                     f"chunks={summary['chunks_written']}"
                     + (" · bootstrap" if summary.get("bootstrapped") else "")
                 ),
+            ))
+            return
+        if src == "finances":
+            from rag.integrations.finances import ingest as _ingest_finances
+            summary = _ingest_finances()
+            if summary.get("error"):
+                console.print(f"[red]✗[/red] {summary['error']}")
+                return
+            console.print(_fmt_ingest_summary(
+                "finances",
+                total=summary["files_scanned"],
+                indexed=summary["chunks_written"],
+                duration_s=summary["elapsed_ms"] / 1000.0,
+                dry_run=bool(dry_run),
+                extra=f"{summary['files_updated']} actualizados",
             ))
             return
         if src == "reminders":

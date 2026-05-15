@@ -1066,7 +1066,13 @@ class MLXBackend(LLMBackend):
             )
 
         mx.eval(normalised)
-        return {"embeddings": normalised.tolist()}
+        result = normalised.tolist()
+        # Liberar tensores MLX (hidden B×T×D, pooled B×D, normalised B×D)
+        # antes de retornar. Sin clear_cache los buffers Metal permanecen
+        # hasta presión externa → fragmentation acumulada en embed calls
+        # frecuentes (queries, tune, etc.).
+        mx.clear_cache()
+        return {"embeddings": result}
 
     def _get_sampler(self, temperature: float, top_p: float) -> Any:
         """Return a cached make_sampler() result for (temperature, top_p).

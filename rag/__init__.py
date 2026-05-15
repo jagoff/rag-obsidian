@@ -23626,22 +23626,22 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
     # del embed call (in-process MPS encode amortiza el setup del kernel
     # sobre el batch entero). Para 6157 chunks: 2101 calls → ~400 calls.
     #
-    # Gateado por `RAG_INDEX_BATCH_EMBEDS`. Default depende del backend
-    # (MLX-aware desde 2026-05-08 — bug GPU Hang en batched path):
+    # Gateado por `RAG_INDEX_BATCH_EMBEDS`. Default depende del backend:
     #
     #   - PyTorch/MPS embedder (`RAG_EMBED_BACKEND=pytorch`): default ON.
     #     El batched path acumula chunks de N notas y manda `embed()` en
     #     batches grandes. Reduce overhead del kernel setup MPS y baja
     #     2101→400 calls para 6157 chunks.
-    #   - MLX embedder (default post-Ola 9): default OFF. El batched path
-    #     dispara `[METAL] Command buffer execution failed` reproducible
-    #     determinísticamente cuando llega al primer flush con archivos
-    #     mixed-len + URL indexing en cascada (bug 2026-05-08, 7 retries
-    #     idénticos a 447-468/681). El path no-batched (un embed por nota)
-    #     funciona en 49s para 4 archivos stale + 405 URLs.
+    #   - MLX embedder (default post-Ola 9): default OFF (mantenido por
+    #     precaución). El bug original (2026-05-08, GPU Hang en batched path)
+    #     fue causado por Metal memory acumulada entre embed de docs y embed
+    #     de URLs sin `mx.clear_cache()` entre ellos. Arreglado en 2026-05-15
+    #     en `_flush_batch` (clear_cache entre embeds) y en `_encode_batch`
+    #     (clear_cache post-forward). Para habilitar el batched path MLX:
+    #     `RAG_INDEX_BATCH_EMBEDS=1 RAG_INDEX_BATCH_SIZE=8`.
+    #     Probá primero con un vault pequeño antes de aplicar a full vault.
     #
-    # Override manual: `RAG_INDEX_BATCH_EMBEDS=1` fuerza el batched path
-    # aunque MLX (no recomendado hasta que se patche el flush_batch).
+    # Override manual: `RAG_INDEX_BATCH_EMBEDS=1` fuerza el batched path.
     # `=0` fuerza no-batched aunque PyTorch.
     #
     # Tamaño configurable via `RAG_INDEX_BATCH_SIZE` (default auto-tuned based

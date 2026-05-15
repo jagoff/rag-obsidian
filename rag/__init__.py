@@ -3,44 +3,17 @@
 
 import os
 
-# Pin HF / transformers into offline + quiet mode BEFORE any import that
-# transitively pulls huggingface_hub. These libs read the envs at module-init
-# and cache the offline flag globally; setting them later (inside a lazy
-# loader) leaves a client that tries HEAD requests and fails on air-gapped
-# setups. The reranker + sentence_transformers path both inherit this.
-#
-# `os.environ.setdefault` means an operator who WANTS online mode can still
-# export the var explicitly before launching — we don't overwrite.
-#
-# Consolidated 2026-04-20: was previously split across two blocks (a
-# conditional RAG_LOCAL_EMBED bootstrap + an unconditional block after
-# stdlib imports). Verified no top-level import in this module transitively
-# pulls huggingface_hub — `sentence_transformers` is lazy-imported inside
-# get_reranker() / _get_local_embedder(), so setting the flags once here
-# is sufficient and simpler than the split.
+# ADR-003: HF Offline + Fastembed Cache Bootstrap — docs/adr/003-hf-offline-env-bootstrap.md
+# Must run BEFORE any import that transitively pulls huggingface_hub.
 for _k, _v in {
     "HF_HUB_OFFLINE": "1",
     "TRANSFORMERS_OFFLINE": "1",
     "HF_HUB_DISABLE_TELEMETRY": "1",
     "HF_HUB_DISABLE_PROGRESS_BARS": "1",
-    # suppresses fd-2 "unauthenticated" warn from huggingface_hub
     "HF_HUB_VERBOSITY": "error",
     "TRANSFORMERS_NO_ADVISORY_WARNINGS": "1",
     "TRANSFORMERS_VERBOSITY": "error",
     "TQDM_DISABLE": "1",
-    # mem0's qdrant vector store lazy-loads `fastembed.SparseTextEmbedding(
-    # model_name="Qdrant/bm25")` for hybrid keyword search. fastembed's
-    # default cache dir is `tempfile.gettempdir()/fastembed_cache`, which
-    # on macOS resolves to `/var/folders/.../T/fastembed_cache` — and macOS
-    # periodically GC's that path. Combined with HF_HUB_OFFLINE=1 above, a
-    # cache miss after the GC means fastembed can't redownload the model
-    # and the encoder fails to initialise (see web.error.log 2026-04-29:
-    # `Could not find the model tar.gz file at /var/folders/.../T/
-    # fastembed_cache/bm25 and local_files_only=True`). Pinning the cache
-    # to ~/.cache/fastembed (HOME-relative, never GC'd) is the persistent
-    # fix; one-time download via `python -c 'from fastembed import
-    # SparseTextEmbedding; SparseTextEmbedding("Qdrant/bm25")'` (with
-    # offline mode disabled) populates the dir.
     "FASTEMBED_CACHE_PATH": os.path.join(os.path.expanduser("~"), ".cache", "fastembed"),
 }.items():
     os.environ.setdefault(_k, _v)
@@ -81,42 +54,18 @@ logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
-# === LOKY SEMAPHORE LEAK FIX (2026-04-26) ===================================
-# Espejo del fix de web/server.py para todas las invocaciones `rag <cmd>`,
-# especialmente los daemons de larga duración (`rag watch`, `rag serve`).
-# `tqdm` (transitively pulled por sentence-transformers / transformers) crea
-# un `multiprocessing.RLock()` lazy en su primer `tqdm.get_lock()` — ese
-# RLock es un POSIX named semaphore que NO se libera al exit del proceso.
-# Joblib además monkey-patchea `SemLock._make_name` para que todos los
-# SemLocks usen el prefix `/loky-PID-XXX`. Resultado: `resource_tracker`
-# warnea `leaked semaphore objects: {/loky-PID-XXX}` en cada shutdown
-# clean del watch daemon (9 warnings acumuladas en `watch.error.log`
-# pre-fix).
-#
-# `TQDM_DISABLE=1` (ya seteado arriba) desactiva las progress bars, pero
-# NO previene la creación del SemLock via `tqdm.get_lock()` que ST llama
-# durante la carga del reranker / embedder para coordinar multi-worker
-# dataloaders. Pre-setear `_lock` a un `threading.RLock` (in-process, no
-# semaphore POSIX) antes de que nada triggee `get_lock()` evita el leak.
-#
-# Idempotente: si algo ya seteo `_lock` (ej. web/server.py cuando `rag` y
-# `web` comparten un proceso), `set_lock` sobreescribe con el mismo tipo.
+# ADR-001: Loky Semaphore Leak Fix — docs/adr/001-loky-semaphore-leak-fix.md
+# Pre-set tqdm lock to threading.RLock before any heavy dep touches it.
 try:
     import tqdm as _tqdm_preset
     _tqdm_preset.tqdm.set_lock(threading.RLock())
 except Exception:  # pragma: no cover - tqdm not installed
     pass
 
-
-# El teardown (drain del joblib/loky pool) vive en `rag/_shutdown.py` para
-# compartir el código con `web/server.py` — ver ese módulo para la doc
-# completa del bug + el fix en tres pasos. Acá solo registramos el handler
-# via atexit para que cualquier invocación del CLI (watch, serve, query,
-# chat, etc.) lo dispare al exit del intérprete.
+# Drain joblib/loky pool on interpreter exit (shared with web/server.py).
 from rag._shutdown import shutdown_joblib_loky_pool as _shutdown_joblib_loky_pool
 
 atexit.register(_shutdown_joblib_loky_pool)
-# === END LOKY SEMAPHORE LEAK FIX ============================================
 
 # Contextual Retrieval (Anthropic Sept 2024) — gated por
 # `RAG_CONTEXTUAL_RETRIEVAL=1`. Importado top-level porque es un módulo
@@ -1998,7 +1947,7 @@ _COLLECTION_BASE = "obsidian_notes_v12"  # v12: 1024-dim, qwen3-embedding:0.6b +
 # in docs/design-cross-source-corpus.md §10.6.
 VALID_SOURCES: frozenset[str] = frozenset(
     {"vault", "memory", "calendar", "gmail", "whatsapp", "reminders", "messages",
-     "contacts", "calls", "safari", "drive", "pillow", "finances"}
+     "contacts", "calls", "safari", "drive", "pillow", "finances", "health"}
 )
 # `pillow` (iOS sleep tracker) tiene un ingester propio en
 # `rag index --source pillow`. Sus datos viven en `rag_sleep_sessions`
@@ -2031,6 +1980,11 @@ SOURCE_WEIGHTS: dict[str, float] = {
     # `VALID_SOURCES` + `CONFIDENCE_RERANK_MIN_PER_SOURCE`. Weight nominal
     # 0.50 — defensivo si por algún motivo escribiera chunks (no debería).
     "pillow":    0.50,
+    # `health` (Apple Health export.xml, despachado en `rag index --source health`):
+    # los datos viven en `rag_apple_health_daily` (no escriben chunks al corpus
+    # vectorial), pero la entry queda acá para mantener paridad con
+    # `VALID_SOURCES`. Weight nominal 0.50 — defensivo.
+    "health":    0.50,
 }
 
 # Recency half-life per source, in days. None → no decay applied (chunks
@@ -3672,16 +3626,40 @@ def _generate_context_summary(text: str, title: str, folder: str) -> str:
         "de qué trata esta nota. Sin preámbulos, sin disculpas, sin explicaciones."
     )
     try:
-        resp = _summary_client().chat(
-            model=HELPER_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            options={**HELPER_OPTIONS, "num_predict": 40},
-            keep_alive=LLM_KEEP_ALIVE,
-        )
-        raw = resp.message.content.strip()
-        # Take only the first sentence, cap at 120 chars to avoid prefix bloat
-        first_line = raw.split("\n")[0].split(". ")[0]
-        return first_line[:120]
+        import signal
+        import threading
+
+        result = None
+        exception = None
+
+        def _llm_call():
+            nonlocal result, exception
+            try:
+                resp = _summary_client().chat(
+                    model=HELPER_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    options={**HELPER_OPTIONS, "num_predict": 40},
+                    keep_alive=LLM_KEEP_ALIVE,
+                )
+                raw = resp.message.content.strip()
+                # Take only the first sentence, cap at 120 chars to avoid prefix bloat
+                first_line = raw.split("\n")[0].split(". ")[0]
+                result = first_line[:120]
+            except Exception as e:
+                exception = e
+
+        thread = threading.Thread(target=_llm_call, daemon=True)
+        thread.start()
+        thread.join(timeout=30)  # 30 second timeout
+        if thread.is_alive():
+            # Timeout - thread still running
+            _silent_log("context_summary_timeout", {"title": title, "folder": folder})
+            return None
+        if exception:
+            raise exception
+        if result is None:
+            return None
+        return result
     except Exception:
         # Audit 2026-04-26: pre-fix devolvía "" en error transitorio →
         # `get_context_summary` cacheaba ese "" → embedding del chunk
@@ -4543,7 +4521,10 @@ class RankerWeights:
 
 
 # Proceso-local cache invalidado por mtime del config.
+# Lock garantiza que check-then-set sea atómico frente a invalidaciones
+# concurrentes desde el background SQL thread (audit A2 2026-05-14).
 _ranker_weights_cache: tuple[float, RankerWeights] | None = None
+_ranker_weights_lock = threading.Lock()
 
 
 def get_ranker_weights() -> RankerWeights:
@@ -4553,16 +4534,18 @@ def get_ranker_weights() -> RankerWeights:
         mtime = RANKER_CONFIG_PATH.stat().st_mtime if RANKER_CONFIG_PATH.is_file() else 0.0
     except OSError:
         mtime = 0.0
-    if _ranker_weights_cache and _ranker_weights_cache[0] == mtime:
-        return _ranker_weights_cache[1]
-    w = RankerWeights.load()
-    _ranker_weights_cache = (mtime, w)
-    return w
+    with _ranker_weights_lock:
+        if _ranker_weights_cache and _ranker_weights_cache[0] == mtime:
+            return _ranker_weights_cache[1]
+        w = RankerWeights.load()
+        _ranker_weights_cache = (mtime, w)
+        return w
 
 
 def _invalidate_ranker_weights() -> None:
     global _ranker_weights_cache
-    _ranker_weights_cache = None
+    with _ranker_weights_lock:
+        _ranker_weights_cache = None
 
 
 # Stopwords ES+EN usadas por `_tokenize_for_title_match` para que queries con
@@ -7412,6 +7395,16 @@ def _sql_read_with_retry(
     return default
 
 
+# Flag process-local: una vez que _ensure_telemetry_tables() corre con éxito,
+# las tablas ya existen en la DB. Connections subsecuentes solo necesitan
+# correr el DDL si la DB fue recreada (mtime cambió) o si es la primera vez.
+# Esto evita el overhead del DDL-check en cada uno de los 135 call sites de
+# _ragvec_state_conn (audit B3 2026-05-14).
+_telemetry_tables_ensured: bool = False
+_telemetry_tables_ensured_mtime: float = 0.0
+_telemetry_tables_ensured_lock = threading.Lock()
+
+
 @contextlib.contextmanager
 def _ragvec_state_conn():
     """Open a short-lived sqlite3 connection to telemetry.db with WAL + busy
@@ -7431,10 +7424,17 @@ def _ragvec_state_conn():
     is one-conn-per-thread. The close in `finally` guarantees the fd is
     released before the yield frame unwinds — no leaked handles on
     exception or GC pressure.
+
+    B3 (audit 2026-05-14): _ensure_telemetry_tables() se saltea en calls
+    subsecuentes cuando la DB no cambió (mtime invariante), eliminando el
+    overhead de ~30 CREATE TABLE IF NOT EXISTS por conexión en los 135
+    call sites del hot-path.
     """
+    global _telemetry_tables_ensured, _telemetry_tables_ensured_mtime
     import sqlite3 as _sqlite3
     DB_PATH.mkdir(parents=True, exist_ok=True)
-    conn = _sqlite3.connect(str(DB_PATH / _TELEMETRY_DB_FILENAME),
+    _telemetry_db_path = str(DB_PATH / _TELEMETRY_DB_FILENAME)
+    conn = _sqlite3.connect(_telemetry_db_path,
                             isolation_level=None, check_same_thread=False,
                             timeout=60.0)
     try:
@@ -7466,7 +7466,22 @@ def _ragvec_state_conn():
             "CREATE TABLE IF NOT EXISTS rag_schema_version ("
             " table_name TEXT PRIMARY KEY, version INTEGER NOT NULL DEFAULT 0)"
         )
-        _ensure_telemetry_tables(conn)
+        # B3: solo llamar _ensure_telemetry_tables() si la DB fue recreada
+        # (mtime distinto) o si es el primer call del proceso.
+        try:
+            _db_mtime = os.path.getmtime(_telemetry_db_path)
+        except OSError:
+            _db_mtime = 0.0
+        with _telemetry_tables_ensured_lock:
+            _needs_ensure = (
+                not _telemetry_tables_ensured
+                or _db_mtime != _telemetry_tables_ensured_mtime
+            )
+        if _needs_ensure:
+            _ensure_telemetry_tables(conn)
+            with _telemetry_tables_ensured_lock:
+                _telemetry_tables_ensured = True
+                _telemetry_tables_ensured_mtime = _db_mtime
         yield conn
     finally:
         try:
@@ -8201,6 +8216,45 @@ def get_db() -> SqliteVecCollection:
             _db_singleton = (db_key, col)
             _db_singleton_created_at = time.time()
         return _db_singleton[1]
+
+
+def _db_quick_check(db_path: Path, db_name: str = "ragvec.db") -> bool:
+    """Run PRAGMA quick_check on startup to detect corruption.
+    
+    D5 (audit 2026-05-14): Corruption like "database disk image is malformed"
+    can go undetected until a write fails. quick_check scans the database
+    structure and returns 'ok' if valid, or a list of errors. We run this
+    once at daemon startup to fail fast if the DB is corrupt.
+    
+    Args:
+        db_path: Path to the database directory (e.g., DB_PATH)
+        db_name: Name of the database file (default "ragvec.db")
+    
+    Returns:
+        True if check passed, False if corruption detected.
+    """
+    import sqlite3 as _sqlite3
+    db_file = db_path / db_name
+    if not db_file.exists():
+        return True  # DB doesn't exist yet, not an error
+    
+    try:
+        conn = _sqlite3.connect(str(db_file), timeout=10.0)
+        try:
+            cur = conn.execute("PRAGMA quick_check")
+            result = cur.fetchone()
+            if result and result[0] == "ok":
+                return True
+            else:
+                # Corruption detected
+                console.print(f"[red]Database corruption detected in {db_name}:[/red]")
+                console.print(f"[red]{result}[/red]")
+                return False
+        finally:
+            conn.close()
+    except Exception as e:
+        console.print(f"[red]Failed to run quick_check on {db_name}: {e}[/red]")
+        return False
 
 
 def _collection_name_for_vault(vault_path: Path) -> str:
@@ -8947,6 +9001,13 @@ _WIKILINK_EXPANSION_N = 5           # max targets expanded per chunk prefix
 _WIKILINK_SUMMARY_CHARS = 160       # per-target snippet size
 _WIKILINK_TOTAL_BUDGET = 1200       # hard cap across all expansions
 
+# LRU cache for wikilink expansion - avoids repeated disk I/O for same links
+# Cache key: (title, str(vault_root), target_mtime) -> snippet
+# Tunable via env var for high-link-density vaults
+_WIKILINK_CACHE_MAX = int(os.environ.get("RAG_WIKILINK_CACHE_MAX", "256"))
+_wikilink_cache: "OrderedDict[tuple[str, str, float], str]" = OrderedDict()
+_wikilink_cache_lock = threading.Lock()
+
 
 def _wikilink_expansion_enabled() -> bool:
     return os.environ.get("RAG_WIKILINK_EXPANSION", "").strip().lower() in {
@@ -8999,11 +9060,16 @@ def _wikilink_expansion_bits(
     Gracefully skips missing targets, cyclic self-links, and files that
     fail to read. Bounded by `_WIKILINK_EXPANSION_N` items and
     `_WIKILINK_TOTAL_BUDGET` total chars.
+    
+    Uses LRU cache to avoid repeated disk I/O for same links across files.
+    Cache key includes target mtime to auto-invalidate on file changes.
     """
     if not outlinks or vault_root is None:
         return []
     bits: list[str] = []
     budget = _WIKILINK_TOTAL_BUDGET
+    vault_key = str(vault_root)
+    
     for title in outlinks[: _WIKILINK_EXPANSION_N * 3]:  # headroom for skips
         if len(bits) >= _WIKILINK_EXPANSION_N or budget <= 0:
             break
@@ -9012,17 +9078,44 @@ def _wikilink_expansion_bits(
             continue
         if self_path is not None and target.resolve() == self_path.resolve():
             continue  # self-link — skip
+        
+        # Check cache first
         try:
-            raw = target.read_text(encoding="utf-8", errors="ignore")
+            target_mtime = target.stat().st_mtime
         except OSError:
             continue
-        # Strip frontmatter + wikilinks for a clean text preview; collapse
-        # whitespace so the snippet is a single-line blurb.
-        body = clean_md(raw)
-        body = re.sub(r"\s+", " ", body).strip()
-        if not body:
-            continue
-        snippet = body[:_WIKILINK_SUMMARY_CHARS]
+        
+        cache_key = (title, vault_key, target_mtime)
+        
+        # Try cache lookup under lock
+        snippet = None
+        with _wikilink_cache_lock:
+            cached = _wikilink_cache.get(cache_key)
+            if cached is not None:
+                _wikilink_cache.move_to_end(cache_key)
+                snippet = cached
+        
+        if snippet is None:
+            # Cache miss - read from disk
+            try:
+                raw = target.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            # Strip frontmatter + wikilinks for a clean text preview; collapse
+            # whitespace so the snippet is a single-line blurb.
+            body = clean_md(raw)
+            body = re.sub(r"\s+", " ", body).strip()
+            if not body:
+                continue
+            snippet = body[:_WIKILINK_SUMMARY_CHARS]
+            
+            # Store in cache
+            with _wikilink_cache_lock:
+                _wikilink_cache[cache_key] = snippet
+                _wikilink_cache.move_to_end(cache_key)
+                while len(_wikilink_cache) > _WIKILINK_CACHE_MAX:
+                    _wikilink_cache.popitem(last=False)
+        
         line = f"Relacionada [[{title}]]: {snippet}"
         if len(line) > budget:
             line = line[:budget]
@@ -12135,12 +12228,12 @@ atexit.register(_save_expand_cache)
 # "banco Santander información cuenta") y mueven el embed mean-pool del query
 # real. Costo skipeado: ~1-3s por query (una call a qwen2.5:3b).
 # El gate ORIGINAL era "<2 tokens skippear" (pre-2026-04-21) → se flipeó a 4
-# para skippear queries tipo "hora" o "hoy", y ahora 6 para skippear el grueso
-# de queries conversacionales cortas. Eval sin regresión medible en el
-# queries.yaml (hit@5 bit-idéntico post-flip).
-# Override: `RAG_EXPAND_MIN_TOKENS=4` (restore pre-fix) o `=2` (restore del
+# para skippear queries tipo "hora" o "hoy", y ahora 3 para permitir queries
+# cortas sobre finances ("ingresos abril 2026" = 3 tokens). Bajado de 6 a 4 a 3
+# (2026-05-14) para mejorar retrieval de datos financieros con queries generales.
+# Override: `RAG_EXPAND_MIN_TOKENS=6` (restore pre-fix) o `=2` (restore del
 # original) para ver el impacto A/B en producción.
-_EXPAND_MIN_TOKENS = int(os.environ.get("RAG_EXPAND_MIN_TOKENS", "6"))
+_EXPAND_MIN_TOKENS = int(os.environ.get("RAG_EXPAND_MIN_TOKENS", "3"))
 
 # Dedicated single-thread executor for running `expand_queries` off the
 # retrieve() critical path. One worker is enough — we only fire one
@@ -12642,14 +12735,13 @@ def recency_boost(meta: dict, half_life_days: float = 90.0) -> float:
     return math.exp(-math.log(2) * age_days / half_life_days)
 
 
-_INTENT_COUNT_RE = re.compile(r"\b(cu[aá]nt[aos]s?|how many)\b", re.IGNORECASE)
+_INTENT_COUNT_RE = re.compile(r"\b(cu[aá]nt[aos]s?\s+(?:archivos|notas|documentos)|how many)\b", re.IGNORECASE)
 _INTENT_LIST_RE = re.compile(
     r"\b(list[aá](?:me|r)?|dame\s+(?:todas|las\s+notas)|mostr[aá](?:me|r)?\s+notas|qu[eé]\s+notas\s+tengo)\b",
     re.IGNORECASE,
 )
 _INTENT_RECENT_RE = re.compile(
-    r"\b(recientes?|modificad[aos]{1,2}|[uú]ltim[aos]{1,2}\s+notas?|esta\s+semana|este\s+mes|hoy)\b",
-    re.IGNORECASE,
+    r"\b(recientes?|modificad[aos]{1,2}|[uú]ltim[aos]{1,2}\s+notas?|esta\s+semana|hoy)\b", re.IGNORECASE,
 )
 # Agenda: temporal *browsing* (not specific-event lookup). Distinguishes
 # "qué tengo esta semana" (user wants calendar events + reminders ahead)
@@ -20016,21 +20108,27 @@ def _cluster_queries(qs: list[str], threshold: float = 0.75) -> list[list[int]]:
     return [c["indices"] for c in clusters]
 
 
-@cli.command(name="health-import")
+@cli.command(name="health-import", hidden=True)
 @click.option("--days", default=30, show_default=True,
               help="Ventana en días a importar desde export.xml")
 @click.option("--export-path", default=None,
               help="Override path al export.xml (default: env "
                    "OBSIDIAN_RAG_HEALTH_EXPORT o iCloud Drive)")
 def health_import_cmd(days: int, export_path: str | None):
-    """Importar Apple Health daily aggregates desde iCloud Drive
-    (`export.xml`) a `rag_apple_health_daily`. SAX streaming —
-    constant memory aunque el file pese ~2GB.
+    """[DEPRECATED] Importar Apple Health daily aggregates desde iCloud Drive.
+
+    Use `rag index --source health` en su lugar. Este comando se mantiene
+    por compatibilidad pero será removido en una versión futura.
 
     Idempotente: re-correr sobre el mismo file produce el mismo estado
     final. Setup: en iPhone → Health → tap profile → "Export Health Data"
     → "Save to Files" → iCloud Drive/Health/.
     """
+    console.print(
+        "[yellow][deprecated][/yellow] `rag health-import` está deprecated. "
+        "Usá `rag index --source health` en su lugar.",
+        err=True,
+    )
     from rag.integrations.apple_health import import_export_xml
     from pathlib import Path as _Path
     p = _Path(export_path) if export_path else None
@@ -20282,11 +20380,13 @@ def silence(kind: str | None, off: bool, do_list: bool):
 
 _AMBIENT_CONFIG_CACHE: tuple[str, float, dict | None] | None = None
 _AMBIENT_CONFIG_CACHE_TTL_S = 10.0
+_AMBIENT_CONFIG_CACHE_LOCK = threading.Lock()
 
 
 def _invalidate_ambient_config_cache() -> None:
     global _AMBIENT_CONFIG_CACHE
-    _AMBIENT_CONFIG_CACHE = None
+    with _AMBIENT_CONFIG_CACHE_LOCK:
+        _AMBIENT_CONFIG_CACHE = None
 
 
 def _ambient_config() -> dict | None:
@@ -20311,28 +20411,37 @@ def _ambient_config() -> dict | None:
     global _AMBIENT_CONFIG_CACHE
     now = time.time()
     current_path = str(AMBIENT_CONFIG_PATH)
-    if _AMBIENT_CONFIG_CACHE is not None:
-        cached_path, cached_ts, cached_cfg = _AMBIENT_CONFIG_CACHE
-        if cached_path == current_path and now - cached_ts < _AMBIENT_CONFIG_CACHE_TTL_S:
-            return cached_cfg
+    with _AMBIENT_CONFIG_CACHE_LOCK:
+        if _AMBIENT_CONFIG_CACHE is not None:
+            cached_path, cached_ts, cached_cfg = _AMBIENT_CONFIG_CACHE
+            if cached_path == current_path and now - cached_ts < _AMBIENT_CONFIG_CACHE_TTL_S:
+                return cached_cfg
 
     # Kill switch global via env var (audit 2026-04-25 R2-Wikilinks #5).
     # Útil para silenciar el ambient hook sin tocar el config.json — ej.
     # cuando el user está debugueando algo que dispara muchos saves o
     # quiere correr `rag index --reset` sin spam de notificaciones.
+    #
+    # Nota: la lectura del archivo y la normalización se hacen FUERA del
+    # lock para no bloquear otros threads durante I/O. Solo el assign final
+    # al cache se hace dentro del lock (audit A1 2026-05-14).
     if os.environ.get("RAG_AMBIENT_DISABLED", "").lower() in ("1", "true", "yes"):
-        _AMBIENT_CONFIG_CACHE = (current_path, now, None)
+        with _AMBIENT_CONFIG_CACHE_LOCK:
+            _AMBIENT_CONFIG_CACHE = (current_path, now, None)
         return None
     if not AMBIENT_CONFIG_PATH.is_file():
-        _AMBIENT_CONFIG_CACHE = (current_path, now, None)
+        with _AMBIENT_CONFIG_CACHE_LOCK:
+            _AMBIENT_CONFIG_CACHE = (current_path, now, None)
         return None
     try:
         c = json.loads(AMBIENT_CONFIG_PATH.read_text(encoding="utf-8"))
     except Exception:
-        _AMBIENT_CONFIG_CACHE = (current_path, now, None)
+        with _AMBIENT_CONFIG_CACHE_LOCK:
+            _AMBIENT_CONFIG_CACHE = (current_path, now, None)
         return None
     if c.get("enabled") is False:
-        _AMBIENT_CONFIG_CACHE = (current_path, now, None)
+        with _AMBIENT_CONFIG_CACHE_LOCK:
+            _AMBIENT_CONFIG_CACHE = (current_path, now, None)
         return None
     if c.get("chat_id") or c.get("bot_token"):
         # Legacy bot schema — refuse silently (the CLI `ambient status`
@@ -20342,10 +20451,12 @@ def _ambient_config() -> dict | None:
             "warning": "legacy_bot_config_ignored",
             "hint": "Re-habilitar desde el bot de WhatsApp (schema ahora es {jid, enabled}).",
         })
-        _AMBIENT_CONFIG_CACHE = (current_path, now, None)
+        with _AMBIENT_CONFIG_CACHE_LOCK:
+            _AMBIENT_CONFIG_CACHE = (current_path, now, None)
         return None
     if not c.get("jid"):
-        _AMBIENT_CONFIG_CACHE = (current_path, now, None)
+        with _AMBIENT_CONFIG_CACHE_LOCK:
+            _AMBIENT_CONFIG_CACHE = (current_path, now, None)
         return None
     # Normalize allowed_folders: strip trailing slashes, drop empties.
     # Case-sensitive on purpose — the vault uses PARA folders like
@@ -20360,7 +20471,8 @@ def _ambient_config() -> dict | None:
         c["allowed_folders"] = folders or None  # None → default at read site
     else:
         c["allowed_folders"] = None
-    _AMBIENT_CONFIG_CACHE = (current_path, now, c)
+    with _AMBIENT_CONFIG_CACHE_LOCK:
+        _AMBIENT_CONFIG_CACHE = (current_path, now, c)
     return c
 
 
@@ -22813,6 +22925,7 @@ def _ambient_hook(
 def _index_single_file(
     col: SqliteVecCollection, path: Path, skip_contradict: bool = False,
     vault_path: Path | None = None,
+    existing_hashes: dict[str, str] | None = None,
 ) -> str:
     """(Re)index one markdown file. Returns one of:
     'skipped' (unchanged), 'indexed' (new/updated), 'removed' (file gone),
@@ -22821,6 +22934,10 @@ def _index_single_file(
 
     `vault_path` lets callers (multi-vault `watch`) target a non-default
     vault without swapping the `VAULT_PATH` global. Defaults to `VAULT_PATH`.
+    
+    `existing_hashes` is an optional pre-fetched dict mapping file paths to their
+    current hashes in the collection. When provided, avoids a per-file SQL query.
+    Used by `_run_index_inner` for batch optimization.
     """
     vault = vault_path or VAULT_PATH
     try:
@@ -22830,11 +22947,20 @@ def _index_single_file(
     if is_excluded(doc_id_prefix):
         return "skipped"
 
-    existing = col.get(where={"file": doc_id_prefix}, include=["metadatas"])
-    existing_ids = existing["ids"]
-    existing_hash = (
-        existing["metadatas"][0].get("hash") if existing["metadatas"] else None
-    )
+    # Use pre-fetched hashes if available (batch optimization), otherwise query DB
+    if existing_hashes is not None:
+        existing_hash = existing_hashes.get(doc_id_prefix)
+        existing_ids = []  # Will fetch if needed for delete
+        if existing_hash is not None:
+            # Need to fetch IDs for deletion if file changed
+            existing = col.get(where={"file": doc_id_prefix}, include=["ids"])
+            existing_ids = existing["ids"]
+    else:
+        existing = col.get(where={"file": doc_id_prefix}, include=["metadatas"])
+        existing_ids = existing["ids"]
+        existing_hash = (
+            existing["metadatas"][0].get("hash") if existing["metadatas"] else None
+        )
 
     if not path.is_file():
         if existing_ids:
@@ -22928,8 +23054,30 @@ def _index_single_file(
         wikilink_bits = _wikilink_expansion_bits(outlinks, vault, path)
 
     # Contextual embedding: generate or retrieve cached document-level summary
-    ctx_summary = get_context_summary(text, h, path.stem, folder)
-    synth_qs = get_synthetic_questions(text, h, path.stem, folder)
+    # Parallelize context_summary and synthetic_questions calls (both are independent)
+    # Performance optimization: reduces cold-path time from ~1-2s to ~0.5-1s per file
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    
+    ctx_summary: str = ""
+    synth_qs: list[str] | None = None
+    
+    def _get_ctx():
+        return get_context_summary(text, h, path.stem, folder)
+    
+    def _get_synth():
+        return get_synthetic_questions(text, h, path.stem, folder)
+    
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            future_ctx = executor.submit(_get_ctx)
+            future_synth = executor.submit(_get_synth)
+            
+            ctx_summary = future_ctx.result(timeout=30)
+            synth_qs = future_synth.result(timeout=30)
+    except Exception:
+        # Fallback to sequential if parallelization fails
+        ctx_summary = get_context_summary(text, h, path.stem, folder)
+        synth_qs = get_synthetic_questions(text, h, path.stem, folder)
 
     chunks = semantic_chunks(
         text, path.stem, folder, tags, fm,
@@ -23410,7 +23558,10 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
         _run_cross_source_etls(VAULT_PATH)
 
     # Build file → chunks_in_db map (once) so we can detect stale/orphan chunks.
-    existing_all = col.get(include=["metadatas"])
+    # Performance optimization: filter to source=vault only, since cross-source
+    # chunks (whatsapp://, calendar://, etc.) are excluded from orphan cleanup
+    # anyway. Reduces data fetched from DB by ~30-50% for vaults with ingesters.
+    existing_all = col.get(where={"source": "vault"}, include=["metadatas"])
     file_to_chunks: dict[str, list[tuple[str, str]]] = {}
     for id_, meta in zip(existing_all["ids"], existing_all["metadatas"]):
         file_to_chunks.setdefault(meta.get("file", ""), []).append(
@@ -23421,6 +23572,14 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
         p for p in VAULT_PATH.rglob("*.md")
         if not is_excluded(str(p.relative_to(VAULT_PATH)))
     ]
+    # 2026-05-14: Si el vault tiene flag single_file_only, solo mantener el más reciente
+    cfg = _load_vaults_config()
+    single_file_vault = cfg.get("single_file_only")
+    if single_file_vault and single_file_vault in cfg.get("vaults", {}):
+        if Path(cfg["vaults"][single_file_vault]).resolve() == VAULT_PATH.resolve():
+            # Filtrar solo el archivo más reciente por mtime
+            if md_files:
+                md_files = [max(md_files, key=lambda p: p.stat().st_mtime)]
     console.print(f"[cyan]Indexando {len(md_files)} notas...[/cyan]")
 
     indexed_files = set()
@@ -23478,17 +23637,33 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
     # aunque MLX (no recomendado hasta que se patche el flush_batch).
     # `=0` fuerza no-batched aunque PyTorch.
     #
-    # Tamaño configurable via `RAG_INDEX_BATCH_SIZE` (default 16 chunks).
-    # Solo aplica cuando batched está ON.
+    # Tamaño configurable via `RAG_INDEX_BATCH_SIZE` (default auto-tuned based
+    # on available memory). Solo aplica cuando batched está ON.
+    # Auto-tuning heuristic: 16 chunks for <16GB RAM, 32 for 16-32GB, 64 for >32GB.
+    # Override via env var if needed.
     _embed_backend = os.environ.get("RAG_EMBED_BACKEND", "mlx").strip().lower()
     _batch_default = "0" if _embed_backend == "mlx" else "1"
     _batch_enabled = os.environ.get(
         "RAG_INDEX_BATCH_EMBEDS", _batch_default
     ).strip().lower() not in ("0", "false", "no")
+    
+    # Auto-tune batch size based on available memory
     try:
-        _batch_target = int(os.environ.get("RAG_INDEX_BATCH_SIZE", "16"))
+        import psutil
+        mem_gb = psutil.virtual_memory().total / (1024**3)
+        if mem_gb < 16:
+            _batch_auto = 16
+        elif mem_gb < 32:
+            _batch_auto = 32
+        else:
+            _batch_auto = 64
+    except Exception:
+        _batch_auto = 16  # fallback if psutil unavailable
+    
+    try:
+        _batch_target = int(os.environ.get("RAG_INDEX_BATCH_SIZE", str(_batch_auto)))
     except (TypeError, ValueError):
-        _batch_target = 16
+        _batch_target = _batch_auto
     if _batch_target < 1:
         _batch_target = 1
 
@@ -23498,6 +23673,10 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
     #              raw, path, folder, tags}.
     pending_files: list[dict] = []
     pending_chunk_count = 0
+    
+    # `pending_urls`: acumular URLs de múltiples archivos para batch index.
+    # Cada entry: {file, note_title, folder, tags, urls: [{url, anchor, line, context}]}
+    pending_urls: list[dict] = []
 
     def _flush_batch():
         """Embed all pending files en una llamada y commit a la collection.
@@ -23548,16 +23727,89 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
                 )
             except Exception as exc:
                 _silent_log("index_batch_entities", exc)
+            # Acumular URLs para batch processing
             try:
-                urls_indexed += _index_urls(
-                    col_urls, f["doc_id_prefix"], f["raw"],
-                    f["path"].stem, f["folder"], f["tags"],
-                )
+                urls = extract_urls(f["raw"])
+                if urls:
+                    pending_urls.append({
+                        "file": f["doc_id_prefix"],
+                        "note_title": f["path"].stem,
+                        "folder": f["folder"],
+                        "tags": f["tags"],
+                        "urls": urls,
+                    })
             except Exception:
                 pass
             indexed_files.add(f["doc_id_prefix"])
         pending_files.clear()
         pending_chunk_count = 0
+        
+        # Batch process URLs: delete old + embed + add new
+        if pending_urls:
+            try:
+                # Delete old URLs for all files in this batch
+                all_files = [u["file"] for u in pending_urls]
+                for file_path in all_files:
+                    try:
+                        existing = col_urls.get(where={"file": file_path}, include=[])
+                        if existing.get("ids"):
+                            col_urls.delete(ids=existing["ids"])
+                    except Exception:
+                        pass
+                
+                # Collect all URL contexts for batch embed
+                all_url_contexts: list[str] = []
+                url_offsets: list[tuple[int, int]] = []
+                for u in pending_urls:
+                    start = len(all_url_contexts)
+                    all_url_contexts.extend([url["context"] for url in u["urls"]])
+                    url_offsets.append((start, len(all_url_contexts)))
+                
+                # Batch embed all URL contexts
+                url_embeddings: list | None = None
+                try:
+                    url_embeddings = embed(all_url_contexts)
+                except Exception as exc:
+                    _silent_log("index_batch_urls_embed", exc)
+                    url_embeddings = None
+                
+                # Add all URLs in batch
+                if url_embeddings is not None:
+                    for u, (start, end) in zip(pending_urls, url_offsets):
+                        file_urls = u["urls"]
+                        embs = url_embeddings[start:end]
+                        if len(embs) != len(file_urls):
+                            continue
+                        
+                        ids = [f"{u['file']}::url::{i}" for i in range(len(file_urls))]
+                        contexts = [url["context"] for url in file_urls]
+                        metas = [
+                            {
+                                "file": u["file"],
+                                "note": u["note_title"],
+                                "folder": u["folder"],
+                                "tags": ",".join(u["tags"]),
+                                "url": url["url"],
+                                "anchor": url["anchor"],
+                                "line": url["line"],
+                                "source": "note",
+                            }
+                            for url in file_urls
+                        ]
+                        try:
+                            col_urls.add(
+                                ids=ids,
+                                embeddings=embs,
+                                documents=contexts,
+                                metadatas=metas,
+                            )
+                            urls_indexed += len(file_urls)
+                        except Exception:
+                            pass
+            except Exception as exc:
+                _silent_log("index_batch_urls", exc)
+            pending_urls.clear()
+        
         # Defensivo post-flush: liberar MPS cache después de cada batch.
         # El wrapper `_encode_with_cleanup` solo libera por encode call,
         # los embedding tensors retornados quedan vivos en Python list
@@ -24140,6 +24392,40 @@ def _do_index(reset: bool, no_contradict: bool, source_opt: str | None,
                 dry_run=bool(dry_run),
                 extra=f"{summary['mood_signals']} mood signals",
             ))
+            return
+        if src == "health":
+            # Apple Health export.xml → rag_apple_health_daily (telemetry).
+            # SAX streaming — constant memory aunque el file pese ~2GB.
+            from rag.integrations.apple_health import import_export_xml
+            from pathlib import Path as _Path
+            # Default 30 days, override via --since (ISO timestamp) or env var.
+            days = 30
+            if since_opt:
+                # Parse ISO timestamp to days ago
+                try:
+                    from datetime import datetime, timezone, timedelta as _timedelta
+                    since_dt = datetime.fromisoformat(since_opt.replace("Z", "+00:00"))
+                    days = max(1, int((datetime.now(timezone.utc) - since_dt).total_seconds() / 86400))
+                except Exception:
+                    pass
+            result = import_export_xml(days=days)
+            if result.get("skipped_reason"):
+                console.print(
+                    f"[dim]health: {result.get('skipped_reason')}[/dim]"
+                )
+                return
+            console.print(_fmt_ingest_summary(
+                "health",
+                total=result["imported"],
+                indexed=result["records_kept"],
+                deleted=0,
+                duration_s=result["elapsed_s"],
+                dry_run=bool(dry_run),
+                extra=f"{result['records_scanned']:,} scanned",
+            ))
+            days_seen = result.get("days_seen") or []
+            if days_seen:
+                console.print(f"[dim]{days_seen[0]} → {days_seen[-1]}[/dim]")
             return
         if src not in VALID_SOURCES:
             console.print(
@@ -41278,6 +41564,10 @@ def _is_placeholder_bullet(text: str) -> bool:
     return bool(_MORNING_PLACEHOLDER_RE.match(folded))
 
 
+# Regex extraída de _sanitize_morning_parts — se compilaba en cada call (B4 audit 2026-05-14).
+_SANITIZE_WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)")
+
+
 def _sanitize_morning_parts(parts: dict, ev: dict) -> dict:
     """Anti-alucinación post-LLM: descarta bullets que no tienen sustento en
     la evidencia real. El LLM tiende a inventar contradicciones, low-conf
@@ -41379,7 +41669,7 @@ def _sanitize_morning_parts(parts: dict, ev: dict) -> dict:
 
     focus = out.get("focus") or []
     if isinstance(focus, list) and focus:
-        wl_re = re.compile(r"\[\[([^\]|#]+)")
+        wl_re = _SANITIZE_WIKILINK_RE
         # Map title → known real path from filtered evidence (recent_notes
         # already excludes daemon paths). If a [[wikilink]] in focus matches
         # a daemon-generated title we know about, drop the bullet.
@@ -42749,6 +43039,19 @@ def _today_brief_client() -> "_SemaphoredChatClient":
     return _TODAY_BRIEF_CLIENT
 
 
+# Regex extraída de _strip_empty_today_sections — se compilaba en cada call (B4 audit 2026-05-14).
+_STRIP_EMPTY_PLACEHOLDER_RE = re.compile(
+    r"^\s*\W*\s*("
+    r"nada\s+qued|no\s+hubo|no\s+hay\b|no\s+habia|"
+    r"ninguna|ningun\b|sin\s+novedades?|sin\s+actividad|sin\s+nada|"
+    r"no\s+se\s+registr|no\s+se\s+detect|no\s+aparec|"
+    r"no\s+hay\s+datos?\s+suficientes|no\s+aplica|"
+    r"todo\s+(quedo|esta)\s+(en\s+orden|al\s+dia|categorizado)"
+    r")",
+    re.IGNORECASE,
+)
+
+
 def _strip_empty_today_sections(narrative: str) -> str:
     """Drop secciones del evening cuyo body es solo placeholder ("nada quedó
     suelto", "no hubo X", "ninguna pregunta", etc.) o está vacío.
@@ -42765,16 +43068,7 @@ def _strip_empty_today_sections(narrative: str) -> str:
     """
     if not narrative:
         return narrative
-    placeholder_re = re.compile(
-        r"^\s*\W*\s*("
-        r"nada\s+qued|no\s+hubo|no\s+hay\b|no\s+habia|"
-        r"ninguna|ningun\b|sin\s+novedades?|sin\s+actividad|sin\s+nada|"
-        r"no\s+se\s+registr|no\s+se\s+detect|no\s+aparec|"
-        r"no\s+hay\s+datos?\s+suficientes|no\s+aplica|"
-        r"todo\s+(quedo|esta)\s+(en\s+orden|al\s+dia|categorizado)"
-        r")",
-        re.IGNORECASE,
-    )
+    placeholder_re = _STRIP_EMPTY_PLACEHOLDER_RE
 
     def _is_placeholder_body(body: str) -> bool:
         # Strip todas las líneas en blanco / list-marker only / "(nota)" lines
@@ -45258,10 +45552,11 @@ def _is_weather_query(q: str) -> bool:
 _FINANCE_CARDS_KEYWORDS = re.compile(
     r"\btarjet|\bvisa\b|\bmaster(?:card)?\b|\bamex\b|\bcr[eé]dito\b"
     r"|saldo.*paga|fecha.*cierre|fecha.*vencim|resumen.*tarjeta"
-    r"|cu[aá]nto.*deb[oe]"
+    r"|cu[aá]nto.*deb[oe]|cu[aá]nto.*cobr[aeo]|cu[aá]nto.*gan[aeo]"
     r"|\b(?:[uú]ltim[oa]s?|recientes?)\s+(?:gastos?|consumos?|movimientos?|compras?|cargos?|transac)\b"
     r"|\b(?:consumos?|movimientos?|cargos?)\s+(?:de|del|en|con|mi)"
-    r"|gast[oéó]s?|gast[aá][mn]os|gastar|presupuesto|plata|finanz|moze",
+    r"|gast[oéó]s?|gast[aá][mn]os|gastar|presupuesto|plata|finanz|moze"
+    r"|sueldo|haberes|ingresos|neto|recibo.*haberes|recibo.*sueldo",
     re.IGNORECASE,
 )
 _FINANCE_CARDS_MAX_TOKENS = 16
@@ -45357,6 +45652,16 @@ def _format_finance_cards_block(finance: dict | None, cards: list[dict] | None) 
     return "\n\n".join(parts).strip()
 
 
+# Regexes extraídas de _detect_finance_intent — se compilaban en cada call (B4 audit 2026-05-14).
+_FINANCE_CARDS_RE = re.compile(
+    r"\btarjeta(s)?\b|\bvisa\b|\bmaster(card)?\b|\bamex\b|\b"
+    r"american\s+express\b|\bcr[eé]dito\b|\bbanco\b|\bdebitos?\s+autom"
+)
+_FINANCE_MOZE_RE = re.compile(
+    r"\bmoze\b|\befectivo\b|\bgastos?\s+diarios?\b|\bd[ií]a\s+a\s+d[ií]a\b"
+)
+
+
 def _detect_finance_intent(question: str) -> str:
     """Clasifica la pregunta financiera del user para decidir qué fuente
     pasar al LLM. Tres buckets:
@@ -45373,16 +45678,9 @@ def _detect_finance_intent(question: str) -> str:
     de gastos personales — sumar los montos es alucinación.
     """
     q = (question or "").lower()
-    cards_re = re.compile(
-        r"\btarjeta(s)?\b|\bvisa\b|\bmaster(card)?\b|\bamex\b|\b"
-        r"american\s+express\b|\bcr[eé]dito\b|\bbanco\b|\bdebitos?\s+autom"
-    )
-    moze_re = re.compile(
-        r"\bmoze\b|\befectivo\b|\bgastos?\s+diarios?\b|\bd[ií]a\s+a\s+d[ií]a\b"
-    )
-    if cards_re.search(q):
+    if _FINANCE_CARDS_RE.search(q):
         return "cards"
-    if moze_re.search(q):
+    if _FINANCE_MOZE_RE.search(q):
         return "moze"
     return "generic"
 
@@ -46459,6 +46757,17 @@ def serve(host: str, port: int):
     col = get_db()
     if col.count() == 0:
         console.print("[red]Índice vacío. Ejecuta: rag index[/red]")
+        return
+
+    # D5 (audit 2026-05-14): Check database integrity on startup.
+    # Corruption like "database disk image is malformed" can go undetected
+    # until a write fails. Fail fast if the DB is corrupt.
+    console.print("[dim]Checking database integrity…[/dim]")
+    if not _db_quick_check(DB_PATH, "ragvec.db"):
+        console.print("[red]ragvec.db is corrupted. Restore from backup or run: rag index --reset[/red]")
+        return
+    if not _db_quick_check(DB_PATH, "telemetry.db"):
+        console.print("[red]telemetry.db is corrupted. Restore from backup or delete it to rebuild.[/red]")
         return
 
     # Eager warmup — block until all models are ready.
@@ -48791,6 +49100,16 @@ def _sql_rotate_log_tables(*, dry_run: bool = False,
         if not dry_run:
             conn.commit()
 
+        # PRAGMA optimize: actualiza estadísticas del query planner de SQLite.
+        # Costoso solo la primera vez post-ANALYZE; luego es O(dirty-pages).
+        # Se corre antes del checkpoint para que el WAL incluya los cambios
+        # de las estadísticas (C1 audit 2026-05-14).
+        if not dry_run:
+            try:
+                conn.execute("PRAGMA optimize")
+            except Exception:
+                pass
+
         # WAL checkpoint once after all deletes — cheaper than N checkpoints.
         # Post-split: telemetry.db-wal (not ragvec.db-wal).
         wal_path = DB_PATH / (_TELEMETRY_DB_FILENAME + "-wal")
@@ -49332,6 +49651,10 @@ def _rag_free_plan_archived_logs(
     return out
 
 
+# Regex extraída de _rag_free_plan_ranker_snapshots — se compilaba en cada call (B4 audit 2026-05-14).
+_RANKER_SNAPSHOT_FILENAME_RE = re.compile(r"^ranker\.(\d+)\.\d+\.json$")
+
+
 def _rag_free_plan_ranker_snapshots(
     *,
     keep: int = _RAG_FREE_RANKER_KEEP_DEFAULT,
@@ -49344,12 +49667,11 @@ def _rag_free_plan_ranker_snapshots(
     state_dir = state_dir or (Path.home() / ".local/share/obsidian-rag")
     if not state_dir.is_dir():
         return []
-    pat = re.compile(r"^ranker\.(\d+)\.\d+\.json$")
     entries: list[dict] = []
     for f in state_dir.iterdir():
         if not f.is_file():
             continue
-        m = pat.match(f.name)
+        m = _RANKER_SNAPSHOT_FILENAME_RE.match(f.name)
         if not m:
             continue
         try:

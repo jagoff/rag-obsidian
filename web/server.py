@@ -22,71 +22,28 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
-# === MLX_LM EAGER PRELOAD (2026-05-08) ======================================
-# `transformers` 5.x + `accelerate` 1.13 race: cuando un thread no-main
-# (prewarm del reranker) inicia `from transformers import AutoTokenizer`
-# antes de que el main thread haya tocado `mlx_lm`, `accelerate.state`
-# queda en estado parcialmente inicializado en `sys.modules` y todo
-# import posterior de `mlx_lm` raisa `cannot import name 'AcceleratorState'
-# from partially initialized module 'accelerate.state'`. Eso decapita
-# `MLXBackend()` con un `RuntimeError("mlx-lm not installed")` engañoso
-# (el `from e` cause real es el circular import).
-#
-# Fix: forzar el import de `mlx_lm` aquí, en el main thread, ANTES de que
-# cualquier prewarm thread arranque. Una vez `transformers` y `accelerate`
-# quedan inicializados limpios en `sys.modules`, los handlers de las
-# requests pueden hacer `import mlx_lm` libremente desde cualquier thread.
+# ADR-002: MLX-LM Eager Preload — docs/adr/002-mlx-lm-eager-preload.md
+# Force mlx_lm import in main thread before any prewarm thread triggers
+# transformers/accelerate race. See ADR for full trace + root cause.
 try:
     import mlx_lm  # noqa: F401, PLC0415
 except ImportError:
     pass
-# === END MLX_LM EAGER PRELOAD ===============================================
 
-# === LOKY SEMAPHORE LEAK FIX (2026-04-25) ===================================
-# `tqdm` (transitively pulled by sentence-transformers / transformers) crea
-# un `multiprocessing.RLock()` lazy en su primer `tqdm.get_lock()` para
-# coordinar progress bars en multi-process. Ese RLock es un POSIX named
-# semaphore que NO se libera al shutdown del web daemon — Python no tiene
-# atexit hook que lo unlinkee.
-#
-# Adicionalmente, `joblib.externals.loky.backend.__init__` monkey-patcha
-# `multiprocessing.synchronize.SemLock._make_name` para que TODOS los
-# SemLocks creados después usen el prefix `/loky-PID-XXX`. Resultado: la
-# warning `leaked semaphore objects: {/loky-PID-XXX}` aparece en cada
-# clean shutdown del web daemon — 247 leaks acumulados en `web.error.log`
-# pre-fix.
-#
-# Trace empírico (2026-04-25 con monkey-patch de SemLock.__init__) confirma:
-# el SemLock se crea en `tqdm/std.py:121 create_mp_lock` durante el primer
-# `cls.get_lock()` que dispara sentence-transformers al cargar el reranker.
-#
-# Fix: pre-set el lock de tqdm a un `threading.RLock` (in-process, no
-# semaphore POSIX) ANTES de que cualquier dep pesado (sentence-transformers,
-# transformers, etc.) toque tqdm. La condición `not hasattr(cls, '_lock')`
-# en `tqdm.tqdm.get_lock()` deja nuestro lock alone y nunca llama
-# `TqdmDefaultWriteLock()` que es donde se crea el SemLock.
-#
-# Side effect: las progress bars de tqdm en este proceso ya no son
-# inter-process safe — pero el web daemon es single-process (uvicorn con
-# workers=1), así que no hay loss real. Si alguna vez se introduce
-# multi-process workers, este lock necesita re-evaluación.
+# ADR-001: Loky Semaphore Leak Fix — docs/adr/001-loky-semaphore-leak-fix.md
+# Pre-set tqdm lock to threading.RLock before any heavy dep touches it.
 try:
     import tqdm as _tqdm
     _tqdm.tqdm.set_lock(threading.RLock())
 except Exception:  # pragma: no cover - tqdm not installed
     pass
-# === END LOKY SEMAPHORE LEAK FIX ============================================
 
 # Reuse consolidated thread-safe cache helpers (extracted 2026-05-15).
 from rag.cache import ThreadSafeCache, ThreadSafeCacheMultiKey
 
-# pillow-heif registra el HEIC/HEIF reader/writer en PIL. Audit 2026-04-25
-# R2-OCR #4 followup: sin esto, las fotos del iPhone (HEIC default) eran
-# passthrough en `_sanitize_image_exif` y conservaban GPS coords al
-# copiarse al vault iCloud. Lo registramos UNA sola vez al import del
-# módulo — `register_heif_opener()` es idempotente pero igual lo
-# guardeamos detrás del flag `_HEIC_AVAILABLE` para que el sanitizer
-# (y sus tests) puedan detectar cuándo el plugin está disponible.
+# Register HEIC/HEIF reader in PIL once. Audit 2026-04-25 R2-OCR #4: without
+# this iPhone photos (HEIC default) were passthrough in _sanitize_image_exif
+# and kept GPS coords when copied to the iCloud vault.
 try:
     import pillow_heif as _pillow_heif  # noqa: PLC0415
     _pillow_heif.register_heif_opener()

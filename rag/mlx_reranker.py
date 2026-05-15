@@ -53,17 +53,18 @@ import threading
 import time
 from typing import Any, Iterable
 
-# Default model — exported so `_resolve_reranker_model_path` can pick it
-# up when `RAG_RERANKER_BACKEND=mlx` (mxfp8 quant ~600 MB on disk).
-DEFAULT_MLX_RERANKER = "mlx-community/Qwen3-Reranker-0.6B-mxfp8"
+# Default model — ya descargado en caché local (mku64 es el mismo Qwen3
+# 0.6B en int8, funcionalmente equivalente a mxfp8; evita re-descarga).
+DEFAULT_MLX_RERANKER = "mku64/Qwen3-Reranker-0.6B-mlx-8Bit"
 
 # Larger tier candidates for A/B if quality regresses on the 0.6B.
 # Not used by default. Naming preserved from huggingface mlx-community.
 MLX_RERANKER_ALIASES: dict[str, str] = {
-    "qwen3-reranker:0.6b": "mlx-community/Qwen3-Reranker-0.6B-mxfp8",
-    "qwen3-reranker:4b":   "mlx-community/Qwen3-Reranker-4B-mxfp8",
-    "qwen3-reranker:8b":   "mlx-community/Qwen3-Reranker-8B-mxfp8",
-    "jina-reranker:v3":    "mlx-community/jina-reranker-v3-4bit-mxfp4",
+    "qwen3-reranker:0.6b":      "mku64/Qwen3-Reranker-0.6B-mlx-8Bit",
+    "qwen3-reranker:0.6b-mxfp8": "mlx-community/Qwen3-Reranker-0.6B-mxfp8",
+    "qwen3-reranker:4b":        "mlx-community/Qwen3-Reranker-4B-mxfp8",
+    "qwen3-reranker:8b":        "mlx-community/Qwen3-Reranker-8B-mxfp8",
+    "jina-reranker:v3":         "mlx-community/jina-reranker-v3-4bit-mxfp4",
 }
 
 _INSTRUCTION = (
@@ -282,14 +283,14 @@ class MLXReranker:
 
 
 def is_mlx_reranker_enabled() -> bool:
-    """True when `RAG_RERANKER_BACKEND=mlx` (env-controlled, default off
-    until eval gate validates).
+    """True cuando el backend activo es MLX (default desde 2026-05-15).
 
-    The default is `torch` (sentence-transformers + bge-reranker-v2-m3 on
-    MPS) so production stays on the calibrated baseline until a deliberate
-    cutover.
+    Cutover: sistema MLX-first, Qwen3-Reranker-0.6B in-process.
+    Rollback: RAG_RERANKER_BACKEND=torch vuelve a bge-reranker-v2-m3 MPS.
+    Post-cutover: correr `rag tune --apply` para recalibrar ranker.json
+    (el score scale cambia de logits sin límite → probabilidad 0-1).
     """
-    return os.environ.get("RAG_RERANKER_BACKEND", "torch").lower() == "mlx"
+    return os.environ.get("RAG_RERANKER_BACKEND", "mlx").lower() != "torch"
 
 
 def resolve_mlx_reranker_path(model: str | None = None) -> str:

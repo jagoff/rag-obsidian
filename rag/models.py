@@ -63,7 +63,7 @@ DEFAULTS: dict[str, str] = {
     "chat":   "qwen2.5:7b",
     "helper": "qwen2.5:3b",
     "embed":  "qwen3-embedding:0.6b",
-    "rerank": "BAAI/bge-reranker-v2-m3",
+    "rerank": "qwen3-reranker:0.6b",
     "stt":    "small",
     "vlm":    "mlx-community/granite-vision-3.2-2b-4bit",
 }

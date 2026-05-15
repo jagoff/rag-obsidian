@@ -175,7 +175,9 @@ class MLXReranker:
             yes = float(logits[self._yes_id])
             no = float(logits[self._no_id])
             mx.eval(logits)
-        return 1.0 / (1.0 + math.exp(-(yes - no)))
+        result = 1.0 / (1.0 + math.exp(-(yes - no)))
+        mx.clear_cache()
+        return result
 
     def _score_batch(self, pairs: list[tuple[str, str]]) -> list[float]:
         """Batched forward único sobre `pairs` con padding RIGHT al
@@ -215,9 +217,12 @@ class MLXReranker:
             no_col = last[:, self._no_id]
             diff = yes_col - no_col
             mx.eval(diff)
-        # sigmoid en CPU (es escalar/vector chico) — preferimos no hacer
-        # otro forward MLX solo para sigmoid.
+        # Convertir a Python scalars y liberar tensores MLX.
+        # Sin clear_cache(), cada mini-batch de rerank acumula buffers Metal
+        # (logits: B×T×V, last: B×V, diff: B) → durante `rag tune` con 200
+        # samples × ceil(25/8)=4 batches = 800 forwards sin release → OOM.
         diffs = [float(d) for d in diff]
+        mx.clear_cache()
         return [1.0 / (1.0 + math.exp(-x)) for x in diffs]
 
     # -- public -------------------------------------------------------------

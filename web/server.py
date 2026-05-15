@@ -27,7 +27,7 @@ from typing import Callable
 # transformers/accelerate race. See ADR for full trace + root cause.
 try:
     import mlx_lm  # noqa: F401, PLC0415
-except ImportError:
+except (ImportError, RuntimeError):
     pass
 
 # ADR-001: Loky Semaphore Leak Fix — docs/adr/001-loky-semaphore-leak-fix.md
@@ -463,7 +463,7 @@ async def _lifespan(_app) -> "AsyncIterator[None]":
 
 
 app = FastAPI(
-    title="obsidian-rag web", docs_url=None, redoc_url=None,
+    title="obsidian-rag web", docs_url=None, redoc_url=None, openapi_url=None,
     lifespan=_lifespan,
 )
 
@@ -504,6 +504,35 @@ app.mount(
     _CachedStaticFiles(directory=STATIC_DIR, max_age=_STATIC_MAX_AGE),
     name="static",
 )
+
+# ── Admin token — protege endpoints de pánico / destructivos ─────────────────
+# La lógica vive ahora en `web/_admin.py` (refactor W3b 2026-05-09). Acá
+# re-exportamos los símbolos para preservar back-compat con tests externos
+# (`from web.server import _require_admin_token`, etc.) y aplicamos el
+# `@app.get` decorator sobre `admin_token` (la función está sin decorar
+# en `_admin.py` para evitar el circular import server↔_admin que se
+# dispara al import-time del decorator).
+#
+# Detalle (admin_token contract): Bearer en archivo 0o600 generado al
+# primer boot, persistido en ~/.config/obsidian-rag/admin_token.txt.
+# Uso desde cliente:
+#   curl -X POST http://localhost:8765/api/reindex \
+#        -H "Authorization: Bearer <token>"
+from web._admin import (  # noqa: E402, F401
+    _ADMIN_TOKEN,
+    _ADMIN_TOKEN_PATH,
+    _is_localhost_request,
+    _load_or_create_admin_token,
+    _require_admin_token,
+    admin_token,
+)
+
+# Aplicamos el decorator manual — equivalente a `@app.get("/api/admin/token")`
+# sobre la función importada arriba. La función hace lazy lookup de
+# `_is_localhost_request` y `_check_rate_limit` sobre `web.server` para
+# preservar el patrón `patch("web.server._is_localhost_request", ...)`
+# que usan los tests.
+app.get("/api/admin/token")(admin_token)
 
 # ── /memo: visor de las memorias del MCP `memo` ──────────────────────────
 # `memo` es el sucesor de `mem-vault` (2026-05-10): mismo rol — memoria
@@ -611,7 +640,7 @@ def memo_temporal_stale_api(days: int = 90, limit: int = 30) -> dict:
 _memo_cleanup_lock = __import__("threading").Lock()
 
 
-@app.post("/api/memo/delete")
+@app.post("/api/memo/delete", dependencies=[Depends(_require_admin_token)])
 def memo_delete_api(ids: list[str]) -> dict:
     """Borra una o más memorias por id. Llama `memo delete --yes` per id.
 
@@ -645,7 +674,7 @@ def memo_delete_api(ids: list[str]) -> dict:
     return {"ok": True, "deleted": deleted, "errors": errors}
 
 
-@app.post("/api/memo/cleanup")
+@app.post("/api/memo/cleanup", dependencies=[Depends(_require_admin_token)])
 def memo_cleanup_api(apply_dead: bool = True, apply_dupes: bool = False) -> dict:
     """Cleanup periódico: borra dead memorias (nunca usadas + creadas
     hace >30d + score <40). Wraps `scripts/memo_cleanup.py:run_cleanup`.
@@ -686,7 +715,7 @@ def memo_cleanup_api(apply_dead: bool = True, apply_dupes: bool = False) -> dict
         _memo_cleanup_lock.release()
 
 
-@app.post("/api/memo/merge")
+@app.post("/api/memo/merge", dependencies=[Depends(_require_admin_token)])
 def memo_merge_api(pairs: list[dict[str, str]]) -> dict:
     """Fusiona pares de near-dupes de memo.
 
@@ -934,36 +963,6 @@ app.add_middleware(
     # (text/event-stream) + JSON, X-Requested-With para `fetch()` con cred.
     allow_headers=["Content-Type", "Authorization", "Accept", "X-Requested-With"],
 )
-
-# ── Admin token — protege endpoints de pánico / destructivos ─────────────────
-# La lógica vive ahora en `web/_admin.py` (refactor W3b 2026-05-09). Acá
-# re-exportamos los símbolos para preservar back-compat con tests externos
-# (`from web.server import _require_admin_token`, etc.) y aplicamos el
-# `@app.get` decorator sobre `admin_token` (la función está sin decorar
-# en `_admin.py` para evitar el circular import server↔_admin que se
-# dispara al import-time del decorator).
-#
-# Detalle (admin_token contract): Bearer en archivo 0o600 generado al
-# primer boot, persistido en ~/.config/obsidian-rag/admin_token.txt.
-# Uso desde cliente:
-#   curl -X POST http://localhost:8765/api/reindex \
-#        -H "Authorization: Bearer <token>"
-from web._admin import (  # noqa: E402, F401
-    _ADMIN_TOKEN,
-    _ADMIN_TOKEN_PATH,
-    _is_localhost_request,
-    _load_or_create_admin_token,
-    _require_admin_token,
-    admin_token,
-)
-
-# Aplicamos el decorator manual — equivalente a `@app.get("/api/admin/token")`
-# sobre la función importada arriba. La función hace lazy lookup de
-# `_is_localhost_request` y `_check_rate_limit` sobre `web.server` para
-# preservar el patrón `patch("web.server._is_localhost_request", ...)`
-# que usan los tests.
-app.get("/api/admin/token")(admin_token)
-
 
 # Chat model for /chat. Delegated to `resolve_chat_model()` so it tracks
 # whatever rag.py decides is best on this host (command-r > qwen2.5:14b >
@@ -2718,7 +2717,7 @@ def ollama_unload() -> dict:
         mlx_loaded = list(getattr(mlx_backend, "_loaded", {}).keys())
         getattr(mlx_backend, "_loaded", {}).clear()
         freed.extend(mlx_loaded)
-    except ImportError as exc:
+    except (ImportError, RuntimeError) as exc:
         freed.append(f"mlx_clear (fail: {exc})")
     try:
         from rag import maybe_unload_reranker, _reranker_last_use  # noqa: F401
@@ -2728,6 +2727,20 @@ def ollama_unload() -> dict:
     except ImportError:
         reranker_dropped = False
     return {"ok": True, "freed_models": freed, "reranker_dropped": reranker_dropped}
+
+
+@app.post("/api/ollama/restart", dependencies=[Depends(_require_admin_token)])
+def ollama_restart_compat() -> dict:
+    """Compat endpoint for old panic-button clients.
+
+    Ollama was removed from the runtime during the MLX cutover; keeping the
+    route protected preserves the auth invariant for old dashboards/tests
+    without pretending that a restart action still exists.
+    """
+    raise HTTPException(
+        status_code=410,
+        detail="Ollama restart no existe post-MLX; usá /api/ollama/unload.",
+    )
 
 
 class ReminderCreateRequest(BaseModel):
@@ -2740,7 +2753,7 @@ class ReminderCreateRequest(BaseModel):
     recurrence: dict | None = None  # {freq, interval, byday?}
 
 
-@app.post("/api/reminders/create")
+@app.post("/api/reminders/create", dependencies=[Depends(_require_admin_token)])
 def create_reminder(req: ReminderCreateRequest, request: Request) -> dict:
     """Create an Apple Reminder.
 
@@ -2810,7 +2823,7 @@ class CalendarCreateRequest(BaseModel):
     recurrence: dict | None = None  # {freq, interval, byday?}
 
 
-@app.post("/api/calendar/create")
+@app.post("/api/calendar/create", dependencies=[Depends(_require_admin_token)])
 def create_calendar_event(req: CalendarCreateRequest, request: Request) -> dict:
     """Create a Calendar.app event. Called from chat proposal cards after
     the user confirms. Returns the event UID so the UI can surface a
@@ -2939,7 +2952,7 @@ class ReminderCompleteRequest(BaseModel):
     reminder_id: str
 
 
-@app.post("/api/reminders/complete")
+@app.post("/api/reminders/complete", dependencies=[Depends(_require_admin_token)])
 def complete_reminder(req: ReminderCompleteRequest) -> dict:
     """Mark an Apple Reminder as completed by its stable id.
 
@@ -3676,7 +3689,7 @@ def _parse_scheduled_for_to_utc(raw: str) -> str:
         raise ValueError(f"scheduled_for inválido: {e}") from e
 
 
-@app.post("/api/whatsapp/send")
+@app.post("/api/whatsapp/send", dependencies=[Depends(_require_admin_token)])
 def whatsapp_send(req: WhatsAppSendRequest, request: Request) -> dict:
     """Execute a WhatsApp send after the user clicked [Enviar] (envío
     inmediato) o [Programar] (envío diferido) on a ``propose_whatsapp_send``
@@ -4284,7 +4297,7 @@ class _WASenderOverrideRequest(BaseModel):
     name: str | None = None  # null/empty → remove override
 
 
-@app.post("/api/wa/sender-override")
+@app.post("/api/wa/sender-override", dependencies=[Depends(_require_admin_token)])
 def wa_sender_override(req: _WASenderOverrideRequest) -> dict:
     """Edita `~/.config/obsidian-rag/wa_sender_overrides.json`. El user
     asigna manualmente un display name a un JID que el sistema no
@@ -4326,7 +4339,7 @@ def wa_sender_override(req: _WASenderOverrideRequest) -> dict:
             "total_overrides": len(data)}
 
 
-@app.post("/api/wa/chats/{jid}/archive")
+@app.post("/api/wa/chats/{jid}/archive", dependencies=[Depends(_require_admin_token)])
 def wa_chat_archive(jid: str) -> dict:
     """Archiva un chat — sale del sidebar default, accesible solo desde
     la vista "Archivados". Idempotente.
@@ -4339,7 +4352,7 @@ def wa_chat_archive(jid: str) -> dict:
     return {"ok": True, "archived": True}
 
 
-@app.post("/api/wa/chats/{jid}/unarchive")
+@app.post("/api/wa/chats/{jid}/unarchive", dependencies=[Depends(_require_admin_token)])
 def wa_chat_unarchive(jid: str) -> dict:
     """Saca un chat del archivo — vuelve al sidebar default."""
     from rag.integrations.whatsapp import _db_local  # noqa: PLC0415
@@ -4350,7 +4363,7 @@ def wa_chat_unarchive(jid: str) -> dict:
     return {"ok": True, "archived": False}
 
 
-@app.post("/api/wa/chats/{jid}/pin")
+@app.post("/api/wa/chats/{jid}/pin", dependencies=[Depends(_require_admin_token)])
 def wa_chat_pin(jid: str) -> dict:
     """Pin un chat (contacto individual o grupo) a la sidebar.
     Idempotente. Pedido user 2026-05-11: aplica a ambos kinds.
@@ -4363,7 +4376,7 @@ def wa_chat_pin(jid: str) -> dict:
     return {"ok": True, "pinned": True}
 
 
-@app.post("/api/wa/chats/{jid}/unpin")
+@app.post("/api/wa/chats/{jid}/unpin", dependencies=[Depends(_require_admin_token)])
 def wa_chat_unpin(jid: str) -> dict:
     """Unpin un contacto. No-op si no estaba pinned."""
     from rag.integrations.whatsapp import _db_local  # noqa: PLC0415
@@ -4824,7 +4837,7 @@ class _WAMarkReadRequest(BaseModel):
     last_seen_ts: str | None = None
 
 
-@app.post("/api/wa/mark_read")
+@app.post("/api/wa/mark_read", dependencies=[Depends(_require_admin_token)])
 def wa_mark_read(req: _WAMarkReadRequest) -> dict:
     """Marca un chat como leído hasta `last_seen_ts` (default: ahora).
 
@@ -5034,7 +5047,7 @@ class _WAReactRequest(BaseModel):
     emoji: str  # "" = remove
 
 
-@app.post("/api/wa/react")
+@app.post("/api/wa/react", dependencies=[Depends(_require_admin_token)])
 def wa_react(req: _WAReactRequest) -> dict:
     """Reacciona a un mensaje (o remueve la reacción si emoji='').
 
@@ -5228,7 +5241,7 @@ def wa_media(message_id: str, jid: str) -> FileResponse:
 _WA_MEDIA_OUT_DIR = Path.home() / ".local/share/obsidian-rag/wa-media/out"
 
 
-@app.post("/api/wa/send_media")
+@app.post("/api/wa/send_media", dependencies=[Depends(_require_admin_token)])
 async def wa_send_media(
     request: Request,
     jid: str = Form(...),
@@ -5275,14 +5288,16 @@ async def wa_send_media(
         if 1 <= len(raw_ext) <= 8 and raw_ext.isalnum():
             ext = "." + raw_ext
     out_path = month_dir / f"{_uuid.uuid4().hex}{ext}"
-    out_path.write_bytes(body_bytes)
+    await asyncio.to_thread(out_path.write_bytes, body_bytes)
 
     reply_to = None
     if reply_to_id:
         reply_to = {"message_id": reply_to_id, "original_text": "", "sender_jid": ""}
 
     try:
-        resp = _bc.send_media(jid, str(out_path), caption=caption, reply_to=reply_to)
+        resp = await asyncio.to_thread(
+            _bc.send_media, jid, str(out_path), caption=caption, reply_to=reply_to,
+        )
     except _bc.BridgeError as e:
         return {"ok": False, "error_kind": "bridge_error", "error": str(e), "status": e.status}
     return {
@@ -5368,7 +5383,7 @@ def wa_search_index(full: bool = False) -> dict:
     return {"ok": True, "inserted": inserted, "pending": pending}
 
 
-@app.post("/api/wa/voice")
+@app.post("/api/wa/voice", dependencies=[Depends(_require_admin_token)])
 async def wa_voice(
     request: Request,
     jid: str = Form(...),
@@ -5549,7 +5564,7 @@ def wa_voice_healthcheck() -> dict:
     }
 
 
-@app.post("/api/wa/send_voice")
+@app.post("/api/wa/send_voice", dependencies=[Depends(_require_admin_token)])
 def wa_send_voice(req: _WASendVoiceRequest) -> dict:
     """TTS-to-PTT: convierte `text` a OGG/Opus con `say -v <voice>` y
     lo envía como audio PTT.
@@ -5795,7 +5810,7 @@ def wa_voice_transcript(message_id: str, jid: str) -> dict:
     }
 
 
-@app.post("/api/wa/typing")
+@app.post("/api/wa/typing", dependencies=[Depends(_require_admin_token)])
 def wa_typing(req: _WATypingRequest) -> dict:
     """Envía presence (typing/recording) al contacto. Fire-and-forget."""
     from rag.integrations.whatsapp import bridge_client as _bc  # noqa: PLC0415
@@ -5811,7 +5826,7 @@ def wa_typing(req: _WATypingRequest) -> dict:
         return {"ok": False, "error": str(e), "status": e.status}
 
 
-@app.post("/api/wa/send")
+@app.post("/api/wa/send", dependencies=[Depends(_require_admin_token)])
 def wa_send(req: _WASendRequest) -> dict:
     """Envía un mensaje de texto via el bridge. Soporta `reply_to` para
     quotear un mensaje previo (ContextInfo nativo de whatsmeow).
@@ -6012,13 +6027,19 @@ def _promise_update_status(promise_id: int, new_status: str, reason: str) -> dic
     return {"ok": True, "promise": _promise_row_to_dict(row)}
 
 
-@app.post("/api/wa/promises/{promise_id}/resolve")
+@app.post(
+    "/api/wa/promises/{promise_id}/resolve",
+    dependencies=[Depends(_require_admin_token)],
+)
 def wa_promises_resolve(promise_id: int) -> dict:
     """Marca la promesa como cumplida."""
     return _promise_update_status(promise_id, "done", "manual_resolve")
 
 
-@app.post("/api/wa/promises/{promise_id}/cancel")
+@app.post(
+    "/api/wa/promises/{promise_id}/cancel",
+    dependencies=[Depends(_require_admin_token)],
+)
 def wa_promises_cancel(promise_id: int) -> dict:
     """Cancela la promesa (ya no aplica / falsa positivo del regex)."""
     return _promise_update_status(promise_id, "cancelled", "manual_cancel")
@@ -6170,7 +6191,7 @@ def mail_summary(req: MailSummaryRequest) -> dict:
     }
 
 
-@app.post("/api/mail/send")
+@app.post("/api/mail/send", dependencies=[Depends(_require_admin_token)])
 def mail_send(req: MailSendRequest, request: Request) -> dict:
     """Execute a Gmail send after the user clicked [Enviar] on a
     ``propose_mail_send`` proposal card.
@@ -7527,21 +7548,25 @@ def get_chat_model() -> dict:
     """
     override = _read_chat_model_override()
     try:
-        from rag.llm_backend import MLXBackend, MLX_MODEL_ALIAS
-        mlx_ids = set(MLXBackend().list_available())
+        from rag.llm_backend import MLX_MODEL_ALIAS, list_cached_mlx_models
+        mlx_ids = set(list_cached_mlx_models())
         available = sorted(
             alias for alias, hf_id in MLX_MODEL_ALIAS.items()
             if hf_id in mlx_ids
             and not any(alias.startswith(p) for p in _CHAT_MODEL_FAMILY_DENYLIST)
         )
-    except ImportError:
+    except (ImportError, RuntimeError):
         available = []
     try:
         default = resolve_chat_model()
     except Exception:
         default = None
+    try:
+        current = _resolve_web_chat_model()
+    except Exception:
+        current = default or override or WEB_CHAT_MODEL
     return {
-        "current": _resolve_web_chat_model(),
+        "current": current,
         "override": override,
         "env_override": WEB_CHAT_MODEL,
         "default": default,
@@ -7565,8 +7590,8 @@ def set_chat_model(req: ChatModelRequest) -> dict:
     requested = (req.model or "").strip() or None
     if requested is not None:
         try:
-            from rag.llm_backend import MLXBackend, MLX_MODEL_ALIAS
-            mlx_ids = set(MLXBackend().list_available())
+            from rag.llm_backend import MLX_MODEL_ALIAS, list_cached_mlx_models
+            mlx_ids = set(list_cached_mlx_models())
             available = {alias for alias, hf_id in MLX_MODEL_ALIAS.items() if hf_id in mlx_ids}
         except ImportError:
             available = set()
@@ -20797,8 +20822,8 @@ def _resolve_diagnose_model() -> str:
     if _DIAGNOSE_MODEL_RESOLVED is not None:
         return _DIAGNOSE_MODEL_RESOLVED
     try:
-        from rag.llm_backend import MLXBackend, MLX_MODEL_ALIAS
-        mlx_ids = set(MLXBackend().list_available())
+        from rag.llm_backend import MLX_MODEL_ALIAS, list_cached_mlx_models
+        mlx_ids = set(list_cached_mlx_models())
         available = {alias for alias, hf_id in MLX_MODEL_ALIAS.items() if hf_id in mlx_ids}
     except ImportError:
         available = set()
@@ -22658,6 +22683,7 @@ _SCREEN_TIME_TTL = 300.0  # 5 min
 @app.get("/api/screen-time")
 def screen_time_api(days: int = Query(default=7, ge=1, le=30)) -> dict:
     """Screen Time de macOS: uso por app en las últimas `days` días."""
+    global _SCREEN_TIME_CACHE
     now_ts = time.time()
     if now_ts - _SCREEN_TIME_CACHE["ts"] < _SCREEN_TIME_TTL:
         return _SCREEN_TIME_CACHE["payload"] or {"apps": []}
@@ -24200,7 +24226,7 @@ def _read_vm_stat() -> dict:
         out = subprocess.run(
             ["vm_stat"], capture_output=True, text=True, errors="replace", timeout=2, check=False,
         ).stdout
-    except subprocess.SubprocessError:
+    except (subprocess.SubprocessError, OSError):
         return {}
     page_size = 4096
     stats: dict[str, float] = {}
@@ -24235,7 +24261,7 @@ def _sample_memory() -> dict | None:
             ["ps", "-axo", "rss=,command="],
             capture_output=True, text=True, errors="replace", timeout=5, check=False,
         ).stdout
-    except subprocess.SubprocessError:
+    except (subprocess.SubprocessError, OSError):
         return None
 
     by_cat: dict[str, float] = {k: 0.0 for k in _MEMORY_CATEGORIES}
@@ -24586,7 +24612,7 @@ def _sample_cpu(prev_state: dict) -> dict | None:
             ["ps", "-axo", "pid=,cputime=,command="],
             capture_output=True, text=True, errors="replace", timeout=5, check=False,
         ).stdout
-    except subprocess.SubprocessError:
+    except (subprocess.SubprocessError, OSError):
         return None
 
     per_pid_cpu: dict[int, float] = {}

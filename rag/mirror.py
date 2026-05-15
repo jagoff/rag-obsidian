@@ -45,7 +45,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FuturesTimeout, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -93,9 +93,24 @@ def _cache_get(key: str) -> dict[str, Any] | None:
         return value
 
 
+_CACHE_MAX_KEYS = 64  # máximo de keys distintas (fechas históricas)
+
+
 def _cache_set(key: str, value: dict[str, Any]) -> None:
+    now = time.time()
     with _CACHE_LOCK:
-        _CACHE[key] = (time.time(), value)
+        _CACHE[key] = (now, value)
+        # Evict stale entries proactivamente para evitar crecimiento sin límite.
+        if len(_CACHE) > _CACHE_MAX_KEYS:
+            cutoff = now - _CACHE_TTL_S
+            stale = [k for k, (ts, _) in _CACHE.items() if ts < cutoff]
+            for k in stale:
+                _CACHE.pop(k, None)
+            # Si aún hay demasiadas, evict las más viejas.
+            if len(_CACHE) > _CACHE_MAX_KEYS:
+                oldest = sorted(_CACHE.items(), key=lambda x: x[1][0])
+                for k, _ in oldest[: len(_CACHE) - _CACHE_MAX_KEYS]:
+                    _CACHE.pop(k, None)
 
 
 # ── DB helper ──────────────────────────────────────────────────────────────
@@ -427,21 +442,22 @@ def _source_screen_time(date: str) -> dict[str, Any]:
         return {"apps": []}
 
     try:
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(str(db_path), timeout=2.0)
         conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
+        try:
+            cursor = conn.cursor()
 
-        # Query para obtener uso por app en los últimos 7 días
-        query = """
-        SELECT ZBUNDLEID, ZTOTALTIMEINSECONDS
-        FROM ZUSAGE
-        WHERE ZDAY >= date('now', '-7 days')
-        ORDER BY ZDAY DESC, ZTOTALTIMEINSECONDS DESC
-        """
+            query = """
+            SELECT ZBUNDLEID, ZTOTALTIMEINSECONDS
+            FROM ZUSAGE
+            WHERE ZDAY >= date('now', '-7 days')
+            ORDER BY ZDAY DESC, ZTOTALTIMEINSECONDS DESC
+            """
 
-        cursor.execute(query)
-        rows = cursor.fetchall()
-        conn.close()
+            cursor.execute(query)
+            rows = cursor.fetchall()
+        finally:
+            conn.close()
 
         # Agregar por bundle ID y convertir a horas
         apps: dict[str, dict] = {}
@@ -707,11 +723,17 @@ def assemble_mirror(
     t0 = time.time()
     sources_data: dict[str, Any] = {}
 
-    with ThreadPoolExecutor(max_workers=len(_SOURCES), thread_name_prefix="mirror") as ex:
-        future_to_name = {
-            ex.submit(fn, date): name
-            for name, fn in _SOURCES.items()
-        }
+    # No usar `with ThreadPoolExecutor` — el context manager llama
+    # shutdown(wait=True) al salir, bloqueando hasta que fuentes colgadas
+    # (osascript, ScreenTime DB) terminen. Con shutdown(wait=False) el
+    # thread queda en daemon y el caller puede continuar con resultados
+    # parciales. El FuturesTimeout de as_completed también se captura.
+    ex = ThreadPoolExecutor(max_workers=len(_SOURCES), thread_name_prefix="mirror")
+    future_to_name: dict[Future[Any], str] = {
+        ex.submit(fn, date): name
+        for name, fn in _SOURCES.items()
+    }
+    try:
         for fut in as_completed(future_to_name, timeout=_PER_SOURCE_TIMEOUT_S * 3):
             name = future_to_name[fut]
             try:
@@ -719,6 +741,13 @@ def assemble_mirror(
             except Exception as exc:
                 logger.warning("mirror: source %s failed: %s", name, exc)
                 sources_data[name] = {"error": str(exc)[:200]}
+    except FuturesTimeout:
+        for name in future_to_name.values():
+            if name not in sources_data:
+                logger.warning("mirror: source %s timed out", name)
+                sources_data[name] = {"error": "timeout"}
+    finally:
+        ex.shutdown(wait=False)
 
     response = {
         "date": date,
@@ -755,12 +784,39 @@ Ejemplos válidos:
 Generá SOLO el JSON, nada más:"""
 
 
+_INSIGHTS_TIMEOUT_S = 8.0
+
+
 def generate_insights(mirror_data: dict[str, Any]) -> dict[str, Any]:
     """Genera 3-5 insights vía LLM basado en el mirror snapshot.
 
-    Sync con timeout 8s. Si falla → empty.
+    Sync con timeout 8s enforceado via ThreadPoolExecutor. Si falla → empty.
     """
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout  # noqa: PLC0415
+
     summary = _summarize_for_llm(mirror_data)
+    try:
+        from rag.llm_backend import get_backend  # noqa: PLC0415
+    except ImportError:
+        return {"insights": [], "error": "llm_backend no disponible"}
+
+    def _call() -> dict[str, Any]:
+        return _generate_insights_inner(summary)
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(_call)
+            return fut.result(timeout=_INSIGHTS_TIMEOUT_S)
+    except FuturesTimeout:
+        logger.warning("mirror insights LLM timed out after %ss", _INSIGHTS_TIMEOUT_S)
+        return {"insights": [], "error": "timeout"}
+    except Exception as exc:
+        logger.warning("mirror insights LLM failed: %s", exc)
+        return {"insights": [], "error": str(exc)[:200]}
+
+
+def _generate_insights_inner(summary: str) -> dict[str, Any]:
+    """Ejecuta el LLM call de insights. Llamado en thread separado desde generate_insights."""
     try:
         from rag.llm_backend import get_backend  # noqa: PLC0415
     except ImportError:
@@ -775,10 +831,17 @@ def generate_insights(mirror_data: dict[str, Any]) -> dict[str, Any]:
             helper_model = resolve_chat_model("helper")
         except Exception:
             helper_model = "qwen2.5:3b"
+        from rag.llm_backend import ChatOptions  # noqa: PLC0415
+        helper_opts = ChatOptions(
+            temperature=float(HELPER_OPTIONS.get("temperature", 0)),
+            seed=int(HELPER_OPTIONS.get("seed", 42)),
+            num_ctx=int(HELPER_OPTIONS.get("num_ctx", 1024)),
+            num_predict=int(HELPER_OPTIONS.get("num_predict", 128)),
+        )
         resp = backend.chat(
             model=helper_model,
             messages=[{"role": "user", "content": prompt}],
-            options=HELPER_OPTIONS,
+            options=helper_opts,
             stream=False,
         )
         content = ""
@@ -822,27 +885,27 @@ def _summarize_for_llm(mirror: dict[str, Any]) -> str:
         lines.append("Proyectos activos:")
         for p in proj[:5]:
             lines.append(
-                f"- {p['name']} ({p['note_count_30d']} notas 30d, "
-                f"hace {p['days_ago']}d)"
+                f"- {p.get('name', '?')} ({p.get('note_count_30d', 0)} notas 30d, "
+                f"hace {p.get('days_ago', '?')}d)"
             )
 
     ent = s.get("top_entities", {}).get("items", [])
     if ent:
         lines.append("\nEntidades top 7d:")
         for e in ent[:6]:
-            lines.append(f"- {e['name']} ({e['kind']}): {e['n_mentions_7d']} menciones")
+            lines.append(f"- {e.get('name', '?')} ({e.get('kind', '?')}): {e.get('n_mentions_7d', 0)} menciones")
 
     mood = s.get("mood_today", {})
     if mood.get("score") is not None:
         lines.append(
-            f"\nMood hoy: {mood['score']:+.2f} ({mood['n_signals']} señales · "
+            f"\nMood hoy: {mood['score']:+.2f} ({mood.get('n_signals', 0)} señales · "
             f"sources: {', '.join(mood.get('sources_used', []))})"
         )
 
     timeline = s.get("mood_timeline", {}).get("days", [])
     if timeline:
-        scores_recent = [d["score"] for d in timeline[-7:]]
-        scores_old = [d["score"] for d in timeline[-14:-7]] if len(timeline) >= 14 else []
+        scores_recent = [d.get("score", 0) for d in timeline[-7:] if d.get("score") is not None]
+        scores_old = [d.get("score", 0) for d in timeline[-14:-7] if d.get("score") is not None] if len(timeline) >= 14 else []
         if scores_old and scores_recent:
             avg_recent = sum(scores_recent) / len(scores_recent)
             avg_old = sum(scores_old) / len(scores_old)
@@ -855,13 +918,13 @@ def _summarize_for_llm(mirror: dict[str, Any]) -> str:
     if pend:
         lines.append("\nPendientes:")
         for p in pend[:5]:
-            lines.append(f"- {p['title']} [{p['category']}]")
+            lines.append(f"- {p.get('title', '?')} [{p.get('category', '?')}]")
 
     spot = s.get("spotify_top", {}).get("items", [])
     if spot:
         lines.append("\nSpotify top 7d:")
         for sp in spot[:3]:
-            lines.append(f"- {sp['artist']} ({sp['plays']} plays)")
+            lines.append(f"- {sp.get('artist', '?')} ({sp.get('plays', 0)} plays)")
 
     obs = s.get("observations", {})
     if obs:
@@ -879,6 +942,6 @@ def _summarize_for_llm(mirror: dict[str, Any]) -> str:
     if dormant:
         lines.append("\nNotas dormidas (>30d):")
         for d in dormant[:3]:
-            lines.append(f"- {d['title']} (hace {d['days_ago']}d)")
+            lines.append(f"- {d.get('title', '?')} (hace {d.get('days_ago', '?')}d)")
 
     return "\n".join(lines)

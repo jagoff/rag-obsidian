@@ -61,6 +61,8 @@ def test_anticipatory_candidate_required_fields():
         "kind", "score", "message", "dedup_key", "snooze_hours", "reason",
         # Proactive draft fields (Fase 2): opcionales, default None.
         "target_jid", "target_name", "draft", "draft_meta",
+        # Link a nota fuente (para UI).
+        "source_note",
     }
     assert c.target_jid is None and c.draft is None
 

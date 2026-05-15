@@ -77,126 +77,8 @@ except Exception:  # pragma: no cover - tqdm not installed
     pass
 # === END LOKY SEMAPHORE LEAK FIX ============================================
 
-# === THREAD-SAFE CACHE HELPER (2026-05-08) ==================================
-# Generic thread-safe cache to reduce lock proliferation. Consolidates
-# the pattern of dict + ts + lock that was repeated 10+ times across
-# dashboard endpoints. Prevents lock ordering issues and reduces surface area.
-class ThreadSafeCache:
-    """Thread-safe cache with TTL and single-flight refresh."""
-    
-    def __init__(self, ttl: float = 60.0):
-        self._lock = threading.Lock()
-        self._cache: dict = {"ts": 0.0, "payload": None}
-        self._ttl = ttl
-        self._refreshing = False
-    
-    def get(self) -> tuple[float, dict] | None:
-        """Get cached payload if fresh. Returns (ts, payload) or None."""
-        with self._lock:
-            entry = self._cache
-            if entry["ts"] == 0.0:
-                return None
-            if time.time() - entry["ts"] > self._ttl:
-                return None
-            return (entry["ts"], entry["payload"])
-    
-    def put(self, payload: dict) -> None:
-        """Update cache with new payload."""
-        with self._lock:
-            self._cache = {"ts": time.time(), "payload": payload}
-            self._refreshing = False
-    
-    def is_refreshing(self) -> bool:
-        """Check if a refresh is in progress (single-flight guard)."""
-        with self._lock:
-            return self._refreshing
-    
-    def set_refreshing(self, value: bool) -> None:
-        """Set refresh flag (single-flight guard)."""
-        with self._lock:
-            self._refreshing = value
-
-
-class ThreadSafeCacheMultiKey:
-    """Thread-safe cache with TTL and multi-key support.
-
-    Used for caches that need to store multiple values keyed by a tuple
-    (or any hashable). Automatically evicts stale entries on each `put`,
-    plus optional LRU-style eviction by age when ``max_size`` está
-    seteado (cap absoluto al número de entries vivas).
-    """
-    def __init__(self, ttl: float = 60.0, max_size: int | None = None):
-        self._lock = threading.Lock()
-        self._cache: dict[Any, dict] = {}
-        self._ttl = ttl
-        # Cap opcional al # de entries. Cuando se setea, post-put evictamos
-        # las más viejas (por `ts`) hasta dejar exactamente `max_size`. Sin
-        # esto, un cache muy usado podría inflarse aunque las entries no
-        # estén "stale" todavía (el cutoff es `ttl + 5s`).
-        self._max_size = max_size
-        self._refreshing: dict[Any, bool] = {}
-
-    def get(self, key: Any) -> tuple[float, Any] | None:
-        """Get cached value for key if fresh, else None."""
-        now = time.time()
-        with self._lock:
-            entry = self._cache.get(key)
-            if entry is not None:
-                if (now - entry["ts"]) < self._ttl:
-                    return (entry["ts"], entry["payload"])
-        return None
-
-    def put(self, key: Any, payload: Any) -> None:
-        """Update cached value for key and evict stale entries."""
-        now = time.time()
-        with self._lock:
-            self._cache[key] = {"ts": now, "payload": payload}
-            self._refreshing.pop(key, None)
-            # Evict stale entries (TTL + small grace).
-            cutoff = now - (self._ttl + 5.0)
-            stale = [k for k, v in self._cache.items() if v["ts"] < cutoff]
-            for k in stale:
-                self._cache.pop(k, None)
-                self._refreshing.pop(k, None)
-            # Cap absoluto: si seguimos por encima de max_size, evictamos
-            # los `n` más viejos por `ts` ascendente. Es LRU-by-write,
-            # no LRU-by-access — adecuado para los caches del dashboard
-            # donde un usuario "viejo" probablemente no vuelva.
-            if self._max_size is not None and len(self._cache) > self._max_size:
-                sorted_keys = sorted(
-                    self._cache.items(), key=lambda kv: kv[1]["ts"],
-                )
-                excess = len(self._cache) - self._max_size
-                for k, _ in sorted_keys[:excess]:
-                    self._cache.pop(k, None)
-                    self._refreshing.pop(k, None)
-
-    def clear(self) -> None:
-        """Reset el cache + flags de refresh. Usado por el chat cache
-        cuando el user pidió wipe del histórico (ej. invalidar después
-        de un re-index del vault)."""
-        with self._lock:
-            self._cache.clear()
-            self._refreshing.clear()
-
-    def delete(self, key: Any) -> None:
-        """Remove key explícito (idempotente — no rompe si no existe).
-        Usado por el SSE counter cuando una IP suelta su último slot —
-        deja el cache liviano en vez de esperar al TTL natural."""
-        with self._lock:
-            self._cache.pop(key, None)
-            self._refreshing.pop(key, None)
-
-    def start_refresh(self, key: Any) -> bool:
-        """Mark refresh as in progress for key. Returns True if we won the race."""
-        with self._lock:
-            if self._refreshing.get(key, False):
-                return False
-            self._refreshing[key] = True
-            return True
-
-
-# === END THREAD-SAFE CACHE HELPER =======================================
+# Reuse consolidated thread-safe cache helpers (extracted 2026-05-15).
+from rag.cache import ThreadSafeCache, ThreadSafeCacheMultiKey
 
 # pillow-heif registra el HEIC/HEIF reader/writer en PIL. Audit 2026-04-25
 # R2-OCR #4 followup: sin esto, las fotos del iPhone (HEIC default) eran
@@ -6942,15 +6824,20 @@ def followups(req: FollowupsRequest) -> dict:
 # Related-context (Deezer + YouTube) -----------------------------------------
 # Deezer's public search API needs no auth (CORS-restricted but server-side
 # is fine). Returned every relevant track has a `link` to deezer.com.
+#
+# A4 (audit 2026-05-14): migradas de urllib.request.urlopen (blocking I/O,
+# timeout=4s) a httpx.AsyncClient para no bloquear el event loop de uvicorn.
+# El endpoint `/api/related` pasó de sync a async def.
 
 
-def _deezer_search(query: str, limit: int = 2) -> list[dict]:
-    import urllib.request
+async def _deezer_search(query: str, limit: int = 2) -> list[dict]:
     import urllib.parse
+    import httpx  # noqa: PLC0415
     qs = urllib.parse.urlencode({"q": query, "limit": limit})
     try:
-        with urllib.request.urlopen(f"https://api.deezer.com/search?{qs}", timeout=4) as r:
-            data = json.loads(r.read())
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            r = await client.get(f"https://api.deezer.com/search?{qs}")
+            data = r.json()
     except Exception:
         return []
     items: list[dict] = []
@@ -6967,19 +6854,20 @@ def _deezer_search(query: str, limit: int = 2) -> list[dict]:
     return [i for i in items if i.get("url") and i.get("title")]
 
 
-def _youtube_search(query: str, limit: int = 2) -> list[dict]:
+async def _youtube_search(query: str, limit: int = 2) -> list[dict]:
     key = os.environ.get("YOUTUBE_API_KEY", "").strip()
     if not key:
         return []
-    import urllib.request
     import urllib.parse
+    import httpx  # noqa: PLC0415
     qs = urllib.parse.urlencode({
         "part": "snippet", "q": query, "maxResults": limit,
         "type": "video", "key": key, "relevanceLanguage": "es", "safeSearch": "none",
     })
     try:
-        with urllib.request.urlopen(f"https://www.googleapis.com/youtube/v3/search?{qs}", timeout=4) as r:
-            data = json.loads(r.read())
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            r = await client.get(f"https://www.googleapis.com/youtube/v3/search?{qs}")
+            data = r.json()
     except Exception:
         return []
     items: list[dict] = []
@@ -7004,7 +6892,7 @@ class RelatedRequest(BaseModel):
 
 
 @app.post("/api/related")
-def related(req: RelatedRequest) -> dict:
+async def related(req: RelatedRequest) -> dict:
     """External enrichment: Deezer + YouTube. Returns merged items list.
     Empty if no API keys present or query is empty. The frontend decides
     when to call this (low-confidence answers, empty retrieval, etc.) so
@@ -7014,11 +6902,16 @@ def related(req: RelatedRequest) -> dict:
     if not q or len(q) < 3:
         return {"items": []}
     wanted = set(req.sources or ["youtube"])
-    items: list[dict] = []
+    coros = []
     if "deezer" in wanted:
-        items.extend(_deezer_search(q, limit=2))
+        coros.append(_deezer_search(q, limit=2))
     if "youtube" in wanted:
-        items.extend(_youtube_search(q, limit=2))
+        coros.append(_youtube_search(q, limit=2))
+    results = await asyncio.gather(*coros, return_exceptions=True)
+    items: list[dict] = []
+    for r in results:
+        if isinstance(r, list):
+            items.extend(r)
     return {"items": items}
 
 
@@ -10752,7 +10645,7 @@ def _fetch_credit_cards(now: datetime | None = None) -> list[dict]:  # noqa: ARG
         # case-fold del FS (HFS+/APFS son case-insensitive por default pero
         # vault sync remoto puede no serlo).
         seen: set[Path] = set()
-        for pattern in ("Último resumen*.xlsx", "Ultimo resumen*.xlsx"):
+        for pattern in ("VISA/Último resumen*.xlsx", "VISA/Ultimo resumen*.xlsx"):
             for p in _FINANCE_BACKUP_DIR.glob(pattern):
                 seen.add(p)
         files = sorted(seen, key=lambda p: p.name)
@@ -13732,6 +13625,8 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             )
             _cached = _CHAT_CACHE.get(_cache_key)
             if _cached:
+                # ThreadSafeCacheMultiKey.get() returns (ts, payload) tuple
+                _cached_ts, _cached_payload = _cached
                 # Replay completo como SSE. Status `cached` NO es redundante
                 # aunque el `done` event también lleve `cached: True` — el
                 # UI lo consume en app.js:2346 para mostrar el label "desde
@@ -13743,20 +13638,20 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 yield _sse("status", {"stage": "cached"})
                 if not is_propose_intent:
                     yield _sse("sources", {
-                        "items": _cached["sources_items"],
-                        "confidence": _cached["top_score"],
+                        "items": _cached_payload["sources_items"],
+                        "confidence": _cached_payload["top_score"],
                     })
                 # Stream el texto en chunks chicos para mantener la ilusión
                 # de streaming (el cliente ya espera SSE tokens). 40 chars ≈
                 # 10 tokens — UI renderea suave sin el feel "pegote instantáneo".
-                _text = _cached["text"]
+                _text = _cached_payload["text"]
                 for i in range(0, len(_text), 40):
                     yield _sse("token", {"delta": _text[i:i+40]})
                 _cached_total_ms = int((time.perf_counter() - _t0) * 1000)
                 _cached_turn_id = new_turn_id()
                 yield _sse("done", {
                     "turn_id": _cached_turn_id,
-                    "top_score": _cached["top_score"],
+                    "top_score": _cached_payload["top_score"],
                     "total_ms": _cached_total_ms,
                     "retrieve_ms": 0,
                     "ttft_ms": _cached_total_ms,
@@ -13764,7 +13659,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     "cached": True,
                 })
                 _enrich_evt = _emit_enrich(
-                    _cached_turn_id, question, _text, float(_cached["top_score"]),
+                    _cached_turn_id, question, _text, float(_cached_payload["top_score"]),
                 )
                 if _enrich_evt:
                     yield _enrich_evt
@@ -23827,6 +23722,7 @@ except (TypeError, ValueError):
     _SSE_MAX_PER_IP = _SSE_MAX_PER_IP_DEFAULT
 _SSE_CONNECTIONS_PER_IP = ThreadSafeCacheMultiKey(
     ttl=86400.0,  # 24h - no expira por tiempo, solo por release
+    max_size=1000,  # límite de IPs únicas en cache para prevenir memory leak
 )
 
 

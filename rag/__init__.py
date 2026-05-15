@@ -725,6 +725,13 @@ VAULT_PATH = _resolve_vault_path()
 # the user drops in manually.
 
 
+def _default_state_dir() -> Path:
+    return Path(
+        os.environ.get("OBSIDIAN_RAG_STATE_DIR")
+        or str(Path.home() / ".local/share/obsidian-rag")
+    ).expanduser()
+
+
 def _ensure_state_dir_secure() -> Path:
     """Create ~/.local/share/obsidian-rag with 0o700 permissions.
 
@@ -734,7 +741,7 @@ def _ensure_state_dir_secure() -> Path:
     swallow the error rather than crash import — the worst case is the
     dir keeps its previous mode, which matches the old behavior.
     """
-    root = Path.home() / ".local/share/obsidian-rag"
+    root = _default_state_dir()
     root.mkdir(parents=True, exist_ok=True)
     try:
         root.chmod(0o700)
@@ -773,7 +780,7 @@ def _write_secret_file(path: Path, content: str) -> None:
 
 _STATE_DIR = _ensure_state_dir_secure()
 
-DB_PATH = Path(os.environ.get("OBSIDIAN_RAG_DB_PATH") or str(Path.home() / ".local/share/obsidian-rag/ragvec"))
+DB_PATH = Path(os.environ.get("OBSIDIAN_RAG_DB_PATH") or str(_STATE_DIR / "ragvec"))
 # Telemetry DB file — intentionally separate from ragvec.db (sqlite-vec + meta_*).
 # Pre-2026-04-21 both workloads shared one file + one WAL; bulk writes from the
 # indexer (`rag index`, `watch`, cross-source ingesters) were blocking hot-path
@@ -786,14 +793,14 @@ DB_PATH = Path(os.environ.get("OBSIDIAN_RAG_DB_PATH") or str(Path.home() / ".loc
 # because scripts/ingest_*.py open their own conn directly; moving them would
 # lose cursors and force full-rescan on next run.
 _TELEMETRY_DB_FILENAME = "telemetry.db"
-LOG_PATH = Path.home() / ".local/share/obsidian-rag/queries.jsonl"
-EVAL_LOG_PATH = Path.home() / ".local/share/obsidian-rag/eval.jsonl"
-BEHAVIOR_LOG_PATH = Path.home() / ".local/share/obsidian-rag/behavior.jsonl"
-BRIEF_WRITTEN_PATH = Path.home() / ".local/share/obsidian-rag/brief_written.jsonl"
-BRIEF_STATE_PATH = Path.home() / ".local/share/obsidian-rag/brief_state.jsonl"
+LOG_PATH = _STATE_DIR / "queries.jsonl"
+EVAL_LOG_PATH = _STATE_DIR / "eval.jsonl"
+BEHAVIOR_LOG_PATH = _STATE_DIR / "behavior.jsonl"
+BRIEF_WRITTEN_PATH = _STATE_DIR / "brief_written.jsonl"
+BRIEF_STATE_PATH = _STATE_DIR / "brief_state.jsonl"
 COLLECTION_WRITE_LOCK = DB_PATH / "collection_write.lock"  # A/B 2026-05-06: per-DB
-COLLECTION_OPS_LOG = Path.home() / ".local/share/obsidian-rag/collection_ops.log"
-COLLECTION_RESET_SENTINEL = Path.home() / ".local/share/obsidian-rag/collection_reset_at"
+COLLECTION_OPS_LOG = _STATE_DIR / "collection_ops.log"
+COLLECTION_RESET_SENTINEL = _STATE_DIR / "collection_reset_at"
 # Process-level mutex acquired al top de `rag index`. Evita que dos
 # invocaciones simultáneas se peleen por el sqlite-vec write lock y los
 # embeddings. Backed by `fcntl.flock(LOCK_EX | LOCK_NB)` — non-blocking,
@@ -806,7 +813,7 @@ INDEX_PROCESS_LOCK = DB_PATH / "index.lock"
 # unload, contradict JSON parse, feedback golden rebuild). Best-effort
 # sites (optional enrichment, shutdown cleanup, Apple integrations) still
 # use bare `pass`.
-SILENT_ERRORS_LOG_PATH = Path.home() / ".local/share/obsidian-rag/silent_errors.jsonl"
+SILENT_ERRORS_LOG_PATH = _STATE_DIR / "silent_errors.jsonl"
 
 
 # Single-writer queue for best-effort JSONL appends on the response path.
@@ -2916,7 +2923,7 @@ def resolve_chat_model() -> str:
     próxima call vuelve a resolver — pickea el override env si está set.
 
     MLX backend (único soportado post-Ola 7): consulta la cache MLX via
-    `MLXBackend.list_available()`. Match por alias short-name
+    `list_cached_mlx_models()`. Match por alias short-name
     (e.g. `qwen2.5:7b`) — `MLX_MODEL_ALIAS` traduce en ambas direcciones,
     así un candidato es "available" iff su HF id mapeado está presente en
     `~/.cache/huggingface/hub/`.
@@ -2929,10 +2936,9 @@ def resolve_chat_model() -> str:
         return explicit
     if _CHAT_MODEL_RESOLVED is not None:
         return _CHAT_MODEL_RESOLVED
-    from rag.llm_backend import get_backend, MLX_MODEL_ALIAS, MLXBackend  # local import
-    backend = get_backend().name  # singleton — 1 env lookup al startup, cached
+    from rag.llm_backend import MLX_MODEL_ALIAS, list_cached_mlx_models  # local import
     try:
-        mlx_ids = set(MLXBackend().list_available())
+        mlx_ids = set(list_cached_mlx_models())
         available = {alias for alias, hf_id in MLX_MODEL_ALIAS.items() if hf_id in mlx_ids}
     except Exception:
         available = set()
@@ -3331,7 +3337,7 @@ console = Console()
 # Short notes (< 300 chars) skip summarization — the prefix already captures
 # the key signal and a summary would be redundant.
 
-CONTEXT_CACHE_PATH = Path.home() / ".local/share/obsidian-rag/context_summaries.json"
+CONTEXT_CACHE_PATH = _STATE_DIR / "context_summaries.json"
 _CONTEXT_MIN_BODY = 300  # chars — skip summary for notes shorter than this
 # In-memory LRU cap. Long-running web daemon + large vaults can grow the
 # dict without bound (1 entry per unique chunk hash). LRU keeps memory
@@ -3712,7 +3718,7 @@ def get_context_summary(text: str, file_hash: str, title: str, folder: str) -> s
 # returns [] silently; an empty list just reverts the chunk to
 # context-summary-only behavior, never blocks indexing.
 
-SYNTHETIC_Q_CACHE_PATH = Path.home() / ".local/share/obsidian-rag/synthetic_questions.json"
+SYNTHETIC_Q_CACHE_PATH = _STATE_DIR / "synthetic_questions.json"
 _SYNTHETIC_Q_MIN_BODY = 300  # chars — same threshold as context summary
 _SYNTHETIC_Q_CAP = 4         # hard upper bound on questions per note
 _SYNTHETIC_Q_MAX_CHARS = 120 # per-question char cap
@@ -3753,12 +3759,12 @@ from rag.synthetic_questions import (  # noqa: E402, F401
 # entrante tiene cosine ≥ FEEDBACK_MATCH_COSINE con alguna query calificada
 # previamente — sin eso el feedback pasado no se aplica.
 
-FEEDBACK_PATH = Path.home() / ".local/share/obsidian-rag/feedback.jsonl"
-FEEDBACK_GOLDEN_PATH = Path.home() / ".local/share/obsidian-rag/feedback_golden.json"
+FEEDBACK_PATH = _STATE_DIR / "feedback.jsonl"
+FEEDBACK_GOLDEN_PATH = _STATE_DIR / "feedback_golden.json"
 # Hard-ignore: paths que el usuario marcó "no me muestres esto más" — se
 # filtran del candidate pool antes del rerank. Distinto del feedback negativo
 # (que es semántico por query y solo pena): acá el usuario declara "nunca".
-IGNORED_NOTES_PATH = Path.home() / ".local/share/obsidian-rag/ignored_notes.json"
+IGNORED_NOTES_PATH = _STATE_DIR / "ignored_notes.json"
 # Calibrados con bge-m3 sobre queries reales de queries.jsonl (26 queries únicas):
 #   - 0.88 sólo matcheaba restatements casi verbatim (3/325 pares).
 #   - 0.80 captura paraphrases de la misma intent ("qué es ikigai" /
@@ -3786,7 +3792,7 @@ FEEDBACK_NEGATIVE_PENALTY = 0.15
 # usando queries.yaml como objetivo. Defaults preservan el comportamiento
 # previo exacto: recency_always=0 + tag_literal=0 ⇒ ranking idéntico a antes.
 
-RANKER_CONFIG_PATH = Path.home() / ".local/share/obsidian-rag/ranker.json"
+RANKER_CONFIG_PATH = _STATE_DIR / "ranker.json"
 
 
 # ── Behavior priors ──────────────────────────────────────────────────────────
@@ -7241,7 +7247,7 @@ def _sql_max_ts(conn, table: str) -> str | None:
 # tables` (idempotent) so a process that hits the writer path before the
 # singleton was warmed still gets a valid schema.
 
-_SQL_STATE_ERROR_LOG = Path.home() / ".local/share/obsidian-rag/sql_state_errors.jsonl"
+_SQL_STATE_ERROR_LOG = _STATE_DIR / "sql_state_errors.jsonl"
 
 
 def _log_sql_state_error(event_type: str, **fields) -> None:
@@ -7870,11 +7876,25 @@ class SqliteVecCollection:
         embeddings = [list(e) for e in embeddings]
         if embeddings:
             self._ensure_vec_table(len(embeddings[0]))
+
+        # Pre-compute cols_list and SQL template once (not per-row).
+        cols_list = ["chunk_id", "document"] + list(known) + ["extra_json"]
+        placeholders = ",".join("?" * len(cols_list))
+        updates = ", ".join(f"{c}=excluded.{c}" for c in cols_list if c != "chunk_id")
+        # RETURNING rowid: collapse INSERT + SELECT rowid into a single query.
+        # Requires SQLite ≥3.35 (available since CPython 3.10 ships 3.35+;
+        # our runtime is 3.53). Works for both INSERT and ON CONFLICT upsert paths.
+        meta_sql = (
+            f"INSERT INTO {self._meta}({','.join(cols_list)}) VALUES({placeholders}) "
+            f"ON CONFLICT(chunk_id) DO UPDATE SET {updates} RETURNING rowid"
+        )
+        vec_delete_sql = f"DELETE FROM {self._vec} WHERE rowid = ?"
+        vec_insert_sql = f"INSERT INTO {self._vec}(rowid, embedding) VALUES(?, ?)"
+
         with self._db:
             for cid, emb, doc, meta in zip(ids, embeddings, documents, metadatas):
                 extra = {k: v for k, v in meta.items() if k not in known}
                 extra_json = json.dumps(extra, ensure_ascii=False) if extra else None
-                # Normalize created_ts to float or None
                 created_ts = meta.get("created_ts")
                 try:
                     created_ts = float(created_ts) if created_ts is not None else None
@@ -7886,30 +7906,16 @@ class SqliteVecCollection:
                         values.append(created_ts)
                     else:
                         v = meta.get(col)
-                        # Preserve primitive types (int/float/bool/str/None);
-                        # only stringify complex values like lists/dicts.
                         if v is None or isinstance(v, (int, float, bool, str)):
                             values.append(v)
                         else:
                             values.append(str(v))
                 values.append(extra_json)
-                cols_list = ["chunk_id", "document"] + list(known) + ["extra_json"]
-                placeholders = ",".join("?" * len(values))
-                updates = ", ".join(f"{c}=excluded.{c}" for c in cols_list if c != "chunk_id")
-                self._db.execute(
-                    f"INSERT INTO {self._meta}({','.join(cols_list)}) VALUES({placeholders}) "
-                    f"ON CONFLICT(chunk_id) DO UPDATE SET {updates}",
-                    values,
-                )
-                rowid = self._db.execute(
-                    f"SELECT rowid FROM {self._meta} WHERE chunk_id = ?", (cid,)
-                ).fetchone()[0]
+                rowid = self._db.execute(meta_sql, values).fetchone()[0]
                 # Replace vec entry (vec0 doesn't support upsert directly)
-                self._db.execute(f"DELETE FROM {self._vec} WHERE rowid = ?", (rowid,))
-                self._db.execute(
-                    f"INSERT INTO {self._vec}(rowid, embedding) VALUES(?, ?)",
-                    (rowid, sqlite_vec.serialize_float32(list(emb))),
-                )
+                self._db.execute(vec_delete_sql, (rowid,))
+                self._db.execute(vec_insert_sql,
+                                 (rowid, sqlite_vec.serialize_float32(list(emb))))
             self._bump_version()
 
     def update(self, ids, metadatas):
@@ -23685,6 +23691,11 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
         Si la batch de embed entera falla (OOM/timeout/etc), reintenta
         archivo por archivo para aislar el problema. Files que fallan
         en el reintento se loggean y se skippean — el resto se commitea.
+
+        Perf (2026-05-15): una sola transacción SQLite para todos los chunks
+        del batch (era N transacciones, una por archivo). Una sola query de
+        delete de URLs via $in (era N get+delete queries). Ambos reducen el
+        WAL overhead y el lock contention en reindex de vault grande.
         """
         nonlocal added_chunks, urls_indexed, pending_chunk_count
         if not pending_files:
@@ -23709,25 +23720,24 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
                 except Exception as inner_exc:
                     _silent_log("index_batch_embed_per_file", inner_exc)
                     f["_failed"] = True
+
+        # Collect valid chunks across ALL files for a single col.add() call.
+        # One SQLite transaction for the entire flush instead of N.
+        batch_ids: list[str] = []
+        batch_embs: list = []
+        batch_docs: list[str] = []
+        batch_metas: list[dict] = []
+
         for f, (start, end) in zip(pending_files, offsets):
             if f.get("_failed"):
                 continue
             embs = embeddings[start:end]
             if any(e is None for e in embs):
                 continue
-            col.add(
-                ids=f["ids"],
-                embeddings=embs,
-                documents=f["display_texts"],
-                metadatas=f["metadatas"],
-            )
-            added_chunks += len(f["ids"])
-            try:
-                _extract_and_index_entities_for_chunks(
-                    f["display_texts"], f["ids"], f["metadatas"], "vault"
-                )
-            except Exception as exc:
-                _silent_log("index_batch_entities", exc)
+            batch_ids.extend(f["ids"])
+            batch_embs.extend(embs)
+            batch_docs.extend(f["display_texts"])
+            batch_metas.extend(f["metadatas"])
             # Acumular URLs para batch processing
             try:
                 urls = extract_urls(f["raw"])
@@ -23742,22 +23752,46 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
             except Exception:
                 pass
             indexed_files.add(f["doc_id_prefix"])
+
+        # Single col.add() → single WAL write + one lock acquisition.
+        if batch_ids:
+            try:
+                col.add(ids=batch_ids, embeddings=batch_embs,
+                        documents=batch_docs, metadatas=batch_metas)
+                added_chunks += len(batch_ids)
+            except Exception as exc:
+                _silent_log("index_flush_col_add", exc)
+            try:
+                _extract_and_index_entities_for_chunks(
+                    batch_docs, batch_ids, batch_metas, "vault"
+                )
+            except Exception as exc:
+                _silent_log("index_batch_entities", exc)
+
         pending_files.clear()
         pending_chunk_count = 0
-        
+
+        # Liberar Metal cache entre embed de docs y embed de URLs.
+        # Sin esto, el segundo forward (URL contexts) encuentra el allocator
+        # fragmentado por el primero y dispara GPU Hang en MLX.
+        # `mx.clear_cache()` es no-op si mlx no está importado.
+        try:
+            import mlx.core as _mx_core
+            _mx_core.clear_cache()
+        except Exception:
+            pass
+
         # Batch process URLs: delete old + embed + add new
         if pending_urls:
             try:
-                # Delete old URLs for all files in this batch
-                all_files = [u["file"] for u in pending_urls]
-                for file_path in all_files:
-                    try:
-                        existing = col_urls.get(where={"file": file_path}, include=[])
-                        if existing.get("ids"):
-                            col_urls.delete(ids=existing["ids"])
-                    except Exception:
-                        pass
-                
+                # Delete stale URLs for ALL files en UN SOLO query via $in.
+                # Era un loop get+delete por archivo (N queries → 1 query).
+                all_files_with_urls = [u["file"] for u in pending_urls]
+                try:
+                    col_urls.delete(where={"file": {"$in": all_files_with_urls}})
+                except Exception as exc:
+                    _silent_log("index_batch_urls_delete", exc)
+
                 # Collect all URL contexts for batch embed
                 all_url_contexts: list[str] = []
                 url_offsets: list[tuple[int, int]] = []
@@ -23765,7 +23799,7 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
                     start = len(all_url_contexts)
                     all_url_contexts.extend([url["context"] for url in u["urls"]])
                     url_offsets.append((start, len(all_url_contexts)))
-                
+
                 # Batch embed all URL contexts
                 url_embeddings: list | None = None
                 try:
@@ -23773,19 +23807,23 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
                 except Exception as exc:
                     _silent_log("index_batch_urls_embed", exc)
                     url_embeddings = None
-                
-                # Add all URLs in batch
+
+                # Collect all URL records for a single col_urls.add() call.
                 if url_embeddings is not None:
+                    all_url_ids: list[str] = []
+                    all_url_embs: list = []
+                    all_url_docs: list[str] = []
+                    all_url_metas: list[dict] = []
                     for u, (start, end) in zip(pending_urls, url_offsets):
                         file_urls = u["urls"]
                         embs = url_embeddings[start:end]
                         if len(embs) != len(file_urls):
                             continue
-                        
-                        ids = [f"{u['file']}::url::{i}" for i in range(len(file_urls))]
-                        contexts = [url["context"] for url in file_urls]
-                        metas = [
-                            {
+                        for i, (url, emb) in enumerate(zip(file_urls, embs)):
+                            all_url_ids.append(f"{u['file']}::url::{i}")
+                            all_url_embs.append(emb)
+                            all_url_docs.append(url["context"])
+                            all_url_metas.append({
                                 "file": u["file"],
                                 "note": u["note_title"],
                                 "folder": u["folder"],
@@ -23794,33 +23832,23 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
                                 "anchor": url["anchor"],
                                 "line": url["line"],
                                 "source": "note",
-                            }
-                            for url in file_urls
-                        ]
+                            })
+                    if all_url_ids:
                         try:
                             col_urls.add(
-                                ids=ids,
-                                embeddings=embs,
-                                documents=contexts,
-                                metadatas=metas,
+                                ids=all_url_ids,
+                                embeddings=all_url_embs,
+                                documents=all_url_docs,
+                                metadatas=all_url_metas,
                             )
-                            urls_indexed += len(file_urls)
-                        except Exception:
-                            pass
+                            urls_indexed += len(all_url_ids)
+                        except Exception as exc:
+                            _silent_log("index_batch_urls_add", exc)
             except Exception as exc:
                 _silent_log("index_batch_urls", exc)
             pending_urls.clear()
-        
+
         # Defensivo post-flush: liberar MPS cache después de cada batch.
-        # El wrapper `_encode_with_cleanup` solo libera por encode call,
-        # los embedding tensors retornados quedan vivos en Python list
-        # hasta que el `for f, ...` de arriba los pasa a `col.add()`. Sin
-        # este `empty_cache()` final, MPS allocator fragmenta entre 200+
-        # flushes de un reindex full → GPU OOM acumulado (signature
-        # `kIOGPUCommandBufferCallbackErrorOutOfMemory` reproducido HOY
-        # 2026-05-06 PID 29718). Combinado con
-        # `start_memory_pressure_watchdog()` arriba para defensa en
-        # profundidad.
         # MLX-aware: `_torch_mps_empty_cache()` no-op cuando backend full-MLX
         # (post-Ola 9 default) — invalidar Metal command buffers desde Python
         # mientras MLX está procesando un batch produce GPU Hang Error.
@@ -24019,12 +24047,10 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
         orphan_ids.extend(eid for eid, _ in file_to_chunks[f])
     if orphan_ids:
         col.delete(ids=orphan_ids)
-    # Mirror orphan cleanup in the URL collection.
-    for f in orphan_files:
+    # Mirror orphan cleanup in the URL collection via single $in query.
+    if orphan_files:
         try:
-            existing_urls = col_urls.get(where={"file": f}, include=[])
-            if existing_urls.get("ids"):
-                col_urls.delete(ids=existing_urls["ids"])
+            col_urls.delete(where={"file": {"$in": list(orphan_files)}})
         except Exception as exc:
             _silent_log('index_urls_cleanup_on_reindex', exc)
 

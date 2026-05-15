@@ -51,7 +51,9 @@
     })();
   </script>
   <script src="/static/pwa/register-sw.js" defer></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js" defer></script>
+  <script src="/static/vendor/chart.umd.min.js"
+          integrity="sha384-vsrfeLOOY6KuIYKDlmVH5UiBmgIdB1oEf7p01YgWHuqmOHfZr374+odEv96n9tNC"
+          defer></script>
   <style>
     :root {
       --bg: #1a1a1f;
@@ -1370,6 +1372,52 @@
     @keyframes fadeUp {
       to { opacity: 1; transform: translateY(0); }
     }
+
+    /* ── Finance layout: drag & drop + collapse ───────────────────── */
+    .learn-section { position: relative; }
+    .learn-section-hdr { cursor: grab; }
+    .learn-section-hdr:active { cursor: grabbing; }
+    .learn-section-hdr .drag-grip {
+      display: inline-block;
+      font-family: var(--font-mono, monospace);
+      font-size: 12px;
+      line-height: 1;
+      color: var(--text-faint);
+      opacity: 0.35;
+      letter-spacing: -2px;
+      user-select: none;
+      margin-right: 8px;
+      flex-shrink: 0;
+    }
+    .learn-section:hover .learn-section-hdr .drag-grip {
+      opacity: 1;
+      color: var(--accent, #79ddff);
+    }
+    .learn-section.is-dragging {
+      opacity: 0.35;
+      border-style: dashed;
+      border-color: var(--accent, #79ddff);
+    }
+    .learn-section.drop-before {
+      box-shadow: inset 2px 0 0 var(--accent, #79ddff);
+    }
+    .learn-section.drop-after {
+      box-shadow: inset -2px 0 0 var(--accent, #79ddff);
+    }
+    .reset-layout-btn {
+      background: var(--bg-elev, #222228);
+      border: 1px solid var(--border, #33333a);
+      color: var(--text-dim);
+      padding: 4px 12px;
+      border-radius: 4px;
+      font-size: 11px;
+      cursor: pointer;
+      margin-left: 8px;
+    }
+    .reset-layout-btn:hover {
+      background: var(--bg-card, #26262c);
+      color: var(--text);
+    }
   </style>
 </head>
 <body>
@@ -1457,7 +1505,36 @@
       </div>
     </section>
 
-    <!-- ── 1. INGRESOS vs GASTOS POR MES ─────────────────────────── -->
+    <!-- ── 1. MOVIMIENTOS RECIENTES (MOZE) ───────────────────────── -->
+    <section class="learn-section" id="sec-recent" aria-labelledby="h-recent">
+      <header class="learn-section-hdr">
+        <h2 id="h-recent" title="Últimos 50 movimientos del CSV de MOZE">Movimientos recientes</h2>
+        <p class="muted">Últimos 50 gastos / ingresos categorizados</p>
+        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-recent" data-collapse="body-recent">−</button>
+      </header>
+      <div class="learn-section-body" id="body-recent">
+        <div class="chart-card wide" data-chart-card="recent-table">
+          <div class="tx-scroll">
+            <table class="tx-table" id="recent-table">
+              <thead>
+                <tr>
+                  <th>Fecha</th>
+                  <th>Tipo</th>
+                  <th>Categoría</th>
+                  <th>Nombre</th>
+                  <th>Comercio</th>
+                  <th>Cuenta</th>
+                  <th class="tx-amount">Monto</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── 2. INGRESOS vs GASTOS POR MES ─────────────────────────── -->
     <section class="learn-section" id="sec-by-month" aria-labelledby="h-by-month">
       <header class="learn-section-hdr">
         <h2 id="h-by-month" title="Serie temporal de los últimos 12 meses">Ingresos y gastos por mes</h2>
@@ -1478,7 +1555,7 @@
       </div>
     </section>
 
-    <!-- ── 2. POR CATEGORÍA (donut + lista) ──────────────────────── -->
+    <!-- ── 3. POR CATEGORÍA (donut + lista) ──────────────────────── -->
     <section class="learn-section" id="sec-by-category" aria-labelledby="h-by-category">
       <header class="learn-section-hdr">
         <h2 id="h-by-category" title="Donut: gastos por categoría dentro de la ventana">En qué se va la plata</h2>
@@ -1507,7 +1584,7 @@
       </div>
     </section>
 
-    <!-- ── 3. TOP COMERCIOS ──────────────────────────────────────── -->
+    <!-- ── 4. TOP COMERCIOS ──────────────────────────────────────── -->
     <section class="learn-section" id="sec-top-stores" aria-labelledby="h-top-stores">
       <header class="learn-section-hdr">
         <h2 id="h-top-stores" title="Top 15 comercios por gasto en la ventana">Dónde más gastaste</h2>
@@ -1528,7 +1605,7 @@
       </div>
     </section>
 
-    <!-- ── 4. POR CUENTA ─────────────────────────────────────────── -->
+    <!-- ── 5. POR CUENTA ─────────────────────────────────────────── -->
     <section class="learn-section" id="sec-by-account" aria-labelledby="h-by-account">
       <header class="learn-section-hdr">
         <h2 id="h-by-account" title="Resumen de movimientos por cuenta">Movimiento por cuenta</h2>
@@ -1555,7 +1632,7 @@
       </div>
     </section>
 
-    <!-- ── 5. TARJETAS DE CRÉDITO (xlsx) ─────────────────────────── -->
+    <!-- ── 6. TARJETAS DE CRÉDITO (xlsx) ─────────────────────────── -->
     <section class="learn-section" id="sec-cards" aria-labelledby="h-cards">
       <header class="learn-section-hdr">
         <h2 id="h-cards" title="Resúmenes de tarjeta del banco (xlsx)">Tarjeta de crédito</h2>
@@ -1567,7 +1644,7 @@
       </div>
     </section>
 
-    <!-- ── 6. TRANSFERENCIAS BANCARIAS (PDF) ─────────────────────── -->
+    <!-- ── 7. TRANSFERENCIAS BANCARIAS (PDF) ─────────────────────── -->
     <section class="learn-section" id="sec-transfers" aria-labelledby="h-transfers">
       <header class="learn-section-hdr">
         <h2 id="h-transfers" title="Transferencias salientes parseadas del PDF de comprobantes">Transferencias bancarias</h2>
@@ -1592,34 +1669,6 @@
       </div>
     </section>
 
-    <!-- ── 7. MOVIMIENTOS RECIENTES (MOZE) ───────────────────────── -->
-    <section class="learn-section" id="sec-recent" aria-labelledby="h-recent">
-      <header class="learn-section-hdr">
-        <h2 id="h-recent" title="Últimos 50 movimientos del CSV de MOZE">Movimientos recientes</h2>
-        <p class="muted">Últimos 50 gastos / ingresos categorizados</p>
-        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-recent" data-collapse="body-recent">−</button>
-      </header>
-      <div class="learn-section-body" id="body-recent">
-        <div class="chart-card wide" data-chart-card="recent-table">
-          <div class="tx-scroll">
-            <table class="tx-table" id="recent-table">
-              <thead>
-                <tr>
-                  <th>Fecha</th>
-                  <th>Categoría</th>
-                  <th>Descripción</th>
-                  <th>Comercio</th>
-                  <th>Cuenta</th>
-                  <th class="tx-amount">Monto</th>
-                </tr>
-              </thead>
-              <tbody></tbody>
-            </table>
-          </div>
-        </div>
-      </div>
-    </section>
-
     <!-- ── 8. FUENTES DETECTADAS ─────────────────────────────────── -->
     <section class="learn-section" id="sec-sources" aria-labelledby="h-sources">
       <header class="learn-section-hdr">
@@ -1639,5 +1688,12 @@
   <span id="finance-status" class="sr-only" role="status" aria-live="polite">Cargando datos del dashboard de finanzas</span>
 
   <script src="/static/finance.js" defer></script>
+  <script type="module" src="/static/js/finance-layout.mjs"></script>
+  <script type="module">
+    import { initFinanceLayout } from "/static/js/finance-layout.mjs";
+    document.addEventListener("DOMContentLoaded", () => {
+      initFinanceLayout();
+    });
+  </script>
 </body>
 </html>

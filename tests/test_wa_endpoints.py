@@ -163,7 +163,8 @@ def test_search_requires_q(client):
 
 
 # ── Auth-gated endpoints (destructive) ────────────────────────────────────────
-def test_revoke_requires_admin_token(client):
+def test_revoke_requires_admin_token(client, monkeypatch):
+    monkeypatch.delenv("OBSIDIAN_RAG_TEST_ADMIN_BYPASS", raising=False)
     resp = client.post(
         "/api/wa/revoke",
         json={"jid": "5491100000000@s.whatsapp.net", "message_id": "ABC"},
@@ -171,7 +172,8 @@ def test_revoke_requires_admin_token(client):
     assert resp.status_code == 401
 
 
-def test_search_backfill_requires_admin_token(client):
+def test_search_backfill_requires_admin_token(client, monkeypatch):
+    monkeypatch.delenv("OBSIDIAN_RAG_TEST_ADMIN_BYPASS", raising=False)
     resp = client.post("/api/wa/search/backfill")
     assert resp.status_code == 401
 

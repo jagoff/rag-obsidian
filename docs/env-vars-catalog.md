@@ -81,6 +81,9 @@ Para cambiar cualquier default: setear el env var en el shell antes de invocar e
 | Variable | Default | Ubicación | Qué hace |
 |---|---|---|---|
 | `_CONTRADICTION_ASYNC` | `1` (on) | `rag/__init__.py:24758` | Async default para el contradiction detector. Setear `0` para sync (útil si debugueás un falso positivo). |
+| `OBSIDIAN_RAG_STATE_DIR` | `~/.local/share/obsidian-rag` | `rag/__init__.py` | Override del directorio de estado operativo (logs JSONL, caches, ranker, silent errors). Usado por tests/sandboxes para no escribir en el home real durante import. |
+| `OBSIDIAN_RAG_DB_PATH` | `$OBSIDIAN_RAG_STATE_DIR/ragvec` | `rag/__init__.py` | Override del directorio sqlite (`ragvec.db`, `telemetry.db`, locks). Debe apuntar a un directorio writable. |
+| `OBSIDIAN_RAG_TEST_ADMIN_BYPASS` | `""` | `web/_admin.py`, `tests/conftest.py` | Bypass de auth solo para tests: requiere además `PYTEST_CURRENT_TEST`, por lo que no se activa en runtime normal. Los tests de auth lo desactivan explícitamente. |
 | `OBSIDIAN_RAG_WEB_CHAT_MODEL` | `qwen2.5:7b` | `web/server.py:2148` | Override del chat model del web server. Generado al plist en `rag setup`. |
 | `RAG_CACHE_ENABLED` | `1` (on) | `rag/__init__.py:5867` | Master switch del semantic cache. Tests autouse lo fuerzan a `0`. |
 | `RAG_NO_WARMUP` | `""` (off) | `rag/__init__.py` | Debug — skippea el warmup del reranker + bge-m3 + corpus cache en startup. |
@@ -105,7 +108,7 @@ grep -oE '`RAG_[A-Z_]+`|`OBSIDIAN_RAG_[A-Z_]+`|...' CLAUDE.md | tr -d '`' | sort
 # → diff = 47+ missing (este doc)
 ```
 
-Script exacto del audit en `scripts/audit_env_vars.py` (TODO — no committed yet).
+Script exacto del audit en `scripts/audit_env_vars.py`.
 
 ---
 

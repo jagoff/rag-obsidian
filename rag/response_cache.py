@@ -114,7 +114,7 @@ __all__ = [
 # 0.93 is sweet spot — false positives stay rare (unrelated queries
 # typically cosine ~0.80). Override `RAG_CACHE_COSINE`.
 
-_SEMANTIC_CACHE_COSINE = float(os.environ.get("RAG_CACHE_COSINE", "0.93"))
+_SEMANTIC_CACHE_COSINE = float(os.environ.get("RAG_CACHE_COSINE", "0.90"))
 _SEMANTIC_CACHE_DEFAULT_TTL = int(os.environ.get("RAG_CACHE_TTL_DEFAULT", "86400"))  # 24h
 _SEMANTIC_CACHE_RECENT_TTL = int(os.environ.get("RAG_CACHE_TTL_RECENT", "600"))  # 10 min
 _SEMANTIC_CACHE_MAX_ROWS = int(os.environ.get("RAG_CACHE_MAX_ROWS", "2000"))
@@ -387,7 +387,8 @@ def semantic_cache_lookup(
     if not rows:
         probe["reason"] = "corpus_mismatch" if probe["candidates"] == 0 else "empty_cache"
 
-    best_cos = -1.0
+    best_cos = -1.0       # global max cosine (para probe/telemetry)
+    best_cos_valid = -1.0  # max cosine entre candidates válidos (≥threshold, no stale)
     best = None
     # Memoization local: `(full_path → mtime|None)` reusable entre entries
     # del mismo lookup. Si N entries citan el mismo set de notas (caso
@@ -422,8 +423,8 @@ def semantic_cache_lookup(
             if _cached_entry_is_stale(paths, cached_ts, mtime_cache=_mtime_cache):
                 probe["skipped_stale"] += 1
                 continue
-            if cos > best_cos or best is None:
-                best_cos = cos
+            if cos > best_cos_valid:
+                best_cos_valid = cos
                 best = {
                     "id": int(rid),
                     "question": question,

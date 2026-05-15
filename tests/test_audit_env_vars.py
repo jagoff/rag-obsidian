@@ -258,6 +258,35 @@ def test_subscript_form_is_detected(tmp_path: Path) -> None:
     assert "RAG_SUBSCRIPT" in report["undocumented"]
 
 
+def test_settings_helper_calls_are_detected(tmp_path: Path) -> None:
+    """Centralised settings wrappers such as ``_str_env`` count as env usage."""
+    _make_tree(
+        tmp_path,
+        rag_init="import os\n",
+    )
+    settings_path = tmp_path / "rag" / "settings.py"
+    settings_path.write_text(
+        dedent(
+            """
+            def _str_env(name, default=""):
+                return default
+            def _int_env(name, default):
+                return default
+
+            HOST = _str_env("OBSIDIAN_RAG_BIND_HOST", "127.0.0.1")
+            POOL = _int_env("RAG_WEB_RERANK_POOL", 3)
+            """,
+        ).strip(),
+        encoding="utf-8",
+    )
+
+    mod = _import_audit_module()
+    report = mod.audit(tmp_path)
+
+    assert "OBSIDIAN_RAG_BIND_HOST" in report["undocumented"]
+    assert "RAG_WEB_RERANK_POOL" in report["undocumented"]
+
+
 def test_dynamic_keys_are_skipped(tmp_path: Path) -> None:
     """``os.environ.get(name)`` (variable key) is ignored — can't audit it."""
     _make_tree(
@@ -308,6 +337,29 @@ def test_walks_integrations_and_scripts(tmp_path: Path) -> None:
 
     assert "RAG_FROM_INTEGRATION" in report["undocumented"]
     assert "RAG_FROM_SCRIPT" in report["undocumented"]
+
+
+def test_walks_nested_rag_and_web_packages(tmp_path: Path) -> None:
+    """Recursive globs must include split packages below ``rag/`` and ``web/``."""
+    _make_tree(tmp_path, rag_init="import os\n")
+    nested_sources = {
+        "rag/runtime/jobs/demo.py": 'import os\nX = os.environ.get("RAG_RUNTIME_JOB", "")\n',
+        "rag/integrations/whatsapp/demo.py": (
+            'import os\nX = os.environ.get("RAG_WA_NESTED", "")\n'
+        ),
+        "web/nested/demo.py": 'import os\nX = os.environ.get("RAG_WEB_NESTED", "")\n',
+    }
+    for rel, body in nested_sources.items():
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+
+    mod = _import_audit_module()
+    report = mod.audit(tmp_path)
+
+    assert "RAG_RUNTIME_JOB" in report["undocumented"]
+    assert "RAG_WA_NESTED" in report["undocumented"]
+    assert "RAG_WEB_NESTED" in report["undocumented"]
 
 
 @pytest.mark.parametrize(

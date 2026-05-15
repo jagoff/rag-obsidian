@@ -1,6 +1,6 @@
-"""Tests para el admin token en endpoints de pánico.
+"""Tests para el admin token en endpoints de pánico / mutación.
 
-Valida que los 8 endpoints protegidos devuelven 401 sin token,
+Valida que los endpoints protegidos devuelven 401 sin token,
 401 con token incorrecto, y 2xx/proceden con el token correcto.
 También valida la generación del token file al primer boot.
 """
@@ -32,6 +32,11 @@ def _isolate_db_path(tmp_path):
         _rag.DB_PATH = snap
 
 
+@pytest.fixture(autouse=True)
+def _disable_test_admin_bypass(monkeypatch):
+    monkeypatch.delenv("OBSIDIAN_RAG_TEST_ADMIN_BYPASS", raising=False)
+
+
 @pytest.fixture()
 def client():
     return TestClient(app, raise_server_exceptions=False)
@@ -53,6 +58,19 @@ _ADMIN_ENDPOINTS = [
     "/api/auto-fix",
     "/api/auto-fix-devin",
     "/api/chat/model",
+    "/api/memo/delete",
+    "/api/memo/merge",
+    "/api/reminders/create",
+    "/api/calendar/create",
+    "/api/reminders/complete",
+    "/api/whatsapp/send",
+    "/api/wa/sender-override",
+    "/api/wa/mark_read",
+    "/api/wa/react",
+    "/api/wa/send",
+    "/api/wa/send_voice",
+    "/api/wa/typing",
+    "/api/mail/send",
 ]
 
 

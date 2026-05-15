@@ -196,7 +196,14 @@ class MLXEmbedder:
             emb = last / (norm + 1e-12)
             emb_fp32 = emb.astype(_mx.float32)
             _mx.eval(emb_fp32)
-        return np.array(emb_fp32)
+        # Convertir a numpy y liberar tensores MLX. `np.array()` copia los
+        # datos a CPU RAM; después del return, `emb_fp32`, `h`, `last`, `emb`
+        # son inalcanzables → el GC los marca como free en el próximo
+        # clear_cache(). Sin el clear_cache() explícito, el allocator MLX
+        # retiene la memoria Metal hasta presión externa.
+        result = np.array(emb_fp32)
+        _mx.clear_cache()
+        return result
 
     def encode(
         self,
@@ -227,11 +234,27 @@ class MLXEmbedder:
             return np.zeros((0, 1024), dtype=np.float32)
         self._load()
         bs = max(1, int(batch_size))
-        chunks: list[np.ndarray] = []
-        for i in range(0, len(texts_list), bs):
-            chunk = texts_list[i : i + bs]
-            chunks.append(self._encode_batch(chunk))
-        out = np.concatenate(chunks, axis=0)
+
+        # Sort-by-length before batching: texts of similar length en el mismo
+        # batch reducen el padding promedio un 20-40% en batches mixed-length
+        # (notas cortas de 50 tokens mezcladas con notas de 512 desperdician
+        # ~9× el compute del batch entero en padding). Unsort al final para
+        # preservar el orden original del caller.
+        order = sorted(range(len(texts_list)), key=lambda i: len(texts_list[i]))
+        sorted_texts = [texts_list[i] for i in order]
+        # Inverse permutation para restaurar el orden original.
+        inv_order = [0] * len(order)
+        for sorted_pos, orig_pos in enumerate(order):
+            inv_order[orig_pos] = sorted_pos
+
+        sorted_chunks: list[np.ndarray] = []
+        for i in range(0, len(sorted_texts), bs):
+            chunk = sorted_texts[i : i + bs]
+            sorted_chunks.append(self._encode_batch(chunk))
+        sorted_out = np.concatenate(sorted_chunks, axis=0)
+        # Restore original order via the inverse permutation.
+        out = sorted_out[inv_order]
+
         if not normalize_embeddings:
             # Si el caller pidió raw (sin L2), des-normalizamos no es
             # posible — pero ningún call site lo pide en obsidian-rag.

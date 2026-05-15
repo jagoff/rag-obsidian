@@ -15,9 +15,13 @@ import unittest.mock as mock
 
 import pytest
 
-mlx_lm = pytest.importorskip("mlx_lm")  # noqa: F841
-
-import mlx.core as mx  # type: ignore[import-not-found]
+try:
+    mlx_lm = pytest.importorskip("mlx_lm")  # noqa: F841
+    import mlx.core as mx  # type: ignore[import-not-found]
+except RuntimeError as exc:
+    if "No Metal device available" in str(exc):
+        pytest.skip("requires MLX Metal device", allow_module_level=True)
+    raise
 import numpy as np
 
 from rag.llm_backend import MLXBackend, reset_backend

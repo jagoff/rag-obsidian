@@ -50,7 +50,28 @@ def _finances_path() -> Path:
 
 
 def _extract_text_from_pdf(path: Path) -> str:
-    """Extract text from PDF using pypdf."""
+    """Extract text from PDF using pdftotext (poppler), fallback to pypdf + ocrmac."""
+    # Try pdftotext first (best for banking PDFs)
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["pdftotext", str(path), "-"],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            text = result.stdout.strip()
+            logger.info("pdftotext extracted %d chars", len(text))
+            return text
+    except FileNotFoundError:
+        logger.info("pdftotext not found, falling back to pypdf")
+    except subprocess.TimeoutExpired:
+        logger.warning("pdftotext timeout, falling back to pypdf")
+    except Exception as exc:
+        logger.warning("pdftotext failed: %s, falling back to pypdf", exc)
+
+    # Fallback to pypdf
     try:
         import pypdf
     except ImportError:
@@ -62,9 +83,37 @@ def _extract_text_from_pdf(path: Path) -> str:
         text = ""
         for page in reader.pages:
             text += page.extract_text() + "\n"
-        return text.strip()
+        text = text.strip()
+        # If pypdf extracted very little text, try OCR
+        if len(text) < 100:
+            logger.info("pypdf extracted minimal text (%d chars), trying OCR", len(text))
+            return _extract_text_from_pdf_ocr(path)
+        return text
     except Exception as exc:
         logger.warning("Failed to extract PDF text with pypdf: %s", exc)
+        return _extract_text_from_pdf_ocr(path)
+
+
+def _extract_text_from_pdf_ocr(path: Path) -> str:
+    """Extract text from PDF using pdf2image + ocrmac (macOS Vision)."""
+    try:
+        from pdf2image import convert_from_path
+        from ocrmac import ocrmac as ocrmac_mod
+    except ImportError as e:
+        logger.warning("pdf2image or ocrmac not available for PDF OCR: %s", e)
+        return ""
+
+    try:
+        # Convert PDF to images
+        images = convert_from_path(str(path), dpi=200)
+        text = ""
+        for img in images:
+            # OCR each image with ocrmac
+            result = ocrmac_mod.OCR(img, language_preference=["es-ES", "en-US"])
+            text += result.recognize() + "\n"
+        return text.strip()
+    except Exception as exc:
+        logger.warning("Failed to extract PDF text with pdf2image+ocrmac: %s", exc)
         return ""
 
 
@@ -195,13 +244,13 @@ class FinanceFile:
 
 
 def _scan_finances_folder(base_path: Path) -> list[FinanceFile]:
-    """Scan Finances folder and extract text from supported files."""
+    """Scan Finances folder recursively and extract text from supported files."""
     if not base_path.is_dir():
         logger.warning("Finances folder not found: %s", base_path)
         return []
 
     files = []
-    for item in base_path.iterdir():
+    for item in base_path.rglob("*"):
         if item.is_dir():
             continue
         if item.name.startswith("."):
@@ -222,7 +271,7 @@ def _scan_finances_folder(base_path: Path) -> list[FinanceFile]:
         if text:
             files.append(FinanceFile(
                 path=item,
-                name=item.name,
+                name=str(item.relative_to(base_path)),
                 mtime=mtime,
                 file_type=file_type,
                 text=text,
@@ -368,8 +417,8 @@ def ingest(path: Path | str | None = None) -> dict[str, Any]:
                 existing = col.get(where={"file": file_key}, include=[])
                 if existing.get("ids"):
                     col.delete(ids=existing["ids"])
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("finances: failed to delete existing chunks for %s: %s", f.name, exc)
 
             # Add new chunks
             if ids and docs and metas:

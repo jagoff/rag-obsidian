@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Audit env-var consistency between code and docs.
 
-Walks the Python source tree (``rag/``, ``web/``, ``mcp_server.py``,
-``scripts/*.py``) using ``ast`` and collects every ``os.environ.get(...)``,
+Walks the Python source tree (``rag/**/*.py``, ``web/**/*.py``,
+``mcp_server.py``, ``scripts/*.py``) using ``ast`` and collects every ``os.environ.get(...)``,
 ``os.getenv(...)`` and ``os.environ["..."]`` reference whose key is a string
 literal. Cross-checks against:
 
@@ -57,10 +57,8 @@ _DOC_VAR_PATTERN = _re_compile(
 # Source files (relative to root) that we walk via AST. Globs are resolved
 # with ``Path.glob`` — single-star segments do not recurse, ``**`` does.
 _SOURCE_GLOBS: tuple[str, ...] = (
-    "rag/__init__.py",
-    "rag/integrations/*.py",
-    "web/server.py",
-    "web/*.py",
+    "rag/**/*.py",
+    "web/**/*.py",
     "mcp_server.py",
     "scripts/*.py",
 )
@@ -97,6 +95,13 @@ def _str_literal(node: ast.expr | None) -> str | None:
     return None
 
 
+def _default_literal(node: ast.expr | None) -> str | None:
+    """Return simple literal defaults normalised to strings for comparison."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, (str, int, float, bool)):
+        return str(node.value)
+    return None
+
+
 class _EnvVarVisitor(ast.NodeVisitor):
     """Collect env-var references inside a parsed source file.
 
@@ -116,11 +121,19 @@ class _EnvVarVisitor(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> None:  # noqa: N802 — ast API
         target = _resolve_attr_chain(node.func)
-        if target in {"os.environ.get", "os.getenv"} and node.args:
+        if target in {
+            "os.environ.get",
+            "os.getenv",
+            "_bool_env",
+            "_bool_env_opt",
+            "_int_env",
+            "_float_env",
+            "_str_env",
+        } and node.args:
             key = _str_literal(node.args[0])
             if key and _VAR_NAME_PATTERN.match(key):
                 default = (
-                    _str_literal(node.args[1]) if len(node.args) >= 2 else None
+                    _default_literal(node.args[1]) if len(node.args) >= 2 else None
                 )
                 self.findings.append((key, default, node.lineno))
         self.generic_visit(node)

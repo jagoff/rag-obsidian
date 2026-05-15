@@ -49,8 +49,9 @@ sobre tumbar todo el flujo.
 from __future__ import annotations
 
 import os
+import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # Cap del delta para evitar runaway tuning con muestras chicas.
 _DELTA_CAP_ABS = 0.2
@@ -70,7 +71,10 @@ _WINDOW_DAYS = 30
 _CACHE_TTL_SECONDS = 3600.0
 
 # Cache: {kind: (delta, expires_at_monotonic)}
+# Lock requerido: este módulo se usa desde el web server (long-running,
+# multi-thread) vía _phase2_kind_threshold — el dict no es thread-safe.
 _cache: dict[str, tuple[float, float]] = {}
+_cache_lock = threading.Lock()
 
 
 def _is_disabled() -> bool:
@@ -85,7 +89,7 @@ def _query_kind_counts(kind: str) -> tuple[int, int, int]:
     Returns (positive, negative, mute). En cualquier error retorna
     (0, 0, 0) — silent-fail.
     """
-    cutoff = (datetime.now() - timedelta(days=_WINDOW_DAYS)).isoformat(timespec="seconds")
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=_WINDOW_DAYS)).isoformat(timespec="seconds")
     try:
         import rag
         from rag_anticipate.feedback import _ensure_feedback_table
@@ -168,7 +172,8 @@ def compute_kind_threshold_adjustment(kind: str, *, use_cache: bool = True) -> f
 
     now_mono = time.monotonic()
     if use_cache:
-        cached = _cache.get(kind)
+        with _cache_lock:
+            cached = _cache.get(kind)
         if cached is not None:
             delta, expires_at = cached
             if now_mono < expires_at:
@@ -181,7 +186,8 @@ def compute_kind_threshold_adjustment(kind: str, *, use_cache: bool = True) -> f
         delta = 0.0
 
     if use_cache:
-        _cache[kind] = (delta, now_mono + _CACHE_TTL_SECONDS)
+        with _cache_lock:
+            _cache[kind] = (delta, now_mono + _CACHE_TTL_SECONDS)
     return delta
 
 
@@ -232,7 +238,8 @@ def all_kinds_feedback_summary() -> list[dict]:
 
 def reset_cache() -> None:
     """Limpia la cache. Tests + manual debug."""
-    _cache.clear()
+    with _cache_lock:
+        _cache.clear()
 
 
 __all__ = [

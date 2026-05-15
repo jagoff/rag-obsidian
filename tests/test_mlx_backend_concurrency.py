@@ -32,7 +32,12 @@ from typing import Any
 
 import pytest
 
-pytest.importorskip("mlx_lm")
+try:
+    pytest.importorskip("mlx_lm")
+except RuntimeError as exc:
+    if "No Metal device available" in str(exc):
+        pytest.skip("requires MLX Metal device", allow_module_level=True)
+    raise
 
 from rag.llm_backend import MLXBackend, reset_backend, to_mlx  # noqa: E402
 

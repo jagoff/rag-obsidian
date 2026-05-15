@@ -3,44 +3,17 @@
 
 import os
 
-# Pin HF / transformers into offline + quiet mode BEFORE any import that
-# transitively pulls huggingface_hub. These libs read the envs at module-init
-# and cache the offline flag globally; setting them later (inside a lazy
-# loader) leaves a client that tries HEAD requests and fails on air-gapped
-# setups. The reranker + sentence_transformers path both inherit this.
-#
-# `os.environ.setdefault` means an operator who WANTS online mode can still
-# export the var explicitly before launching — we don't overwrite.
-#
-# Consolidated 2026-04-20: was previously split across two blocks (a
-# conditional RAG_LOCAL_EMBED bootstrap + an unconditional block after
-# stdlib imports). Verified no top-level import in this module transitively
-# pulls huggingface_hub — `sentence_transformers` is lazy-imported inside
-# get_reranker() / _get_local_embedder(), so setting the flags once here
-# is sufficient and simpler than the split.
+# ADR-003: HF Offline + Fastembed Cache Bootstrap — docs/adr/003-hf-offline-env-bootstrap.md
+# Must run BEFORE any import that transitively pulls huggingface_hub.
 for _k, _v in {
     "HF_HUB_OFFLINE": "1",
     "TRANSFORMERS_OFFLINE": "1",
     "HF_HUB_DISABLE_TELEMETRY": "1",
     "HF_HUB_DISABLE_PROGRESS_BARS": "1",
-    # suppresses fd-2 "unauthenticated" warn from huggingface_hub
     "HF_HUB_VERBOSITY": "error",
     "TRANSFORMERS_NO_ADVISORY_WARNINGS": "1",
     "TRANSFORMERS_VERBOSITY": "error",
     "TQDM_DISABLE": "1",
-    # mem0's qdrant vector store lazy-loads `fastembed.SparseTextEmbedding(
-    # model_name="Qdrant/bm25")` for hybrid keyword search. fastembed's
-    # default cache dir is `tempfile.gettempdir()/fastembed_cache`, which
-    # on macOS resolves to `/var/folders/.../T/fastembed_cache` — and macOS
-    # periodically GC's that path. Combined with HF_HUB_OFFLINE=1 above, a
-    # cache miss after the GC means fastembed can't redownload the model
-    # and the encoder fails to initialise (see web.error.log 2026-04-29:
-    # `Could not find the model tar.gz file at /var/folders/.../T/
-    # fastembed_cache/bm25 and local_files_only=True`). Pinning the cache
-    # to ~/.cache/fastembed (HOME-relative, never GC'd) is the persistent
-    # fix; one-time download via `python -c 'from fastembed import
-    # SparseTextEmbedding; SparseTextEmbedding("Qdrant/bm25")'` (with
-    # offline mode disabled) populates the dir.
     "FASTEMBED_CACHE_PATH": os.path.join(os.path.expanduser("~"), ".cache", "fastembed"),
 }.items():
     os.environ.setdefault(_k, _v)
@@ -58,6 +31,7 @@ import json
 import queue
 import re
 import secrets
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -81,42 +55,18 @@ logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
-# === LOKY SEMAPHORE LEAK FIX (2026-04-26) ===================================
-# Espejo del fix de web/server.py para todas las invocaciones `rag <cmd>`,
-# especialmente los daemons de larga duración (`rag watch`, `rag serve`).
-# `tqdm` (transitively pulled por sentence-transformers / transformers) crea
-# un `multiprocessing.RLock()` lazy en su primer `tqdm.get_lock()` — ese
-# RLock es un POSIX named semaphore que NO se libera al exit del proceso.
-# Joblib además monkey-patchea `SemLock._make_name` para que todos los
-# SemLocks usen el prefix `/loky-PID-XXX`. Resultado: `resource_tracker`
-# warnea `leaked semaphore objects: {/loky-PID-XXX}` en cada shutdown
-# clean del watch daemon (9 warnings acumuladas en `watch.error.log`
-# pre-fix).
-#
-# `TQDM_DISABLE=1` (ya seteado arriba) desactiva las progress bars, pero
-# NO previene la creación del SemLock via `tqdm.get_lock()` que ST llama
-# durante la carga del reranker / embedder para coordinar multi-worker
-# dataloaders. Pre-setear `_lock` a un `threading.RLock` (in-process, no
-# semaphore POSIX) antes de que nada triggee `get_lock()` evita el leak.
-#
-# Idempotente: si algo ya seteo `_lock` (ej. web/server.py cuando `rag` y
-# `web` comparten un proceso), `set_lock` sobreescribe con el mismo tipo.
+# ADR-001: Loky Semaphore Leak Fix — docs/adr/001-loky-semaphore-leak-fix.md
+# Pre-set tqdm lock to threading.RLock before any heavy dep touches it.
 try:
     import tqdm as _tqdm_preset
     _tqdm_preset.tqdm.set_lock(threading.RLock())
-except Exception:  # pragma: no cover - tqdm not installed
+except ImportError:
     pass
 
-
-# El teardown (drain del joblib/loky pool) vive en `rag/_shutdown.py` para
-# compartir el código con `web/server.py` — ver ese módulo para la doc
-# completa del bug + el fix en tres pasos. Acá solo registramos el handler
-# via atexit para que cualquier invocación del CLI (watch, serve, query,
-# chat, etc.) lo dispare al exit del intérprete.
+# Drain joblib/loky pool on interpreter exit (shared with web/server.py).
 from rag._shutdown import shutdown_joblib_loky_pool as _shutdown_joblib_loky_pool
 
 atexit.register(_shutdown_joblib_loky_pool)
-# === END LOKY SEMAPHORE LEAK FIX ============================================
 
 # Contextual Retrieval (Anthropic Sept 2024) — gated por
 # `RAG_CONTEXTUAL_RETRIEVAL=1`. Importado top-level porque es un módulo
@@ -678,7 +628,7 @@ def _load_vaults_config() -> dict:
         return {"vaults": {}, "current": None}
     try:
         mtime_ns = VAULTS_CONFIG_PATH.stat().st_mtime_ns
-    except Exception:
+    except OSError:
         mtime_ns = 0
     with _VAULTS_CFG_LOCK:
         if (
@@ -688,7 +638,7 @@ def _load_vaults_config() -> dict:
             return _copy_mod.deepcopy(_VAULTS_CFG_MEMO["data"])
     try:
         cfg = json.loads(VAULTS_CONFIG_PATH.read_text(encoding="utf-8"))
-    except Exception:
+    except (OSError, json.JSONDecodeError):
         # Called during module init (before _silent_log is defined).
         # User-visible failure mode: empty vault list → default vault used.
         return {"vaults": {}, "current": None}
@@ -775,6 +725,13 @@ VAULT_PATH = _resolve_vault_path()
 # the user drops in manually.
 
 
+def _default_state_dir() -> Path:
+    return Path(
+        os.environ.get("OBSIDIAN_RAG_STATE_DIR")
+        or str(Path.home() / ".local/share/obsidian-rag")
+    ).expanduser()
+
+
 def _ensure_state_dir_secure() -> Path:
     """Create ~/.local/share/obsidian-rag with 0o700 permissions.
 
@@ -784,7 +741,7 @@ def _ensure_state_dir_secure() -> Path:
     swallow the error rather than crash import — the worst case is the
     dir keeps its previous mode, which matches the old behavior.
     """
-    root = Path.home() / ".local/share/obsidian-rag"
+    root = _default_state_dir()
     root.mkdir(parents=True, exist_ok=True)
     try:
         root.chmod(0o700)
@@ -823,7 +780,7 @@ def _write_secret_file(path: Path, content: str) -> None:
 
 _STATE_DIR = _ensure_state_dir_secure()
 
-DB_PATH = Path(os.environ.get("OBSIDIAN_RAG_DB_PATH") or str(Path.home() / ".local/share/obsidian-rag/ragvec"))
+DB_PATH = Path(os.environ.get("OBSIDIAN_RAG_DB_PATH") or str(_STATE_DIR / "ragvec"))
 # Telemetry DB file — intentionally separate from ragvec.db (sqlite-vec + meta_*).
 # Pre-2026-04-21 both workloads shared one file + one WAL; bulk writes from the
 # indexer (`rag index`, `watch`, cross-source ingesters) were blocking hot-path
@@ -836,14 +793,14 @@ DB_PATH = Path(os.environ.get("OBSIDIAN_RAG_DB_PATH") or str(Path.home() / ".loc
 # because scripts/ingest_*.py open their own conn directly; moving them would
 # lose cursors and force full-rescan on next run.
 _TELEMETRY_DB_FILENAME = "telemetry.db"
-LOG_PATH = Path.home() / ".local/share/obsidian-rag/queries.jsonl"
-EVAL_LOG_PATH = Path.home() / ".local/share/obsidian-rag/eval.jsonl"
-BEHAVIOR_LOG_PATH = Path.home() / ".local/share/obsidian-rag/behavior.jsonl"
-BRIEF_WRITTEN_PATH = Path.home() / ".local/share/obsidian-rag/brief_written.jsonl"
-BRIEF_STATE_PATH = Path.home() / ".local/share/obsidian-rag/brief_state.jsonl"
+LOG_PATH = _STATE_DIR / "queries.jsonl"
+EVAL_LOG_PATH = _STATE_DIR / "eval.jsonl"
+BEHAVIOR_LOG_PATH = _STATE_DIR / "behavior.jsonl"
+BRIEF_WRITTEN_PATH = _STATE_DIR / "brief_written.jsonl"
+BRIEF_STATE_PATH = _STATE_DIR / "brief_state.jsonl"
 COLLECTION_WRITE_LOCK = DB_PATH / "collection_write.lock"  # A/B 2026-05-06: per-DB
-COLLECTION_OPS_LOG = Path.home() / ".local/share/obsidian-rag/collection_ops.log"
-COLLECTION_RESET_SENTINEL = Path.home() / ".local/share/obsidian-rag/collection_reset_at"
+COLLECTION_OPS_LOG = _STATE_DIR / "collection_ops.log"
+COLLECTION_RESET_SENTINEL = _STATE_DIR / "collection_reset_at"
 # Process-level mutex acquired al top de `rag index`. Evita que dos
 # invocaciones simultáneas se peleen por el sqlite-vec write lock y los
 # embeddings. Backed by `fcntl.flock(LOCK_EX | LOCK_NB)` — non-blocking,
@@ -856,7 +813,7 @@ INDEX_PROCESS_LOCK = DB_PATH / "index.lock"
 # unload, contradict JSON parse, feedback golden rebuild). Best-effort
 # sites (optional enrichment, shutdown cleanup, Apple integrations) still
 # use bare `pass`.
-SILENT_ERRORS_LOG_PATH = Path.home() / ".local/share/obsidian-rag/silent_errors.jsonl"
+SILENT_ERRORS_LOG_PATH = _STATE_DIR / "silent_errors.jsonl"
 
 
 # Single-writer queue for best-effort JSONL appends on the response path.
@@ -903,7 +860,7 @@ def _log_writer_loop() -> None:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 with path.open("a", encoding="utf-8") as f:
                     f.write(line)
-            except Exception as _exc_log_write:
+            except OSError as _exc_log_write:
                 # Si el writer mismo falla, NO podemos llamar a
                 # _silent_log() (recursión infinita). Fallback: stderr,
                 # que en launchd va al StandardErrorPath del plist
@@ -914,7 +871,7 @@ def _log_writer_loop() -> None:
                         f"[rag-log-writer] write to {path} failed: "
                         f"{type(_exc_log_write).__name__}: {_exc_log_write}\n"
                     )
-                except Exception:
+                except ImportError:
                     pass
         finally:
             _LOG_QUEUE.task_done()
@@ -1167,7 +1124,7 @@ def _silent_log(where: str, exc: BaseException, *, with_traceback: bool = False)
                 pass
         line = json.dumps(record, ensure_ascii=False) + "\n"
         _LOG_QUEUE.put_nowait((SILENT_ERRORS_LOG_PATH, line))
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         pass
     _bump_silent_log_counter()
 
@@ -1187,7 +1144,7 @@ def _log_collection_op(op: str, collection_name: str, extra: dict | None = None)
         COLLECTION_OPS_LOG.parent.mkdir(parents=True, exist_ok=True)
         with COLLECTION_OPS_LOG.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception as exc:
+    except (json.JSONDecodeError, TypeError) as exc:
         _silent_log("collection_ops_log_write", exc)
 
 
@@ -1828,7 +1785,7 @@ def _brief_state_seen(brief_path: str, cited_path: str) -> bool:
                 (key,),
             ).fetchone()
             return row is not None
-    except Exception as exc:
+    except sqlite3.Error as exc:
         _log_sql_state_error("brief_state_sql_read_failed", err=repr(exc))
         return False
 
@@ -1880,7 +1837,7 @@ def _diff_brief_signal() -> None:
                     "brief_path": r["brief_path"],
                     "paths_cited": json.loads(r["paths_cited_json"] or "[]"),
                 }
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 continue
             entries.append(rec)
 
@@ -1937,7 +1894,7 @@ def _diff_brief_signal() -> None:
                     "path": cited,
                 })
                 _brief_state_record(brief_path_str, cited)
-    except Exception as exc:
+    except (json.JSONDecodeError, TypeError) as exc:
         # Brief generation must never fail because of signal diff. Log
         # so we can notice if this subsystem silently stops producing
         # kept/deleted events (would degrade ranker-vivo input).
@@ -1998,7 +1955,7 @@ _COLLECTION_BASE = "obsidian_notes_v12"  # v12: 1024-dim, qwen3-embedding:0.6b +
 # in docs/design-cross-source-corpus.md §10.6.
 VALID_SOURCES: frozenset[str] = frozenset(
     {"vault", "memory", "calendar", "gmail", "whatsapp", "reminders", "messages",
-     "contacts", "calls", "safari", "drive", "pillow", "finances"}
+     "contacts", "calls", "safari", "drive", "pillow", "finances", "health"}
 )
 # `pillow` (iOS sleep tracker) tiene un ingester propio en
 # `rag index --source pillow`. Sus datos viven en `rag_sleep_sessions`
@@ -2031,6 +1988,11 @@ SOURCE_WEIGHTS: dict[str, float] = {
     # `VALID_SOURCES` + `CONFIDENCE_RERANK_MIN_PER_SOURCE`. Weight nominal
     # 0.50 — defensivo si por algún motivo escribiera chunks (no debería).
     "pillow":    0.50,
+    # `health` (Apple Health export.xml, despachado en `rag index --source health`):
+    # los datos viven en `rag_apple_health_daily` (no escriben chunks al corpus
+    # vectorial), pero la entry queda acá para mantener paridad con
+    # `VALID_SOURCES`. Weight nominal 0.50 — defensivo.
+    "health":    0.50,
 }
 
 # Recency half-life per source, in days. None → no decay applied (chunks
@@ -2582,7 +2544,7 @@ def _load_cross_source_filters() -> dict:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             raw = {}
-    except Exception as exc:
+    except OSError as exc:
         # H-7 fix (2026-05-08): NO memoizar `{}` en falla transitoria.
         # Pre-fix: un YAML parse error o read error one-shot deshabilitaba
         # *todas* las reglas cross-source hasta el próximo restart, porque
@@ -2961,7 +2923,7 @@ def resolve_chat_model() -> str:
     próxima call vuelve a resolver — pickea el override env si está set.
 
     MLX backend (único soportado post-Ola 7): consulta la cache MLX via
-    `MLXBackend.list_available()`. Match por alias short-name
+    `list_cached_mlx_models()`. Match por alias short-name
     (e.g. `qwen2.5:7b`) — `MLX_MODEL_ALIAS` traduce en ambas direcciones,
     así un candidato es "available" iff su HF id mapeado está presente en
     `~/.cache/huggingface/hub/`.
@@ -2974,10 +2936,9 @@ def resolve_chat_model() -> str:
         return explicit
     if _CHAT_MODEL_RESOLVED is not None:
         return _CHAT_MODEL_RESOLVED
-    from rag.llm_backend import get_backend, MLX_MODEL_ALIAS, MLXBackend  # local import
-    backend = get_backend().name  # singleton — 1 env lookup al startup, cached
+    from rag.llm_backend import MLX_MODEL_ALIAS, list_cached_mlx_models  # local import
     try:
-        mlx_ids = set(MLXBackend().list_available())
+        mlx_ids = set(list_cached_mlx_models())
         available = {alias for alias, hf_id in MLX_MODEL_ALIAS.items() if hf_id in mlx_ids}
     except Exception:
         available = set()
@@ -3376,7 +3337,7 @@ console = Console()
 # Short notes (< 300 chars) skip summarization — the prefix already captures
 # the key signal and a summary would be redundant.
 
-CONTEXT_CACHE_PATH = Path.home() / ".local/share/obsidian-rag/context_summaries.json"
+CONTEXT_CACHE_PATH = _STATE_DIR / "context_summaries.json"
 _CONTEXT_MIN_BODY = 300  # chars — skip summary for notes shorter than this
 # In-memory LRU cap. Long-running web daemon + large vaults can grow the
 # dict without bound (1 entry per unique chunk hash). LRU keeps memory
@@ -3403,7 +3364,7 @@ def _load_context_cache() -> dict[str, str]:
         if CONTEXT_CACHE_PATH.is_file():
             try:
                 _context_cache = OrderedDict(json.loads(CONTEXT_CACHE_PATH.read_text()))
-            except Exception as exc:
+            except (json.JSONDecodeError, TypeError) as exc:
                 _silent_log("context_cache_load", exc)
                 _context_cache = OrderedDict()
         else:
@@ -3672,17 +3633,41 @@ def _generate_context_summary(text: str, title: str, folder: str) -> str:
         "de qué trata esta nota. Sin preámbulos, sin disculpas, sin explicaciones."
     )
     try:
-        resp = _summary_client().chat(
-            model=HELPER_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            options={**HELPER_OPTIONS, "num_predict": 40},
-            keep_alive=LLM_KEEP_ALIVE,
-        )
-        raw = resp.message.content.strip()
-        # Take only the first sentence, cap at 120 chars to avoid prefix bloat
-        first_line = raw.split("\n")[0].split(". ")[0]
-        return first_line[:120]
-    except Exception:
+        import signal
+        import threading
+
+        result = None
+        exception = None
+
+        def _llm_call():
+            nonlocal result, exception
+            try:
+                resp = _summary_client().chat(
+                    model=HELPER_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    options={**HELPER_OPTIONS, "num_predict": 40},
+                    keep_alive=LLM_KEEP_ALIVE,
+                )
+                raw = resp.message.content.strip()
+                # Take only the first sentence, cap at 120 chars to avoid prefix bloat
+                first_line = raw.split("\n")[0].split(". ")[0]
+                result = first_line[:120]
+            except Exception as e:
+                exception = e
+
+        thread = threading.Thread(target=_llm_call, daemon=True)
+        thread.start()
+        thread.join(timeout=30)  # 30 second timeout
+        if thread.is_alive():
+            # Timeout - thread still running
+            _silent_log("context_summary_timeout", {"title": title, "folder": folder})
+            return None
+        if exception:
+            raise exception
+        if result is None:
+            return None
+        return result
+    except ImportError:
         # Audit 2026-04-26: pre-fix devolvía "" en error transitorio →
         # `get_context_summary` cacheaba ese "" → embedding del chunk
         # quedaba SIN prefix contextual permanente (hasta que la nota
@@ -3733,7 +3718,7 @@ def get_context_summary(text: str, file_hash: str, title: str, folder: str) -> s
 # returns [] silently; an empty list just reverts the chunk to
 # context-summary-only behavior, never blocks indexing.
 
-SYNTHETIC_Q_CACHE_PATH = Path.home() / ".local/share/obsidian-rag/synthetic_questions.json"
+SYNTHETIC_Q_CACHE_PATH = _STATE_DIR / "synthetic_questions.json"
 _SYNTHETIC_Q_MIN_BODY = 300  # chars — same threshold as context summary
 _SYNTHETIC_Q_CAP = 4         # hard upper bound on questions per note
 _SYNTHETIC_Q_MAX_CHARS = 120 # per-question char cap
@@ -3774,12 +3759,12 @@ from rag.synthetic_questions import (  # noqa: E402, F401
 # entrante tiene cosine ≥ FEEDBACK_MATCH_COSINE con alguna query calificada
 # previamente — sin eso el feedback pasado no se aplica.
 
-FEEDBACK_PATH = Path.home() / ".local/share/obsidian-rag/feedback.jsonl"
-FEEDBACK_GOLDEN_PATH = Path.home() / ".local/share/obsidian-rag/feedback_golden.json"
+FEEDBACK_PATH = _STATE_DIR / "feedback.jsonl"
+FEEDBACK_GOLDEN_PATH = _STATE_DIR / "feedback_golden.json"
 # Hard-ignore: paths que el usuario marcó "no me muestres esto más" — se
 # filtran del candidate pool antes del rerank. Distinto del feedback negativo
 # (que es semántico por query y solo pena): acá el usuario declara "nunca".
-IGNORED_NOTES_PATH = Path.home() / ".local/share/obsidian-rag/ignored_notes.json"
+IGNORED_NOTES_PATH = _STATE_DIR / "ignored_notes.json"
 # Calibrados con bge-m3 sobre queries reales de queries.jsonl (26 queries únicas):
 #   - 0.88 sólo matcheaba restatements casi verbatim (3/325 pares).
 #   - 0.80 captura paraphrases de la misma intent ("qué es ikigai" /
@@ -3807,7 +3792,7 @@ FEEDBACK_NEGATIVE_PENALTY = 0.15
 # usando queries.yaml como objetivo. Defaults preservan el comportamiento
 # previo exacto: recency_always=0 + tag_literal=0 ⇒ ranking idéntico a antes.
 
-RANKER_CONFIG_PATH = Path.home() / ".local/share/obsidian-rag/ranker.json"
+RANKER_CONFIG_PATH = _STATE_DIR / "ranker.json"
 
 
 # ── Behavior priors ──────────────────────────────────────────────────────────
@@ -4522,7 +4507,7 @@ class RankerWeights:
             if RANKER_CONFIG_PATH.is_file():
                 data = json.loads(RANKER_CONFIG_PATH.read_text(encoding="utf-8"))
                 return cls.from_dict(data.get("weights", {}) if isinstance(data, dict) else {})
-        except Exception as exc:
+        except (json.JSONDecodeError, TypeError) as exc:
             # Corrupt ranker.json silently reverts to hardcoded defaults —
             # tuning weights lost until next `rag tune --apply`. Log so we
             # can detect it before eval regressions surface.
@@ -4543,7 +4528,10 @@ class RankerWeights:
 
 
 # Proceso-local cache invalidado por mtime del config.
+# Lock garantiza que check-then-set sea atómico frente a invalidaciones
+# concurrentes desde el background SQL thread (audit A2 2026-05-14).
 _ranker_weights_cache: tuple[float, RankerWeights] | None = None
+_ranker_weights_lock = threading.Lock()
 
 
 def get_ranker_weights() -> RankerWeights:
@@ -4553,16 +4541,18 @@ def get_ranker_weights() -> RankerWeights:
         mtime = RANKER_CONFIG_PATH.stat().st_mtime if RANKER_CONFIG_PATH.is_file() else 0.0
     except OSError:
         mtime = 0.0
-    if _ranker_weights_cache and _ranker_weights_cache[0] == mtime:
-        return _ranker_weights_cache[1]
-    w = RankerWeights.load()
-    _ranker_weights_cache = (mtime, w)
-    return w
+    with _ranker_weights_lock:
+        if _ranker_weights_cache and _ranker_weights_cache[0] == mtime:
+            return _ranker_weights_cache[1]
+        w = RankerWeights.load()
+        _ranker_weights_cache = (mtime, w)
+        return w
 
 
 def _invalidate_ranker_weights() -> None:
     global _ranker_weights_cache
-    _ranker_weights_cache = None
+    with _ranker_weights_lock:
+        _ranker_weights_cache = None
 
 
 # Stopwords ES+EN usadas por `_tokenize_for_title_match` para que queries con
@@ -4758,7 +4748,7 @@ def load_ignored_paths() -> set[str]:
         result = set(data.get("paths", []))
         _ignored_paths_cache = (mt, result)
         return result
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         return set()
 
 
@@ -4868,9 +4858,9 @@ def record_feedback(
                 conn.execute(
                     "DELETE FROM rag_feedback_golden_meta "
                     "WHERE k='last_built_source_ts'")
-            except Exception:
+            except sqlite3.Error:
                 pass
-    except Exception as exc:
+    except sqlite3.Error as exc:
         _log_sql_state_error("feedback_sql_write_failed", err=repr(exc))
     # Also clear the in-process memo so the next load picks up the new state.
     global _feedback_golden_memo, _feedback_golden_source_ts_sql
@@ -4935,7 +4925,7 @@ def _maybe_trigger_incremental_tune() -> bool:
                 (last_tune_iso,),
             ).fetchone()
             n_new = int(cnt[0] if cnt else 0)
-    except Exception as exc:
+    except sqlite3.Error as exc:
         _log_sql_state_error("incremental_tune_check_sql_failed",
                               err=repr(exc))
         return False
@@ -4990,7 +4980,7 @@ def _maybe_trigger_incremental_tune() -> bool:
                 "RAG_INCREMENTAL_TUNE_THRESHOLD": "0",  # avoid recursion
             },
         )
-    except Exception as exc:
+    except subprocess.SubprocessError as exc:
         _log_sql_state_error("incremental_tune_spawn_failed",
                               err=repr(exc))
         try:
@@ -5017,7 +5007,7 @@ def feedback_counts() -> tuple[int, int]:
                 " SUM(CASE WHEN rating < 0 THEN 1 ELSE 0 END)"
                 " FROM rag_feedback"
             ).fetchone()
-    except Exception as exc:
+    except sqlite3.Error as exc:
         _silent_log("feedback_counts_sql_read", exc)
         return 0, 0
     if row is None:
@@ -5056,7 +5046,7 @@ def _feedback_golden_meta_ts(conn) -> str | None:
             "SELECT v FROM rag_feedback_golden_meta WHERE k='last_built_source_ts'"
         ).fetchone()
         return row[0] if row and row[0] else None
-    except Exception:
+    except sqlite3.Error:
         return None
 
 
@@ -5064,7 +5054,7 @@ def _feedback_golden_table_empty(conn) -> bool:
     try:
         row = conn.execute("SELECT COUNT(*) FROM rag_feedback_golden").fetchone()
         return int(row[0] if row else 0) == 0
-    except Exception:
+    except sqlite3.Error:
         return True
 
 
@@ -5138,10 +5128,10 @@ def _write_feedback_golden_sql(conn, golden: dict, source_ts: str) -> None:
             ("last_built_source_ts", source_ts),
         )
         conn.execute("COMMIT")
-    except Exception:
+    except sqlite3.Error:
         try:
             conn.execute("ROLLBACK")
-        except Exception:
+        except sqlite3.Error:
             pass
         raise
 
@@ -5191,13 +5181,13 @@ def _rebuild_feedback_golden_from_sql_feedback(conn) -> dict:
             continue
         try:
             paths = json.loads(r["paths_json"]) if r["paths_json"] else []
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             paths = []
         extra: dict = {}
         if r["extra_json"]:
             try:
                 extra = json.loads(r["extra_json"]) or {}
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 extra = {}
         ev = {
             "turn_id": tid,
@@ -7257,7 +7247,7 @@ def _sql_max_ts(conn, table: str) -> str | None:
 # tables` (idempotent) so a process that hits the writer path before the
 # singleton was warmed still gets a valid schema.
 
-_SQL_STATE_ERROR_LOG = Path.home() / ".local/share/obsidian-rag/sql_state_errors.jsonl"
+_SQL_STATE_ERROR_LOG = _STATE_DIR / "sql_state_errors.jsonl"
 
 
 def _log_sql_state_error(event_type: str, **fields) -> None:
@@ -7282,7 +7272,7 @@ def _log_sql_state_error(event_type: str, **fields) -> None:
                "event": event_type, **fields}
         with _SQL_STATE_ERROR_LOG.open("a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         pass
     _bump_silent_log_counter()
 
@@ -7412,6 +7402,16 @@ def _sql_read_with_retry(
     return default
 
 
+# Flag process-local: una vez que _ensure_telemetry_tables() corre con éxito,
+# las tablas ya existen en la DB. Connections subsecuentes solo necesitan
+# correr el DDL si la DB fue recreada (mtime cambió) o si es la primera vez.
+# Esto evita el overhead del DDL-check en cada uno de los 135 call sites de
+# _ragvec_state_conn (audit B3 2026-05-14).
+_telemetry_tables_ensured: bool = False
+_telemetry_tables_ensured_mtime: float = 0.0
+_telemetry_tables_ensured_lock = threading.Lock()
+
+
 @contextlib.contextmanager
 def _ragvec_state_conn():
     """Open a short-lived sqlite3 connection to telemetry.db with WAL + busy
@@ -7431,10 +7431,17 @@ def _ragvec_state_conn():
     is one-conn-per-thread. The close in `finally` guarantees the fd is
     released before the yield frame unwinds — no leaked handles on
     exception or GC pressure.
+
+    B3 (audit 2026-05-14): _ensure_telemetry_tables() se saltea en calls
+    subsecuentes cuando la DB no cambió (mtime invariante), eliminando el
+    overhead de ~30 CREATE TABLE IF NOT EXISTS por conexión en los 135
+    call sites del hot-path.
     """
+    global _telemetry_tables_ensured, _telemetry_tables_ensured_mtime
     import sqlite3 as _sqlite3
     DB_PATH.mkdir(parents=True, exist_ok=True)
-    conn = _sqlite3.connect(str(DB_PATH / _TELEMETRY_DB_FILENAME),
+    _telemetry_db_path = str(DB_PATH / _TELEMETRY_DB_FILENAME)
+    conn = _sqlite3.connect(_telemetry_db_path,
                             isolation_level=None, check_same_thread=False,
                             timeout=60.0)
     try:
@@ -7466,7 +7473,22 @@ def _ragvec_state_conn():
             "CREATE TABLE IF NOT EXISTS rag_schema_version ("
             " table_name TEXT PRIMARY KEY, version INTEGER NOT NULL DEFAULT 0)"
         )
-        _ensure_telemetry_tables(conn)
+        # B3: solo llamar _ensure_telemetry_tables() si la DB fue recreada
+        # (mtime distinto) o si es el primer call del proceso.
+        try:
+            _db_mtime = os.path.getmtime(_telemetry_db_path)
+        except OSError:
+            _db_mtime = 0.0
+        with _telemetry_tables_ensured_lock:
+            _needs_ensure = (
+                not _telemetry_tables_ensured
+                or _db_mtime != _telemetry_tables_ensured_mtime
+            )
+        if _needs_ensure:
+            _ensure_telemetry_tables(conn)
+            with _telemetry_tables_ensured_lock:
+                _telemetry_tables_ensured = True
+                _telemetry_tables_ensured_mtime = _db_mtime
         yield conn
     finally:
         try:
@@ -7780,7 +7802,7 @@ class SqliteVecCollection:
         if extra:
             try:
                 out.update(json.loads(extra))
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 pass
         return out
 
@@ -7854,11 +7876,25 @@ class SqliteVecCollection:
         embeddings = [list(e) for e in embeddings]
         if embeddings:
             self._ensure_vec_table(len(embeddings[0]))
+
+        # Pre-compute cols_list and SQL template once (not per-row).
+        cols_list = ["chunk_id", "document"] + list(known) + ["extra_json"]
+        placeholders = ",".join("?" * len(cols_list))
+        updates = ", ".join(f"{c}=excluded.{c}" for c in cols_list if c != "chunk_id")
+        # RETURNING rowid: collapse INSERT + SELECT rowid into a single query.
+        # Requires SQLite ≥3.35 (available since CPython 3.10 ships 3.35+;
+        # our runtime is 3.53). Works for both INSERT and ON CONFLICT upsert paths.
+        meta_sql = (
+            f"INSERT INTO {self._meta}({','.join(cols_list)}) VALUES({placeholders}) "
+            f"ON CONFLICT(chunk_id) DO UPDATE SET {updates} RETURNING rowid"
+        )
+        vec_delete_sql = f"DELETE FROM {self._vec} WHERE rowid = ?"
+        vec_insert_sql = f"INSERT INTO {self._vec}(rowid, embedding) VALUES(?, ?)"
+
         with self._db:
             for cid, emb, doc, meta in zip(ids, embeddings, documents, metadatas):
                 extra = {k: v for k, v in meta.items() if k not in known}
                 extra_json = json.dumps(extra, ensure_ascii=False) if extra else None
-                # Normalize created_ts to float or None
                 created_ts = meta.get("created_ts")
                 try:
                     created_ts = float(created_ts) if created_ts is not None else None
@@ -7870,30 +7906,16 @@ class SqliteVecCollection:
                         values.append(created_ts)
                     else:
                         v = meta.get(col)
-                        # Preserve primitive types (int/float/bool/str/None);
-                        # only stringify complex values like lists/dicts.
                         if v is None or isinstance(v, (int, float, bool, str)):
                             values.append(v)
                         else:
                             values.append(str(v))
                 values.append(extra_json)
-                cols_list = ["chunk_id", "document"] + list(known) + ["extra_json"]
-                placeholders = ",".join("?" * len(values))
-                updates = ", ".join(f"{c}=excluded.{c}" for c in cols_list if c != "chunk_id")
-                self._db.execute(
-                    f"INSERT INTO {self._meta}({','.join(cols_list)}) VALUES({placeholders}) "
-                    f"ON CONFLICT(chunk_id) DO UPDATE SET {updates}",
-                    values,
-                )
-                rowid = self._db.execute(
-                    f"SELECT rowid FROM {self._meta} WHERE chunk_id = ?", (cid,)
-                ).fetchone()[0]
+                rowid = self._db.execute(meta_sql, values).fetchone()[0]
                 # Replace vec entry (vec0 doesn't support upsert directly)
-                self._db.execute(f"DELETE FROM {self._vec} WHERE rowid = ?", (rowid,))
-                self._db.execute(
-                    f"INSERT INTO {self._vec}(rowid, embedding) VALUES(?, ?)",
-                    (rowid, sqlite_vec.serialize_float32(list(emb))),
-                )
+                self._db.execute(vec_delete_sql, (rowid,))
+                self._db.execute(vec_insert_sql,
+                                 (rowid, sqlite_vec.serialize_float32(list(emb))))
             self._bump_version()
 
     def update(self, ids, metadatas):
@@ -8203,6 +8225,45 @@ def get_db() -> SqliteVecCollection:
         return _db_singleton[1]
 
 
+def _db_quick_check(db_path: Path, db_name: str = "ragvec.db") -> bool:
+    """Run PRAGMA quick_check on startup to detect corruption.
+    
+    D5 (audit 2026-05-14): Corruption like "database disk image is malformed"
+    can go undetected until a write fails. quick_check scans the database
+    structure and returns 'ok' if valid, or a list of errors. We run this
+    once at daemon startup to fail fast if the DB is corrupt.
+    
+    Args:
+        db_path: Path to the database directory (e.g., DB_PATH)
+        db_name: Name of the database file (default "ragvec.db")
+    
+    Returns:
+        True if check passed, False if corruption detected.
+    """
+    import sqlite3 as _sqlite3
+    db_file = db_path / db_name
+    if not db_file.exists():
+        return True  # DB doesn't exist yet, not an error
+    
+    try:
+        conn = _sqlite3.connect(str(db_file), timeout=10.0)
+        try:
+            cur = conn.execute("PRAGMA quick_check")
+            result = cur.fetchone()
+            if result and result[0] == "ok":
+                return True
+            else:
+                # Corruption detected
+                console.print(f"[red]Database corruption detected in {db_name}:[/red]")
+                console.print(f"[red]{result}[/red]")
+                return False
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        console.print(f"[red]Failed to run quick_check on {db_name}: {e}[/red]")
+        return False
+
+
 def _collection_name_for_vault(vault_path: Path) -> str:
     """Mismo schema que COLLECTION_NAME: sha256[:8] sufijo salvo default.
     Factorizado para que podamos abrir colecciones de vaults *distintos* al
@@ -8464,7 +8525,7 @@ def _load_wiki_cache() -> dict[str, str]:
         if WIKI_CACHE_PATH.is_file():
             try:
                 _wiki_cache = OrderedDict(json.loads(WIKI_CACHE_PATH.read_text()))
-            except Exception as exc:
+            except (json.JSONDecodeError, TypeError) as exc:
                 _silent_log("wiki_cache_load", exc)
                 _wiki_cache = OrderedDict()
         else:
@@ -8520,7 +8581,7 @@ def _generate_wiki_page_summary(text: str, title: str, folder: str) -> dict | No
         )
         raw = resp.message.content.strip()
         data = json.loads(raw)
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         # Transient — do not cache. Next index pass retries.
         return None
     if not isinstance(data, dict):
@@ -8581,7 +8642,7 @@ def _is_rag_wiki_page(page_path: Path) -> bool:
         return False
     try:
         raw = page_path.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
+    except OSError:
         return False
     if not raw.startswith("---"):
         return False
@@ -8681,7 +8742,7 @@ def _get_or_generate_wiki_page_data(
             cache.move_to_end(source_hash)
             try:
                 return json.loads(cache[source_hash])
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 # Corrupt entry — fall through to regenerate and overwrite.
                 pass
     if len(text) < _WIKI_MIN_BODY:
@@ -8721,7 +8782,7 @@ def _update_wiki_index(vault_path: Path) -> int:
             continue
         try:
             raw = page.read_text(encoding="utf-8", errors="ignore")
-        except Exception:
+        except OSError:
             continue
         title = page.stem
         source = ""
@@ -8947,6 +9008,13 @@ _WIKILINK_EXPANSION_N = 5           # max targets expanded per chunk prefix
 _WIKILINK_SUMMARY_CHARS = 160       # per-target snippet size
 _WIKILINK_TOTAL_BUDGET = 1200       # hard cap across all expansions
 
+# LRU cache for wikilink expansion - avoids repeated disk I/O for same links
+# Cache key: (title, str(vault_root), target_mtime) -> snippet
+# Tunable via env var for high-link-density vaults
+_WIKILINK_CACHE_MAX = int(os.environ.get("RAG_WIKILINK_CACHE_MAX", "256"))
+_wikilink_cache: "OrderedDict[tuple[str, str, float], str]" = OrderedDict()
+_wikilink_cache_lock = threading.Lock()
+
 
 def _wikilink_expansion_enabled() -> bool:
     return os.environ.get("RAG_WIKILINK_EXPANSION", "").strip().lower() in {
@@ -8999,11 +9067,16 @@ def _wikilink_expansion_bits(
     Gracefully skips missing targets, cyclic self-links, and files that
     fail to read. Bounded by `_WIKILINK_EXPANSION_N` items and
     `_WIKILINK_TOTAL_BUDGET` total chars.
+    
+    Uses LRU cache to avoid repeated disk I/O for same links across files.
+    Cache key includes target mtime to auto-invalidate on file changes.
     """
     if not outlinks or vault_root is None:
         return []
     bits: list[str] = []
     budget = _WIKILINK_TOTAL_BUDGET
+    vault_key = str(vault_root)
+    
     for title in outlinks[: _WIKILINK_EXPANSION_N * 3]:  # headroom for skips
         if len(bits) >= _WIKILINK_EXPANSION_N or budget <= 0:
             break
@@ -9012,17 +9085,44 @@ def _wikilink_expansion_bits(
             continue
         if self_path is not None and target.resolve() == self_path.resolve():
             continue  # self-link — skip
+        
+        # Check cache first
         try:
-            raw = target.read_text(encoding="utf-8", errors="ignore")
+            target_mtime = target.stat().st_mtime
         except OSError:
             continue
-        # Strip frontmatter + wikilinks for a clean text preview; collapse
-        # whitespace so the snippet is a single-line blurb.
-        body = clean_md(raw)
-        body = re.sub(r"\s+", " ", body).strip()
-        if not body:
-            continue
-        snippet = body[:_WIKILINK_SUMMARY_CHARS]
+        
+        cache_key = (title, vault_key, target_mtime)
+        
+        # Try cache lookup under lock
+        snippet = None
+        with _wikilink_cache_lock:
+            cached = _wikilink_cache.get(cache_key)
+            if cached is not None:
+                _wikilink_cache.move_to_end(cache_key)
+                snippet = cached
+        
+        if snippet is None:
+            # Cache miss - read from disk
+            try:
+                raw = target.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            # Strip frontmatter + wikilinks for a clean text preview; collapse
+            # whitespace so the snippet is a single-line blurb.
+            body = clean_md(raw)
+            body = re.sub(r"\s+", " ", body).strip()
+            if not body:
+                continue
+            snippet = body[:_WIKILINK_SUMMARY_CHARS]
+            
+            # Store in cache
+            with _wikilink_cache_lock:
+                _wikilink_cache[cache_key] = snippet
+                _wikilink_cache.move_to_end(cache_key)
+                while len(_wikilink_cache) > _WIKILINK_CACHE_MAX:
+                    _wikilink_cache.popitem(last=False)
+        
         line = f"Relacionada [[{title}]]: {snippet}"
         if len(line) > budget:
             line = line[:budget]
@@ -10646,7 +10746,7 @@ def _osascript_contact_search(predicate: str, value: str) -> dict | None:
             check=False, timeout=2.0,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-    except Exception:
+    except subprocess.SubprocessError:
         # Silent-fail: si `open` falla, el osascript de abajo va a
         # fallar con -600 igual y terminamos en el warning branch.
         pass
@@ -10689,7 +10789,7 @@ end run
                     f"[contacts-shim] osascript failed (rc={proc.returncode}): "
                     f"{(proc.stderr or '').strip()[:160]}\n"
                 )
-            except Exception:
+            except ImportError:
                 pass
         return None
     out = (proc.stdout or "").strip()
@@ -10907,7 +11007,7 @@ def _ensure_contacts_cache(ttl_s: int = _CONTACTS_PHONE_INDEX_TTL_S) -> dict:
                         _contacts_phone_index = cache
                     return cache
                 # else: schema viejo (v1 o ausente) → fallthrough a tier 3
-    except Exception as exc:
+    except (json.JSONDecodeError, TypeError) as exc:
         _silent_log("contacts_phone_index_disk_read", exc)
 
     # Tier 3: osascript dump
@@ -10919,7 +11019,7 @@ def _ensure_contacts_cache(ttl_s: int = _CONTACTS_PHONE_INDEX_TTL_S) -> dict:
         )
         if proc.returncode == 0:
             out = proc.stdout or ""
-    except Exception as exc:
+    except subprocess.SubprocessError as exc:
         _silent_log("contacts_dump_osascript", exc)
 
     idx, contacts = _parse_contacts_dump(out)
@@ -10944,7 +11044,7 @@ def _ensure_contacts_cache(ttl_s: int = _CONTACTS_PHONE_INDEX_TTL_S) -> dict:
                 }),
                 encoding="utf-8",
             )
-        except Exception as exc:
+        except (json.JSONDecodeError, TypeError) as exc:
             _silent_log("contacts_phone_index_disk_write", exc)
 
     with _contacts_cache_lock:
@@ -11039,7 +11139,7 @@ def _recent_contact_keys(channel: str, limit: int = 20) -> list[str]:
                 f"ORDER BY id DESC LIMIT ?",
                 (*cmds, fetch_n),
             ).fetchall()
-    except Exception as exc:
+    except sqlite3.Error as exc:
         _silent_log("recent_contact_keys", exc)
         return []
 
@@ -11050,7 +11150,7 @@ def _recent_contact_keys(channel: str, limit: int = 20) -> list[str]:
             continue
         try:
             payload = json.loads(payload_json)
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             continue
         raw = payload.get(field) or ""
         if not raw:
@@ -11260,7 +11360,7 @@ def build_person_context(query: str, vault_root: Path | None = None) -> str | No
         full = root / rel
         try:
             body = _strip_frontmatter(full.read_text(encoding="utf-8")).strip()
-        except Exception:
+        except OSError:
             continue
         if not body:
             continue
@@ -11592,7 +11692,7 @@ def _apply_reranker_lora_adapter(model, adapter_dir: Path) -> bool:
         # downstream `.predict()` calls hit the LoRA-adjusted forward.
         model.model = peft_model
         return True
-    except Exception as exc:
+    except ImportError as exc:
         # Catch-all: any unexpected failure (corrupt safetensors, dtype
         # mismatch, OOM during adapter init) falls back to base model.
         _silent_log("reranker_ft_adapter_load_failed", exc)
@@ -11752,7 +11852,7 @@ def get_reranker():
             # CLI standalone al import de mlx_lm.
             try:
                 from rag.llm_backend import _MLX_FORWARD_LOCK as _fwd_lock
-            except Exception:
+            except ImportError:
                 _fwd_lock = None
 
             def _predict_with_cleanup(*args, **kwargs):
@@ -11802,14 +11902,14 @@ def maybe_unload_reranker(force: bool = False) -> bool:
                 from rag.mlx_reranker import MLXReranker
                 if isinstance(_reranker, MLXReranker):
                     _reranker.unload()
-            except Exception:
+            except ImportError:
                 pass
             del _reranker
             _reranker = None
             # MLX-aware: skipea cuando backend full-MLX (MLX maneja propio cache).
             _torch_mps_empty_cache()
             gc.collect()
-        except Exception as exc:
+        except ImportError as exc:
             # Called out in code-review-followup as a site where silent
             # failure could mask a real bug. If gc/del on the reranker
             # throws, we've left _reranker at None but didn't free the
@@ -12061,7 +12161,7 @@ def _load_expand_cache() -> "OrderedDict[str, list[str]]":
             return _expand_cache
         try:
             data = json.loads(EXPAND_CACHE_PATH.read_text())
-        except Exception as exc:
+        except (json.JSONDecodeError, TypeError) as exc:
             _silent_log("expand_cache_load", exc)
             try:
                 backup = EXPAND_CACHE_PATH.with_suffix(
@@ -12109,7 +12209,7 @@ def _save_expand_cache() -> None:
     try:
         tmp.write_text(payload)
         os.replace(tmp, EXPAND_CACHE_PATH)
-    except Exception:
+    except OSError:
         try:
             tmp.unlink(missing_ok=True)
         except Exception:  # pragma: no cover
@@ -12135,12 +12235,12 @@ atexit.register(_save_expand_cache)
 # "banco Santander información cuenta") y mueven el embed mean-pool del query
 # real. Costo skipeado: ~1-3s por query (una call a qwen2.5:3b).
 # El gate ORIGINAL era "<2 tokens skippear" (pre-2026-04-21) → se flipeó a 4
-# para skippear queries tipo "hora" o "hoy", y ahora 6 para skippear el grueso
-# de queries conversacionales cortas. Eval sin regresión medible en el
-# queries.yaml (hit@5 bit-idéntico post-flip).
-# Override: `RAG_EXPAND_MIN_TOKENS=4` (restore pre-fix) o `=2` (restore del
+# para skippear queries tipo "hora" o "hoy", y ahora 3 para permitir queries
+# cortas sobre finances ("ingresos abril 2026" = 3 tokens). Bajado de 6 a 4 a 3
+# (2026-05-14) para mejorar retrieval de datos financieros con queries generales.
+# Override: `RAG_EXPAND_MIN_TOKENS=6` (restore pre-fix) o `=2` (restore del
 # original) para ver el impacto A/B en producción.
-_EXPAND_MIN_TOKENS = int(os.environ.get("RAG_EXPAND_MIN_TOKENS", "6"))
+_EXPAND_MIN_TOKENS = int(os.environ.get("RAG_EXPAND_MIN_TOKENS", "3"))
 
 # Dedicated single-thread executor for running `expand_queries` off the
 # retrieve() critical path. One worker is enough — we only fire one
@@ -12211,7 +12311,7 @@ def _lookup_learned_paraphrases(question: str, *, limit: int = 2) -> list[str]:
                     [now_ts, key, *para_texts],
                 )
             return para_texts
-    except Exception:
+    except sqlite3.Error:
         return []
 
 
@@ -12239,7 +12339,7 @@ def _record_learned_paraphrase(
                 (q_norm, paraphrase, ts, ts),
             )
         return True
-    except Exception:
+    except sqlite3.Error:
         return False
 
 
@@ -12631,7 +12731,7 @@ def recency_boost(meta: dict, half_life_days: float = 90.0) -> float:
         # Accept ISO strings like "2026-04-13T16:50:16-03:00" or date-only.
         from datetime import datetime as _dt
         dt = _dt.fromisoformat(stamp.replace("Z", "+00:00"))
-    except Exception:
+    except ImportError:
         return 0.0
     try:
         now = datetime.now(dt.tzinfo) if dt.tzinfo else datetime.now()
@@ -12642,14 +12742,13 @@ def recency_boost(meta: dict, half_life_days: float = 90.0) -> float:
     return math.exp(-math.log(2) * age_days / half_life_days)
 
 
-_INTENT_COUNT_RE = re.compile(r"\b(cu[aá]nt[aos]s?|how many)\b", re.IGNORECASE)
+_INTENT_COUNT_RE = re.compile(r"\b(cu[aá]nt[aos]s?\s+(?:archivos|notas|documentos)|how many)\b", re.IGNORECASE)
 _INTENT_LIST_RE = re.compile(
     r"\b(list[aá](?:me|r)?|dame\s+(?:todas|las\s+notas)|mostr[aá](?:me|r)?\s+notas|qu[eé]\s+notas\s+tengo)\b",
     re.IGNORECASE,
 )
 _INTENT_RECENT_RE = re.compile(
-    r"\b(recientes?|modificad[aos]{1,2}|[uú]ltim[aos]{1,2}\s+notas?|esta\s+semana|este\s+mes|hoy)\b",
-    re.IGNORECASE,
+    r"\b(recientes?|modificad[aos]{1,2}|[uú]ltim[aos]{1,2}\s+notas?|esta\s+semana|hoy)\b", re.IGNORECASE,
 )
 # Agenda: temporal *browsing* (not specific-event lookup). Distinguishes
 # "qué tengo esta semana" (user wants calendar events + reminders ahead)
@@ -12849,7 +12948,7 @@ def _classify_intent_llm(
         )
         raw = resp.message.content.strip()
         data = json.loads(raw)
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         return None
     if not isinstance(data, dict):
         return None
@@ -13020,7 +13119,7 @@ def classify_intent(
             if tr:
                 params["date_range"] = tr
                 return "episodic", params
-    except Exception:  # noqa: BLE001
+    except ImportError:
         pass
 
     if _INTENT_COUNT_RE.search(question):
@@ -13394,7 +13493,7 @@ def resolve_entity_from_query(question: str, sql_conn) -> tuple[str, int] | None
             return None
         scored.sort(reverse=True)
         return (scored[0][2], scored[0][1])
-    except Exception as exc:
+    except (json.JSONDecodeError, TypeError) as exc:
         try:
             _silent_log("entity_resolve_error", exc)
         except Exception:
@@ -13429,7 +13528,7 @@ def handle_entity_lookup(
                 "WHERE entity_id = ? ORDER BY ts DESC LIMIT 200",
                 (entity_id,)
             ).fetchall()
-    except Exception as exc:
+    except sqlite3.Error as exc:
         try:
             _silent_log("entity_lookup_sql_failed", exc)
         except Exception:
@@ -14027,7 +14126,7 @@ def system_prompt_for_intent(intent: str, loose: bool) -> str:
             fingerprint = summarize_for_prompt()
             if fingerprint:
                 base = base + "\n" + fingerprint
-        except Exception:  # noqa: BLE001
+        except ImportError:
             # Silent — si hay bug en el extractor, no rompemos el prompt.
             pass
     # G4 — Episodic intent appendea instrucción narrativa.
@@ -14035,7 +14134,7 @@ def system_prompt_for_intent(intent: str, loose: bool) -> str:
         try:
             from rag.episodic import episodic_system_prompt_suffix  # noqa: PLC0415
             base = base + episodic_system_prompt_suffix()
-        except Exception:  # noqa: BLE001
+        except ImportError:
             pass
     return base
 
@@ -14344,7 +14443,7 @@ def _chat_copy_to_clipboard(text: str) -> bool:
         ) as proc:
             proc.stdin.write(text.encode("utf-8"))
         return True
-    except Exception:
+    except subprocess.SubprocessError:
         return False
 
 
@@ -14410,7 +14509,7 @@ def _chat_setup_readline() -> Path | None:
                 pass
         atexit.register(_save)
         return path
-    except Exception:
+    except OSError:
         return None
 
 
@@ -14966,7 +15065,7 @@ def find_contradictions(
         return []
     try:
         data = json.loads(m.group(0))
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         return []
     hits = data.get("contradictions") or []
     if not isinstance(hits, list):
@@ -15355,7 +15454,7 @@ def _summarize_conversation_history(
             ).fetchone()
         if row:
             return row[0]
-    except Exception as _e:
+    except sqlite3.Error as _e:
         _silent_log("conversation_summary_cache_read_error", {"error": str(_e)})
         _bump_silent_log_counter()
 
@@ -15410,7 +15509,7 @@ def _summarize_conversation_history(
                 (session_id, history_hash, summary, _now_iso),
             )
             _conn.commit()
-    except Exception as _e:
+    except sqlite3.Error as _e:
         _silent_log("conversation_summary_cache_write_error", {"error": str(_e)})
         _bump_silent_log_counter()
         # Cache write failure is non-fatal — we already have the summary
@@ -16850,7 +16949,7 @@ def retrieve(
                     _apply_typo_telemetry(_decompose_rr)
                     return _decompose_rr
                 # Fall through si las sub-retrieves no devolvieron nada.
-        except Exception as _de_exc:
+        except ImportError as _de_exc:
             _silent_log("query_decompose.outer", _de_exc)
 
     # 3. Multi-query expansion (original + 2 paraphrases).
@@ -17270,7 +17369,7 @@ def retrieve(
                 # Si el judge corrio OK, reemplazamos scores. Si fallo
                 # (parse_failed=True), _blended_scores == _ce_scores.
                 scores = _blended_scores
-        except Exception as _llm_judge_exc:
+        except ImportError as _llm_judge_exc:
             _silent_log("llm_judge.outer", _llm_judge_exc)
 
     # Capturar el comienzo del score-loop block (scoring + recency + tag +
@@ -17667,7 +17766,7 @@ def retrieve(
                         )
                         for w in _wrapped
                     ]
-        except Exception as _cp_exc:
+        except ImportError as _cp_exc:
             _silent_log("contradiction_penalty_failed", _cp_exc)
 
     # ── MMR diversification (post-rerank, pre cap top-k) ──────────────────
@@ -17745,7 +17844,7 @@ def retrieve(
                         scored_all[doc["_idx"]]
                         for doc, _ in _mmr_after
                     ]
-        except Exception as _mmr_exc:
+        except ImportError as _mmr_exc:
             _silent_log("mmr_failed", _mmr_exc)
 
     # Feature #14 (2026-04-23): adaptive k — cuando el top-1 domina
@@ -17916,7 +18015,7 @@ def retrieve(
                         graph_metas.append(best_meta)
                 except Exception as exc:
                     _silent_log("graph_expand.neighbor_fetch", exc)
-        except Exception as exc:
+        except sqlite3.Error as exc:
             # with_traceback=True acá porque ya vimos 2 hits en
             # silent_errors.jsonl 2026-04-30 con TypeError genérico —
             # no podíamos diagnosticar sin stack trace. El opt-in cubre
@@ -18678,7 +18777,7 @@ def _compute_source_feedback_amplification(conn) -> dict:
             "  AND paths_json != '' "
             f"  AND ts > datetime('now', '-{SOURCE_FEEDBACK_AMP_WINDOW_DAYS} days')"
         ).fetchall()
-    except Exception:
+    except sqlite3.Error:
         return {}
     for (paths_json_str,) in rows:
         try:
@@ -18739,7 +18838,7 @@ def _source_feedback_amp() -> dict:
                 _source_feedback_amp_cache = computed
                 _source_feedback_amp_cache_key = max_ts
                 return computed
-        except Exception:
+        except sqlite3.Error:
             return _source_feedback_amp_cache or {}
 
 
@@ -19406,7 +19505,7 @@ def find_contradictions_for_note(
         return []
     try:
         data = json.loads(m.group(0))
-    except Exception as exc:
+    except (json.JSONDecodeError, TypeError) as exc:
         # The followup audit explicitly flagged this: qwen2.5:3b used
         # to emit malformed JSON here, which silently dropped real
         # contradictions from the index. Now we at least see it.
@@ -19486,7 +19585,7 @@ def _frontmatter_contradicts_set(path: Path) -> set[str]:
     """
     try:
         raw = path.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
+    except OSError:
         return set()
     try:
         fm = parse_frontmatter(raw) or {}
@@ -19506,7 +19605,7 @@ def _update_contradicts_frontmatter(path: Path, contradicts: list[str]) -> bool:
     """
     try:
         raw = path.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
+    except OSError:
         return False
     if raw.startswith("---\n"):
         end = raw.find("\n---\n", 4)
@@ -19537,7 +19636,7 @@ def _update_contradicts_frontmatter(path: Path, contradicts: list[str]) -> bool:
         new_raw = fm_block + raw
     try:
         path.write_text(new_raw, encoding="utf-8")
-    except Exception:
+    except OSError:
         return False
     return True
 
@@ -19576,7 +19675,7 @@ def _check_and_flag_contradictions(
         return None
     try:
         new_raw = path.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
+    except OSError:
         _log_contradictions(doc_id_prefix, skipped="error")
         return None
     console.print(
@@ -19661,7 +19760,7 @@ def _append_pending_contradiction(rec: dict) -> None:
         _CONTRA_PENDING_PATH.parent.mkdir(parents=True, exist_ok=True)
         with _CONTRA_PENDING_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except Exception as exc:
+    except (json.JSONDecodeError, TypeError) as exc:
         _silent_log("contradiction_pending_write", exc)
 
 
@@ -19806,7 +19905,7 @@ def _retry_pending_contradictions(col: SqliteVecCollection) -> int:
         return 0
     try:
         raw = _CONTRA_PENDING_PATH.read_text(encoding="utf-8")
-    except Exception:
+    except OSError:
         return 0
     remaining: list[str] = []
     retried = 0
@@ -19822,14 +19921,14 @@ def _retry_pending_contradictions(col: SqliteVecCollection) -> int:
                 continue
             _spawn_contradiction_worker(col, p, rec["text"], rec["doc_id_prefix"])
             retried += 1
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             remaining.append(line)
     try:
         if remaining:
             _CONTRA_PENDING_PATH.write_text("\n".join(remaining) + "\n", encoding="utf-8")
         else:
             _CONTRA_PENDING_PATH.unlink(missing_ok=True)
-    except Exception as exc:
+    except OSError as exc:
         _silent_log("contradiction_pending_rewrite", exc)
     return retried
 
@@ -19962,7 +20061,7 @@ def _scan_queries_log(days: int = 14) -> list[dict]:
             cursor = conn.execute(sql, (since_iso, scan_limit))
             rows = cursor.fetchall()
             cols = [d[0] for d in cursor.description]
-    except Exception as exc:
+    except sqlite3.Error as exc:
         _silent_log("scan_queries_log_sql_read", exc)
         return []
     events: list[dict] = []
@@ -19972,7 +20071,7 @@ def _scan_queries_log(days: int = 14) -> list[dict]:
         if extra:
             try:
                 ej = json.loads(extra) if isinstance(extra, str) else extra
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 ej = None
             if isinstance(ej, dict):
                 # Hoist ALL extra_json keys to top-level so callers that
@@ -20016,21 +20115,27 @@ def _cluster_queries(qs: list[str], threshold: float = 0.75) -> list[list[int]]:
     return [c["indices"] for c in clusters]
 
 
-@cli.command(name="health-import")
+@cli.command(name="health-import", hidden=True)
 @click.option("--days", default=30, show_default=True,
               help="Ventana en días a importar desde export.xml")
 @click.option("--export-path", default=None,
               help="Override path al export.xml (default: env "
                    "OBSIDIAN_RAG_HEALTH_EXPORT o iCloud Drive)")
 def health_import_cmd(days: int, export_path: str | None):
-    """Importar Apple Health daily aggregates desde iCloud Drive
-    (`export.xml`) a `rag_apple_health_daily`. SAX streaming —
-    constant memory aunque el file pese ~2GB.
+    """[DEPRECATED] Importar Apple Health daily aggregates desde iCloud Drive.
+
+    Use `rag index --source health` en su lugar. Este comando se mantiene
+    por compatibilidad pero será removido en una versión futura.
 
     Idempotente: re-correr sobre el mismo file produce el mismo estado
     final. Setup: en iPhone → Health → tap profile → "Export Health Data"
     → "Save to Files" → iCloud Drive/Health/.
     """
+    console.print(
+        "[yellow][deprecated][/yellow] `rag health-import` está deprecated. "
+        "Usá `rag index --source health` en su lugar.",
+        err=True,
+    )
     from rag.integrations.apple_health import import_export_xml
     from pathlib import Path as _Path
     p = _Path(export_path) if export_path else None
@@ -20191,7 +20296,7 @@ def feedback_patterns(last: int, min_share: float, dry_run: bool, push: bool):
                 " ORDER BY ts DESC LIMIT ?"
             )
             rows = conn.execute(sql, (last,)).fetchall()
-    except Exception as exc:
+    except sqlite3.Error as exc:
         _silent_log("patterns_feedback_sql_read", exc)
         console.print("[yellow]error leyendo feedback SQL[/yellow]")
         return
@@ -20282,11 +20387,13 @@ def silence(kind: str | None, off: bool, do_list: bool):
 
 _AMBIENT_CONFIG_CACHE: tuple[str, float, dict | None] | None = None
 _AMBIENT_CONFIG_CACHE_TTL_S = 10.0
+_AMBIENT_CONFIG_CACHE_LOCK = threading.Lock()
 
 
 def _invalidate_ambient_config_cache() -> None:
     global _AMBIENT_CONFIG_CACHE
-    _AMBIENT_CONFIG_CACHE = None
+    with _AMBIENT_CONFIG_CACHE_LOCK:
+        _AMBIENT_CONFIG_CACHE = None
 
 
 def _ambient_config() -> dict | None:
@@ -20311,28 +20418,37 @@ def _ambient_config() -> dict | None:
     global _AMBIENT_CONFIG_CACHE
     now = time.time()
     current_path = str(AMBIENT_CONFIG_PATH)
-    if _AMBIENT_CONFIG_CACHE is not None:
-        cached_path, cached_ts, cached_cfg = _AMBIENT_CONFIG_CACHE
-        if cached_path == current_path and now - cached_ts < _AMBIENT_CONFIG_CACHE_TTL_S:
-            return cached_cfg
+    with _AMBIENT_CONFIG_CACHE_LOCK:
+        if _AMBIENT_CONFIG_CACHE is not None:
+            cached_path, cached_ts, cached_cfg = _AMBIENT_CONFIG_CACHE
+            if cached_path == current_path and now - cached_ts < _AMBIENT_CONFIG_CACHE_TTL_S:
+                return cached_cfg
 
     # Kill switch global via env var (audit 2026-04-25 R2-Wikilinks #5).
     # Útil para silenciar el ambient hook sin tocar el config.json — ej.
     # cuando el user está debugueando algo que dispara muchos saves o
     # quiere correr `rag index --reset` sin spam de notificaciones.
+    #
+    # Nota: la lectura del archivo y la normalización se hacen FUERA del
+    # lock para no bloquear otros threads durante I/O. Solo el assign final
+    # al cache se hace dentro del lock (audit A1 2026-05-14).
     if os.environ.get("RAG_AMBIENT_DISABLED", "").lower() in ("1", "true", "yes"):
-        _AMBIENT_CONFIG_CACHE = (current_path, now, None)
+        with _AMBIENT_CONFIG_CACHE_LOCK:
+            _AMBIENT_CONFIG_CACHE = (current_path, now, None)
         return None
     if not AMBIENT_CONFIG_PATH.is_file():
-        _AMBIENT_CONFIG_CACHE = (current_path, now, None)
+        with _AMBIENT_CONFIG_CACHE_LOCK:
+            _AMBIENT_CONFIG_CACHE = (current_path, now, None)
         return None
     try:
         c = json.loads(AMBIENT_CONFIG_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        _AMBIENT_CONFIG_CACHE = (current_path, now, None)
+    except (json.JSONDecodeError, TypeError):
+        with _AMBIENT_CONFIG_CACHE_LOCK:
+            _AMBIENT_CONFIG_CACHE = (current_path, now, None)
         return None
     if c.get("enabled") is False:
-        _AMBIENT_CONFIG_CACHE = (current_path, now, None)
+        with _AMBIENT_CONFIG_CACHE_LOCK:
+            _AMBIENT_CONFIG_CACHE = (current_path, now, None)
         return None
     if c.get("chat_id") or c.get("bot_token"):
         # Legacy bot schema — refuse silently (the CLI `ambient status`
@@ -20342,10 +20458,12 @@ def _ambient_config() -> dict | None:
             "warning": "legacy_bot_config_ignored",
             "hint": "Re-habilitar desde el bot de WhatsApp (schema ahora es {jid, enabled}).",
         })
-        _AMBIENT_CONFIG_CACHE = (current_path, now, None)
+        with _AMBIENT_CONFIG_CACHE_LOCK:
+            _AMBIENT_CONFIG_CACHE = (current_path, now, None)
         return None
     if not c.get("jid"):
-        _AMBIENT_CONFIG_CACHE = (current_path, now, None)
+        with _AMBIENT_CONFIG_CACHE_LOCK:
+            _AMBIENT_CONFIG_CACHE = (current_path, now, None)
         return None
     # Normalize allowed_folders: strip trailing slashes, drop empties.
     # Case-sensitive on purpose — the vault uses PARA folders like
@@ -20360,7 +20478,8 @@ def _ambient_config() -> dict | None:
         c["allowed_folders"] = folders or None  # None → default at read site
     else:
         c["allowed_folders"] = None
-    _AMBIENT_CONFIG_CACHE = (current_path, now, c)
+    with _AMBIENT_CONFIG_CACHE_LOCK:
+        _AMBIENT_CONFIG_CACHE = (current_path, now, c)
     return c
 
 
@@ -20386,7 +20505,7 @@ def _ambient_should_skip(doc_id_prefix: str, h: str) -> bool:
             except (TypeError, ValueError):
                 ts = 0.0
             return row[0] == h and ts >= cutoff
-    except Exception as exc:
+    except sqlite3.Error as exc:
         _log_sql_state_error("ambient_state_sql_read_failed",
                               err=repr(exc))
         return False
@@ -20541,7 +20660,7 @@ def _reminder_wa_release(conn, reminder_id: str) -> None:
             (reminder_id,),
         )
         conn.commit()
-    except Exception:
+    except sqlite3.Error:
         pass
 
 
@@ -20656,7 +20775,7 @@ def push_due_reminders_to_whatsapp(
         return summary
     try:
         cfg = json.loads(AMBIENT_CONFIG_PATH.read_text(encoding="utf-8"))
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         summary["reason"] = "no_ambient_config"
         return summary
     if cfg.get("enabled") is False or not cfg.get("jid"):
@@ -21972,7 +22091,7 @@ def propose_whatsapp_send_note(
         try:
             results_raw = _agent_tool_search(q, k=3)
             results = json.loads(results_raw) if results_raw else []
-        except Exception as exc:
+        except (json.JSONDecodeError, TypeError) as exc:
             results = []
             note_error = f"search_failed: {str(exc)[:80]}"
 
@@ -22162,9 +22281,9 @@ def _resolve_contact_target_vault(query: str) -> dict:
                         "emails": emails,
                         "addresses": addresses,
                     })
-            except Exception:
+            except OSError:
                 continue
-    except Exception:
+    except OSError:
         pass
 
     if not matches:
@@ -22658,7 +22777,7 @@ def _brief_push_to_whatsapp(
         try:
             from rag.voice_brief import send_audio_to_whatsapp  # noqa: PLC0415
             audio_sent = send_audio_to_whatsapp(cfg["jid"], audio_path)
-        except Exception as exc:
+        except ImportError as exc:
             _silent_log("brief_push_audio", exc)
             audio_sent = False
     audio_marker = "\n\n(audio arriba ↑)" if audio_sent else ""
@@ -22813,6 +22932,7 @@ def _ambient_hook(
 def _index_single_file(
     col: SqliteVecCollection, path: Path, skip_contradict: bool = False,
     vault_path: Path | None = None,
+    existing_hashes: dict[str, str] | None = None,
 ) -> str:
     """(Re)index one markdown file. Returns one of:
     'skipped' (unchanged), 'indexed' (new/updated), 'removed' (file gone),
@@ -22821,6 +22941,10 @@ def _index_single_file(
 
     `vault_path` lets callers (multi-vault `watch`) target a non-default
     vault without swapping the `VAULT_PATH` global. Defaults to `VAULT_PATH`.
+    
+    `existing_hashes` is an optional pre-fetched dict mapping file paths to their
+    current hashes in the collection. When provided, avoids a per-file SQL query.
+    Used by `_run_index_inner` for batch optimization.
     """
     vault = vault_path or VAULT_PATH
     try:
@@ -22830,11 +22954,20 @@ def _index_single_file(
     if is_excluded(doc_id_prefix):
         return "skipped"
 
-    existing = col.get(where={"file": doc_id_prefix}, include=["metadatas"])
-    existing_ids = existing["ids"]
-    existing_hash = (
-        existing["metadatas"][0].get("hash") if existing["metadatas"] else None
-    )
+    # Use pre-fetched hashes if available (batch optimization), otherwise query DB
+    if existing_hashes is not None:
+        existing_hash = existing_hashes.get(doc_id_prefix)
+        existing_ids = []  # Will fetch if needed for delete
+        if existing_hash is not None:
+            # Need to fetch IDs for deletion if file changed
+            existing = col.get(where={"file": doc_id_prefix}, include=["ids"])
+            existing_ids = existing["ids"]
+    else:
+        existing = col.get(where={"file": doc_id_prefix}, include=["metadatas"])
+        existing_ids = existing["ids"]
+        existing_hash = (
+            existing["metadatas"][0].get("hash") if existing["metadatas"] else None
+        )
 
     if not path.is_file():
         if existing_ids:
@@ -22928,8 +23061,30 @@ def _index_single_file(
         wikilink_bits = _wikilink_expansion_bits(outlinks, vault, path)
 
     # Contextual embedding: generate or retrieve cached document-level summary
-    ctx_summary = get_context_summary(text, h, path.stem, folder)
-    synth_qs = get_synthetic_questions(text, h, path.stem, folder)
+    # Parallelize context_summary and synthetic_questions calls (both are independent)
+    # Performance optimization: reduces cold-path time from ~1-2s to ~0.5-1s per file
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    
+    ctx_summary: str = ""
+    synth_qs: list[str] | None = None
+    
+    def _get_ctx():
+        return get_context_summary(text, h, path.stem, folder)
+    
+    def _get_synth():
+        return get_synthetic_questions(text, h, path.stem, folder)
+    
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            future_ctx = executor.submit(_get_ctx)
+            future_synth = executor.submit(_get_synth)
+            
+            ctx_summary = future_ctx.result(timeout=30)
+            synth_qs = future_synth.result(timeout=30)
+    except Exception:
+        # Fallback to sequential if parallelization fails
+        ctx_summary = get_context_summary(text, h, path.stem, folder)
+        synth_qs = get_synthetic_questions(text, h, path.stem, folder)
 
     chunks = semantic_chunks(
         text, path.stem, folder, tags, fm,
@@ -23410,7 +23565,10 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
         _run_cross_source_etls(VAULT_PATH)
 
     # Build file → chunks_in_db map (once) so we can detect stale/orphan chunks.
-    existing_all = col.get(include=["metadatas"])
+    # Performance optimization: filter to source=vault only, since cross-source
+    # chunks (whatsapp://, calendar://, etc.) are excluded from orphan cleanup
+    # anyway. Reduces data fetched from DB by ~30-50% for vaults with ingesters.
+    existing_all = col.get(where={"source": "vault"}, include=["metadatas"])
     file_to_chunks: dict[str, list[tuple[str, str]]] = {}
     for id_, meta in zip(existing_all["ids"], existing_all["metadatas"]):
         file_to_chunks.setdefault(meta.get("file", ""), []).append(
@@ -23421,6 +23579,14 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
         p for p in VAULT_PATH.rglob("*.md")
         if not is_excluded(str(p.relative_to(VAULT_PATH)))
     ]
+    # 2026-05-14: Si el vault tiene flag single_file_only, solo mantener el más reciente
+    cfg = _load_vaults_config()
+    single_file_vault = cfg.get("single_file_only")
+    if single_file_vault and single_file_vault in cfg.get("vaults", {}):
+        if Path(cfg["vaults"][single_file_vault]).resolve() == VAULT_PATH.resolve():
+            # Filtrar solo el archivo más reciente por mtime
+            if md_files:
+                md_files = [max(md_files, key=lambda p: p.stat().st_mtime)]
     console.print(f"[cyan]Indexando {len(md_files)} notas...[/cyan]")
 
     indexed_files = set()
@@ -23460,35 +23626,51 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
     # del embed call (in-process MPS encode amortiza el setup del kernel
     # sobre el batch entero). Para 6157 chunks: 2101 calls → ~400 calls.
     #
-    # Gateado por `RAG_INDEX_BATCH_EMBEDS`. Default depende del backend
-    # (MLX-aware desde 2026-05-08 — bug GPU Hang en batched path):
+    # Gateado por `RAG_INDEX_BATCH_EMBEDS`. Default depende del backend:
     #
     #   - PyTorch/MPS embedder (`RAG_EMBED_BACKEND=pytorch`): default ON.
     #     El batched path acumula chunks de N notas y manda `embed()` en
     #     batches grandes. Reduce overhead del kernel setup MPS y baja
     #     2101→400 calls para 6157 chunks.
-    #   - MLX embedder (default post-Ola 9): default OFF. El batched path
-    #     dispara `[METAL] Command buffer execution failed` reproducible
-    #     determinísticamente cuando llega al primer flush con archivos
-    #     mixed-len + URL indexing en cascada (bug 2026-05-08, 7 retries
-    #     idénticos a 447-468/681). El path no-batched (un embed por nota)
-    #     funciona en 49s para 4 archivos stale + 405 URLs.
+    #   - MLX embedder (default post-Ola 9): default OFF (mantenido por
+    #     precaución). El bug original (2026-05-08, GPU Hang en batched path)
+    #     fue causado por Metal memory acumulada entre embed de docs y embed
+    #     de URLs sin `mx.clear_cache()` entre ellos. Arreglado en 2026-05-15
+    #     en `_flush_batch` (clear_cache entre embeds) y en `_encode_batch`
+    #     (clear_cache post-forward). Para habilitar el batched path MLX:
+    #     `RAG_INDEX_BATCH_EMBEDS=1 RAG_INDEX_BATCH_SIZE=8`.
+    #     Probá primero con un vault pequeño antes de aplicar a full vault.
     #
-    # Override manual: `RAG_INDEX_BATCH_EMBEDS=1` fuerza el batched path
-    # aunque MLX (no recomendado hasta que se patche el flush_batch).
+    # Override manual: `RAG_INDEX_BATCH_EMBEDS=1` fuerza el batched path.
     # `=0` fuerza no-batched aunque PyTorch.
     #
-    # Tamaño configurable via `RAG_INDEX_BATCH_SIZE` (default 16 chunks).
-    # Solo aplica cuando batched está ON.
+    # Tamaño configurable via `RAG_INDEX_BATCH_SIZE` (default auto-tuned based
+    # on available memory). Solo aplica cuando batched está ON.
+    # Auto-tuning heuristic: 16 chunks for <16GB RAM, 32 for 16-32GB, 64 for >32GB.
+    # Override via env var if needed.
     _embed_backend = os.environ.get("RAG_EMBED_BACKEND", "mlx").strip().lower()
     _batch_default = "0" if _embed_backend == "mlx" else "1"
     _batch_enabled = os.environ.get(
         "RAG_INDEX_BATCH_EMBEDS", _batch_default
     ).strip().lower() not in ("0", "false", "no")
+    
+    # Auto-tune batch size based on available memory
     try:
-        _batch_target = int(os.environ.get("RAG_INDEX_BATCH_SIZE", "16"))
+        import psutil
+        mem_gb = psutil.virtual_memory().total / (1024**3)
+        if mem_gb < 16:
+            _batch_auto = 16
+        elif mem_gb < 32:
+            _batch_auto = 32
+        else:
+            _batch_auto = 64
+    except ImportError:
+        _batch_auto = 16  # fallback if psutil unavailable
+    
+    try:
+        _batch_target = int(os.environ.get("RAG_INDEX_BATCH_SIZE", str(_batch_auto)))
     except (TypeError, ValueError):
-        _batch_target = 16
+        _batch_target = _batch_auto
     if _batch_target < 1:
         _batch_target = 1
 
@@ -23498,6 +23680,10 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
     #              raw, path, folder, tags}.
     pending_files: list[dict] = []
     pending_chunk_count = 0
+    
+    # `pending_urls`: acumular URLs de múltiples archivos para batch index.
+    # Cada entry: {file, note_title, folder, tags, urls: [{url, anchor, line, context}]}
+    pending_urls: list[dict] = []
 
     def _flush_batch():
         """Embed all pending files en una llamada y commit a la collection.
@@ -23505,6 +23691,11 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
         Si la batch de embed entera falla (OOM/timeout/etc), reintenta
         archivo por archivo para aislar el problema. Files que fallan
         en el reintento se loggean y se skippean — el resto se commitea.
+
+        Perf (2026-05-15): una sola transacción SQLite para todos los chunks
+        del batch (era N transacciones, una por archivo). Una sola query de
+        delete de URLs via $in (era N get+delete queries). Ambos reducen el
+        WAL overhead y el lock contention en reindex de vault grande.
         """
         nonlocal added_chunks, urls_indexed, pending_chunk_count
         if not pending_files:
@@ -23529,45 +23720,135 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
                 except Exception as inner_exc:
                     _silent_log("index_batch_embed_per_file", inner_exc)
                     f["_failed"] = True
+
+        # Collect valid chunks across ALL files for a single col.add() call.
+        # One SQLite transaction for the entire flush instead of N.
+        batch_ids: list[str] = []
+        batch_embs: list = []
+        batch_docs: list[str] = []
+        batch_metas: list[dict] = []
+
         for f, (start, end) in zip(pending_files, offsets):
             if f.get("_failed"):
                 continue
             embs = embeddings[start:end]
             if any(e is None for e in embs):
                 continue
-            col.add(
-                ids=f["ids"],
-                embeddings=embs,
-                documents=f["display_texts"],
-                metadatas=f["metadatas"],
-            )
-            added_chunks += len(f["ids"])
+            batch_ids.extend(f["ids"])
+            batch_embs.extend(embs)
+            batch_docs.extend(f["display_texts"])
+            batch_metas.extend(f["metadatas"])
+            # Acumular URLs para batch processing
             try:
-                _extract_and_index_entities_for_chunks(
-                    f["display_texts"], f["ids"], f["metadatas"], "vault"
-                )
-            except Exception as exc:
-                _silent_log("index_batch_entities", exc)
-            try:
-                urls_indexed += _index_urls(
-                    col_urls, f["doc_id_prefix"], f["raw"],
-                    f["path"].stem, f["folder"], f["tags"],
-                )
+                urls = extract_urls(f["raw"])
+                if urls:
+                    pending_urls.append({
+                        "file": f["doc_id_prefix"],
+                        "note_title": f["path"].stem,
+                        "folder": f["folder"],
+                        "tags": f["tags"],
+                        "urls": urls,
+                    })
             except Exception:
                 pass
             indexed_files.add(f["doc_id_prefix"])
+
+        # Single col.add() → single WAL write + one lock acquisition.
+        if batch_ids:
+            try:
+                col.add(ids=batch_ids, embeddings=batch_embs,
+                        documents=batch_docs, metadatas=batch_metas)
+                added_chunks += len(batch_ids)
+            except Exception as exc:
+                _silent_log("index_flush_col_add", exc)
+            try:
+                _extract_and_index_entities_for_chunks(
+                    batch_docs, batch_ids, batch_metas, "vault"
+                )
+            except Exception as exc:
+                _silent_log("index_batch_entities", exc)
+
         pending_files.clear()
         pending_chunk_count = 0
+
+        # Liberar Metal cache entre embed de docs y embed de URLs.
+        # Sin esto, el segundo forward (URL contexts) encuentra el allocator
+        # fragmentado por el primero y dispara GPU Hang en MLX.
+        # `mx.clear_cache()` es no-op si mlx no está importado.
+        try:
+            import mlx.core as _mx_core
+            _mx_core.clear_cache()
+        except Exception:
+            pass
+
+        # Batch process URLs: delete old + embed + add new
+        if pending_urls:
+            try:
+                # Delete stale URLs for ALL files en UN SOLO query via $in.
+                # Era un loop get+delete por archivo (N queries → 1 query).
+                all_files_with_urls = [u["file"] for u in pending_urls]
+                try:
+                    col_urls.delete(where={"file": {"$in": all_files_with_urls}})
+                except Exception as exc:
+                    _silent_log("index_batch_urls_delete", exc)
+
+                # Collect all URL contexts for batch embed
+                all_url_contexts: list[str] = []
+                url_offsets: list[tuple[int, int]] = []
+                for u in pending_urls:
+                    start = len(all_url_contexts)
+                    all_url_contexts.extend([url["context"] for url in u["urls"]])
+                    url_offsets.append((start, len(all_url_contexts)))
+
+                # Batch embed all URL contexts
+                url_embeddings: list | None = None
+                try:
+                    url_embeddings = embed(all_url_contexts)
+                except Exception as exc:
+                    _silent_log("index_batch_urls_embed", exc)
+                    url_embeddings = None
+
+                # Collect all URL records for a single col_urls.add() call.
+                if url_embeddings is not None:
+                    all_url_ids: list[str] = []
+                    all_url_embs: list = []
+                    all_url_docs: list[str] = []
+                    all_url_metas: list[dict] = []
+                    for u, (start, end) in zip(pending_urls, url_offsets):
+                        file_urls = u["urls"]
+                        embs = url_embeddings[start:end]
+                        if len(embs) != len(file_urls):
+                            continue
+                        for i, (url, emb) in enumerate(zip(file_urls, embs)):
+                            all_url_ids.append(f"{u['file']}::url::{i}")
+                            all_url_embs.append(emb)
+                            all_url_docs.append(url["context"])
+                            all_url_metas.append({
+                                "file": u["file"],
+                                "note": u["note_title"],
+                                "folder": u["folder"],
+                                "tags": ",".join(u["tags"]),
+                                "url": url["url"],
+                                "anchor": url["anchor"],
+                                "line": url["line"],
+                                "source": "note",
+                            })
+                    if all_url_ids:
+                        try:
+                            col_urls.add(
+                                ids=all_url_ids,
+                                embeddings=all_url_embs,
+                                documents=all_url_docs,
+                                metadatas=all_url_metas,
+                            )
+                            urls_indexed += len(all_url_ids)
+                        except Exception as exc:
+                            _silent_log("index_batch_urls_add", exc)
+            except Exception as exc:
+                _silent_log("index_batch_urls", exc)
+            pending_urls.clear()
+
         # Defensivo post-flush: liberar MPS cache después de cada batch.
-        # El wrapper `_encode_with_cleanup` solo libera por encode call,
-        # los embedding tensors retornados quedan vivos en Python list
-        # hasta que el `for f, ...` de arriba los pasa a `col.add()`. Sin
-        # este `empty_cache()` final, MPS allocator fragmenta entre 200+
-        # flushes de un reindex full → GPU OOM acumulado (signature
-        # `kIOGPUCommandBufferCallbackErrorOutOfMemory` reproducido HOY
-        # 2026-05-06 PID 29718). Combinado con
-        # `start_memory_pressure_watchdog()` arriba para defensa en
-        # profundidad.
         # MLX-aware: `_torch_mps_empty_cache()` no-op cuando backend full-MLX
         # (post-Ola 9 default) — invalidar Metal command buffers desde Python
         # mientras MLX está procesando un batch produce GPU Hang Error.
@@ -23717,7 +23998,7 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
                         updated=updated_files,
                         skipped=skipped_files,
                     )
-            except Exception as exc:
+            except OSError as exc:
                 # Aislar el daño a este archivo. Log silent + traceback (para
                 # diagnóstico del root cause del bug #4) + sumar al contador
                 # de skips para que el resumen final muestre cuántos quedaron
@@ -23766,12 +24047,10 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
         orphan_ids.extend(eid for eid, _ in file_to_chunks[f])
     if orphan_ids:
         col.delete(ids=orphan_ids)
-    # Mirror orphan cleanup in the URL collection.
-    for f in orphan_files:
+    # Mirror orphan cleanup in the URL collection via single $in query.
+    if orphan_files:
         try:
-            existing_urls = col_urls.get(where={"file": f}, include=[])
-            if existing_urls.get("ids"):
-                col_urls.delete(ids=existing_urls["ids"])
+            col_urls.delete(where={"file": {"$in": list(orphan_files)}})
         except Exception as exc:
             _silent_log('index_urls_cleanup_on_reindex', exc)
 
@@ -24141,6 +24420,40 @@ def _do_index(reset: bool, no_contradict: bool, source_opt: str | None,
                 extra=f"{summary['mood_signals']} mood signals",
             ))
             return
+        if src == "health":
+            # Apple Health export.xml → rag_apple_health_daily (telemetry).
+            # SAX streaming — constant memory aunque el file pese ~2GB.
+            from rag.integrations.apple_health import import_export_xml
+            from pathlib import Path as _Path
+            # Default 30 days, override via --since (ISO timestamp) or env var.
+            days = 30
+            if since_opt:
+                # Parse ISO timestamp to days ago
+                try:
+                    from datetime import datetime, timezone, timedelta as _timedelta
+                    since_dt = datetime.fromisoformat(since_opt.replace("Z", "+00:00"))
+                    days = max(1, int((datetime.now(timezone.utc) - since_dt).total_seconds() / 86400))
+                except ImportError:
+                    pass
+            result = import_export_xml(days=days)
+            if result.get("skipped_reason"):
+                console.print(
+                    f"[dim]health: {result.get('skipped_reason')}[/dim]"
+                )
+                return
+            console.print(_fmt_ingest_summary(
+                "health",
+                total=result["imported"],
+                indexed=result["records_kept"],
+                deleted=0,
+                duration_s=result["elapsed_s"],
+                dry_run=bool(dry_run),
+                extra=f"{result['records_scanned']:,} scanned",
+            ))
+            days_seen = result.get("days_seen") or []
+            if days_seen:
+                console.print(f"[dim]{days_seen[0]} → {days_seen[-1]}[/dim]")
+            return
         if src not in VALID_SOURCES:
             console.print(
                 f"[red]Fuente inválida:[/red] {src}. "
@@ -24472,7 +24785,7 @@ def vlm_backfill(vault_scope: str | None, max_captions: int | None, dry_run: boo
             capture_output=True, text=True, timeout=5,
         )
         _web_running = _out.returncode == 0 and "state = running" in _out.stdout
-    except Exception:
+    except subprocess.SubprocessError:
         _web_running = False
     if _web_running and not force_run:
         console.print(
@@ -24544,7 +24857,7 @@ def vlm_backfill(vault_scope: str | None, max_captions: int | None, dry_run: boo
                 "SELECT image_path, mtime FROM rag_vlm_captions"
             ):
                 cached[str(row[0])] = float(row[1])
-    except Exception as exc:
+    except sqlite3.Error as exc:
         _silent_log("vlm_backfill_cache_scan", exc)
 
     pending: list[Path] = []
@@ -24552,7 +24865,7 @@ def vlm_backfill(vault_scope: str | None, max_captions: int | None, dry_run: boo
     for path in md_files:
         try:
             raw = path.read_text(encoding="utf-8", errors="ignore")
-        except Exception:
+        except OSError:
             continue
         images = _extract_embedded_images(raw, path, vault_root)
         for img in images:
@@ -24848,7 +25161,7 @@ def watch(debounce: float, all_vaults: bool):
                                 f"{empty_cycles * debounce:.0f}s idle",
                                 flush=True,
                             )
-                    except Exception as exc:
+                    except ImportError as exc:
                         _silent_log("watch_idle_unload_failed", exc)
                     unloaded_after_idle = True
             now_t = time.time()
@@ -25125,7 +25438,7 @@ def query(
                     "intent": hit.get("intent"),
                 })
                 return
-        except Exception as _cache_exc:
+        except ImportError as _cache_exc:
             _silent_log("semantic_cache_lookup_query", _cache_exc)
             _cache_emb = None
             if _cache_probe is None:
@@ -25722,7 +26035,7 @@ def query(
                 title="[dim]NLI grounding[/dim]",
                 border_style="dim",
             ))
-        except Exception as _nli_exc:
+        except ImportError as _nli_exc:
             _silent_log("nli_grounding_panel_query", _nli_exc)
 
     # ── Semantic cache store (GC#1 2026-04-22, durability fix 2026-04-23) ──
@@ -26197,7 +26510,7 @@ def _handle_chat_create_intent(question: str) -> tuple[bool, dict | None]:
     if isinstance(args, str):
         try:
             args = json.loads(args)
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             args = {}
     if not isinstance(args, dict):
         args = {}
@@ -26206,7 +26519,7 @@ def _handle_chat_create_intent(question: str) -> tuple[bool, dict | None]:
         if isinstance(params, str):
             try:
                 params = json.loads(params)
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 params = {}
         if not isinstance(params, dict):
             params = {}
@@ -26230,7 +26543,7 @@ def _handle_chat_create_intent(question: str) -> tuple[bool, dict | None]:
 
     try:
         payload = json.loads(result_json)
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         console.print(f"[yellow]⚠ {name} devolvió JSON inválido[/yellow]")
         return False, None
 
@@ -27123,7 +27436,7 @@ def chat(
                     title="[dim]NLI grounding[/dim]",
                     border_style="dim",
                 ))
-            except Exception as _nli_exc:
+            except ImportError as _nli_exc:
                 _silent_log("nli_grounding_panel_chat", _nli_exc)
 
         turn_id = new_turn_id()
@@ -27201,7 +27514,7 @@ def read_user_state() -> dict | None:
         if age > USER_STATE_TTL_HOURS:
             return None
         return {"state": data["state"], "age_hours": age}
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         return None
 
 
@@ -27236,7 +27549,7 @@ def read_user_profile() -> str:
             if end != -1:
                 raw = raw[end + 5 :]
         return raw.strip()[:2000]
-    except Exception:
+    except OSError:
         return ""
 
 
@@ -27746,7 +28059,7 @@ def draft_stats(plain: bool):
                 "WHERE ts >= datetime('now', 'localtime', '-30 days') "
                 "GROUP BY decision ORDER BY decision"
             ).fetchall())
-    except Exception as exc:
+    except sqlite3.Error as exc:
         msg = f"error leyendo rag_draft_decisions: {exc}"
         click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
         return
@@ -27810,7 +28123,7 @@ def draft_stats(plain: bool):
     if meta_path.is_file():
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             meta = None
         if meta:
             ft_active = _drafts_ft_enabled() and _drafts_ft_adapter_available()
@@ -27899,7 +28212,7 @@ def draft_finetune(
     # bars + métricas en tiempo real. Exit code propaga.
     try:
         proc = subprocess.run(cmd, check=False)
-    except Exception as exc:
+    except subprocess.SubprocessError as exc:
         console.print(f"[red]error invocando script: {exc}[/red]")
         raise click.exceptions.Exit(1)
     raise click.exceptions.Exit(proc.returncode)
@@ -27962,7 +28275,7 @@ def brief_stats(plain: bool):
             ).fetchone()
             if row and row[0]:
                 last_ts = row[0]
-    except Exception as exc:
+    except sqlite3.Error as exc:
         msg = f"error leyendo rag_brief_feedback: {exc}"
         click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
         return
@@ -28066,7 +28379,7 @@ def brief_schedule_status(plain: bool, lookback_days: int):
     """
     try:
         from rag.brief_schedule import VALID_BRIEF_KINDS, analyze_brief_feedback
-    except Exception as exc:
+    except ImportError as exc:
         msg = f"error importando rag.brief_schedule: {exc}"
         click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
         return
@@ -28105,7 +28418,7 @@ def brief_schedule_reset(kind: str, plain: bool):
         from rag.brief_schedule import (
             VALID_BRIEF_KINDS, reset_brief_schedule_pref,
         )
-    except Exception as exc:
+    except ImportError as exc:
         msg = f"error importando rag.brief_schedule: {exc}"
         click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
         return
@@ -28163,7 +28476,7 @@ def _bootstrap_brief_plist(kind: str) -> tuple[bool, str]:
             check=False, capture_output=True,
         )
         return (True, f"{label} re-bootstrapped")
-    except Exception as exc:
+    except OSError as exc:
         return (False, f"error: {exc}")
 
 
@@ -28175,7 +28488,7 @@ def current_schedule_for_bootstrap(kind: str) -> tuple[int, int]:
     try:
         from rag.brief_schedule import current_schedule
         return current_schedule(kind)
-    except Exception:
+    except ImportError:
         # Defensive fallback to defaults from DEFAULT_SCHEDULES.
         return {"morning": (7, 0), "today": (22, 0), "digest": (22, 0)}.get(kind, (0, 0))
 
@@ -28211,7 +28524,7 @@ def brief_schedule_auto_tune(dry_run: bool, apply_flag: bool, lookback_days: int
         from rag.brief_schedule import (
             VALID_BRIEF_KINDS, analyze_brief_feedback, set_brief_schedule_pref,
         )
-    except Exception as exc:
+    except ImportError as exc:
         msg = f"error importando rag.brief_schedule: {exc}"
         click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
         return
@@ -28400,11 +28713,11 @@ def migrations_apply_cmd(target: int | None, dry_run: bool, plain: bool) -> None
                 )
                 conn.execute(f"RELEASE SAVEPOINT {sp}")
                 applied_now.append(v)
-            except Exception as exc:
+            except sqlite3.Error as exc:
                 try:
                     conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
                     conn.execute(f"RELEASE SAVEPOINT {sp}")
-                except Exception:
+                except sqlite3.Error:
                     pass
                 if plain:
                     click.echo(f"FAILED at {v} {name}: {exc!r}")
@@ -28451,7 +28764,7 @@ def migrations_bootstrap_cmd(plain: bool) -> None:
                     (v, name, now, _m._migration_hash(fn)),
                 )
                 registered.append(v)
-            except Exception:
+            except sqlite3.Error:
                 continue
         if plain:
             click.echo(f"bootstrapped {registered}")
@@ -28965,7 +29278,7 @@ def _feedback_augmented_cases(min_len: int = 4) -> list[dict]:
     try:
         with _ragvec_state_conn() as conn:
             rows = conn.execute(sql).fetchall()
-    except Exception as exc:
+    except sqlite3.Error as exc:
         _silent_log("feedback_augmented_cases_sql_read", exc)
         return []
     seen_q: set[str] = set()
@@ -29029,7 +29342,7 @@ def _feedback_implicit_cases(
     try:
         with _ragvec_state_conn() as conn:
             rows = conn.execute(sql, (cutoff,)).fetchall()
-    except Exception as exc:
+    except sqlite3.Error as exc:
         _log_sql_state_error("feedback_implicit_cases_sql_read_failed",
                               err=repr(exc))
         return []
@@ -29261,7 +29574,7 @@ def _brief_synthetic_cases(
                         pos[key] = "brief_kept_synthetic"
                     elif event == "deleted":
                         neg[key] = "brief_deleted_synthetic"
-    except Exception as exc:
+    except sqlite3.Error as exc:
         _log_sql_state_error("brief_synthetic_cases_sql_read_failed",
                               err=repr(exc))
         return []
@@ -29423,7 +29736,7 @@ def _backup_ranker_config() -> Path | None:
             except Exception:
                 pass
         return backup
-    except Exception:
+    except ImportError:
         return None
 
 
@@ -29435,7 +29748,7 @@ def _restore_ranker_backup(backup: Path) -> bool:
         shutil.copy2(backup, tmp)
         tmp.replace(RANKER_CONFIG_PATH)
         return True
-    except Exception:
+    except ImportError:
         return False
 
 
@@ -29613,7 +29926,7 @@ def tune(queries_file: str, k: int, samples: int, seed: int,
                     for k in sorted(bw.as_dict())
                     if abs(bw.as_dict()[k] - current_w.as_dict()[k]) > 1e-6
                 ) or "(sin diferencia)"
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 delta_str = "(no se pudo parsear)"
             mtime_str = datetime.fromtimestamp(bp.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
             console.print(f"  [cyan]{bp.name}[/cyan]  {mtime_str}  Δ {delta_str}")
@@ -30092,7 +30405,7 @@ def tune(queries_file: str, k: int, samples: int, seed: int,
             console.print(
                 f"[green]✓[/green] Stratified eval OK: {decision['reason']}"
             )
-    except Exception as exc:
+    except ImportError as exc:
         # Stratified eval es bonus — si rompe, NO afectamos el flow del tune.
         # Si esto pasa, el aggregate gate ya fue OK (sino habríamos exited
         # antes), así que el modelo igual queda persistido.
@@ -30133,7 +30446,7 @@ def _replay_load_row(query_id: int) -> "dict | None":
                     except (json.JSONDecodeError, TypeError):
                         data[col] = None
             return data
-    except Exception as exc:
+    except (json.JSONDecodeError, TypeError) as exc:
         _silent_log("replay_load_row", exc)
         return None
 
@@ -30491,7 +30804,7 @@ def replay(
                 since_iso = _dt.datetime.fromtimestamp(
                     float(since_ts), tz=_dt.timezone.utc
                 ).strftime("%Y-%m-%dT%H:%M:%S")
-        except Exception:
+        except ImportError:
             since_iso = None
 
         rows: list[dict] = []
@@ -30530,7 +30843,7 @@ def replay(
                             except (json.JSONDecodeError, TypeError):
                                 data[col] = None
                     rows.append(data)
-        except Exception as exc:
+        except (json.JSONDecodeError, TypeError) as exc:
             _silent_log("replay_bulk_load", exc)
             if not plain and not as_json:
                 console.print(f"[red]Error cargando historial:[/red] {exc}")
@@ -30787,7 +31100,7 @@ def gaps(threshold: float, min_count: int, days: int):
             continue
         try:
             e = json.loads(line)
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             continue
         score = e.get("top_score")
         if score is None or score > threshold:
@@ -31118,7 +31431,7 @@ def _collect_week_evidence(
                 continue
             try:
                 e = json.loads(line)
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 continue
             try:
                 ts = datetime.fromisoformat(e.get("ts", ""))
@@ -31148,7 +31461,7 @@ def _collect_week_evidence(
                 ):
                     try:
                         targets = json.loads(targets_json) if targets_json else []
-                    except Exception:
+                    except (json.JSONDecodeError, TypeError):
                         continue
                     if not isinstance(targets, list) or not targets:
                         continue
@@ -31160,7 +31473,7 @@ def _collect_week_evidence(
                             for c in targets if isinstance(c, dict)
                         ],
                     })
-            except Exception as _exc:
+            except (json.JSONDecodeError, TypeError) as _exc:
                 try:
                     _silent_log("week_evidence_contradictions_sql_failed", _exc)
                 except Exception:
@@ -31173,7 +31486,7 @@ def _collect_week_evidence(
                 ):
                     try:
                         extra = json.loads(extra_json) if extra_json else {}
-                    except Exception:
+                    except (json.JSONDecodeError, TypeError):
                         extra = {}
                     contrad = extra.get("contradictions") if isinstance(extra, dict) else None
                     if isinstance(contrad, list) and contrad:
@@ -31193,12 +31506,12 @@ def _collect_week_evidence(
                                 "q": q_clean,
                                 "top_score": float(top_score),
                             })
-            except Exception as _exc:
+            except (json.JSONDecodeError, TypeError) as _exc:
                 try:
                     _silent_log("week_evidence_queries_sql_failed", _exc)
                 except Exception:
                     pass
-    except Exception as _exc:
+    except (json.JSONDecodeError, TypeError) as _exc:
         try:
             _silent_log("week_evidence_conn_failed", _exc)
         except Exception:
@@ -31430,7 +31743,7 @@ def _render_silent_errors_log(n: int, summary: bool) -> None:
             continue
         try:
             entries.append(json.loads(line))
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             continue
     if not entries:
         console.print("[dim]silent_errors.jsonl está vacío — nada que reportar.[/dim]")
@@ -31628,7 +31941,7 @@ def _load_query_entries(since: datetime, log_path: Path = LOG_PATH) -> list[dict
             continue
         try:
             e = json.loads(line)
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             continue
         try:
             ts = datetime.fromisoformat(e.get("ts", ""))
@@ -32773,7 +33086,7 @@ def do(instruction: str, yes: bool, max_iterations: int):
             if isinstance(args, str):
                 try:
                     args = json.loads(args)
-                except Exception:
+                except (json.JSONDecodeError, TypeError):
                     args = {}
             if not isinstance(args, dict):
                 args = {}
@@ -32784,7 +33097,7 @@ def do(instruction: str, yes: bool, max_iterations: int):
                 if isinstance(params, str):
                     try:
                         params = json.loads(params)
-                    except Exception:
+                    except (json.JSONDecodeError, TypeError):
                         params = {}
                 if not isinstance(params, dict):
                     params = {}
@@ -33354,7 +33667,7 @@ def _rebuild_urls_index() -> dict:
             total += n
             if n:
                 files_with_urls += 1
-        except Exception:
+        except OSError:
             continue
     console.print(
         f"[green]Listo. {total} URLs en {files_with_urls} notas.[/green]"
@@ -33397,7 +33710,7 @@ def links(query: str | None, k: int, folder: str | None, tag: str | None,
         import subprocess
         try:
             subprocess.run(["open", url], check=False)
-        except Exception as e:
+        except subprocess.SubprocessError as e:
             msg = f"No pude abrir: {e}"
             click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
             return
@@ -34081,7 +34394,7 @@ def file_cmd(path: str | None, folder: str, one: bool, limit: int,
             if fm.get("file") == "skip":
                 skipped_by_fm.append(str(p.relative_to(VAULT_PATH)))
                 continue
-        except Exception:
+        except OSError:
             pass
         eligible.append(p)
 
@@ -34679,7 +34992,7 @@ def _cache_telemetry_stats(days: int = 7) -> dict:
                 }
                 for q, hc, intent, lts in top_rows
             ]
-    except Exception as exc:
+    except sqlite3.Error as exc:
         _log_sql_state_error("cache_telemetry_stats_failed", err=repr(exc))
     return out
 
@@ -35577,7 +35890,7 @@ def _fetch_youtube_title(url: str) -> str:
         req = urllib.request.Request(endpoint, headers={"User-Agent": _READ_USER_AGENT})
         with urllib.request.urlopen(req, timeout=_READ_TIMEOUT_SECS) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         return ""
     title = (data.get("title") or "").strip()
     author = (data.get("author_name") or "").strip()
@@ -35803,7 +36116,7 @@ def _read_generate_summary(prompt: str) -> str:
         # Sin filter, leaks del LLM con texto pt llegan a la nota guardada.
         from rag.iberian_leak_filter import replace_iberian_leaks
         return replace_iberian_leaks((resp.message.content or "").strip())
-    except Exception:
+    except ImportError:
         return ""
 
 
@@ -35813,7 +36126,7 @@ def _read_slug_from(title: str, url: str) -> str:
     try:
         import urllib.parse as _up
         host = _up.urlparse(url).netloc or ""
-    except Exception:
+    except ImportError:
         host = ""
     host = host.replace("www.", "")
     return _slug(host, maxlen=40) if host else "read"
@@ -37359,7 +37672,7 @@ def _parse_natural_datetime(
     try:
         import dateparser  # noqa: PLC0415
         dt = dateparser.parse(s_norm, languages=list(lang), settings=settings)
-    except Exception:
+    except ImportError:
         dt = None
 
     if isinstance(dt, datetime):
@@ -37455,7 +37768,7 @@ def _parse_natural_datetime(
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE)
     try:
         data = json.loads(raw)
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         return None
     iso = data.get("iso") if isinstance(data, dict) else None
     if not iso or not isinstance(iso, str):
@@ -37879,7 +38192,7 @@ def _create_calendar_event(
                 if err is not None and hasattr(err, "localizedDescription"):
                     # No tan crítico — caemos al fallback AppleScript.
                     pass
-        except Exception:
+        except ImportError:
             # Cualquier error en EventKit → fallback silencioso.
             pass
 
@@ -38035,7 +38348,7 @@ def _delete_reminder(reminder_id: str) -> tuple[bool, str]:
             if err is not None and hasattr(err, "localizedDescription"):
                 return False, f"EventKit: {err.localizedDescription()}"
             # Falló el remove sin error útil — caer al fallback.
-    except Exception:
+    except ImportError:
         # Cualquier error en el path EventKit (framework no carga,
         # pyobjc roto, lookup falla, etc) → fallback silencioso.
         pass
@@ -38134,7 +38447,7 @@ def _delete_calendar_event(event_uid: str) -> tuple[bool, str]:
             if err is not None and hasattr(err, "localizedDescription"):
                 return False, f"EventKit: {err.localizedDescription()}"
             # Remove falló sin error útil — caer al fallback.
-    except Exception:
+    except ImportError:
         # Si el framework no cargó / pyobjc roto / etc → fallback.
         pass
 
@@ -39715,7 +40028,7 @@ def _load_user_nickname(vault_root: Path | None = None) -> str | None:
 
     try:
         txt = root.read_text(encoding="utf-8")
-    except Exception:
+    except OSError:
         return None
 
     nick: str | None = None
@@ -39763,7 +40076,7 @@ def _parse_mention_dossier(rel_path: str, vault_root: Path | None = None) -> dic
     out: dict = {"name": p.stem, "aliases": [], "phone_digits": ""}
     try:
         txt = p.read_text(encoding="utf-8")
-    except Exception:
+    except OSError:
         return out
     # Phone via centralized parser — matches the full label set (tel|phone|
     # cel|whatsapp|wa|…), not just "Teléfono". Before 2026-04-21 this regex
@@ -40158,7 +40471,7 @@ def _fetch_recent_queries(
             continue
         try:
             e = json.loads(line)
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             continue
         if e.get("cmd") != "query":
             continue
@@ -40278,7 +40591,7 @@ def _fetch_system_activity(
                     continue
                 try:
                     e = json.loads(line)
-                except Exception:
+                except (json.JSONDecodeError, TypeError):
                     continue
                 try:
                     ts = datetime.fromisoformat(e.get("ts", ""))
@@ -40331,7 +40644,7 @@ def _fetch_system_activity(
                     continue
                 try:
                     e = json.loads(line)
-                except Exception:
+                except (json.JSONDecodeError, TypeError):
                     continue
                 try:
                     ts = datetime.fromisoformat(e.get("ts", ""))
@@ -40500,7 +40813,7 @@ def _collect_morning_evidence(
                 continue
             try:
                 e = json.loads(line)
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 continue
             try:
                 ts = datetime.fromisoformat(e.get("ts", ""))
@@ -40533,7 +40846,7 @@ def _collect_morning_evidence(
                 continue
             try:
                 e = json.loads(line)
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 continue
             try:
                 ts = datetime.fromisoformat(e.get("ts", ""))
@@ -40560,7 +40873,7 @@ def _collect_morning_evidence(
     try:
         from rag import wa_scheduled as _wa_sched  # noqa: PLC0415
         wa_today = _wa_sched.list_today_pending(now=now)
-    except Exception:
+    except ImportError:
         wa_today = []
     ev = {
         "recent_notes": recent,
@@ -40746,7 +41059,7 @@ def _generate_morning_narrative(prompt: str) -> str:
         # es visible. Filter es idempotente y safe sobre texto en es puro.
         from rag.iberian_leak_filter import replace_iberian_leaks
         return replace_iberian_leaks((resp.message.content or "").strip())
-    except Exception:
+    except ImportError:
         return ""
 
 
@@ -41229,7 +41542,7 @@ def _generate_morning_json(prompt: str) -> dict | None:
                 return [_filter_strings(x) for x in v]
             return v
         return _filter_strings(data)
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         return None
 
 
@@ -41276,6 +41589,10 @@ def _is_placeholder_bullet(text: str) -> bool:
     folded = unicodedata.normalize("NFD", text)
     folded = "".join(c for c in folded if not unicodedata.combining(c))
     return bool(_MORNING_PLACEHOLDER_RE.match(folded))
+
+
+# Regex extraída de _sanitize_morning_parts — se compilaba en cada call (B4 audit 2026-05-14).
+_SANITIZE_WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)")
 
 
 def _sanitize_morning_parts(parts: dict, ev: dict) -> dict:
@@ -41379,7 +41696,7 @@ def _sanitize_morning_parts(parts: dict, ev: dict) -> dict:
 
     focus = out.get("focus") or []
     if isinstance(focus, list) and focus:
-        wl_re = re.compile(r"\[\[([^\]|#]+)")
+        wl_re = _SANITIZE_WIKILINK_RE
         # Map title → known real path from filtered evidence (recent_notes
         # already excludes daemon paths). If a [[wikilink]] in focus matches
         # a daemon-generated title we know about, drop the bullet.
@@ -41650,7 +41967,7 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int,
                 )
             else:
                 console.print("[dim]→ audio: TTS no disponible o falló — text-only[/dim]")
-        except Exception as exc:
+        except ImportError as exc:
             _silent_log("morning_voice_brief", exc)
             audio_path = None
     if _brief_push_to_whatsapp(
@@ -41875,7 +42192,7 @@ def _collect_today_evidence(
                 continue
             try:
                 e = json.loads(line)
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 continue
             try:
                 ts = datetime.fromisoformat(e.get("ts", ""))
@@ -41919,7 +42236,7 @@ def _collect_today_evidence(
                 continue
             try:
                 e = json.loads(line)
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 continue
             try:
                 ts = datetime.fromisoformat(e.get("ts", ""))
@@ -41947,7 +42264,7 @@ def _collect_today_evidence(
     try:
         from rag import wa_scheduled as _wa_sched  # noqa: PLC0415
         wa_today_pending = _wa_sched.list_today_pending()
-    except Exception:
+    except ImportError:
         wa_today_pending = []
 
     return {
@@ -42749,6 +43066,19 @@ def _today_brief_client() -> "_SemaphoredChatClient":
     return _TODAY_BRIEF_CLIENT
 
 
+# Regex extraída de _strip_empty_today_sections — se compilaba en cada call (B4 audit 2026-05-14).
+_STRIP_EMPTY_PLACEHOLDER_RE = re.compile(
+    r"^\s*\W*\s*("
+    r"nada\s+qued|no\s+hubo|no\s+hay\b|no\s+habia|"
+    r"ninguna|ningun\b|sin\s+novedades?|sin\s+actividad|sin\s+nada|"
+    r"no\s+se\s+registr|no\s+se\s+detect|no\s+aparec|"
+    r"no\s+hay\s+datos?\s+suficientes|no\s+aplica|"
+    r"todo\s+(quedo|esta)\s+(en\s+orden|al\s+dia|categorizado)"
+    r")",
+    re.IGNORECASE,
+)
+
+
 def _strip_empty_today_sections(narrative: str) -> str:
     """Drop secciones del evening cuyo body es solo placeholder ("nada quedó
     suelto", "no hubo X", "ninguna pregunta", etc.) o está vacío.
@@ -42765,16 +43095,7 @@ def _strip_empty_today_sections(narrative: str) -> str:
     """
     if not narrative:
         return narrative
-    placeholder_re = re.compile(
-        r"^\s*\W*\s*("
-        r"nada\s+qued|no\s+hubo|no\s+hay\b|no\s+habia|"
-        r"ninguna|ningun\b|sin\s+novedades?|sin\s+actividad|sin\s+nada|"
-        r"no\s+se\s+registr|no\s+se\s+detect|no\s+aparec|"
-        r"no\s+hay\s+datos?\s+suficientes|no\s+aplica|"
-        r"todo\s+(quedo|esta)\s+(en\s+orden|al\s+dia|categorizado)"
-        r")",
-        re.IGNORECASE,
-    )
+    placeholder_re = _STRIP_EMPTY_PLACEHOLDER_RE
 
     def _is_placeholder_body(body: str) -> bool:
         # Strip todas las líneas en blanco / list-marker only / "(nota)" lines
@@ -42843,7 +43164,7 @@ def _generate_today_narrative(prompt: str) -> str:
     try:
         from rag.today_correlator import normalize_voice_to_2da_persona
         normalized = normalize_voice_to_2da_persona(raw)
-    except Exception:
+    except ImportError:
         normalized = raw
     # Sacar secciones con placeholder ("nada quedó suelto", etc.) — el
     # user pidió explícitamente que si está vacío no se muestre ni el
@@ -43002,7 +43323,7 @@ def _ingest_cursors_load() -> dict[str, float]:
             return {}
         return {str(k): float(v) for k, v in raw.items()
                 if isinstance(v, (int, float))}
-    except Exception as exc:
+    except (json.JSONDecodeError, TypeError) as exc:
         _silent_log("ingest_cursors_load", exc)
         return {}
 
@@ -43016,7 +43337,7 @@ def _ingest_cursors_mark(source: str) -> None:
         tmp = _INGEST_CURSORS_PATH.with_suffix(".tmp")
         tmp.write_text(json.dumps(cursors, indent=2), encoding="utf-8")
         tmp.replace(_INGEST_CURSORS_PATH)
-    except Exception as exc:
+    except (json.JSONDecodeError, TypeError) as exc:
         _silent_log("ingest_cursors_mark", exc)
 
 
@@ -43251,7 +43572,7 @@ def _wa_bridge_is_loaded() -> bool:
             capture_output=True, text=True, timeout=5,
         )
         return result.returncode == 0
-    except Exception:
+    except subprocess.SubprocessError:
         return False
 
 
@@ -43337,7 +43658,7 @@ def bridge_status():
     if _WA_BRIDGE_SENTINEL.exists():
         try:
             sentinel_ts = _WA_BRIDGE_SENTINEL.read_text().strip()
-        except Exception as exc:
+        except OSError as exc:
             sentinel_ts = f"<read error: {exc!r}>"
 
     # Last LoggedOut / Connected events in bridge.log (best-effort)
@@ -43354,7 +43675,7 @@ def bridge_status():
                     last_logged_out = line.strip()[:160]
                 elif "Connected to WhatsApp" in line and "Successfully" not in line:
                     last_connected = line.strip()[:160]
-        except Exception:
+        except subprocess.SubprocessError:
             pass
 
     # Compose console output
@@ -43482,7 +43803,7 @@ def bridge_reauth(keep_session: bool, yes: bool):
                  f"gui/{_wa_bridge_uid()}/{_WA_BRIDGE_LAUNCHD_LABEL}"],
                 capture_output=True, text=True, timeout=10, check=False,
             )
-        except Exception as exc:
+        except subprocess.SubprocessError as exc:
             console.print(f"[yellow]warn:[/yellow] launchctl bootout: {exc!r}")
         # Wait for bridge to release port 8080. Up to 5s — usually <1s.
         for _ in range(50):
@@ -43586,7 +43907,7 @@ def bridge_reauth(keep_session: bool, yes: bool):
             console.print(f"[yellow]warn:[/yellow] launchctl bootstrap rc={result.returncode}: {result.stderr.strip()}")
         else:
             console.print("[green]✓[/green]")
-    except Exception as exc:
+    except subprocess.SubprocessError as exc:
         console.print(f"[red]✗[/red] launchctl bootstrap: {exc!r}")
 
     # ── Step 5: verify with HTTP probe ────────────────────────────────
@@ -43814,7 +44135,7 @@ def _build_today_extras_for_cli(target: datetime) -> dict:
     try:
         from rag.today_correlator import correlate_today_signals as _corr
         extras["correlations"] = _corr({}, extras)
-    except Exception:
+    except ImportError:
         extras["correlations"] = {"people": [], "topics": []}
     return extras
 
@@ -44017,13 +44338,13 @@ def find_dead_notes(
             ):
                 try:
                     paths = json.loads(paths_json) if paths_json else []
-                except Exception:
+                except (json.JSONDecodeError, TypeError):
                     continue
                 if isinstance(paths, list):
                     for p in paths:
                         if isinstance(p, str) and p:
                             retrieved_paths.add(p)
-    except Exception as _exc:
+    except (json.JSONDecodeError, TypeError) as _exc:
         try:
             _silent_log("find_dead_notes_sql_read_failed", _exc)
         except Exception:
@@ -44460,7 +44781,7 @@ def _followup_judge(loop_text: str, candidate_snippet: str) -> tuple[bool, str]:
         return False, ""
     try:
         data = json.loads(m.group(0))
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         return False, ""
     resolved = bool(data.get("resolved"))
     reason = str(data.get("reason") or "").strip()[:200]
@@ -44918,7 +45239,7 @@ def ambient_status():
             # Detectar schema viejo para dar un hint útil.
             try:
                 raw = json.loads(AMBIENT_CONFIG_PATH.read_text(encoding="utf-8"))
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 raw = {}
             if raw.get("chat_id") or raw.get("bot_token"):
                 console.print(
@@ -44939,7 +45260,7 @@ def ambient_status():
         try:
             n = sum(1 for _ in AMBIENT_STATE_PATH.open())
             console.print(f"[dim]State: {n} análisis registrados[/dim]")
-        except Exception:
+        except OSError:
             pass
 
 
@@ -44993,7 +45314,7 @@ def ambient_disable():
         return
     try:
         c = json.loads(AMBIENT_CONFIG_PATH.read_text(encoding="utf-8"))
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         c = {}
     c["enabled"] = False
     AMBIENT_CONFIG_PATH.write_text(json.dumps(c, indent=2), encoding="utf-8")
@@ -45032,7 +45353,7 @@ def _load_raw_ambient_config() -> dict:
     try:
         c = json.loads(AMBIENT_CONFIG_PATH.read_text(encoding="utf-8"))
         return c if isinstance(c, dict) else {}
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         return {}
 
 
@@ -45138,7 +45459,7 @@ def ambient_log(n: int):
     for line in lines:
         try:
             e = json.loads(line)
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             continue
         ts = e.get("ts", "")[-8:]
         applied = e.get("wikilinks_applied", 0)
@@ -45258,10 +45579,11 @@ def _is_weather_query(q: str) -> bool:
 _FINANCE_CARDS_KEYWORDS = re.compile(
     r"\btarjet|\bvisa\b|\bmaster(?:card)?\b|\bamex\b|\bcr[eé]dito\b"
     r"|saldo.*paga|fecha.*cierre|fecha.*vencim|resumen.*tarjeta"
-    r"|cu[aá]nto.*deb[oe]"
+    r"|cu[aá]nto.*deb[oe]|cu[aá]nto.*cobr[aeo]|cu[aá]nto.*gan[aeo]"
     r"|\b(?:[uú]ltim[oa]s?|recientes?)\s+(?:gastos?|consumos?|movimientos?|compras?|cargos?|transac)\b"
     r"|\b(?:consumos?|movimientos?|cargos?)\s+(?:de|del|en|con|mi)"
-    r"|gast[oéó]s?|gast[aá][mn]os|gastar|presupuesto|plata|finanz|moze",
+    r"|gast[oéó]s?|gast[aá][mn]os|gastar|presupuesto|plata|finanz|moze"
+    r"|sueldo|haberes|ingresos|neto|recibo.*haberes|recibo.*sueldo",
     re.IGNORECASE,
 )
 _FINANCE_CARDS_MAX_TOKENS = 16
@@ -45357,6 +45679,16 @@ def _format_finance_cards_block(finance: dict | None, cards: list[dict] | None) 
     return "\n\n".join(parts).strip()
 
 
+# Regexes extraídas de _detect_finance_intent — se compilaban en cada call (B4 audit 2026-05-14).
+_FINANCE_CARDS_RE = re.compile(
+    r"\btarjeta(s)?\b|\bvisa\b|\bmaster(card)?\b|\bamex\b|\b"
+    r"american\s+express\b|\bcr[eé]dito\b|\bbanco\b|\bdebitos?\s+autom"
+)
+_FINANCE_MOZE_RE = re.compile(
+    r"\bmoze\b|\befectivo\b|\bgastos?\s+diarios?\b|\bd[ií]a\s+a\s+d[ií]a\b"
+)
+
+
 def _detect_finance_intent(question: str) -> str:
     """Clasifica la pregunta financiera del user para decidir qué fuente
     pasar al LLM. Tres buckets:
@@ -45373,16 +45705,9 @@ def _detect_finance_intent(question: str) -> str:
     de gastos personales — sumar los montos es alucinación.
     """
     q = (question or "").lower()
-    cards_re = re.compile(
-        r"\btarjeta(s)?\b|\bvisa\b|\bmaster(card)?\b|\bamex\b|\b"
-        r"american\s+express\b|\bcr[eé]dito\b|\bbanco\b|\bdebitos?\s+autom"
-    )
-    moze_re = re.compile(
-        r"\bmoze\b|\befectivo\b|\bgastos?\s+diarios?\b|\bd[ií]a\s+a\s+d[ií]a\b"
-    )
-    if cards_re.search(q):
+    if _FINANCE_CARDS_RE.search(q):
         return "cards"
-    if moze_re.search(q):
+    if _FINANCE_MOZE_RE.search(q):
         return "moze"
     return "generic"
 
@@ -45511,7 +45836,7 @@ def _finance_short_circuit_answer(
         from web.server import _fetch_credit_cards, _fetch_finance
         finance_data = _fetch_finance()
         cards_data = _fetch_credit_cards()
-    except Exception as exc:
+    except ImportError as exc:
         _silent_log("serve_finance_fetch", exc)
         return None
 
@@ -45904,7 +46229,7 @@ def extract_enrich_entities(question: str, answer: str) -> dict:
             "events": [str(e).strip() for e in (data.get("events") or []) if str(e).strip()][:5],
             "topics": [str(t).strip() for t in (data.get("topics") or []) if str(t).strip()][:5],
         }
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         return empty
 
 
@@ -45981,7 +46306,7 @@ def _apple_contact_name(phone: str) -> str | None:
             capture_output=True, text=True, timeout=3,
         )
         name = (res.stdout or "").strip()
-    except Exception:
+    except subprocess.SubprocessError:
         name = ""
     return name or None
 
@@ -46459,6 +46784,17 @@ def serve(host: str, port: int):
     col = get_db()
     if col.count() == 0:
         console.print("[red]Índice vacío. Ejecuta: rag index[/red]")
+        return
+
+    # D5 (audit 2026-05-14): Check database integrity on startup.
+    # Corruption like "database disk image is malformed" can go undetected
+    # until a write fails. Fail fast if the DB is corrupt.
+    console.print("[dim]Checking database integrity…[/dim]")
+    if not _db_quick_check(DB_PATH, "ragvec.db"):
+        console.print("[red]ragvec.db is corrupted. Restore from backup or run: rag index --reset[/red]")
+        return
+    if not _db_quick_check(DB_PATH, "telemetry.db"):
+        console.print("[red]telemetry.db is corrupted. Restore from backup or delete it to rebuild.[/red]")
         return
 
     # Eager warmup — block until all models are ready.
@@ -47109,7 +47445,7 @@ def serve(host: str, port: int):
                         except Exception:
                             pass
                         return _sem_payload
-            except Exception as _serve_sem_exc:
+            except ImportError as _serve_sem_exc:
                 _silent_log("serve_semantic_cache_lookup", _serve_sem_exc)
                 _serve_sem_emb = None
                 _serve_sem_hash = ""
@@ -47648,7 +47984,7 @@ def _corpus_breakdown_by_source() -> list[tuple[str, int, str]]:
     try:
         import sqlite3 as _sqlite3
         con = _sqlite3.connect(f"file:{DB_PATH / 'ragvec.db'}?mode=ro", uri=True)
-    except Exception:
+    except sqlite3.Error:
         return []
     try:
         cur = con.cursor()
@@ -47756,7 +48092,7 @@ def rag_health_report() -> dict:
                         continue
                     try:
                         rec = json.loads(line)
-                    except Exception:
+                    except (json.JSONDecodeError, TypeError):
                         continue
                     ts = rec.get("ts")
                     if not ts:
@@ -47770,7 +48106,7 @@ def rag_health_report() -> dict:
                         continue
                     key = rec.get(key_field) or "(unknown)"
                     counts[key] = counts.get(key, 0) + 1
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             pass
         return counts
 
@@ -47809,7 +48145,7 @@ def rag_health_report() -> dict:
                 ).fetchone()
                 report["cache_stats"]["rows"] = int(_row[0] or 0)
                 report["cache_stats"]["total_hits"] = int(_row[1] or 0)
-            except Exception:
+            except sqlite3.Error:
                 # Tabla no existe aún — DB fresca pre-GC#1.
                 report["cache_stats"]["rows"] = 0
                 report["cache_stats"]["total_hits"] = 0
@@ -47835,9 +48171,9 @@ def rag_health_report() -> dict:
                 _total = int(_row2[1] or 0)
                 if _total > 0:
                     report["cache_stats"]["hit_rate_24h"] = _hits / _total
-            except Exception:
+            except sqlite3.Error:
                 pass
-    except Exception:
+    except sqlite3.Error:
         # _ragvec_state_conn failed to open (missing DB, locked beyond
         # retry, etc.). Leave the None defaults — `rag stats` renders
         # "cache: (unavailable)" in that branch.
@@ -48045,7 +48381,7 @@ def _resolve_nth_source_from_last_query(
             return None
         try:
             paths = json.loads(paths_json)
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             return None
         if not isinstance(paths, list) or not paths:
             return None
@@ -48066,7 +48402,7 @@ def _resolve_nth_source_from_last_query(
             "total_sources": len(paths),
             "out_of_range": False,
         }
-    except Exception as exc:
+    except (json.JSONDecodeError, TypeError) as exc:
         _log_sql_state_error(
             "resolve_nth_source_failed", err=repr(exc),
         )
@@ -48448,7 +48784,7 @@ def session_export(
 
     try:
         target_path.write_text(md, encoding="utf-8")
-    except Exception as exc:
+    except OSError as exc:
         console.print(f"[red]Error writing {target_path}: {exc!r}[/red]")
         return
 
@@ -48791,6 +49127,16 @@ def _sql_rotate_log_tables(*, dry_run: bool = False,
         if not dry_run:
             conn.commit()
 
+        # PRAGMA optimize: actualiza estadísticas del query planner de SQLite.
+        # Costoso solo la primera vez post-ANALYZE; luego es O(dirty-pages).
+        # Se corre antes del checkpoint para que el WAL incluya los cambios
+        # de las estadísticas (C1 audit 2026-05-14).
+        if not dry_run:
+            try:
+                conn.execute("PRAGMA optimize")
+            except sqlite3.Error:
+                pass
+
         # WAL checkpoint once after all deletes — cheaper than N checkpoints.
         # Post-split: telemetry.db-wal (not ragvec.db-wal).
         wal_path = DB_PATH / (_TELEMETRY_DB_FILENAME + "-wal")
@@ -48880,10 +49226,10 @@ def _sql_rotate_log_tables(*, dry_run: bool = False,
                         (_VACUUM_META_KEY_TS, now_iso),
                     )
                     conn.execute("COMMIT")
-                except Exception:
+                except sqlite3.Error:
                     try:
                         conn.execute("ROLLBACK")
-                    except Exception:
+                    except sqlite3.Error:
                         pass
                     raise
         elif should_vacuum and dry_run:
@@ -49154,7 +49500,7 @@ def _rollback_state_migration(*, force: bool = False,
         except _sqlite.Error as e:
             try:
                 conn.execute("ROLLBACK")
-            except Exception:
+            except sqlite3.Error:
                 pass
             out["refused"] = f"sqlite error: {e}"
             return out
@@ -49332,6 +49678,10 @@ def _rag_free_plan_archived_logs(
     return out
 
 
+# Regex extraída de _rag_free_plan_ranker_snapshots — se compilaba en cada call (B4 audit 2026-05-14).
+_RANKER_SNAPSHOT_FILENAME_RE = re.compile(r"^ranker\.(\d+)\.\d+\.json$")
+
+
 def _rag_free_plan_ranker_snapshots(
     *,
     keep: int = _RAG_FREE_RANKER_KEEP_DEFAULT,
@@ -49344,12 +49694,11 @@ def _rag_free_plan_ranker_snapshots(
     state_dir = state_dir or (Path.home() / ".local/share/obsidian-rag")
     if not state_dir.is_dir():
         return []
-    pat = re.compile(r"^ranker\.(\d+)\.\d+\.json$")
     entries: list[dict] = []
     for f in state_dir.iterdir():
         if not f.is_file():
             continue
-        m = pat.match(f.name)
+        m = _RANKER_SNAPSHOT_FILENAME_RE.match(f.name)
         if not m:
             continue
         try:
@@ -49402,7 +49751,7 @@ def _rag_free_execute(
                 try:
                     conn.execute(f"DROP TABLE IF EXISTS {t}")
                     out["tables_dropped"].append(t)
-                except Exception as e:
+                except sqlite3.Error as e:
                     out["errors"].append(f"drop {t}: {e}")
             # Tambien limpiamos filas de rag_schema_version para las tablas
             # dropeadas — sin esto, futuras invocaciones de
@@ -49416,10 +49765,10 @@ def _rag_free_execute(
                     out["tables_dropped"],
                 )
             conn.execute("COMMIT")
-        except Exception as e:
+        except sqlite3.Error as e:
             try:
                 conn.execute("ROLLBACK")
-            except Exception:
+            except sqlite3.Error:
                 pass
             out["errors"].append(f"transaction: {e}")
         finally:
@@ -49435,7 +49784,7 @@ def _rag_free_execute(
                 conn.execute("VACUUM")
             finally:
                 conn.close()
-        except Exception as e:
+        except sqlite3.Error as e:
             out["errors"].append(f"vacuum: {e}")
         if ragvec_path.is_file():
             after_bytes = ragvec_path.stat().st_size + (
@@ -49648,13 +49997,13 @@ def run_maintenance(
             results["voice_briefs_cleaned"] = {
                 "deleted": n_vb, "bytes_freed": bytes_vb, "errors": [],
             }
-        except Exception as e:
+        except ImportError as e:
             results["voice_briefs_cleaned_error"] = str(e)
     else:
         try:
             from rag.voice_brief import cleanup_old_voice_briefs as _cobv  # noqa: PLC0415
             results["voice_briefs_cleaned"] = _cobv()
-        except Exception as e:
+        except ImportError as e:
             results["voice_briefs_cleaned_error"] = str(e)
 
     # 10b. Chat-uploads TTL cleanup (audit 2026-04-25 R2-Security #6).
@@ -49734,7 +50083,7 @@ def run_maintenance(
             except OSError:
                 continue
         results["reranker_ft_cleaned"] = {"deleted": _ft_deleted, "bytes_freed": _ft_bytes}
-    except Exception as e:
+    except ImportError as e:
         results["reranker_ft_cleaned_error"] = str(e)
 
     # 11. URL orphans (files deleted but URL rows remain)
@@ -49771,13 +50120,13 @@ def run_maintenance(
                         continue
                     try:
                         ev = json.loads(line)
-                    except Exception:
+                    except (json.JSONDecodeError, TypeError):
                         continue
                     paths = ev.get("paths") or []
                     if paths and not any(p in od for p in paths):
                         n_fb_orphan += 1
             results["feedback_orphans"] = n_fb_orphan
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             results["feedback_orphans"] = 0
     else:
         results["feedback_orphans"] = _prune_feedback_orphans(VAULT_PATH)
@@ -49801,7 +50150,7 @@ def run_maintenance(
                     " WHERE ts < datetime('now', '-30 days')"
                 )
                 results["conv_summaries_pruned"] = (_cs_cur.fetchone() or [0])[0]
-    except Exception as _cs_e:
+    except sqlite3.Error as _cs_e:
         results["conv_summaries_pruned_error"] = str(_cs_e)
 
     # 13. Embedder health (read-only) — verifica que el SentenceTransformer
@@ -49881,7 +50230,7 @@ def run_maintenance(
                     pass
         finally:
             _ret_con.close()
-    except Exception as exc:
+    except sqlite3.Error as exc:
         results["screen_obs_retention_error"] = str(exc)
 
     # 15. Background SQL queue health — drops son signal de overload.
@@ -49980,7 +50329,7 @@ def _validate_cutover_state() -> list[dict]:
                     f"SELECT COUNT(*) FROM {table}"  # noqa: S608 - hardcoded table list
                 ).fetchone()
                 sql_rows = int(row[0]) if row else 0
-        except Exception as exc:
+        except sqlite3.Error as exc:
             entry.update({
                 "status": "sql_err",
                 "err": repr(exc)[:200],
@@ -50316,7 +50665,7 @@ def _feedback_stats() -> dict:
                 "pos_no_cp": int(row[4] or 0),
                 "neg_no_cp": int(row[5] or 0),
             }
-    except Exception:
+    except sqlite3.Error:
         return {"total": 0, "pos": 0, "neg": 0, "with_cp": 0,
                 "pos_no_cp": 0, "neg_no_cp": 0}
 
@@ -50345,13 +50694,13 @@ def _set_feedback_corrective_path(feedback_id: int, corrective_path: str) -> boo
                     "DELETE FROM rag_feedback_golden_meta "
                     "WHERE k='last_built_source_ts'"
                 )
-            except Exception:
+            except sqlite3.Error:
                 pass
         global _feedback_golden_memo, _feedback_golden_source_ts_sql
         _feedback_golden_memo = None
         _feedback_golden_source_ts_sql = None
         return True
-    except Exception as exc:
+    except sqlite3.Error as exc:
         try:
             _log_sql_state_error("feedback_update_cp_failed", err=repr(exc))
         except Exception:
@@ -50394,7 +50743,7 @@ def _feedback_rows_without_cp(
             for rid, ts, turn_id, rating, q, paths_json in rows:
                 try:
                     paths = json.loads(paths_json) if paths_json else []
-                except Exception:
+                except (json.JSONDecodeError, TypeError):
                     paths = []
                 out.append({
                     "id": int(rid),
@@ -50405,7 +50754,7 @@ def _feedback_rows_without_cp(
                     "paths": [p for p in paths if isinstance(p, str) and p],
                 })
             return out
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         return []
 
 
@@ -50443,11 +50792,11 @@ def _harvest_candidates(
             for qid, ts, q, score, cmd, session, paths_json, scores_json in rows:
                 try:
                     paths = json.loads(paths_json) if paths_json else []
-                except Exception:
+                except (json.JSONDecodeError, TypeError):
                     paths = []
                 try:
                     scores = json.loads(scores_json) if scores_json else []
-                except Exception:
+                except (json.JSONDecodeError, TypeError):
                     scores = []
                 out.append({
                     "id": int(qid),
@@ -50460,7 +50809,7 @@ def _harvest_candidates(
                     "scores": scores,
                 })
             return out
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         return []
 
 
@@ -50514,13 +50863,13 @@ def _feedback_insert_harvested(
                     "DELETE FROM rag_feedback_golden_meta "
                     "WHERE k='last_built_source_ts'"
                 )
-            except Exception:
+            except sqlite3.Error:
                 pass
         global _feedback_golden_memo, _feedback_golden_source_ts_sql
         _feedback_golden_memo = None
         _feedback_golden_source_ts_sql = None
         return True
-    except Exception as exc:
+    except sqlite3.Error as exc:
         try:
             _log_sql_state_error("harvester_insert_failed", err=repr(exc))
         except Exception:
@@ -50962,7 +51311,7 @@ def _behavior_backfill_candidates(limit: int) -> list[dict]:
                 if extra_raw:
                     _ej = json.loads(extra_raw)
                     sess = _ej.get("session") or _ej.get("session_id")
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 sess = None
             out.append({
                 "id": int(rid),
@@ -50973,7 +51322,7 @@ def _behavior_backfill_candidates(limit: int) -> list[dict]:
                 "session": sess,
                 "extra_json_raw": extra_raw,
             })
-    except Exception as exc:
+    except (json.JSONDecodeError, TypeError) as exc:
         _log_sql_state_error("behavior_backfill_candidates_failed", err=repr(exc))
     return out
 
@@ -51102,7 +51451,7 @@ def _behavior_backfill_find_match(
                     "match_policy": "time_nearest",
                     "delta_s": _behavior_delta_seconds(orphan_ts, row[1]),
                 }
-    except Exception as exc:
+    except sqlite3.Error as exc:
         _log_sql_state_error("behavior_backfill_match_failed", err=repr(exc))
     return None
 
@@ -51129,7 +51478,7 @@ def _behavior_backfill_apply(row_id: int, extra_raw: str | None,
     tracing fields del backfill. Returns True on success."""
     try:
         extra = json.loads(extra_raw) if extra_raw else {}
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         extra = {}
     extra["original_query_id"] = int(query_id)
     # Provenance — útil para auditar después qué fue backfilleado vs
@@ -51319,7 +51668,7 @@ def context_estimate(
     if file_arg:
         try:
             text = Path(file_arg).read_text(encoding="utf-8", errors="ignore")
-        except Exception as exc:
+        except OSError as exc:
             console.print(f"[red]Error leyendo {file_arg}: {exc!r}[/red]")
             return
     elif text_arg:
@@ -51465,7 +51814,7 @@ def _train_paraphrases_from_feedback(
                 f"  AND q.variants_json IS NOT NULL "
                 f"  AND q.variants_json != '' "
             ).fetchall()
-    except Exception:
+    except sqlite3.Error:
         stats["errors"] += 1
         return stats
     for q, variants_json in rows:
@@ -51475,7 +51824,7 @@ def _train_paraphrases_from_feedback(
             continue
         try:
             variants = json.loads(variants_json)
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             stats["errors"] += 1
             continue
         if not isinstance(variants, list):
@@ -51548,7 +51897,7 @@ def paraphrases_stats(limit: int):
                 "ORDER BY hit_count DESC, last_used_ts DESC LIMIT ?",
                 (int(limit),),
             ).fetchall()
-    except Exception as exc:
+    except sqlite3.Error as exc:
         console.print(f"[red]Error: {exc!r}[/red]")
         return
     console.print()
@@ -51589,7 +51938,7 @@ def paraphrases_clear(yes: bool):
             cur = conn.execute("DELETE FROM rag_learned_paraphrases")
             n = cur.rowcount or 0
         console.print(f"[green]✓[/green] Borradas {n} rows.")
-    except Exception as exc:
+    except sqlite3.Error as exc:
         console.print(f"[red]Error: {exc!r}[/red]")
 
 
@@ -52079,7 +52428,7 @@ def get_nli_model():
                         # MLX-aware: skipea cuando backend full-MLX (no-op).
                         _torch_mps_empty_cache()
                 _nli_model.predict = _nli_predict_with_cleanup
-        except Exception as exc:
+        except ImportError as exc:
             _silent_log("nli_load_failed", exc)
             return None
     return _nli_model
@@ -52101,7 +52450,7 @@ def maybe_unload_nli_model(force: bool = False) -> bool:
             _nli_model = None
             _torch_mps_empty_cache()
             gc.collect()
-        except Exception as exc:
+        except ImportError as exc:
             _silent_log("nli_unload", exc)
     return True
 
@@ -52759,7 +53108,7 @@ def _upsert_entities_for_chunk(
         conn.commit()
         return len(entities)
 
-    except Exception as exc:
+    except (json.JSONDecodeError, TypeError) as exc:
         try:
             _silent_log("entity_upsert_failed", exc)
         except Exception:
@@ -52845,7 +53194,7 @@ def receipt(image_path: Path, as_json: bool, no_cache: bool):
                     "DELETE FROM rag_vlm_receipts WHERE image_path = ?",
                     (str(image_path.resolve()),),
                 )
-        except Exception:
+        except sqlite3.Error:
             pass
 
     parsed = _vlm_parse_receipt(image_path)

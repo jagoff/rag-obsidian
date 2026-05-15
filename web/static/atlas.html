@@ -31,7 +31,9 @@
   </script>
   <script src="/static/pwa/register-sw.js" defer></script>
   <!-- Chart.js para sparklines de entidades. Misma versión que dashboard/finance. -->
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js" defer></script>
+  <script src="/static/vendor/chart.umd.min.js"
+          integrity="sha384-vsrfeLOOY6KuIYKDlmVH5UiBmgIdB1oEf7p01YgWHuqmOHfZr374+odEv96n9tNC"
+          defer></script>
   <!-- ── 3D force-directed graph (Vasco Asturiano + three.js) ─────────
        three@0.149 es la última versión que expone `window.THREE` como
        global UMD — three deprecó UMD en r150+ y la r160 lo sacó del
@@ -46,9 +48,12 @@
             LinearFilter al construir el canvas-texture del label).
        Total ~700 KB gzip; cargado solo en /atlas, otros dashboards no
        pagan. NO defer porque atlas.js los usa al boot vía global. -->
-  <script src="https://cdn.jsdelivr.net/npm/three@0.149.0/build/three.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/3d-force-graph@1.73.4/dist/3d-force-graph.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/three-spritetext@1.8.2/dist/three-spritetext.min.js"></script>
+  <script src="/static/vendor/three-0.149.0.min.js"
+          integrity="sha384-RRHfJ6w1mTlKUBMYT/hvnRiOzEB/vyRV3DrQOseb6oYfvaZSfdd0byS4bHps0k2R"></script>
+  <script src="/static/vendor/3d-force-graph-1.73.4.min.js"
+          integrity="sha384-GNPicn8pBA2/PGSyPTpxIlPurgLUYcNYJ2zskIq782dE9+gp5E32WSyuxZqA7J+u"></script>
+  <script src="/static/vendor/three-spritetext-1.8.2.min.js"
+          integrity="sha384-8hX0id4j/d/+9ukCS+LZDb9WpPp63OqiuZ5bpPPnixibnP01z1avvWuQD3xdEIQX"></script>
   <style>
     :root {
       --bg: #1a1a1f;

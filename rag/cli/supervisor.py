@@ -163,6 +163,11 @@ def logs_cmd(follow: bool, n: int) -> None:
         args.append("-f")
     args += ["-n", str(n), str(log_path)]
     try:
-        subprocess.run(args, check=False)
+        # tail -f es interactivo → sin timeout (el user lo interrumpe con C-c).
+        # tail estático tiene timeout de seguridad por si el FS se congela.
+        timeout = None if follow else 10
+        subprocess.run(args, check=False, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        click.secho("✗ tail timed out (FS frozen?)", fg="red", err=True)
     except KeyboardInterrupt:
         pass

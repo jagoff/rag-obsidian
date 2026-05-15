@@ -103,6 +103,29 @@ MLX_MODEL_ALIAS: dict[str, str] = {
 SHORT_NAME_ALIAS: dict[str, str] = {v: k for k, v in MLX_MODEL_ALIAS.items()}
 
 
+def list_cached_mlx_models() -> list[str]:
+    """Return cached MLX HuggingFace model IDs without importing MLX runtime."""
+    from pathlib import Path
+
+    hub = Path.home() / ".cache" / "huggingface" / "hub"
+    if not hub.exists():
+        return []
+    out: list[str] = []
+    for d in hub.iterdir():
+        if not d.is_dir():
+            continue
+        name = d.name
+        if "mlx-community" not in name:
+            continue
+        # `models--mlx-community--Qwen2.5-3B-Instruct-4bit` →
+        # `mlx-community/Qwen2.5-3B-Instruct-4bit`
+        stripped = name.removeprefix("models--")
+        parts = stripped.split("--")
+        if len(parts) >= 2:
+            out.append(f"{parts[0]}/{'-'.join(parts[1:])}")
+    return out
+
+
 def to_mlx(model: str) -> str:
     """Resolve any model name to its MLX HuggingFace ID."""
     if model.startswith("mlx-community/"):
@@ -354,6 +377,11 @@ class MLXBackend(LLMBackend):
                 "mlx-lm not installed. Run `uv tool install --reinstall "
                 "--editable '.[mlx]'`."
             ) from e
+        except RuntimeError as e:
+            raise RuntimeError(
+                "mlx-lm is installed but MLX could not initialize a Metal device. "
+                "Run this on an Apple Silicon/macOS session with Metal available."
+            ) from e
 
         # OrderedDict to preserve LRU order: oldest first, newest last
         from collections import OrderedDict
@@ -532,11 +560,16 @@ class MLXBackend(LLMBackend):
             is_big = incoming in self._BIG_MODELS
 
             if is_big:
-                # Big models are single-tenant: evict everything else.
+                # Big models are single-tenant: evict everything else,
+                # including the embedder — it stays in VRAM otherwise and
+                # inflates usage when Qwen3-30B (~17 GB) loads.
                 for k in list(self._loaded.keys()):
                     if k != incoming:
                         self._loaded.pop(k, None)
                         self._last_used.pop(k, None)
+                for k in list(self._loaded_embed.keys()):
+                    self._loaded_embed.pop(k, None)
+                    self._last_used.pop(k, None)
                 return
 
             # Incoming is small: evict any big, then LRU-trim small ones.
@@ -888,26 +921,7 @@ class MLXBackend(LLMBackend):
         return s
 
     def list_available(self) -> list[str]:
-        # Scan ~/.cache/huggingface/hub/ for mlx-community models
-        from pathlib import Path
-
-        hub = Path.home() / ".cache" / "huggingface" / "hub"
-        if not hub.exists():
-            return []
-        out: list[str] = []
-        for d in hub.iterdir():
-            if not d.is_dir():
-                continue
-            name = d.name
-            if "mlx-community" not in name:
-                continue
-            # `models--mlx-community--Qwen2.5-3B-Instruct-4bit` →
-            # `mlx-community/Qwen2.5-3B-Instruct-4bit`
-            stripped = name.removeprefix("models--")
-            parts = stripped.split("--")
-            if len(parts) >= 2:
-                out.append(f"{parts[0]}/{'-'.join(parts[1:])}")
-        return out
+        return list_cached_mlx_models()
 
     def unload(self, model: str | None = None) -> bool:
         """Pop `model` (or all) from `_loaded` + clear MLX Metal cache.
@@ -984,14 +998,17 @@ class MLXBackend(LLMBackend):
 
         canonical = to_mlx(model)
 
-        # Load (or retrieve cached) embedder model + tokenizer
-        if canonical not in self._loaded_embed:
-            from mlx_lm import load  # type: ignore[import-not-found]
+        # Load (or retrieve cached) embedder model + tokenizer.
+        # Double-checked under lock: concurrent requests can both pass the
+        # `not in` check and trigger two mlx_lm.load() calls without the
+        # lock, wasting ~5-8s and potentially leaving a dangling reference.
+        with self._loaded_lock:
+            if canonical not in self._loaded_embed:
+                from mlx_lm import load  # type: ignore[import-not-found]
 
-            embed_model, embed_tokenizer = load(canonical)
-            self._loaded_embed[canonical] = (embed_model, embed_tokenizer)
-
-        embed_model, embed_tokenizer = self._loaded_embed[canonical]
+                embed_model, embed_tokenizer = load(canonical)
+                self._loaded_embed[canonical] = (embed_model, embed_tokenizer)
+            embed_model, embed_tokenizer = self._loaded_embed[canonical]
         self._last_used[canonical] = time.monotonic()
 
         # mlx-lm wraps HF tokenizers in `TokenizerWrapper` (not directly
@@ -1049,7 +1066,13 @@ class MLXBackend(LLMBackend):
             )
 
         mx.eval(normalised)
-        return {"embeddings": normalised.tolist()}
+        result = normalised.tolist()
+        # Liberar tensores MLX (hidden B×T×D, pooled B×D, normalised B×D)
+        # antes de retornar. Sin clear_cache los buffers Metal permanecen
+        # hasta presión externa → fragmentation acumulada en embed calls
+        # frecuentes (queries, tune, etc.).
+        mx.clear_cache()
+        return {"embeddings": result}
 
     def _get_sampler(self, temperature: float, top_p: float) -> Any:
         """Return a cached make_sampler() result for (temperature, top_p).
@@ -1102,6 +1125,7 @@ class MLXBackend(LLMBackend):
 
 
 _BACKEND_SINGLETON: LLMBackend | None = None
+_BACKEND_SINGLETON_LOCK = threading.Lock()
 
 
 def get_backend() -> LLMBackend:
@@ -1109,7 +1133,9 @@ def get_backend() -> LLMBackend:
     global _BACKEND_SINGLETON
     if _BACKEND_SINGLETON is not None:
         return _BACKEND_SINGLETON
-    _BACKEND_SINGLETON = MLXBackend()
+    with _BACKEND_SINGLETON_LOCK:
+        if _BACKEND_SINGLETON is None:
+            _BACKEND_SINGLETON = MLXBackend()
     return _BACKEND_SINGLETON
 
 
@@ -1130,6 +1156,7 @@ __all__ = [
     "MLXBackend",
     "MLX_MODEL_ALIAS",
     "get_backend",
+    "list_cached_mlx_models",
     "reset_backend",
     "strip_think_blocks",
     "to_mlx",

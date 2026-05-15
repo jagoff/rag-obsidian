@@ -6,16 +6,23 @@ Cubre:
 - ``generate_insights()`` JSON parsing (strict + markdown fence),
   truncation a 5×500 chars, error path cuando LLM falla.
 - ``cache_invalidate()`` clear total.
+- ``_source_screen_time()`` DB inexistente, DB locked (timeout),
+  conn leak (conn.close() en excepción).
 """
 from __future__ import annotations
 
 import json
+import sqlite3
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from rag import mirror as mirror_mod
 from rag.mirror import (
     _SOURCES,
+    _source_screen_time,
     assemble_mirror,
     cache_invalidate,
     generate_insights,
@@ -229,3 +236,85 @@ def _patch_backend(monkeypatch, content: str):
 
     monkeypatch.setattr("rag.llm_backend.get_backend", lambda: _BE())
     monkeypatch.setattr("rag.resolve_chat_model", lambda _t: "qwen2.5:3b")
+
+
+# ── _source_screen_time ─────────────────────────────────────────────────
+
+
+def test_source_screen_time_db_not_found(monkeypatch, tmp_path):
+    """DB inexistente → devuelve {"apps": []} sin excepción."""
+    monkeypatch.setattr(mirror_mod.Path, "home", lambda: tmp_path)
+    result = _source_screen_time("2026-05-14")
+    assert result == {"apps": []}
+
+
+def test_source_screen_time_returns_top5(monkeypatch, tmp_path):
+    """DB con datos válidos → devuelve top 5 apps ordenadas por uso."""
+    db_dir = tmp_path / "Library" / "Application Support" / "ScreenTime"
+    db_dir.mkdir(parents=True)
+    db_path = db_dir / "MTDatabase.db"
+
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE ZUSAGE (ZBUNDLEID TEXT, ZTOTALTIMEINSECONDS REAL, ZDAY TEXT)"
+    )
+    today = "2026-05-14"
+    for i, (bundle, secs) in enumerate([
+        ("com.apple.Safari", 7200),
+        ("com.slack.desktop", 5400),
+        ("com.apple.Terminal", 3600),
+        ("com.spotify.client", 1800),
+        ("com.apple.mail", 900),
+        ("com.apple.finder", 300),
+    ]):
+        conn.execute("INSERT INTO ZUSAGE VALUES (?, ?, ?)", (bundle, secs, today))
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(mirror_mod.Path, "home", lambda: tmp_path)
+    result = _source_screen_time(today)
+
+    assert "apps" in result
+    assert len(result["apps"]) == 5
+    assert result["apps"][0]["app_name"] == "Safari"
+    assert result["apps"][0]["total_hours"] == round(7200 / 3600, 2)
+
+
+def test_source_screen_time_conn_closed_on_exception(monkeypatch, tmp_path):
+    """conn.close() se llama incluso si cursor.execute() falla (no conn leak)."""
+    db_dir = tmp_path / "Library" / "Application Support" / "ScreenTime"
+    db_dir.mkdir(parents=True)
+    db_path = db_dir / "MTDatabase.db"
+
+    # Crear la DB vacía (sin tabla) para que cursor.execute() falle con OperationalError.
+    conn_init = sqlite3.connect(str(db_path))
+    conn_init.close()
+
+    close_calls = []
+
+    class _TrackedConn:
+        """Wrapper que delega a una conexión real y registra close()."""
+        def __init__(self, real):
+            self._real = real
+            self.row_factory = None
+
+        def cursor(self):
+            return self._real.cursor()
+
+        def close(self):
+            close_calls.append(True)
+            self._real.close()
+
+    original_connect = sqlite3.connect
+
+    def patched_connect(path, **kwargs):
+        real = original_connect(path, **kwargs)
+        return _TrackedConn(real)
+
+    monkeypatch.setattr(mirror_mod.Path, "home", lambda: tmp_path)
+    with patch("rag.mirror.sqlite3.connect", side_effect=patched_connect):
+        result = _source_screen_time("2026-05-14")
+
+    # La tabla ZUSAGE no existe → OperationalError → conn.close() igual se llama.
+    assert "error" in result
+    assert len(close_calls) == 1, "conn.close() debe haberse llamado exactamente una vez"

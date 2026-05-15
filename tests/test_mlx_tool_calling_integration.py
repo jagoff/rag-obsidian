@@ -17,7 +17,12 @@ from typing import Any
 
 import pytest
 
-mlx_lm = pytest.importorskip("mlx_lm")  # noqa: F841
+try:
+    mlx_lm = pytest.importorskip("mlx_lm")  # noqa: F841
+except RuntimeError as exc:
+    if "No Metal device available" in str(exc):
+        pytest.skip("requires MLX Metal device", allow_module_level=True)
+    raise
 
 from rag.llm_backend import ChatOptions, MLXBackend, reset_backend  # noqa: E402
 

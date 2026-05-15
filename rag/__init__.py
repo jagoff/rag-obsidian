@@ -59,7 +59,7 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 try:
     import tqdm as _tqdm_preset
     _tqdm_preset.tqdm.set_lock(threading.RLock())
-except Exception:  # pragma: no cover - tqdm not installed
+except ImportError:
     pass
 
 # Drain joblib/loky pool on interpreter exit (shared with web/server.py).
@@ -852,7 +852,7 @@ def _log_writer_loop() -> None:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 with path.open("a", encoding="utf-8") as f:
                     f.write(line)
-            except Exception as _exc_log_write:
+            except OSError as _exc_log_write:
                 # Si el writer mismo falla, NO podemos llamar a
                 # _silent_log() (recursión infinita). Fallback: stderr,
                 # que en launchd va al StandardErrorPath del plist
@@ -863,7 +863,7 @@ def _log_writer_loop() -> None:
                         f"[rag-log-writer] write to {path} failed: "
                         f"{type(_exc_log_write).__name__}: {_exc_log_write}\n"
                     )
-                except Exception:
+                except ImportError:
                     pass
         finally:
             _LOG_QUEUE.task_done()
@@ -1116,7 +1116,7 @@ def _silent_log(where: str, exc: BaseException, *, with_traceback: bool = False)
                 pass
         line = json.dumps(record, ensure_ascii=False) + "\n"
         _LOG_QUEUE.put_nowait((SILENT_ERRORS_LOG_PATH, line))
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         pass
     _bump_silent_log_counter()
 
@@ -1136,7 +1136,7 @@ def _log_collection_op(op: str, collection_name: str, extra: dict | None = None)
         COLLECTION_OPS_LOG.parent.mkdir(parents=True, exist_ok=True)
         with COLLECTION_OPS_LOG.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception as exc:
+    except (json.JSONDecodeError, TypeError) as exc:
         _silent_log("collection_ops_log_write", exc)
 
 
@@ -1777,7 +1777,7 @@ def _brief_state_seen(brief_path: str, cited_path: str) -> bool:
                 (key,),
             ).fetchone()
             return row is not None
-    except Exception as exc:
+    except sqlite3.Error as exc:
         _log_sql_state_error("brief_state_sql_read_failed", err=repr(exc))
         return False
 
@@ -1829,7 +1829,7 @@ def _diff_brief_signal() -> None:
                     "brief_path": r["brief_path"],
                     "paths_cited": json.loads(r["paths_cited_json"] or "[]"),
                 }
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 continue
             entries.append(rec)
 
@@ -1886,7 +1886,7 @@ def _diff_brief_signal() -> None:
                     "path": cited,
                 })
                 _brief_state_record(brief_path_str, cited)
-    except Exception as exc:
+    except (json.JSONDecodeError, TypeError) as exc:
         # Brief generation must never fail because of signal diff. Log
         # so we can notice if this subsystem silently stops producing
         # kept/deleted events (would degrade ranker-vivo input).
@@ -2536,7 +2536,7 @@ def _load_cross_source_filters() -> dict:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             raw = {}
-    except Exception as exc:
+    except OSError as exc:
         # H-7 fix (2026-05-08): NO memoizar `{}` en falla transitoria.
         # Pre-fix: un YAML parse error o read error one-shot deshabilitaba
         # *todas* las reglas cross-source hasta el próximo restart, porque
@@ -3357,7 +3357,7 @@ def _load_context_cache() -> dict[str, str]:
         if CONTEXT_CACHE_PATH.is_file():
             try:
                 _context_cache = OrderedDict(json.loads(CONTEXT_CACHE_PATH.read_text()))
-            except Exception as exc:
+            except (json.JSONDecodeError, TypeError) as exc:
                 _silent_log("context_cache_load", exc)
                 _context_cache = OrderedDict()
         else:
@@ -3660,7 +3660,7 @@ def _generate_context_summary(text: str, title: str, folder: str) -> str:
         if result is None:
             return None
         return result
-    except Exception:
+    except ImportError:
         # Audit 2026-04-26: pre-fix devolvía "" en error transitorio →
         # `get_context_summary` cacheaba ese "" → embedding del chunk
         # quedaba SIN prefix contextual permanente (hasta que la nota
@@ -4500,7 +4500,7 @@ class RankerWeights:
             if RANKER_CONFIG_PATH.is_file():
                 data = json.loads(RANKER_CONFIG_PATH.read_text(encoding="utf-8"))
                 return cls.from_dict(data.get("weights", {}) if isinstance(data, dict) else {})
-        except Exception as exc:
+        except (json.JSONDecodeError, TypeError) as exc:
             # Corrupt ranker.json silently reverts to hardcoded defaults —
             # tuning weights lost until next `rag tune --apply`. Log so we
             # can detect it before eval regressions surface.
@@ -4741,7 +4741,7 @@ def load_ignored_paths() -> set[str]:
         result = set(data.get("paths", []))
         _ignored_paths_cache = (mt, result)
         return result
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         return set()
 
 
@@ -4851,9 +4851,9 @@ def record_feedback(
                 conn.execute(
                     "DELETE FROM rag_feedback_golden_meta "
                     "WHERE k='last_built_source_ts'")
-            except Exception:
+            except sqlite3.Error:
                 pass
-    except Exception as exc:
+    except sqlite3.Error as exc:
         _log_sql_state_error("feedback_sql_write_failed", err=repr(exc))
     # Also clear the in-process memo so the next load picks up the new state.
     global _feedback_golden_memo, _feedback_golden_source_ts_sql
@@ -4918,7 +4918,7 @@ def _maybe_trigger_incremental_tune() -> bool:
                 (last_tune_iso,),
             ).fetchone()
             n_new = int(cnt[0] if cnt else 0)
-    except Exception as exc:
+    except sqlite3.Error as exc:
         _log_sql_state_error("incremental_tune_check_sql_failed",
                               err=repr(exc))
         return False
@@ -4973,7 +4973,7 @@ def _maybe_trigger_incremental_tune() -> bool:
                 "RAG_INCREMENTAL_TUNE_THRESHOLD": "0",  # avoid recursion
             },
         )
-    except Exception as exc:
+    except subprocess.SubprocessError as exc:
         _log_sql_state_error("incremental_tune_spawn_failed",
                               err=repr(exc))
         try:
@@ -5000,7 +5000,7 @@ def feedback_counts() -> tuple[int, int]:
                 " SUM(CASE WHEN rating < 0 THEN 1 ELSE 0 END)"
                 " FROM rag_feedback"
             ).fetchone()
-    except Exception as exc:
+    except sqlite3.Error as exc:
         _silent_log("feedback_counts_sql_read", exc)
         return 0, 0
     if row is None:
@@ -5039,7 +5039,7 @@ def _feedback_golden_meta_ts(conn) -> str | None:
             "SELECT v FROM rag_feedback_golden_meta WHERE k='last_built_source_ts'"
         ).fetchone()
         return row[0] if row and row[0] else None
-    except Exception:
+    except sqlite3.Error:
         return None
 
 
@@ -5047,7 +5047,7 @@ def _feedback_golden_table_empty(conn) -> bool:
     try:
         row = conn.execute("SELECT COUNT(*) FROM rag_feedback_golden").fetchone()
         return int(row[0] if row else 0) == 0
-    except Exception:
+    except sqlite3.Error:
         return True
 
 
@@ -5121,10 +5121,10 @@ def _write_feedback_golden_sql(conn, golden: dict, source_ts: str) -> None:
             ("last_built_source_ts", source_ts),
         )
         conn.execute("COMMIT")
-    except Exception:
+    except sqlite3.Error:
         try:
             conn.execute("ROLLBACK")
-        except Exception:
+        except sqlite3.Error:
             pass
         raise
 
@@ -5174,13 +5174,13 @@ def _rebuild_feedback_golden_from_sql_feedback(conn) -> dict:
             continue
         try:
             paths = json.loads(r["paths_json"]) if r["paths_json"] else []
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             paths = []
         extra: dict = {}
         if r["extra_json"]:
             try:
                 extra = json.loads(r["extra_json"]) or {}
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 extra = {}
         ev = {
             "turn_id": tid,
@@ -7265,7 +7265,7 @@ def _log_sql_state_error(event_type: str, **fields) -> None:
                "event": event_type, **fields}
         with _SQL_STATE_ERROR_LOG.open("a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         pass
     _bump_silent_log_counter()
 
@@ -7795,7 +7795,7 @@ class SqliteVecCollection:
         if extra:
             try:
                 out.update(json.loads(extra))
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 pass
         return out
 
@@ -8252,7 +8252,7 @@ def _db_quick_check(db_path: Path, db_name: str = "ragvec.db") -> bool:
                 return False
         finally:
             conn.close()
-    except Exception as e:
+    except sqlite3.Error as e:
         console.print(f"[red]Failed to run quick_check on {db_name}: {e}[/red]")
         return False
 
@@ -8518,7 +8518,7 @@ def _load_wiki_cache() -> dict[str, str]:
         if WIKI_CACHE_PATH.is_file():
             try:
                 _wiki_cache = OrderedDict(json.loads(WIKI_CACHE_PATH.read_text()))
-            except Exception as exc:
+            except (json.JSONDecodeError, TypeError) as exc:
                 _silent_log("wiki_cache_load", exc)
                 _wiki_cache = OrderedDict()
         else:
@@ -8574,7 +8574,7 @@ def _generate_wiki_page_summary(text: str, title: str, folder: str) -> dict | No
         )
         raw = resp.message.content.strip()
         data = json.loads(raw)
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         # Transient — do not cache. Next index pass retries.
         return None
     if not isinstance(data, dict):
@@ -8635,7 +8635,7 @@ def _is_rag_wiki_page(page_path: Path) -> bool:
         return False
     try:
         raw = page_path.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
+    except OSError:
         return False
     if not raw.startswith("---"):
         return False
@@ -8735,7 +8735,7 @@ def _get_or_generate_wiki_page_data(
             cache.move_to_end(source_hash)
             try:
                 return json.loads(cache[source_hash])
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 # Corrupt entry — fall through to regenerate and overwrite.
                 pass
     if len(text) < _WIKI_MIN_BODY:
@@ -8775,7 +8775,7 @@ def _update_wiki_index(vault_path: Path) -> int:
             continue
         try:
             raw = page.read_text(encoding="utf-8", errors="ignore")
-        except Exception:
+        except OSError:
             continue
         title = page.stem
         source = ""
@@ -10739,7 +10739,7 @@ def _osascript_contact_search(predicate: str, value: str) -> dict | None:
             check=False, timeout=2.0,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-    except Exception:
+    except subprocess.SubprocessError:
         # Silent-fail: si `open` falla, el osascript de abajo va a
         # fallar con -600 igual y terminamos en el warning branch.
         pass
@@ -10782,7 +10782,7 @@ end run
                     f"[contacts-shim] osascript failed (rc={proc.returncode}): "
                     f"{(proc.stderr or '').strip()[:160]}\n"
                 )
-            except Exception:
+            except ImportError:
                 pass
         return None
     out = (proc.stdout or "").strip()
@@ -11000,7 +11000,7 @@ def _ensure_contacts_cache(ttl_s: int = _CONTACTS_PHONE_INDEX_TTL_S) -> dict:
                         _contacts_phone_index = cache
                     return cache
                 # else: schema viejo (v1 o ausente) → fallthrough a tier 3
-    except Exception as exc:
+    except (json.JSONDecodeError, TypeError) as exc:
         _silent_log("contacts_phone_index_disk_read", exc)
 
     # Tier 3: osascript dump
@@ -11012,7 +11012,7 @@ def _ensure_contacts_cache(ttl_s: int = _CONTACTS_PHONE_INDEX_TTL_S) -> dict:
         )
         if proc.returncode == 0:
             out = proc.stdout or ""
-    except Exception as exc:
+    except subprocess.SubprocessError as exc:
         _silent_log("contacts_dump_osascript", exc)
 
     idx, contacts = _parse_contacts_dump(out)
@@ -11037,7 +11037,7 @@ def _ensure_contacts_cache(ttl_s: int = _CONTACTS_PHONE_INDEX_TTL_S) -> dict:
                 }),
                 encoding="utf-8",
             )
-        except Exception as exc:
+        except (json.JSONDecodeError, TypeError) as exc:
             _silent_log("contacts_phone_index_disk_write", exc)
 
     with _contacts_cache_lock:
@@ -11132,7 +11132,7 @@ def _recent_contact_keys(channel: str, limit: int = 20) -> list[str]:
                 f"ORDER BY id DESC LIMIT ?",
                 (*cmds, fetch_n),
             ).fetchall()
-    except Exception as exc:
+    except sqlite3.Error as exc:
         _silent_log("recent_contact_keys", exc)
         return []
 
@@ -11143,7 +11143,7 @@ def _recent_contact_keys(channel: str, limit: int = 20) -> list[str]:
             continue
         try:
             payload = json.loads(payload_json)
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             continue
         raw = payload.get(field) or ""
         if not raw:
@@ -11353,7 +11353,7 @@ def build_person_context(query: str, vault_root: Path | None = None) -> str | No
         full = root / rel
         try:
             body = _strip_frontmatter(full.read_text(encoding="utf-8")).strip()
-        except Exception:
+        except OSError:
             continue
         if not body:
             continue
@@ -11685,7 +11685,7 @@ def _apply_reranker_lora_adapter(model, adapter_dir: Path) -> bool:
         # downstream `.predict()` calls hit the LoRA-adjusted forward.
         model.model = peft_model
         return True
-    except Exception as exc:
+    except ImportError as exc:
         # Catch-all: any unexpected failure (corrupt safetensors, dtype
         # mismatch, OOM during adapter init) falls back to base model.
         _silent_log("reranker_ft_adapter_load_failed", exc)
@@ -11845,7 +11845,7 @@ def get_reranker():
             # CLI standalone al import de mlx_lm.
             try:
                 from rag.llm_backend import _MLX_FORWARD_LOCK as _fwd_lock
-            except Exception:
+            except ImportError:
                 _fwd_lock = None
 
             def _predict_with_cleanup(*args, **kwargs):
@@ -11895,14 +11895,14 @@ def maybe_unload_reranker(force: bool = False) -> bool:
                 from rag.mlx_reranker import MLXReranker
                 if isinstance(_reranker, MLXReranker):
                     _reranker.unload()
-            except Exception:
+            except ImportError:
                 pass
             del _reranker
             _reranker = None
             # MLX-aware: skipea cuando backend full-MLX (MLX maneja propio cache).
             _torch_mps_empty_cache()
             gc.collect()
-        except Exception as exc:
+        except ImportError as exc:
             # Called out in code-review-followup as a site where silent
             # failure could mask a real bug. If gc/del on the reranker
             # throws, we've left _reranker at None but didn't free the
@@ -12154,7 +12154,7 @@ def _load_expand_cache() -> "OrderedDict[str, list[str]]":
             return _expand_cache
         try:
             data = json.loads(EXPAND_CACHE_PATH.read_text())
-        except Exception as exc:
+        except (json.JSONDecodeError, TypeError) as exc:
             _silent_log("expand_cache_load", exc)
             try:
                 backup = EXPAND_CACHE_PATH.with_suffix(
@@ -12202,7 +12202,7 @@ def _save_expand_cache() -> None:
     try:
         tmp.write_text(payload)
         os.replace(tmp, EXPAND_CACHE_PATH)
-    except Exception:
+    except OSError:
         try:
             tmp.unlink(missing_ok=True)
         except Exception:  # pragma: no cover
@@ -12304,7 +12304,7 @@ def _lookup_learned_paraphrases(question: str, *, limit: int = 2) -> list[str]:
                     [now_ts, key, *para_texts],
                 )
             return para_texts
-    except Exception:
+    except sqlite3.Error:
         return []
 
 
@@ -12332,7 +12332,7 @@ def _record_learned_paraphrase(
                 (q_norm, paraphrase, ts, ts),
             )
         return True
-    except Exception:
+    except sqlite3.Error:
         return False
 
 
@@ -12724,7 +12724,7 @@ def recency_boost(meta: dict, half_life_days: float = 90.0) -> float:
         # Accept ISO strings like "2026-04-13T16:50:16-03:00" or date-only.
         from datetime import datetime as _dt
         dt = _dt.fromisoformat(stamp.replace("Z", "+00:00"))
-    except Exception:
+    except ImportError:
         return 0.0
     try:
         now = datetime.now(dt.tzinfo) if dt.tzinfo else datetime.now()
@@ -12941,7 +12941,7 @@ def _classify_intent_llm(
         )
         raw = resp.message.content.strip()
         data = json.loads(raw)
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         return None
     if not isinstance(data, dict):
         return None
@@ -13112,7 +13112,7 @@ def classify_intent(
             if tr:
                 params["date_range"] = tr
                 return "episodic", params
-    except Exception:  # noqa: BLE001
+    except ImportError:
         pass
 
     if _INTENT_COUNT_RE.search(question):
@@ -13486,7 +13486,7 @@ def resolve_entity_from_query(question: str, sql_conn) -> tuple[str, int] | None
             return None
         scored.sort(reverse=True)
         return (scored[0][2], scored[0][1])
-    except Exception as exc:
+    except (json.JSONDecodeError, TypeError) as exc:
         try:
             _silent_log("entity_resolve_error", exc)
         except Exception:
@@ -13521,7 +13521,7 @@ def handle_entity_lookup(
                 "WHERE entity_id = ? ORDER BY ts DESC LIMIT 200",
                 (entity_id,)
             ).fetchall()
-    except Exception as exc:
+    except sqlite3.Error as exc:
         try:
             _silent_log("entity_lookup_sql_failed", exc)
         except Exception:
@@ -14119,7 +14119,7 @@ def system_prompt_for_intent(intent: str, loose: bool) -> str:
             fingerprint = summarize_for_prompt()
             if fingerprint:
                 base = base + "\n" + fingerprint
-        except Exception:  # noqa: BLE001
+        except ImportError:
             # Silent — si hay bug en el extractor, no rompemos el prompt.
             pass
     # G4 — Episodic intent appendea instrucción narrativa.
@@ -14127,7 +14127,7 @@ def system_prompt_for_intent(intent: str, loose: bool) -> str:
         try:
             from rag.episodic import episodic_system_prompt_suffix  # noqa: PLC0415
             base = base + episodic_system_prompt_suffix()
-        except Exception:  # noqa: BLE001
+        except ImportError:
             pass
     return base
 
@@ -14436,7 +14436,7 @@ def _chat_copy_to_clipboard(text: str) -> bool:
         ) as proc:
             proc.stdin.write(text.encode("utf-8"))
         return True
-    except Exception:
+    except subprocess.SubprocessError:
         return False
 
 
@@ -14502,7 +14502,7 @@ def _chat_setup_readline() -> Path | None:
                 pass
         atexit.register(_save)
         return path
-    except Exception:
+    except OSError:
         return None
 
 
@@ -15058,7 +15058,7 @@ def find_contradictions(
         return []
     try:
         data = json.loads(m.group(0))
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         return []
     hits = data.get("contradictions") or []
     if not isinstance(hits, list):
@@ -15447,7 +15447,7 @@ def _summarize_conversation_history(
             ).fetchone()
         if row:
             return row[0]
-    except Exception as _e:
+    except sqlite3.Error as _e:
         _silent_log("conversation_summary_cache_read_error", {"error": str(_e)})
         _bump_silent_log_counter()
 
@@ -15502,7 +15502,7 @@ def _summarize_conversation_history(
                 (session_id, history_hash, summary, _now_iso),
             )
             _conn.commit()
-    except Exception as _e:
+    except sqlite3.Error as _e:
         _silent_log("conversation_summary_cache_write_error", {"error": str(_e)})
         _bump_silent_log_counter()
         # Cache write failure is non-fatal — we already have the summary
@@ -16942,7 +16942,7 @@ def retrieve(
                     _apply_typo_telemetry(_decompose_rr)
                     return _decompose_rr
                 # Fall through si las sub-retrieves no devolvieron nada.
-        except Exception as _de_exc:
+        except ImportError as _de_exc:
             _silent_log("query_decompose.outer", _de_exc)
 
     # 3. Multi-query expansion (original + 2 paraphrases).
@@ -17362,7 +17362,7 @@ def retrieve(
                 # Si el judge corrio OK, reemplazamos scores. Si fallo
                 # (parse_failed=True), _blended_scores == _ce_scores.
                 scores = _blended_scores
-        except Exception as _llm_judge_exc:
+        except ImportError as _llm_judge_exc:
             _silent_log("llm_judge.outer", _llm_judge_exc)
 
     # Capturar el comienzo del score-loop block (scoring + recency + tag +
@@ -17759,7 +17759,7 @@ def retrieve(
                         )
                         for w in _wrapped
                     ]
-        except Exception as _cp_exc:
+        except ImportError as _cp_exc:
             _silent_log("contradiction_penalty_failed", _cp_exc)
 
     # ── MMR diversification (post-rerank, pre cap top-k) ──────────────────
@@ -17837,7 +17837,7 @@ def retrieve(
                         scored_all[doc["_idx"]]
                         for doc, _ in _mmr_after
                     ]
-        except Exception as _mmr_exc:
+        except ImportError as _mmr_exc:
             _silent_log("mmr_failed", _mmr_exc)
 
     # Feature #14 (2026-04-23): adaptive k — cuando el top-1 domina
@@ -18008,7 +18008,7 @@ def retrieve(
                         graph_metas.append(best_meta)
                 except Exception as exc:
                     _silent_log("graph_expand.neighbor_fetch", exc)
-        except Exception as exc:
+        except sqlite3.Error as exc:
             # with_traceback=True acá porque ya vimos 2 hits en
             # silent_errors.jsonl 2026-04-30 con TypeError genérico —
             # no podíamos diagnosticar sin stack trace. El opt-in cubre
@@ -18770,7 +18770,7 @@ def _compute_source_feedback_amplification(conn) -> dict:
             "  AND paths_json != '' "
             f"  AND ts > datetime('now', '-{SOURCE_FEEDBACK_AMP_WINDOW_DAYS} days')"
         ).fetchall()
-    except Exception:
+    except sqlite3.Error:
         return {}
     for (paths_json_str,) in rows:
         try:
@@ -18831,7 +18831,7 @@ def _source_feedback_amp() -> dict:
                 _source_feedback_amp_cache = computed
                 _source_feedback_amp_cache_key = max_ts
                 return computed
-        except Exception:
+        except sqlite3.Error:
             return _source_feedback_amp_cache or {}
 
 
@@ -19498,7 +19498,7 @@ def find_contradictions_for_note(
         return []
     try:
         data = json.loads(m.group(0))
-    except Exception as exc:
+    except (json.JSONDecodeError, TypeError) as exc:
         # The followup audit explicitly flagged this: qwen2.5:3b used
         # to emit malformed JSON here, which silently dropped real
         # contradictions from the index. Now we at least see it.
@@ -19578,7 +19578,7 @@ def _frontmatter_contradicts_set(path: Path) -> set[str]:
     """
     try:
         raw = path.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
+    except OSError:
         return set()
     try:
         fm = parse_frontmatter(raw) or {}
@@ -19598,7 +19598,7 @@ def _update_contradicts_frontmatter(path: Path, contradicts: list[str]) -> bool:
     """
     try:
         raw = path.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
+    except OSError:
         return False
     if raw.startswith("---\n"):
         end = raw.find("\n---\n", 4)
@@ -19629,7 +19629,7 @@ def _update_contradicts_frontmatter(path: Path, contradicts: list[str]) -> bool:
         new_raw = fm_block + raw
     try:
         path.write_text(new_raw, encoding="utf-8")
-    except Exception:
+    except OSError:
         return False
     return True
 
@@ -19668,7 +19668,7 @@ def _check_and_flag_contradictions(
         return None
     try:
         new_raw = path.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
+    except OSError:
         _log_contradictions(doc_id_prefix, skipped="error")
         return None
     console.print(
@@ -19753,7 +19753,7 @@ def _append_pending_contradiction(rec: dict) -> None:
         _CONTRA_PENDING_PATH.parent.mkdir(parents=True, exist_ok=True)
         with _CONTRA_PENDING_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except Exception as exc:
+    except (json.JSONDecodeError, TypeError) as exc:
         _silent_log("contradiction_pending_write", exc)
 
 
@@ -19898,7 +19898,7 @@ def _retry_pending_contradictions(col: SqliteVecCollection) -> int:
         return 0
     try:
         raw = _CONTRA_PENDING_PATH.read_text(encoding="utf-8")
-    except Exception:
+    except OSError:
         return 0
     remaining: list[str] = []
     retried = 0
@@ -19914,14 +19914,14 @@ def _retry_pending_contradictions(col: SqliteVecCollection) -> int:
                 continue
             _spawn_contradiction_worker(col, p, rec["text"], rec["doc_id_prefix"])
             retried += 1
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             remaining.append(line)
     try:
         if remaining:
             _CONTRA_PENDING_PATH.write_text("\n".join(remaining) + "\n", encoding="utf-8")
         else:
             _CONTRA_PENDING_PATH.unlink(missing_ok=True)
-    except Exception as exc:
+    except OSError as exc:
         _silent_log("contradiction_pending_rewrite", exc)
     return retried
 
@@ -20054,7 +20054,7 @@ def _scan_queries_log(days: int = 14) -> list[dict]:
             cursor = conn.execute(sql, (since_iso, scan_limit))
             rows = cursor.fetchall()
             cols = [d[0] for d in cursor.description]
-    except Exception as exc:
+    except sqlite3.Error as exc:
         _silent_log("scan_queries_log_sql_read", exc)
         return []
     events: list[dict] = []
@@ -20064,7 +20064,7 @@ def _scan_queries_log(days: int = 14) -> list[dict]:
         if extra:
             try:
                 ej = json.loads(extra) if isinstance(extra, str) else extra
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 ej = None
             if isinstance(ej, dict):
                 # Hoist ALL extra_json keys to top-level so callers that
@@ -20289,7 +20289,7 @@ def feedback_patterns(last: int, min_share: float, dry_run: bool, push: bool):
                 " ORDER BY ts DESC LIMIT ?"
             )
             rows = conn.execute(sql, (last,)).fetchall()
-    except Exception as exc:
+    except sqlite3.Error as exc:
         _silent_log("patterns_feedback_sql_read", exc)
         console.print("[yellow]error leyendo feedback SQL[/yellow]")
         return
@@ -20435,7 +20435,7 @@ def _ambient_config() -> dict | None:
         return None
     try:
         c = json.loads(AMBIENT_CONFIG_PATH.read_text(encoding="utf-8"))
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         with _AMBIENT_CONFIG_CACHE_LOCK:
             _AMBIENT_CONFIG_CACHE = (current_path, now, None)
         return None
@@ -20498,7 +20498,7 @@ def _ambient_should_skip(doc_id_prefix: str, h: str) -> bool:
             except (TypeError, ValueError):
                 ts = 0.0
             return row[0] == h and ts >= cutoff
-    except Exception as exc:
+    except sqlite3.Error as exc:
         _log_sql_state_error("ambient_state_sql_read_failed",
                               err=repr(exc))
         return False
@@ -20653,7 +20653,7 @@ def _reminder_wa_release(conn, reminder_id: str) -> None:
             (reminder_id,),
         )
         conn.commit()
-    except Exception:
+    except sqlite3.Error:
         pass
 
 
@@ -20768,7 +20768,7 @@ def push_due_reminders_to_whatsapp(
         return summary
     try:
         cfg = json.loads(AMBIENT_CONFIG_PATH.read_text(encoding="utf-8"))
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         summary["reason"] = "no_ambient_config"
         return summary
     if cfg.get("enabled") is False or not cfg.get("jid"):
@@ -22084,7 +22084,7 @@ def propose_whatsapp_send_note(
         try:
             results_raw = _agent_tool_search(q, k=3)
             results = json.loads(results_raw) if results_raw else []
-        except Exception as exc:
+        except (json.JSONDecodeError, TypeError) as exc:
             results = []
             note_error = f"search_failed: {str(exc)[:80]}"
 
@@ -22274,9 +22274,9 @@ def _resolve_contact_target_vault(query: str) -> dict:
                         "emails": emails,
                         "addresses": addresses,
                     })
-            except Exception:
+            except OSError:
                 continue
-    except Exception:
+    except OSError:
         pass
 
     if not matches:
@@ -22770,7 +22770,7 @@ def _brief_push_to_whatsapp(
         try:
             from rag.voice_brief import send_audio_to_whatsapp  # noqa: PLC0415
             audio_sent = send_audio_to_whatsapp(cfg["jid"], audio_path)
-        except Exception as exc:
+        except ImportError as exc:
             _silent_log("brief_push_audio", exc)
             audio_sent = False
     audio_marker = "\n\n(audio arriba ↑)" if audio_sent else ""
@@ -23657,7 +23657,7 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
             _batch_auto = 32
         else:
             _batch_auto = 64
-    except Exception:
+    except ImportError:
         _batch_auto = 16  # fallback if psutil unavailable
     
     try:
@@ -23969,7 +23969,7 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
                         updated=updated_files,
                         skipped=skipped_files,
                     )
-            except Exception as exc:
+            except OSError as exc:
                 # Aislar el daño a este archivo. Log silent + traceback (para
                 # diagnóstico del root cause del bug #4) + sumar al contador
                 # de skips para que el resumen final muestre cuántos quedaron
@@ -24406,7 +24406,7 @@ def _do_index(reset: bool, no_contradict: bool, source_opt: str | None,
                     from datetime import datetime, timezone, timedelta as _timedelta
                     since_dt = datetime.fromisoformat(since_opt.replace("Z", "+00:00"))
                     days = max(1, int((datetime.now(timezone.utc) - since_dt).total_seconds() / 86400))
-                except Exception:
+                except ImportError:
                     pass
             result = import_export_xml(days=days)
             if result.get("skipped_reason"):
@@ -24758,7 +24758,7 @@ def vlm_backfill(vault_scope: str | None, max_captions: int | None, dry_run: boo
             capture_output=True, text=True, timeout=5,
         )
         _web_running = _out.returncode == 0 and "state = running" in _out.stdout
-    except Exception:
+    except subprocess.SubprocessError:
         _web_running = False
     if _web_running and not force_run:
         console.print(
@@ -24830,7 +24830,7 @@ def vlm_backfill(vault_scope: str | None, max_captions: int | None, dry_run: boo
                 "SELECT image_path, mtime FROM rag_vlm_captions"
             ):
                 cached[str(row[0])] = float(row[1])
-    except Exception as exc:
+    except sqlite3.Error as exc:
         _silent_log("vlm_backfill_cache_scan", exc)
 
     pending: list[Path] = []
@@ -24838,7 +24838,7 @@ def vlm_backfill(vault_scope: str | None, max_captions: int | None, dry_run: boo
     for path in md_files:
         try:
             raw = path.read_text(encoding="utf-8", errors="ignore")
-        except Exception:
+        except OSError:
             continue
         images = _extract_embedded_images(raw, path, vault_root)
         for img in images:
@@ -25134,7 +25134,7 @@ def watch(debounce: float, all_vaults: bool):
                                 f"{empty_cycles * debounce:.0f}s idle",
                                 flush=True,
                             )
-                    except Exception as exc:
+                    except ImportError as exc:
                         _silent_log("watch_idle_unload_failed", exc)
                     unloaded_after_idle = True
             now_t = time.time()
@@ -25411,7 +25411,7 @@ def query(
                     "intent": hit.get("intent"),
                 })
                 return
-        except Exception as _cache_exc:
+        except ImportError as _cache_exc:
             _silent_log("semantic_cache_lookup_query", _cache_exc)
             _cache_emb = None
             if _cache_probe is None:
@@ -26008,7 +26008,7 @@ def query(
                 title="[dim]NLI grounding[/dim]",
                 border_style="dim",
             ))
-        except Exception as _nli_exc:
+        except ImportError as _nli_exc:
             _silent_log("nli_grounding_panel_query", _nli_exc)
 
     # ── Semantic cache store (GC#1 2026-04-22, durability fix 2026-04-23) ──
@@ -26483,7 +26483,7 @@ def _handle_chat_create_intent(question: str) -> tuple[bool, dict | None]:
     if isinstance(args, str):
         try:
             args = json.loads(args)
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             args = {}
     if not isinstance(args, dict):
         args = {}
@@ -26492,7 +26492,7 @@ def _handle_chat_create_intent(question: str) -> tuple[bool, dict | None]:
         if isinstance(params, str):
             try:
                 params = json.loads(params)
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 params = {}
         if not isinstance(params, dict):
             params = {}
@@ -26516,7 +26516,7 @@ def _handle_chat_create_intent(question: str) -> tuple[bool, dict | None]:
 
     try:
         payload = json.loads(result_json)
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         console.print(f"[yellow]⚠ {name} devolvió JSON inválido[/yellow]")
         return False, None
 
@@ -27409,7 +27409,7 @@ def chat(
                     title="[dim]NLI grounding[/dim]",
                     border_style="dim",
                 ))
-            except Exception as _nli_exc:
+            except ImportError as _nli_exc:
                 _silent_log("nli_grounding_panel_chat", _nli_exc)
 
         turn_id = new_turn_id()
@@ -27487,7 +27487,7 @@ def read_user_state() -> dict | None:
         if age > USER_STATE_TTL_HOURS:
             return None
         return {"state": data["state"], "age_hours": age}
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         return None
 
 
@@ -27522,7 +27522,7 @@ def read_user_profile() -> str:
             if end != -1:
                 raw = raw[end + 5 :]
         return raw.strip()[:2000]
-    except Exception:
+    except OSError:
         return ""
 
 
@@ -28032,7 +28032,7 @@ def draft_stats(plain: bool):
                 "WHERE ts >= datetime('now', 'localtime', '-30 days') "
                 "GROUP BY decision ORDER BY decision"
             ).fetchall())
-    except Exception as exc:
+    except sqlite3.Error as exc:
         msg = f"error leyendo rag_draft_decisions: {exc}"
         click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
         return
@@ -28096,7 +28096,7 @@ def draft_stats(plain: bool):
     if meta_path.is_file():
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             meta = None
         if meta:
             ft_active = _drafts_ft_enabled() and _drafts_ft_adapter_available()
@@ -28185,7 +28185,7 @@ def draft_finetune(
     # bars + métricas en tiempo real. Exit code propaga.
     try:
         proc = subprocess.run(cmd, check=False)
-    except Exception as exc:
+    except subprocess.SubprocessError as exc:
         console.print(f"[red]error invocando script: {exc}[/red]")
         raise click.exceptions.Exit(1)
     raise click.exceptions.Exit(proc.returncode)
@@ -28248,7 +28248,7 @@ def brief_stats(plain: bool):
             ).fetchone()
             if row and row[0]:
                 last_ts = row[0]
-    except Exception as exc:
+    except sqlite3.Error as exc:
         msg = f"error leyendo rag_brief_feedback: {exc}"
         click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
         return
@@ -28352,7 +28352,7 @@ def brief_schedule_status(plain: bool, lookback_days: int):
     """
     try:
         from rag.brief_schedule import VALID_BRIEF_KINDS, analyze_brief_feedback
-    except Exception as exc:
+    except ImportError as exc:
         msg = f"error importando rag.brief_schedule: {exc}"
         click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
         return
@@ -28391,7 +28391,7 @@ def brief_schedule_reset(kind: str, plain: bool):
         from rag.brief_schedule import (
             VALID_BRIEF_KINDS, reset_brief_schedule_pref,
         )
-    except Exception as exc:
+    except ImportError as exc:
         msg = f"error importando rag.brief_schedule: {exc}"
         click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
         return
@@ -28449,7 +28449,7 @@ def _bootstrap_brief_plist(kind: str) -> tuple[bool, str]:
             check=False, capture_output=True,
         )
         return (True, f"{label} re-bootstrapped")
-    except Exception as exc:
+    except OSError as exc:
         return (False, f"error: {exc}")
 
 
@@ -28461,7 +28461,7 @@ def current_schedule_for_bootstrap(kind: str) -> tuple[int, int]:
     try:
         from rag.brief_schedule import current_schedule
         return current_schedule(kind)
-    except Exception:
+    except ImportError:
         # Defensive fallback to defaults from DEFAULT_SCHEDULES.
         return {"morning": (7, 0), "today": (22, 0), "digest": (22, 0)}.get(kind, (0, 0))
 
@@ -28497,7 +28497,7 @@ def brief_schedule_auto_tune(dry_run: bool, apply_flag: bool, lookback_days: int
         from rag.brief_schedule import (
             VALID_BRIEF_KINDS, analyze_brief_feedback, set_brief_schedule_pref,
         )
-    except Exception as exc:
+    except ImportError as exc:
         msg = f"error importando rag.brief_schedule: {exc}"
         click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
         return
@@ -28686,11 +28686,11 @@ def migrations_apply_cmd(target: int | None, dry_run: bool, plain: bool) -> None
                 )
                 conn.execute(f"RELEASE SAVEPOINT {sp}")
                 applied_now.append(v)
-            except Exception as exc:
+            except sqlite3.Error as exc:
                 try:
                     conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
                     conn.execute(f"RELEASE SAVEPOINT {sp}")
-                except Exception:
+                except sqlite3.Error:
                     pass
                 if plain:
                     click.echo(f"FAILED at {v} {name}: {exc!r}")
@@ -28737,7 +28737,7 @@ def migrations_bootstrap_cmd(plain: bool) -> None:
                     (v, name, now, _m._migration_hash(fn)),
                 )
                 registered.append(v)
-            except Exception:
+            except sqlite3.Error:
                 continue
         if plain:
             click.echo(f"bootstrapped {registered}")
@@ -29251,7 +29251,7 @@ def _feedback_augmented_cases(min_len: int = 4) -> list[dict]:
     try:
         with _ragvec_state_conn() as conn:
             rows = conn.execute(sql).fetchall()
-    except Exception as exc:
+    except sqlite3.Error as exc:
         _silent_log("feedback_augmented_cases_sql_read", exc)
         return []
     seen_q: set[str] = set()
@@ -29315,7 +29315,7 @@ def _feedback_implicit_cases(
     try:
         with _ragvec_state_conn() as conn:
             rows = conn.execute(sql, (cutoff,)).fetchall()
-    except Exception as exc:
+    except sqlite3.Error as exc:
         _log_sql_state_error("feedback_implicit_cases_sql_read_failed",
                               err=repr(exc))
         return []
@@ -29547,7 +29547,7 @@ def _brief_synthetic_cases(
                         pos[key] = "brief_kept_synthetic"
                     elif event == "deleted":
                         neg[key] = "brief_deleted_synthetic"
-    except Exception as exc:
+    except sqlite3.Error as exc:
         _log_sql_state_error("brief_synthetic_cases_sql_read_failed",
                               err=repr(exc))
         return []
@@ -29709,7 +29709,7 @@ def _backup_ranker_config() -> Path | None:
             except Exception:
                 pass
         return backup
-    except Exception:
+    except ImportError:
         return None
 
 
@@ -29721,7 +29721,7 @@ def _restore_ranker_backup(backup: Path) -> bool:
         shutil.copy2(backup, tmp)
         tmp.replace(RANKER_CONFIG_PATH)
         return True
-    except Exception:
+    except ImportError:
         return False
 
 
@@ -29899,7 +29899,7 @@ def tune(queries_file: str, k: int, samples: int, seed: int,
                     for k in sorted(bw.as_dict())
                     if abs(bw.as_dict()[k] - current_w.as_dict()[k]) > 1e-6
                 ) or "(sin diferencia)"
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 delta_str = "(no se pudo parsear)"
             mtime_str = datetime.fromtimestamp(bp.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
             console.print(f"  [cyan]{bp.name}[/cyan]  {mtime_str}  Δ {delta_str}")
@@ -30378,7 +30378,7 @@ def tune(queries_file: str, k: int, samples: int, seed: int,
             console.print(
                 f"[green]✓[/green] Stratified eval OK: {decision['reason']}"
             )
-    except Exception as exc:
+    except ImportError as exc:
         # Stratified eval es bonus — si rompe, NO afectamos el flow del tune.
         # Si esto pasa, el aggregate gate ya fue OK (sino habríamos exited
         # antes), así que el modelo igual queda persistido.
@@ -30419,7 +30419,7 @@ def _replay_load_row(query_id: int) -> "dict | None":
                     except (json.JSONDecodeError, TypeError):
                         data[col] = None
             return data
-    except Exception as exc:
+    except (json.JSONDecodeError, TypeError) as exc:
         _silent_log("replay_load_row", exc)
         return None
 
@@ -30777,7 +30777,7 @@ def replay(
                 since_iso = _dt.datetime.fromtimestamp(
                     float(since_ts), tz=_dt.timezone.utc
                 ).strftime("%Y-%m-%dT%H:%M:%S")
-        except Exception:
+        except ImportError:
             since_iso = None
 
         rows: list[dict] = []
@@ -30816,7 +30816,7 @@ def replay(
                             except (json.JSONDecodeError, TypeError):
                                 data[col] = None
                     rows.append(data)
-        except Exception as exc:
+        except (json.JSONDecodeError, TypeError) as exc:
             _silent_log("replay_bulk_load", exc)
             if not plain and not as_json:
                 console.print(f"[red]Error cargando historial:[/red] {exc}")
@@ -31073,7 +31073,7 @@ def gaps(threshold: float, min_count: int, days: int):
             continue
         try:
             e = json.loads(line)
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             continue
         score = e.get("top_score")
         if score is None or score > threshold:
@@ -31404,7 +31404,7 @@ def _collect_week_evidence(
                 continue
             try:
                 e = json.loads(line)
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 continue
             try:
                 ts = datetime.fromisoformat(e.get("ts", ""))
@@ -31434,7 +31434,7 @@ def _collect_week_evidence(
                 ):
                     try:
                         targets = json.loads(targets_json) if targets_json else []
-                    except Exception:
+                    except (json.JSONDecodeError, TypeError):
                         continue
                     if not isinstance(targets, list) or not targets:
                         continue
@@ -31446,7 +31446,7 @@ def _collect_week_evidence(
                             for c in targets if isinstance(c, dict)
                         ],
                     })
-            except Exception as _exc:
+            except (json.JSONDecodeError, TypeError) as _exc:
                 try:
                     _silent_log("week_evidence_contradictions_sql_failed", _exc)
                 except Exception:
@@ -31459,7 +31459,7 @@ def _collect_week_evidence(
                 ):
                     try:
                         extra = json.loads(extra_json) if extra_json else {}
-                    except Exception:
+                    except (json.JSONDecodeError, TypeError):
                         extra = {}
                     contrad = extra.get("contradictions") if isinstance(extra, dict) else None
                     if isinstance(contrad, list) and contrad:
@@ -31479,12 +31479,12 @@ def _collect_week_evidence(
                                 "q": q_clean,
                                 "top_score": float(top_score),
                             })
-            except Exception as _exc:
+            except (json.JSONDecodeError, TypeError) as _exc:
                 try:
                     _silent_log("week_evidence_queries_sql_failed", _exc)
                 except Exception:
                     pass
-    except Exception as _exc:
+    except (json.JSONDecodeError, TypeError) as _exc:
         try:
             _silent_log("week_evidence_conn_failed", _exc)
         except Exception:
@@ -31716,7 +31716,7 @@ def _render_silent_errors_log(n: int, summary: bool) -> None:
             continue
         try:
             entries.append(json.loads(line))
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             continue
     if not entries:
         console.print("[dim]silent_errors.jsonl está vacío — nada que reportar.[/dim]")
@@ -31914,7 +31914,7 @@ def _load_query_entries(since: datetime, log_path: Path = LOG_PATH) -> list[dict
             continue
         try:
             e = json.loads(line)
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             continue
         try:
             ts = datetime.fromisoformat(e.get("ts", ""))
@@ -33059,7 +33059,7 @@ def do(instruction: str, yes: bool, max_iterations: int):
             if isinstance(args, str):
                 try:
                     args = json.loads(args)
-                except Exception:
+                except (json.JSONDecodeError, TypeError):
                     args = {}
             if not isinstance(args, dict):
                 args = {}
@@ -33070,7 +33070,7 @@ def do(instruction: str, yes: bool, max_iterations: int):
                 if isinstance(params, str):
                     try:
                         params = json.loads(params)
-                    except Exception:
+                    except (json.JSONDecodeError, TypeError):
                         params = {}
                 if not isinstance(params, dict):
                     params = {}
@@ -33640,7 +33640,7 @@ def _rebuild_urls_index() -> dict:
             total += n
             if n:
                 files_with_urls += 1
-        except Exception:
+        except OSError:
             continue
     console.print(
         f"[green]Listo. {total} URLs en {files_with_urls} notas.[/green]"
@@ -33683,7 +33683,7 @@ def links(query: str | None, k: int, folder: str | None, tag: str | None,
         import subprocess
         try:
             subprocess.run(["open", url], check=False)
-        except Exception as e:
+        except subprocess.SubprocessError as e:
             msg = f"No pude abrir: {e}"
             click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
             return
@@ -34367,7 +34367,7 @@ def file_cmd(path: str | None, folder: str, one: bool, limit: int,
             if fm.get("file") == "skip":
                 skipped_by_fm.append(str(p.relative_to(VAULT_PATH)))
                 continue
-        except Exception:
+        except OSError:
             pass
         eligible.append(p)
 
@@ -34965,7 +34965,7 @@ def _cache_telemetry_stats(days: int = 7) -> dict:
                 }
                 for q, hc, intent, lts in top_rows
             ]
-    except Exception as exc:
+    except sqlite3.Error as exc:
         _log_sql_state_error("cache_telemetry_stats_failed", err=repr(exc))
     return out
 
@@ -35863,7 +35863,7 @@ def _fetch_youtube_title(url: str) -> str:
         req = urllib.request.Request(endpoint, headers={"User-Agent": _READ_USER_AGENT})
         with urllib.request.urlopen(req, timeout=_READ_TIMEOUT_SECS) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         return ""
     title = (data.get("title") or "").strip()
     author = (data.get("author_name") or "").strip()
@@ -36089,7 +36089,7 @@ def _read_generate_summary(prompt: str) -> str:
         # Sin filter, leaks del LLM con texto pt llegan a la nota guardada.
         from rag.iberian_leak_filter import replace_iberian_leaks
         return replace_iberian_leaks((resp.message.content or "").strip())
-    except Exception:
+    except ImportError:
         return ""
 
 
@@ -36099,7 +36099,7 @@ def _read_slug_from(title: str, url: str) -> str:
     try:
         import urllib.parse as _up
         host = _up.urlparse(url).netloc or ""
-    except Exception:
+    except ImportError:
         host = ""
     host = host.replace("www.", "")
     return _slug(host, maxlen=40) if host else "read"
@@ -37645,7 +37645,7 @@ def _parse_natural_datetime(
     try:
         import dateparser  # noqa: PLC0415
         dt = dateparser.parse(s_norm, languages=list(lang), settings=settings)
-    except Exception:
+    except ImportError:
         dt = None
 
     if isinstance(dt, datetime):
@@ -37741,7 +37741,7 @@ def _parse_natural_datetime(
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE)
     try:
         data = json.loads(raw)
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         return None
     iso = data.get("iso") if isinstance(data, dict) else None
     if not iso or not isinstance(iso, str):
@@ -38165,7 +38165,7 @@ def _create_calendar_event(
                 if err is not None and hasattr(err, "localizedDescription"):
                     # No tan crítico — caemos al fallback AppleScript.
                     pass
-        except Exception:
+        except ImportError:
             # Cualquier error en EventKit → fallback silencioso.
             pass
 
@@ -38321,7 +38321,7 @@ def _delete_reminder(reminder_id: str) -> tuple[bool, str]:
             if err is not None and hasattr(err, "localizedDescription"):
                 return False, f"EventKit: {err.localizedDescription()}"
             # Falló el remove sin error útil — caer al fallback.
-    except Exception:
+    except ImportError:
         # Cualquier error en el path EventKit (framework no carga,
         # pyobjc roto, lookup falla, etc) → fallback silencioso.
         pass
@@ -38420,7 +38420,7 @@ def _delete_calendar_event(event_uid: str) -> tuple[bool, str]:
             if err is not None and hasattr(err, "localizedDescription"):
                 return False, f"EventKit: {err.localizedDescription()}"
             # Remove falló sin error útil — caer al fallback.
-    except Exception:
+    except ImportError:
         # Si el framework no cargó / pyobjc roto / etc → fallback.
         pass
 
@@ -40001,7 +40001,7 @@ def _load_user_nickname(vault_root: Path | None = None) -> str | None:
 
     try:
         txt = root.read_text(encoding="utf-8")
-    except Exception:
+    except OSError:
         return None
 
     nick: str | None = None
@@ -40049,7 +40049,7 @@ def _parse_mention_dossier(rel_path: str, vault_root: Path | None = None) -> dic
     out: dict = {"name": p.stem, "aliases": [], "phone_digits": ""}
     try:
         txt = p.read_text(encoding="utf-8")
-    except Exception:
+    except OSError:
         return out
     # Phone via centralized parser — matches the full label set (tel|phone|
     # cel|whatsapp|wa|…), not just "Teléfono". Before 2026-04-21 this regex
@@ -40444,7 +40444,7 @@ def _fetch_recent_queries(
             continue
         try:
             e = json.loads(line)
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             continue
         if e.get("cmd") != "query":
             continue
@@ -40564,7 +40564,7 @@ def _fetch_system_activity(
                     continue
                 try:
                     e = json.loads(line)
-                except Exception:
+                except (json.JSONDecodeError, TypeError):
                     continue
                 try:
                     ts = datetime.fromisoformat(e.get("ts", ""))
@@ -40617,7 +40617,7 @@ def _fetch_system_activity(
                     continue
                 try:
                     e = json.loads(line)
-                except Exception:
+                except (json.JSONDecodeError, TypeError):
                     continue
                 try:
                     ts = datetime.fromisoformat(e.get("ts", ""))
@@ -40786,7 +40786,7 @@ def _collect_morning_evidence(
                 continue
             try:
                 e = json.loads(line)
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 continue
             try:
                 ts = datetime.fromisoformat(e.get("ts", ""))
@@ -40819,7 +40819,7 @@ def _collect_morning_evidence(
                 continue
             try:
                 e = json.loads(line)
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 continue
             try:
                 ts = datetime.fromisoformat(e.get("ts", ""))
@@ -40846,7 +40846,7 @@ def _collect_morning_evidence(
     try:
         from rag import wa_scheduled as _wa_sched  # noqa: PLC0415
         wa_today = _wa_sched.list_today_pending(now=now)
-    except Exception:
+    except ImportError:
         wa_today = []
     ev = {
         "recent_notes": recent,
@@ -41032,7 +41032,7 @@ def _generate_morning_narrative(prompt: str) -> str:
         # es visible. Filter es idempotente y safe sobre texto en es puro.
         from rag.iberian_leak_filter import replace_iberian_leaks
         return replace_iberian_leaks((resp.message.content or "").strip())
-    except Exception:
+    except ImportError:
         return ""
 
 
@@ -41515,7 +41515,7 @@ def _generate_morning_json(prompt: str) -> dict | None:
                 return [_filter_strings(x) for x in v]
             return v
         return _filter_strings(data)
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         return None
 
 
@@ -41940,7 +41940,7 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int,
                 )
             else:
                 console.print("[dim]→ audio: TTS no disponible o falló — text-only[/dim]")
-        except Exception as exc:
+        except ImportError as exc:
             _silent_log("morning_voice_brief", exc)
             audio_path = None
     if _brief_push_to_whatsapp(
@@ -42165,7 +42165,7 @@ def _collect_today_evidence(
                 continue
             try:
                 e = json.loads(line)
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 continue
             try:
                 ts = datetime.fromisoformat(e.get("ts", ""))
@@ -42209,7 +42209,7 @@ def _collect_today_evidence(
                 continue
             try:
                 e = json.loads(line)
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 continue
             try:
                 ts = datetime.fromisoformat(e.get("ts", ""))
@@ -42237,7 +42237,7 @@ def _collect_today_evidence(
     try:
         from rag import wa_scheduled as _wa_sched  # noqa: PLC0415
         wa_today_pending = _wa_sched.list_today_pending()
-    except Exception:
+    except ImportError:
         wa_today_pending = []
 
     return {
@@ -43137,7 +43137,7 @@ def _generate_today_narrative(prompt: str) -> str:
     try:
         from rag.today_correlator import normalize_voice_to_2da_persona
         normalized = normalize_voice_to_2da_persona(raw)
-    except Exception:
+    except ImportError:
         normalized = raw
     # Sacar secciones con placeholder ("nada quedó suelto", etc.) — el
     # user pidió explícitamente que si está vacío no se muestre ni el
@@ -43296,7 +43296,7 @@ def _ingest_cursors_load() -> dict[str, float]:
             return {}
         return {str(k): float(v) for k, v in raw.items()
                 if isinstance(v, (int, float))}
-    except Exception as exc:
+    except (json.JSONDecodeError, TypeError) as exc:
         _silent_log("ingest_cursors_load", exc)
         return {}
 
@@ -43310,7 +43310,7 @@ def _ingest_cursors_mark(source: str) -> None:
         tmp = _INGEST_CURSORS_PATH.with_suffix(".tmp")
         tmp.write_text(json.dumps(cursors, indent=2), encoding="utf-8")
         tmp.replace(_INGEST_CURSORS_PATH)
-    except Exception as exc:
+    except (json.JSONDecodeError, TypeError) as exc:
         _silent_log("ingest_cursors_mark", exc)
 
 
@@ -43545,7 +43545,7 @@ def _wa_bridge_is_loaded() -> bool:
             capture_output=True, text=True, timeout=5,
         )
         return result.returncode == 0
-    except Exception:
+    except subprocess.SubprocessError:
         return False
 
 
@@ -43631,7 +43631,7 @@ def bridge_status():
     if _WA_BRIDGE_SENTINEL.exists():
         try:
             sentinel_ts = _WA_BRIDGE_SENTINEL.read_text().strip()
-        except Exception as exc:
+        except OSError as exc:
             sentinel_ts = f"<read error: {exc!r}>"
 
     # Last LoggedOut / Connected events in bridge.log (best-effort)
@@ -43648,7 +43648,7 @@ def bridge_status():
                     last_logged_out = line.strip()[:160]
                 elif "Connected to WhatsApp" in line and "Successfully" not in line:
                     last_connected = line.strip()[:160]
-        except Exception:
+        except subprocess.SubprocessError:
             pass
 
     # Compose console output
@@ -43776,7 +43776,7 @@ def bridge_reauth(keep_session: bool, yes: bool):
                  f"gui/{_wa_bridge_uid()}/{_WA_BRIDGE_LAUNCHD_LABEL}"],
                 capture_output=True, text=True, timeout=10, check=False,
             )
-        except Exception as exc:
+        except subprocess.SubprocessError as exc:
             console.print(f"[yellow]warn:[/yellow] launchctl bootout: {exc!r}")
         # Wait for bridge to release port 8080. Up to 5s — usually <1s.
         for _ in range(50):
@@ -43880,7 +43880,7 @@ def bridge_reauth(keep_session: bool, yes: bool):
             console.print(f"[yellow]warn:[/yellow] launchctl bootstrap rc={result.returncode}: {result.stderr.strip()}")
         else:
             console.print("[green]✓[/green]")
-    except Exception as exc:
+    except subprocess.SubprocessError as exc:
         console.print(f"[red]✗[/red] launchctl bootstrap: {exc!r}")
 
     # ── Step 5: verify with HTTP probe ────────────────────────────────
@@ -44108,7 +44108,7 @@ def _build_today_extras_for_cli(target: datetime) -> dict:
     try:
         from rag.today_correlator import correlate_today_signals as _corr
         extras["correlations"] = _corr({}, extras)
-    except Exception:
+    except ImportError:
         extras["correlations"] = {"people": [], "topics": []}
     return extras
 
@@ -44311,13 +44311,13 @@ def find_dead_notes(
             ):
                 try:
                     paths = json.loads(paths_json) if paths_json else []
-                except Exception:
+                except (json.JSONDecodeError, TypeError):
                     continue
                 if isinstance(paths, list):
                     for p in paths:
                         if isinstance(p, str) and p:
                             retrieved_paths.add(p)
-    except Exception as _exc:
+    except (json.JSONDecodeError, TypeError) as _exc:
         try:
             _silent_log("find_dead_notes_sql_read_failed", _exc)
         except Exception:
@@ -44754,7 +44754,7 @@ def _followup_judge(loop_text: str, candidate_snippet: str) -> tuple[bool, str]:
         return False, ""
     try:
         data = json.loads(m.group(0))
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         return False, ""
     resolved = bool(data.get("resolved"))
     reason = str(data.get("reason") or "").strip()[:200]
@@ -45212,7 +45212,7 @@ def ambient_status():
             # Detectar schema viejo para dar un hint útil.
             try:
                 raw = json.loads(AMBIENT_CONFIG_PATH.read_text(encoding="utf-8"))
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 raw = {}
             if raw.get("chat_id") or raw.get("bot_token"):
                 console.print(
@@ -45233,7 +45233,7 @@ def ambient_status():
         try:
             n = sum(1 for _ in AMBIENT_STATE_PATH.open())
             console.print(f"[dim]State: {n} análisis registrados[/dim]")
-        except Exception:
+        except OSError:
             pass
 
 
@@ -45287,7 +45287,7 @@ def ambient_disable():
         return
     try:
         c = json.loads(AMBIENT_CONFIG_PATH.read_text(encoding="utf-8"))
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         c = {}
     c["enabled"] = False
     AMBIENT_CONFIG_PATH.write_text(json.dumps(c, indent=2), encoding="utf-8")
@@ -45326,7 +45326,7 @@ def _load_raw_ambient_config() -> dict:
     try:
         c = json.loads(AMBIENT_CONFIG_PATH.read_text(encoding="utf-8"))
         return c if isinstance(c, dict) else {}
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         return {}
 
 
@@ -45432,7 +45432,7 @@ def ambient_log(n: int):
     for line in lines:
         try:
             e = json.loads(line)
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             continue
         ts = e.get("ts", "")[-8:]
         applied = e.get("wikilinks_applied", 0)
@@ -45809,7 +45809,7 @@ def _finance_short_circuit_answer(
         from web.server import _fetch_credit_cards, _fetch_finance
         finance_data = _fetch_finance()
         cards_data = _fetch_credit_cards()
-    except Exception as exc:
+    except ImportError as exc:
         _silent_log("serve_finance_fetch", exc)
         return None
 
@@ -46202,7 +46202,7 @@ def extract_enrich_entities(question: str, answer: str) -> dict:
             "events": [str(e).strip() for e in (data.get("events") or []) if str(e).strip()][:5],
             "topics": [str(t).strip() for t in (data.get("topics") or []) if str(t).strip()][:5],
         }
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         return empty
 
 
@@ -46279,7 +46279,7 @@ def _apple_contact_name(phone: str) -> str | None:
             capture_output=True, text=True, timeout=3,
         )
         name = (res.stdout or "").strip()
-    except Exception:
+    except subprocess.SubprocessError:
         name = ""
     return name or None
 
@@ -47418,7 +47418,7 @@ def serve(host: str, port: int):
                         except Exception:
                             pass
                         return _sem_payload
-            except Exception as _serve_sem_exc:
+            except ImportError as _serve_sem_exc:
                 _silent_log("serve_semantic_cache_lookup", _serve_sem_exc)
                 _serve_sem_emb = None
                 _serve_sem_hash = ""
@@ -47957,7 +47957,7 @@ def _corpus_breakdown_by_source() -> list[tuple[str, int, str]]:
     try:
         import sqlite3 as _sqlite3
         con = _sqlite3.connect(f"file:{DB_PATH / 'ragvec.db'}?mode=ro", uri=True)
-    except Exception:
+    except sqlite3.Error:
         return []
     try:
         cur = con.cursor()
@@ -48065,7 +48065,7 @@ def rag_health_report() -> dict:
                         continue
                     try:
                         rec = json.loads(line)
-                    except Exception:
+                    except (json.JSONDecodeError, TypeError):
                         continue
                     ts = rec.get("ts")
                     if not ts:
@@ -48079,7 +48079,7 @@ def rag_health_report() -> dict:
                         continue
                     key = rec.get(key_field) or "(unknown)"
                     counts[key] = counts.get(key, 0) + 1
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             pass
         return counts
 
@@ -48118,7 +48118,7 @@ def rag_health_report() -> dict:
                 ).fetchone()
                 report["cache_stats"]["rows"] = int(_row[0] or 0)
                 report["cache_stats"]["total_hits"] = int(_row[1] or 0)
-            except Exception:
+            except sqlite3.Error:
                 # Tabla no existe aún — DB fresca pre-GC#1.
                 report["cache_stats"]["rows"] = 0
                 report["cache_stats"]["total_hits"] = 0
@@ -48144,9 +48144,9 @@ def rag_health_report() -> dict:
                 _total = int(_row2[1] or 0)
                 if _total > 0:
                     report["cache_stats"]["hit_rate_24h"] = _hits / _total
-            except Exception:
+            except sqlite3.Error:
                 pass
-    except Exception:
+    except sqlite3.Error:
         # _ragvec_state_conn failed to open (missing DB, locked beyond
         # retry, etc.). Leave the None defaults — `rag stats` renders
         # "cache: (unavailable)" in that branch.
@@ -48354,7 +48354,7 @@ def _resolve_nth_source_from_last_query(
             return None
         try:
             paths = json.loads(paths_json)
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             return None
         if not isinstance(paths, list) or not paths:
             return None
@@ -48375,7 +48375,7 @@ def _resolve_nth_source_from_last_query(
             "total_sources": len(paths),
             "out_of_range": False,
         }
-    except Exception as exc:
+    except (json.JSONDecodeError, TypeError) as exc:
         _log_sql_state_error(
             "resolve_nth_source_failed", err=repr(exc),
         )
@@ -48757,7 +48757,7 @@ def session_export(
 
     try:
         target_path.write_text(md, encoding="utf-8")
-    except Exception as exc:
+    except OSError as exc:
         console.print(f"[red]Error writing {target_path}: {exc!r}[/red]")
         return
 
@@ -49107,7 +49107,7 @@ def _sql_rotate_log_tables(*, dry_run: bool = False,
         if not dry_run:
             try:
                 conn.execute("PRAGMA optimize")
-            except Exception:
+            except sqlite3.Error:
                 pass
 
         # WAL checkpoint once after all deletes — cheaper than N checkpoints.
@@ -49199,10 +49199,10 @@ def _sql_rotate_log_tables(*, dry_run: bool = False,
                         (_VACUUM_META_KEY_TS, now_iso),
                     )
                     conn.execute("COMMIT")
-                except Exception:
+                except sqlite3.Error:
                     try:
                         conn.execute("ROLLBACK")
-                    except Exception:
+                    except sqlite3.Error:
                         pass
                     raise
         elif should_vacuum and dry_run:
@@ -49473,7 +49473,7 @@ def _rollback_state_migration(*, force: bool = False,
         except _sqlite.Error as e:
             try:
                 conn.execute("ROLLBACK")
-            except Exception:
+            except sqlite3.Error:
                 pass
             out["refused"] = f"sqlite error: {e}"
             return out
@@ -49724,7 +49724,7 @@ def _rag_free_execute(
                 try:
                     conn.execute(f"DROP TABLE IF EXISTS {t}")
                     out["tables_dropped"].append(t)
-                except Exception as e:
+                except sqlite3.Error as e:
                     out["errors"].append(f"drop {t}: {e}")
             # Tambien limpiamos filas de rag_schema_version para las tablas
             # dropeadas — sin esto, futuras invocaciones de
@@ -49738,10 +49738,10 @@ def _rag_free_execute(
                     out["tables_dropped"],
                 )
             conn.execute("COMMIT")
-        except Exception as e:
+        except sqlite3.Error as e:
             try:
                 conn.execute("ROLLBACK")
-            except Exception:
+            except sqlite3.Error:
                 pass
             out["errors"].append(f"transaction: {e}")
         finally:
@@ -49757,7 +49757,7 @@ def _rag_free_execute(
                 conn.execute("VACUUM")
             finally:
                 conn.close()
-        except Exception as e:
+        except sqlite3.Error as e:
             out["errors"].append(f"vacuum: {e}")
         if ragvec_path.is_file():
             after_bytes = ragvec_path.stat().st_size + (
@@ -49970,13 +49970,13 @@ def run_maintenance(
             results["voice_briefs_cleaned"] = {
                 "deleted": n_vb, "bytes_freed": bytes_vb, "errors": [],
             }
-        except Exception as e:
+        except ImportError as e:
             results["voice_briefs_cleaned_error"] = str(e)
     else:
         try:
             from rag.voice_brief import cleanup_old_voice_briefs as _cobv  # noqa: PLC0415
             results["voice_briefs_cleaned"] = _cobv()
-        except Exception as e:
+        except ImportError as e:
             results["voice_briefs_cleaned_error"] = str(e)
 
     # 10b. Chat-uploads TTL cleanup (audit 2026-04-25 R2-Security #6).
@@ -50056,7 +50056,7 @@ def run_maintenance(
             except OSError:
                 continue
         results["reranker_ft_cleaned"] = {"deleted": _ft_deleted, "bytes_freed": _ft_bytes}
-    except Exception as e:
+    except ImportError as e:
         results["reranker_ft_cleaned_error"] = str(e)
 
     # 11. URL orphans (files deleted but URL rows remain)
@@ -50093,13 +50093,13 @@ def run_maintenance(
                         continue
                     try:
                         ev = json.loads(line)
-                    except Exception:
+                    except (json.JSONDecodeError, TypeError):
                         continue
                     paths = ev.get("paths") or []
                     if paths and not any(p in od for p in paths):
                         n_fb_orphan += 1
             results["feedback_orphans"] = n_fb_orphan
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             results["feedback_orphans"] = 0
     else:
         results["feedback_orphans"] = _prune_feedback_orphans(VAULT_PATH)
@@ -50123,7 +50123,7 @@ def run_maintenance(
                     " WHERE ts < datetime('now', '-30 days')"
                 )
                 results["conv_summaries_pruned"] = (_cs_cur.fetchone() or [0])[0]
-    except Exception as _cs_e:
+    except sqlite3.Error as _cs_e:
         results["conv_summaries_pruned_error"] = str(_cs_e)
 
     # 13. Embedder health (read-only) — verifica que el SentenceTransformer
@@ -50203,7 +50203,7 @@ def run_maintenance(
                     pass
         finally:
             _ret_con.close()
-    except Exception as exc:
+    except sqlite3.Error as exc:
         results["screen_obs_retention_error"] = str(exc)
 
     # 15. Background SQL queue health — drops son signal de overload.
@@ -50302,7 +50302,7 @@ def _validate_cutover_state() -> list[dict]:
                     f"SELECT COUNT(*) FROM {table}"  # noqa: S608 - hardcoded table list
                 ).fetchone()
                 sql_rows = int(row[0]) if row else 0
-        except Exception as exc:
+        except sqlite3.Error as exc:
             entry.update({
                 "status": "sql_err",
                 "err": repr(exc)[:200],
@@ -50638,7 +50638,7 @@ def _feedback_stats() -> dict:
                 "pos_no_cp": int(row[4] or 0),
                 "neg_no_cp": int(row[5] or 0),
             }
-    except Exception:
+    except sqlite3.Error:
         return {"total": 0, "pos": 0, "neg": 0, "with_cp": 0,
                 "pos_no_cp": 0, "neg_no_cp": 0}
 
@@ -50667,13 +50667,13 @@ def _set_feedback_corrective_path(feedback_id: int, corrective_path: str) -> boo
                     "DELETE FROM rag_feedback_golden_meta "
                     "WHERE k='last_built_source_ts'"
                 )
-            except Exception:
+            except sqlite3.Error:
                 pass
         global _feedback_golden_memo, _feedback_golden_source_ts_sql
         _feedback_golden_memo = None
         _feedback_golden_source_ts_sql = None
         return True
-    except Exception as exc:
+    except sqlite3.Error as exc:
         try:
             _log_sql_state_error("feedback_update_cp_failed", err=repr(exc))
         except Exception:
@@ -50716,7 +50716,7 @@ def _feedback_rows_without_cp(
             for rid, ts, turn_id, rating, q, paths_json in rows:
                 try:
                     paths = json.loads(paths_json) if paths_json else []
-                except Exception:
+                except (json.JSONDecodeError, TypeError):
                     paths = []
                 out.append({
                     "id": int(rid),
@@ -50727,7 +50727,7 @@ def _feedback_rows_without_cp(
                     "paths": [p for p in paths if isinstance(p, str) and p],
                 })
             return out
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         return []
 
 
@@ -50765,11 +50765,11 @@ def _harvest_candidates(
             for qid, ts, q, score, cmd, session, paths_json, scores_json in rows:
                 try:
                     paths = json.loads(paths_json) if paths_json else []
-                except Exception:
+                except (json.JSONDecodeError, TypeError):
                     paths = []
                 try:
                     scores = json.loads(scores_json) if scores_json else []
-                except Exception:
+                except (json.JSONDecodeError, TypeError):
                     scores = []
                 out.append({
                     "id": int(qid),
@@ -50782,7 +50782,7 @@ def _harvest_candidates(
                     "scores": scores,
                 })
             return out
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         return []
 
 
@@ -50836,13 +50836,13 @@ def _feedback_insert_harvested(
                     "DELETE FROM rag_feedback_golden_meta "
                     "WHERE k='last_built_source_ts'"
                 )
-            except Exception:
+            except sqlite3.Error:
                 pass
         global _feedback_golden_memo, _feedback_golden_source_ts_sql
         _feedback_golden_memo = None
         _feedback_golden_source_ts_sql = None
         return True
-    except Exception as exc:
+    except sqlite3.Error as exc:
         try:
             _log_sql_state_error("harvester_insert_failed", err=repr(exc))
         except Exception:
@@ -51284,7 +51284,7 @@ def _behavior_backfill_candidates(limit: int) -> list[dict]:
                 if extra_raw:
                     _ej = json.loads(extra_raw)
                     sess = _ej.get("session") or _ej.get("session_id")
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 sess = None
             out.append({
                 "id": int(rid),
@@ -51295,7 +51295,7 @@ def _behavior_backfill_candidates(limit: int) -> list[dict]:
                 "session": sess,
                 "extra_json_raw": extra_raw,
             })
-    except Exception as exc:
+    except (json.JSONDecodeError, TypeError) as exc:
         _log_sql_state_error("behavior_backfill_candidates_failed", err=repr(exc))
     return out
 
@@ -51424,7 +51424,7 @@ def _behavior_backfill_find_match(
                     "match_policy": "time_nearest",
                     "delta_s": _behavior_delta_seconds(orphan_ts, row[1]),
                 }
-    except Exception as exc:
+    except sqlite3.Error as exc:
         _log_sql_state_error("behavior_backfill_match_failed", err=repr(exc))
     return None
 
@@ -51451,7 +51451,7 @@ def _behavior_backfill_apply(row_id: int, extra_raw: str | None,
     tracing fields del backfill. Returns True on success."""
     try:
         extra = json.loads(extra_raw) if extra_raw else {}
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         extra = {}
     extra["original_query_id"] = int(query_id)
     # Provenance — útil para auditar después qué fue backfilleado vs
@@ -51641,7 +51641,7 @@ def context_estimate(
     if file_arg:
         try:
             text = Path(file_arg).read_text(encoding="utf-8", errors="ignore")
-        except Exception as exc:
+        except OSError as exc:
             console.print(f"[red]Error leyendo {file_arg}: {exc!r}[/red]")
             return
     elif text_arg:
@@ -51787,7 +51787,7 @@ def _train_paraphrases_from_feedback(
                 f"  AND q.variants_json IS NOT NULL "
                 f"  AND q.variants_json != '' "
             ).fetchall()
-    except Exception:
+    except sqlite3.Error:
         stats["errors"] += 1
         return stats
     for q, variants_json in rows:
@@ -51797,7 +51797,7 @@ def _train_paraphrases_from_feedback(
             continue
         try:
             variants = json.loads(variants_json)
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             stats["errors"] += 1
             continue
         if not isinstance(variants, list):
@@ -51870,7 +51870,7 @@ def paraphrases_stats(limit: int):
                 "ORDER BY hit_count DESC, last_used_ts DESC LIMIT ?",
                 (int(limit),),
             ).fetchall()
-    except Exception as exc:
+    except sqlite3.Error as exc:
         console.print(f"[red]Error: {exc!r}[/red]")
         return
     console.print()
@@ -51911,7 +51911,7 @@ def paraphrases_clear(yes: bool):
             cur = conn.execute("DELETE FROM rag_learned_paraphrases")
             n = cur.rowcount or 0
         console.print(f"[green]✓[/green] Borradas {n} rows.")
-    except Exception as exc:
+    except sqlite3.Error as exc:
         console.print(f"[red]Error: {exc!r}[/red]")
 
 
@@ -52401,7 +52401,7 @@ def get_nli_model():
                         # MLX-aware: skipea cuando backend full-MLX (no-op).
                         _torch_mps_empty_cache()
                 _nli_model.predict = _nli_predict_with_cleanup
-        except Exception as exc:
+        except ImportError as exc:
             _silent_log("nli_load_failed", exc)
             return None
     return _nli_model
@@ -52423,7 +52423,7 @@ def maybe_unload_nli_model(force: bool = False) -> bool:
             _nli_model = None
             _torch_mps_empty_cache()
             gc.collect()
-        except Exception as exc:
+        except ImportError as exc:
             _silent_log("nli_unload", exc)
     return True
 
@@ -53081,7 +53081,7 @@ def _upsert_entities_for_chunk(
         conn.commit()
         return len(entities)
 
-    except Exception as exc:
+    except (json.JSONDecodeError, TypeError) as exc:
         try:
             _silent_log("entity_upsert_failed", exc)
         except Exception:
@@ -53167,7 +53167,7 @@ def receipt(image_path: Path, as_json: bool, no_cache: bool):
                     "DELETE FROM rag_vlm_receipts WHERE image_path = ?",
                     (str(image_path.resolve()),),
                 )
-        except Exception:
+        except sqlite3.Error:
             pass
 
     parsed = _vlm_parse_receipt(image_path)

@@ -292,9 +292,9 @@ def _parse_pdf_amount_ars(s: str) -> float:
 
 
 def _load_pdf_transfers(finance_dir: Path) -> tuple[list[dict], list[dict]]:
-    """Parsea CADA `*.pdf` del dir buscando líneas con shape de transferencia
-    bancaria. Si no hay ``pdftotext`` instalado o el PDF no rinde texto,
-    devuelve listas vacías sin romper.
+    """Parsea CADA `*.pdf` del subdirectorio `Debito/` buscando líneas con
+    shape de transferencia bancaria. Si no hay ``pdftotext`` instalado o el
+    PDF no rinde texto, devuelve listas vacías sin romper.
 
     Soporta nombres "Abril - Santander.pdf", "Marzo - Santander.pdf",
     "Comprobantes 2026-03.pdf", etc. — no se asume naming.
@@ -303,7 +303,7 @@ def _load_pdf_transfers(finance_dir: Path) -> tuple[list[dict], list[dict]]:
     if not pdftotext:
         return ([], [])
 
-    pdfs = sorted(finance_dir.glob("*.pdf"), key=lambda p: p.stat().st_mtime)
+    pdfs = sorted(finance_dir.glob("Debito/*.pdf"), key=lambda p: p.stat().st_mtime)
     if not pdfs:
         return ([], [])
 
@@ -362,14 +362,99 @@ def _load_pdf_transfers(finance_dir: Path) -> tuple[list[dict], list[dict]]:
     return (transfers, sources)
 
 
+# ── Ingresos (PDF recibos de sueldo) ─────────────────────────────────────
+
+
+def _load_income_pdfs(finance_dir: Path) -> tuple[list[dict], list[dict]]:
+    """Parsea CADA `*.pdf` del subdirectorio `Ingresos/` buscando líneas con
+    shape de recibo de sueldo. Extrae periodo y monto neto. Si no hay
+    ``pdftotext`` instalado o el PDF no rinde texto, devuelve listas vacías
+    sin romper.
+    """
+    pdftotext = shutil.which("pdftotext")
+    if not pdftotext:
+        return ([], [])
+
+    pdfs = sorted(finance_dir.glob("Ingresos/*.pdf"), key=lambda p: p.stat().st_mtime)
+    if not pdfs:
+        return ([], [])
+
+    incomes: list[dict] = []
+    sources: list[dict] = []
+
+    for path in pdfs:
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        try:
+            res = subprocess.run(
+                [pdftotext, "-layout", str(path), "-"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            continue
+        if res.returncode != 0:
+            continue
+
+        text = res.stdout
+        # Buscar "Periodo a Pagar" y "Total Neto"
+        # Formato: "Periodo a Pagar" en una línea, "Abril 2026" en la siguiente
+        # Formato: "Total Neto" en una línea, monto numérico al final de la línea siguiente
+        period_match = re.search(r"Periodo a Pagar.*?\n\s*([A-Za-z]+)\s+(\d{4})", text, re.MULTILINE)
+        # El monto está al final de la línea siguiente a "Total Neto"
+        # Buscamos el último número en esa línea (el formato ES tiene puntos y comas)
+        neto_match = re.search(r"Total Neto.*?\n.*?(\d{1,3}(?:\.\d{3})*,\d{2})", text, re.MULTILINE)
+
+        if period_match and neto_match:
+            month_str = period_match.group(1)
+            year = int(period_match.group(2))
+            # Mapear mes español a número
+            month_map = {
+                "enero": 1, "febrero": 2, "marzo": 3, "abril": 4,
+                "mayo": 5, "junio": 6, "julio": 7, "agosto": 8,
+                "septiembre": 9, "octubre": 10, "noviembre": 11, "diciembre": 12,
+            }
+            month_lower = month_str.lower()
+            month = month_map.get(month_lower, 1)
+
+            # Parsear monto: "7.035.567,00" → 7035567.00
+            amount_str = neto_match.group(1).replace(".", "").replace(",", ".")
+            try:
+                amount = float(amount_str)
+            except ValueError:
+                continue
+
+            # Fecha del recibo (primer día del mes)
+            date = datetime(year, month, 1).isoformat()
+
+            incomes.append({
+                "date": date,
+                "amount": amount,
+                "currency": "ARS",
+                "source": "income_pdf",
+                "source_file": path.name,
+            })
+            sources.append({
+                "path": path.name,
+                "mtime": datetime.fromtimestamp(mtime).isoformat(timespec="seconds"),
+                "amount": amount,
+            })
+
+    incomes.sort(key=lambda i: i["date"], reverse=True)
+    return (incomes, sources)
+
+
 # ── Tarjetas de crédito (xlsx) — reutiliza el parser existente ──────────
 
 
 def _load_credit_cards(finance_dir: Path) -> list[dict]:
     """Llama a ``web.server._parse_credit_card_xlsx`` para cada xlsx
-    `Último resumen*.xlsx` / `Ultimo resumen*.xlsx` en el dir, y devuelve
-    los dicts. Sin cache propio — el endpoint del dashboard cachea TODO
-    junto.
+    `VISA/Último resumen*.xlsx` / `VISA/Ultimo resumen*.xlsx` en el
+    subdirectorio `VISA/`, y devuelve los dicts. Sin cache propio — el
+    endpoint del dashboard cachea TODO junto.
 
     Import lazy de ``web.server`` para evitar dependencia circular en
     import-time (el dashboard lo importa el server después de definir
@@ -381,7 +466,7 @@ def _load_credit_cards(finance_dir: Path) -> list[dict]:
         return []
 
     seen: set[Path] = set()
-    for pattern in ("Último resumen*.xlsx", "Ultimo resumen*.xlsx"):
+    for pattern in ("VISA/Último resumen*.xlsx", "VISA/Ultimo resumen*.xlsx"):
         for p in finance_dir.glob(pattern):
             seen.add(p)
     if not seen:
@@ -548,9 +633,10 @@ def _kpis(txs: list[dict], now: datetime) -> dict:
     }
 
 
-def _by_month(txs: list[dict], months: int = 12) -> dict:
+def _by_month(txs: list[dict], months: int = 12, incomes: list[dict] | None = None) -> dict:
     """Serie temporal: gastos vs ingresos por mes (últimos N meses), por
-    bucket de moneda. Devuelve:
+    bucket de moneda. Los ingresos se toman SOLO de los PDF de recibos de
+    sueldo (fuente de verdad), NO de MOZE (desactualizado). Devuelve:
 
         {
             "labels": ["2025-05", "2025-06", ..., "2026-04"],
@@ -560,7 +646,8 @@ def _by_month(txs: list[dict], months: int = 12) -> dict:
             "income_usd": [...],
         }
     """
-    if not txs:
+    incomes = incomes or []
+    if not txs and not incomes:
         return {
             "labels": [],
             "expenses_ars": [],
@@ -573,17 +660,25 @@ def _by_month(txs: list[dict], months: int = 12) -> dict:
         "expenses_ars": 0.0, "expenses_usd": 0.0,
         "income_ars": 0.0, "income_usd": 0.0,
     })
+    # Solo gastos de MOZE (NO ingresos de MOZE, usamos PDF como fuente de verdad)
     for t in txs:
         ym = _ym(t["date"])
         cb = t["currency_bucket"]
         if t["type"] == "expense":
             key = "expenses_ars" if cb == "ARS" else ("expenses_usd" if cb == "USD" else None)
         elif t["type"] == "income":
-            key = "income_ars" if cb == "ARS" else ("income_usd" if cb == "USD" else None)
+            # Ignorar ingresos de MOZE (desactualizados)
+            continue
         else:
             key = None
         if key:
             buckets[ym][key] += abs(t["amount"])
+    # Agregar ingresos SOLO de PDF de recibos de sueldo (fuente de verdad)
+    for i in incomes:
+        ym = _ym(i["date"])
+        key = "income_ars" if i["currency"] == "ARS" else ("income_usd" if i["currency"] == "USD" else None)
+        if key:
+            buckets[ym][key] += i["amount"]
     if not buckets:
         return {
             "labels": [],
@@ -724,6 +819,93 @@ def _recent_transactions(txs: list[dict], n: int = 50) -> list[dict]:
     return out
 
 
+def _normalize_transfer_to_transaction(t: dict) -> dict:
+    """Normaliza una transferencia de PDF al formato de transaction."""
+    return {
+        "date": t["date"],
+        "time": "",
+        "type": t["type"],
+        "category": "Transferencia",
+        "subcategory": "",
+        "name": t["recipient"],
+        "store": t["recipient"],
+        "account": t["account"],
+        "currency": t["currency"],
+        "amount": t["amount"],
+        "note": f"PDF: {t['source_file']}",
+    }
+
+
+def _normalize_card_purchase_to_transaction(p: dict, card_info: dict) -> dict:
+    """Normaliza un consumo de tarjeta de crédito al formato de transaction."""
+    return {
+        "date": p["date"],
+        "time": "",
+        "type": "expense",
+        "category": "Tarjeta de crédito",
+        "subcategory": f"{card_info.get('brand', '')} {card_info.get('last4', '')}",
+        "name": p["description"],
+        "store": p["description"],
+        "account": f"Tarjeta {card_info.get('brand', '')} {card_info.get('last4', '')}",
+        "currency": p["currency"],
+        "amount": p["amount"],
+        "note": f"Resumen: {card_info.get('source_file', '')}",
+    }
+
+
+def _all_recent_transactions(
+    transactions: list[dict],
+    transfers: list[dict],
+    cards: list[dict],
+    n: int = 50,
+) -> list[dict]:
+    """Combina MOZE transactions, PDF transfers y credit cards en una sola lista
+    de movimientos recientes ordenados por fecha descendente."""
+    all_movements: list[dict] = []
+
+    # MOZE transactions
+    for t in transactions:
+        if t["type"] in ("balance_adjustment", "other"):
+            continue
+        all_movements.append({
+            "date": t["date"],
+            "time": t["time"],
+            "type": t["type"],
+            "category": t["category"],
+            "subcategory": t["subcategory"],
+            "name": t["name"],
+            "store": t["store"],
+            "account": t["account"],
+            "currency": t["currency"],
+            "amount": t["amount"],
+            "note": t["note"],
+        })
+
+    # PDF transfers
+    for t in transfers:
+        all_movements.append(_normalize_transfer_to_transaction(t))
+
+    # Credit card purchases
+    for card in cards:
+        card_info = {
+            "brand": card.get("brand", ""),
+            "last4": card.get("last4", ""),
+            "source_file": card.get("source_file", ""),
+        }
+        for p in card.get("all_purchases_ars", []):
+            all_movements.append(_normalize_card_purchase_to_transaction(p, card_info))
+        for p in card.get("all_purchases_usd", []):
+            all_movements.append(_normalize_card_purchase_to_transaction(p, card_info))
+
+    # Ordenar por fecha descendente (date + time)
+    all_movements.sort(
+        key=lambda x: (x["date"] or "", x["time"] or ""),
+        reverse=True,
+    )
+
+    return all_movements[:n]
+
+
 def _transfers_summary(transfers: list[dict], now: datetime, months: int = 12) -> dict:
     """Resumen de transferencias bancarias (PDF). Por mes + top destinatarios.
 
@@ -779,8 +961,12 @@ def snapshot(
     """Snapshot completo para `/api/finance`. Cache LRU por (paths, mtimes).
 
     Args:
-        finance_dir: Override del dir de tarjetas/PDFs (para tests). Default:
+        finance_dir: Override del dir de finanzas (para tests). Default:
             ``_FINANCE_BACKUP_DIR`` de web.server (env `OBSIDIAN_RAG_FINANCE_DIR`).
+            Se espera la estructura:
+            - `VISA/Último resumen*.xlsx` / `VISA/Ultimo resumen*.xlsx` (tarjetas)
+            - `Debito/*.pdf` (transferencias bancarias)
+            - `Ingresos/` (recibos de sueldo - no usado aún en el dashboard)
         moze_dir: Override del dir de MOZE CSV (para tests). Default:
             ``_MOZE_BACKUP_DIR`` de web.server (env `OBSIDIAN_RAG_MOZE_DIR`).
         now: Override de "now" (para tests). Default: `datetime.now()`.
@@ -790,7 +976,8 @@ def snapshot(
 
     Returns:
         Dict con shape estable. Nunca lanza — silent-fail per
-        convención web/.
+        convención web/. Si NINGUNO de los dos dirs tiene datos, fallback a
+        payload vacío.
     """
     now = now or datetime.now()
     # `using_defaults` distingue invocaciones de producción (sin args, hay
@@ -837,9 +1024,10 @@ def snapshot(
         if _MOZE_CACHE and _MOZE_CACHE.exists() and _MOZE_CACHE != moze_dir:
             moze_files.extend(_MOZE_CACHE.glob("MOZE_*.csv"))
         finance_files = (
-            list(finance_dir.glob("Último resumen*.xlsx"))
-            + list(finance_dir.glob("Ultimo resumen*.xlsx"))
-            + list(finance_dir.glob("*.pdf"))
+            list(finance_dir.glob("VISA/Último resumen*.xlsx"))
+            + list(finance_dir.glob("VISA/Ultimo resumen*.xlsx"))
+            + list(finance_dir.glob("Debito/*.pdf"))
+            + list(finance_dir.glob("Ingresos/*.pdf"))
         ) if finance_dir.exists() else []
         all_files = moze_files + finance_files
         cache_key = tuple(sorted((str(p), p.stat().st_mtime) for p in all_files))
@@ -849,11 +1037,6 @@ def snapshot(
     except OSError:
         cache_key = None
 
-    if cache_key is not None:
-        with _DASHBOARD_CACHE_LOCK:
-            if _DASHBOARD_CACHE.get("key") == cache_key:
-                return _DASHBOARD_CACHE["payload"]
-
     extra_moze: tuple[Path, ...] = (_MOZE_CACHE,) if _MOZE_CACHE else ()
     transactions, moze_sources = (
         _load_moze_rows(moze_dir, extra_dirs=extra_moze)
@@ -862,8 +1045,18 @@ def snapshot(
     )
     transfers, pdf_sources = _load_pdf_transfers(finance_dir) if finance_dir.exists() else ([], [])
     cards = _load_credit_cards(finance_dir) if finance_dir.exists() else []
+    incomes, income_sources = _load_income_pdfs(finance_dir) if finance_dir.exists() else ([], [])
 
-    if not transactions and not transfers and not cards:
+    if cache_key is not None:
+        with _DASHBOARD_CACHE_LOCK:
+            # Si hay archivos de ingresos, siempre regenerar para asegurar frescura
+            # (cambio reciente en la estructura)
+            if incomes:
+                pass  # No usar cache
+            elif _DASHBOARD_CACHE.get("key") == cache_key:
+                return _DASHBOARD_CACHE["payload"]
+
+    if not transactions and not transfers and not cards and not incomes:
         return _empty_payload(now, "no_data", str(finance_dir), str(moze_dir))
 
     payload = {
@@ -875,19 +1068,21 @@ def snapshot(
             "window_days": window_days,
             "moze_sources": moze_sources,
             "pdf_sources": pdf_sources,
+            "income_sources": income_sources,
             "card_files": [c.get("source_file") for c in cards],
             "n_transactions": len(transactions),
             "n_transfers": len(transfers),
             "n_cards": len(cards),
+            "n_incomes": len(incomes),
         },
         "kpis": _kpis(transactions, now),
-        "by_month": _by_month(transactions, months),
+        "by_month": _by_month(transactions, months, incomes=incomes),
         "by_category_ars": _by_category(transactions, window_days, now, "ARS"),
         "by_category_usd": _by_category(transactions, window_days, now, "USD"),
         "top_stores_ars": _top_stores(transactions, window_days, now, "ARS"),
         "top_stores_usd": _top_stores(transactions, window_days, now, "USD"),
         "by_account": _by_account(transactions),
-        "recent": _recent_transactions(transactions, n=50),
+        "recent": _all_recent_transactions(transactions, transfers, cards, n=50),
         "transfers": _transfers_summary(transfers, now, months=months),
         "transfers_recent": transfers[:50],
         "cards": cards,

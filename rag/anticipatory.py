@@ -128,6 +128,11 @@ _ANTICIPATE_ECHO_MIN_COSINE = float(
 _ANTICIPATE_COMMITMENT_MIN_AGE_DAYS = int(
     os.environ.get("RAG_ANTICIPATE_COMMITMENT_MIN_AGE_DAYS", "7")
 )
+# Screen-time tiene threshold más alto que el global (0.50 → 4h de uso mínimo)
+# para evitar que notificaciones de uso moderado (2-3h) inunden el agent.
+_ANTICIPATE_SCREEN_TIME_MIN_SCORE = float(
+    os.environ.get("RAG_ANTICIPATE_SCREEN_TIME_MIN_SCORE", "0.50")
+)
 
 
 @dataclass(frozen=True)
@@ -620,23 +625,25 @@ def _anticipate_signal_screen_time(now: datetime) -> list["AnticipatoryCandidate
         return []
 
     try:
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(str(db_path), timeout=2.0)
         conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
+        try:
+            cursor = conn.cursor()
 
-        # La tabla ZUSAGE tiene datos de uso por app
-        # Campos principales: ZBUNDLEID, ZTOTALTIMEINSECONDS, ZDAY
-        # ZTOTALTIMEINSECONDS está en segundos, convertir a horas
-        query = """
-        SELECT ZBUNDLEID, ZTOTALTIMEINSECONDS
-        FROM ZUSAGE
-        WHERE ZDAY >= date('now', '-1 day')
-        ORDER BY ZTOTALTIMEINSECONDS DESC
-        LIMIT 10
-        """
-        cursor.execute(query)
-        rows = cursor.fetchall()
-        conn.close()
+            # La tabla ZUSAGE tiene datos de uso por app
+            # Campos principales: ZBUNDLEID, ZTOTALTIMEINSECONDS, ZDAY
+            # ZTOTALTIMEINSECONDS está en segundos, convertir a horas
+            query = """
+            SELECT ZBUNDLEID, ZTOTALTIMEINSECONDS
+            FROM ZUSAGE
+            WHERE ZDAY >= date('now', '-1 day')
+            ORDER BY ZTOTALTIMEINSECONDS DESC
+            LIMIT 10
+            """
+            cursor.execute(query)
+            rows = cursor.fetchall()
+        finally:
+            conn.close()
     except Exception as exc:
         _silent_log("anticipate_screen_time_db", exc)
         return []
@@ -741,6 +748,8 @@ def _phase2_kind_threshold(kind: str) -> float:
     # Kind-specific minimums (all others use the global default).
     if kind == "anticipate-echo":
         return float(_ANTICIPATE_ECHO_MIN_SCORE) + float(delta)
+    if kind == "anticipate-screen-time":
+        return float(_ANTICIPATE_SCREEN_TIME_MIN_SCORE) + float(delta)
     return float(_ANTICIPATE_MIN_SCORE) + float(delta)
 
 

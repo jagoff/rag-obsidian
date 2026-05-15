@@ -163,13 +163,19 @@ obsidian-rag-mcp = "mcp_server:main"
 py-modules = ["mcp_server"]
 packages = [
     "rag",
+    "rag.cli",
     "rag.integrations",
+    "rag.integrations.whatsapp",
+    "rag.plists",
+    "rag.runtime",
+    "rag.runtime.jobs",
     "scripts",
     "web",
     "rag_anticipate",
     "rag_anticipate.signals",
     "rag_whisper_learning",
     "rag_routing_learning",
+    "rag_negotiations",
     # Implicit feedback learning (2026-04-26 — Sprint 1 del cierre del
     # loop de aprendizaje). Infiere `corrective_path` desde behavior
     # post-👎 sin pedir input al user. Lee rag_feedback + rag_behavior,
@@ -188,6 +194,7 @@ packages = [
 # FileNotFoundError al import time desde ~/.local/share/uv/tools/.
 [tool.setuptools.package-data]
 "rag" = ["prompts/**/*.md"]
+"web" = ["static/**/*"]
 
 [tool.setuptools.data-files]
 "share/obsidian-rag/prompts/rules" = ["rag/prompts/rules/chunk_as_data.v1.md", "rag/prompts/rules/name_preservation.v1.md"]

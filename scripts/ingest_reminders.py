@@ -452,7 +452,7 @@ def run(
     # rag.DB_PATH already points at `.../ragvec/` — do NOT append an extra
     # `ragvec/` segment (that produced `.../ragvec/ragvec/ragvec.db` and an
     # "unable to open database file" on a clean host).
-    state_conn = sqlite3.connect(str(rag.DB_PATH / "ragvec.db"))
+    state_conn = sqlite3.connect(str(rag.DB_PATH / "ragvec.db"), timeout=15.0)
     _ensure_state_table(state_conn)
     if reset:
         _reset_state(state_conn)

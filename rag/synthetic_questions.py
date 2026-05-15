@@ -146,15 +146,36 @@ def _generate_synthetic_questions(text: str, title: str, folder: str) -> list[st
         "{\"preguntas\": [\"...\", \"...\", \"...\"]}"
     )
     try:
-        resp = rag._summary_client().chat(
-            model=rag.HELPER_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            options={**rag.HELPER_OPTIONS, "num_predict": 220},
-            keep_alive=rag.LLM_KEEP_ALIVE,
-            format="json",
-        )
-        raw = resp.message.content.strip()
-        data = json.loads(raw)
+        result = None
+        exception = None
+
+        def _llm_call():
+            nonlocal result, exception
+            try:
+                resp = rag._summary_client().chat(
+                    model=rag.HELPER_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    options={**rag.HELPER_OPTIONS, "num_predict": 220},
+                    keep_alive=rag.LLM_KEEP_ALIVE,
+                    format="json",
+                )
+                raw = resp.message.content.strip()
+                result = json.loads(raw)
+            except Exception as e:
+                exception = e
+
+        thread = threading.Thread(target=_llm_call, daemon=True)
+        thread.start()
+        thread.join(timeout=30)  # 30 second timeout
+        if thread.is_alive():
+            # Timeout - thread still running
+            rag._silent_log("synthetic_questions_timeout", {"title": title, "folder": folder})
+            return None
+        if exception:
+            raise exception
+        if result is None:
+            return None
+        data = result
     except Exception:
         # Transient — do not cache. Next index pass will retry.
         return None

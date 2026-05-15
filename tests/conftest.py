@@ -5,6 +5,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+_TEST_STATE_DIR = Path(
+    os.environ.get("OBSIDIAN_RAG_TEST_STATE_DIR", "/private/tmp/obsidian-rag-pytest")
+)
+os.environ.setdefault("OBSIDIAN_RAG_STATE_DIR", str(_TEST_STATE_DIR))
+os.environ.setdefault("OBSIDIAN_RAG_DB_PATH", str(_TEST_STATE_DIR / "ragvec"))
+os.environ.setdefault("OBSIDIAN_RAG_TEST_ADMIN_BYPASS", "1")
+
 # ── OpenMP/libomp ABI clash workaround (macOS Apple Silicon) ───────────
 # En macOS Apple Silicon hay un bug conocido: cuando dos librerías nativas
 # linkean cada una su propia `libomp.dylib` (torch trae una embedded,

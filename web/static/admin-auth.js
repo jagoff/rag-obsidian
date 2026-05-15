@@ -1,5 +1,5 @@
 /**
- * admin-auth.js — gestión del Bearer token para los 8 endpoints admin.
+ * admin-auth.js — gestión del Bearer token para endpoints admin.
  *
  * Boot:
  *   1. fetch GET /api/admin/token (solo accesible desde localhost)
@@ -29,8 +29,28 @@
     "/api/status/action",
     "/api/diagnose-error/execute",
     "/api/chat/model",
+    "/api/memo/delete",
+    "/api/memo/cleanup",
+    "/api/memo/merge",
+    "/api/reminders/create",
+    "/api/reminders/complete",
+    "/api/calendar/create",
+    "/api/mail/send",
+    "/api/whatsapp/send",
+    "/api/wa/sender-override",
+    "/api/wa/chats",
+    "/api/wa/mark_read",
+    "/api/wa/react",
     "/api/wa/revoke",
+    "/api/wa/hide",
+    "/api/wa/send_media",
+    "/api/wa/voice",
+    "/api/wa/send_voice",
+    "/api/wa/typing",
+    "/api/wa/send",
+    "/api/wa/promises",
     "/api/wa/search/backfill",
+    "/api/wa/search/index",
   ];
 
   function isAdminPath(url) {

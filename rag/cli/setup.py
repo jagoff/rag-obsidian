@@ -877,38 +877,71 @@ def _run_catch_up_index(ctx: click.Context) -> None:
       → SystemExit code != 0), informa al user con un mensaje "skip" y
       sigue (no aborta `start`).
     - Si tira excepción no-Exit, la loggea silent y avisa.
+
+    2026-05-14: Agregado sync automático de la carpeta de finances si existe.
+    Si `/Users/fer/Library/Mobile Documents/com~apple~CloudDocs/Finances` existe,
+    se registra como vault "finances" (si no lo estaba) y se indexa junto con
+    el vault activo.
     """
-    from rag import _silent_log, console, index  # noqa: PLC0415
+    from rag import (  # noqa: PLC0415
+        _load_vaults_config,
+        _save_vaults_config,
+        _silent_log,
+        console,
+        index,
+    )
+
+    # ── Auto-registrar finances si existe ────────────────────────────────
+    finances_path = Path.home() / "Library/Mobile Documents/com~apple~CloudDocs/Finances"
+    vaults_to_index = [None]  # None = vault activo
+    if finances_path.exists() and finances_path.is_dir():
+        cfg = _load_vaults_config()
+        if "finances" not in cfg["vaults"] or cfg["vaults"]["finances"] != str(finances_path):
+            cfg["vaults"]["finances"] = str(finances_path)
+            # Flag para indicar que solo indexe el archivo más reciente (MOZE)
+            cfg["single_file_only"] = "finances"
+            _save_vaults_config(cfg)
+            console.print(
+                f"[dim]·[/dim] vault [bold]finances[/bold] registrado → {finances_path} "
+                f"[dim](single_file_only)[/dim]"
+            )
+        elif cfg.get("single_file_only") != "finances":
+            # Actualizar el flag si ya existía el vault pero no tenía el flag
+            cfg["single_file_only"] = "finances"
+            _save_vaults_config(cfg)
+        vaults_to_index.append("finances")
 
     console.print()
     console.print("[bold cyan]▸ catch-up index (incremental)[/bold cyan]")
-    try:
-        # Click param names — `--full` binds a `full_flag`, `--reset` (alias
-        # legacy) a `reset_legacy`. Pasarle `reset=False` revienta con
-        # `TypeError: index() got an unexpected keyword argument 'reset'`.
-        # `contextual` y `fast` son options nuevas — defaults explícitos.
-        ctx.invoke(
-            index,
-            full_flag=False,
-            reset_legacy=False,
-            no_contradict=False,
-            source_opt=None,
-            since_opt=None,
-            dry_run=False,
-            max_chats=None,
-            vault_scope=None,
-            contextual=False,
-            fast=False,
-        )
-    except SystemExit as e:
-        if e.code != 0:
-            console.print(
-                "[yellow]·[/yellow] catch-up skip "
-                "(otro `rag index` activo, retry manual con `rag index`)"
+    for vault in vaults_to_index:
+        vault_label = vault if vault else "activo"
+        try:
+            # Click param names — `--full` binds a `full_flag`, `--reset` (alias
+            # legacy) a `reset_legacy`. Pasarle `reset=False` revienta con
+            # `TypeError: index() got an unexpected keyword argument 'reset'`.
+            # `contextual` y `fast` son options nuevas — defaults explícitos.
+            ctx.invoke(
+                index,
+                full_flag=False,
+                reset_legacy=False,
+                no_contradict=False,
+                source_opt=None,
+                since_opt=None,
+                dry_run=False,
+                max_chats=None,
+                vault_scope=vault,
+                contextual=False,
+                fast=False,
             )
-    except Exception as exc:
-        console.print(f"[yellow]·[/yellow] catch-up falló: {exc!r}")
-        _silent_log("rag_start_index_failed", exc)
+        except SystemExit as e:
+            if e.code != 0:
+                console.print(
+                    f"[yellow]·[/yellow] catch-up skip [{vault_label}] "
+                    "(otro `rag index` activo, retry manual con `rag index`)"
+                )
+        except Exception as exc:
+            console.print(f"[yellow]·[/yellow] catch-up falló [{vault_label}]: {exc!r}")
+            _silent_log("rag_start_index_failed", exc)
 
 
 @click.command("start")
@@ -1133,7 +1166,7 @@ def start(
             console.print("  [dim]would-call[/dim] [index] rag index (incremental)")
         return
 
-    if not yes:
+    if not yes and not start_all:
         if not click.confirm("¿Seguir?", default=True):
             console.print("[yellow]Cancelado.[/yellow]")
             return

@@ -60,7 +60,7 @@ _PLANNING_PAT = (
 )
 
 _TOOL_INTENT_RULES: tuple[tuple[str, dict, str], ...] = (
-    ("finance_summary", {}, r"gast[oéó]s?|gast[aá][mn]os|gastar|presupuesto|plata|finanz|moze"),
+    ("finance_summary", {}, r"gast[oéó]s?|gast[aá][mn]os|gastar|presupuesto|plata|finanz|moze|sueldo|haberes|ingresos|neto|recibo.*haberes|recibo.*sueldo|cu[aá]nto.*cobr[aeo]|cu[aá]nto.*gan[aeo]"),
     # Tarjetas: keywords inequívocos del dominio "resumen de tarjeta de
     # crédito" → fuerza credit_cards_summary.
     #

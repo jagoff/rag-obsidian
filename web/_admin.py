@@ -27,6 +27,7 @@ Mismo trato para `_ADMIN_TOKEN_PATH` (test
 """
 from __future__ import annotations
 
+import os
 import secrets
 import sys
 from pathlib import Path
@@ -96,6 +97,11 @@ def _require_admin_token(request: Request) -> None:
     Usar como: `@app.post("/api/...", dependencies=[Depends(_require_admin_token)])`.
     Compara con `secrets.compare_digest` para evitar timing attacks.
     """
+    if (
+        os.environ.get("OBSIDIAN_RAG_TEST_ADMIN_BYPASS") == "1"
+        and os.environ.get("PYTEST_CURRENT_TEST")
+    ):
+        return
     auth = request.headers.get("Authorization", "")
     scheme, _, provided = auth.partition(" ")
     if scheme.lower() != "bearer" or not secrets.compare_digest(
@@ -128,7 +134,8 @@ def admin_token(request: Request):
 
     El frontend (`/static/*.js`) llama este endpoint una vez al boot,
     cachea el token en memoria y lo manda como `Authorization: Bearer X`
-    en los 8 endpoints admin (auto-fix-devin, reindex, ollama/*, etc.).
+    en los endpoints admin (auto-fix-devin, reindex, ollama/*, mutaciones
+    externas, etc.).
 
     Restringido a localhost — un device remoto en LAN/tunnel NO puede leer
     el token aunque acceda al frontend (el browser del LAN-user pegaría 403).

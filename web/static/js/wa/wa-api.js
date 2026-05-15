@@ -1,7 +1,7 @@
 // Wrappers `fetch()` para `/api/wa/*`. Centralizan baseURL + errores.
-// Sin auth en read/send (el repo es local-first); el revoke (delete-for-
-// everyone) requiere admin token, que `admin-auth.js` inyecta vía
-// monkey-patch de `window.fetch` cuando el browser está en loopback.
+// Las mutaciones (send, react, pin/archive, revoke, etc.) requieren admin
+// token; `admin-auth.js` lo inyecta vía monkey-patch cuando el browser está
+// en loopback.
 
 const BASE = "";
 

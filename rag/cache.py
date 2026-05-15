@@ -19,7 +19,7 @@ class ThreadSafeCache:
         self._ttl = ttl
         self._refreshing = False
 
-    def get(self) -> tuple[float, dict] | None:
+    def get(self, _key: Any = None) -> tuple[float, dict] | None:
         """Get cached payload if fresh. Returns (ts, payload) or None."""
         with self._lock:
             entry = self._cache
@@ -29,8 +29,16 @@ class ThreadSafeCache:
                 return None
             return (entry["ts"], entry["payload"])
 
-    def put(self, payload: dict) -> None:
+    def put(self, *args: Any) -> None:
         """Update cache with new payload."""
+        if len(args) == 1:
+            payload = args[0]
+        elif len(args) == 2:
+            # Back-compat with pre-extraction call sites that passed a
+            # sentinel key to the single-entry cache.
+            payload = args[1]
+        else:
+            raise TypeError("put() expects payload or (key, payload)")
         with self._lock:
             self._cache = {"ts": time.time(), "payload": payload}
             self._refreshing = False

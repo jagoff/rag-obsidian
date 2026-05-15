@@ -885,7 +885,7 @@ def run(
 
     # Cursor state is kept in the same sqlite-vec DB next to the vec tables.
     # This is the state DB, not the bridge — never confuse them.
-    state_conn = sqlite3.connect(str(rag.DB_PATH / "ragvec.db"))
+    state_conn = sqlite3.connect(str(rag.DB_PATH / "ragvec.db"), timeout=15.0)
     state_conn.row_factory = sqlite3.Row
     _ensure_state_table(state_conn)
     if reset:

@@ -7,6 +7,8 @@ it exercises MLXBackend.__init__ which does `import mlx_lm` eagerly.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from rag.llm_backend import (
@@ -14,10 +16,20 @@ from rag.llm_backend import (
     ChatOptions,
     MLXBackend,
     get_backend,
+    list_cached_mlx_models,
     reset_backend,
     to_mlx,
     to_short_name,
 )
+
+
+def _requires_mlx_lm() -> None:
+    try:
+        pytest.importorskip("mlx_lm")
+    except RuntimeError as exc:
+        if "No Metal device available" in str(exc):
+            pytest.skip("requires MLX Metal device")
+        raise
 
 # ---------------------------------------------------------------------------
 # Autouse: reset singleton before every test so tests don't pollute each other
@@ -38,7 +50,7 @@ def _reset(monkeypatch):
 
 def test_to_mlx_resolves_aliases():
     assert to_mlx("qwen2.5:3b") == "mlx-community/Qwen2.5-3B-Instruct-4bit"
-    assert to_mlx("command-r") == "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit"
+    assert to_mlx("command-r") == "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit-DWQ"
     # Already canonical — identity
     assert to_mlx("mlx-community/Foo") == "mlx-community/Foo"
     # Unknown short alias — identity passthrough
@@ -70,7 +82,7 @@ def test_get_backend_default_mlx(monkeypatch):
     """Post-cutover 2026-05-05: el default de get_backend es MLX. La conftest
     autouse `_force_ollama_backend_for_tests` setea ollama por test, así que
     aquí explícitamente desetea para verificar el verdadero default."""
-    pytest.importorskip("mlx_lm")
+    _requires_mlx_lm()
     monkeypatch.delenv("RAG_LLM_BACKEND", raising=False)
 
     from rag.llm_backend import MLXBackend
@@ -86,7 +98,7 @@ def test_get_backend_default_mlx(monkeypatch):
 
 
 def test_get_backend_mlx_when_env_set(monkeypatch):
-    pytest.importorskip("mlx_lm")
+    _requires_mlx_lm()
 
     monkeypatch.setenv("RAG_LLM_BACKEND", "mlx")
 
@@ -104,7 +116,7 @@ def test_get_backend_invalid_falls_back_to_mlx(monkeypatch, caplog):
     """Post-Ola 7: cualquier valor distinto de 'mlx' (incluyendo 'ollama'
     y 'invalid') loguea warning y vuelve a MLX. Antes esto raisearía
     ValueError; ahora MLX es el único backend vivo."""
-    pytest.importorskip("mlx_lm")
+    _requires_mlx_lm()
     monkeypatch.setenv("RAG_LLM_BACKEND", "invalid")
 
     backend = get_backend()
@@ -165,14 +177,30 @@ def test_mlx_alias_table_complete():
 
 
 # ---------------------------------------------------------------------------
-# 10. reset_backend clears singleton
+# 10. cache scan does not require MLX runtime
+# ---------------------------------------------------------------------------
+
+
+def test_list_cached_mlx_models_scans_hf_cache_without_mlx(monkeypatch, tmp_path):
+    hub = tmp_path / ".cache" / "huggingface" / "hub"
+    (hub / "models--mlx-community--Qwen2.5-7B-Instruct-4bit").mkdir(parents=True)
+    (hub / "models--BAAI--bge-reranker-v2-m3").mkdir()
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    assert list_cached_mlx_models() == [
+        "mlx-community/Qwen2.5-7B-Instruct-4bit",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# 11. reset_backend clears singleton
 # ---------------------------------------------------------------------------
 
 
 def test_reset_backend_clears_singleton(monkeypatch):
     """Post-Ola 7: solo MLX vivo. El test verifica que reset_backend()
     fuerza re-resolver el singleton (instancias distintas pre/post reset)."""
-    pytest.importorskip("mlx_lm")
+    _requires_mlx_lm()
     monkeypatch.setenv("RAG_LLM_BACKEND", "mlx")
 
     b1 = get_backend()

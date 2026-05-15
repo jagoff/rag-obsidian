@@ -35,7 +35,7 @@ except ImportError:
 try:
     import tqdm as _tqdm
     _tqdm.tqdm.set_lock(threading.RLock())
-except Exception:  # pragma: no cover - tqdm not installed
+except ImportError:
     pass
 
 # Reuse consolidated thread-safe cache helpers (extracted 2026-05-15).
@@ -379,7 +379,7 @@ def _own_conversation_path(session_id: str) -> str | None:
     try:
         from web.conversation_writer import get_conversation_path
         return get_conversation_path(session_id)
-    except Exception:
+    except ImportError:
         return None
 
 
@@ -446,7 +446,7 @@ async def _lifespan(_app) -> "AsyncIterator[None]":
         _limiter = _att.current_default_thread_limiter()
         _limiter.total_tokens = _tp_target
         print(f"[lifespan] anyio threadpool → {_tp_target} tokens", flush=True)
-    except Exception as _exc:
+    except ImportError as _exc:
         print(f"[lifespan] threadpool bump skipped: {_exc}", flush=True)
 
     for fn in _startup_callbacks:
@@ -634,13 +634,13 @@ def memo_delete_api(ids: list[str]) -> dict:
                 deleted.append(mid)
             else:
                 errors.append({"id": mid, "error": r.stderr.decode()[:300]})
-        except Exception as exc:
+        except subprocess.SubprocessError as exc:
             errors.append({"id": mid, "error": f"{type(exc).__name__}: {exc}"})
     # Invalidate caches post-batch
     try:
         from web.memo_v06 import cache_invalidate
         cache_invalidate()
-    except Exception:
+    except ImportError:
         pass
     return {"ok": True, "deleted": deleted, "errors": errors}
 
@@ -672,15 +672,15 @@ def memo_cleanup_api(apply_dead: bool = True, apply_dupes: bool = False) -> dict
             from web.memo_dashboard import _snapshot_cache  # may not exist
             if hasattr(_snapshot_cache, "clear"):
                 _snapshot_cache.clear()
-        except Exception:
+        except ImportError:
             pass
         try:
             from web.memo_v06 import cache_invalidate
             cache_invalidate()
-        except Exception:
+        except ImportError:
             pass
         return {"ok": True, "results": results}
-    except Exception as e:
+    except ImportError as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
     finally:
         _memo_cleanup_lock.release()
@@ -797,7 +797,7 @@ def memo_merge_api(pairs: list[dict[str, str]]) -> dict:
                 deleted_in_batch.add(delete_id)
             else:
                 errors.append({"pair": pair, "error": result.stderr.decode()})
-        except Exception as e:
+        except subprocess.SubprocessError as e:
             errors.append({"pair": pair, "error": str(e)})
 
     return {"ok": True, "merged": merged, "errors": errors,
@@ -893,7 +893,7 @@ if _allow_tunnel:
         if _raw_url and re.match(r"^https://[a-z0-9-]+\.trycloudflare\.com$", _raw_url):
             _tunnel_url = _raw_url
             _tunnel_credentials = True
-    except Exception:
+    except OSError:
         pass  # state file missing/unreadable → no tunnel URL in regex
 
     if _tunnel_url:
@@ -1488,7 +1488,7 @@ def api_screen_capture(obs_id: int) -> "Response":  # noqa: F821
     try:
         import rag as _rag  # noqa: PLC0415
         db_path = _rag.DB_PATH / "telemetry.db"
-    except Exception as exc:
+    except ImportError as exc:
         raise HTTPException(status_code=500, detail=f"rag import failed: {exc}")
 
     try:
@@ -1891,7 +1891,7 @@ def cross_source_patterns(
         return patterns_summary(
             days=days_clamped, top=top_clamped, lags=lag_list,
         )
-    except Exception as exc:
+    except ImportError as exc:
         # Silent-fail: el frontend muestra empty state en lugar de
         # error 500. No queremos que un bug en patterns rompa el panel.
         print(f"[patterns] failed: {exc}", file=sys.stderr)
@@ -1932,7 +1932,7 @@ def mood_history(days: int = 30) -> dict:
     days = max(1, min(d, 90))
     try:
         from rag import mood as _mood
-    except Exception:
+    except ImportError:
         return {"days": [], "histogram": [], "total_days_with_data": 0}
 
     try:
@@ -2180,7 +2180,7 @@ def submit_draft_preview(req: DraftPreviewPayload, request: Request) -> dict:
         try:
             import rag as _rag_mod  # noqa: PLC0415
             _rag_mod._silent_log("drafts_ft_generate_failed", exc)
-        except Exception:
+        except ImportError:
             pass
     return {"ok": True, "preview": preview, "ft_active": ft_active}
 
@@ -2609,7 +2609,7 @@ def submit_behavior(req: BehaviorRequest, request: Request) -> dict:
                 ).fetchone()
                 if _row and _row[0]:
                     query_val = _row[0]
-        except Exception:
+        except sqlite3.Error:
             pass  # silent — peor caso queda como antes (query=None)
 
     # Resolver original_query_id desde la última query de la sesión para
@@ -2631,7 +2631,7 @@ def submit_behavior(req: BehaviorRequest, request: Request) -> dict:
                 ).fetchone()
                 if _row:
                     oqid = int(_row[0])
-        except Exception:
+        except sqlite3.Error:
             pass  # silent-fail — telemetría nunca rompe el endpoint
 
     try:
@@ -2718,14 +2718,14 @@ def ollama_unload() -> dict:
         mlx_loaded = list(getattr(mlx_backend, "_loaded", {}).keys())
         getattr(mlx_backend, "_loaded", {}).clear()
         freed.extend(mlx_loaded)
-    except Exception as exc:
+    except ImportError as exc:
         freed.append(f"mlx_clear (fail: {exc})")
     try:
         from rag import maybe_unload_reranker, _reranker_last_use  # noqa: F401
         import rag as _rag
         _rag._reranker_last_use = 0.0   # force eviction regardless of idle_ttl
         reranker_dropped = maybe_unload_reranker()
-    except Exception:
+    except ImportError:
         reranker_dropped = False
     return {"ok": True, "freed_models": freed, "reranker_dropped": reranker_dropped}
 
@@ -2794,7 +2794,7 @@ def create_reminder(req: ReminderCreateRequest, request: Request) -> dict:
         try:
             import rag as _rag_mod  # noqa: PLC0415
             _rag_mod._silent_log("home_cache_bust", _exc_home_bust)
-        except Exception:
+        except ImportError:
             pass
     return {"ok": True, "id": res}
 
@@ -2959,7 +2959,7 @@ def complete_reminder(req: ReminderCompleteRequest) -> dict:
         try:
             import rag as _rag_mod  # noqa: PLC0415
             _rag_mod._silent_log("home_cache_bust", _exc_home_bust)
-        except Exception:
+        except ImportError:
             pass
     return {"ok": True, "message": msg}
 
@@ -2994,7 +2994,7 @@ def delete_reminder(req: ReminderDeleteRequest) -> dict:
         try:
             import rag as _rag_mod  # noqa: PLC0415
             _rag_mod._silent_log("home_cache_bust", _exc_home_bust)
-        except Exception:
+        except ImportError:
             pass
     return {"ok": True, "message": msg}
 
@@ -3122,7 +3122,7 @@ def _sanitize_image_exif(raw_bytes: bytes, suffix: str) -> bytes:
             buf = io.BytesIO()
             stripped.save(buf, format=fmt)
             return buf.getvalue()
-    except Exception:
+    except OSError:
         # Cualquier error → fallback al raw original. Privacidad
         # degradada pero la nota se guarda.
         return raw_bytes
@@ -3259,7 +3259,7 @@ async def upload_chat_image(file: UploadFile = File(...)) -> dict:
                 if not existing:
                     sanitized = _sanitize_image_exif(raw, suffix)
                     vault_img_path.write_bytes(sanitized)
-    except Exception:
+    except OSError:
         # Silent-fail: copia al vault es nice-to-have, no debe romper
         # el flujo principal de OCR + detección.
         pass
@@ -3334,7 +3334,7 @@ async def upload_chat_image(file: UploadFile = File(...)) -> dict:
                 "FROM rag_cita_detections WHERE ocr_hash = ?",
                 (ocr_key,),
             ).fetchone()
-    except Exception:
+    except sqlite3.Error:
         prior = None
         ocr_key = ""
 
@@ -3430,7 +3430,7 @@ async def upload_chat_image(file: UploadFile = File(...)) -> dict:
                 reminder_id=reminder_id,
                 created_at=_time.time(),
             )
-        except Exception:
+        except ImportError:
             pass  # silent-fail: dedup miss en próximo upload no es crítico
 
     if kind not in {"event", "reminder"}:
@@ -3488,9 +3488,9 @@ async def upload_chat_image(file: UploadFile = File(...)) -> dict:
                             "threshold_days": _CHAT_UPLOAD_HISTORICAL_DAYS,
                             "ocr_source": ocr_source,
                         })
-                    except Exception:
+                    except ImportError:
                         pass
-        except Exception:
+        except ImportError:
             # Cualquier error de parsing → no bloqueamos, dejamos
             # que el routing normal decida (best-effort guardrail).
             pass
@@ -3517,7 +3517,7 @@ async def upload_chat_image(file: UploadFile = File(...)) -> dict:
                     notes=notes,
                 )
             resp = json.loads(resp_json)
-        except Exception as e:
+        except (json.JSONDecodeError, TypeError) as e:
             resp = {"created": False, "error": f"propose_*_failed: {e}"}
 
         if resp.get("created"):
@@ -3554,7 +3554,7 @@ async def upload_chat_image(file: UploadFile = File(...)) -> dict:
             parsed = _parse_natural_datetime(when, now=_dt.now())
             if parsed:
                 parsed_iso = parsed.isoformat()
-        except Exception:
+        except ImportError:
             parsed_iso = None
 
     if kind == "event":
@@ -3812,11 +3812,11 @@ def whatsapp_send(req: WhatsAppSendRequest, request: Request) -> dict:
             "reply_to_id": reply_to_id,
             "sent": True,
         })
-    except Exception as exc:
+    except ImportError as exc:
         try:
             import rag as _rag_mod  # noqa: PLC0415
             _rag_mod._silent_log("whatsapp_send_audit_log", exc)
-        except Exception:
+        except ImportError:
             pass
     return {"ok": True, "jid": jid}
 
@@ -3994,7 +3994,7 @@ def whatsapp_context(jid: str, limit: int = 5) -> dict:
     try:
         from rag.integrations.whatsapp import _fetch_whatsapp_recent_with_jid  # noqa: PLC0415
         return _fetch_whatsapp_recent_with_jid(j, limit=int(limit))
-    except Exception as e:
+    except ImportError as e:
         raise HTTPException(status_code=500, detail=f"error leyendo bridge: {e}") from e
 
 
@@ -4025,7 +4025,7 @@ def whatsapp_scheduled_list(
             limit=max(1, min(int(limit), 1000)),
         )
         return {"items": items, "count": len(items)}
-    except Exception as e:
+    except ImportError as e:
         raise HTTPException(status_code=500, detail=f"error listando scheduled: {e}") from e
 
 
@@ -4045,7 +4045,7 @@ def whatsapp_scheduled_cancel(scheduled_id: int) -> dict:
     try:
         from rag import wa_scheduled  # noqa: PLC0415
         ok = wa_scheduled.cancel(int(scheduled_id), reason="user_cancel_dashboard")
-    except Exception as e:
+    except ImportError as e:
         raise HTTPException(status_code=500, detail=f"error cancelando: {e}") from e
     if not ok:
         return {"ok": False, "reason": "not_pending_or_not_found"}
@@ -4312,7 +4312,7 @@ def wa_sender_override(req: _WASenderOverrideRequest) -> dict:
             data = _json.loads(path.read_text(encoding="utf-8") or "{}")
             if not isinstance(data, dict):
                 data = {}
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             data = {}
     if name:
         data[req.jid] = name
@@ -4974,7 +4974,7 @@ async def wa_draft_check(req: _WADraftCheckRequest, request: Request) -> dict:
                 format="json",
             )
         )
-    except Exception as exc:  # noqa: BLE001
+    except ImportError as exc:
         return {
             "ok": True,
             "conflicts": [],
@@ -5495,7 +5495,7 @@ def wa_voice_list() -> dict:
         )
         if proc.returncode != 0:
             return {"ok": False, "voices": [], "error": "say failed"}
-    except Exception as exc:
+    except subprocess.SubprocessError as exc:
         return {"ok": False, "voices": [], "error": str(exc)[:200]}
 
     voices: list[dict] = []
@@ -5703,7 +5703,7 @@ def wa_voice_transcript(message_id: str, jid: str) -> dict:
                 text=cached.get("text") or "",
                 audio_ts=cached.get("audio_ts") or "",
             )
-        except Exception:
+        except ImportError:
             pass
         return {
             "ok": True,
@@ -5779,7 +5779,7 @@ def wa_voice_transcript(message_id: str, jid: str) -> dict:
             msg_id=message_id, jid=jid, sender=sender_raw,
             text=text, audio_ts=str(audio_ts or ""),
         )
-    except Exception as exc:  # noqa: BLE001
+    except ImportError as exc:
         try:
             _rag._silent_log("wa_voice_note_write_failed", exc)
         except Exception:
@@ -5866,14 +5866,14 @@ def _detect_outbound_promise(jid: str, text: str) -> int | None:
     """
     try:
         from rag.integrations.whatsapp import _has_promise_hint  # noqa: PLC0415
-    except Exception:
+    except ImportError:
         return None
     if not text or not _has_promise_hint(text):
         return None
     try:
         from rag import _ragvec_state_conn, _silent_log  # noqa: PLC0415
         from rag.integrations.whatsapp import fetch as _wa_fetch  # noqa: PLC0415
-    except Exception:
+    except ImportError:
         return None
 
     name = ""
@@ -5886,7 +5886,7 @@ def _detect_outbound_promise(jid: str, text: str) -> int | None:
     try:
         from rag.integrations.whatsapp.tail import try_parse_due_from_text  # noqa: PLC0415
         due_iso = try_parse_due_from_text(text)
-    except Exception:
+    except ImportError:
         due_iso = None
     due_conf = 0.7 if due_iso else 0.3
     try:
@@ -5902,7 +5902,7 @@ def _detect_outbound_promise(jid: str, text: str) -> int | None:
             promise_id = cur.lastrowid
             conn.commit()
         return int(promise_id)
-    except Exception as exc:
+    except sqlite3.Error as exc:
         try:
             _silent_log("promise_tracker_insert", exc)
         except Exception:
@@ -5979,7 +5979,7 @@ def wa_promises_list(
         with _ragvec_state_conn() as conn:
             conn.row_factory = _sqlite3.Row
             rows = conn.execute(sql, params).fetchall()
-    except Exception as exc:
+    except sqlite3.Error as exc:
         raise HTTPException(status_code=500, detail=f"db error: {exc}")
     return {"ok": True, "promises": [_promise_row_to_dict(r) for r in rows]}
 
@@ -6105,7 +6105,7 @@ def mail_summary(req: MailSummaryRequest) -> dict:
     try:
         from rag.integrations.gmail import _gmail_service
         from rag import _gmail_thread_last_meta, _summary_client, HELPER_MODEL, HELPER_OPTIONS, LLM_KEEP_ALIVE
-    except Exception as e:
+    except ImportError as e:
         raise HTTPException(status_code=500, detail=f"gmail integration unavailable: {e}") from e
 
     svc = _gmail_service()
@@ -6226,7 +6226,7 @@ def mail_send(req: MailSendRequest, request: Request) -> dict:
             "message_id": result.get("message_id", ""),
             "sent": True,
         })
-    except Exception:
+    except ImportError:
         pass
     return {
         "ok": True,
@@ -6265,7 +6265,7 @@ def get_dossier(name: str, days: int = 30, max_messages: int = 30) -> dict:
     max_messages = max(5, min(int(max_messages), 100))
     try:
         from rag.integrations.whatsapp.dossier import generate_dossier
-    except Exception as e:
+    except ImportError as e:
         raise HTTPException(status_code=500, detail=f"dossier module unavailable: {e}") from e
 
     try:
@@ -6308,7 +6308,7 @@ def calendar_upcoming(limit: int = 5, days: int = 1) -> dict:
     days = max(0, min(int(days), 7))
     try:
         from rag.integrations.calendar import _fetch_calendar_ahead
-    except Exception as e:
+    except ImportError as e:
         raise HTTPException(status_code=500, detail=f"calendar module unavailable: {e}") from e
 
     try:
@@ -6369,7 +6369,7 @@ def calendar_free_slots(
 
     try:
         from rag.integrations.calendar import _fetch_calendar_ahead
-    except Exception as e:
+    except ImportError as e:
         raise HTTPException(status_code=500, detail=f"calendar module unavailable: {e}") from e
 
     try:
@@ -6504,7 +6504,7 @@ def list_contacts(q: str = "", kind: str = "any", limit: int = 20) -> dict:
         try:
             import rag as _rag  # noqa: PLC0415
             _rag._silent_log("api_contacts", exc)
-        except Exception:
+        except ImportError:
             pass
         contacts = []
     return {
@@ -6772,7 +6772,7 @@ def followups(req: FollowupsRequest) -> dict:
             if len(out) >= 3:
                 break
         return {"followups": out}
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         return {"followups": []}
 
 
@@ -7534,7 +7534,7 @@ def get_chat_model() -> dict:
             if hf_id in mlx_ids
             and not any(alias.startswith(p) for p in _CHAT_MODEL_FAMILY_DENYLIST)
         )
-    except Exception:
+    except ImportError:
         available = []
     try:
         default = resolve_chat_model()
@@ -7568,7 +7568,7 @@ def set_chat_model(req: ChatModelRequest) -> dict:
             from rag.llm_backend import MLXBackend, MLX_MODEL_ALIAS
             mlx_ids = set(MLXBackend().list_available())
             available = {alias for alias, hf_id in MLX_MODEL_ALIAS.items() if hf_id in mlx_ids}
-        except Exception:
+        except ImportError:
             available = set()
         if requested not in available:
             raise HTTPException(
@@ -7634,7 +7634,7 @@ def query_history(limit: int = 200) -> dict:
             if len(picked) >= limit:
                 break
         return {"history": list(reversed(picked))}
-    except Exception as exc:
+    except sqlite3.Error as exc:
         _log_sql_state_error("history_sql_read_failed", err=repr(exc))
         return {"history": []}
 
@@ -8286,7 +8286,7 @@ def _maybe_emit_proposal(name: str, out: str) -> str | None:
         return None
     try:
         payload = json.loads(out)
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         return None
     if not isinstance(payload, dict):
         return None
@@ -8905,7 +8905,7 @@ def _gen_tasks_response(sess: dict, question: str, history: list[dict]):
         if tail:
             parts.append(tail)
             yield _sse("token", {"delta": tail})
-    except Exception as exc:
+    except ImportError as exc:
         # Ver `[chat-stream-error] phase=synthesis` en /api/chat para
         # rationale — mismo bug de observabilidad acá. Este es el brief
         # de /api/tasks (streaming directo, sin tool loop).
@@ -9164,7 +9164,7 @@ def _fetch_spotify(limit: int = 10) -> dict | None:
         from rag.integrations.spotify_local import (
             now_playing, recent_tracks_today, recent_tracks_lookback,
         )
-    except Exception:
+    except ImportError:
         return None
     try:
         np = now_playing()
@@ -9236,7 +9236,7 @@ def _fetch_sleep() -> dict | None:
             last_night, weekly_stats, latest_self_report_mood,
             patterns_summary,
         )
-    except Exception:
+    except ImportError:
         return None
     try:
         ln = last_night()
@@ -9313,7 +9313,7 @@ def _fetch_screen_observations(limit: int = 6) -> list[dict]:
     """
     try:
         from rag import _ragvec_state_conn  # noqa: PLC0415
-    except Exception:
+    except ImportError:
         return []
     try:
         with _ragvec_state_conn() as conn:
@@ -9325,7 +9325,7 @@ def _fetch_screen_observations(limit: int = 6) -> list[dict]:
             )
             cols = [c[0] for c in cur.description]
             rows = cur.fetchall()
-    except Exception:
+    except sqlite3.Error:
         return []
     out = []
     for r in rows:
@@ -9357,14 +9357,14 @@ def _fetch_health() -> dict | None:
         from rag.integrations.apple_health import (
             daily_summary, recent_summaries,
         )
-    except Exception:
+    except ImportError:
         return None
     try:
         from datetime import datetime as _dt
         today = _dt.now().strftime("%Y-%m-%d")
         row = daily_summary(today)
         recent = recent_summaries(days=14)
-    except Exception:
+    except ImportError:
         return None
     if not recent:
         return None
@@ -9466,7 +9466,7 @@ def _fetch_mood() -> dict | None:
     """
     try:
         from rag import mood as _mood
-    except Exception:
+    except ImportError:
         return None
     try:
         today = _mood._today_local()
@@ -9685,7 +9685,7 @@ def _fetch_eval_trend(n: int = 10) -> dict | None:
                 " ORDER BY ts DESC LIMIT ?",
                 (n,),
             ).fetchall()
-    except Exception:
+    except sqlite3.Error:
         return None
     if not rows:
         return None
@@ -9695,7 +9695,7 @@ def _fetch_eval_trend(n: int = 10) -> dict | None:
         if row[1]:
             try:
                 entry.update(json.loads(row[1]))
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 pass
         history.append(entry)
     return {
@@ -9755,7 +9755,7 @@ def _ensure_followup_aging_table() -> None:
                 ")"
             )
         _FOLLOWUP_AGING_DDL_ENSURED = True
-    except Exception:
+    except sqlite3.Error:
         # Si el DDL falla (DB locked, permissions, etc.), seguimos sin
         # persistencia — el SWR in-memory sigue funcionando. NO blockear.
         pass
@@ -9772,7 +9772,7 @@ def _followup_aging_load_from_disk() -> tuple[float, dict] | None:
             row = conn.execute(
                 "SELECT ts, payload_json FROM rag_followup_aging_cache WHERE id = 1"
             ).fetchone()
-    except Exception:
+    except sqlite3.Error:
         return None
     if row is None:
         return None
@@ -9784,7 +9784,7 @@ def _followup_aging_load_from_disk() -> tuple[float, dict] | None:
     try:
         import json as _json
         return float(ts), _json.loads(payload_json)
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         return None
 
 
@@ -9804,7 +9804,7 @@ def _followup_aging_persist(ts: float, payload: dict, elapsed_s: float | None = 
                 "payload_json=excluded.payload_json, elapsed_s=excluded.elapsed_s",
                 (ts, _json.dumps(payload, ensure_ascii=False), elapsed_s),
             )
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         pass
 
 
@@ -10069,7 +10069,7 @@ def _fetch_finance(now: datetime | None = None) -> dict | None:
         from rag.integrations import tally4_realm
         tally4_realm.ensure_moze_csv(_MOZE_BACKUP_DIR)
         cache_dir = tally4_realm.CACHE_DIR
-    except Exception:
+    except ImportError:
         cache_dir = None
     try:
         csvs: list[Path] = []
@@ -10109,7 +10109,7 @@ def _fetch_finance(now: datetime | None = None) -> dict | None:
                 except ValueError:
                     continue
                 rows.append((d, r))
-    except Exception:
+    except OSError:
         return None
     if not rows:
         return None
@@ -10771,7 +10771,7 @@ def _record_home_compute_total(
                 ),
             )
             conn.commit()
-    except Exception:
+    except sqlite3.Error:
         pass  # silent-fail per convention
 
 
@@ -10791,7 +10791,7 @@ def _hydrate_home_compute_history_from_sql() -> None:
                 "ORDER BY ts DESC LIMIT ?",
                 (_HOME_COMPUTE_HISTORY_MAX,),
             ).fetchall()
-    except Exception:
+    except sqlite3.Error:
         return
     if not rows:
         return
@@ -10854,7 +10854,7 @@ def _diagnose_home_slowdown() -> dict:
         used_pct = _rag._system_memory_used_pct()
         if used_pct is not None:
             details["mem_used_pct"] = round(used_pct, 1)
-    except Exception:
+    except ImportError:
         pass
 
     # Pick the dominant cause for the UI label.
@@ -10927,7 +10927,7 @@ def _home_refresh(regenerate: bool = False) -> None:
     try:
         payload = _home_compute(regenerate)
         body = json.dumps(payload, default=str).encode()
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         with _HOME_LOCK:
             _HOME_STATE["computing"] = False
             _HOME_STATE["computing_regenerate"] = False
@@ -10990,7 +10990,7 @@ def _load_home_cache() -> None:
         _HOME_STATE["ts"] = ts
         print(f"[home-cache] hydrated from disk age={age:.0f}s size={len(body_bytes)}B",
               file=sys.stderr)
-    except Exception as exc:
+    except (json.JSONDecodeError, TypeError) as exc:
         print(f"[home-cache] load failed: {exc}", file=sys.stderr)
 
 
@@ -11492,7 +11492,7 @@ def _ensure_reranker_prewarmer() -> None:
             from rag import get_reranker as _get_rr
             _get_rr()
             print("[prewarm] reranker loaded", flush=True)
-        except Exception as exc:
+        except ImportError as exc:
             print(f"[prewarm] reranker skipped: {exc}", flush=True)
 
     threading.Thread(target=_load, name="reranker-prewarmer", daemon=True).start()
@@ -11524,7 +11524,7 @@ def _ensure_corpus_prewarmer() -> None:
                 except Exception:
                     pass
                 break
-        except Exception as exc:
+        except ImportError as exc:
             print(f"[prewarm] corpus skipped: {exc}", flush=True)
 
     threading.Thread(target=_load, name="corpus-prewarmer", daemon=True).start()
@@ -11932,7 +11932,7 @@ def _home_compute(
     try:
         from rag.today_correlator import correlate_today_signals as _corr
         today_correlations = _corr(today_ev, extras_lite)
-    except Exception as exc:  # noqa: BLE001
+    except ImportError as exc:
         print(f"[today-correlator] failed: {exc}", file=sys.stderr)
         today_correlations = {"people": [], "topics": [], "time_overlaps": []}
 
@@ -12042,7 +12042,7 @@ def _home_compute(
             _rag_mod.WHATSAPP_BOT_JID,
             now=now if isinstance(now, datetime) else None,
         )
-    except Exception as exc:  # noqa: BLE001
+    except ImportError as exc:
         print(f"[today-patterns] failed: {exc}", file=sys.stderr)
 
     # Highlights: stats sintéticos que el frontend rendea como fila de
@@ -12238,7 +12238,7 @@ def _drain_conversation_writers() -> None:
                     "count": len(stragglers),
                 }) + "\n",
             ))
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             pass
 
 
@@ -12256,7 +12256,7 @@ def _signal_rag_daemon_loops() -> None:
     try:
         from rag import request_daemon_shutdown as _rds
         _rds()
-    except Exception as exc:
+    except ImportError as exc:
         print(f"[lifespan-shutdown] _signal_rag_daemon_loops falló: {exc}", flush=True)
 
 
@@ -12292,7 +12292,7 @@ def _append_pending_conversation_turn(rec: dict) -> None:
         _CONV_PENDING_PATH.parent.mkdir(parents=True, exist_ok=True)
         with _CONV_PENDING_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         # Dead-letter failed too — nothing else we can do without blocking
         # the SSE response. The LOG_QUEUE error record above is the last
         # signal the operator gets.
@@ -12422,7 +12422,7 @@ def _persist_conversation_turn(
                 "path": str(path.relative_to(vault_root)),
             }) + "\n",
         ))
-    except Exception as exc:
+    except (json.JSONDecodeError, TypeError) as exc:
         # Persist the turn payload to a retry queue on disk so a transient
         # SQL / fs failure doesn't drop it silently. Consumed at startup by
         # _retry_pending_conversation_turns. Errors still surface via
@@ -12456,7 +12456,7 @@ def _retry_pending_conversation_turns() -> int:
         return 0
     try:
         raw = _CONV_PENDING_PATH.read_text(encoding="utf-8")
-    except Exception:
+    except OSError:
         return 0
     remaining: list[str] = []
     retried = 0
@@ -12483,7 +12483,7 @@ def _retry_pending_conversation_turns() -> int:
             )
             write_turn(Path(rec["vault_root"]), rec["session_id"], turn)
             retried += 1
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             # Keep the line for the next retry cycle.
             remaining.append(line)
     try:
@@ -12492,7 +12492,7 @@ def _retry_pending_conversation_turns() -> int:
                                            encoding="utf-8")
         else:
             _CONV_PENDING_PATH.unlink(missing_ok=True)
-    except Exception:
+    except OSError:
         pass
     return retried
 
@@ -12553,7 +12553,7 @@ def _resolve_redo_question(turn_id: str) -> tuple[str | None, str | None]:
                 " ORDER BY ts DESC LIMIT 1",
                 (turn_id,),
             ).fetchone()
-    except Exception as exc:  # noqa: BLE001 — log + fail gracefully
+    except sqlite3.Error as exc:
         print(f"[redo] sql lookup failed: {type(exc).__name__}: {exc}", flush=True)
         return None, None
     if row is None:
@@ -12764,11 +12764,11 @@ async def api_query(req: QueryRequest, request: Request) -> dict:
             hint = stale_source_hint(question)
             if hint:
                 canned = canned + "\n\n" + hint
-        except Exception as exc:
+        except ImportError as exc:
             try:
                 import rag as _rag_mod  # noqa: PLC0415
                 _rag_mod._silent_log("api_query_stale_hint", exc)
-            except Exception:
+            except ImportError:
                 pass
         return {
             "answer": canned,
@@ -12910,12 +12910,12 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         _client_device = _rag_mod._classify_device(
             request.headers.get("User-Agent", "")
         )
-    except Exception as exc:
+    except ImportError as exc:
         _client_device = "other"
         try:
             import rag as _rag_mod_log  # noqa: PLC0415
             _rag_mod_log._silent_log("chat_device_classification", exc)
-        except Exception:
+        except ImportError:
             pass
 
     # ── /redo path ───────────────────────────────────────────────────────
@@ -12983,7 +12983,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         try:
             import rag as _rag_mod  # noqa: PLC0415
             _rag_mod._silent_log("chat_session_state_lookup", exc)
-        except Exception:
+        except ImportError:
             pass
 
     # Spotify control short-circuit — comandos directos de playback
@@ -13103,7 +13103,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             if _intent in _rag._nli_skip_intents():
                 return None
             claims = _rag.split_claims(full)
-        except Exception as exc:
+        except ImportError as exc:
             print(f"[nli-grounding] skipped (pre-flight): {type(exc).__name__}: {exc}", flush=True)
             return None
 
@@ -13209,7 +13209,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         try:
             import rag as _rag_mod_for_remind
             _remind_intent_match = _rag_mod_for_remind.parse_remind_intent(question)
-        except Exception:
+        except ImportError:
             _remind_intent_match = None
         if (
             _remind_intent_match
@@ -13376,7 +13376,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         try:
             import rag as _rag_mod_for_fin
             _is_finance_q = _rag_mod_for_fin._is_finance_or_cards_query(question)
-        except Exception:
+        except ImportError:
             _is_finance_q = False
         if _is_finance_q:
             try:
@@ -13533,7 +13533,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 try:
                     import rag as _rag_m
                     _meta_intent, _ = _rag_m.classify_intent(question, set(), set())
-                except Exception:
+                except ImportError:
                     _meta_intent = None
                 log_query_event({
                     "cmd": "web.chat.metachat", "q": question[:200],
@@ -13544,7 +13544,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     # — habilita `SELECT device, AVG(...) GROUP BY 1` en analytics
                     "device": _client_device,
                 })
-            except Exception:
+            except ImportError:
                 pass
             return
 
@@ -13573,7 +13573,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             try:
                 from rag import get_db_for
                 _vault_chunks = get_db_for(vaults[0][1]).count() if vaults else 0
-            except Exception:
+            except ImportError:
                 _vault_chunks = 0
             _cache_key = _chat_cache_key(
                 question, req.vault_scope or "", _resolve_web_chat_model(), _vault_chunks
@@ -13879,7 +13879,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                         except Exception:
                             pass
                         return
-            except Exception as _sem_exc:
+            except ImportError as _sem_exc:
                 print(
                     f"[chat-cache] semantic lookup failed: "
                     f"{type(_sem_exc).__name__}: {_sem_exc}",
@@ -13966,7 +13966,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 question, set(), set(),
             )
             _early_hint = _build_retrieve_hint(_early_intent)
-        except Exception:
+        except ImportError:
             pass
         _retrieving_status = {"stage": "retrieving"}
         if _early_hint:
@@ -14186,7 +14186,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     import rag as _rag_mod
                     _intent_for_log, _ = _rag_mod.classify_intent(
                         search_question, set(), set())
-                except Exception:
+                except ImportError:
                     _intent_for_log = None
             # List-intent override (2026-04-28): si la query pide
             # explícitamente una lista amplia ("mostrame todas las
@@ -14314,7 +14314,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 result["filters_applied"] = _fa
             # ── /Feature H ───────────────────────────────────────────────
             _t_retrieve_end = time.perf_counter()
-        except Exception as exc:
+        except ImportError as exc:
             # 2026-04-28 wave-7: sanitizar el error message antes de emitirlo
             # al user. Repro Conv 6: "cómo funciona el sistema RAG" → assertion
             # interna `bm25_search llamado en paralelo — es GIL-serialised por
@@ -14663,7 +14663,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         try:
             from rag import confidence_threshold_for_source as _conf_thresh_fn
             _conf_threshold = _conf_thresh_fn(_top_src) if _top_src else CONFIDENCE_RERANK_MIN
-        except Exception:
+        except ImportError:
             _conf_threshold = CONFIDENCE_RERANK_MIN
         _low_conf_bypass = (
             not is_propose_intent
@@ -15216,7 +15216,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 if isinstance(params, str):
                     try:
                         params = json.loads(params)
-                    except Exception:
+                    except (json.JSONDecodeError, TypeError):
                         params = {}
                 args = params
             if not isinstance(args, dict):
@@ -15341,7 +15341,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 # síntesis. Lazy import para deploy parcial.
                 try:
                     from rag._tool_output_helpers import truncate_tool_output_for_synthesis
-                except Exception:
+                except ImportError:
                     truncate_tool_output_for_synthesis = lambda name, raw, **kw: raw  # type: ignore
 
                 _datos_block = ""
@@ -15386,7 +15386,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     if _n == "drive_search":
                         try:
                             _drive_payload = json.loads(_res)
-                        except Exception:
+                        except (json.JSONDecodeError, TypeError):
                             continue
                         if not isinstance(_drive_payload, dict):
                             continue
@@ -15407,7 +15407,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     elif _n == "whatsapp_pending":
                         try:
                             _wa_payload = json.loads(_res)
-                        except Exception:
+                        except (json.JSONDecodeError, TypeError):
                             continue
                         if not isinstance(_wa_payload, list):
                             continue
@@ -15695,7 +15695,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 # timeoutiara. Lazy import para deploy parcial.
                 try:
                     from rag._tool_output_helpers import truncate_tool_output_for_synthesis as _trunc_tool_out
-                except Exception:
+                except ImportError:
                     _trunc_tool_out = lambda name, raw, **kw: raw  # type: ignore
 
                 # Serial bucket first — vault search is the gating signal.
@@ -15715,7 +15715,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                         else:
                             _ret = _fn(**_filter_tool_args(_name, _args))
                             _out = _ret if isinstance(_ret, str) else json.dumps(_ret, ensure_ascii=False)
-                    except Exception as _exc:
+                    except (json.JSONDecodeError, TypeError) as _exc:
                         _out = f"Error: {_exc}"
                     _elapsed_ms = int((time.perf_counter() - _t_tool_start) * 1000)
                     _round_serial_sum_ms += _elapsed_ms
@@ -15750,7 +15750,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                             else:
                                 _ret = _fn(**_filter_tool_args(_name, _args))
                                 _out = _ret if isinstance(_ret, str) else json.dumps(_ret, ensure_ascii=False)
-                        except Exception as _exc:
+                        except (json.JSONDecodeError, TypeError) as _exc:
                             _out = f"Error: {_exc}"
                         return _name, _out, int((time.perf_counter() - _t0) * 1000)
 
@@ -15797,7 +15797,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     "role": "system",
                     "content": "Alcanzado cap de herramientas; respondé con lo que tenés.",
                 })
-        except Exception as exc:
+        except (json.JSONDecodeError, TypeError) as exc:
             # Ver `[chat-stream-error] phase=synthesis` (más abajo) para
             # rationale del logging — mismo bug de observabilidad acá.
             # Este es el except del tool-decision loop (cliente non-stream
@@ -16003,7 +16003,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     f"{tool_names_called or 'none'}",
                     flush=True,
                 )
-        except Exception as exc:
+        except ImportError as exc:
             # Diagnóstico: sin este print el server NO loggea NADA cuando el
             # frontend muestra "LLM falló: timed out". Debugear regresiones
             # post-eval era imposible (los chat-timing de éxito sí están en
@@ -16074,7 +16074,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                         f"unverified={_nli_unverified_count}",
                         flush=True,
                     )
-        except Exception as _nli_exc:
+        except ImportError as _nli_exc:
             print(
                 f"[citation-nli] wire-up error (silent-fail): "
                 f"{type(_nli_exc).__name__}: {_nli_exc}",
@@ -16413,7 +16413,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                         f"len={len(full)}",
                         flush=True,
                     )
-                except Exception as _sem_put_err:
+                except ImportError as _sem_put_err:
                     print(
                         f"[chat-cache] semantic put failed: "
                         f"{type(_sem_put_err).__name__}: {_sem_put_err}",
@@ -16669,7 +16669,7 @@ def _query_pulse_recencies(paths_filter: set[str] | None = None) -> dict[str, fl
     try:
         import rag as _rag_mod
         telemetry_db = Path(_rag_mod.DB_PATH) / _rag_mod._TELEMETRY_DB_FILENAME
-    except Exception:
+    except ImportError:
         return {}
     if not telemetry_db.exists():
         return {}
@@ -16684,7 +16684,7 @@ def _query_pulse_recencies(paths_filter: set[str] | None = None) -> dict[str, fl
                 "WHERE ts >= ? AND paths_json IS NOT NULL AND paths_json != ''",
                 (cutoff,),
             ).fetchall()
-    except Exception:
+    except sqlite3.Error:
         return {}
 
     for ts_str, pjson in rows:
@@ -16697,7 +16697,7 @@ def _query_pulse_recencies(paths_filter: set[str] | None = None) -> dict[str, fl
             continue
         try:
             paths = _json.loads(pjson)
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             continue
         if not isinstance(paths, list):
             continue
@@ -16753,7 +16753,7 @@ def atlas_pulse_recent_api(since_id: int = 0, limit: int = 30) -> dict:
     try:
         import rag as _rag_mod
         telemetry_db = Path(_rag_mod.DB_PATH) / _rag_mod._TELEMETRY_DB_FILENAME
-    except Exception:
+    except ImportError:
         return {"events": [], "last_id": since_id}
     if not telemetry_db.exists():
         return {"events": [], "last_id": since_id}
@@ -16768,7 +16768,7 @@ def atlas_pulse_recent_api(since_id: int = 0, limit: int = 30) -> dict:
                 "ORDER BY id ASC LIMIT ?",
                 (since_id, limit),
             ).fetchall()
-    except Exception:
+    except sqlite3.Error:
         return {"events": [], "last_id": since_id}
 
     events = []
@@ -16783,7 +16783,7 @@ def atlas_pulse_recent_api(since_id: int = 0, limit: int = 30) -> dict:
             continue
         try:
             paths = _json.loads(pjson)
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             continue
         if not isinstance(paths, list):
             continue
@@ -16917,7 +16917,7 @@ def transcripts_dashboard(nofresh: int = 0) -> HTMLResponse:
             try:
                 from rag_whisper_learning.patterns import find_correction_patterns
                 patterns_data = find_correction_patterns(min_count=2)
-            except Exception:
+            except ImportError:
                 patterns_data = []
             # Heatmap por hora del día (últimos 30 días, hora local).
             # Útil para visualizar cuándo el user manda audios típicamente.
@@ -16934,7 +16934,7 @@ def transcripts_dashboard(nofresh: int = 0) -> HTMLResponse:
                     h = int(row[0]) if row[0] is not None else 0
                     if 0 <= h < 24:
                         hour_counts[h] = int(row[1] or 0)
-            except Exception:
+            except sqlite3.Error:
                 pass
             # Heatmap semanal día×hora (últimos 60 días para tener suficiente
             # signal por celda). Sqlite `strftime('%w', ...)` devuelve 0-6
@@ -16959,9 +16959,9 @@ def transcripts_dashboard(nofresh: int = 0) -> HTMLResponse:
                     h = int(row[1]) if row[1] is not None else 0
                     if 0 <= d < 7 and 0 <= h < 24:
                         week_counts[(d, h)] = int(row[2] or 0)
-            except Exception:
+            except sqlite3.Error:
                 pass
-    except Exception as exc:
+    except sqlite3.Error as exc:
         return HTMLResponse(
             f"<!doctype html><html><body>"
             f"<h1>Whisper transcripts</h1>"
@@ -17583,7 +17583,7 @@ def _status_probe_mlx_backend() -> dict:
         ms = int((time.monotonic() - t0) * 1000)
         return {"id": "mlx-backend", "name": "MLX backend", "kind": "probe",
                 "status": "ok", "detail": f"running · import {ms}ms"}
-    except Exception as e:
+    except ImportError as e:
         ms = int((time.monotonic() - t0) * 1000)
         return {"id": "mlx-backend", "name": "MLX backend", "kind": "probe",
                 "status": "down", "detail": f"{type(e).__name__}: {e} ({ms}ms)"}
@@ -17602,7 +17602,7 @@ def _status_probe_rag_db() -> dict:
         return {"id": "rag-db", "name": "RAG DB (ragvec)", "kind": "probe",
                 "status": "ok",
                 "detail": f"{_status_fmt_size(st.st_size)} · modif. {_status_fmt_age(age)}"}
-    except Exception as e:
+    except ImportError as e:
         return {"id": "rag-db", "name": "RAG DB (ragvec)", "kind": "probe",
                 "status": "down", "detail": f"{type(e).__name__}: {e}"}
 
@@ -17619,7 +17619,7 @@ def _status_probe_telemetry_db() -> dict:
         return {"id": "telemetry-db", "name": "Telemetry DB", "kind": "probe",
                 "status": "ok",
                 "detail": f"{_status_fmt_size(st.st_size)} · modif. {_status_fmt_age(age)}"}
-    except Exception as e:
+    except ImportError as e:
         return {"id": "telemetry-db", "name": "Telemetry DB", "kind": "probe",
                 "status": "warn", "detail": f"{type(e).__name__}: {e}"}
 
@@ -17670,7 +17670,7 @@ def _status_probe_tunnel_url() -> dict:
         return {"id": "tunnel-url", "name": "Tunnel URL", "kind": "probe",
                 "status": "ok", "detail": f"{url} · {_status_fmt_age(age)}",
                 "meta": {"url": url}}
-    except Exception as e:
+    except OSError as e:
         return {"id": "tunnel-url", "name": "Tunnel URL", "kind": "probe",
                 "status": "warn", "detail": f"{type(e).__name__}: {e}"}
 
@@ -18147,7 +18147,7 @@ def _status_latency_build_payload() -> dict:
                         * 100.0
                     )
                     summary["delta_p95_pct"] = round(delta, 1)
-    except Exception as e:
+    except sqlite3.Error as e:
         # Telemetry DB locked / schema missing: devolver payload neutral
         # en vez de 500ear el /status. El frontend muestra "—" y el
         # semáforo global sigue funcionando con el resto de sus probes.
@@ -18247,7 +18247,7 @@ def _rollup_error_log(path: Path, key_field: str, source: str,
                     continue
                 try:
                     rec = json.loads(line)
-                except Exception:
+                except (json.JSONDecodeError, TypeError):
                     continue
                 ts = rec.get("ts")
                 if not ts:
@@ -18263,7 +18263,7 @@ def _rollup_error_log(path: Path, key_field: str, source: str,
                 key = rec.get(key_field) or "(unknown)"
                 counts[key] = counts.get(key, 0) + 1
                 total += 1
-    except Exception as e:
+    except (json.JSONDecodeError, TypeError) as e:
         print(f"[status_errors] warn: rollup of {path.name} failed: {type(e).__name__}: {e}", flush=True)
     return total, counts
 
@@ -18488,7 +18488,7 @@ def _read_start_interval_s(plist_label: str) -> int | None:
         return None
     try:
         content = plist_path.read_text(encoding="utf-8")
-    except Exception:
+    except OSError:
         return None
     # Simple regex — no need for plistlib here; `<key>StartInterval</key>
     # <integer>NNN</integer>` es stable-enough en plists generados por
@@ -18688,7 +18688,7 @@ def _read_jsonl_events(path: Path, key_field: str, level: str,
                     continue
                 try:
                     rec = json.loads(line)
-                except Exception:
+                except (json.JSONDecodeError, TypeError):
                     continue
                 ts = rec.get("ts")
                 if not ts:
@@ -18729,7 +18729,7 @@ def _read_jsonl_events(path: Path, key_field: str, level: str,
                     "exc_type": exc_type,
                     "message": message[:500],  # truncate to keep payload
                 })
-    except Exception as e:
+    except (json.JSONDecodeError, TypeError) as e:
         print(f"[status_logs] warn: read of {path.name} failed: {type(e).__name__}: {e}", flush=True)
     return events
 
@@ -18943,7 +18943,7 @@ def _persist_status_samples(payload: dict) -> None:
                 conn.execute(
                     "DELETE FROM rag_status_samples WHERE ts < datetime('now', '-8 days')"
                 )
-    except Exception as e:
+    except sqlite3.Error as e:
         print(f"[status_samples] warn: persist failed: {type(e).__name__}: {e}", flush=True)
 
 
@@ -19117,7 +19117,7 @@ def _status_uptime_build_payload() -> dict:
                     "samples_7d": samples_total,
                     "buckets": buckets,
                 })
-    except Exception as e:
+    except sqlite3.Error as e:
         print(f"[status_uptime] warn: build failed: {type(e).__name__}: {e}", flush=True)
         # Returns lista vacía — frontend muestra "sin datos" en heatmap.
 
@@ -19185,7 +19185,7 @@ def _read_swap_usage() -> float:
         m = re.search(r"used\s*=\s*([\d.]+)M", out)
         if m:
             return round(float(m.group(1)) / 1024.0, 2)
-    except Exception:
+    except subprocess.SubprocessError:
         pass
     return 0.0
 
@@ -19537,7 +19537,7 @@ def _read_tail_lines(path: Path, max_lines: int, max_bytes: int = 4 * 1024 * 102
             if len(lines) > max_lines:
                 lines = lines[-max_lines:]
             return lines
-    except Exception:
+    except OSError:
         return []
 
 
@@ -20800,7 +20800,7 @@ def _resolve_diagnose_model() -> str:
         from rag.llm_backend import MLXBackend, MLX_MODEL_ALIAS
         mlx_ids = set(MLXBackend().list_available())
         available = {alias for alias, hf_id in MLX_MODEL_ALIAS.items() if hf_id in mlx_ids}
-    except Exception:
+    except ImportError:
         available = set()
     for candidate in _DIAGNOSE_MODEL_PREFERENCE:
         if candidate in available:
@@ -20890,7 +20890,7 @@ def diagnose_error(req: _DiagnoseErrorRequest, request: Request) -> StreamingRes
                 if done:
                     yield f"data: {json.dumps({'type': 'done'})}\n\n"
                     break
-        except Exception as e:
+        except (json.JSONDecodeError, TypeError) as e:
             err_msg = f"{type(e).__name__}: {e}"
             yield f"data: {json.dumps({'type': 'error', 'message': err_msg})}\n\n"
 
@@ -21174,7 +21174,7 @@ def _audit_diagnose_execution(record: dict) -> None:
         _DIAGNOSE_AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
         with _DIAGNOSE_AUDIT_LOG.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
-    except Exception as e:
+    except (json.JSONDecodeError, TypeError) as e:
         print(f"[diagnose-execute] audit log write failed: "
               f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
 
@@ -21481,7 +21481,7 @@ def auto_fix(req: _AutoFixRequest, request: Request) -> StreamingResponse:
                 )
                 raw_content = (resp.message.content if hasattr(resp, "message") else
                                resp["message"]["content"])
-            except Exception as e:
+            except ImportError as e:
                 yield f"data: {json.dumps({'type': 'error', 'message': f'LLM call failed: {e}'})}\n\n"
                 return
 
@@ -21646,7 +21646,7 @@ def _recover_devin_final_message(pid: int) -> str | None:
                 if msg:
                     return msg
         return None
-    except Exception:  # pragma: no cover — best-effort
+    except (json.JSONDecodeError, TypeError):
         return None
 
 
@@ -21820,7 +21820,7 @@ def auto_fix_devin(req: _AutoFixRequest, request: Request) -> StreamingResponse:
                         yield f"data: {json.dumps({'type': 'heartbeat', 'elapsed_s': elapsed_int})}\n\n"
 
             exit_code = proc.returncode if proc.returncode is not None else -1
-        except Exception as e:
+        except (json.JSONDecodeError, TypeError) as e:
             yield f"data: {json.dumps({'type': 'error', 'message': f'{type(e).__name__}: {e}'})}\n\n"
             return
 
@@ -21931,7 +21931,7 @@ def _ensure_error_queue_table() -> None:
                     conn.execute(idx)
                 conn.commit()
             _ERROR_QUEUE_DDL_DONE = True
-        except Exception as e:
+        except sqlite3.Error as e:
             print(f"[error-queue] DDL failed: {type(e).__name__}: {e}",
                   file=sys.stderr, flush=True)
 
@@ -22004,7 +22004,7 @@ def _enqueue_error(
             )
             conn.commit()
             return cursor.lastrowid, True
-    except Exception as e:
+    except sqlite3.Error as e:
         print(f"[error-queue] enqueue failed: {type(e).__name__}: {e}",
               file=sys.stderr, flush=True)
         return -1, False
@@ -22073,7 +22073,7 @@ def _get_next_pending_error() -> dict | None:
                 "error_ts": row[5],
                 "occurrence_count": row[6], "attempts": row[7],
             }
-    except Exception as e:
+    except (json.JSONDecodeError, TypeError) as e:
         print(f"[error-queue] get_next failed: {type(e).__name__}: {e}",
               file=sys.stderr, flush=True)
         return None
@@ -22093,7 +22093,7 @@ def _process_error_with_devin(error_id: int) -> dict:
                 "FROM rag_error_queue WHERE id = ?",
                 (error_id,),
             ).fetchone()
-    except Exception as e:
+    except sqlite3.Error as e:
         return {"error": f"fetch row failed: {e}"}
     if not row:
         return {"error": "row no existe"}
@@ -22215,7 +22215,7 @@ def _process_error_with_devin(error_id: int) -> dict:
             "resolution_status": resolution_status, "reason": reason,
             "duration_s": duration_s,
         }
-    except Exception as e:
+    except subprocess.SubprocessError as e:
         duration_s = round(time.monotonic() - t0, 3)
         _finalize_error(error_id, -1, "", "failed",
                         f"{type(e).__name__}: {e}", duration_s)
@@ -22247,7 +22247,7 @@ def _finalize_error(
                  resolution_status, reason, error_id),
             )
             conn.commit()
-    except Exception as e:
+    except sqlite3.Error as e:
         print(f"[error-queue] finalize failed: {type(e).__name__}: {e}",
               file=sys.stderr, flush=True)
 
@@ -22398,7 +22398,7 @@ def logs_queue_list(status: str = "all", limit: int = 100) -> dict:
             counts = dict(conn.execute(
                 "SELECT status, COUNT(*) FROM rag_error_queue GROUP BY status"
             ).fetchall())
-    except Exception as e:
+    except sqlite3.Error as e:
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}") from e
 
     entries = [{
@@ -22440,7 +22440,7 @@ def logs_queue_get(error_id: int) -> dict:
                 "FROM rag_error_queue WHERE id = ?",
                 (error_id,),
             ).fetchone()
-    except Exception as e:
+    except sqlite3.Error as e:
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}") from e
     if not row:
         raise HTTPException(status_code=404, detail="error no encontrado")
@@ -22608,7 +22608,7 @@ def _collect_screentime_daily(
             ).fetchall()
         finally:
             conn.close()
-    except Exception:
+    except sqlite3.Error:
         return daily
     by_day = {day: int(secs or 0) for day, secs in rows if day}
     for d in range(st_days):
@@ -22717,7 +22717,7 @@ def screen_time_api(days: int = Query(default=7, ge=1, le=30)) -> dict:
         payload = {"apps": apps_list[:20]}  # Top 20 apps
         _SCREEN_TIME_CACHE = {"ts": now_ts, "payload": payload}
         return payload
-    except Exception as exc:
+    except sqlite3.Error as exc:
         return {"apps": [], "error": str(exc)}
 
 
@@ -22851,14 +22851,14 @@ def _dashboard_sql_row_to_event(row, json_cols: tuple[str, ...] = ()) -> dict:
                 if isinstance(extra, dict):
                     for ek, ev_val in extra.items():
                         ev.setdefault(ek, ev_val)
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 pass
             continue
         if k.endswith("_json"):
             base = k[:-5]
             try:
                 decoded = json.loads(v)
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 decoded = None
             target = base if base in json_cols else k
             if decoded is not None:
@@ -22893,7 +22893,7 @@ def _dashboard_compute_sql(days: int = 30) -> dict:
             _q_all_total: int = conn.execute(
                 "SELECT COUNT(*) FROM rag_queries"
             ).fetchone()[0] or 0
-        except Exception:
+        except sqlite3.Error:
             _q_all_total = 0
         # fb_rows_all: feedback all-time; necesitamos las rows para path-counts,
         # corrective-misses y neg-reasons. Cap defensivo 10 000 para evitar RAM
@@ -22942,7 +22942,7 @@ def _dashboard_compute_sql(days: int = 30) -> dict:
                     behavior_signal_by_source.setdefault(
                         str(ev_type), {}
                     )[str(src)] = int(n)
-        except Exception as exc:
+        except sqlite3.Error as exc:
             # Silently degrade — the dashboard shouldn't 500 because of
             # a missing column or a schema mismatch from an older DB.
             _log_sql_state_error(
@@ -22978,7 +22978,7 @@ def _dashboard_compute_sql(days: int = 30) -> dict:
                     if isinstance(payload, dict):
                         for pk, pv in payload.items():
                             ev.setdefault(pk, pv)
-                except Exception:
+                except (json.JSONDecodeError, TypeError):
                     pass
                 continue
             ev[k] = v
@@ -23419,7 +23419,7 @@ def _dashboard_aggregate(
                 session_turns_total += len(turns)
                 if sess.get("id", "").startswith("wa:"):
                     wa_sessions += 1
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 continue
 
     # ── Screen Time (macOS knowledgeC.db) ────────────────────────────
@@ -23547,21 +23547,21 @@ def _row_to_query_ev(row: dict) -> dict:
     if raw_extra:
         try:
             extra = json.loads(raw_extra) or {}
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             extra = {}
     paths: list = []
     raw_paths = row.get("paths_json")
     if raw_paths:
         try:
             paths = json.loads(raw_paths) or []
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             paths = []
     bad: list = []
     raw_bad = row.get("bad_citations_json")
     if raw_bad:
         try:
             bad = json.loads(raw_bad) or []
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             bad = []
     return {
         "ts": row.get("ts"),
@@ -23585,14 +23585,14 @@ def _row_to_feedback_ev(row: dict) -> dict:
     if raw_extra:
         try:
             extra = json.loads(raw_extra) or {}
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             extra = {}
     paths: list = []
     raw_paths = row.get("paths_json")
     if raw_paths:
         try:
             paths = json.loads(raw_paths) or []
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             paths = []
     return {
         "ts": row.get("ts"),
@@ -23612,7 +23612,7 @@ def _row_to_ambient_ev(row: dict) -> dict:
     if raw_payload:
         try:
             payload = json.loads(raw_payload) or {}
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             payload = {}
     return {
         "ts": row.get("ts"),
@@ -23629,7 +23629,7 @@ def _row_to_contradiction_ev(row: dict) -> dict:
     if raw:
         try:
             contradicts = json.loads(raw) or []
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             contradicts = []
     skipped_val = row.get("skipped")
     return {
@@ -23708,7 +23708,7 @@ def _stream_max_id(conn, table: str) -> int:
     try:
         row = conn.execute(f"SELECT COALESCE(MAX(id), 0) FROM {table}").fetchone()
         return int(row[0]) if row else 0
-    except Exception:
+    except sqlite3.Error:
         return 0
 
 
@@ -23723,7 +23723,7 @@ def _stream_fetch_since(conn, table: str, last_id: int) -> list[dict]:
         )
         cols = [c[0] for c in cur.description]
         return [dict(zip(cols, r)) for r in cur.fetchall()]
-    except Exception:
+    except sqlite3.Error:
         return []
 
 
@@ -24200,7 +24200,7 @@ def _read_vm_stat() -> dict:
         out = subprocess.run(
             ["vm_stat"], capture_output=True, text=True, errors="replace", timeout=2, check=False,
         ).stdout
-    except Exception:
+    except subprocess.SubprocessError:
         return {}
     page_size = 4096
     stats: dict[str, float] = {}
@@ -24235,7 +24235,7 @@ def _sample_memory() -> dict | None:
             ["ps", "-axo", "rss=,command="],
             capture_output=True, text=True, errors="replace", timeout=5, check=False,
         ).stdout
-    except Exception:
+    except subprocess.SubprocessError:
         return None
 
     by_cat: dict[str, float] = {k: 0.0 for k in _MEMORY_CATEGORIES}
@@ -24285,7 +24285,7 @@ def _memory_load_history() -> None:
     try:
         with _MEMORY_STATE_PATH.open("r", encoding="utf-8") as fh:
             lines = fh.readlines()[-_MEMORY_BUFFER_MAX:]
-    except Exception:
+    except OSError:
         return
     for raw in lines:
         raw = raw.strip()
@@ -24293,7 +24293,7 @@ def _memory_load_history() -> None:
             continue
         try:
             _MEMORY_BUFFER.append(json.loads(raw))
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             continue
 
 
@@ -24404,7 +24404,7 @@ def _memory_trim_file() -> None:
         tail = lines[-cap:]
         with _MEMORY_STATE_PATH.open("w", encoding="utf-8") as fh:
             fh.writelines(tail)
-    except Exception:
+    except OSError:
         pass
 
 
@@ -24586,7 +24586,7 @@ def _sample_cpu(prev_state: dict) -> dict | None:
             ["ps", "-axo", "pid=,cputime=,command="],
             capture_output=True, text=True, errors="replace", timeout=5, check=False,
         ).stdout
-    except Exception:
+    except subprocess.SubprocessError:
         return None
 
     per_pid_cpu: dict[int, float] = {}
@@ -24664,7 +24664,7 @@ def _cpu_load_history() -> None:
     try:
         with _CPU_STATE_PATH.open("r", encoding="utf-8") as fh:
             lines = fh.readlines()[-_CPU_BUFFER_MAX:]
-    except Exception:
+    except OSError:
         return
     for raw in lines:
         raw = raw.strip()
@@ -24672,7 +24672,7 @@ def _cpu_load_history() -> None:
             continue
         try:
             _CPU_BUFFER.append(json.loads(raw))
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             continue
 
 
@@ -24702,7 +24702,7 @@ def _cpu_trim_file() -> None:
             return
         with _CPU_STATE_PATH.open("w", encoding="utf-8") as fh:
             fh.writelines(lines[-cap:])
-    except Exception:
+    except OSError:
         pass
 
 
@@ -24868,15 +24868,15 @@ def system_metrics_api(hours: int = 24) -> dict:
                     if r[4]:
                         try:
                             row["by_category"] = json.loads(r[4])
-                        except Exception:
+                        except (json.JSONDecodeError, TypeError):
                             pass
                     if r[5]:
                         try:
                             row["top"] = json.loads(r[5])
-                        except Exception:
+                        except (json.JSONDecodeError, TypeError):
                             pass
                     cpu_rows.append(row)
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 pass
             try:
                 for r in conn.execute(
@@ -24888,22 +24888,22 @@ def system_metrics_api(hours: int = 24) -> dict:
                     if r[2]:
                         try:
                             row["by_category"] = json.loads(r[2])
-                        except Exception:
+                        except (json.JSONDecodeError, TypeError):
                             pass
                     if r[3]:
                         try:
                             row["top"] = json.loads(r[3])
-                        except Exception:
+                        except (json.JSONDecodeError, TypeError):
                             pass
                     if r[4]:
                         try:
                             row["vm"] = json.loads(r[4])
-                        except Exception:
+                        except (json.JSONDecodeError, TypeError):
                             pass
                     mem_rows.append(row)
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 pass
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         pass
     return {"hours": hours, "cpu": cpu_rows, "memory": mem_rows}
 
@@ -24952,13 +24952,13 @@ def vault_health_api() -> dict:
     try:
         from rag.vault_health import compute_vault_health  # noqa: PLC0415
         return compute_vault_health()
-    except Exception as exc:
+    except ImportError as exc:
         # Defensa de último recurso — el módulo NUNCA debería raisear,
         # pero el endpoint promete HTTP 200 + JSON parseable a la UI.
         try:
             from rag.vault_health import WEIGHTS as _W  # noqa: PLC0415
             weights = dict(_W)
-        except Exception:
+        except ImportError:
             weights = {}
         return {
             "score":           None,
@@ -25175,7 +25175,7 @@ def fine_tunning_queue(limit: int = 20, days: int = 30) -> dict:
                                     rt = last_chunk.replace("\n", " ").strip()
                                     response_short = rt[:240] + ("…" if len(rt) > 240 else "")
                                     response_source = "vault"
-                        except Exception:
+                        except OSError:
                             pass
                     items.append({
                         "item_id": str(qid),
@@ -25194,7 +25194,7 @@ def fine_tunning_queue(limit: int = 20, days: int = 30) -> dict:
                             "answer_len": answer_len,
                         },
                     })
-            except Exception as exc_ra:
+            except OSError as exc_ra:
                 _silent_log("fine_tunning_queue_retrieval_answer_error", str(exc_ra))
 
             # ── Draft WA: drafts del bot a contactos, sin rating del panel ──
@@ -25269,7 +25269,7 @@ def fine_tunning_queue(limit: int = 20, days: int = 30) -> dict:
                             "decision": decision,
                         },
                     })
-            except Exception as exc_dw:
+            except sqlite3.Error as exc_dw:
                 _silent_log("fine_tunning_queue_draft_wa_error", str(exc_dw))
 
             # ── Brief: today / digest / morning / evening enviados ──────────
@@ -25329,7 +25329,7 @@ def fine_tunning_queue(limit: int = 20, days: int = 30) -> dict:
                             "sections": list(sections.keys())[:6],
                         },
                     })
-            except Exception as exc_b:
+            except sqlite3.Error as exc_b:
                 _silent_log("fine_tunning_queue_brief_error", str(exc_b))
 
             # ── Anticipate: pushes del agente anticipatorio enviados ────────
@@ -25383,7 +25383,7 @@ def fine_tunning_queue(limit: int = 20, days: int = 30) -> dict:
                             "preview_short": preview,
                         },
                     })
-            except Exception as exc_a:
+            except sqlite3.Error as exc_a:
                 _silent_log("fine_tunning_queue_anticipate_error", str(exc_a))
 
             # NOTE: stream `tool_routing` registered en el validator pero NO
@@ -25393,11 +25393,11 @@ def fine_tunning_queue(limit: int = 20, days: int = 30) -> dict:
             # branch downstream queda listo (rag_feedback scope='tool_routing')
             # para cuando se agregue logging.
 
-    except Exception as exc:
+    except OSError as exc:
         try:
             from rag import _silent_log as _sl  # noqa: PLC0415
             _sl("fine_tunning_queue_error", str(exc))
-        except Exception:
+        except ImportError:
             pass
         items = []
 
@@ -25448,12 +25448,12 @@ def fine_tunning_stats() -> dict:
                     "WHERE ts >= datetime('now','-7 days')"
                 ).fetchone()
                 out["ratings_7d"] = int(r[0]) if r else 0
-            except Exception:
+            except sqlite3.Error:
                 pass
             try:
                 r = conn.execute("SELECT COUNT(*) FROM rag_ft_panel_ratings").fetchone()
                 out["ratings_total"] = int(r[0]) if r else 0
-            except Exception:
+            except sqlite3.Error:
                 pass
             # Draft LoRA gate
             try:
@@ -25467,7 +25467,7 @@ def fine_tunning_stats() -> dict:
                 out["draft_lora"]["pct"] = round(
                     100.0 * min(1.0, draft_n / 100.0), 1
                 )
-            except Exception:
+            except sqlite3.Error:
                 pass
             # Reranker LoRA gate
             try:
@@ -25491,7 +25491,7 @@ def fine_tunning_stats() -> dict:
                 out["reranker_lora"]["pct"] = round(
                     100.0 * min(pos_pct, corr_pct), 1
                 )
-            except Exception:
+            except sqlite3.Error:
                 pass
             # Pending counts por stream (ballpark, mismos filtros que /queue)
             try:
@@ -25512,7 +25512,7 @@ def fine_tunning_stats() -> dict:
                           AND ftr.item_id = CAST(q.id AS TEXT))
                 """).fetchone()
                 out["pending_by_stream"]["retrieval_answer"] = int(cnt[0]) if cnt else 0
-            except Exception:
+            except sqlite3.Error:
                 pass
             try:
                 cnt = conn.execute("""
@@ -25526,7 +25526,7 @@ def fine_tunning_stats() -> dict:
                         WHERE ftr.stream='draft_wa' AND ftr.item_id = d.draft_id)
                 """).fetchone()
                 out["pending_by_stream"]["draft_wa"] = int(cnt[0]) if cnt else 0
-            except Exception:
+            except sqlite3.Error:
                 pass
             try:
                 cnt = conn.execute("""
@@ -25541,7 +25541,7 @@ def fine_tunning_stats() -> dict:
                         WHERE bf.dedup_key = CAST(b.id AS TEXT))
                 """).fetchone()
                 out["pending_by_stream"]["brief"] = int(cnt[0]) if cnt else 0
-            except Exception:
+            except sqlite3.Error:
                 pass
             try:
                 cnt = conn.execute("""
@@ -25557,9 +25557,9 @@ def fine_tunning_stats() -> dict:
                         WHERE af.dedup_key = a.dedup_key)
                 """).fetchone()
                 out["pending_by_stream"]["anticipate"] = int(cnt[0]) if cnt else 0
-            except Exception:
+            except sqlite3.Error:
                 pass
-    except Exception:
+    except sqlite3.Error:
         pass
     return out
 
@@ -25615,7 +25615,7 @@ def fine_tunning_rate(req: FineTunningRateRequest) -> dict:
                   shown_count   = shown_count + 1
             """, (req.item_id, req.stream, now, now))
             conn.commit()
-    except Exception as exc:
+    except sqlite3.Error as exc:
         _silent_log("fine_tunning_queue_state_upsert_failed", str(exc))
 
     # ── Fan-out a tablas downstream — cierra el loop de aprendizaje ─────
@@ -25734,7 +25734,7 @@ def _fanout_ft_rating_to_downstream(req) -> None:
                             )
                             if cur_dup.fetchone() is not None:
                                 return  # ya escrito, skip
-            except Exception:
+            except sqlite3.Error:
                 pass
         elif stream == "whatsapp_msg":
             paths = [item_id] if item_id else []
@@ -25810,7 +25810,7 @@ def fine_tunning_snooze(req: FineTunningSnoozeRequest) -> dict:
                   last_shown_ts    = excluded.last_shown_ts
             """, (req.item_id, req.stream, now_iso, now_iso, snoozed_until))
             conn.commit()
-    except Exception as exc:
+    except sqlite3.Error as exc:
         _silent_log("fine_tunning_snooze_failed", str(exc))
         raise HTTPException(status_code=500, detail="snooze failed") from exc
 

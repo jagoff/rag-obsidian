@@ -38,7 +38,7 @@ def model():
       helper  — paths deterministas, HELPER_OPTIONS (`qwen2.5:3b` default)
       embed   — sentence embedding (`qwen3-embedding:0.6b`, dim 1024 obligatoria)
       rerank  — cross-encoder rerank (`bge-reranker-v2-m3` PT / Qwen3 MLX)
-      stt     — Whisper STT (`small` default)
+      stt     — Whisper STT (`large-v3-turbo` default)
       vlm     — vision-language para OCR fallback (`granite-vision-3.2-2b-4bit`)
 
     Override por env var: RAG_<TIER>_MODEL. CLI escribe ahí + dispara hooks.

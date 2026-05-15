@@ -12,7 +12,7 @@ Two responsibilities, one module:
 ## Surfaces (re-exported on `rag.<name>` via the shim at the bottom of `rag/__init__.py`)
 
 Helpers (callable from Python):
-- `_WHISPER_MODEL_DEFAULT` — string, short alias del modelo (default "small").
+- `_WHISPER_MODEL_DEFAULT` — string, short alias del modelo (default "large-v3-turbo").
 - `_WHISPER_NAME_TO_HF` — dict, map de alias corto a HF repo
   ([`mlx-community/whisper-*-mlx`](https://huggingface.co/mlx-community)).
 - `_whisper_model_cache` — dict, memoised wrapper instances by short alias.
@@ -85,7 +85,7 @@ from rag import cli, console
 
 
 # ── STT primitives ──────────────────────────────────────────────────────────
-_WHISPER_MODEL_DEFAULT = "small"
+_WHISPER_MODEL_DEFAULT = "large-v3-turbo"
 _whisper_model_cache: dict[str, object] = {}
 
 # Map de alias corto (compat histórico con faster-whisper) al HF repo MLX
@@ -267,7 +267,7 @@ def transcribe_audio(
         path: Path to the audio file. Any format ffmpeg reads (mp3, m4a,
             wav, opus, mp4, ogg, flac, aac, …).
         model: alias corto del modelo whisper. Options: tiny / base / small /
-            medium / large-v3 / large-v3-turbo / …. Default "small". El alias
+            medium / large-v3 / large-v3-turbo / …. Default "large-v3-turbo". El alias
             se resuelve al repo MLX correspondiente vía `_WHISPER_NAME_TO_HF`
             (también acepta HF repo full tipo `mlx-community/whisper-...`).
         language: Force a language code (e.g. "es", "en"). None = auto-

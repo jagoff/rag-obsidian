@@ -31,6 +31,7 @@ import json
 import queue
 import re
 import secrets
+import sqlite3
 import subprocess
 import sys
 import threading

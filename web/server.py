@@ -138,6 +138,7 @@ from rag import (  # noqa: E402
     retrieve_result_to_log_extras,
     _build_replay_fields,
 )
+from rag.settings import settings  # noqa: E402
 
 # Cosine band for the borderline reform-LLM gate. The lower bound matches
 # `TOPIC_SHIFT_COSINE` (0.32) — anything below already gets `history = []`
@@ -435,7 +436,7 @@ async def _lifespan(_app) -> "AsyncIterator[None]":
     # Override via env RAG_WEB_THREADPOOL_TOKENS si hace falta.
     try:
         import anyio.to_thread as _att
-        _tp_target = int(os.environ.get("RAG_WEB_THREADPOOL_TOKENS", "100"))
+        _tp_target = settings.threadpool_tokens
         # `current_default_thread_limiter` es sync desde anyio 4.x (devuelve
         # `CapacityLimiter` directo). El `await` previo tiraba
         # `TypeError: object CapacityLimiter can't be used in 'await' expression`
@@ -497,7 +498,7 @@ class _CachedStaticFiles(StaticFiles):
         return response
 
 
-_STATIC_MAX_AGE = 0 if os.environ.get("OBSIDIAN_RAG_STATIC_NO_CACHE") == "1" else 3600
+_STATIC_MAX_AGE = 0 if settings.static_no_cache else 3600
 app.mount(
     "/static",
     _CachedStaticFiles(directory=STATIC_DIR, max_age=_STATIC_MAX_AGE),
@@ -855,8 +856,8 @@ from fastapi.middleware.cors import CORSMiddleware  # noqa: E402 — must go aft
 # que propaga el watcher (`cloudflared_watcher.sh`). Default OFF — la URL
 # random de trycloudflare.com es unguessable pero expone el server al
 # internet público (sin auth). Solo activar junto con el túnel.
-_allow_lan = os.environ.get("OBSIDIAN_RAG_ALLOW_LAN", "").strip().lower() in ("1", "true", "yes")
-_allow_tunnel = os.environ.get("OBSIDIAN_RAG_ALLOW_TUNNEL", "").strip().lower() in ("1", "true", "yes")
+_allow_lan = settings.allow_lan
+_allow_tunnel = settings.allow_tunnel
 if _allow_lan:
     # RFC1918 ranges: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16. Nada más.
     # https? cubre http (LAN plain) y https (Caddy tls internal).
@@ -975,7 +976,7 @@ app.get("/api/admin/token")(admin_token)
 # qwen2.5:3b was used here for a while as a speed optimization (~600ms
 # prefill, ~10× faster) but failed those three constraints consistently.
 # Set OBSIDIAN_RAG_WEB_CHAT_MODEL to override if you need speed over quality.
-WEB_CHAT_MODEL = os.environ.get("OBSIDIAN_RAG_WEB_CHAT_MODEL") or None
+WEB_CHAT_MODEL = settings.web_chat_model
 
 # Runtime model override — persisted to disk so it survives server restarts.
 # Takes priority over env / resolve_chat_model() so the user can A/B different
@@ -1174,7 +1175,7 @@ _WEB_SYSTEM_PROMPT_V2 = 'Eres un asistente de consulta sobre las notas personale
 # Selector con fallback seguro a v1 si el env var toma un valor raro.
 _WEB_SYSTEM_PROMPT = (
     _WEB_SYSTEM_PROMPT_V1
-    if os.environ.get("RAG_WEB_PROMPT_VERSION", "v2").strip() == "v1"
+    if settings.prompt_version == "v1"
     else _WEB_SYSTEM_PROMPT_V2
 )
 
@@ -2700,10 +2701,7 @@ _WEB_CHAT_NUM_CTX = 4096
 # >5 líneas de cambio + decisión de producto sobre el shape del SSE
 # stream, así que queda gateado por esta env var pero sin consumer
 # hasta que rag-llm valide el approach.
-_CRITIQUE_ENABLED = (
-    os.environ.get("RAG_CRITIQUE_ENABLED", "0").strip().lower()
-    in ("1", "true", "yes")
-)
+_CRITIQUE_ENABLED = settings.critique_enabled
 
 
 @app.post("/api/ollama/unload", dependencies=[Depends(_require_admin_token)])
@@ -3046,7 +3044,7 @@ _CHAT_UPLOAD_AUTOCREATE_CONFIDENCE = 0.85
 _CHAT_UPLOAD_HISTORICAL_DAYS_DEFAULT = 30
 try:
     _CHAT_UPLOAD_HISTORICAL_DAYS = int(
-        os.environ.get("RAG_OCR_HISTORICAL_MAX_DAYS", _CHAT_UPLOAD_HISTORICAL_DAYS_DEFAULT)
+        str(settings.ocr_historical_max_days)
     )
     if _CHAT_UPLOAD_HISTORICAL_DAYS < 0:
         _CHAT_UPLOAD_HISTORICAL_DAYS = _CHAT_UPLOAD_HISTORICAL_DAYS_DEFAULT
@@ -4626,7 +4624,7 @@ def wa_anticipate_today(limit: int = 3, min_score: float = 0.30) -> dict:
     Si todas las signals fallan / no hay candidates → `candidates: []`
     (no error). El frontend muestra empty state.
     """
-    if os.environ.get("RAG_ANTICIPATE_DISABLED", "").strip() in ("1", "true", "yes"):
+    if settings.anticipate_disabled:
         return {
             "ok": True,
             "disabled": True,
@@ -7879,7 +7877,7 @@ def _redact_pii(text: str) -> tuple[str, int]:
         return text, 0
     # Single-user opt-out: ver `_PiiRedactFilter.__init__` para rationale.
     # Override: RAG_PII_REDACT_USER_OUTPUT=0.
-    if os.environ.get("RAG_PII_REDACT_USER_OUTPUT", "1").strip() in ("0", "false", "no"):
+    if not settings.pii_redact_user_output:
         return text, 0
     out = text
     n = 0
@@ -11302,7 +11300,7 @@ _HOME_PREWARMER_STARTED = False
 # Beneficio: visitas post-restart instantáneas en vez de pagar 6-10s
 # cold compute la primera vez. Para deshabilitar (ej. perf debug):
 # `OBSIDIAN_RAG_HOME_PREWARM=0` en el plist o en el shell del proceso.
-_HOME_PREWARM_ENABLED = os.environ.get("OBSIDIAN_RAG_HOME_PREWARM", "1") not in ("0", "false", "no")
+_HOME_PREWARM_ENABLED = settings.home_prewarm
 
 def _ensure_home_prewarmer() -> None:
     """Start the pre-warmer loop iff opt-in. Called from startup and from
@@ -11346,7 +11344,7 @@ def _ensure_home_prewarmer() -> None:
 #
 # Cost: ~100-200ms of ollama compute per cycle, ~5GB VRAM pinned continuously.
 # Safe on 36GB unified memory with command-r NOT also resident.
-_CHAT_PREWARM_INTERVAL = int(os.environ.get("OBSIDIAN_RAG_CHAT_PREWARM_INTERVAL", "240"))
+_CHAT_PREWARM_INTERVAL = settings.chat_prewarm_interval
 _CHAT_PREWARMER_STARTED = False
 
 def _chat_prewarm_targets() -> list[tuple[str, int]]:
@@ -11395,7 +11393,7 @@ def _chat_prewarm_targets() -> list[tuple[str, int]]:
     #
     # Override: `RAG_MLX_PREWARM=1` mantiene el prewarm bajo MLX
     # (útil para tests / debug).
-    _backend_choice = os.environ.get("RAG_LLM_BACKEND", "mlx").strip().lower()
+    _backend_choice = settings.llm_backend
     _mlx_prewarm = os.environ.get(
         "RAG_MLX_PREWARM", ""
     ).strip() not in ("", "0", "false", "no")
@@ -11559,8 +11557,8 @@ def _ensure_corpus_prewarmer() -> None:
 #   - el response fue vacío/error
 #   - _wa_in_query matcheó (WA data change rápidamente, datos frescos importan)
 _CHAT_CACHE = ThreadSafeCacheMultiKey(
-    ttl=float(os.environ.get("RAG_WEB_CHAT_CACHE_TTL", "86400")),  # default 24h
-    max_size=int(os.environ.get("RAG_WEB_CHAT_CACHE_MAX", "100")),
+    ttl=settings.chat_cache_ttl,
+    max_size=settings.chat_cache_max,
 )
 
 
@@ -13113,7 +13111,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # Override via env for hosts where bge-m3 + reranker + qwen3 fight
         # for MPS — bumping to 6-8s buys headroom without unbounded waits.
         try:
-            _nli_budget_s = float(os.environ.get("RAG_NLI_GROUNDING_BUDGET_S", "4.0"))
+            _nli_budget_s = settings.nli_grounding_budget_s
         except ValueError:
             _nli_budget_s = 4.0
 
@@ -14229,7 +14227,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             #   RAG_WEB_RERANK_POOL=5 → vuelve al comportamiento legacy
             #   RAG_WEB_RERANK_POOL=2 → más agresivo si hace falta
             try:
-                _default_pool = int(os.environ.get("RAG_WEB_RERANK_POOL", "3"))
+                _default_pool = settings.rerank_pool
             except ValueError:
                 _default_pool = 3
             _retrieve_pool = 15 if _is_list_intent else _default_pool
@@ -14583,10 +14581,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # mostraba al user → desconcierto ("ves la nota en sources, LLM
         # dice no encontré nada"). Filtrar acá unifica ambas vistas.
         # Override: RAG_CONTEXT_PURGE_STALE=0.
-        if (
-            os.environ.get("RAG_CONTEXT_PURGE_STALE", "1").strip()
-            not in ("0", "false", "no")
-        ):
+        if settings.context_purge_stale:
             from pathlib import Path as _PathSrc
             _docs_in = result.get("docs") or []
             _metas_in = result.get("metas") or []
@@ -14817,7 +14812,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # purge-on-index puede ser horas. En el ínterin estos chunks
         # llegan al LLM como "info real" y producen respuestas wrong.
         # Override: RAG_CONTEXT_PURGE_STALE=0.
-        if os.environ.get("RAG_CONTEXT_PURGE_STALE", "1").strip() not in ("0", "false", "no"):
+        if settings.context_purge_stale:
             from pathlib import Path as _PathStale
             _live_docs: list[str] = []
             _live_metas: list[dict] = []
@@ -14844,7 +14839,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             _docs = _live_docs
             _metas = _live_metas
 
-        if os.environ.get("RAG_CONTEXT_DEDUP_BY_FILE", "1").strip() not in ("0", "false", "no"):
+        if settings.context_dedup_by_file:
             # Dedup por file: cuando hay múltiples chunks de una misma nota,
             # elegir el chunk cuya H1 (primer línea) matchea MÁS tokens
             # significativos de la pregunta. Razón: `chunk_id` está en None
@@ -15035,9 +15030,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             # Gate: RAG_HISTORY_SUMMARY (default ON, set to "0"/"false"/"no"
             # to disable).  When ≤1 turn or feature is OFF, falls back to
             # the original raw concatenation.
-            _RAG_HISTORY_SUMMARY_ON = os.environ.get(
-                "RAG_HISTORY_SUMMARY", "1"
-            ).strip().lower() not in ("0", "false", "no", "")
+            _RAG_HISTORY_SUMMARY_ON = settings.history_summary
             if _RAG_HISTORY_SUMMARY_ON and len(history or []) > 2:
                 # history is a flat message list; pairs of (user, assistant)
                 # messages = turns.  history[:-2] = all but last turn.
@@ -22020,7 +22013,7 @@ def _enqueue_error(
 # Rate limit del worker — max N invocaciones de Devin por hora.
 # Cada invocación tarda ~60-120s y consume ACUs pagas, así que el cap
 # es conservador. Ajustable con env var.
-_AUTO_FIX_WORKER_HOURLY_CAP = int(os.environ.get("RAG_AUTO_FIX_HOURLY_CAP", "12"))
+_AUTO_FIX_WORKER_HOURLY_CAP = settings.auto_fix_hourly_cap
 _AUTO_FIX_WORKER_INVOCATIONS: list[float] = []  # monotonic ts de invocaciones
 
 
@@ -22271,7 +22264,7 @@ _ERROR_QUEUE_STOP = threading.Event()
 # Flag para habilitar el worker automático. Default: off para que el user
 # explícitamente lo active (evita sorpresas con ACUs). Se controla via
 # env var o via /api/logs/queue/config.
-_WORKER_AUTO_ENABLED = os.environ.get("RAG_AUTO_FIX_WORKER", "0") == "1"
+_WORKER_AUTO_ENABLED = settings.auto_fix_worker
 
 
 def _scanner_loop() -> None:
@@ -23672,7 +23665,7 @@ _STREAM_SOURCES: dict[str, tuple[str, Callable[[dict], dict]]] = {
 # mobile) sin permitir runaway. Configurable por env var.
 _SSE_MAX_PER_IP_DEFAULT = 3
 try:
-    _SSE_MAX_PER_IP = int(os.environ.get("RAG_SSE_MAX_PER_IP", _SSE_MAX_PER_IP_DEFAULT))
+    _SSE_MAX_PER_IP = settings.sse_max_per_ip
     if _SSE_MAX_PER_IP < 1:
         _SSE_MAX_PER_IP = _SSE_MAX_PER_IP_DEFAULT
 except (TypeError, ValueError):
@@ -24319,8 +24312,7 @@ def _metrics_background_default() -> bool:
     Override: `RAG_METRICS_ASYNC=0` fuerza sync (útil si se sospecha que
     el daemon worker está saturado).
     """
-    val = os.environ.get("RAG_METRICS_ASYNC", "").strip().lower()
-    return val not in ("0", "false", "no")
+    return settings.metrics_async
 
 
 def _persist_with_sqlite_retry(
@@ -25989,5 +25981,5 @@ if __name__ == "__main__":
     # `http://192.168.x.x:8765`), setear OBSIDIAN_RAG_BIND_HOST=0.0.0.0.
     # Ojo: sin auth, cualquiera en el mismo WiFi puede leer el vault —
     # úsalo sólo en red doméstica confiable.
-    bind_host = os.environ.get("OBSIDIAN_RAG_BIND_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    bind_host = settings.bind_host
     uvicorn.run(app, host=bind_host, port=8765, log_level="info")

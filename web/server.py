@@ -11169,7 +11169,14 @@ async def home_stream(request: Request, regenerate: bool = False) -> StreamingRe
         # (signals fan-out + LLM brief + correlator). Trade-off: un
         # stream realmente wedged ata recursos 60s en lugar de 30s,
         # pero los compute lentos genuinos ya no se cortan a la mitad.
-        HARD_CAP_S = 60.0
+        #
+        # 2026-05-15: subido de 60s a 120s. Con regenerate=True el path
+        # ahora incluye narrative LLM (qwen2.5:7b, 20-40s) además del
+        # fan-out de señales (hasta 22s) → total puede exceder 60s en
+        # condiciones normales. 120s da margen para signals lentas +
+        # narrative sin cortar el stream legítimo. Un stream wedged real
+        # (hang total) ata recursos 2min — aceptable en un servidor local.
+        HARD_CAP_S = 120.0 if regenerate else 60.0
 
         worker = threading.Thread(target=_runner, name="home-stream", daemon=True)
         worker.start()
@@ -11180,13 +11187,16 @@ async def home_stream(request: Request, regenerate: bool = False) -> StreamingRe
         # itself is the dominant bottleneck on cold start). The UI
         # uses this list to seed placeholder chips so users see the
         # full surface from t=0.
+        _hello_stages = [
+            "today", "signals", "tomorrow", "forecast",
+            "pagerank", "chrome", "eval", "followup",
+            "drive", "wa_unreplied", "bookmarks", "vaults",
+            "finance", "cards", "youtube", "spotify",
+        ]
+        if regenerate:
+            _hello_stages.append("narrative")
         yield _sse("hello", {
-            "stages": [
-                "today", "signals", "tomorrow", "forecast",
-                "pagerank", "chrome", "eval", "followup",
-                "drive", "wa_unreplied", "bookmarks", "vaults",
-                "finance", "cards", "youtube", "spotify",
-            ],
+            "stages": _hello_stages,
             "substages": {
                 "signals": [
                     "signals.mail_unread", "signals.reminders",
@@ -12044,8 +12054,16 @@ def _home_compute(
             today_correlations = {"people": [], "topics": [], "time_overlaps": []}
         extras["correlations"] = today_correlations
         prompt = _render_today_prompt(date_label, today_ev, extras=extras)
+        if progress is not None:
+            with suppress(Exception):
+                progress("narrative", "start", 0.0, None)
+        _t_narrative = time.time()
         narrative = _generate_today_narrative(prompt)
         narrative_source = "generated" if narrative else "error"
+        _narrative_ms = (time.time() - _t_narrative) * 1000.0
+        if progress is not None:
+            with suppress(Exception):
+                progress("narrative", "done" if narrative else "error", _narrative_ms, None)
         if narrative:
             _persist_today_brief(date_label, narrative)
 

@@ -81,8 +81,8 @@ Detalle migración en [`docs/mlx-migration.md`](docs/mlx-migration.md).
 - `qwen2.5:3b` (HELPER) → [`mlx-community/Qwen2.5-3B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-3B-Instruct-4bit)
 - `qwen2.5:7b` (CHAT default) → [`mlx-community/Qwen2.5-7B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-7B-Instruct-4bit)
 - `command-r` / `qwen2.5:14b` (HQ tier) → [`mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit`](https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit)
-- `qwen3-embedding:0.6b` (embedder) → [`mlx-community/Qwen3-Embedding-0.6B-8bit`](https://huggingface.co/mlx-community/Qwen3-Embedding-0.6B-8bit) via [`mlx-lm`](https://github.com/ml-explore/mlx-lm) in-process ([`rag/mlx_embed.py`](rag/mlx_embed.py)). Cosine ≥0.9977 vs PyTorch fp16 — bit-equivalente funcional, NO requiere reindex.
-- `whisper-small` (STT) → [`mlx-community/whisper-small-mlx`](https://huggingface.co/mlx-community/whisper-small-mlx) via [`mlx-whisper`](https://github.com/ml-explore/mlx-examples/tree/main/whisper). Familia tiny/base/small/medium/large-v3/large-v3-turbo en `_WHISPER_NAME_TO_HF` ([`rag/whisper.py`](rag/whisper.py)).
+- `qwen3-embedding:0.6b` (embedder) → [`mlx-community/Qwen3-Embedding-0.6B-8bit`](https://huggingface.co/mlx-community/Qwen3-Embedding-0.6B-8bit) via [`mlx-lm`](https://github.com/ml-explore/mlx-lm) in-process ([`rag/mlx_embed.py`](rag/mlx_embed.py)).
+- `whisper-small` (STT) → [`mlx-community/whisper-small-mlx`](https://huggingface.co/mlx-community/whisper-small-mlx) via [`mlx-whisper`](https://github.com/ml-explore/mlx-examples/tree/main/whisper). Familia tiny…large-v3-turbo en `_WHISPER_NAME_TO_HF` ([`rag/whisper.py`](rag/whisper.py)).
 - NLI grounding (default OFF, opt-in `RAG_NLI_GROUNDING=1`) → LLM-as-judge con `qwen2.5:3b` ([`rag/postprocess.py`](rag/postprocess.py) `_ground_claims_via_llm`). Rollback `RAG_NLI_BACKEND=mdeberta` cae a CrossEncoder + mDeBERTa.
 
 **Tipos response** ([`rag/llm_backend.py`](rag/llm_backend.py)): `Message`, `ChatResponse`, `GenerateResponse` son pydantic `BaseModel` locales. `Message.ToolCall.Function` preservado via assignment post-class.
@@ -92,10 +92,6 @@ Detalle migración en [`docs/mlx-migration.md`](docs/mlx-migration.md).
 **Idle-unload watchdog**: evicta modelos con `now - last_used > RAG_MLX_IDLE_TTL` (default 1800s). Disable: `RAG_MLX_IDLE_TTL=0` o `RAG_MLX_IDLE_DISABLE=1`.
 
 **Memory pressure watchdog** (`_handle_memory_pressure`): MLX-only path. Llama `MLXBackend.unload(model)` (pop `_loaded` + `mx.clear_cache()`) cuando swap pressure ≥ threshold.
-
-**Rollback emergencia**: requiere `git revert` de Ola 7+ commits + `uv pip install ollama>=0.6.1` + re-pull modelos chat. NO se soporta vía env var — `RAG_LLM_BACKEND=ollama` loguea warning + cae a MLX. Para embedder, rollback PyTorch SentenceTransformer disponible vía `RAG_EMBED_BACKEND=pytorch`.
-
-`ollama>=0.6.1` removido de `pyproject.toml`. Daemon Ollama (`com.ollama.ollama`) puede seguir corriendo para integraciones externas, no para obsidian-rag.
 
 ## Idioma
 
@@ -390,8 +386,6 @@ query → typo correct → anaphora resolve → classify_intent → infer_filter
 
 Stopwords adicionales en `_ENTITY_STOPWORDS_GLOBAL` (rag/__init__.py) — frozenset de chat slang aplicada a TODOS los tipos (oka, dale, che, jajaja, Bueno, hola, etc.). Distinto a `_ENTITY_STOPWORDS_PERSON` que es type-específico (pronombres, artículos).
 
-Doc canónica de la regla en [`~/.claude/CLAUDE.md`](file:///Users/fer/.claude/CLAUDE.md) sección "Nombres propios del user" — global (todos los proyectos, no solo obsidian-rag) para que cualquier agente futuro respete el principio "contrastá la creación de lugares contra un mapa o una lista previa".
-
 ## Eval baselines (floor MLX 2026-05-09)
 
 - Singles: `hit@5 56.60% [43.40, 69.81] · MRR 0.519 [0.396, 0.651] · n=53`
@@ -402,14 +396,7 @@ Bumped 2026-05-09 (era `0.535 / 0.617 / chains 72%` el 2026-05-05). Drift natura
 
 Floor PRE-MLX (archivado): singles `53.70% [40.74, 66.67]`, chains `72.00% [52.00, 88.00]`.
 
-**Prototypes evaluados 2026-05-09 (todos KEEP OFF)** — Floor wins:
-- `RAG_LLM_JUDGE=1`: singles MRR -4.1pp REGRESS, chains tie. Reject.
-- `RAG_NLI_GROUNDING=1`: NO-OP en métricas retrieval (afecta solo response post-citation-repair). Reject.
-- `RAG_QUERY_DECOMPOSE=1`: NO-OP en este golden (no multi-sub queries). Reject hasta golden expand.
-- `RAG_CONTEXTUAL_RETRIEVAL=1`: NO-OP sin re-index del corpus. Reject sin `rag index --full` previo.
-- `RAG_MMR=1`: singles MRR -0.6pp + chains MRR -0.2pp REGRESS marginal. Reject.
-
-Doc consolidado: [`99-obsidian/99-AI/system/prototypes-eval-2026-05-09/result.md`](file:///Users/fer/Library/Mobile%20Documents/iCloud~md~obsidian/Documents/Notes/99-obsidian/99-AI/system/prototypes-eval-2026-05-09/result.md).
+**Prototypes evaluados 2026-05-09 (todos KEEP OFF)**: `RAG_LLM_JUDGE=1` (singles MRR -4.1pp REGRESS), `RAG_NLI_GROUNDING=1` (NO-OP retrieval), `RAG_QUERY_DECOMPOSE=1` (NO-OP golden actual), `RAG_CONTEXTUAL_RETRIEVAL=1` (NO-OP sin re-index), `RAG_MMR=1` (MRR -0.6pp REGRESS). Floor wins.
 
 `rag eval --latency --max-p95-ms N` agrega P50/P95/P99 + CI gate. Bootstrap 1000 resamples seed=42. **HyDE drops singles ~5pp** — opt-in via `--hyde`. `seen_titles` post-rerank penalty `0.1`.
 
@@ -431,13 +418,7 @@ Dos databases en `~/.local/share/obsidian-rag/ragvec/`:
 3. Readers SQL: retry + stale-cache fallback, nunca empty default que sobrescriba memo.
 4. Tests con TestClient o writers SQL aíslan `DB_PATH` per-file (snap+restore manual, no `monkeypatch.setattr`).
 
-**Silent-fail logging fixes** (audit 2026-05-12):
-Revisión sistemática del proyecto entero (91 archivos Python) encontró 3 casos de `except Exception: pass` sin logging que fueron migrados a `_silent_log`:
-- `mcp_server.py` línea 483 - `rag._index_single_file()` en `rag_capture` → `rag._silent_log("mcp_capture_index", e)`
-- `mcp_server.py` línea 571 - `rag._index_single_file()` en `rag_save_note` → `rag._silent_log("mcp_save_note_index", e)`
-- `scripts/ingest_whatsapp.py` línea 714 - `rag._vlm_caption_budget_reset()` → `rag._silent_log("wa_scan_images_budget_reset", e)`
-
-Patrón: cuando se encuentre `except Exception: pass` sin logging en código que puede fallar por razones no triviales, migrar a `_silent_log` para observabilidad en `silent_errors.jsonl`. Excepciones aceptables: cleanup en finally blocks, parsing defensivo con fallback default, o casos con contadores/metrics que proveen visibilidad.
+**Silent-fail logging** — patrón: cuando se encuentre `except Exception: pass` sin logging en código no-trivial, migrar a `_silent_log` para observabilidad en `silent_errors.jsonl`. Excepciones aceptables: cleanup en finally blocks, parsing defensivo con fallback default, o casos con contadores/metrics que proveen visibilidad.
 
 **Diagnóstico data-first**: `python scripts/audit_telemetry_health.py --days 7` — PRIMER comando antes de "auditá el sistema". Agrega los 5 queries que reprodujeron audit 2026-04-24 en 1 segundo.
 

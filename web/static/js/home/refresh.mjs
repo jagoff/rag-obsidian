@@ -126,11 +126,21 @@ export function initRefreshButton(onDone, onFallbackLoad) {
       }
     });
 
+    // Named "error" SSE event (server-sent hard cap or compute failure).
+    // Distinct from the EventSource built-in onerror which fires on
+    // network errors. The server sends this before closing the stream.
     es.addEventListener("error", (e) => {
-      if (es.readyState === EventSource.CLOSED) {
-        console.warn("[home.v2] SSE closed unexpectedly");
+      if (e.data) {
+        // Named SSE event: server signalled an error, stop immediately.
+        console.warn("[home.v2] SSE error from server:", e.data);
         stopProgress();
+        return;
       }
+      // Built-in EventSource error (network drop / auto-reconnect attempt).
+      // readyState can be CONNECTING (auto-reconnect) or CLOSED.
+      // Close in both cases — we have a safety-timeout fallback.
+      console.warn("[home.v2] SSE connection error, readyState=", es.readyState);
+      stopProgress();
     });
 
     // Trickle: avance mínimo cuando el server tarda en mandar events.

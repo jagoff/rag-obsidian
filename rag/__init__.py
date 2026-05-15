@@ -627,7 +627,7 @@ def _load_vaults_config() -> dict:
         return {"vaults": {}, "current": None}
     try:
         mtime_ns = VAULTS_CONFIG_PATH.stat().st_mtime_ns
-    except Exception:
+    except OSError:
         mtime_ns = 0
     with _VAULTS_CFG_LOCK:
         if (
@@ -637,7 +637,7 @@ def _load_vaults_config() -> dict:
             return _copy_mod.deepcopy(_VAULTS_CFG_MEMO["data"])
     try:
         cfg = json.loads(VAULTS_CONFIG_PATH.read_text(encoding="utf-8"))
-    except Exception:
+    except (OSError, json.JSONDecodeError):
         # Called during module init (before _silent_log is defined).
         # User-visible failure mode: empty vault list → default vault used.
         return {"vaults": {}, "current": None}

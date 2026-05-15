@@ -87,6 +87,8 @@ Para cambiar cualquier default: setear el env var en el shell antes de invocar e
 | `OBSIDIAN_RAG_WEB_CHAT_MODEL` | `qwen2.5:7b` | `web/server.py:2148` | Override del chat model del web server. Generado al plist en `rag setup`. |
 | `RAG_CACHE_ENABLED` | `1` (on) | `rag/__init__.py:5867` | Master switch del semantic cache. Tests autouse lo fuerzan a `0`. |
 | `RAG_NO_WARMUP` | `""` (off) | `rag/__init__.py` | Debug — skippea el warmup del reranker + bge-m3 + corpus cache en startup. |
+| `RAG_INDEX_NICE` | `10` | `rag/__init__.py` | Prioridad CPU del proceso durante `rag index`. Valor nice absoluto (0–20; mayor = menos prioridad). `0` desactiva el cambio de prioridad. Permite que el web server y el WA listener sigan respondiendo durante reindex largo. |
+| `RAG_INDEX_BATCH_SLEEP_MS` | `0` | `rag/__init__.py` | Pausa en ms después de cada `_flush_batch()` durante `rag index`. Default 0 (sin pausa, velocidad máxima). Ejemplo: `150` → ~5 batches/s máximo, GPU respira entre embeddings. Útil para reindex de background sin saturar Metal. |
 | `RAG_OCR` | `""` (on) | `rag/__init__.py` | Opt-out del OCR de imágenes embebidas (Apple Vision). `0` desactiva. |
 | `RAG_POSTPROCESS_MODEL` | `""` | `rag/__init__.py:204` | Override del model LLM usado en stages de postprocess (critique, NLI repair). Default = chat model. |
 | `RAG_RERANKER_FT_PATH` | `""` (off) | `rag/__init__.py:14325` | Path al cross-encoder fine-tuned (gate GC#2.C). Cuando hay model promovido, apunta al symlink `~/.cache/obsidian-rag/reranker-ft-current`. |

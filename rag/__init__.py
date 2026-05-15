@@ -23505,6 +23505,25 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
     `RAG_RERANKER_NEVER_UNLOAD` sin re-indentar ~400 líneas. La función
     receives `col` ya inicializado para no duplicar `get_db()`.
     """
+    # ── Throttling: bajar prioridad CPU para no saturar la Mac ───────────
+    # RAG_INDEX_NICE=10 (default): setea nice absoluto 10 (lower = más amable).
+    # =0 desactiva (usa la prioridad actual del proceso).
+    # Solo aplica al proceso del indexer; el web server corre en su propio proceso.
+    _index_nice = int(os.environ.get("RAG_INDEX_NICE", "10"))
+    if _index_nice > 0:
+        try:
+            os.setpriority(os.PRIO_PROCESS, 0, _index_nice)
+        except (AttributeError, OSError):
+            pass  # Windows / sin permisos: no-op silencioso
+
+    # RAG_INDEX_BATCH_SLEEP_MS=0 (default): sleep en ms después de cada
+    # _flush_batch() para ceder tiempo de GPU/CPU entre batches.
+    # Ejemplo: =200 → 200ms de pausa entre cada flush (~5 batches/s máximo).
+    _index_batch_sleep_s = max(
+        0.0,
+        float(os.environ.get("RAG_INDEX_BATCH_SLEEP_MS", "0")) / 1000.0,
+    )
+
     _invalidate_corpus_cache()
     # Audit 2026-04-26 (BUG #23): reset VLM caption budget per-run.
     # Pre-fix: counter `_vlm_caption_calls_used` se acumulaba entre
@@ -23847,6 +23866,13 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
             except Exception as exc:
                 _silent_log("index_batch_urls", exc)
             pending_urls.clear()
+
+        # Throttle: ceder CPU/GPU entre batches cuando RAG_INDEX_BATCH_SLEEP_MS > 0.
+        # Permite que el web server, WA listener y otras tareas sigan respondiendo
+        # durante un reindex largo. Default 0 (sin pausa) para mantener velocidad
+        # actual; set RAG_INDEX_BATCH_SLEEP_MS=150 para reindex de background suave.
+        if _index_batch_sleep_s > 0:
+            time.sleep(_index_batch_sleep_s)
 
         # Defensivo post-flush: liberar MPS cache después de cada batch.
         # MLX-aware: `_torch_mps_empty_cache()` no-op cuando backend full-MLX

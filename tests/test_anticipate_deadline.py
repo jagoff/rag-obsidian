@@ -132,7 +132,7 @@ def test_due_today_score_is_1(mock_vault):
     assert len(out) == 1
     assert out[0].score == 1.0
     assert out[0].kind == "anticipate-deadline"
-    assert "0 días" in out[0].message
+    assert "hoy" in out[0].message
     assert "[[today]]" in out[0].message
     assert out[0].snooze_hours == 24
 

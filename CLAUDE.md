@@ -280,6 +280,8 @@ Catálogo completo (47+ vars) en [`docs/env-vars-catalog.md`](docs/env-vars-cata
 **Indexing**:
 - `RAG_INDEX_BATCH_EMBEDS` — gobierna batched embed path en `_run_index_inner` (`_flush_batch`). **MLX-aware default**: cuando `RAG_EMBED_BACKEND=mlx`, default `0` (no-batched). Cuando `=pytorch`, default `1`. Batched path en MLX dispara `[METAL] Command buffer execution failed` reproducible; no-batched anda en 35s para vault de 681 archivos. Override `=1` desaconsejado hasta patch real.
 - `RAG_INDEX_BATCH_SIZE=16` — solo aplica cuando batched ON.
+- `RAG_INDEX_NICE=10` — prioridad CPU nice absoluto (0–20) para el proceso de `rag index`. Default 10 (menor prioridad que normal). `=0` desactiva. Permite que web server y WA listener sigan respondiendo durante reindex.
+- `RAG_INDEX_BATCH_SLEEP_MS=0` — pausa en ms después de cada `_flush_batch()`. Default 0 (velocidad máxima). Ejemplo: `=150` para reindex de background suave (~5 batches/s). No afecta incremental rápido (la mayoría de archivos se saltean por hash).
 
 **Performance + memoria**:
 - `RAG_LLM_KEEP_ALIVE=-1` (default forever). Compat alias `OLLAMA_KEEP_ALIVE` (legacy plists). MLX in-process — no-op pero el value se sigue propagando.

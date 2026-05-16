@@ -96,8 +96,14 @@ def _rag_binary() -> str:
     """Best-effort path to the installed `rag` binary. Default uv tool path
     first; fall back to PATH lookup. The launchd service runs without our
     interactive PATH so we resolve it once at install time.
+
+    Prefiere el wrapper del venv del proyecto (.venv/bin/rag) cuando existe:
+    garantiza que los plists usen el Python correcto del proyecto (3.13)
+    en lugar del global (potencialmente 3.14 de Homebrew), que puede tener
+    paquetes incompatibles (ej. torch built para 3.13 instalado en env 3.14).
     """
     candidates = [
+        _repo_root() / ".venv/bin/rag",   # dev venv — Python correcto del proyecto
         Path.home() / ".local/bin/rag",
         Path("/usr/local/bin/rag"),
         Path("/opt/homebrew/bin/rag"),

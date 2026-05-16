@@ -316,20 +316,40 @@ def _setup_install(
     def _bootout(plist_path: Path, label: str) -> None:
         """`launchctl bootout` + wait until el daemon está REALMENTE gone.
 
-        `launchctl bootout` devuelve sync (el subprocess termina) pero el
-        teardown interno de launchd queda en flight — el daemon puede seguir
-        listado por 1-3s mientras drena. Si bootstrappeamos en esa ventana,
-        macOS Sequoia devuelve EIO 5 ("Input/output error") porque ve el
-        slot ocupado por el daemon viejo en death throes.
+        Dos-fase:
+        1. Poll launchctl list hasta que el label desaparezca (max 3s) —
+           cubre el teardown interno de launchd que deja el slot ocupado.
+        2. Si el proceso tenía PID conocido, poll os.kill(pid, 0) hasta que
+           el proceso muera (max 25s extra) — cubre el ExitTimeOut=20s que
+           launchd le da al proceso para hacer cleanup antes de SIGKILL.
+           Sin este segundo poll, el bootstrap inmediato encuentra el puerto
+           todavía en uso y falla con [Errno 48] address already in use.
 
-        Fix: poll `launchctl list` hasta que el label DESAPAREZCA (max 3s).
-        Eso garantiza que el bootstrap subsiguiente trabaje contra un slot
-        limpio. Si el label nunca desaparece (daemon zombie), seguimos
-        adelante igual — el bootstrap fallará ruidosamente y el caller lo
-        verá.
+        Si el PID no se pudo capturar (proceso no estaba corriendo),
+        old_pid es None y la fase 2 se saltea — comportamiento idéntico al
+        original para daemons que no estaban running.
         """
         from rag.cli.daemons_control import _loaded_launchd_labels  # noqa: PLC0415
         import time as _time  # noqa: PLC0415
+        import os as _os  # noqa: PLC0415
+
+        # Capturar PID ANTES del bootout para poder esperar la muerte real
+        # del proceso (no sólo la desaparición del label de launchd).
+        old_pid: int | None = None
+        try:
+            r = subprocess.run(
+                ["launchctl", "print", f"{_domain}/{label}"],
+                capture_output=True, text=True, check=False,
+            )
+            for line in r.stdout.splitlines():
+                line = line.strip()
+                if line.startswith("pid ="):
+                    old_pid = int(line.split("=", 1)[1].strip())
+                    break
+        except Exception:
+            pass
+
+        # Bootout
         try:
             subprocess.run(
                 ["launchctl", "bootout", f"{_domain}/{label}"],
@@ -338,12 +358,28 @@ def _setup_install(
             )
         except Exception:
             return
-        # Poll hasta 3s o hasta que el label desaparezca.
+
+        # Fase 1: poll hasta 3s o hasta que el label desaparezca de launchctl.
         deadline = _time.time() + 3.0
         while _time.time() < deadline:
             if label not in _loaded_launchd_labels():
-                return
+                break
             _time.sleep(0.1)
+
+        # Fase 2: si teníamos PID, esperar que el proceso muera (max 25s).
+        # ExitTimeOut en todos los plists es 20s; 25s garantiza que launchd
+        # haya enviado SIGKILL y el proceso haya liberado el puerto antes de
+        # que el caller intente bootstrappear el nuevo proceso.
+        if old_pid is not None:
+            deadline2 = _time.time() + 25.0
+            while _time.time() < deadline2:
+                try:
+                    _os.kill(old_pid, 0)  # no-op signal: sólo chequea existencia
+                    _time.sleep(0.2)
+                except (ProcessLookupError, PermissionError):
+                    # ProcessLookupError → proceso muerto (fast path normal).
+                    # PermissionError → proceso de otro user, tratar como gone.
+                    break
 
     for deprecated in _DEPRECATED_LABELS:
         dep_plist = _LAUNCH_AGENTS_DIR / f"{deprecated}.plist"

@@ -62,6 +62,7 @@ _ADMIN_ENDPOINTS = [
     "/api/memo/merge",
     "/api/reminders/create",
     "/api/calendar/create",
+    "/api/vlm/describe",
     "/api/reminders/complete",
     "/api/whatsapp/send",
     "/api/wa/sender-override",

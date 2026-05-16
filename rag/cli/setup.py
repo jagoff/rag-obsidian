@@ -432,6 +432,10 @@ def _render_rag_net_plist(label: str) -> str | None:
                 "RAG_STATE_SQL": "1",
                 "WA_DRAFT_ALL_CONTACTS": "1",
                 "CALENDAR_NAME": "Agenda",
+                # Alias strings duplicados intencionalmente desde rag.models.DEFAULTS.
+                # Los plists se generan en tiempo de instalación (sin env activo), así
+                # que no podemos importar el módulo en este contexto — literal es lo
+                # correcto. Actualizar aquí si cambia el DEFAULTS correspondiente.
                 "CALENDAR_HELPER_MODEL": "qwen2.5:3b",
                 "CALENDAR_HELPER_LONG_MODEL": "qwen2.5:7b",
                 "DRAFT_HELPER_MODEL": "qwen2.5:7b",

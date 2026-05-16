@@ -102,6 +102,9 @@ def _mood_daemon_opted_in() -> bool:
 # pero mantenerlo no cuesta nada (es un set chico) y protege contra rollback
 # parcial (user revertió a versión vieja y después volvió a la nueva).
 _DEPRECATED_LABELS: frozenset[str] = frozenset({
+    # External RagNet helper removed 2026-05-16: monthly WhatsApp notes are
+    # now written by `rag.integrations.whatsapp_etl` during `rag index`.
+    "com.fer.whatsapp-vault-sync",
     # Consolidados en `wa-fast` el 2026-05-04:
     "com.fer.obsidian-rag-reminder-wa-push",
     "com.fer.obsidian-rag-wa-scheduled-send",

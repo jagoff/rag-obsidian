@@ -20,7 +20,7 @@ que: (a) carga el modelo igual, (b) hace el dummy encode, y (c) **setea
 el Event** en success. Diseño consistente con `rag serve` + `rag query`
 que ya llaman `_warmup_local_embedder()` via `warmup_async()`.
 
-Scope del test: inspeccionar el source de `web/server.py` — el warmup
+Scope del test: inspeccionar el source de `web/_lifecycle.py` — el warmup
 vive adentro de un closure + thread daemon, complicado de testear con
 mocks sin caminar por FastAPI lifespan + por el import path de `rag`.
 Grep-based contract test es suficiente para evitar regresiones.
@@ -30,11 +30,11 @@ from __future__ import annotations
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-WEB_SERVER = REPO / "web" / "server.py"
+WEB_LIFECYCLE = REPO / "web" / "_lifecycle.py"
 
 
 def _source() -> str:
-    return WEB_SERVER.read_text()
+    return WEB_LIFECYCLE.read_text()
 
 
 # ── El warmup llama al helper canonicalizado, no al loader directo ──────────

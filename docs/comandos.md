@@ -28,7 +28,8 @@ Indexa tu vault. Incremental — solo re-procesa notas que cambiaron desde la ú
 
 ```bash
 rag index                           # incremental (default — skip por hash)
-rag index --full                    # borra y reconstruye todo (lento)
+rag index --full                    # borra y reconstruye todo; safe mode ON por default
+RAG_INDEX_FULL_SAFE=0 rag index --full  # full con enriquecimientos, guardas base ON
 rag index --no-contradict           # saltea el check de contradicciones
 rag index --source whatsapp         # indexa WhatsApp en vez del vault
 rag index --source calendar         # idem para calendario
@@ -587,6 +588,20 @@ rag vault remove personal                   # desregistrar (no borra chunks)
 ---
 
 ## Servicios y automatización
+
+### `rag start` / `rag stop`
+Levanta o baja el stack launchd. `rag start` corre primero un catch-up incremental seguro sin checks de contradicción y recién después carga los daemons.
+
+```bash
+rag start                                   # supervisor/watch/web + RagNet + catch-up
+rag start --full                            # todo _services_spec; hoy mismo set managed post-supervisor
+rag start --no-index                        # levantar sin catch-up
+rag start --without-rag-net                 # solo obsidian-rag managed
+rag stop                                    # frenar todo el stack
+RAG_START_SAFE=0 rag start --full           # opt-out de guardas de start (no recomendado)
+```
+
+Safe mode de `start` fuerza `RAG_INDEX_SAFE=1` para el catch-up aunque tu shell tenga un opt-out viejo, usa `--no-contradict` y apaga context/synthetic/entities durante el bootstrap, chequea memory pressure antes de indexar y antes de levantar servicios, y escalona los bootstraps.
 
 ### `rag setup`
 Instala o desinstala los servicios launchd que mantienen el sistema vivo.

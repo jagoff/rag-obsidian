@@ -3,7 +3,7 @@
 Surface:
 
 - ``_wa_chat_month_link(jid, label, ts_iso)`` — wikilink al chat-month note
-  sincronizado por `whatsapp-to-vault` (vive en
+  sincronizado por el ETL nativo de RAG (vive en
   `99-obsidian/99-AI/external-ingest/WhatsApp/<slug>/YYYY-MM.md`).
 - ``_wa_tasks_write_note(vault, run_ts, by_chat, extractions)`` — append
   timestamped section a `00-Inbox/WA-YYYY-MM-DD.md`. Crea el archivo con
@@ -28,16 +28,18 @@ from pathlib import Path
 
 
 def _wa_chat_month_link(jid: str, label: str, ts_iso: str) -> str:
-    """Wikilink to the vault-sync'd chat note for the message's month.
+    """Wikilink to the native WhatsApp chat note for the message's month.
 
     Falls back to just the label if the month can't be parsed. The link
-    target mirrors `whatsapp-to-vault`'s layout:
+    target mirrors `rag.integrations.whatsapp_etl`'s layout:
     `99-obsidian/99-AI/external-ingest/WhatsApp/<slug>/YYYY-MM.md`.
     """
     slug_src = label if any(ch.isalpha() for ch in label) else (jid.split("@")[0] or "sin-nombre")
-    # Same slug rule as vault-sync: strip non-word/dash/dot/space.
+    # Same slug rule as the native vault sync: strip non-word/dash/dot/space.
     slug = re.sub(r"[^\w\-\. ]+", "", slug_src).strip()
     slug = re.sub(r"\s+", " ", slug)[:80] or "sin-nombre"
+    if slug in {".", ".."}:
+        slug = "sin-nombre"
     try:
         dt = datetime.fromisoformat(ts_iso[:19].replace(" ", "T"))
         ym = dt.strftime("%Y-%m")

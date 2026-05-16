@@ -18,6 +18,7 @@ publicar voice.
 from __future__ import annotations
 
 import logging
+import shutil
 import subprocess
 import tempfile
 import uuid
@@ -68,13 +69,25 @@ def transcribe_blob(data: bytes, *, language: str = "es", suffix: str = ".webm")
         cleanup(tmp)
 
 
+def _ffmpeg_bin() -> str | None:
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    fallback = Path("/opt/homebrew/bin/ffmpeg")
+    return str(fallback) if fallback.is_file() else None
+
+
 def to_opus(in_path: Path) -> Path | None:
     """Convierte un archivo audio a `.ogg/opus 32kbps mono` (formato PTT
     de WhatsApp). Devuelve el path del `.ogg` o ``None`` si ffmpeg falla.
     """
+    ffmpeg = _ffmpeg_bin()
+    if ffmpeg is None:
+        logger.warning("ffmpeg to_opus failed: ffmpeg not found")
+        return None
     out_path = _temp_dir() / f"{uuid.uuid4().hex}.ogg"
     cmd = [
-        "/opt/homebrew/bin/ffmpeg",
+        ffmpeg,
         "-hide_banner",
         "-loglevel", "error",
         "-y",

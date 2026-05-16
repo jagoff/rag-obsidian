@@ -187,3 +187,88 @@ def test_top_stores_window_filter() -> None:
     assert out["items"][0]["name"] == "Manalu"
     assert out["items"][0]["amount"] == pytest.approx(27000.0)
     assert out["items"][0]["count"] == 2
+
+
+def test_credit_card_pdf_text_extracts_usd_purchases() -> None:
+    """Los resúmenes VISA PDF Santander aportan consumos USD reales."""
+    text = """
+          3004 SANTA FE                                                          CIERRE      31 Dic 25 VENCIMIENTO 09 Ene 26
+                                                                                 Prox.Cierre: 29 Ene 26             Prox.Vto.: 06 Feb 26
+
+Fecha            Comprobante Referencia                                                              $                      U$S
+  25 Noviem. 27 278050   GOOGLE *Google O P1gunINz USD          9,99                                        9,99
+              28 697517 K SUNO INC.        in1SYaHVEUSD         24,00                                       24,00
+  25 Diciem. 14 252745 K VERCEL INC.                USD        20,00                                       20,00-
+              20 651214 K MERPAGO*SUPERDELCA                                             210.917,40
+
+Tarjeta 1059 Total Consumos de FERNANDO R FERRARI                                            1445.371,58 *              120,84 *
+  25 Diciem. 31                 IMPUESTO DE SELLOS        $                                       1.515,18
+                                                          SALDO ACTUAL                 $ 1515.123,45             U$S        120,84
+                                                          PAGO MINIMO                  $             144.410,00
+"""
+    card = fd._parse_credit_card_pdf_text(
+        text,
+        "Resumen de tarjeta de crédito VISA-09-01-2026.pdf",
+        source_mtime=0,
+    )
+    assert card is not None
+    assert card["brand"] == "Visa"
+    assert card["last4"] == "1059"
+    assert card["holder"] == "FERNANDO R FERRARI"
+    assert card["closing_date"] == "2025-12-31"
+    assert card["due_date"] == "2026-01-09"
+    assert card["next_closing_date"] == "2026-01-29"
+    assert card["next_due_date"] == "2026-02-06"
+    assert card["total_usd"] == pytest.approx(120.84)
+
+    usd_by_desc = {p["description"]: p for p in card["all_purchases_usd"]}
+    assert usd_by_desc["GOOGLE *Google O P1gunINz"]["date"] == "2025-11-27"
+    assert usd_by_desc["GOOGLE *Google O P1gunINz"]["amount"] == pytest.approx(9.99)
+    assert usd_by_desc["SUNO INC. in1SYaHVE"]["amount"] == pytest.approx(24.0)
+    assert usd_by_desc["VERCEL INC."]["amount"] == pytest.approx(-20.0)
+    assert card["other_charges_total_ars"] == pytest.approx(1515.18)
+
+
+def test_snapshot_includes_credit_card_usd_in_aggregates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Los USD de tarjeta entran en KPIs/series; ARS de tarjeta no duplica MOZE."""
+    (tmp_path / "VISA").mkdir()
+    fd._DASHBOARD_CACHE["key"] = None
+    fd._DASHBOARD_CACHE["payload"] = None
+
+    card = {
+        "brand": "Visa",
+        "last4": "1059",
+        "source_file": "Resumen de tarjeta de crédito VISA-08-04-2026.pdf",
+        "all_purchases_ars": [
+            {"date": "2026-04-10", "description": "MERPAGO", "amount": 200000.0, "currency": "ARS"},
+        ],
+        "all_purchases_usd": [
+            {"date": "2026-04-10", "description": "APPLE.COM/BILL", "amount": 24.99, "currency": "USD"},
+            {"date": "2026-04-14", "description": "VERCEL INC.", "amount": -5.0, "currency": "USD"},
+        ],
+    }
+    monkeypatch.setattr(fd, "_load_moze_rows", lambda *a, **k: ([], []))
+    monkeypatch.setattr(fd, "_load_pdf_transfers", lambda *a, **k: ([], []))
+    monkeypatch.setattr(fd, "_load_income_pdfs", lambda *a, **k: ([], []))
+    monkeypatch.setattr(fd, "_load_credit_cards", lambda *a, **k: [card])
+
+    payload = fd.snapshot(
+        finance_dir=tmp_path,
+        moze_dir=tmp_path,
+        now=datetime(2026, 5, 16),
+        months=3,
+    )
+
+    assert payload["meta"]["n_transactions"] == 0
+    assert payload["meta"]["n_card_transactions"] == 2
+    assert payload["meta"]["usd_window_fallback"] is True
+    assert payload["meta"]["usd_window_days"] == 93
+    assert payload["kpis"]["expenses_usd"]["value"] == pytest.approx(19.99)
+    assert payload["kpis"]["expenses_usd"]["period"] == "2026-04"
+    assert payload["kpis"]["expenses_usd"]["fallback_to_latest"] is True
+    assert payload["kpis"]["expenses_ars"]["value"] == 0
+    assert payload["by_month"]["labels"][-1] == "2026-04"
+    assert payload["by_month"]["expenses_usd"][-1] == pytest.approx(19.99)
+    assert payload["by_month"]["expenses_ars"][-1] == 0
+    assert payload["by_category_usd"]["items"][0]["amount"] == pytest.approx(19.99)
+    assert payload["top_stores_usd"]["items"][0]["name"] == "APPLE.COM/BILL"

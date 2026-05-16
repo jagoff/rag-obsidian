@@ -128,6 +128,32 @@ def test_voice_healthcheck_missing_say(client, monkeypatch):
     assert "say" in body["missing"]
 
 
+def test_to_opus_uses_ffmpeg_from_path(monkeypatch, tmp_path):
+    """to_opus debe usar el ffmpeg resuelto por PATH, no un path hardcodeado."""
+    import subprocess
+
+    from rag.integrations.whatsapp import voice as _voice
+
+    input_audio = tmp_path / "voice.webm"
+    input_audio.write_bytes(b"audio")
+    calls = []
+
+    monkeypatch.setattr(_voice.shutil, "which",
+                        lambda cmd: "/custom/bin/ffmpeg" if cmd == "ffmpeg" else None)
+
+    def fake_run(cmd, capture_output, text, timeout):
+        calls.append(cmd)
+        Path(cmd[-1]).write_bytes(b"x" * 300)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(_voice.subprocess, "run", fake_run)
+
+    out = _voice.to_opus(input_audio)
+
+    assert out is not None
+    assert calls[0][0] == "/custom/bin/ffmpeg"
+
+
 def test_send_voice_custom_voice(client, monkeypatch, tmp_path):
     """`voice` param se pasa a tts_text_to_opus."""
     from rag.integrations.whatsapp import voice as _voice, bridge_client as _bc

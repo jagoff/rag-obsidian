@@ -6,6 +6,7 @@ import {
   escapeHTML, fmtTimeAgo,
   obsidianUrl, gmailThreadUrl, whatsappUrl, youtubeUrl,
   getCurrentPayload,
+  isReminderDueToday, isReminderDueTomorrow, reminderTitle,
 } from "./core.mjs";
 
 // ── Wikilinks → Markdown links ────────────────────────────────────────────────
@@ -332,7 +333,7 @@ export function renderTodayHero(payload) {
     const trimmed = (contentHTML || "").trim();
     if (!trimmed) return "";
     return `
-    <div class="hero-section ${cls}">
+    <div class="hero-section ${cls}" id="hero-${cls}">
       <h3><span>${emoji} ${escapeHTML(label)}</span>${count != null ? `<span class="count">${count}</span>` : ""}</h3>
       <div class="prose">${trimmed}</div>
     </div>
@@ -477,15 +478,6 @@ export function renderTodayHero(payload) {
     questionsHTML = items.length ? `<ul>${items.join("")}</ul>` : "";
   }
 
-  const dueMatchesToday = (r) => {
-    const due = (r.due || r.due_at || "").toLowerCase();
-    return /\btoday\b|\bhoy\b/.test(due);
-  };
-  const dueMatchesTomorrow = (r) => {
-    const due = (r.due || r.due_at || "").toLowerCase();
-    return /\btomorrow\b|ma[ñn]ana/.test(due);
-  };
-
   const renderAgendaItems = (events, reminders, fallbackPrefix) => {
     const items = [];
     for (const e of events.slice(0, 6)) {
@@ -495,7 +487,7 @@ export function renderTodayHero(payload) {
       items.push(`<li><strong>${escapeHTML(prefix)}</strong> — ${escapeHTML(title)}</li>`);
     }
     for (const r of reminders.slice(0, 3)) {
-      items.push(`<li>📌 ${escapeHTML(truncate(r.title || r.text || "", 80))}</li>`);
+      items.push(`<li>📌 ${escapeHTML(truncate(reminderTitle(r), 80))}</li>`);
     }
     return items.length ? `<ul>${items.join("")}</ul>` : "";
   };
@@ -504,7 +496,7 @@ export function renderTodayHero(payload) {
   if (split.today) {
     todayHTML = mdToHTML(split.today);
   } else {
-    const reminders = (signals.reminders || []).filter(dueMatchesToday);
+    const reminders = (signals.reminders || []).filter(isReminderDueToday);
     todayHTML = renderAgendaItems(todayEvents, reminders, "todo el día");
   }
 
@@ -515,7 +507,7 @@ export function renderTodayHero(payload) {
   if (split.tomorrow && !tomorrowBriefIsStale) {
     tomorrowHTML = mdToHTML(split.tomorrow);
   } else {
-    const reminders = (signals.reminders || []).filter(dueMatchesTomorrow);
+    const reminders = (signals.reminders || []).filter(isReminderDueTomorrow);
     tomorrowHTML = renderAgendaItems(tomorrowEvents, reminders, "todo el día");
   }
 
@@ -526,9 +518,9 @@ export function renderTodayHero(payload) {
     + ((signals.followup_aging?.stale_30plus || 0) > 0 ? 1 : 0)
     + (evidence.new_contradictions?.length || 0);
   const todayCount = todayEvents.length
-    + (signals.reminders || []).filter(dueMatchesToday).length;
+    + (signals.reminders || []).filter(isReminderDueToday).length;
   const tomorrowCount = tomorrowEvents.length
-    + (signals.reminders || []).filter(dueMatchesTomorrow).length;
+    + (signals.reminders || []).filter(isReminderDueTomorrow).length;
 
   // Agenda combina "Para hoy" + "Para mañana" en una sola hero-section
   // (col 4 de la grilla). Se renderea como h3 + dos sub-blocks .hero-sub
@@ -550,7 +542,7 @@ export function renderTodayHero(payload) {
   // items reales (todayHTML/tomorrowHTML vacíos), no la renderizamos.
   const agendaHasContent = !!((todayHTML || "").trim() || (tomorrowHTML || "").trim());
   const agendaHTML = agendaHasContent ? `
-    <div class="hero-section s-agenda">
+    <div class="hero-section s-agenda" id="hero-s-agenda">
       <h3><span>🌅 Agenda</span>${agendaCount ? `<span class="count">${agendaCount}</span>` : ""}</h3>
       ${agendaBody}
     </div>

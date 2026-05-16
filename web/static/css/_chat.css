@@ -1243,6 +1243,13 @@ kbd {
     0 0 0 1px color-mix(in srgb, var(--cyan) 25%, transparent);
 }
 
+#input-wrap.drag-over {
+  border-color: var(--cyan);
+  box-shadow:
+    var(--shadow-md),
+    0 0 0 2px color-mix(in srgb, var(--cyan) 34%, transparent);
+}
+
 /* Hover micro-lift — transform (no layout shift) en chips/slash items. */
 .follow-chip:hover {
   transform: translateY(-1px);

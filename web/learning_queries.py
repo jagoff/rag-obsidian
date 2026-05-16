@@ -889,14 +889,17 @@ _IMPLICIT_SOURCES = (
     "requery_detection",
     "session_outcome_loss",
     "session_outcome_win",
+    "session_outcome_weak_negative",
     "corrective_paths",
 )
 
 
 def _feedback_implicit_by_source(days: int) -> dict:
-    """Cuenta por source dentro de extra_json.implicit_loss_source. Usamos
-    LIKE con el valor literal — los sources están definidos en el código
-    de RAG (no son free-text del user) así que el set es cerrado."""
+    """Cuenta feedback implícito por fuente.
+
+    `corrective_paths` vive en `extra_json.corrective_source`, no en
+    `implicit_loss_source`, así que se cuenta con un filtro separado.
+    """
     from rag import _ragvec_state_conn, _sql_read_with_retry
 
     cutoff = _cutoff_iso(days)
@@ -906,6 +909,14 @@ def _feedback_implicit_by_source(days: int) -> dict:
         out["other"] = 0
         with _ragvec_state_conn() as conn:
             for src in _IMPLICIT_SOURCES:
+                if src == "corrective_paths":
+                    n = conn.execute(
+                        "SELECT COUNT(*) FROM rag_feedback "
+                        "WHERE ts >= ? AND extra_json LIKE '%\"corrective_source\"%'",
+                        (cutoff,),
+                    ).fetchone()[0] or 0
+                    out[src] = int(n)
+                    continue
                 n = conn.execute(
                     "SELECT COUNT(*) FROM rag_feedback "
                     "WHERE ts >= ? AND extra_json LIKE ?",
@@ -914,7 +925,8 @@ def _feedback_implicit_by_source(days: int) -> dict:
                 out[src] = int(n)
             n_total = conn.execute(
                 "SELECT COUNT(*) FROM rag_feedback "
-                "WHERE ts >= ? AND extra_json LIKE '%implicit_loss_source%'",
+                "WHERE ts >= ? AND (extra_json LIKE '%implicit_loss_source%' "
+                "OR extra_json LIKE '%\"corrective_source\"%')",
                 (cutoff,),
             ).fetchone()[0] or 0
         out["other"] = max(0, int(n_total) - sum(out[s] for s in _IMPLICIT_SOURCES))
@@ -941,7 +953,8 @@ def _feedback_implicit_rate(days: int) -> dict:
         with _ragvec_state_conn() as conn:
             impl_rows = conn.execute(
                 "SELECT DATE(ts) AS d, COUNT(*) FROM rag_feedback "
-                "WHERE ts >= ? AND extra_json LIKE '%implicit_loss_source%' "
+                "WHERE ts >= ? AND (extra_json LIKE '%implicit_loss_source%' "
+                "OR extra_json LIKE '%\"corrective_source\"%') "
                 "GROUP BY d",
                 (cutoff,),
             ).fetchall()
@@ -1920,7 +1933,10 @@ def _vault_surface_archive_over_time(days: int) -> dict:
 # algo está mal o no.
 #
 # Filosofía:
-#   - "Worst-case wins": si una sola señal está roja, el banner va rojo.
+#   - "Worst-case wins" para señales accionables: si una sola señal está roja,
+#     el banner va rojo.
+#   - Gaps de cobertura ("sin suficientes datos") se muestran en los detalles,
+#     pero no convierten en alarma un sistema que operativamente está verde.
 #   - Cada señal trae 4 datos: nivel propio, valor crudo (para el dev),
 #     texto plain (para el usuario), y tooltip técnico (para el dev en hover).
 #   - Thresholds basados en p50 histórico (30d) — ver constantes ``_HEALTH_*``
@@ -1971,6 +1987,29 @@ def _level_worst(levels: list[str]) -> str:
     if "yellow" in levels:
         return "yellow"
     return "green"
+
+
+_HEALTH_COVERAGE_GAP_KEYS = {
+    "retrieval_singles",
+    "retrieval_chains",
+    "response_speed",
+}
+
+
+def _is_coverage_gap_signal(signal: dict) -> bool:
+    """Yellow por falta de muestras, no por degradación real.
+
+    Estas señales siguen visibles como yellow en el detalle, pero no deben
+    disparar el headline "Hay algo para vigilar" si servicios, freshness y
+    errores están verdes. Fallas de lectura ("No pude leer la base") NO son
+    coverage gaps y conservan su yellow actionable.
+    """
+    return (
+        signal.get("key") in _HEALTH_COVERAGE_GAP_KEYS
+        and signal.get("level") == "yellow"
+        and signal.get("value_raw") is None
+        and str(signal.get("value_text") or "").startswith("Sin suficientes")
+    )
 
 
 def _signal(*, key: str, label: str, level: str, value_text: str,
@@ -2367,21 +2406,31 @@ def _health_errors_24h() -> dict:
 
 def _health_response_speed() -> dict:
     """p95 de latencia (t_retrieve + t_gen) en los últimos 7 días.
-    NTILE(100) sobre los queries con t > 0 nos da percentiles sin
-    necesidad de window functions complejas."""
+    Usamos nearest-rank p95 y exponemos el total real de muestras.
+    NTILE(100) no sirve acá: con pocos samples puede no haber ningún row
+    en el bucket 95, y terminaba reportando n=0 aunque hubiera queries."""
     from rag import _ragvec_state_conn, _sql_read_with_retry
 
     def _do() -> dict:
         with _ragvec_state_conn() as conn:
             row = conn.execute("""
-                WITH ranked AS (
-                  SELECT (COALESCE(t_retrieve,0)+COALESCE(t_gen,0)) AS t,
-                         NTILE(100) OVER (ORDER BY (COALESCE(t_retrieve,0)+COALESCE(t_gen,0))) AS pct
+                WITH samples AS (
+                  SELECT (COALESCE(t_retrieve,0)+COALESCE(t_gen,0)) AS t
                   FROM rag_queries
                   WHERE ts >= datetime('now','-7 days')
                     AND (COALESCE(t_retrieve,0)+COALESCE(t_gen,0)) > 0
+                ),
+                ranked AS (
+                  SELECT
+                    t,
+                    ROW_NUMBER() OVER (ORDER BY t) AS rn,
+                    COUNT(*) OVER () AS n
+                  FROM samples
                 )
-                SELECT MAX(t), COUNT(*) FROM ranked WHERE pct = 95
+                SELECT t, n
+                FROM ranked
+                WHERE rn = CAST(((n * 95 + 99) / 100) AS INTEGER)
+                LIMIT 1
             """).fetchone()
         p95 = float(row[0]) if row and row[0] is not None else 0.0
         n = int(row[1]) if row and row[1] is not None else 0
@@ -2392,7 +2441,7 @@ def _health_response_speed() -> dict:
                 level="yellow",
                 value_text=f"Sin suficientes consultas para medir (n={n})",
                 value_raw=None,
-                tooltip=f"NTILE(100) p95 de t_retrieve+t_gen en 7d, "
+                tooltip=f"nearest-rank p95 de t_retrieve+t_gen en 7d, "
                         f"n={n} < min={_HEALTH_SPEED_MIN_SAMPLES}",
                 explanation="Hacen falta más consultas en los últimos 7 días "
                             "para que el p95 sea representativo.",
@@ -2471,7 +2520,12 @@ def system_health() -> dict:
         _health_errors_24h(),
         _health_response_speed(),
     ]
-    overall = _level_worst([s["level"] for s in signals])
+    coverage_gaps = [s for s in signals if _is_coverage_gap_signal(s)]
+    actionable_levels = [
+        s["level"] for s in signals
+        if not _is_coverage_gap_signal(s)
+    ]
+    overall = _level_worst(actionable_levels)
     headlines = {
         "green": "Todo funcionando bien",
         "yellow": "Hay algo para vigilar",
@@ -2482,6 +2536,12 @@ def system_health() -> dict:
         "yellow": "Hay alguna señal que conviene revisar — todo lo crítico anda.",
         "red": "Algo importante no está funcionando — mirá los detalles.",
     }
+    if overall == "green" and coverage_gaps:
+        headlines["green"] = "Todo lo crítico funcionando"
+        summaries["green"] = (
+            "Servicios, vault y errores están bien; faltan datos para medir "
+            "calidad o velocidad con más confianza."
+        )
     return {
         "level": overall,
         "headline": headlines[overall],

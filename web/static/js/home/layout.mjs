@@ -6,7 +6,14 @@ import {
   LS_HERO_ORDER,
   LS_HERO_SUB_COLLAPSED,
 } from "./panel-today.mjs";
-import { observeAllPanels, observePanel, clearPanelSizeOverrides, setPanelSize } from "./autosizer.mjs";
+import {
+  applySavedPanelSize,
+  clearPanelSizeOverrides,
+  hasPanelSizeOverrides,
+  observeAllPanels,
+  observePanel,
+  setPanelSize,
+} from "./autosizer.mjs";
 
 // ── Constantes de localStorage ─────────────────────────────────────────────────
 
@@ -14,6 +21,7 @@ const LS_PANELS_ORDER = "home.v2.panels.order.v1";
 const LS_PANELS_COLLAPSED = "home.v2.panels.collapsed.v1";
 const LS_SECTIONS_COLLAPSED = "home.v2.sections.collapsed.v1";
 const SECTION_BODY_IDS = ["sec-acc-body", "sec-mon-body", "sec-amb-body"];
+const ORDER_CONTAINER_IDS = ["home-cmdbar", ...SECTION_BODY_IDS];
 
 // ── Orden persistido ───────────────────────────────────────────────────────────
 
@@ -29,10 +37,11 @@ function readSavedOrder() {
 
 function saveCurrentOrder() {
   const order = {};
-  for (const secId of SECTION_BODY_IDS) {
+  for (const secId of ORDER_CONTAINER_IDS) {
     const sec = document.getElementById(secId);
     if (!sec) continue;
-    order[secId] = Array.from(sec.querySelectorAll(":scope > .panel"))
+    const itemSelector = secId === "home-cmdbar" ? ":scope > .kpi" : ":scope > .panel";
+    order[secId] = Array.from(sec.querySelectorAll(itemSelector))
       .map((p) => p.id)
       .filter(Boolean);
   }
@@ -47,7 +56,7 @@ function saveCurrentOrder() {
 export function applySavedOrder() {
   const saved = readSavedOrder();
   if (!saved) return;
-  for (const secId of SECTION_BODY_IDS) {
+  for (const secId of ORDER_CONTAINER_IDS) {
     const sec = document.getElementById(secId);
     if (!sec) continue;
     const ids = Array.isArray(saved[secId]) ? saved[secId] : [];
@@ -146,6 +155,54 @@ export function injectCollapseButton(panel) {
   // Evitar que el click inicie un drag (el panel padre tiene draggable=true)
   btn.addEventListener("mousedown", (ev) => ev.stopPropagation());
   head.appendChild(btn);
+}
+
+function injectKpiControls(kpi) {
+  if (kpi.dataset.kpiControlsInit === "1") return;
+  kpi.dataset.kpiControlsInit = "1";
+  const controls = document.createElement("div");
+  controls.className = "kpi-layout-controls";
+
+  const grip = document.createElement("span");
+  grip.className = "drag-grip kpi-drag-grip";
+  grip.setAttribute("aria-hidden", "true");
+  grip.title = "arrastrá para reordenar";
+  grip.textContent = "⋮⋮";
+  controls.appendChild(grip);
+
+  for (const dim of ["w", "h"]) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = `kpi-size-btn kpi-size-${dim}`;
+    btn.setAttribute("aria-label", dim === "w" ? "Toggle ancho" : "Toggle alto");
+    btn.title = dim === "w" ? "ancho: compacto ↔ ancho completo" : "alto: corto ↕ alto";
+    btn.textContent = dim === "w" ? "↔" : "↕";
+    btn.setAttribute("draggable", "false");
+    btn.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      togglePanelDim(kpi, dim);
+    });
+    btn.addEventListener("mousedown", (ev) => ev.stopPropagation());
+    controls.appendChild(btn);
+  }
+
+  const collapse = document.createElement("button");
+  collapse.type = "button";
+  collapse.className = "panel-collapse-btn kpi-collapse-btn";
+  collapse.setAttribute("aria-label", "Colapsar/expandir indicador");
+  collapse.setAttribute("aria-expanded", "true");
+  collapse.title = "Minimizar/expandir";
+  collapse.innerHTML = '<span class="toggle-icon" aria-hidden="true">▼</span>';
+  collapse.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    togglePanelCollapse(kpi);
+  });
+  collapse.addEventListener("mousedown", (ev) => ev.stopPropagation());
+  controls.appendChild(collapse);
+
+  kpi.appendChild(controls);
 }
 
 // ── Chips de tamaño manual (override del autosizer) ───────────────────
@@ -276,6 +333,15 @@ function startResize(ev, panel, axis) {
   document.addEventListener("mouseup", onUp);
 }
 
+function setupPanel(panel) {
+  applySavedPanelSize(panel);
+  makePanelDraggable(panel);
+  injectSizeChips(panel);
+  injectResizeHandles(panel);
+  injectCollapseButton(panel);
+  observePanel(panel);
+}
+
 export function injectResizeHandles(panel) {
   if (panel.dataset.resizeInit === "1") return;
   panel.dataset.resizeInit = "1";
@@ -301,7 +367,16 @@ function onPanelDragStart(ev) {
   // Si el drag se origina en un control interactivo del header (chips
   // de resize, botón collapse), cancelar — el browser propaga dragstart
   // desde el child al panel padre cuando el child no es draggable.
-  if (ev.target && ev.target.closest(".panel-size-chip, .panel-collapse-btn")) {
+  if (ev.target && ev.target.closest(
+    ".panel-size-chip, .panel-collapse-btn, .kpi-layout-controls",
+  )) {
+    ev.preventDefault();
+    return;
+  }
+  if (
+    ev.currentTarget?.classList?.contains("kpi") &&
+    !ev.target?.closest(".kpi-drag-grip")
+  ) {
     ev.preventDefault();
     return;
   }
@@ -380,6 +455,13 @@ export function makePanelDraggable(panel) {
   panel.addEventListener("drop", onPanelDrop);
 }
 
+function setupKpi(kpi) {
+  applySavedPanelSize(kpi);
+  injectKpiControls(kpi);
+  injectResizeHandles(kpi);
+  makePanelDraggable(kpi);
+}
+
 export function makeSectionDroppable(secId) {
   const sec = document.getElementById(secId);
   if (!sec) return;
@@ -415,7 +497,7 @@ function hasCustomLayout() {
     if (localStorage.getItem(LS_HERO_ORDER)) return true;
     if (localStorage.getItem(LS_HERO_SUB_COLLAPSED)) return true;
     if (localStorage.getItem(LS_SECTIONS_COLLAPSED)) return true;
-    if (localStorage.getItem("home.v2.panel-sizes.v1")) return true;
+    if (hasPanelSizeOverrides()) return true;
   } catch {}
   return false;
 }
@@ -433,12 +515,12 @@ export function injectResetButton() {
   btn.type = "button";
   btn.id = "reset-order-btn";
   btn.className = "reset-order-btn";
-  btn.title = "Resetear layout (orden + paneles colapsados)";
+  btn.title = "Resetear layout (orden + tamaños + paneles colapsados)";
   btn.setAttribute("aria-label", "Resetear layout de los paneles");
   btn.textContent = "↺ layout";
   btn.hidden = !hasCustomLayout();
   btn.addEventListener("click", () => {
-    if (confirm("¿Resetear el layout de los paneles al default? (orden + collapse)")) {
+    if (confirm("¿Resetear el layout de los paneles al default? (orden + tamaños + collapse)")) {
       clearSavedOrder();
     }
   });
@@ -513,10 +595,10 @@ export function initLayout() {
   applySavedOrder();
   // 2. Hacer cada panel draggable + insertar grip + chips + handles + collapse
   document.querySelectorAll(".section-body > .panel").forEach((panel) => {
-    makePanelDraggable(panel);
-    injectSizeChips(panel);
-    injectResizeHandles(panel);
-    injectCollapseButton(panel);
+    setupPanel(panel);
+  });
+  document.querySelectorAll("#home-cmdbar > .kpi").forEach((kpi) => {
+    setupKpi(kpi);
   });
   // 2b. Mismo tratamiento para las .hero-section (LO QUE PASÓ / SIN PROCESAR
   //     / PREGUNTAS / AGENDA) — son los 4 sub-bloques del today-hero-body
@@ -525,6 +607,7 @@ export function initLayout() {
   const heroBody = document.getElementById("today-hero-body");
   if (heroBody) {
     heroBody.querySelectorAll(":scope > .hero-section").forEach((sec) => {
+      applySavedPanelSize(sec);
       injectResizeHandles(sec);
     });
     // El hero-body se re-renderiza cuando llega el brief — watch nuevas
@@ -533,6 +616,7 @@ export function initLayout() {
       for (const m of muts) {
         for (const n of m.addedNodes) {
           if (n.nodeType === 1 && n.classList?.contains("hero-section")) {
+            applySavedPanelSize(n);
             injectResizeHandles(n);
           }
         }
@@ -542,8 +626,8 @@ export function initLayout() {
   }
   // 3. Aplicar estado de collapse persistido
   applySavedCollapse();
-  // 4. Hacer cada section-body un drop zone para "soltar al final"
-  SECTION_BODY_IDS.forEach(makeSectionDroppable);
+  // 4. Hacer cada section-body/cmdbar un drop zone para "soltar al final"
+  ORDER_CONTAINER_IDS.forEach(makeSectionDroppable);
   // 5. Inyectar botón reset en la topbar
   injectResetButton();
   // 6. Auto-sizing por content (4-col grid + 2 alturas).
@@ -556,17 +640,24 @@ export function initLayout() {
     if (!sec) return;
     const mo = new MutationObserver((mutations) => {
       for (const m of mutations) {
+        if (m.type === "childList") {
+          for (const n of m.addedNodes) {
+            if (n.nodeType !== 1 || !n.classList?.contains("panel")) continue;
+            setupPanel(n);
+            mo.observe(n, { attributes: true, attributeFilter: ["hidden"] });
+          }
+          continue;
+        }
         if (m.type !== "attributes" || m.attributeName !== "hidden") continue;
         const panel = m.target;
         if (panel?.classList?.contains("panel") && !panel.hidden) {
-          injectSizeChips(panel);
-          injectResizeHandles(panel);
-          observePanel(panel);
+          setupPanel(panel);
         }
       }
     });
     sec.querySelectorAll(":scope > .panel").forEach((p) => {
       mo.observe(p, { attributes: true, attributeFilter: ["hidden"] });
     });
+    mo.observe(sec, { childList: true });
   });
 }

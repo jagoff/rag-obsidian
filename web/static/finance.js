@@ -445,6 +445,9 @@ function renderKPIs(kpis) {
         if (cfg.fmt === "category_name") {
           dEl.textContent = valSubtitle || "";
           dEl.className = "kpi-delta neutral";
+        } else if (data.fallback_to_latest && data.period_label) {
+          dEl.textContent = `último: ${fmtMonth(data.period_label)}`;
+          dEl.className = "kpi-delta neutral";
         } else if (data.delta_pct == null) {
           dEl.textContent = "";
           dEl.className = "kpi-delta neutral";
@@ -1017,7 +1020,7 @@ function renderCards(cards) {
         <path d="M2 11h20"/>
       </svg>
       <h3>Sin resúmenes de tarjeta</h3>
-      <p>Cuando aparezca un <code>Último resumen - &lt;Marca&gt; &lt;NNNN&gt;.xlsx</code> en la carpeta <code>Finances/</code>, se mostrará acá con todos los consumos del ciclo.</p>
+      <p>Cuando aparezca un resumen de tarjeta <code>.xlsx</code> o <code>.pdf</code> en <code>Finances/VISA/</code>, se mostrará acá con todos los consumos del ciclo.</p>
     </div>`;
     return;
   }
@@ -1755,7 +1758,7 @@ function renderSources(meta) {
 
   sumEl.innerHTML = `
     Carpeta: <code>${escapeHtml(meta.finance_dir || "—")}</code><br>
-    ${fmtInt(meta.n_transactions)} transacciones MOZE · ${fmtInt(meta.n_transfers)} transferencias PDF · ${fmtInt(meta.n_cards)} resúmenes de tarjeta.
+    ${fmtInt(meta.n_transactions)} transacciones MOZE · ${fmtInt(meta.n_transfers)} transferencias PDF · ${fmtInt(meta.n_cards)} resúmenes de tarjeta · ${fmtInt(meta.n_card_transactions || 0)} consumos USD de tarjeta.
   `;
 
   const sections = [];
@@ -1810,7 +1813,10 @@ function renderAll(data) {
   renderSources(data.meta || {});
   if (el.metaPeriod && data.meta) {
     const wd = data.meta.window_days || state.windowDays;
-    el.metaPeriod.textContent = `${wd} días · ${data.meta.months || 12}m`;
+    const usdWd = data.meta.usd_window_days || wd;
+    el.metaPeriod.textContent = data.meta.usd_window_fallback
+      ? `${wd} días ARS · ${usdWd} días USD · ${data.meta.months || 12}m`
+      : `${wd} días · ${data.meta.months || 12}m`;
   }
   if (el.metaUpdated) {
     el.metaUpdated.textContent = `actualizado ${nowHM()}`;

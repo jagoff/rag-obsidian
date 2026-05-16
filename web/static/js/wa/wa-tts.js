@@ -12,7 +12,7 @@ const VOICE_STORAGE_KEY = "wzp-tts-voice";
 let _btn = null;
 let _input = null;
 let _activeJid = null;
-let _healthOk = false;
+let _healthOk = true;
 let _healthMissing = [];
 let _voicesLoaded = false;
 
@@ -43,7 +43,10 @@ async function checkHealth() {
     }
     if (_healthOk) await loadVoices();
   } catch (e) {
+    _healthOk = true;
     // silent — si el healthcheck falla, dejamos pasar el click normal
+  } finally {
+    updateState();
   }
 }
 

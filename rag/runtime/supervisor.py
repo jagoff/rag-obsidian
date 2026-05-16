@@ -127,11 +127,7 @@ def _register_builtin_ipc() -> None:
         if not label:
             return {"ok": False, "error": "missing 'job' field"}
         sched = Scheduler.global_instance()
-        result = sched.run_now(label)
-        # Mark trigger as IPC for telemetry.
-        # (run_now ya persistió con trigger="cron" default; idealmente
-        # le pasaríamos trigger="ipc" pero no es campo público todavía
-        # — F2 ajusta cuando importe.)
+        result = sched.run_now(label, trigger="ipc")
         return result
 
 

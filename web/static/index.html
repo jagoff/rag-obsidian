@@ -17,8 +17,8 @@
        dejamos igual para compat. -->
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <meta name="apple-mobile-web-app-title" content="rag">
-  <title>rag · chat</title>
+  <meta name="apple-mobile-web-app-title" content="ra.ai">
+  <title>ra.ai · chat</title>
 
   <!-- ── PWA wiring ────────────────────────────────────────────────
        Manifest + icons + splash screens. Regenerar con
@@ -197,7 +197,7 @@
          solo top-level heading por documento; el heading canónico vive
          en la sidebar (línea 118) que está siempre en el DOM. Este
          brand es decorativo + click-target, no un heading semántico. -->
-    <p class="topbar-title mobile-brand">rag <span>· chat</span></p>
+    <p class="topbar-title mobile-brand">ra.ai <span>· chat</span></p>
     <button id="mobile-new-btn" class="icon-btn" type="button"
             aria-label="Nueva conversación" title="Nueva conversación">
       <svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true"
@@ -216,7 +216,7 @@
         <!-- Brand: `.topbar-title` sobrevive como class name (app.js
              lo engancha para el clear-view handler). -->
         <h1 class="topbar-title sidebar-brand">
-          <span class="sidebar-brand-full">rag <span>· chat</span></span>
+          <span class="sidebar-brand-full">ra.ai <span>· chat</span></span>
           <span class="sidebar-brand-mini" aria-hidden="true">r</span>
         </h1>
         <button id="sidebar-collapse-btn" class="icon-btn sidebar-collapse-btn"
@@ -261,6 +261,9 @@
                  role="radiogroup"
                  aria-labelledby="chat-mode-label">
               <button type="button" role="radio" aria-checked="true"
+                      data-mode="work" class="chat-mode-btn"
+                      title="Laboral — Qwen3-30B local para AWS, FinOps e informes">laboral</button>
+              <button type="button" role="radio" aria-checked="false"
                       data-mode="auto" class="chat-mode-btn"
                       title="Auto — el sistema elige según la query">auto</button>
               <button type="button" role="radio" aria-checked="false"
@@ -502,9 +505,9 @@
       <!-- h2 (no h1) — el h1 del documento es el brand de la sidebar.
            El hero es un sub-heading dentro de <main>, no el heading
            top-level de la página (WCAG 2.4.6, 1 h1 por documento). -->
-      <h2 class="empty-hero-title">¿en qué te ayudo?</h2>
+      <h2 class="empty-hero-title">¿qué trabajo resolvemos?</h2>
       <p class="empty-hero-sub">
-        preguntale al vault —
+        Qwen3-30B local · AWS · FinOps · informes · vault —
         <kbd>/</kbd> comandos · <kbd>⌘</kbd><kbd>K</kbd> foco · <kbd>⌘</kbd><kbd>/</kbd> ayuda
       </p>
     </section>
@@ -579,7 +582,7 @@
             <textarea
               id="input"
               rows="1"
-              placeholder="¿cómo puedo ayudarte hoy?"
+              placeholder="Pedime un informe, una evaluación FinOps o una tarea AWS..."
               aria-label="Pregunta"
             ></textarea>
           </div>
@@ -674,7 +677,8 @@
              Al click: rellena #input con el data-query y submitea el
              form directamente (no hay confirmación intermedia). -->
         <div id="quick-chips" role="list" aria-label="Atajos de preguntas">
-          <button type="button" class="quick-chip" data-query="qué tengo hoy">
+          <button type="button" class="quick-chip"
+                  data-query="evaluá este escenario AWS con foco FinOps: ">
             <svg class="quick-chip-icon" width="14" height="14"
                  viewBox="0 0 24 24" aria-hidden="true" fill="none"
                  stroke="currentColor" stroke-width="2"
@@ -684,10 +688,10 @@
               <line x1="8" y1="2" x2="8" y2="6"/>
               <line x1="3" y1="10" x2="21" y2="10"/>
             </svg>
-            Agenda de hoy
+            FinOps AWS
           </button>
           <button type="button" class="quick-chip"
-                  data-query="qué mails importantes tengo">
+                  data-query="redactá un informe ejecutivo sobre: ">
             <svg class="quick-chip-icon" width="14" height="14"
                  viewBox="0 0 24 24" aria-hidden="true" fill="none"
                  stroke="currentColor" stroke-width="2"
@@ -695,30 +699,30 @@
               <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/>
               <polyline points="22,6 12,13 2,6"/>
             </svg>
-            Últimos mails
+            Informe ejecutivo
           </button>
           <button type="button" class="quick-chip"
-                  data-query="qué conversaciones recientes tengo en whatsapp">
+                  data-query="armá un plan de trabajo cloud engineering para: ">
             <svg class="quick-chip-icon" width="14" height="14"
                  viewBox="0 0 24 24" aria-hidden="true" fill="none"
                  stroke="currentColor" stroke-width="2"
                  stroke-linecap="round" stroke-linejoin="round">
               <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
             </svg>
-            WhatsApp
+            Plan cloud
           </button>
           <button type="button" class="quick-chip"
-                  data-query="qué pendientes tengo">
+                  data-query="revisá esta arquitectura AWS con mirada Well-Architected, costos, seguridad y operación: ">
             <svg class="quick-chip-icon" width="14" height="14"
                  viewBox="0 0 24 24" aria-hidden="true" fill="none"
                  stroke="currentColor" stroke-width="2"
                  stroke-linecap="round" stroke-linejoin="round">
               <polyline points="20 6 9 17 4 12"/>
             </svg>
-            Pendientes
+            AWS review
           </button>
           <button type="button" class="quick-chip"
-                  data-query="buscar en el vault ">
+                  data-query="buscá en mi vault contexto laboral sobre: ">
             <svg class="quick-chip-icon" width="14" height="14"
                  viewBox="0 0 24 24" aria-hidden="true" fill="none"
                  stroke="currentColor" stroke-width="2"
@@ -726,17 +730,16 @@
               <circle cx="11" cy="11" r="8"/>
               <line x1="21" y1="21" x2="16.65" y2="16.65"/>
             </svg>
-            Buscar en vault
+            Vault laboral
           </button>
         </div>
-        <!-- File picker oculto: lo dispara el item "📎 Adjuntar imagen"
+        <!-- File picker oculto: lo dispara el item "📎 Adjuntar archivo"
              del mini-popover del botón `+` (construido dinámicamente
              en app.js). Vive dentro del <form> para que el reset de
              value="" en `change` funcione bien y permita re-elegir el
-             mismo archivo otra vez. accept="image/*" cubre jpeg/png/
-             heic/heif/webp/gif — el backend valida tipos y tamaño
-             (max 12MB) en /api/chat/upload-image. -->
-        <input type="file" id="composer-file-input" accept="image/*" hidden>
+             mismo archivo otra vez. Acepta imágenes y documentos comunes;
+             el backend valida tamaño/tipo y extrae texto cuando puede. -->
+        <input type="file" id="composer-file-input" multiple hidden>
       </div>
     </form>
   </main>

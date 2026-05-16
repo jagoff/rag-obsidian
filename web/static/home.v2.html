@@ -33,7 +33,7 @@
         media="(device-width: 402px) and (device-height: 874px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
   <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-16-pro-max.png"
         media="(device-width: 440px) and (device-height: 956px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
-  <link rel="stylesheet" href="/static/home.v2.css?v=76">
+  <link rel="stylesheet" href="/static/home.v2.css?v=84">
   <!-- marked@18 vendored — same SRI as the v1 home. Used to parse the
        today/tomorrow narrative which has 4 H2 sub-sections that need
        real markdown rendering (lists, headers) — not the regex hack. -->
@@ -113,7 +113,7 @@
     <!-- KPI WhatsApp removido (era duplicado del panel "WhatsApp · sin
          responder" en Accionable). 3 KPIs deja más espacio horizontal por
          tarjeta + reduce sameness con la sección de abajo. -->
-    <section class="cmdbar" aria-label="indicadores críticos">
+    <section class="cmdbar" id="home-cmdbar" aria-label="indicadores críticos">
       <article class="kpi" id="kpi-inbox" data-kpi="inbox">
         <a class="kpi-link" href="#p-inbox" aria-label="ir al panel inbox">
           <div class="kpi-label">Inbox sin procesar</div>
@@ -452,11 +452,42 @@
     </div>
   </dialog>
 
-  <script type="module" src="/static/js/home/app.mjs?v=76"></script>
+  <script>
+    window.__RAG_HOME_ASSET_VERSION__ = "83";
+    window.__RAG_HOME_CACHE_READY__ = (async function () {
+      const version = window.__RAG_HOME_ASSET_VERSION__;
+      const key = "rag.home.asset.version";
+      try {
+        const previous = localStorage.getItem(key);
+        if (previous !== version && "caches" in window) {
+          const names = await caches.keys();
+          await Promise.all(
+            names
+              .filter((name) => name.startsWith("rag-pwa-"))
+              .map((name) => caches.delete(name))
+          );
+        }
+        localStorage.setItem(key, version);
+      } catch (_) {}
+    })();
+  </script>
+  <script type="module">
+    const ready = window.__RAG_HOME_CACHE_READY__ || Promise.resolve();
+    ready
+      .catch(() => {})
+      .then(() => import("/static/js/home/app.mjs?v=83"))
+      .catch((err) => {
+        console.error("[home.v2] module boot failed:", err);
+        const serveText = document.getElementById("serve-text");
+        const serveDot = document.getElementById("serve-dot");
+        if (serveText) serveText.textContent = "serve · reload";
+        if (serveDot) serveDot.classList.add("crit");
+      });
+  </script>
   <!-- Registra el SW + auto-reload on update. Sin esto, los fixes que
        deployamos al frontend no se propagan: el SW viejo sirve assets
        cacheados y el JS viejo sigue corriendo aunque haya versión
        nueva disponible. -->
-  <script src="/static/pwa/register-sw.js" defer></script>
+  <script src="/static/pwa/register-sw.js?v=83" defer></script>
 </body>
 </html>

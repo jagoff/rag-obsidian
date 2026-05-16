@@ -13,6 +13,9 @@ SQLite DB with `_RAG_STATE_PATH` monkeypatched. Subprocess-touching helper
 """
 from __future__ import annotations
 
+import contextlib
+from datetime import datetime
+import sqlite3
 import subprocess
 
 import pytest
@@ -124,6 +127,75 @@ class TestSignalShape:
             assert s["level"] in ("green", "yellow", "red"), s["level"]
 
 
+class TestSystemHealthOverall:
+    """El headline global debe distinguir gaps de cobertura vs fallas."""
+
+    def _sig(self, lq, key, level, text, raw=1):
+        return lq._signal(
+            key=key, label=key, level=level,
+            value_text=text, value_raw=raw, tooltip=key,
+            explanation=key,
+        )
+
+    def test_insufficient_coverage_does_not_make_overall_yellow(self, lq, monkeypatch):
+        def _retrieval(_column, *, key, **_kwargs):
+            return self._sig(
+                lq, key, "yellow", "Sin suficientes datos todavía", raw=None,
+            )
+
+        monkeypatch.setattr(lq, "_health_retrieval", _retrieval)
+        monkeypatch.setattr(lq, "_health_services",
+                            lambda: self._sig(lq, "services", "green", "OK"))
+        monkeypatch.setattr(lq, "_health_vault_freshness",
+                            lambda: self._sig(lq, "vault_freshness", "green", "OK"))
+        monkeypatch.setattr(lq, "_health_errors_24h",
+                            lambda: self._sig(lq, "errors_24h", "green", "OK"))
+        monkeypatch.setattr(
+            lq, "_health_response_speed",
+            lambda: self._sig(
+                lq, "response_speed", "yellow",
+                "Sin suficientes consultas para medir (n=1)", raw=None,
+            ),
+        )
+
+        out = lq.system_health()
+
+        assert out["level"] == "green"
+        assert out["headline"] == "Todo lo crítico funcionando"
+
+    def test_actionable_yellow_still_makes_overall_yellow(self, lq, monkeypatch):
+        def _retrieval(_column, *, key, **_kwargs):
+            return self._sig(
+                lq, key, "yellow", "Sin suficientes datos todavía", raw=None,
+            )
+
+        monkeypatch.setattr(lq, "_health_retrieval", _retrieval)
+        monkeypatch.setattr(lq, "_health_services",
+                            lambda: self._sig(lq, "services", "green", "OK"))
+        monkeypatch.setattr(lq, "_health_vault_freshness",
+                            lambda: self._sig(lq, "vault_freshness", "green", "OK"))
+        monkeypatch.setattr(lq, "_health_errors_24h",
+                            lambda: self._sig(lq, "errors_24h", "yellow", "1 degraded", raw=0.01))
+        monkeypatch.setattr(
+            lq, "_health_response_speed",
+            lambda: self._sig(
+                lq, "response_speed", "yellow",
+                "Sin suficientes consultas para medir (n=1)", raw=None,
+            ),
+        )
+
+        out = lq.system_health()
+
+        assert out["level"] == "yellow"
+        assert out["headline"] == "Hay algo para vigilar"
+
+    def test_read_failure_is_not_treated_as_coverage_gap(self, lq):
+        s = self._sig(
+            lq, "retrieval_singles", "yellow", "No pude leer la base", raw=None,
+        )
+        assert not lq._is_coverage_gap_signal(s)
+
+
 # ── Services helper (subprocess-mocked) ─────────────────────────────────────
 
 class TestHealthServices:
@@ -225,6 +297,76 @@ class TestHealthServices:
         monkeypatch.setattr(subprocess, "run", _run)
         s = lq._health_services()
         assert s["level"] == "yellow"
+
+
+# ── Response speed helper ──────────────────────────────────────────────────
+
+class TestHealthResponseSpeed:
+    """Tests para `_health_response_speed` sobre DB aislada."""
+
+    def _patch_temp_db(self, tmp_path, monkeypatch):
+        import rag
+
+        db_path = tmp_path / "telemetry.db"
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "CREATE TABLE rag_queries ("
+                "ts TEXT, t_retrieve REAL, t_gen REAL"
+                ")"
+            )
+
+        @contextlib.contextmanager
+        def _conn():
+            conn = sqlite3.connect(db_path)
+            try:
+                yield conn
+            finally:
+                conn.close()
+
+        monkeypatch.setattr(rag, "_ragvec_state_conn", _conn)
+        monkeypatch.setattr(
+            rag,
+            "_sql_read_with_retry",
+            lambda fn, *_args, **_kwargs: fn(),
+        )
+        return db_path
+
+    def test_counts_total_samples_when_p95_bucket_would_be_empty(
+        self, lq, tmp_path, monkeypatch,
+    ):
+        """Regresión: NTILE(100) con 1 row no crea bucket 95; el health
+        decía n=0 aunque había consultas recientes."""
+        db_path = self._patch_temp_db(tmp_path, monkeypatch)
+        now = datetime.now().isoformat(timespec="seconds")
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "INSERT INTO rag_queries(ts, t_retrieve, t_gen) VALUES (?, ?, ?)",
+                (now, 5.0, 4.5),
+            )
+
+        s = lq._health_response_speed()
+
+        assert s["level"] == "yellow"
+        assert s["value_raw"] is None
+        assert "(n=1)" in s["value_text"]
+        assert "n=1 < min=" in s["tooltip"]
+
+    def test_reports_nearest_rank_p95_when_enough_samples(
+        self, lq, tmp_path, monkeypatch,
+    ):
+        db_path = self._patch_temp_db(tmp_path, monkeypatch)
+        now = datetime.now().isoformat(timespec="seconds")
+        with sqlite3.connect(db_path) as conn:
+            conn.executemany(
+                "INSERT INTO rag_queries(ts, t_retrieve, t_gen) VALUES (?, ?, ?)",
+                [(now, float(i), 0.0) for i in range(1, 21)],
+            )
+
+        s = lq._health_response_speed()
+
+        assert s["level"] == "green"
+        assert s["value_raw"] == 19.0
+        assert "n=20" in s["tooltip"]
 
 
 # ── Threshold contract ──────────────────────────────────────────────────────

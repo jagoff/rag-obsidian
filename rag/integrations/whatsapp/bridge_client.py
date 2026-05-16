@@ -56,20 +56,39 @@ def _check_ok(r: httpx.Response) -> dict[str, Any]:
     return {}
 
 
+def _raise_request_error(path: str, exc: httpx.RequestError) -> None:
+    if isinstance(exc, httpx.TimeoutException):
+        raise BridgeError(f"bridge timeout on {path}: {exc}") from exc
+    raise BridgeError(f"bridge unreachable on {path}: {exc}") from exc
+
+
+def _request_json(
+    method: str,
+    path: str,
+    *,
+    json_body: dict[str, Any] | None = None,
+    params: dict[str, Any] | None = None,
+    timeout: httpx.Timeout = _DEFAULT_TIMEOUT,
+) -> dict[str, Any]:
+    try:
+        with httpx.Client(base_url=_bridge_base(), timeout=timeout) as c:
+            return _check_ok(c.request(method, path, json=json_body, params=params))
+    except httpx.RequestError as exc:
+        _raise_request_error(path, exc)
+
+
 # --- Sync API (para handlers FastAPI sync) ---
 
 
 def health() -> dict[str, Any]:
-    with httpx.Client(base_url=_bridge_base(), timeout=_DEFAULT_TIMEOUT) as c:
-        return _check_ok(c.get("/api/health"))
+    return _request_json("GET", "/api/health")
 
 
 def send_text(jid: str, text: str, reply_to: dict[str, Any] | None = None) -> dict[str, Any]:
     body: dict[str, Any] = {"recipient": jid, "message": text}
     if reply_to:
         body["reply_to"] = reply_to
-    with httpx.Client(base_url=_bridge_base(), timeout=_LONG_TIMEOUT) as c:
-        return _check_ok(c.post("/api/send", json=body))
+    return _request_json("POST", "/api/send", json_body=body, timeout=_LONG_TIMEOUT)
 
 
 def send_media(
@@ -87,8 +106,7 @@ def send_media(
         body["message"] = caption
     if reply_to:
         body["reply_to"] = reply_to
-    with httpx.Client(base_url=_bridge_base(), timeout=_LONG_TIMEOUT) as c:
-        return _check_ok(c.post("/api/send", json=body))
+    return _request_json("POST", "/api/send", json_body=body, timeout=_LONG_TIMEOUT)
 
 
 def send_ptt(jid: str, opus_path: str, reply_to: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -108,21 +126,18 @@ def react(
         "from_me": from_me,
         "emoji": emoji,
     }
-    with httpx.Client(base_url=_bridge_base(), timeout=_DEFAULT_TIMEOUT) as c:
-        return _check_ok(c.post("/api/react", json=body))
+    return _request_json("POST", "/api/react", json_body=body)
 
 
 def revoke(jid: str, message_id: str) -> dict[str, Any]:
     body = {"recipient": jid, "message_id": message_id}
-    with httpx.Client(base_url=_bridge_base(), timeout=_DEFAULT_TIMEOUT) as c:
-        return _check_ok(c.post("/api/revoke", json=body))
+    return _request_json("POST", "/api/revoke", json_body=body)
 
 
 def typing(jid: str, state: str) -> dict[str, Any]:
     """Send presence update. State: 'composing', 'recording', 'paused'."""
     body = {"recipient": jid, "state": state}
-    with httpx.Client(base_url=_bridge_base(), timeout=_DEFAULT_TIMEOUT) as c:
-        return _check_ok(c.post("/api/typing", json=body))
+    return _request_json("POST", "/api/typing", json_body=body)
 
 
 def download_media(message_id: str, chat_jid: str) -> dict[str, Any]:
@@ -131,8 +146,7 @@ def download_media(message_id: str, chat_jid: str) -> dict[str, Any]:
     para que el caller los sirva como FileResponse.
     """
     body = {"message_id": message_id, "chat_jid": chat_jid}
-    with httpx.Client(base_url=_bridge_base(), timeout=_LONG_TIMEOUT) as c:
-        return _check_ok(c.post("/api/download", json=body))
+    return _request_json("POST", "/api/download", json_body=body, timeout=_LONG_TIMEOUT)
 
 
 def get_avatar_bytes(jid: str, full: bool = False, refresh: bool = False) -> bytes | None:
@@ -142,8 +156,11 @@ def get_avatar_bytes(jid: str, full: bool = False, refresh: bool = False) -> byt
     params = {"jid": jid, "size": "full" if full else "preview"}
     if refresh:
         params["refresh"] = "1"
-    with httpx.Client(base_url=_bridge_base(), timeout=_LONG_TIMEOUT) as c:
-        r = c.get("/api/avatar", params=params)
+    try:
+        with httpx.Client(base_url=_bridge_base(), timeout=_LONG_TIMEOUT) as c:
+            r = c.get("/api/avatar", params=params)
+    except httpx.RequestError as exc:
+        _raise_request_error("/api/avatar", exc)
     if r.status_code == 404:
         return None
     if r.status_code >= 400:

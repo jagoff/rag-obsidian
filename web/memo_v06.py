@@ -23,10 +23,13 @@ nunca tocamos esos files (read-only).
 
 from __future__ import annotations
 
+import json
+import os
 import sqlite3
 import threading
 import time
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 # Lazy global Memory singleton — el primer endpoint que lo necesite paga
@@ -40,6 +43,47 @@ _mem_instance: Any = None
 # evita recomputar entre clicks del scrubber del frontend.
 _cache: dict[str, tuple[float, Any]] = {}
 _CACHE_TTL = 60.0
+
+
+def _memo_dir() -> Path:
+    override = os.environ.get("MEMO_DATA_DIR")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".local/share/memo"
+
+
+def _graph_db() -> Path:
+    return _memo_dir() / "graph.db"
+
+
+def _history_db() -> Path:
+    return _memo_dir() / "history.db"
+
+
+def _memvec_db() -> Path:
+    return _memo_dir() / "memvec.db"
+
+
+def _open_ro(db: Path) -> sqlite3.Connection | None:
+    if not db.exists():
+        return None
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _parse_tags(raw: Any) -> list[str]:
+    if not raw:
+        return []
+    if isinstance(raw, list):
+        return [str(t) for t in raw][:12]
+    try:
+        loaded = json.loads(raw)
+        if isinstance(loaded, list):
+            return [str(t) for t in loaded][:12]
+    except Exception:
+        pass
+    return []
 
 
 def _get_memory() -> Any:
@@ -204,20 +248,40 @@ def graph(limit_nodes: int = 80, min_count: int = 2,
 
     Falla suave si `graph.db` no existe / está vacío.
     """
-    mem = _get_memory()
-    if (e := _err_if_no_memo(mem)) is not None:
-        return e
-
+    limit_nodes = max(1, min(300, int(limit_nodes or 80)))
+    min_count = max(1, int(min_count or 1))
+    type_filter = (type_filter or "").strip().lower() or None
     cache_key = f"graph:{limit_nodes}:{min_count}:{type_filter or ''}"
 
     def _build():
-        try:
-            graph_store = mem.graph
-            stats = graph_store.stats()
-        except Exception as exc:
-            return {"ok": False, "error": f"graph not available: {exc}"}
+        cx = _open_ro(_graph_db())
+        if cx is None:
+            return {
+                "ok": True,
+                "nodes": [],
+                "edges": [],
+                "stats": {"entities": 0, "links": 0, "memorias": 0},
+                "hint": "graph empty — run `memo extract-entities --all` to populate",
+            }
 
-        if stats.get("entities", 0) == 0:
+        try:
+            stats_row = cx.execute(
+                "SELECT "
+                "  (SELECT COUNT(*) FROM entities) AS entities, "
+                "  (SELECT COUNT(*) FROM entity_memoria) AS links, "
+                "  (SELECT COUNT(DISTINCT memoria_id) FROM entity_memoria) AS memorias"
+            ).fetchone()
+            stats = {
+                "entities": int(stats_row["entities"] or 0) if stats_row else 0,
+                "links": int(stats_row["links"] or 0) if stats_row else 0,
+                "memorias": int(stats_row["memorias"] or 0) if stats_row else 0,
+            }
+        except Exception as exc:
+            cx.close()
+            return {"ok": False, "error": f"graph read failed: {exc}"}
+
+        if stats["entities"] == 0:
+            cx.close()
             return {
                 "ok": True,
                 "nodes": [],
@@ -226,24 +290,46 @@ def graph(limit_nodes: int = 80, min_count: int = 2,
                 "hint": "graph empty — run `memo extract-entities --all` to populate",
             }
 
-        # Top-N entities by mention_count
-        top = graph_store.top_entities(limit=limit_nodes, type_=type_filter)
-        top = [e for e in top if e.get("mention_count", 0) >= min_count]
-        names = {(e["name"], e["type"]) for e in top}
+        params: list[Any] = [min_count]
+        where = "WHERE mention_count >= ?"
+        if type_filter:
+            where += " AND lower(type) = ?"
+            params.append(type_filter)
+        params.append(limit_nodes)
+        try:
+            top = cx.execute(
+                "SELECT id, name, type, mention_count, first_seen, last_seen "
+                f"FROM entities {where} "
+                "ORDER BY mention_count DESC, lower(name) ASC LIMIT ?",
+                params,
+            ).fetchall()
+        except Exception as exc:
+            cx.close()
+            return {"ok": False, "error": f"graph read failed: {exc}"}
 
-        # Mapping (name, type) → idx para edges
-        idx_of: dict[tuple[str, str], int] = {}
+        if not top:
+            cx.close()
+            return {
+                "ok": True,
+                "nodes": [],
+                "edges": [],
+                "stats": stats,
+                "hint": "graph empty for the selected filters",
+            }
+
+        # Mapping entity row id -> frontend node idx para edges.
+        idx_of: dict[int, int] = {}
         nodes = []
         for i, e in enumerate(top):
-            key = (e["name"], e["type"])
-            idx_of[key] = i
+            idx_of[int(e["id"])] = i
             nodes.append({
                 "id": i,
+                "entity_id": int(e["id"]),
                 "name": e["name"],
                 "type": e["type"],
-                "count": e.get("mention_count", 0),
-                "first_seen": e.get("first_seen"),
-                "last_seen": e.get("last_seen"),
+                "count": int(e["mention_count"] or 0),
+                "first_seen": e["first_seen"],
+                "last_seen": e["last_seen"],
             })
 
         # Edges: co-ocurrencia. Por cada memoria que mencione ≥2 entidades
@@ -251,22 +337,25 @@ def graph(limit_nodes: int = 80, min_count: int = 2,
         # Una sola query JOIN: por memoria, listar sus entities.
         # Path: db_path está en mem.graph.db_path
         try:
-            cx = sqlite3.connect(str(graph_store.db_path), timeout=5.0)
-            cx.row_factory = sqlite3.Row
+            placeholders = ",".join("?" for _ in idx_of)
             rows = cx.execute(
-                "SELECT em.memoria_id, e.name, e.type "
-                "FROM entity_memoria em JOIN entities e ON e.id = em.entity_id"
+                "SELECT memoria_id, entity_id "
+                "FROM entity_memoria "
+                f"WHERE entity_id IN ({placeholders})",
+                list(idx_of),
             ).fetchall()
-            cx.close()
         except Exception as exc:
+            cx.close()
             return {"ok": False, "error": f"graph read failed: {exc}"}
+        finally:
+            cx.close()
 
-        by_memoria: dict[str, list[tuple[str, str]]] = {}
+        by_memoria: dict[str, list[int]] = {}
         for r in rows:
-            key = (r["name"], r["type"])
-            if key not in idx_of:
+            entity_id = int(r["entity_id"])
+            if entity_id not in idx_of:
                 continue
-            by_memoria.setdefault(r["memoria_id"], []).append(key)
+            by_memoria.setdefault(r["memoria_id"], []).append(entity_id)
 
         edge_weights: dict[tuple[int, int], int] = {}
         for mid, ents in by_memoria.items():
@@ -304,30 +393,34 @@ def temporal_timeline(days: int = 30) -> dict:
     """Saves / updates / deletes per día sobre los últimos `days`.
     Lee `events` table directo. Cap days=365.
     """
-    mem = _get_memory()
-    if (e := _err_if_no_memo(mem)) is not None:
-        return e
     days = max(1, min(365, int(days)))
     cache_key = f"timeline:{days}"
 
     def _build():
         cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
-        events = mem.history.list_recent(limit=100_000)
         bucket_saves: dict[str, int] = {}
         bucket_updates: dict[str, int] = {}
         bucket_deletes: dict[str, int] = {}
-        for ev in events:
-            ts = ev.get("ts") or ""
-            if ts < cutoff:
-                continue
-            day = ts[:10]
-            op = ev.get("op")
-            if op == "save":
-                bucket_saves[day] = bucket_saves.get(day, 0) + 1
-            elif op == "update":
-                bucket_updates[day] = bucket_updates.get(day, 0) + 1
-            elif op == "delete":
-                bucket_deletes[day] = bucket_deletes.get(day, 0) + 1
+        cx = _open_ro(_history_db())
+        if cx is not None:
+            try:
+                rows = cx.execute(
+                    "SELECT substr(ts, 1, 10) AS day, op, COUNT(*) AS c "
+                    "FROM events WHERE ts >= ? "
+                    "GROUP BY day, op",
+                    (cutoff,),
+                ).fetchall()
+            finally:
+                cx.close()
+            for ev in rows:
+                day = ev["day"]
+                op = ev["op"]
+                if op == "save":
+                    bucket_saves[day] = int(ev["c"] or 0)
+                elif op == "update":
+                    bucket_updates[day] = int(ev["c"] or 0)
+                elif op == "delete":
+                    bucket_deletes[day] = int(ev["c"] or 0)
         # Series ordenadas (relleno días vacíos con 0)
         series: list[dict[str, Any]] = []
         today = datetime.now(UTC).date()
@@ -354,31 +447,47 @@ def temporal_stale(days_threshold: int = 90, limit: int = 30) -> dict:
     a archive/delete. Lee meta directo (más rápido que TemporalAnalyzer
     que también arma access_count que NO está en history.db).
     """
-    mem = _get_memory()
-    if (e := _err_if_no_memo(mem)) is not None:
-        return e
     days_threshold = max(7, min(720, int(days_threshold)))
+    limit = max(1, min(200, int(limit or 30)))
     cache_key = f"stale:{days_threshold}:{limit}"
 
     def _build():
         cutoff = (datetime.now(UTC) - timedelta(days=days_threshold))
         cutoff_iso = cutoff.isoformat()
-        rows = mem.list(limit=10_000)
+        cx = _open_ro(_memvec_db())
+        if cx is None:
+            return {
+                "ok": False,
+                "error": f"memvec.db no encontrado en {_memvec_db()}",
+                "threshold_days": days_threshold,
+                "total_stale": 0,
+                "rows": [],
+            }
+        try:
+            rows = cx.execute(
+                "SELECT id, title, type, tags, updated FROM meta "
+                "WHERE updated < ? ORDER BY updated ASC LIMIT 10000",
+                (cutoff_iso,),
+            ).fetchall()
+        finally:
+            cx.close()
         stale: list[dict[str, Any]] = []
         for r in rows:
-            upd = r.updated or ""
+            upd = r["updated"] or ""
             if upd < cutoff_iso:
                 try:
                     dt = datetime.fromisoformat(upd.replace("Z", "+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=UTC)
                     days_old = (datetime.now(UTC) - dt).days
                 except Exception:
                     days_old = days_threshold
                 stale.append({
-                    "id": r.id[:8],
-                    "id_full": r.id,
-                    "title": r.title,
-                    "type": r.type,
-                    "tags": list(r.tags or []),
+                    "id": r["id"][:8],
+                    "id_full": r["id"],
+                    "title": r["title"],
+                    "type": r["type"],
+                    "tags": _parse_tags(r["tags"]),
                     "updated": upd,
                     "days_old": days_old,
                 })

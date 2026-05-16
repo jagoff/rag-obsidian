@@ -6,6 +6,7 @@ import {
   escapeHTML, fmtTimeAgo,
   isBotOrSelf, parseSenderName,
   obsidianUrl, gmailThreadUrl, whatsappUrl,
+  isReminderDueTomorrow, reminderTitle,
   renderPanelList,
 } from "./core.mjs";
 
@@ -123,10 +124,7 @@ export function renderTomorrow(payload) {
     ? payload.tomorrow_calendar
     : [];
   const signals = payload.signals || {};
-  const reminders = (signals.reminders || []).filter((r) => {
-    const due = (r.due || r.due_at || "").toLowerCase();
-    return due.includes("tomorrow") || due.includes("mañana");
-  });
+  const reminders = (signals.reminders || []).filter(isReminderDueTomorrow);
 
   const rows = [];
   for (const e of events.slice(0, 8)) {
@@ -141,7 +139,7 @@ export function renderTomorrow(payload) {
   }
   for (const r of reminders.slice(0, 3)) {
     rows.push({
-      title: `📌 ${r.title || r.text || ""}`,
+      title: `📌 ${reminderTitle(r)}`,
       meta: [r.list || null].filter(Boolean),
     });
   }

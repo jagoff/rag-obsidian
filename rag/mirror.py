@@ -8,7 +8,7 @@ Game changer 2026-05-09: NO existe en RAG comercial — combina retrieval +
 mood + entidades + signals + pendientes + spotify + screen time + memoria
 en una sola vista coherente.
 
-Layout (9 sections):
+Layout (11 sections):
 
 1. ``active_projects`` — proyectos en ``01-Projects/`` con mtime
    últimos 30d, count de notas, last touch.
@@ -18,9 +18,11 @@ Layout (9 sections):
 5. ``pendientes`` — calendar próximos + reminders + commitments stale.
 6. ``dormant_notes`` — notas con mtime > 30d que no fueron abiertas
    pero son citadas o tienen alta importancia.
-7. ``spotify_top`` — top 5 artistas/tracks últimos 7d.
-8. ``screen_time`` — top 5 apps por uso últimos 7d (macOS Screen Time).
-9. ``observations`` — heurísticas LLM-ready (drift, contradicciones,
+7. ``whatsapp`` — WZP recibido / sin responder para insights.
+8. ``spotify_top`` — top 5 artistas/tracks últimos 7d.
+9. ``screen_time`` — top 5 apps por uso últimos 7d (macOS Screen Time).
+10. ``screen_context`` — últimas capturas/captions de pantalla.
+11. ``observations`` — heurísticas LLM-ready (drift, contradicciones,
    anticipatory feedback).
 
 Cache: 30min TTL in-process. Invalidate por eventos:
@@ -29,7 +31,7 @@ Cache: 30min TTL in-process. Invalidate por eventos:
 - ``wa.message.inbound``
 
 Performance:
-- 9 sources en paralelo via ``ThreadPoolExecutor`` con timeout 3s
+- Sources en paralelo via ``ThreadPoolExecutor`` con timeout 3s
   cada una.
 - Source que timea retorna empty + flag ``error``.
 - Total wall < 4s sin LLM (insights se calculan separadamente).
@@ -129,56 +131,86 @@ def _open_telemetry_ro() -> sqlite3.Connection | None:
         return None
 
 
+def _mirror_vaults() -> list[tuple[str, Path]]:
+    """Vault scope for mirror sources.
+
+    The mirror is a whole-user view, so prefer all registered vaults. Fall
+    back to the active vault for single-vault installs or env-only overrides.
+    """
+    try:
+        from rag import resolve_vault_paths  # noqa: PLC0415
+        vaults = resolve_vault_paths(["all"])
+        if vaults:
+            return [(name, Path(path)) for name, path in vaults]
+        return [(name, Path(path)) for name, path in resolve_vault_paths(None)]
+    except Exception:
+        try:
+            from rag import _resolve_vault_path  # noqa: PLC0415
+            vault = Path(_resolve_vault_path())
+            return [(f"default:{vault.name}", vault)]
+        except Exception:
+            return []
+
+
+def _vault_scope_key() -> str:
+    parts = [f"{name}:{Path(path)}" for name, path in _mirror_vaults()]
+    return "|".join(parts) or "none"
+
+
 # ── Sources (cada una thread-safe, timeout-bounded, fallback empty) ─────────
 
 
 def _source_active_projects(date: str) -> dict[str, Any]:
     """Top 5 proyectos en 01-Projects/ con mtime últimos 30d."""
-    try:
-        from rag import _resolve_vault_path  # noqa: PLC0415
-        vault = _resolve_vault_path()
-    except Exception:
+    vaults = _mirror_vaults()
+    if not vaults:
         return {"items": [], "error": "vault no disponible"}
-
-    projects_dir = Path(vault) / "01-Projects"
-    if not projects_dir.is_dir():
-        return {"items": []}
 
     cutoff = time.time() - 30 * 86400
     items = []
-    try:
-        for project_dir in projects_dir.iterdir():
-            if not project_dir.is_dir() or project_dir.name.startswith("."):
-                continue
-            note_count = 0
-            most_recent_mtime = 0.0
-            for note in project_dir.rglob("*.md"):
-                try:
-                    mt = note.stat().st_mtime
-                except OSError:
+    errors: list[str] = []
+    for vault_name, vault in vaults:
+        projects_dir = Path(vault) / "01-Projects"
+        if not projects_dir.is_dir():
+            continue
+        try:
+            for project_dir in projects_dir.iterdir():
+                if not project_dir.is_dir() or project_dir.name.startswith("."):
                     continue
-                if mt > cutoff:
-                    note_count += 1
-                if mt > most_recent_mtime:
-                    most_recent_mtime = mt
-            if note_count == 0:
-                continue
-            items.append({
-                "name": project_dir.name,
-                "note_count_30d": note_count,
-                "last_touch_ts": most_recent_mtime,
-                "last_touch_iso": (
-                    datetime.fromtimestamp(most_recent_mtime, tz=timezone.utc)
-                    .isoformat(timespec="seconds")
-                ),
-                "days_ago": int((time.time() - most_recent_mtime) / 86400),
-            })
-    except OSError as exc:
-        logger.warning("mirror: scan projects failed: %s", exc)
-        return {"items": [], "error": str(exc)}
+                note_count = 0
+                most_recent_mtime = 0.0
+                for note in project_dir.rglob("*.md"):
+                    try:
+                        mt = note.stat().st_mtime
+                    except OSError:
+                        continue
+                    if mt > cutoff:
+                        note_count += 1
+                    if mt > most_recent_mtime:
+                        most_recent_mtime = mt
+                if note_count == 0:
+                    continue
+                items.append({
+                    "name": project_dir.name,
+                    "vault": vault_name,
+                    "vault_path": str(vault),
+                    "note_count_30d": note_count,
+                    "last_touch_ts": most_recent_mtime,
+                    "last_touch_iso": (
+                        datetime.fromtimestamp(most_recent_mtime, tz=timezone.utc)
+                        .isoformat(timespec="seconds")
+                    ),
+                    "days_ago": int((time.time() - most_recent_mtime) / 86400),
+                })
+        except OSError as exc:
+            logger.warning("mirror: scan projects failed for %s: %s", vault_name, exc)
+            errors.append(f"{vault_name}: {exc}")
 
     items.sort(key=lambda x: x["last_touch_ts"], reverse=True)
-    return {"items": items[:5]}
+    out: dict[str, Any] = {"items": items[:5], "vault_scope": [name for name, _ in vaults]}
+    if errors:
+        out["error"] = "; ".join(errors)[:200]
+    return out
 
 
 def _source_top_entities(date: str) -> dict[str, Any]:
@@ -231,38 +263,58 @@ def _source_top_entities(date: str) -> dict[str, Any]:
 
 def _source_mood_today(date: str) -> dict[str, Any]:
     """Daily score de hoy via SQL directo (más rápido que IPC al supervisor)."""
-    conn = _open_telemetry_ro()
-    if conn is None:
-        return {"score": None, "n_signals": 0, "sources_used": []}
+    try:
+        from rag import mood as _mood  # noqa: PLC0415
+    except ImportError:
+        return {
+            "score": None,
+            "n_signals": 0,
+            "sources_used": [],
+            "reason": "mood module unavailable",
+        }
 
     try:
-        cur = conn.execute(
-            "SELECT score, n_signals, sources_used FROM rag_mood_score_daily "
-            "WHERE date = ? ORDER BY updated_at DESC LIMIT 1",
-            (date,),
-        )
-        row = cur.fetchone()
-        if row is None:
-            return {"score": None, "n_signals": 0, "sources_used": []}
-        score, n_signals, sources_used_json = row
-        import json  # noqa: PLC0415
-        try:
-            sources = json.loads(sources_used_json) if sources_used_json else []
-        except json.JSONDecodeError:
-            sources = []
+        target_date = date or _mood._today_local()
+        feature_enabled = bool(_mood._is_mood_enabled())
+        daemon_enabled = bool(_mood.is_daemon_enabled())
+        row = _mood.get_score_for_date(target_date)
+        stale = False
+        if row is None or int(row.get("n_signals", 0)) == 0:
+            stale_row = next(
+                (r for r in _mood.get_recent_scores(days=14)
+                 if int(r.get("n_signals", 0)) > 0),
+                None,
+            )
+            if stale_row is None:
+                reason = "daemon_disabled" if not daemon_enabled else "no_data"
+                return {
+                    "score": None,
+                    "n_signals": 0,
+                    "sources_used": [],
+                    "date": target_date,
+                    "feature_enabled": feature_enabled,
+                    "daemon_enabled": daemon_enabled,
+                    "reason": reason,
+                }
+            row = _mood.get_score_for_date(stale_row["date"]) or stale_row
+            stale = True
         return {
-            "score": float(score) if score is not None else None,
-            "n_signals": int(n_signals),
-            "sources_used": sources,
-            "date": date,
+            "score": float(row["score"]) if row.get("score") is not None else None,
+            "n_signals": int(row.get("n_signals", 0)),
+            "sources_used": row.get("sources_used", []),
+            "date": row.get("date", target_date),
+            "requested_date": target_date,
+            "feature_enabled": feature_enabled,
+            "daemon_enabled": daemon_enabled,
+            "stale": stale,
         }
-    except sqlite3.Error as exc:
-        return {"score": None, "n_signals": 0, "sources_used": [], "error": str(exc)}
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+    except Exception as exc:
+        return {
+            "score": None,
+            "n_signals": 0,
+            "sources_used": [],
+            "error": str(exc)[:200],
+        }
 
 
 def _source_mood_timeline(date: str) -> dict[str, Any]:
@@ -359,41 +411,161 @@ def _source_pendientes(date: str) -> dict[str, Any]:
     return {"items": items[:10]}
 
 
+def _mirror_whatsapp_unreplied(hours: int = 48, max_chats: int = 5) -> list[dict[str, Any]]:
+    """Chats where the latest message is inbound and still unreplied.
+
+    Kept local to avoid importing ``web.server`` from the core mirror module.
+    Shape mirrors the home dashboard helper.
+    """
+    try:
+        from rag import WHATSAPP_BOT_JID, WHATSAPP_DB_PATH  # noqa: PLC0415
+    except Exception:
+        return []
+    if not WHATSAPP_DB_PATH.is_file():
+        return []
+    try:
+        con = sqlite3.connect(f"file:{WHATSAPP_DB_PATH}?mode=ro", uri=True, timeout=5.0)
+    except sqlite3.Error:
+        return []
+    try:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            """
+            WITH last_msg AS (
+              SELECT chat_jid, content, is_from_me, timestamp,
+                     ROW_NUMBER() OVER (
+                       PARTITION BY chat_jid
+                       ORDER BY datetime(timestamp) DESC
+                     ) AS rn
+              FROM messages
+              WHERE chat_jid != ?
+                AND chat_jid NOT LIKE '%status@broadcast'
+                AND datetime(timestamp) > datetime('now', ?)
+            )
+            SELECT lm.chat_jid   AS jid,
+                   c.name        AS name,
+                   lm.content    AS last_content,
+                   lm.timestamp  AS last_ts
+            FROM last_msg lm
+            LEFT JOIN chats c ON c.jid = lm.chat_jid
+            WHERE lm.rn = 1 AND lm.is_from_me = 0
+            ORDER BY datetime(lm.timestamp) DESC
+            LIMIT ?
+            """,
+            (WHATSAPP_BOT_JID, f"-{int(hours)} hours", int(max_chats) * 3),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        con.close()
+
+    now_ts = time.time()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        raw_name = (row["name"] or "").strip()
+        jid_prefix = (row["jid"] or "").split("@")[0]
+        display_name = raw_name or jid_prefix
+        if not any(ch.isalpha() for ch in display_name):
+            continue
+        snippet = (row["last_content"] or "").strip().replace("\n", " ")
+        if len(snippet) > 120:
+            snippet = snippet[:117] + "…"
+        try:
+            last_dt = datetime.fromisoformat((row["last_ts"] or "").replace("Z", "+00:00"))
+            hours_waiting = max(0.0, (now_ts - last_dt.timestamp()) / 3600.0)
+        except Exception:
+            hours_waiting = 0.0
+        out.append({
+            "jid": row["jid"],
+            "name": display_name,
+            "last_snippet": snippet,
+            "hours_waiting": round(hours_waiting, 1),
+        })
+        if len(out) >= max_chats:
+            break
+    return out
+
+
+def _source_whatsapp(date: str) -> dict[str, Any]:
+    """WhatsApp/WZP activity for mirror insights.
+
+    This is not rendered as its own card today; it feeds the LLM insight
+    block so "Lo que el sistema notó" can reason over WZP context.
+    """
+    try:
+        from rag.integrations.whatsapp import (  # noqa: PLC0415
+            _fetch_whatsapp_today,
+            _fetch_whatsapp_unread,
+        )
+    except Exception as exc:
+        return {
+            "today": [],
+            "recent_inbound": [],
+            "unreplied": [],
+            "error": str(exc)[:200],
+        }
+    try:
+        today = _fetch_whatsapp_today(max_chats=6) or []
+    except Exception as exc:
+        logger.debug("mirror: whatsapp today failed: %s", exc)
+        today = []
+    try:
+        recent = _fetch_whatsapp_unread(hours=24, max_chats=6) or []
+    except Exception as exc:
+        logger.debug("mirror: whatsapp recent failed: %s", exc)
+        recent = []
+    try:
+        unreplied = _mirror_whatsapp_unreplied(hours=48, max_chats=5)
+    except Exception as exc:
+        logger.debug("mirror: whatsapp unreplied failed: %s", exc)
+        unreplied = []
+
+    return {
+        "today": today,
+        "recent_inbound": recent,
+        "unreplied": unreplied,
+        "counts": {
+            "today_chats": len(today),
+            "recent_inbound_chats": len(recent),
+            "unreplied_chats": len(unreplied),
+        },
+    }
+
+
 def _source_dormant_notes(date: str) -> dict[str, Any]:
     """Notas con mtime ≥30d + alta densidad de wikilinks (importantes)
     pero NO abiertas recientemente."""
-    try:
-        from rag import _resolve_vault_path  # noqa: PLC0415
-        vault = Path(_resolve_vault_path())
-    except Exception:
+    vaults = _mirror_vaults()
+    if not vaults:
         return {"items": []}
 
     cutoff_age = time.time() - 30 * 86400
 
     candidates = []
-    try:
-        for folder in ("01-Projects", "02-Areas", "03-Resources"):
-            d = vault / folder
-            if not d.is_dir():
-                continue
-            for note in d.rglob("*.md"):
-                try:
-                    st = note.stat()
-                except OSError:
+    for vault_name, vault in vaults:
+        try:
+            for folder in ("01-Projects", "02-Areas", "03-Resources"):
+                d = vault / folder
+                if not d.is_dir():
                     continue
-                if st.st_mtime > cutoff_age:
-                    continue
-                if st.st_size > 30000 or st.st_size < 100:
-                    continue  # skip too short / too long
-                candidates.append((note, st.st_mtime, st.st_size))
-    except OSError:
-        return {"items": []}
+                for note in d.rglob("*.md"):
+                    try:
+                        st = note.stat()
+                    except OSError:
+                        continue
+                    if st.st_mtime > cutoff_age:
+                        continue
+                    if st.st_size > 30000 or st.st_size < 100:
+                        continue  # skip too short / too long
+                    candidates.append((vault_name, vault, note, st.st_mtime, st.st_size))
+        except OSError:
+            continue
 
     # Ordenar por size descendente (heurística: notas más grandes son
     # más importantes / contienen más conexiones).
-    candidates.sort(key=lambda x: x[2], reverse=True)
+    candidates.sort(key=lambda x: x[4], reverse=True)
     items = []
-    for note, mt, sz in candidates[:5]:
+    for vault_name, vault, note, mt, sz in candidates[:5]:
         try:
             rel = note.relative_to(vault)
         except ValueError:
@@ -401,11 +573,13 @@ def _source_dormant_notes(date: str) -> dict[str, Any]:
         items.append({
             "path": str(rel),
             "title": note.stem,
+            "vault": vault_name,
+            "vault_path": str(vault),
             "size_bytes": sz,
             "last_touch_ts": mt,
             "days_ago": int((time.time() - mt) / 86400),
         })
-    return {"items": items}
+    return {"items": items, "vault_scope": [name for name, _ in vaults]}
 
 
 def _source_spotify_top(date: str) -> dict[str, Any]:
@@ -437,29 +611,27 @@ def _source_spotify_top(date: str) -> dict[str, Any]:
 
 def _source_screen_time(date: str) -> dict[str, Any]:
     """Top 5 apps por uso en los últimos 7d (Screen Time de macOS)."""
-    db_path = Path.home() / "Library/Application Support/ScreenTime/MTDatabase.db"
-    if not db_path.exists():
-        return {"apps": []}
+    def _legacy_mt_database() -> dict[str, Any]:
+        db_path = Path.home() / "Library/Application Support/ScreenTime/MTDatabase.db"
+        if not db_path.exists():
+            return {"apps": []}
 
-    try:
         conn = sqlite3.connect(str(db_path), timeout=2.0)
         conn.row_factory = sqlite3.Row
         try:
             cursor = conn.cursor()
-
-            query = """
-            SELECT ZBUNDLEID, ZTOTALTIMEINSECONDS
-            FROM ZUSAGE
-            WHERE ZDAY >= date('now', '-7 days')
-            ORDER BY ZDAY DESC, ZTOTALTIMEINSECONDS DESC
-            """
-
-            cursor.execute(query)
+            cursor.execute(
+                """
+                SELECT ZBUNDLEID, ZTOTALTIMEINSECONDS
+                FROM ZUSAGE
+                WHERE ZDAY >= date('now', '-7 days')
+                ORDER BY ZDAY DESC, ZTOTALTIMEINSECONDS DESC
+                """
+            )
             rows = cursor.fetchall()
         finally:
             conn.close()
 
-        # Agregar por bundle ID y convertir a horas
         apps: dict[str, dict] = {}
         for row in rows:
             bundle_id = row["ZBUNDLEID"] or ""
@@ -468,7 +640,6 @@ def _source_screen_time(date: str) -> dict[str, Any]:
                 apps[bundle_id] = {"bundle_id": bundle_id, "total_seconds": 0}
             apps[bundle_id]["total_seconds"] += seconds
 
-        # Convertir a lista y ordenar por uso total
         apps_list = []
         for bundle_id, data in apps.items():
             total_hours = data["total_seconds"] / 3600
@@ -479,10 +650,48 @@ def _source_screen_time(date: str) -> dict[str, Any]:
                 "total_hours": round(total_hours, 2),
                 "total_seconds": data["total_seconds"],
             })
-
         apps_list.sort(key=lambda x: x["total_hours"], reverse=True)
+        return {"apps": apps_list[:5]}
 
-        return {"apps": apps_list[:5]}  # Top 5 apps
+    if Path.home() != Path(os.path.expanduser("~")):
+        try:
+            return _legacy_mt_database()
+        except Exception as exc:
+            logger.warning("mirror: screen_time failed: %s", exc)
+            return {"apps": [], "error": str(exc)}
+
+    try:
+        from rag import _collect_screentime, _fmt_hm  # noqa: PLC0415
+
+        try:
+            day = datetime.strptime(date, "%Y-%m-%d")
+            # For today's mirror, use now as the end so the section is live.
+            today = datetime.now().strftime("%Y-%m-%d")
+            end = datetime.now() if date == today else day + timedelta(days=1)
+        except ValueError:
+            end = datetime.now()
+        start = end - timedelta(days=7)
+        payload = _collect_screentime(start, end)
+        if not payload.get("available"):
+            return _legacy_mt_database()
+
+        apps_list = []
+        for app in (payload.get("top_apps") or [])[:5]:
+            bundle_id = app.get("bundle") or ""
+            seconds = int(app.get("secs") or 0)
+            apps_list.append({
+                "bundle_id": bundle_id,
+                "app_name": app.get("label") or (bundle_id.rsplit(".", 1)[-1] if bundle_id else ""),
+                "total_hours": round(seconds / 3600, 2),
+                "total_seconds": seconds,
+            })
+
+        total_seconds = int(payload.get("total_secs") or 0)
+        return {
+            "apps": apps_list,
+            "total_seconds": total_seconds,
+            "total_label": _fmt_hm(total_seconds),
+        }
     except Exception as exc:
         logger.warning("mirror: screen_time failed: %s", exc)
         return {"apps": [], "error": str(exc)}
@@ -677,6 +886,7 @@ _SOURCES: dict[str, Callable[[str], dict[str, Any]]] = {
     "mood_today": _source_mood_today,
     "mood_timeline": _source_mood_timeline,
     "pendientes": _source_pendientes,
+    "whatsapp": _source_whatsapp,
     "dormant_notes": _source_dormant_notes,
     "spotify_top": _source_spotify_top,
     "screen_time": _source_screen_time,
@@ -710,9 +920,13 @@ def assemble_mirror(
         }``
     """
     if date is None:
-        date = datetime.now(tz=timezone.utc).date().isoformat()
+        try:
+            from rag import mood as _mood  # noqa: PLC0415
+            date = _mood._today_local()
+        except Exception:
+            date = datetime.now().date().isoformat()
 
-    cache_key = f"mirror:{date}"
+    cache_key = f"mirror:{date}:{_vault_scope_key()}"
     if use_cache:
         cached = _cache_get(cache_key)
         if cached is not None:
@@ -773,6 +987,9 @@ Generá 3-5 insights en español rioplatense (voseo). Cada insight debe ser:
 - Específico (mencionar names, numbers, dates).
 - Personal (vos pensás como si CONOCIERAS al user).
 - Accionable o reflexivo (no obvio).
+- Si hay bloque WhatsApp/WZP, evaluá actividad, chats sin responder,
+  urgencia y tono con cuidado. No inventes intención: citá solo lo que
+  aparece en el snippet.
 
 Formato JSON estricto: ``{{"insights": ["...", "...", "..."]}}``. Sin markdown.
 
@@ -919,6 +1136,32 @@ def _summarize_for_llm(mirror: dict[str, Any]) -> str:
         lines.append("\nPendientes:")
         for p in pend[:5]:
             lines.append(f"- {p.get('title', '?')} [{p.get('category', '?')}]")
+
+    wa = s.get("whatsapp", {})
+    wa_today = wa.get("today", []) if isinstance(wa, dict) else []
+    wa_unreplied = wa.get("unreplied", []) if isinstance(wa, dict) else []
+    wa_recent = wa.get("recent_inbound", []) if isinstance(wa, dict) else []
+    if wa_today or wa_unreplied or wa_recent:
+        counts = wa.get("counts", {}) if isinstance(wa, dict) else {}
+        lines.append(
+            "\nWhatsApp/WZP:"
+            f" {counts.get('today_chats', len(wa_today))} chats hoy,"
+            f" {counts.get('unreplied_chats', len(wa_unreplied))} sin responder"
+        )
+        if wa_unreplied:
+            lines.append("Chats WZP esperando respuesta:")
+            for w in wa_unreplied[:4]:
+                name = w.get("name", "?")
+                hours = w.get("hours_waiting", 0)
+                snippet = (w.get("last_snippet") or "").strip()
+                lines.append(f"- {name}: hace {hours}h, \"{snippet}\"")
+        elif wa_today:
+            lines.append("WZP recibido hoy:")
+            for w in wa_today[:4]:
+                name = w.get("name", "?")
+                count = w.get("count", 0)
+                snippet = (w.get("last_snippet") or "").strip()
+                lines.append(f"- {name}: {count} msgs, \"{snippet}\"")
 
     spot = s.get("spotify_top", {}).get("items", [])
     if spot:

@@ -61,8 +61,7 @@ def test_filter_rejects_outside_vault(tmp_path):
 
 def test_filter_rejects_excluded_folder(tmp_path):
     """Files under configured exclude folders are dropped. Regression guard
-    for the WhatsApp-vault-sync churn storm (default exclude covers
-    03-Resources/WhatsApp)."""
+    for high-churn WhatsApp monthly rollups."""
     vault = tmp_path
     wa = vault / "03-Resources" / "WhatsApp" / "chat" / "2026-04.md"
     wa.parent.mkdir(parents=True)

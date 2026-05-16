@@ -8,6 +8,7 @@ dependencies = [
     "fastapi>=0.110",
     "uvicorn>=0.27",
     "click>=8.3.2",
+    "apscheduler>=3.10",
     # `ollama>=0.6.1` removido en Ola 8 (2026-05-06): post-cutover MLX,
     # ningún call site runtime importa el paquete. Si necesitás rollback
     # de emergencia (`RAG_LLM_BACKEND=ollama` ya no es soportado, requiere

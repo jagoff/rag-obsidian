@@ -183,12 +183,12 @@ def whisper_vocab_job() -> dict[str, Any]:
 )
 def implicit_feedback_job() -> dict[str, Any]:
     """Equivalente al pipeline shell del plist viejo:
-    ``rag feedback infer-implicit && detect-requery && classify-sessions``.
+    ``rag feedback detect-requery && infer-implicit && classify-sessions``.
 
     Tres sub-comandos en serie. Si el primero falla, los siguientes
     siguen (idempotentes). Schedule: 03:25 daily."""
     results: list[dict[str, Any]] = []
-    for sub in ("infer-implicit", "detect-requery", "classify-sessions"):
+    for sub in ("detect-requery", "infer-implicit", "classify-sessions"):
         r = _run_subprocess(
             [_RAG_BIN, "feedback", sub, "--json"],
             extra_env={"NO_COLOR": "1", "TERM": "dumb"},

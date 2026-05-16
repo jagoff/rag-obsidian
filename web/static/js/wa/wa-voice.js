@@ -20,6 +20,7 @@ let startTs = 0;
 let timerInterval = null;
 let activeJID = null;
 let onSendCallback = null;
+let recordingMimeType = "";
 
 const els = {
   btn: null,
@@ -105,7 +106,12 @@ async function start() {
     return;
   }
   try {
-    mediaRecorder = new MediaRecorder(mediaStream, RECORD_OPTS);
+    if (typeof MediaRecorder.isTypeSupported === "function" &&
+        MediaRecorder.isTypeSupported(RECORD_OPTS.mimeType)) {
+      mediaRecorder = new MediaRecorder(mediaStream, RECORD_OPTS);
+    } else {
+      mediaRecorder = new MediaRecorder(mediaStream);
+    }
   } catch (e) {
     try {
       mediaRecorder = new MediaRecorder(mediaStream);
@@ -116,6 +122,7 @@ async function start() {
       return;
     }
   }
+  recordingMimeType = mediaRecorder.mimeType || "";
   chunks = [];
   mediaRecorder.ondataavailable = (e) => {
     if (e.data && e.data.size > 0) chunks.push(e.data);
@@ -139,6 +146,7 @@ function cancel() {
     mediaRecorder.stop();
   }
   chunks = [];
+  recordingMimeType = "";
   showRecording(false);
   teardownStream();
 }
@@ -172,9 +180,21 @@ async function onStop() {
   teardownStream();
   showRecording(false);
   if (!chunks.length) return;
-  const blob = new Blob(chunks, { type: RECORD_OPTS.mimeType });
+  const blobType = recordingMimeType || chunks.find((c) => c && c.type)?.type || RECORD_OPTS.mimeType;
+  const blob = new Blob(chunks, { type: blobType });
   chunks = [];
+  recordingMimeType = "";
   await openPreview(blob);
+}
+
+function filenameForBlob(blob) {
+  const type = (blob && blob.type || "").toLowerCase();
+  if (type.includes("webm")) return "voice.webm";
+  if (type.includes("mp4") || type.includes("aac")) return "voice.m4a";
+  if (type.includes("ogg") || type.includes("opus")) return "voice.ogg";
+  if (type.includes("mpeg")) return "voice.mp3";
+  if (type.includes("wav")) return "voice.wav";
+  return "voice.audio";
 }
 
 async function openPreview(blob) {
@@ -195,6 +215,7 @@ async function openPreview(blob) {
     </div>
   `;
   document.body.appendChild(modal);
+  const filename = filenameForBlob(blob);
 
   const close = () => {
     try { modal.remove(); } catch {}
@@ -208,7 +229,7 @@ async function openPreview(blob) {
     const fd = new FormData();
     fd.append("jid", activeJID);
     fd.append("transcribe_only", "true");
-    fd.append("audio", blob, "voice.webm");
+    fd.append("audio", blob, filename);
     const r = await fetch("/api/wa/voice", {
       method: "POST",
       credentials: "same-origin",
@@ -245,7 +266,7 @@ async function openPreview(blob) {
       const fd = new FormData();
       fd.append("jid", activeJID);
       fd.append("transcribe_only", "false");
-      fd.append("audio", blob, "voice.webm");
+      fd.append("audio", blob, filename);
       const r = await fetch("/api/wa/voice", {
         method: "POST",
         credentials: "same-origin",

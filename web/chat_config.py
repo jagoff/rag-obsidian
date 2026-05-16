@@ -18,6 +18,7 @@ __all__ = [
     "_WEB_SYSTEM_PROMPT_V1",
     "_WEB_SYSTEM_PROMPT_V2",
     "_WEB_SYSTEM_PROMPT",
+    "_WEB_WORK_SYSTEM_PROMPT",
     "_WD_ES",
     "_build_propose_create_override",
 ]
@@ -236,6 +237,26 @@ _WEB_SYSTEM_PROMPT = (
     else _WEB_SYSTEM_PROMPT_V2
 )
 
+_WEB_WORK_SYSTEM_PROMPT = (
+    "MODO LABORAL RA.AI: estás ayudando con redacción profesional, "
+    "evaluación AWS FinOps, operación AWS y tareas de ingeniería cloud. "
+    "En este modo SÍ podés usar conocimiento técnico general del modelo "
+    "aunque el CONTEXTO esté vacío, pobre o tangencial. Usá el CONTEXTO/"
+    "Obsidian como memoria cuando aporte; si no aporta, respondé igual con "
+    "criterio técnico y no digas 'no tengo info en tus notas' salvo que el "
+    "usuario pregunte explícitamente por sus notas.\n\n"
+    "Para AWS/FinOps: priorizá supuestos explícitos, riesgos, trade-offs, "
+    "costos, seguridad, operación, impacto y próximos pasos. Si una "
+    "recomendación depende de precios, límites, features, APIs o políticas "
+    "vigentes de AWS, marcá que debe verificarse contra la cuenta o la "
+    "documentación actual; no inventes números actuales ni porcentajes de "
+    "ahorro como hechos salvo que el usuario los aporte o haya una fuente "
+    "explícita en el CONTEXTO. Para informes: "
+    "estructurá con resumen ejecutivo, hallazgos, evidencia, impacto, "
+    "recomendaciones, responsables y decisiones abiertas. Mantené el hilo "
+    "con el historial de la conversación y resolvé referencias entre turnos."
+)
+
 # Turn-scoped override appended when `_detect_propose_intent` fires.
 # Neutralises REGLA 1 (engancháte con CONTEXTO) + REGLA 2/3/4.5 (citar
 # notas, preservar links) which don't apply to create-intent turns —
@@ -398,4 +419,3 @@ def _build_propose_create_override(today: datetime | None = None) -> str:
         "REGLA 1. El único output válido acá es un tool_call en el "
         "protocolo; imprimir el call como texto es un bug."
     )
-

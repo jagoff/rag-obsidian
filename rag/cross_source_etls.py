@@ -470,8 +470,9 @@ from rag.integrations.chrome_history import (  # noqa: F401, E402
 )
 
 # ── WhatsApp ETL (re-export) ─────────────────────────────────────────────────
-# Movido a `rag/integrations/whatsapp_etl.py` (2026-05-09). Re-exportado para
-# preservar `from rag.cross_source_etls import _sync_whatsapp_notes`.
+# Movido a `rag/integrations/whatsapp_etl.py` (2026-05-09). Desde 2026-05-16
+# es nativo Python; los aliases `_WHATSAPP_ETL_*` se preservan para imports
+# privados antiguos, pero ya no apuntan a un script externo.
 from rag.integrations.whatsapp_etl import (  # noqa: F401, E402
     _WHATSAPP_ETL_RE,
     _WHATSAPP_ETL_SCRIPT,

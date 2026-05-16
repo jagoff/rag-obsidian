@@ -243,7 +243,7 @@ class TestWriteNote:
         assert "ambient: skip" in body
         assert "date: 2026-04-17" in body
         assert "## 15:30" in body
-        assert "[[03-Resources/WhatsApp/Grupo A/2026-04|Grupo A]]" in body
+        assert "[[99-obsidian/99-AI/external-ingest/WhatsApp/Grupo A/2026-04|Grupo A]]" in body
         assert "- [ ] comprar pan" in body
         assert "- ❓ ¿vas a venir?" in body
         assert "- 📌 mañana te mando el link" in body
@@ -280,7 +280,7 @@ class TestMonthLink:
         link = rag._wa_chat_month_link(
             "A@g.us", "Grupo A", "2026-04-17 15:00:00",
         )
-        assert link == "[[03-Resources/WhatsApp/Grupo A/2026-04|Grupo A]]"
+        assert link == "[[99-obsidian/99-AI/external-ingest/WhatsApp/Grupo A/2026-04|Grupo A]]"
 
     def test_falls_back_to_jid_prefix_when_label_numeric(self):
         link = rag._wa_chat_month_link(

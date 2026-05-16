@@ -108,6 +108,7 @@ function renderActiveProjects(data) {
     el.appendChild(makeRow(
       p.name,
       `${p.note_count_30d} notas · ${fmtRelDays(p.days_ago)}`,
+      p.vault || null,
     ));
   }
 }
@@ -134,7 +135,14 @@ function renderMood(data) {
   clear(el);
   const score = data?.score;
   if (score == null) {
-    el.appendChild(emptyState("sin signal de mood hoy · activá con `rag mood enable`"));
+    const reason = data?.reason;
+    if (reason === "daemon_disabled") {
+      el.appendChild(emptyState("mood desactivado"));
+    } else if (reason === "no_data") {
+      el.appendChild(emptyState("sin señales de mood todavía"));
+    } else {
+      el.appendChild(emptyState("sin data de mood"));
+    }
     return;
   }
   const lineEl = document.createElement("div");
@@ -157,7 +165,8 @@ function renderMood(data) {
     const meta = document.createElement("div");
     meta.className = "sources";
     const sources = (data.sources_used || []).join(", ") || "—";
-    meta.textContent = `${data.n_signals} señales · sources: ${sources}`;
+    const stale = data.stale && data.date ? ` · último score: ${data.date}` : "";
+    meta.textContent = `${data.n_signals} señales · sources: ${sources}${stale}`;
     el.appendChild(meta);
   }
 }
@@ -181,7 +190,7 @@ function renderMoodTimeline(data) {
   clear(el);
   const days = data?.days || [];
   if (!days.length) {
-    el.appendChild(emptyState("sin data histórica · activá `rag mood enable`"));
+    el.appendChild(emptyState("sin data histórica de mood"));
     return;
   }
   const scores = days.map((d) => d.score);
@@ -209,6 +218,7 @@ function renderDormantNotes(data) {
     el.appendChild(makeRow(
       n.title,
       `${fmtRelDays(n.days_ago)} · ${(n.size_bytes / 1024).toFixed(1)}KB`,
+      n.vault || null,
     ));
   }
 }

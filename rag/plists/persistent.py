@@ -195,7 +195,7 @@ def _web_plist(rag_bin: str) -> str:
         f"    <key>YOUTUBE_API_KEY</key><string>{youtube_key}</string>\n"
         if youtube_key else ""
     )
-    chat_model = os.environ.get("OBSIDIAN_RAG_WEB_CHAT_MODEL", "qwen2.5:7b")
+    chat_model = os.environ.get("OBSIDIAN_RAG_WEB_CHAT_MODEL", "qwen3:30b-a3b")
     # 2026-04-28 (eval Playwright MEDIUM #12 — server crashes mid-conversation):
     # `launchctl print` mostraba `runs = 46` en 2h con un mix de SIGKILL by
     # launchd[1] + SIGTERM-then-SIGKILL escalado. Diagnóstico:
@@ -223,6 +223,18 @@ def _web_plist(rag_bin: str) -> str:
             "PYTHONUNBUFFERED": "1",
             "OBSIDIAN_RAG_WEB_CHAT_MODEL": chat_model,
             "RAG_LOCAL_EMBED": "1",
+            "RAG_WEB_LOCAL_EMBED_PREWARM": "0",
+            "RAG_WEB_BLOCK_ON_EMBED_WARMUP": "0",
+            "RAG_LOCAL_EMBED_WAIT_MS": "0",
+            "RAG_LOCAL_EMBED_IDLE_TTL": "300",
+            # Idle baseline: do not pin the 7B MLX chat model or reranker at
+            # boot. First chat/retrieve can lazy-load; RAG_MLX_IDLE_TTL then
+            # frees MLX Metal buffers after ~3min idle.
+            "RAG_MLX_NO_PREWARM": "1",
+            "RAG_MLX_IDLE_TTL": "180",
+            "RAG_WEB_RERANKER_PREWARM": "0",
+            "RAG_RERANKER_REWARM_AFTER_IDLE": "0",
+            "RAG_WEB_FOLLOWUP_AGING_COMPUTE": "0",
             # Removido 2026-05-10 (memory game-changer): RAG_RERANKER_NEVER_UNLOAD=1
             # pineaba el bge-reranker (~2.5 GB MPS fp32) en VRAM forever, ignorando
             # el idle-TTL global. Ahora el reranker se evicta tras

@@ -11972,8 +11972,19 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             )
             _cached = _chat_cache_get(_cache_key)
             if _cached:
-                # ThreadSafeCacheMultiKey.get() returns (ts, payload) tuple
-                _cached_ts, _cached_payload = _cached
+                # ThreadSafeCacheMultiKey.get() returns (ts, payload), but
+                # some tests/legacy monkeypatches still return payload only.
+                if isinstance(_cached, tuple) and len(_cached) == 2:
+                    _cached_ts, _cached_payload = _cached
+                elif isinstance(_cached, dict):
+                    _cached_ts, _cached_payload = time.time(), _cached
+                else:
+                    _cached_ts, _cached_payload = time.time(), None
+                if not isinstance(_cached_payload, dict):
+                    _cached_payload = None
+                if _cached_payload is None:
+                    _cached = None
+            if _cached:
                 # Replay completo como SSE. Status `cached` NO es redundante
                 # aunque el `done` event también lleve `cached: True` — el
                 # UI lo consume en app.js:2346 para mostrar el label "desde
@@ -12024,7 +12035,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     # fix del persist path queda finito, pero saneamos por
                     # las dudas para que el log de cache-hit no cargue un
                     # `-inf` si algún día alguien persiste crudo.
-                    f"confidence={_sanitize_confidence(_cached['top_score']):.3f} variants=0 "
+                    f"confidence={_sanitize_confidence(_cached_payload['top_score']):.3f} variants=0 "
                     f"tool_rounds=0 tool_ms=0 tool_names= cached=1",
                     flush=True,
                 )
@@ -12032,9 +12043,9 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 append_turn(sess, {
                     "q": question,
                     "a": _text,
-                    "paths": [s.get("file", "") for s in _cached["sources_items"]],
-                    "top_score": _cached["top_score"],
-                    "turn_id": new_turn_id(),
+                    "paths": [s.get("file", "") for s in _cached_payload["sources_items"]],
+                    "top_score": _cached_payload["top_score"],
+                    "turn_id": _cached_turn_id,
                 })
                 save_session(sess)
                 return
@@ -12273,7 +12284,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                         except Exception:
                             pass
                         return
-            except ImportError as _sem_exc:
+            except Exception as _sem_exc:
                 print(
                     f"[chat-cache] semantic lookup failed: "
                     f"{type(_sem_exc).__name__}: {_sem_exc}",
@@ -22756,7 +22767,8 @@ def _metrics_background_default() -> bool:
     Override: `RAG_METRICS_ASYNC=0` fuerza sync (útil si se sospecha que
     el daemon worker está saturado).
     """
-    return settings.metrics_async
+    val = os.environ.get("RAG_METRICS_ASYNC", "1").strip().lower()
+    return val not in {"0", "false", "no"}
 
 
 def _persist_with_sqlite_retry(

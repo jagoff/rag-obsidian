@@ -273,12 +273,9 @@ def _cached_entry_is_stale(
       rejected at store time).
     - File exists AND mtime > cached_ts → stale.
     - File exists AND mtime ≤ cached_ts → fresh.
-    - File missing (deleted/renamed) → NO stale. Razón: corpus-level
-      invalidation (chunk_count delta via `_compute_corpus_hash`) ya
-      catchea note deletions a coarser granularidad. Missing files
-      acá son típicamente vault-path mock de tests o relative-path
-      mismatch. Punishing both con blow-the-cache stale-vote crea
-      false negatives.
+    - File missing (deleted/renamed) → stale para paths vault-relative.
+      Un cache hit que cita una nota inexistente es peor que un miss; el
+      corpus_hash por buckets puede tardar en moverse.
     - Unresolvable vault_path / permission error → asume fresh (mismo
       reasoning).
 
@@ -296,19 +293,21 @@ def _cached_entry_is_stale(
         return False
     for p in paths:
         try:
+            p_str = str(p or "")
+            if not p_str or "://" in p_str:
+                continue
             full = vault / p
             full_key = str(full)
             if mtime_cache is not None and full_key in mtime_cache:
                 mt = mtime_cache[full_key]
             else:
                 if not full.exists():
-                    mt = None
-                else:
-                    mt = full.stat().st_mtime
+                    return True
+                mt = full.stat().st_mtime
                 if mtime_cache is not None:
                     mtime_cache[full_key] = mt
             if mt is None:
-                continue
+                return True
             if mt > cached_ts:
                 return True
         except Exception:

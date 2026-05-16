@@ -77,13 +77,17 @@ class TestYtCircuitBreakerCooldown:
         assert isinstance(result, dict)
         assert result["active"] is False
 
-    def test_cooldown_exponential_backoff(self):
+    def test_cooldown_exponential_backoff(self, monkeypatch):
         """Múltiples bloqueos después de cooldown expirado aumentan exponencialmente.
 
         Nota: llamadas a _set_yt_ip_cooldown() dentro del MISMO cooldown window
         son idempotentes — no bumpean retry_count. Necesitamos esperar a que
         expire entre cada llamada para que el exponential backoff funcione.
         """
+        from rag.integrations import youtube as yt_mod
+
+        cooldowns = (0.01, 0.02, 0.03, 0.04)
+        monkeypatch.setattr(yt_mod, "_YT_IP_BLOCKED_COOLDOWNS_SECONDS", cooldowns)
         durations = []
 
         for i in range(4):
@@ -104,11 +108,11 @@ class TestYtCircuitBreakerCooldown:
 
         # Verificar que cada cooldown es aproximadamente el esperado
         # (allow ~1s de tolerancia por timing)
-        assert durations[0] < _YT_IP_BLOCKED_COOLDOWNS_SECONDS[0] + 1
-        assert durations[1] < _YT_IP_BLOCKED_COOLDOWNS_SECONDS[1] + 1
-        assert durations[2] < _YT_IP_BLOCKED_COOLDOWNS_SECONDS[2] + 1
+        assert durations[0] < cooldowns[0] + 1
+        assert durations[1] < cooldowns[1] + 1
+        assert durations[2] < cooldowns[2] + 1
         # El 4to+ se clampea a 24h
-        assert durations[3] < _YT_IP_BLOCKED_COOLDOWNS_SECONDS[3] + 1
+        assert durations[3] < cooldowns[3] + 1
 
 
 class TestYtTranscriptFetchDetectsIpBlocked:

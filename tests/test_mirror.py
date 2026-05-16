@@ -12,8 +12,10 @@ Cubre:
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import tempfile
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,6 +24,11 @@ import pytest
 from rag import mirror as mirror_mod
 from rag.mirror import (
     _SOURCES,
+    _source_active_projects,
+    _source_dormant_notes,
+    _source_mood_today,
+    _source_whatsapp,
+    _summarize_for_llm,
     _source_screen_time,
     assemble_mirror,
     cache_invalidate,
@@ -142,10 +149,141 @@ def test_sources_registry_has_expected_blocks():
     agregados post-Fase 2e Peekaboo."""
     expected = {
         "active_projects", "top_entities", "mood_today", "mood_timeline",
-        "pendientes", "dormant_notes", "spotify_top",
+        "pendientes", "whatsapp", "dormant_notes", "spotify_top",
         "screen_time", "screen_context", "observations",
     }
     assert set(_SOURCES.keys()) == expected
+
+
+def test_source_active_projects_scans_all_registered_vaults(monkeypatch, tmp_path):
+    import rag as _rag
+
+    home = tmp_path / "home"
+    work = tmp_path / "work"
+    (home / "01-Projects" / "Casa").mkdir(parents=True)
+    (work / "01-Projects" / "Trabajo").mkdir(parents=True)
+    (home / "01-Projects" / "Casa" / "a.md").write_text("home", encoding="utf-8")
+    (work / "01-Projects" / "Trabajo" / "b.md").write_text("work", encoding="utf-8")
+    monkeypatch.setattr(
+        _rag,
+        "resolve_vault_paths",
+        lambda names: [("home", home), ("work", work)] if names == ["all"] else [("home", home)],
+    )
+
+    out = _source_active_projects("2026-05-16")
+
+    by_name = {item["name"]: item for item in out["items"]}
+    assert by_name["Casa"]["vault"] == "home"
+    assert by_name["Trabajo"]["vault"] == "work"
+    assert out["vault_scope"] == ["home", "work"]
+
+
+def test_source_dormant_notes_scans_all_registered_vaults(monkeypatch, tmp_path):
+    import rag as _rag
+
+    home = tmp_path / "home"
+    work = tmp_path / "work"
+    home_note = home / "02-Areas" / "home-old.md"
+    work_note = work / "02-Areas" / "work-old.md"
+    home_note.parent.mkdir(parents=True)
+    work_note.parent.mkdir(parents=True)
+    home_note.write_text("home " * 40, encoding="utf-8")
+    work_note.write_text("work " * 40, encoding="utf-8")
+    old = time.time() - 45 * 86400
+    os.utime(home_note, (old, old))
+    os.utime(work_note, (old, old))
+    monkeypatch.setattr(
+        _rag,
+        "resolve_vault_paths",
+        lambda names: [("home", home), ("work", work)] if names == ["all"] else [("home", home)],
+    )
+
+    out = _source_dormant_notes("2026-05-16")
+
+    by_title = {item["title"]: item for item in out["items"]}
+    assert by_title["home-old"]["vault"] == "home"
+    assert by_title["work-old"]["vault"] == "work"
+
+
+def test_source_mood_today_uses_latest_score_when_today_has_no_signal(monkeypatch):
+    from rag import mood as _mood
+
+    def fake_get_score(date):
+        if date == "2026-05-15":
+            return {
+                "date": "2026-05-15",
+                "score": -0.25,
+                "n_signals": 2,
+                "sources_used": ["spotify"],
+                "top_evidence": [],
+                "updated_at": 0,
+            }
+        return None
+
+    monkeypatch.setattr(_mood, "_is_mood_enabled", lambda: True)
+    monkeypatch.setattr(_mood, "is_daemon_enabled", lambda: True)
+    monkeypatch.setattr(_mood, "get_score_for_date", fake_get_score)
+    monkeypatch.setattr(_mood, "get_recent_scores", lambda days=14: [
+        {"date": "2026-05-16", "score": 0.0, "n_signals": 0},
+        {"date": "2026-05-15", "score": -0.25, "n_signals": 2},
+    ])
+
+    out = _source_mood_today("2026-05-16")
+
+    assert out["score"] == -0.25
+    assert out["date"] == "2026-05-15"
+    assert out["requested_date"] == "2026-05-16"
+    assert out["stale"] is True
+
+
+def test_source_whatsapp_collects_today_recent_and_unreplied(monkeypatch):
+    import rag.integrations.whatsapp as _wa
+
+    monkeypatch.setattr(
+        _wa,
+        "_fetch_whatsapp_today",
+        lambda max_chats=6: [{"name": "Grecia", "count": 2, "last_snippet": "vemos eso"}],
+    )
+    monkeypatch.setattr(
+        _wa,
+        "_fetch_whatsapp_unread",
+        lambda hours=24, max_chats=6: [{"name": "Seba", "count": 1, "last_snippet": "ping"}],
+    )
+    monkeypatch.setattr(
+        mirror_mod,
+        "_mirror_whatsapp_unreplied",
+        lambda hours=48, max_chats=5: [
+            {"name": "Joana", "hours_waiting": 7.5, "last_snippet": "me llamás?"}
+        ],
+    )
+
+    out = _source_whatsapp("2026-05-16")
+
+    assert out["counts"] == {
+        "today_chats": 1,
+        "recent_inbound_chats": 1,
+        "unreplied_chats": 1,
+    }
+    assert out["unreplied"][0]["name"] == "Joana"
+
+
+def test_summarize_for_llm_includes_whatsapp_context():
+    summary = _summarize_for_llm({
+        "date": "2026-05-16",
+        "sources": {
+            "whatsapp": {
+                "counts": {"today_chats": 2, "unreplied_chats": 1},
+                "today": [{"name": "Grecia", "count": 2, "last_snippet": "ok"}],
+                "unreplied": [
+                    {"name": "Joana", "hours_waiting": 7.5, "last_snippet": "me llamás?"}
+                ],
+            }
+        },
+    })
+
+    assert "WhatsApp/WZP" in summary
+    assert "Joana" in summary
+    assert "me llamás?" in summary
 
 
 # ── generate_insights ──────────────────────────────────────────────────

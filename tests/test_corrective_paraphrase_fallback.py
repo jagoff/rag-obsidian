@@ -662,3 +662,37 @@ def test_handles_missing_rag_queries_table_silently():
     assert result["n_inferred"] == 0
     assert result["n_skip_no_open"] == 1
     c.close()
+
+
+# ── Quick Win #2: recuperación de paths desde rag_behavior ─────────────────
+
+
+def test_behavior_recovery_increments_n_paths_recovered(conn):
+    """n_paths_recovered sube cuando el feedback no tiene paths_json pero
+    hay un `query_response` en rag_behavior con `paths_json` dentro de la
+    ventana hacia atrás.
+
+    Quick Win #2 (2026-04-29): el listener WA postea el behavior event
+    con las sources justo antes de mostrarle al user la respuesta. El
+    84% de los feedbacks negativos de WA carecían de paths_json propio —
+    esta rama los recupera para que el inferencer pueda trabajar.
+    """
+    _insert_feedback(conn, ts="2026-04-25T18:00:00", paths=[])  # sin paths_json
+
+    # query_response ANTES del feedback con paths en extra_json.
+    conn.execute(
+        "INSERT INTO rag_behavior (ts, source, event, extra_json) "
+        "VALUES (?, 'web', 'query_response', ?)",
+        (
+            "2026-04-25T17:59:50",
+            json.dumps({"session": "web:abc123", "paths_json": ["recovered.md"]}),
+        ),
+    )
+    # Open en otra nota DESPUÉS del feedback → corrective_path distinto de top.
+    _insert_behavior_open(conn, ts="2026-04-25T18:00:15", path="other-note.md")
+
+    result = infer_corrective_paths_from_behavior(conn, dry_run=False)
+
+    assert result["n_paths_recovered"] == 1
+    assert result["n_inferred"] == 1
+    assert result["updates"][0]["corrective_path"] == "other-note.md"

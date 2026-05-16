@@ -10,7 +10,7 @@
 // { "p-inbox": { "w": "full", "h": "full" }, ... }. Si existe, el
 // autosizer respeta el override y no toca data-w/data-h.
 
-const LS_PANEL_SIZES = "home.v2.panel-sizes.v1";
+export const LS_PANEL_SIZES = "home.v2.panel-sizes.v1";
 const RESIZE_DEBOUNCE_MS = 200;
 
 // Altura del .panel-body disponible en un cell de data-h=half:
@@ -64,14 +64,31 @@ function applySize(panel, w, h) {
   if (panel.dataset.h !== h) panel.dataset.h = h;
 }
 
-function resizePanel(panel) {
-  if (!panel || !panel.id) return;
+function isValidSizeOverride(ov) {
+  return (
+    ov &&
+    (ov.w === "half" || ov.w === "full") &&
+    (ov.h === "half" || ov.h === "full" || ov.h === "xl")
+  );
+}
+
+export function applySavedPanelSize(panel) {
+  if (!panel || !panel.id) return false;
   const overrides = readOverrides();
   const ov = overrides[panel.id];
-  if (ov && (ov.w === "half" || ov.w === "full") && (ov.h === "half" || ov.h === "full" || ov.h === "xl")) {
-    applySize(panel, ov.w, ov.h);
-    return;
-  }
+  if (!isValidSizeOverride(ov)) return false;
+  applySize(panel, ov.w, ov.h);
+  return true;
+}
+
+export function hasPanelSizeOverrides() {
+  return Object.entries(readOverrides())
+    .some(([key, ov]) => !!key && isValidSizeOverride(ov));
+}
+
+function resizePanel(panel) {
+  if (!panel || !panel.id) return;
+  if (applySavedPanelSize(panel)) return;
   // Si está hidden, no clasificar (scrollHeight devolvería 0 o stale).
   if (panel.hidden || panel.offsetParent === null) return;
   // Si está collapsed, mantener height=half (el cuerpo está oculto).
@@ -120,6 +137,7 @@ export function observeAllPanels(root = document) {
 // Manual override API — desde DevTools o un botón futuro:
 // window.ragSetPanelSize("p-inbox", "full", "full")
 export function setPanelSize(panelId, w, h) {
+  if (!panelId) return;
   const overrides = readOverrides();
   if (!w && !h) {
     delete overrides[panelId];
@@ -136,7 +154,9 @@ export function setPanelSize(panelId, w, h) {
     console.warn("[home.v2] no pude persistir override de tamaño:", e);
   }
   const panel = document.getElementById(panelId);
-  if (panel) resizePanel(panel);
+  if (panel) {
+    if (!applySavedPanelSize(panel)) resizePanel(panel);
+  }
 }
 
 export function clearPanelSizeOverrides() {

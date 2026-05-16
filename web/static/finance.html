@@ -1473,8 +1473,8 @@
         <span class="kpi-delta neutral">—</span>
         <span class="kpi-badge">datos insuf.</span>
       </div>
-      <div class="kpi" id="kpi-expenses-usd" title="Gastos USD del mes en curso vs mes anterior">
-        <span class="kpi-label">Gastos USD este mes</span>
+      <div class="kpi" id="kpi-expenses-usd" title="Gastos USD detectados; si el mes actual no tiene USD, muestra el último período con gasto">
+        <span class="kpi-label">Gastos USD detectados</span>
         <span class="kpi-value">—</span>
         <span class="kpi-delta neutral">—</span>
         <span class="kpi-badge">datos insuf.</span>
@@ -1632,10 +1632,10 @@
       </div>
     </section>
 
-    <!-- ── 6. TARJETAS DE CRÉDITO (xlsx) ─────────────────────────── -->
+    <!-- ── 6. TARJETAS DE CRÉDITO (xlsx/PDF) ─────────────────────── -->
     <section class="learn-section" id="sec-cards" aria-labelledby="h-cards">
       <header class="learn-section-hdr">
-        <h2 id="h-cards" title="Resúmenes de tarjeta del banco (xlsx)">Tarjeta de crédito</h2>
+        <h2 id="h-cards" title="Resúmenes de tarjeta del banco (xlsx/PDF)">Tarjeta de crédito</h2>
         <p class="muted">Último resumen del banco con detalle de consumos del ciclo</p>
         <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-cards" data-collapse="body-cards">−</button>
       </header>
@@ -1687,7 +1687,7 @@
 
   <span id="finance-status" class="sr-only" role="status" aria-live="polite">Cargando datos del dashboard de finanzas</span>
 
-  <script src="/static/finance.js" defer></script>
+  <script src="/static/finance.js?v=20260516-usd2" defer></script>
   <script type="module" src="/static/js/finance-layout.mjs"></script>
   <script type="module">
     import { initFinanceLayout } from "/static/js/finance-layout.mjs";

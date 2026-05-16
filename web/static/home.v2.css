@@ -89,6 +89,10 @@
 
 * { box-sizing: border-box; }
 
+[hidden] {
+  display: none !important;
+}
+
 html, body {
   margin: 0;
   padding: 0;
@@ -250,7 +254,9 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 
 .cmdbar {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  grid-template-columns: repeat(6, 1fr);
+  grid-auto-rows: 110px;
+  grid-auto-flow: dense;
   gap: var(--space-3);
   margin-bottom: var(--space-5);
 }
@@ -269,6 +275,13 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
   min-height: 110px;
   transition: border-color var(--dur-base) var(--ease-out);
 }
+.cmdbar > .kpi[data-w="half"] { grid-column: span 2; }
+.cmdbar > .kpi[data-w="full"] { grid-column: span 6; }
+.cmdbar > .kpi[data-h="half"] { grid-row: span 1; }
+.cmdbar > .kpi[data-h="full"] { grid-row: span 2; }
+.cmdbar > .kpi[data-h="xl"] { grid-row: span 3; }
+.cmdbar > .kpi:not([data-w]) { grid-column: span 2; }
+.cmdbar > .kpi:not([data-h]) { grid-row: span 1; }
 .kpi:hover { border-color: var(--border-strong); }
 .kpi.is-critical {
   border-color: rgba(255, 94, 94, 0.35);
@@ -310,6 +323,67 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 .kpi .kpi-trend.up    { color: var(--red); }     /* up=más urgente=red */
 .kpi .kpi-trend.down  { color: var(--phosphor); } /* down=mejor=phosphor */
 .kpi .kpi-trend.flat  { color: var(--text-faint); }
+.kpi-layout-controls {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity var(--dur-fast) var(--ease-out);
+}
+.kpi:hover .kpi-layout-controls,
+.kpi:focus-within .kpi-layout-controls,
+.kpi[data-collapsed="true"] .kpi-layout-controls {
+  opacity: 1;
+}
+.kpi-drag-grip {
+  color: var(--text-faint);
+  cursor: grab;
+  font-size: var(--fs-xs);
+  line-height: 1;
+  padding: 3px 2px;
+}
+.kpi-size-btn {
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--bg-elev-2);
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: var(--fs-mini);
+  height: 20px;
+  min-width: 20px;
+  padding: 0 4px;
+}
+.kpi-size-btn:hover,
+.kpi-collapse-btn:hover {
+  border-color: var(--cyan);
+  color: var(--cyan);
+}
+.kpi-collapse-btn {
+  width: 20px;
+  height: 20px;
+  border-radius: 3px;
+}
+.kpi[data-collapsed="true"] {
+  min-height: 44px;
+  justify-content: center;
+}
+.cmdbar > .kpi[data-collapsed="true"] {
+  grid-row: span 1 !important;
+}
+.kpi[data-collapsed="true"] .kpi-value,
+.kpi[data-collapsed="true"] .kpi-meta,
+.kpi[data-collapsed="true"] .kpi-size-btn,
+.kpi[data-collapsed="true"] .panel-resize-handle {
+  display: none;
+}
+.kpi[data-collapsed="true"] .kpi-link {
+  display: flex;
+  align-items: center;
+}
 
 /* ── Sections (accionable / briefs / monitoring / ambiente) ── */
 
@@ -1614,9 +1688,14 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
     padding-bottom: max(var(--space-6), env(safe-area-inset-bottom));
   }
   .cmdbar {
-    grid-template-columns: repeat(2, 1fr);
+    grid-template-columns: 1fr;
+    grid-auto-rows: auto;
     gap: var(--space-2);
   }
+  .cmdbar > .kpi[data-w],
+  .cmdbar > .kpi:not([data-w]) { grid-column: span 1; }
+  .cmdbar > .kpi[data-h],
+  .cmdbar > .kpi:not([data-h]) { grid-row: auto; }
   .kpi { padding: var(--space-2) var(--space-3); min-height: 88px; }
 
   /* En mobile, todas las sections en una sola columna para no comprimir */
@@ -1716,13 +1795,15 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
   transition: opacity var(--dur-fast) var(--ease-out),
               color var(--dur-fast) var(--ease-out);
 }
-.panel:hover .panel-head .drag-grip {
+.panel:hover .panel-head .drag-grip,
+.kpi:hover .kpi-drag-grip {
   opacity: 1;
   color: var(--cyan);
 }
 
 /* Panel siendo arrastrado — fantasmal */
-.panel.is-dragging {
+.panel.is-dragging,
+.kpi.is-dragging {
   opacity: 0.35;
   border-style: dashed;
   border-color: var(--border-focus);
@@ -1730,11 +1811,15 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 
 /* Drop indicator: línea de inserción en before/after del target */
 .panel.drop-before,
-.panel.drop-after {
+.panel.drop-after,
+.kpi.drop-before,
+.kpi.drop-after {
   position: relative;
 }
 .panel.drop-before::before,
-.panel.drop-after::after {
+.panel.drop-after::after,
+.kpi.drop-before::before,
+.kpi.drop-after::after {
   content: "";
   position: absolute;
   background: var(--cyan);
@@ -1743,13 +1828,15 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
   z-index: 5;
 }
 /* Indicador horizontal (single-col / mobile): línea arriba o abajo */
-.panel.drop-before::before {
+.panel.drop-before::before,
+.kpi.drop-before::before {
   left: -4px; right: -4px;
   top: -4px;
   height: 2px;
   border-radius: 1px;
 }
-.panel.drop-after::after {
+.panel.drop-after::after,
+.kpi.drop-after::after {
   left: -4px; right: -4px;
   bottom: -4px;
   height: 2px;
@@ -1760,7 +1847,8 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
    la altura del panel es similar al ancho y la heurística JS (useX)
    pone before/after en horizontal. Esto pinta verticales. */
 @media (min-width: 720px) {
-  .panel.drop-before::before {
+  .panel.drop-before::before,
+  .kpi.drop-before::before {
     top: -4px; bottom: -4px;
     left: -4px;
     width: 2px;
@@ -1768,7 +1856,8 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
     right: auto;
     border-radius: 1px;
   }
-  .panel.drop-after::after {
+  .panel.drop-after::after,
+  .kpi.drop-after::after {
     top: -4px; bottom: -4px;
     right: -4px;
     width: 2px;
@@ -1780,7 +1869,8 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 
 /* Drop zone sobre toda la section-body (cuando el cursor está en un
    espacio libre del grid, fuera de cualquier panel — appendea al final). */
-.section-body.drop-zone {
+.section-body.drop-zone,
+.cmdbar.drop-zone {
   outline: 2px dashed var(--border-focus);
   outline-offset: 4px;
   border-radius: 4px;
@@ -2197,7 +2287,7 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 /* ── Resize handles (drag bordes para snap half/full) ────────────
    3 handles por panel: right edge (W), bottom edge (H), bottom-right
    corner (XY). Invisibles default, visibles en :hover del panel. */
-.panel, .hero-section { position: relative; }
+.panel, .hero-section, .kpi { position: relative; }
 .hero-section .panel-resize-handle { z-index: 5; }
 .hero-section:hover .panel-resize-handle { opacity: 0.6; }
 .hero-section.is-resizing {
@@ -2214,12 +2304,14 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
   transition: opacity var(--dur-fast) var(--ease-out),
               background var(--dur-fast) var(--ease-out);
 }
-.panel:hover .panel-resize-handle { opacity: 0.6; }
+.panel:hover .panel-resize-handle,
+.kpi:hover .panel-resize-handle { opacity: 0.6; }
 .panel-resize-handle:hover {
   opacity: 1 !important;
   background: var(--cyan);
 }
-.panel.is-resizing .panel-resize-handle { opacity: 1; background: var(--cyan); }
+.panel.is-resizing .panel-resize-handle,
+.kpi.is-resizing .panel-resize-handle { opacity: 1; background: var(--cyan); }
 
 /* Right edge — drag horizontal */
 .panel-resize-x {
@@ -2244,7 +2336,8 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
     linear-gradient(135deg, transparent 50%, var(--text-faint) 50%, var(--text-faint) 60%, transparent 60%, transparent 70%, var(--text-faint) 70%, var(--text-faint) 80%, transparent 80%);
   opacity: 0.35;
 }
-.panel:hover .panel-resize-xy { opacity: 0.8; }
+.panel:hover .panel-resize-xy,
+.kpi:hover .panel-resize-xy { opacity: 0.8; }
 .panel-resize-xy:hover {
   opacity: 1 !important;
   background:
@@ -2252,7 +2345,8 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 }
 
 /* Durante resize, prevenir selección de texto + ghost outline cyan */
-.panel.is-resizing {
+.panel.is-resizing,
+.kpi.is-resizing {
   user-select: none;
   outline: 2px dashed var(--cyan);
   outline-offset: -2px;

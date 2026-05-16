@@ -65,13 +65,12 @@ def test_freshness_edited_after_cached_ts(clean_cache_env):
     assert rag._cached_entry_is_stale(["a.md"], cached_ts=past_ts) is True
 
 
-def test_freshness_missing_file_assumes_fresh(clean_cache_env):
-    """File no existe → tratar como fresh (el corpus_hash global ya invalida
-    en removes, no queremos doble-punish)."""
+def test_freshness_missing_file_is_stale(clean_cache_env):
+    """File no existe → stale; no servimos respuestas con citas rotas."""
     # Nunca creamos el archivo.
     assert rag._cached_entry_is_stale(
         ["nope/doesnotexist.md"], cached_ts=time.time(),
-    ) is False
+    ) is True
 
 
 def test_freshness_multi_path_any_stale_wins(clean_cache_env):

@@ -70,8 +70,8 @@ def ollama_unload() -> dict:
 
         mlx_backend = get_backend()
         mlx_loaded = list(getattr(mlx_backend, "_loaded", {}).keys())
-        getattr(mlx_backend, "_loaded", {}).clear()
-        freed.extend(mlx_loaded)
+        if mlx_backend.unload(None):
+            freed.extend(mlx_loaded or ["mlx"])
     except (ImportError, RuntimeError) as exc:
         freed.append(f"mlx_clear (fail: {exc})")
     try:

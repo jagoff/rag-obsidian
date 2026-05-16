@@ -24,12 +24,13 @@ def test_valid_sources_contains_expected():
     # + Phase 2 added safari + drive (Google Docs/Sheets/Slides corpus,
     # commit de03db1 2026-04-23) + 2026-05-05 added `memory` (memo
     # carve-out from `source=vault`, see `_infer_vault_source`)
-    # + 2026-05-07 added `pillow` (PIL image OCR ingester, despacho ad-hoc
-    # ANTES del check VALID_SOURCES en `_run_index_inner`). Anchor test
-    # so future additions don't silently grow the surface.
+    # + 2026-05-07 added `pillow` (sleep tracker, despacho ad-hoc ANTES del
+    # check VALID_SOURCES en `_run_index_inner`) + finances + health.
+    # Anchor test so future additions don't silently grow the surface.
     assert rag.VALID_SOURCES == frozenset(
         {"vault", "memory", "calendar", "gmail", "whatsapp", "reminders",
-         "messages", "contacts", "calls", "safari", "drive", "pillow"}
+         "messages", "contacts", "calls", "safari", "drive", "pillow",
+         "finances", "health"}
     )
 
 
@@ -52,6 +53,8 @@ def test_source_weights_dict_covers_every_valid_source():
     assert rag.SOURCE_WEIGHTS["calls"] == 0.80
     assert rag.SOURCE_WEIGHTS["whatsapp"] == 0.75
     assert rag.SOURCE_WEIGHTS["messages"] == 0.75
+    assert rag.SOURCE_WEIGHTS["finances"] == 0.85
+    assert rag.SOURCE_WEIGHTS["health"] == 0.50
 
 
 def test_recency_halflife_and_retention_keyed_on_every_source():
@@ -60,10 +63,12 @@ def test_recency_halflife_and_retention_keyed_on_every_source():
     # Vault/Calendar opt out of decay; WhatsApp/Messages/Calls have a
     # mid-term halflife. Bumpeado de 30→60 días en audit 2026-04-25
     # R2-Cross-source #5 — 30d era muy agresivo (rev. comentario
-    # SOURCE_RECENCY_HALFLIFE_DAYS en rag/__init__.py para la historia).
+    # SOURCE_RECENCY_HALFLIFE_DAYS en rag/retrieval_scoring.py para la historia).
     assert rag.SOURCE_RECENCY_HALFLIFE_DAYS["vault"] is None
     assert rag.SOURCE_RECENCY_HALFLIFE_DAYS["calendar"] is None
     assert rag.SOURCE_RECENCY_HALFLIFE_DAYS["whatsapp"] == 60.0
+    assert rag.SOURCE_RECENCY_HALFLIFE_DAYS["health"] is None
+    assert rag.SOURCE_RETENTION_DAYS["health"] is None
 
 
 # ── normalize_source ─────────────────────────────────────────────────────────

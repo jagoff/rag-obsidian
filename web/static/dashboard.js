@@ -1430,7 +1430,7 @@ const MEM_THRESHOLDS_MB = {
   "whatsapp-bridge":         [150, 300],
   "whatsapp-listener":       [150, 300],
   "whatsapp-mcp":            [150, 300],
-  "whatsapp-vault-sync":     [150, 300],
+  "mlx-whisper":             [2000, 5000],
 };
 
 const CPU_THRESHOLDS_PCT = {
@@ -1442,7 +1442,7 @@ const CPU_THRESHOLDS_PCT = {
   "whatsapp-bridge":         [15, 40],
   "whatsapp-listener":       [15, 40],
   "whatsapp-mcp":            [15, 40],
-  "whatsapp-vault-sync":     [15, 40],
+  "mlx-whisper":             [60, 160],
 };
 
 function severityFor(thresholds, label, value) {

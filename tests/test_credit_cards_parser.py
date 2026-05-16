@@ -248,7 +248,8 @@ def test_parse_xlsx_missing_file_returns_none(tmp_path):
 @pytest.fixture
 def cards_dir(tmp_path, monkeypatch):
     """Redirige `_FINANCE_BACKUP_DIR` al tmp_path y limpia el cache.
-    Devuelve el dir para que el test caller pueble los xlsx.
+    Devuelve `VISA/` para que el test caller pueble los xlsx en la misma
+    estructura que lee producción.
     """
     import web.server as srv
 
@@ -256,7 +257,9 @@ def cards_dir(tmp_path, monkeypatch):
     # Limpiar cache para no contaminar entre tests.
     srv._CARDS_CACHE["key"] = None
     srv._CARDS_CACHE["payload"] = None
-    return tmp_path
+    visa_dir = tmp_path / "VISA"
+    visa_dir.mkdir()
+    return visa_dir
 
 
 def test_fetch_returns_empty_when_no_xlsx(cards_dir):

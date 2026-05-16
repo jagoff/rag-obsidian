@@ -215,8 +215,8 @@ Conftest autouse fixture `_reset_backend_singleton_per_test` resetea singleton e
 uv tool install --reinstall --editable '.[entities,stt,mlx]'
 
 # Bootstrap (idempotente)
-rag start                                                        # mínimo viable (5: watch/web/daemon-watchdog/wake-hook/maintenance) + RagNet + catch-up
-rag start --full                                                 # los 30 daemons del spec
+rag start                                                        # supervisor/watch/web + RagNet + catch-up incremental safe/no-contradict
+rag start --full                                                 # todo _services_spec; hoy mismo set managed post-supervisor
 rag stop                                                         # frena todo
 rag health                                                       # snapshot unificado
 
@@ -277,7 +277,14 @@ Catálogo completo (47+ vars) en [`docs/env-vars-catalog.md`](docs/env-vars-cata
 - `RAG_INDEX_BATCH_EMBEDS` — gobierna batched embed path en `_run_index_inner` (`_flush_batch`). **MLX-aware default**: cuando `RAG_EMBED_BACKEND=mlx`, default `0` (no-batched). Cuando `=pytorch`, default `1`. Batched path en MLX dispara `[METAL] Command buffer execution failed` reproducible; no-batched anda en 35s para vault de 681 archivos. Override `=1` desaconsejado hasta patch real.
 - `RAG_INDEX_BATCH_SIZE=16` — solo aplica cuando batched ON.
 - `RAG_INDEX_NICE=10` — prioridad CPU nice absoluto (0–20) para el proceso de `rag index`. Default 10 (menor prioridad que normal). `=0` desactiva. Permite que web server y WA listener sigan respondiendo durante reindex.
-- `RAG_INDEX_BATCH_SLEEP_MS=0` — pausa en ms después de cada `_flush_batch()`. Default 0 (velocidad máxima). Ejemplo: `=150` para reindex de background suave (~5 batches/s). No afecta incremental rápido (la mayoría de archivos se saltean por hash).
+- `RAG_INDEX_SAFE=1` — default ON para todo `rag index`: embed slices, shard de notas grandes, memory guard/preflight y abort limpio si swap/pressure cruza umbral. `=0` desactiva todas las guardas (no recomendado).
+- `RAG_INDEX_FULL_SAFE=1` — default ON adicional para `rag index --full`: desactiva synthetic questions + entities en esa corrida, baja batches de embed a slices de 8 y pausa 150ms entre flushes. `=0` re-activa esos enriquecimientos pero mantiene `RAG_INDEX_SAFE`.
+- `RAG_INDEX_EMBED_SLICE_SIZE=16` (safe incremental) / `8` (full safe) — cap externo de textos por llamada a `embed()` dentro del indexer. Evita picos cuando una nota gigante produce muchos chunks/URLs.
+- `RAG_INDEX_FILE_CHUNK_SLICE_SIZE=128` (safe incremental) / `64` (full safe) — shardea una nota grande antes del flush para que un solo archivo no mande miles de chunks a SQLite/embeddings en una unidad.
+- `RAG_INDEX_BATCH_SLEEP_MS=50` (safe incremental) / `150` (full safe) — pausa en ms después de cada `_flush_batch()`. No afecta incremental rápido cuando los archivos se saltean por hash.
+- `RAG_INDEX_ABORT_SELF_RSS_GB=18.0` — límite duro de RSS del proceso `rag index`; si llega ahí, aborta limpio porque en una Mac 36 GB eso ya es pico/fuga patológica.
+- `RAG_START_SAFE=1` — default ON para `rag start`/`rag start --full`: fuerza `RAG_INDEX_SAFE=1` en el catch-up aunque el shell tenga opt-out viejo, corre catch-up con `--no-contradict` y sin context/synthetic/entities durante bootstrap, chequea memory pressure antes de cargar servicios y escalona bootstraps. `=0` desactiva (no recomendado).
+- `RAG_START_ABORT_USED_PCT=92`, `RAG_START_ABORT_SWAP_GB=2.0`, `RAG_START_BOOTSTRAP_STAGGER_S=2` — límites/stagger del safe mode de start.
 
 **Performance + memoria**:
 - `RAG_LLM_KEEP_ALIVE=-1` (default forever). Compat alias `OLLAMA_KEEP_ALIVE` (legacy plists). MLX in-process — no-op pero el value se sigue propagando.

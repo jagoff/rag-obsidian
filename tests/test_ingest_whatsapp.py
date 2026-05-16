@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 import rag
+from rag.integrations import whatsapp_etl as wetl
 from scripts import ingest_whatsapp as iw
 
 
@@ -259,6 +260,110 @@ def test_read_messages_filters_empty_content(tmp_path):
 def test_read_messages_chat_jid_filter(fake_bridge):
     msgs = iw.read_messages(fake_bridge, since_ts=0, chat_jid="ana@s.whatsapp.net")
     assert all(m.chat_jid == "ana@s.whatsapp.net" for m in msgs)
+
+
+# ── Native WhatsApp -> vault ETL ───────────────────────────────────────
+
+def test_sync_whatsapp_notes_writes_monthly_buckets(tmp_path, monkeypatch):
+    db = tmp_path / "messages.db"
+    rows = [
+        (
+            "m1",
+            "ana@s.whatsapp.net",
+            "Ana",
+            "ana",
+            "hola",
+            "2026-05-15T17:30:00",
+            0,
+            None,
+        ),
+        (
+            "m2",
+            "ana@s.whatsapp.net",
+            "Ana",
+            "yo",
+            "todo bien",
+            "2026-05-15T17:31:00",
+            1,
+            None,
+        ),
+        (
+            "g1",
+            "grupo@g.us",
+            "Grupo",
+            "juan",
+            "foto del tablero",
+            "2026-05-16T09:00:00",
+            0,
+            "image",
+        ),
+        (
+            "s1",
+            "status@broadcast",
+            "",
+            "someone",
+            "status msg",
+            "2026-05-16T10:00:00",
+            0,
+            None,
+        ),
+        (
+            "b1",
+            "ana@s.whatsapp.net",
+            "Ana",
+            "bot",
+            "\u200Bbot output",
+            "2026-05-16T11:00:00",
+            1,
+            None,
+        ),
+    ]
+    _mk_bridge_db(db, rows)
+
+    def _resolve_sender(sender: str, fallback: str = "") -> str:
+        if sender in {"", "ana"}:
+            return fallback or sender or "?"
+        return sender
+
+    monkeypatch.setattr(wetl, "DEFAULT_BRIDGE_DB", db)
+    monkeypatch.setattr(iw.rag, "_resolve_sender_to_name", _resolve_sender)
+
+    vault = tmp_path / "vault"
+    stats = wetl._sync_whatsapp_notes(vault)
+
+    assert stats == {
+        "ok": True,
+        "files_written": 2,
+        "files_unchanged": 0,
+        "buckets": 2,
+        "chats": 2,
+        "target": "99-obsidian/99-AI/external-ingest/WhatsApp",
+    }
+    ana_file = vault / "99-obsidian/99-AI/external-ingest/WhatsApp/Ana/2026-05.md"
+    grupo_file = vault / "99-obsidian/99-AI/external-ingest/WhatsApp/Grupo/2026-05.md"
+    ana = ana_file.read_text(encoding="utf-8")
+    grupo = grupo_file.read_text(encoding="utf-8")
+
+    assert 'chat_jid: "ana@s.whatsapp.net"' in ana
+    assert "# WhatsApp - Ana - 2026-05" in ana
+    assert "- 17:30 - Ana: hola" in ana
+    assert "- 17:31 - yo: todo bien" in ana
+    assert "status msg" not in ana
+    assert "bot output" not in ana
+    assert "- 09:00 - juan: [image] foto del tablero" in grupo
+
+    stats_again = wetl._sync_whatsapp_notes(vault)
+    assert stats_again["files_written"] == 0
+    assert stats_again["files_unchanged"] == 2
+
+
+def test_sync_whatsapp_notes_skips_missing_bridge(tmp_path, monkeypatch):
+    monkeypatch.setattr(wetl, "DEFAULT_BRIDGE_DB", tmp_path / "missing.db")
+
+    assert wetl._sync_whatsapp_notes(tmp_path) == {
+        "ok": False,
+        "reason": "bridge_db_missing",
+    }
 
 
 # ── Chunker ────────────────────────────────────────────────────────────

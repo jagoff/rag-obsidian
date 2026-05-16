@@ -96,9 +96,9 @@ async function load(opts = {}) {
   }
 }
 
-// ── DOMContentLoaded ───────────────────────────────────────────────────────────
+// ── Boot ──────────────────────────────────────────────────────────────────────
 
-document.addEventListener("DOMContentLoaded", () => {
+function boot() {
   // Layout (drag/drop, collapse, reset) — ANTES del primer load para que
   // el orden persistido se aplique antes de que los renderers escriban.
   initLayout();
@@ -119,7 +119,13 @@ document.addEventListener("DOMContentLoaded", () => {
   load();
   // Auto-refresh cada 5 min
   startAutoRefresh(load, 5 * 60 * 1000);
-});
+}
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", boot, { once: true });
+} else {
+  boot();
+}
 
 // ── Browser globals requeridos desde HTML inline ───────────────────────────────
 // No hay onclick= en el HTML de home.v2.html según el código actual,

@@ -144,10 +144,11 @@ def test_implicit_feedback_runs_three_subs_in_series(monkeypatch):
 
     monkeypatch.setattr(mod, "_run_subprocess", _fake_run)
     result = mod.implicit_feedback_job()
-    # Debería haber llamado 3 veces (infer-implicit, detect-requery, classify-sessions).
+    # detect-requery debe correr antes de infer-implicit porque escribe
+    # follow_up_query, consumido por corrective_paths.
     assert len(calls) == 3
     subs = [c[2] for c in calls]  # rag_bin, "feedback", <sub>
-    assert subs == ["infer-implicit", "detect-requery", "classify-sessions"]
+    assert subs == ["detect-requery", "infer-implicit", "classify-sessions"]
     assert result["exit_code"] == 0
     assert result["n_subs_ok"] == 3
 

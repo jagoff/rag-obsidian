@@ -183,25 +183,65 @@ export function renderPanelList(panelId, rows, opts = {}) {
 export function setKPI(id, { value, label, meta, tone, trend }) {
   const el = document.getElementById(id);
   if (!el) return;
-  const numeric = Number(value);
-  const isZeroOrEmpty =
-    value == null ||
-    value === "" ||
-    value === "—" ||
-    (Number.isFinite(numeric) && numeric === 0);
-  el.hidden = isZeroOrEmpty;
-  if (isZeroOrEmpty) return;
+  const displayValue = value == null || value === "" || value === "—" ? 0 : value;
+  el.hidden = false;
   el.classList.remove("is-critical", "is-warning", "is-ok");
   if (tone === "critical") el.classList.add("is-critical");
   else if (tone === "warning") el.classList.add("is-warning");
   else if (tone === "ok") el.classList.add("is-ok");
-  el.querySelector("[data-value]").textContent = value;
+  el.querySelector("[data-value]").textContent = displayValue;
   const metaEl = el.querySelector("[data-meta]");
   if (trend) {
     metaEl.innerHTML = `<span class="kpi-trend ${trend.dir}">${trend.text}</span>`;
   } else {
     metaEl.textContent = meta || "";
   }
+}
+
+export function reminderTitle(reminder) {
+  return reminder?.name || reminder?.title || reminder?.text || "(sin título)";
+}
+
+export function reminderDueDate(reminder) {
+  const raw = String(reminder?.due_date || reminder?.due || reminder?.due_at || "").trim();
+  if (!raw) return null;
+  const dateOnly = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (dateOnly) {
+    return new Date(Number(dateOnly[1]), Number(dateOnly[2]) - 1, Number(dateOnly[3]));
+  }
+  const parsed = new Date(raw);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function sameLocalDay(a, b) {
+  return a.getFullYear() === b.getFullYear()
+    && a.getMonth() === b.getMonth()
+    && a.getDate() === b.getDate();
+}
+
+export function isReminderDueToday(reminder, now = new Date()) {
+  const bucket = String(reminder?.bucket || "").toLowerCase();
+  if (bucket === "overdue" || bucket === "today") return true;
+  if (/\btoday\b|\bhoy\b/.test(String(reminder?.due || reminder?.due_at || reminder?.due_date || "").toLowerCase())) {
+    return true;
+  }
+  const due = reminderDueDate(reminder);
+  if (!due) return false;
+  const tomorrow = new Date(now);
+  tomorrow.setHours(0, 0, 0, 0);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  return due < tomorrow;
+}
+
+export function isReminderDueTomorrow(reminder, now = new Date()) {
+  const raw = String(reminder?.due || reminder?.due_at || reminder?.due_date || "").toLowerCase();
+  if (/\btomorrow\b|ma[ñn]ana/.test(raw)) return true;
+  const due = reminderDueDate(reminder);
+  if (!due) return false;
+  const tomorrow = new Date(now);
+  tomorrow.setHours(0, 0, 0, 0);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  return sameLocalDay(due, tomorrow);
 }
 
 // ── Auto-refresh ───────────────────────────────────────────────────────────────

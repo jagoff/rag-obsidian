@@ -32,6 +32,7 @@ try { localStorage.removeItem(SESSION_KEY); } catch {}
 let vaultScope = localStorage.getItem(VAULT_KEY) || "";
 let ttsEnabled = localStorage.getItem(TTS_KEY) === "1";
 let pending = false;
+let pendingChatAttachments = [];
 let currentController = null;      // AbortController for in-flight /api/chat
 // Side-effect fetches (related, followups, contacts popover, etc) que
 // arrancan tras el done event y no están atadas al ciclo principal de
@@ -293,22 +294,23 @@ loadVaults();
 // Chat mode toggle (auto/fast/deep) ---------------------------------
 // Reemplaza el antiguo model-picker. El mode le dice al backend cómo
 // despachar la generación:
-//   · auto:   let adaptive routing decide (default, recomendado)
+//   · work:   full local model + general work/AWS/FinOps behavior (default)
+//   · auto:   let adaptive routing decide
 //   · fast:   fuerza qwen2.5:3b (respuestas literales, ~2s)
-//   · deep:   fuerza qwen2.5:7b (razonamiento, ~8s)
+//   · deep:   fuerza el modelo grande configurado (razonamiento)
 // Persiste en localStorage; se manda como `mode` en el POST /api/chat.
 // El endpoint legacy POST /api/chat/model sigue existiendo como escape
 // hatch para devs (env var OBSIDIAN_RAG_WEB_CHAT_MODEL o override file).
-const CHAT_MODE_KEY = "rag-chat-mode";
-const VALID_MODES = new Set(["auto", "fast", "deep"]);
+const CHAT_MODE_KEY = "rag-chat-mode-v2";
+const VALID_MODES = new Set(["work", "auto", "fast", "deep"]);
 
 function getChatMode() {
   const raw = localStorage.getItem(CHAT_MODE_KEY);
-  return VALID_MODES.has(raw) ? raw : "auto";
+  return VALID_MODES.has(raw) ? raw : "work";
 }
 
 function setChatMode(mode) {
-  if (!VALID_MODES.has(mode)) mode = "auto";
+  if (!VALID_MODES.has(mode)) mode = "work";
   localStorage.setItem(CHAT_MODE_KEY, mode);
   if (!chatModeToggle) return;
   for (const btn of chatModeToggle.querySelectorAll(".chat-mode-btn")) {
@@ -774,10 +776,11 @@ function autoGrow() {
 function updateSendBtnState() {
   if (!sendBtn) return;
   const hasText = input.value.trim().length > 0;
+  const hasAttachment = pendingChatAttachments.length > 0;
   // Si estamos en medio de un stream el send está oculto (stop-btn
   // visible); el disabled no importa en ese caso, pero lo seteamos
   // por prolijidad del estado interno.
-  sendBtn.disabled = !hasText || pending;
+  sendBtn.disabled = (!hasText && !hasAttachment) || pending;
 }
 
 input.addEventListener("input", () => {
@@ -4232,6 +4235,14 @@ let lastTurnId = null;
 // redo_turn_id is set.
 async function send(question, opts = {}) {
   if (pending) return;
+  const attachmentsForTurn = Array.isArray(opts.attachments)
+    ? opts.attachments
+    : pendingChatAttachments.slice();
+  if (!opts._isAutoRetry && attachmentsForTurn.length) {
+    pendingChatAttachments = [];
+    opts = { ...opts, attachments: attachmentsForTurn };
+    updateSendBtnState();
+  }
   // Si había un auto-retry pendiente del turno anterior y el user
   // ya tipeó otra cosa antes que el timer se dispare, cancelarlo —
   // sino vamos a re-enviar la pregunta vieja sobre el contexto nuevo
@@ -4398,12 +4409,15 @@ async function send(question, opts = {}) {
   }
 
   try {
+    const chatMode = getChatMode();
     const reqBody = {
       question,
       session_id: sessionId,
       vault_scope: vaultScope || null,
-      mode: getChatMode(),
+      mode: chatMode,
     };
+    if (attachmentsForTurn.length) reqBody.attachments = attachmentsForTurn;
+    if (chatMode === "work") reqBody.force = true;
     if (opts.redo_turn_id) reqBody.redo_turn_id = opts.redo_turn_id;
     if (opts.hint) reqBody.hint = opts.hint;
     const res = await fetch("/api/chat", {
@@ -4887,7 +4901,9 @@ async function handleSlashCommand(raw) {
   if (cmd === "/cls" || cmd === "/clear") {
     messagesEl.innerHTML = "";
     input.value = "";
+    pendingChatAttachments = [];
     autoGrow();
+    updateSendBtnState();
     input.focus();
     return true;
   }
@@ -4913,7 +4929,9 @@ async function handleSlashCommand(raw) {
     localStorage.removeItem(SESSION_KEY); // legacy cleanup
     messagesEl.innerHTML = "";
     input.value = "";
+    pendingChatAttachments = [];
     autoGrow();
+    updateSendBtnState();
     pushSystemMessage("meta", "nueva sesión — historial en blanco");
     // Refresca la sidebar para que la sesión viejita aparezca en
     // recientes (o desaparezca si quedó vacía). Silent-fail: la
@@ -5094,7 +5112,12 @@ async function handleSlashCommand(raw) {
 
 form.addEventListener("submit", async (e) => {
   e.preventDefault();
-  const q = input.value.trim();
+  let q = input.value.trim();
+  if (!q && pendingChatAttachments.length) {
+    q = pendingChatAttachments.length === 1
+      ? `Analizá el archivo adjunto: ${pendingChatAttachments[0].name || "archivo"}`
+      : `Analizá los ${pendingChatAttachments.length} archivos adjuntos.`;
+  }
   if (!q) return;
   if (q.startsWith("/")) {
     const handled = await handleSlashCommand(q);
@@ -5116,7 +5139,9 @@ const clearView = () => {
   if (currentController) currentController.abort();
   messagesEl.innerHTML = "";
   input.value = "";
+  pendingChatAttachments = [];
   autoGrow();
+  updateSendBtnState();
   input.focus();
 };
 document.querySelectorAll(".topbar-title").forEach((brand) => {
@@ -5744,7 +5769,7 @@ const composerMicBtn = document.getElementById("composer-mic-btn");
 const composerFileInput = document.getElementById("composer-file-input");
 
 // ── Plus button: mini-popover con dos opciones ─────────────────────────
-// "📎 Adjuntar imagen" → trigger del <input type="file"> oculto.
+// "📎 Adjuntar archivo" → trigger del <input type="file"> oculto.
 // "❓ Atajos y comandos" → mismo helpBtn.click() de antes.
 //
 // El popover se construye on-demand (no vive en el HTML) para no
@@ -5826,12 +5851,12 @@ function _openComposerPlusMenu() {
   menu.setAttribute("role", "menu");
   menu.setAttribute("aria-label", "Opciones del composer");
 
-  // Item 1: 📎 Adjuntar imagen
+  // Item 1: 📎 Adjuntar archivo
   const itemAttach = document.createElement("button");
   itemAttach.type = "button";
   itemAttach.className = "composer-plus-menu-item";
   itemAttach.setAttribute("role", "menuitem");
-  itemAttach.innerHTML = '<span class="composer-plus-menu-icon" aria-hidden="true">📎</span><span class="composer-plus-menu-label">Adjuntar imagen</span>';
+  itemAttach.innerHTML = '<span class="composer-plus-menu-icon" aria-hidden="true">📎</span><span class="composer-plus-menu-label">Adjuntar archivo</span>';
   itemAttach.addEventListener("click", () => {
     _closeComposerPlusMenu();
     if (composerFileInput) composerFileInput.click();
@@ -5898,60 +5923,113 @@ if (composerPlusBtn) {
   });
 }
 
-// ── File input change → upload + render ────────────────────────────────
-// Triggered when user selecciona archivo desde el menú "📎 Adjuntar
-// imagen". Crea un mini-card de loading inmediato, postea el archivo
-// a /api/chat/upload-image, y según la respuesta del backend:
+// ── File input / drag-drop → upload + render ────────────────────────────
+// Triggered when user selecciona o arrastra archivos al composer. Crea un
+// mini-card de loading inmediato. Imágenes conservan el flujo OCR/citas
+// existente; documentos van a /api/chat/upload-file y quedan como contexto
+// del próximo mensaje.
 //   action="created"           → reusar appendCreatedChip()
 //   action="needs_confirmation" → reusar appendProposal()
+//   action="attached"          → guardar attachment para el próximo /api/chat
 //   action="noop"              → el card de loading muta a mensaje
 //                                 explicativo (no hay nada agendable)
 if (composerFileInput) {
   composerFileInput.addEventListener("change", async (ev) => {
-    const file = ev.target.files && ev.target.files[0];
-    if (!file) return;
+    const files = ev.target.files ? [...ev.target.files] : [];
+    if (!files.length) return;
     // Reset value para permitir re-seleccionar el mismo archivo después
     // (sin esto, change no dispara la segunda vez con el mismo file).
     ev.target.value = "";
-
-    // Pre-validación client-side de tamaño (12MB = backend limit). Cortamos
-    // antes del upload para no gastar el round-trip si el user agarró un
-    // RAW de 50MB. El backend igual valida — esto es UX, no security.
-    const MAX_SIZE = 12 * 1024 * 1024;
-    if (file.size > MAX_SIZE) {
-      showToast(`✗ Imagen muy grande (${_formatFileSize(file.size)} — max 12MB)`, "err");
-      return;
-    }
-    // Mismo check para tipo: el backend acepta image/*, pero si el OS
-    // dejó pasar otra cosa cortamos acá.
-    if (file.type && !file.type.startsWith("image/")) {
-      showToast(`✗ Solo imágenes (recibí ${file.type})`, "err");
-      return;
-    }
-
-    const uploadCard = createUploadStatusCard(file);
-    appendUploadCard(uploadCard);
-    scrollBottom();
-
-    try {
-      const fd = new FormData();
-      fd.append("file", file);
-      const res = await fetch("/api/chat/upload-image", {
-        method: "POST",
-        body: fd,
-      });
-      if (!res.ok) {
-        const detail = await res.json().catch(() => ({}));
-        throw new Error(detail.detail || `HTTP ${res.status}`);
-      }
-      const data = await res.json();
-      handleUploadResponse(uploadCard, data);
-      scrollBottom();
-    } catch (err) {
-      _renderUploadCardError(uploadCard, err.message || String(err));
-      showToast(`✗ ${err.message || err}`, "err");
-    }
+    await uploadComposerFiles(files);
   });
+}
+
+const composerInputWrap = document.getElementById("input-wrap");
+let _composerDragDepth = 0;
+
+function _dragEventHasFiles(ev) {
+  const types = ev.dataTransfer && ev.dataTransfer.types;
+  if (!types) return false;
+  if (typeof types.includes === "function") return types.includes("Files");
+  if (typeof types.contains === "function") return types.contains("Files");
+  return Array.prototype.includes.call(types, "Files");
+}
+
+if (composerInputWrap) {
+  composerInputWrap.addEventListener("dragenter", (ev) => {
+    if (!_dragEventHasFiles(ev)) return;
+    ev.preventDefault();
+    _composerDragDepth += 1;
+    composerInputWrap.classList.add("drag-over");
+  });
+  composerInputWrap.addEventListener("dragover", (ev) => {
+    if (!_dragEventHasFiles(ev)) return;
+    ev.preventDefault();
+    ev.dataTransfer.dropEffect = "copy";
+  });
+  composerInputWrap.addEventListener("dragleave", (ev) => {
+    if (!_dragEventHasFiles(ev)) return;
+    _composerDragDepth = Math.max(0, _composerDragDepth - 1);
+    if (_composerDragDepth === 0) composerInputWrap.classList.remove("drag-over");
+  });
+  composerInputWrap.addEventListener("drop", async (ev) => {
+    if (!_dragEventHasFiles(ev)) return;
+    ev.preventDefault();
+    _composerDragDepth = 0;
+    composerInputWrap.classList.remove("drag-over");
+    const files = ev.dataTransfer && ev.dataTransfer.files
+      ? [...ev.dataTransfer.files]
+      : [];
+    if (files.length) await uploadComposerFiles(files);
+  });
+}
+
+function _isImageUpload(file) {
+  const type = (file.type || "").toLowerCase();
+  const name = (file.name || "").toLowerCase();
+  return type.startsWith("image/")
+    || /\.(jpe?g|png|heic|heif|webp|gif)$/.test(name);
+}
+
+async function uploadComposerFiles(files) {
+  for (const file of files) {
+    await uploadComposerFile(file);
+  }
+}
+
+async function uploadComposerFile(file) {
+  const isImage = _isImageUpload(file);
+  const maxSize = isImage ? 12 * 1024 * 1024 : 25 * 1024 * 1024;
+  if (file.size > maxSize) {
+    showToast(
+      `✗ Archivo muy grande (${_formatFileSize(file.size)} — max ${_formatFileSize(maxSize)})`,
+      "err",
+    );
+    return;
+  }
+
+  const uploadCard = createUploadStatusCard(file);
+  appendUploadCard(uploadCard);
+  scrollBottom();
+
+  try {
+    const fd = new FormData();
+    fd.append("file", file);
+    const res = await fetch(isImage ? "/api/chat/upload-image" : "/api/chat/upload-file", {
+      method: "POST",
+      body: fd,
+    });
+    if (!res.ok) {
+      const detail = await res.json().catch(() => ({}));
+      throw new Error(detail.detail || `HTTP ${res.status}`);
+    }
+    const data = await res.json();
+    handleUploadResponse(uploadCard, data, file);
+    scrollBottom();
+  } catch (err) {
+    _renderUploadCardError(uploadCard, err.message || String(err));
+    showToast(`✗ ${err.message || err}`, "err");
+  }
 }
 
 // Helper: KB/MB humanos para el card de loading. <1KB → bytes, <1MB → KB,
@@ -5968,21 +6046,34 @@ function _formatFileSize(bytes) {
 // chip/proposal/noop según la response. El thumb usa
 // URL.createObjectURL para preview local sin re-fetch (revocamos el
 // blob URL cuando el card se reemplace o muera, ver _revokeThumbBlob).
+function _fileExtensionLabel(file) {
+  const name = file.name || "";
+  const idx = name.lastIndexOf(".");
+  const ext = idx >= 0 ? name.slice(idx + 1).trim().toUpperCase() : "";
+  return (ext || "FILE").slice(0, 8);
+}
+
 function createUploadStatusCard(file) {
   const card = el("div", "upload-card loading");
   card.setAttribute("role", "status");
   card.setAttribute("aria-live", "polite");
 
-  const thumb = document.createElement("img");
-  thumb.className = "upload-card-thumb";
-  thumb.alt = "Imagen subida";
-  // createObjectURL puede devolver null en navegadores antiguos / sandbox;
-  // si falla, dejamos el thumb vacío con bg gris (CSS).
-  try {
-    thumb.src = URL.createObjectURL(file);
-    card.dataset.thumbBlobUrl = thumb.src;
-  } catch (_) {
-    thumb.style.display = "none";
+  let thumb;
+  if (_isImageUpload(file)) {
+    thumb = document.createElement("img");
+    thumb.className = "upload-card-thumb";
+    thumb.alt = "Imagen subida";
+    // createObjectURL puede devolver null en navegadores antiguos / sandbox;
+    // si falla, dejamos el thumb vacío con bg gris (CSS).
+    try {
+      thumb.src = URL.createObjectURL(file);
+      card.dataset.thumbBlobUrl = thumb.src;
+    } catch (_) {
+      thumb.style.display = "none";
+    }
+  } else {
+    thumb = el("div", "upload-card-thumb upload-card-file-thumb", _fileExtensionLabel(file));
+    thumb.setAttribute("aria-hidden", "true");
   }
   card.appendChild(thumb);
 
@@ -5991,7 +6082,8 @@ function createUploadStatusCard(file) {
   meta.appendChild(name);
   const size = el("div", "upload-card-size", _formatFileSize(file.size));
   meta.appendChild(size);
-  const status = el("div", "upload-card-status", "procesando con OCR…");
+  const statusText = _isImageUpload(file) ? "procesando con OCR…" : "leyendo archivo…";
+  const status = el("div", "upload-card-status", statusText);
   meta.appendChild(status);
   card.appendChild(meta);
 
@@ -6029,7 +6121,41 @@ function _renderUploadCardError(card, msg) {
 // Routing por response.action. Reusa appendCreatedChip y appendProposal
 // (ya existentes) — el card de loading se reemplaza por el output final
 // en el mismo lugar del DOM (parent del card original).
-function handleUploadResponse(uploadCard, data) {
+function _attachmentPayloadFromUpload(data, file) {
+  const att = data && data.attachment ? data.attachment : null;
+  if (att) {
+    return {
+      name: att.name || file.name || "archivo",
+      content_type: att.content_type || file.type || "",
+      size: att.size || file.size || 0,
+      text: att.text || "",
+      path: att.path || "",
+      vault_path: att.vault_path || "",
+      truncated: !!att.truncated,
+    };
+  }
+  if (data && data.ocr_text && String(data.ocr_text).trim()) {
+    return {
+      name: file.name || "imagen",
+      content_type: file.type || "image/*",
+      size: file.size || 0,
+      text: data.ocr_text || "",
+      path: data.image_path || "",
+      vault_path: data.vault_path || "",
+      truncated: false,
+    };
+  }
+  return null;
+}
+
+function _queueChatAttachment(att) {
+  if (!att) return false;
+  pendingChatAttachments.push(att);
+  updateSendBtnState();
+  return true;
+}
+
+function handleUploadResponse(uploadCard, data, file = {}) {
   const parent = uploadCard.parentNode;
   if (!parent) return;
 
@@ -6048,7 +6174,18 @@ function handleUploadResponse(uploadCard, data) {
     // El cleanup se hace al destruir el chat (beforeunload).
   };
 
-  if (data.action === "created") {
+  if (data.action === "attached") {
+    const att = _attachmentPayloadFromUpload(data, file);
+    if (_queueChatAttachment(att)) {
+      finalizeAsThumb(att && att.text ? "→ adjunto listo" : "→ subido sin texto extraíble");
+      showToast("✓ Archivo adjunto al próximo mensaje", "ok");
+    } else {
+      uploadCard.classList.remove("loading");
+      uploadCard.classList.add("noop");
+      const status = uploadCard.querySelector(".upload-card-status");
+      if (status) status.textContent = "Archivo subido, sin contenido utilizable para el chat.";
+    }
+  } else if (data.action === "created") {
     const payload = {
       kind: data.kind,
       fields: data.fields || {},
@@ -6089,6 +6226,14 @@ function handleUploadResponse(uploadCard, data) {
       uploadCard.classList.add("err");
     } else {
       uploadCard.classList.add("noop");
+    }
+    const att = reason.startsWith("already_processed")
+      ? null
+      : _attachmentPayloadFromUpload(data, file);
+    if (_queueChatAttachment(att)) {
+      userMsg = `${userMsg} Quedó adjunta al próximo mensaje.`;
+      uploadCard.classList.remove("noop");
+      uploadCard.classList.add("done");
     }
     uploadCard.classList.remove("loading");
     const status = uploadCard.querySelector(".upload-card-status");

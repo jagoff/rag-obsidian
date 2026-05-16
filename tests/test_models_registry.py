@@ -206,7 +206,7 @@ def test_list_available_chat_categorizes():
     assert "cached" in catalog
     assert "known" in catalog
     # Known list son aliases del subset chat
-    chat_aliases = {"qwen2.5:7b", "qwen2.5:14b", "qwen3:30b-a3b",
+    chat_aliases = {"qwen2.5:7b", "qwen2.5:14b", "qwen3:30b", "qwen3:30b-a3b",
                     "command-r", "command-r:latest"}
     union = set(catalog["cached"]) | set(catalog["known"])
     assert union == chat_aliases

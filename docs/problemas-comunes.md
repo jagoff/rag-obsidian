@@ -139,16 +139,35 @@ launchctl kickstart -k gui/$(id -u)/com.fer.obsidian-rag-watch
 echo $OBSIDIAN_RAG_WATCH_EXCLUDE_FOLDERS
 ```
 
-### `rag index --reset` tarda horas
+### `rag index --full` tarda horas o sube la memoria
 
-**Esperable**. Un reset reconstruye embeddings para todos los chunks del vault. En un vault de ~5000 chunks puede tardar 10-30 minutos (según el modelo y tu Mac).
+**Esperable hasta cierto punto**. Un full reconstruye embeddings para todos los chunks del vault. En un vault de ~5000 chunks puede tardar 10-30 minutos (según el modelo y tu Mac).
 
-**Optimización**: desactivá la extracción de entidades durante el reset para ir más rápido, y corré el backfill después:
+Desde 2026-05-16, todo `rag index` activa safe mode por default: usa batches de embedding chicos, shardea notas grandes, chequea memory pressure antes y durante la corrida, y aborta limpio si la presión persiste. Además, `rag index --full` desactiva synthetic questions + entities en esa corrida. Para correr full con esos enriquecimientos pero manteniendo las guardas base:
 
 ```bash
-RAG_EXTRACT_ENTITIES=0 rag index --reset
+RAG_INDEX_FULL_SAFE=0 rag index --full
+```
+
+Para desactivar también las guardas base existe `RAG_INDEX_SAFE=0`, pero no es recomendable en una Mac que ya se colgó por presión de memoria.
+
+Si querés recuperar entidades después de un full seguro, corré el backfill aislado:
+
+```bash
 python scripts/backfill_entities.py
 ```
+
+### `rag start --full` sube memoria o deja la Mac pesada
+
+`--full` en `rag start` significa "levantar todo el spec de daemons", no "hacer `rag index --full`". Aun así, desde 2026-05-16 `rag start` tiene su propia safe mode: el catch-up incremental fuerza `RAG_INDEX_SAFE=1`, corre sin checks de contradicción y sin context/synthetic/entities durante bootstrap, chequea memory pressure antes de seguir y escalona el bootstrap de servicios.
+
+Si la presión sigue alta, `rag start` prefiere saltear ese tramo y avisar antes que cargar más procesos. El opt-out existe para debug:
+
+```bash
+RAG_START_SAFE=0 rag start --full
+```
+
+No usar ese opt-out en la Mac que ya se colgó por swap/memoria salvo para aislar un bug con monitoreo manual.
 
 ### Hice `rag index` pero `rag query` dice "vault vacío"
 

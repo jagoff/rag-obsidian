@@ -89,6 +89,7 @@ MLX_MODEL_ALIAS: dict[str, str] = {
     # endpoint Ollama-compat (`/ollama/api/chat`) resuelva sin 404.
     "qwen2.5:14b-instruct": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit-DWQ",
     "qwen3:30b-a3b": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit-DWQ",
+    "qwen3:30b": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit-DWQ",
     # Experimental (A/B vs the 3B helper, NOT default until eval CIs OK).
     # DWQ-2510 = revision Oct 2025 con mejor recall en tasks JSON-structured.
     "qwen3:4b": "mlx-community/Qwen3-4B-Instruct-2507-4bit-DWQ-2510",
@@ -415,6 +416,7 @@ class MLXBackend(LLMBackend):
         self._last_used: dict[str, float] = {}
         self._watchdog_thread: threading.Thread | None = None
         self._watchdog_stop = threading.Event()
+        self._watchdog_lock = threading.Lock()
         # Fix #4: sampler cache — same (temp, top_p) reuses the same sampler object
         self._sampler_cache: dict[tuple[float, float], Any] = {}
         # Embedder model cache — separate from chat `_loaded` to avoid eviction
@@ -437,23 +439,24 @@ class MLXBackend(LLMBackend):
             return
         if self._idle_ttl <= 0:
             return
-        if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
-            return
-        # Check 4× per TTL window. Min 60s para no consumir CPU.
-        interval = max(60, self._idle_ttl // 4)
+        with self._watchdog_lock:
+            if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
+                return
+            # Check 4× per TTL window. Min 60s para no consumir CPU.
+            interval = max(60, self._idle_ttl // 4)
 
-        def _loop() -> None:
-            while not self._watchdog_stop.wait(interval):
-                try:
-                    self._evict_idle()
-                except Exception:
-                    # Watchdog NUNCA raises. Silent-fail mantiene proceso vivo.
-                    pass
+            def _loop() -> None:
+                while not self._watchdog_stop.wait(interval):
+                    try:
+                        self._evict_idle()
+                    except Exception:
+                        # Watchdog NUNCA raises. Silent-fail mantiene proceso vivo.
+                        pass
 
-        self._watchdog_thread = threading.Thread(
-            target=_loop, name="mlx-idle-watchdog", daemon=True,
-        )
-        self._watchdog_thread.start()
+            self._watchdog_thread = threading.Thread(
+                target=_loop, name="mlx-idle-watchdog", daemon=True,
+            )
+            self._watchdog_thread.start()
 
     def _evict_idle(self) -> None:
         """Evict resident models cuyo last_used > _idle_ttl segundos ago.
@@ -1078,8 +1081,9 @@ class MLXBackend(LLMBackend):
         """Return a cached make_sampler() result for (temperature, top_p).
 
         The HELPER path always calls with temp=0, top_p=1.0 — the same
-        sampler object is reused across requests (Fix #4). Thread-safe via
-        a dedicated lock separate from `_loaded_lock`.
+        sampler object is reused across requests (Fix #4). No explicit lock:
+        CPython dict ops are GIL-atomic; a first-call race creates at most
+        one extra identical sampler object (benign).
         """
         key = (float(temperature), float(top_p))
         try:

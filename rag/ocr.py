@@ -406,6 +406,36 @@ _VLM_MODEL_OBJ: object | None = None
 _VLM_PROCESSOR: object | None = None
 _VLM_LOCK = threading.Lock()
 _VLM_LAST_USED: float = 0.0
+_vlm_model_missing_warned: set[str] = set()
+
+
+def _vlm_client():
+    """Legacy Ollama-style VLM client hook.
+
+    The current production backend is MLX-VLM, but tests and older operator
+    overrides patch `rag._vlm_client` directly. Returning None keeps the MLX
+    path as the default while preserving that injection point.
+    """
+    return None
+
+
+def _warn_vlm_model_missing_once(exc: Exception) -> None:
+    msg = str(exc).lower()
+    if "not found" not in msg and "pull" not in msg and "missing" not in msg:
+        return
+    import rag as _rag
+    model_id = _rag.VLM_MODEL
+    if model_id in _rag._vlm_model_missing_warned:
+        return
+    _rag._vlm_model_missing_warned.add(model_id)
+    try:
+        import sys as _sys
+        _sys.stderr.write(
+            f"[ocr-vlm] modelo VLM no disponible: {model_id}. "
+            f"Si usás el backend legacy, corré: ollama pull {model_id}\n"
+        )
+    except Exception:
+        pass
 
 
 def _vlm_caption_enabled() -> bool:
@@ -455,7 +485,6 @@ def _vlm_describe(image_path: "str | Path", prompt: str = "") -> str:
     que el chat template de granite (en `tokenizer_config.json`) renderea
     como `<|system|>\\n...\\n<|user|>\\n<image>\\n{prompt}\\n<|assistant|>\\n`.
     """
-    from mlx_vlm import generate as _mlx_generate  # noqa: PLC0415
     # Serializar el forward MLX con el resto del proceso (embedder, chat,
     # helper) vía `_MLX_FORWARD_LOCK`. Sin esto, un caption disparado durante
     # `_flush_batch()` del indexer colisiona Metal command buffers con el
@@ -465,6 +494,25 @@ def _vlm_describe(image_path: "str | Path", prompt: str = "") -> str:
     from rag.llm_backend import _MLX_FORWARD_LOCK  # noqa: PLC0415
     actual_prompt = prompt or _VLM_CAPTION_PROMPT
     try:
+        import rag as _rag
+        legacy_client_factory = getattr(_rag, "_vlm_client", None)
+        if legacy_client_factory is not None:
+            legacy_client = legacy_client_factory()
+            if legacy_client is not None:
+                resp = legacy_client.chat(
+                    model=_rag.VLM_MODEL,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": actual_prompt,
+                            "images": [str(image_path)],
+                        },
+                    ],
+                )
+                msg = getattr(resp, "message", None)
+                content = getattr(msg, "content", None)
+                return (content if content is not None else str(resp)).strip()
+        from mlx_vlm import generate as _mlx_generate  # noqa: PLC0415
         model, processor = _vlm_load()
         messages = [
             {"role": "user", "content": [
@@ -485,6 +533,7 @@ def _vlm_describe(image_path: "str | Path", prompt: str = "") -> str:
         text = out if isinstance(out, str) else getattr(out, "text", str(out))
         return (text or "").strip()
     except Exception as exc:
+        _warn_vlm_model_missing_once(exc)
         if os.environ.get("RAG_DEBUG"):
             import sys as _sys
             _sys.stderr.write(f"[ocr-vlm] caption failed: {exc}\n")

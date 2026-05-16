@@ -283,6 +283,29 @@ def test_feedback_dedups_by_query_text(conn):
     assert data["n_queries"] == 1
 
 
+def test_feedback_dedupe_keeps_strongest_later_signal(conn):
+    _insert_feedback(
+        conn,
+        ts="2026-04-25T18:00:00",
+        q="dup query",
+        rating=1,
+        paths=["wrong.md"],
+    )
+    _insert_feedback(
+        conn,
+        ts="2026-04-25T19:00:00",
+        q="  DUP   query  ",
+        rating=-1,
+        paths=["wrong.md", "right.md"],
+        corrective_path="right.md",
+    )
+
+    data = feedback_to_training_data(conn, replay_features_fn=_fake_replay)
+
+    assert data["n_queries"] == 1
+    assert sorted(data["y"]) == [0, 0, 2]
+
+
 # ── train_lambdarank ────────────────────────────────────────────────────────
 
 def test_train_lambdarank_minimal_e2e(tmp_path: Path):

@@ -1,6 +1,6 @@
-// command-bar.mjs — 4 KPIs prominentes con trend en la command bar superior.
+// command-bar.mjs — KPIs prominentes con trend en la command bar superior.
 
-import { setKPI } from "./core.mjs";
+import { isReminderDueToday, setKPI } from "./core.mjs";
 
 export function renderCmdBar(payload) {
   const inboxToday = payload.today?.evidence?.inbox_today || [];
@@ -17,17 +17,11 @@ export function renderCmdBar(payload) {
           `${inboxCount} pendientes`,
   });
 
-  const remindersDue = reminders.filter((r) => {
-    if (!r.due_date) return true;
-    const due = new Date(r.due_date);
-    const now = new Date();
-    const eod = new Date(now); eod.setHours(23, 59, 59, 999);
-    return due <= eod;
-  }).length;
+  const remindersDue = reminders.filter((r) => isReminderDueToday(r)).length;
   setKPI("kpi-reminders", {
     value: remindersDue,
     tone: remindersDue === 0 ? "ok" : remindersDue > 3 ? "critical" : "warning",
-    meta: remindersDue === 0 ? "tranquilo" :
+    meta: remindersDue === 0 ? "sin reminders para hoy" :
           remindersDue === 1 ? "1 para hoy" :
           `${remindersDue} para hoy`,
   });
@@ -48,10 +42,6 @@ export function renderCmdBar(payload) {
           `${loops.length} loops STALE`,
   });
 
-  // Ocultar la cmdbar entera si todos los KPIs quedaron en 0 (sin items visibles).
   const cmdbar = document.querySelector(".cmdbar");
-  if (cmdbar) {
-    const visibleKpis = cmdbar.querySelectorAll(".kpi:not([hidden])");
-    cmdbar.hidden = visibleKpis.length === 0;
-  }
+  if (cmdbar) cmdbar.hidden = false;
 }

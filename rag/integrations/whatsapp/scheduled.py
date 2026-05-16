@@ -164,6 +164,50 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         pass
 
 
+def _rollback_quietly(conn: sqlite3.Connection) -> None:
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+
+
+def _mark_send_uncertain(
+    conn: sqlite3.Connection,
+    *,
+    scheduled_id: int,
+    now_iso: str,
+    attempt_count: int,
+    error: Exception,
+) -> bool:
+    """Best-effort terminal marker after bridge send succeeded but SQL commit failed."""
+    _rollback_quietly(conn)
+    try:
+        conn.execute(
+            f"UPDATE {_TABLE} SET status = 'send_uncertain', "
+            f"last_error = ?, last_attempt_at = ?, attempt_count = ? "
+            f"WHERE id = ?",
+            (f"finalize_commit_failed: {error!r}", now_iso, attempt_count, scheduled_id),
+        )
+        conn.commit()
+        _log_ambient("whatsapp_scheduled_send_uncertain", {
+            "scheduled_id": scheduled_id,
+            "attempt_count": attempt_count,
+            "error": repr(error),
+        })
+        return True
+    except Exception as mark_exc:
+        logger.exception(
+            "wa_scheduled_send_uncertain_mark_failed id=%s: %r",
+            scheduled_id, mark_exc,
+        )
+        _log_ambient("whatsapp_scheduled_send_uncertain_mark_failed", {
+            "scheduled_id": scheduled_id,
+            "attempt_count": attempt_count,
+            "error": repr(mark_exc),
+        })
+        return False
+
+
 @contextlib.contextmanager
 def _resolve_conn(conn: Optional[sqlite3.Connection]) -> Iterator[sqlite3.Connection]:
     """Reusa `conn` si se pasó, sino abre `_ragvec_state_conn()` (telemetry.db).
@@ -904,8 +948,15 @@ def run_due_worker(
                             "count": recovered,
                             "stale_threshold_minutes": _STALE_PROCESSING_MINUTES,
                         })
-                except Exception:
-                    pass
+                except Exception as recovery_exc:
+                    summary["errors"].append(
+                        f"processing_recovery_failed={recovery_exc!r}"
+                    )
+                    logger.exception(
+                        "wa_scheduled_processing_recovery_failed: %r",
+                        recovery_exc,
+                    )
+                    _rollback_quietly(c)
 
             rows = c.execute(
                 f"SELECT {_SELECT_COLS_SQL} FROM {_TABLE} "
@@ -991,8 +1042,21 @@ def run_due_worker(
                     ).rowcount
                     try:
                         c.commit()
-                    except Exception:
-                        pass
+                    except Exception as commit_exc:
+                        summary["errors"].append(
+                            f"id={sched['id']} acquire_commit_failed={commit_exc!r}"
+                        )
+                        logger.exception(
+                            "wa_scheduled_acquire_commit_failed id=%s: %r",
+                            sched["id"], commit_exc,
+                        )
+                        _log_ambient("whatsapp_scheduled_acquire_commit_failed", {
+                            "scheduled_id": sched["id"],
+                            "jid": sched["jid"],
+                            "error": repr(commit_exc),
+                        })
+                        _rollback_quietly(c)
+                        continue
                     if not acquired:
                         # Otro worker se lo llevó entre nuestro SELECT y
                         # este UPDATE. Skip silencioso — él lo va a finalizar.
@@ -1035,8 +1099,23 @@ def run_due_worker(
                         )
                         try:
                             c.commit()
-                        except Exception:
-                            pass
+                        except Exception as commit_exc:
+                            summary["ok"] = False
+                            summary["errors"].append(
+                                f"id={sched['id']} sent_finalize_commit_failed={commit_exc!r}"
+                            )
+                            logger.exception(
+                                "wa_scheduled_sent_finalize_commit_failed id=%s: %r",
+                                sched["id"], commit_exc,
+                            )
+                            _mark_send_uncertain(
+                                c,
+                                scheduled_id=int(sched["id"]),
+                                now_iso=now_iso,
+                                attempt_count=new_attempts,
+                                error=commit_exc,
+                            )
+                            return summary
                         if target_status == "sent":
                             summary["sent"] += 1
                             _log_ambient("whatsapp_scheduled_sent", {
@@ -1079,8 +1158,17 @@ def run_due_worker(
                             )
                             try:
                                 c.commit()
-                            except Exception:
-                                pass
+                            except Exception as commit_exc:
+                                summary["ok"] = False
+                                summary["errors"].append(
+                                    f"id={sched['id']} failed_finalize_commit_failed={commit_exc!r}"
+                                )
+                                logger.exception(
+                                    "wa_scheduled_failed_finalize_commit_failed id=%s: %r",
+                                    sched["id"], commit_exc,
+                                )
+                                _rollback_quietly(c)
+                                return summary
                             summary["failed"] += 1
                             _log_ambient("whatsapp_scheduled_failed", {
                                 "scheduled_id": sched["id"],
@@ -1110,8 +1198,17 @@ def run_due_worker(
                             )
                             try:
                                 c.commit()
-                            except Exception:
-                                pass
+                            except Exception as commit_exc:
+                                summary["ok"] = False
+                                summary["errors"].append(
+                                    f"id={sched['id']} retry_finalize_commit_failed={commit_exc!r}"
+                                )
+                                logger.exception(
+                                    "wa_scheduled_retry_finalize_commit_failed id=%s: %r",
+                                    sched["id"], commit_exc,
+                                )
+                                _rollback_quietly(c)
+                                return summary
                             summary["retried"] += 1
                             _log_ambient("whatsapp_scheduled_retry", {
                                 "scheduled_id": sched["id"],

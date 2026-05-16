@@ -104,8 +104,13 @@ def _make_semantic_hit(response="cached response",
 
 
 @pytest.fixture
-def chat_env(monkeypatch):
+def chat_env(monkeypatch, tmp_path):
     """Monkeypatches compartidos. Default: LRU miss + pipeline-friendly retrieve."""
+    vault = tmp_path / "vault"
+    (vault / "02-Areas").mkdir(parents=True)
+    for i in range(2):
+        (vault / "02-Areas" / f"note{i}.md").write_text(f"note {i}")
+    monkeypatch.setattr(server_mod, "VAULT_PATH", vault)
     monkeypatch.setattr(
         server_mod, "multi_retrieve",
         lambda *a, **kw: _canned_retrieve(confidence=0.5),

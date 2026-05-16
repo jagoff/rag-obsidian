@@ -264,6 +264,11 @@ def test_parse_applescript_date_english_locale():
     assert dt == datetime(2026, 4, 14, 9, 30, 0)
 
 
+def test_parse_applescript_date_english_day_first_locale():
+    dt = rag._parse_applescript_date("Tuesday, 19 May 2026 at 12:00:00\u202fAM")
+    assert dt == datetime(2026, 5, 19, 0, 0, 0)
+
+
 def test_parse_applescript_date_returns_none_on_garbage():
     assert rag._parse_applescript_date("not a date") is None
     assert rag._parse_applescript_date("") is None

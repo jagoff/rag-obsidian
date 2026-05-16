@@ -161,6 +161,45 @@ def test_web_plist_has_rag_local_embed():
     assert d["EnvironmentVariables"].get("RAG_LOCAL_EMBED") == "1"
 
 
+def test_web_plist_lazy_loads_local_embedder():
+    """Web should not pin the query embedder before the first search."""
+    d = _parse(rag_module._web_plist(RAG_BIN))
+    env = d["EnvironmentVariables"]
+    assert env.get("RAG_WEB_LOCAL_EMBED_PREWARM") == "0"
+    assert env.get("RAG_WEB_BLOCK_ON_EMBED_WARMUP") == "0"
+    assert env.get("RAG_LOCAL_EMBED_WAIT_MS") == "0"
+    assert env.get("RAG_LOCAL_EMBED_IDLE_TTL") == "300"
+
+
+def test_web_plist_disables_mlx_boot_prewarm():
+    """Idle web startup must not pin the 7B MLX chat model in Metal memory."""
+    d = _parse(rag_module._web_plist(RAG_BIN))
+    env = d["EnvironmentVariables"]
+    assert env.get("RAG_MLX_NO_PREWARM") == "1"
+
+
+def test_web_plist_has_short_mlx_idle_ttl():
+    """Resident MLX models should be evicted promptly after chat idle."""
+    d = _parse(rag_module._web_plist(RAG_BIN))
+    env = d["EnvironmentVariables"]
+    assert env.get("RAG_MLX_IDLE_TTL") == "180"
+
+
+def test_web_plist_disables_reranker_eager_rewarm():
+    """Reranker should not reload itself after idle-unload by default."""
+    d = _parse(rag_module._web_plist(RAG_BIN))
+    env = d["EnvironmentVariables"]
+    assert env.get("RAG_WEB_RERANKER_PREWARM") == "0"
+    assert env.get("RAG_RERANKER_REWARM_AFTER_IDLE") == "0"
+
+
+def test_web_plist_disables_followup_aging_compute():
+    """Home dashboard should not pin the chat model via followup-aging by default."""
+    d = _parse(rag_module._web_plist(RAG_BIN))
+    env = d["EnvironmentVariables"]
+    assert env.get("RAG_WEB_FOLLOWUP_AGING_COMPUTE") == "0"
+
+
 def test_web_plist_has_rag_reranker_never_unload():
     # 2026-05-10: RAG_RERANKER_NEVER_UNLOAD=1 fue removido del web plist porque
     # el memory watchdog maneja el unload dinámicamente (ya no se pinea siempre).

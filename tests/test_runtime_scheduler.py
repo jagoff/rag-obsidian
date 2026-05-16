@@ -80,7 +80,8 @@ def test_run_now_returns_ok_for_clean_handler():
     assert result["ok"] is True
     assert result["error"] is None
     assert result["result"] == {"value": 1}
-    assert result["duration_s"] >= 0
+    assert isinstance(result["duration_s"], float)
+    assert result["duration_s"] > 0
     assert counter["n"] == 1
 
 
@@ -92,6 +93,25 @@ def test_run_now_captures_exception():
     result = Scheduler.global_instance().run_now("bad_job")
     assert result["ok"] is False
     assert "boom" in (result["error"] or "")
+
+
+def test_run_now_honors_handler_exit_code_payload():
+    sched = Scheduler(headless=True)
+    sched.register_job(Job(
+        label="subprocess_job",
+        handler=lambda: {"exit_code": 2, "last_stderr": "boom"},
+        trigger_kind="cron",
+        trigger_args={"hour": 3},
+    ))
+
+    result = sched.run_now("subprocess_job")
+    job = sched.get_job("subprocess_job")
+
+    assert result["ok"] is False
+    assert result["error"] == "boom"
+    assert job is not None
+    assert job.last_exit_code == 2
+    assert job.fails_count == 1
 
 
 def test_run_now_unknown_job():

@@ -133,8 +133,8 @@ def _persist_inbound_promise_if_match(jid: str, content: str, msg_id: str | None
                  due_iso, due_conf, msg_id, jid),
             )
             conn.commit()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("wa promise persist failed: %s", exc)
 
 # Estado de módulo (un solo poller por proceso).
 _subscribers: list[asyncio.Queue] = []

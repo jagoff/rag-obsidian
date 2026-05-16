@@ -15186,6 +15186,25 @@ def retrieve(
         except ImportError as _llm_judge_exc:
             _silent_log("llm_judge.outer", _llm_judge_exc)
 
+    rerank_raw_scores = [float(s) for s in scores]
+    _raw_score_by_candidate_id = {
+        id(c): raw_s for c, raw_s in zip(candidates, rerank_raw_scores)
+    }
+    # Per-source calibration (Feature #2, 2026-04-23). Aplicada antes del
+    # scoring/sort final para que pueda cambiar el ordering cross-source.
+    # Guardamos `rerank_raw_scores` aparte porque algunos gates legacy (WA
+    # fast-path) siguen usando el score crudo pre-calibration.
+    if _SCORE_CALIBRATION_ENABLED:
+        scores = [
+            calibrate_score(
+                (c[1] or {}).get("source") if isinstance(c[1], dict) else None,
+                raw_s,
+            )
+            for c, raw_s in zip(candidates, rerank_raw_scores)
+        ]
+    else:
+        scores = rerank_raw_scores
+
     # Capturar el comienzo del score-loop block (scoring + recency + tag +
     # title_match + PPR + behavior priors). Este rango es el gap más
     # grande entre rerank_ms y graph_expand_ms según producción 2026-04-24:
@@ -15299,6 +15318,15 @@ def retrieve(
     # típicas. Cero cambio funcional.
     _pr_map_hoist = ppr_score if ppr_score else pagerank
     _max_pr_hoist = max(_pr_map_hoist.values()) if _pr_map_hoist else 1.0
+    # Hoist loop-invariant exact-title computations (perf audit 2026-05-16).
+    try:
+        _q_tok_count_exact = len(_tokenize_for_title_match(question))
+    except Exception:
+        _q_tok_count_exact = 0
+    try:
+        _exact_bonus_cfg = float(os.environ.get("RAG_TITLE_EXACT_BONUS", "0.5"))
+    except ValueError:
+        _exact_bonus_cfg = 0.5
     final_pairs: list[tuple] = []
     for c, e, s in zip(candidates, expanded, scores):
         meta = c[1] if isinstance(c[1], dict) else {}
@@ -15356,19 +15384,8 @@ def retrieve(
                 # solo (0.265 max) no puede cerrar. Override:
                 # `RAG_TITLE_EXACT_BONUS=0` desactiva.
                 if _tm >= 0.999:
-                    try:
-                        _q_tok_count = len(_tokenize_for_title_match(question))
-                    except Exception:
-                        _q_tok_count = 0
-                    if 1 <= _q_tok_count <= 4:
-                        try:
-                            _exact_bonus = float(os.environ.get(
-                                "RAG_TITLE_EXACT_BONUS", "0.5"
-                            ))
-                        except ValueError:
-                            _exact_bonus = 0.5
-                        if _exact_bonus > 0:
-                            final += _exact_bonus
+                    if 1 <= _q_tok_count_exact <= 4 and _exact_bonus_cfg > 0:
+                        final += _exact_bonus_cfg
         # Graph PageRank: notes with more inbound wikilinks are more
         # authoritative. Score is normalised [0,1] via rank/max_rank.
         # Feature #6: if personalized PPR was computed for this query,
@@ -15682,25 +15699,13 @@ def retrieve(
     # these already went through BM25+sem merge + cross-encoder rerank, so
     # they're better-quality neighbors than a fresh sem search would give.
     extras_pairs = scored_all[k:]
-    raw_scores = [s for _, _, s in scored]
+    final_scores = [s for _, _, s in scored]
+    raw_scores = [
+        float(_raw_score_by_candidate_id.get(id(c), s))
+        for c, _, s in scored
+    ]
     docs = [e for _, e, _ in scored]
     metas = [c[1] for c, _, _ in scored]
-    # Per-source calibration (Feature #2, 2026-04-23). When
-    # RAG_SCORE_CALIBRATION=1 and models exist for each source, maps raw
-    # cross-encoder scores into [0,1] so thresholds + ordering are uniform.
-    # No-op when flag OFF or no calibration trained yet — returns raw_scores
-    # unchanged element-wise. Isotonic is monotonic per source, so ordering
-    # within a source is preserved; across sources, calibration lets us
-    # compare WA 0.05 (matched) against vault 1.1 (matched) meaningfully.
-    if _SCORE_CALIBRATION_ENABLED:
-        final_scores = [
-            calibrate_score(
-                (m or {}).get("source") if isinstance(m, dict) else None, s
-            )
-            for m, s in zip(metas, raw_scores)
-        ]
-    else:
-        final_scores = raw_scores
     top_score = final_scores[0] if final_scores else float("-inf")
     extras: list[tuple[str, dict]] = [(e, c[1]) for c, e, _ in extras_pairs]
 
@@ -15867,6 +15872,9 @@ def retrieve(
                     docs[evict_slot] = swap_e
                     metas[evict_slot] = swap_meta
                     final_scores[evict_slot] = _swap_s
+                    raw_scores[evict_slot] = float(
+                        _raw_score_by_candidate_id.get(id(swap_c), _swap_s)
+                    )
                     new_rank = evict_slot + 1  # 1-indexed
                     log_behavior_event({
                         "source": "cli",
@@ -22682,6 +22690,10 @@ def _do_index(reset: bool, no_contradict: bool, source_opt: str | None,
     asume que `VAULT_PATH` + `COLLECTION_NAME` ya apuntan al vault target."""
     if source_opt:
         src = source_opt.strip().lower()
+
+        def _raise_ingest_error(summary: dict) -> None:
+            raise click.ClickException(str(summary.get("error") or "ingest failed"))
+
         # `pillow` se despacha ANTES del check de VALID_SOURCES porque NO
         # escribe al corpus vectorial — su ingester escribe a
         # `rag_sleep_sessions` (telemetry) y mantiene a pillow fuera de
@@ -22764,8 +22776,7 @@ def _do_index(reset: bool, no_contradict: bool, source_opt: str | None,
                 dry_run=bool(dry_run),
             )
             if "error" in summary:
-                console.print(f"[red]✗[/red] {summary['error']}")
-                return
+                _raise_ingest_error(summary)
             console.print(_fmt_ingest_summary(
                 "whatsapp",
                 total=summary["messages_read"],
@@ -22781,8 +22792,7 @@ def _do_index(reset: bool, no_contradict: bool, source_opt: str | None,
                 dry_run=bool(dry_run),
             )
             if "error" in summary:
-                console.print(f"[red]✗[/red] {summary['error']}")
-                return
+                _raise_ingest_error(summary)
             # Calendar doesn't expose a corpus total — omit it; show
             # events added + cancelled as delta/deletion.
             console.print(_fmt_ingest_summary(
@@ -22801,8 +22811,7 @@ def _do_index(reset: bool, no_contradict: bool, source_opt: str | None,
                 dry_run=bool(dry_run),
             )
             if "error" in summary:
-                console.print(f"[red]✗[/red] {summary['error']}")
-                return
+                _raise_ingest_error(summary)
             console.print(_fmt_ingest_summary(
                 "gmail",
                 indexed=summary["threads_indexed"],
@@ -22819,8 +22828,7 @@ def _do_index(reset: bool, no_contradict: bool, source_opt: str | None,
                 dry_run=bool(dry_run),
             )
             if "error" in summary:
-                console.print(f"[red]✗[/red] {summary['error']}")
-                return
+                _raise_ingest_error(summary)
             console.print(_fmt_ingest_summary(
                 "drive",
                 total=summary["files_seen"],
@@ -22838,8 +22846,7 @@ def _do_index(reset: bool, no_contradict: bool, source_opt: str | None,
             from rag.integrations.finances import ingest as _ingest_finances
             summary = _ingest_finances()
             if summary.get("error"):
-                console.print(f"[red]✗[/red] {summary['error']}")
-                return
+                _raise_ingest_error(summary)
             console.print(_fmt_ingest_summary(
                 "finances",
                 total=summary["files_scanned"],
@@ -22856,8 +22863,7 @@ def _do_index(reset: bool, no_contradict: bool, source_opt: str | None,
                 dry_run=bool(dry_run),
             )
             if "error" in summary:
-                console.print(f"[red]✗[/red] {summary['error']}")
-                return
+                _raise_ingest_error(summary)
             console.print(_fmt_ingest_summary(
                 "reminders",
                 total=summary["reminders_fetched"],
@@ -22874,8 +22880,7 @@ def _do_index(reset: bool, no_contradict: bool, source_opt: str | None,
                 dry_run=bool(dry_run),
             )
             if "error" in summary:
-                console.print(f"[red]✗[/red] {summary['error']}")
-                return
+                _raise_ingest_error(summary)
             console.print(_fmt_ingest_summary(
                 "contacts",
                 total=summary["contacts_fetched"],
@@ -22893,8 +22898,7 @@ def _do_index(reset: bool, no_contradict: bool, source_opt: str | None,
                 since_iso=since_opt,
             )
             if "error" in summary:
-                console.print(f"[red]✗[/red] {summary['error']}")
-                return
+                _raise_ingest_error(summary)
             missed = summary.get("missed_calls", 0)
             console.print(_fmt_ingest_summary(
                 "calls",
@@ -22914,8 +22918,7 @@ def _do_index(reset: bool, no_contradict: bool, source_opt: str | None,
                 since_iso=since_opt,
             )
             if "error" in summary:
-                console.print(f"[red]✗[/red] {summary['error']}")
-                return
+                _raise_ingest_error(summary)
             # Two-track total — history URLs + bookmarks + reading list —
             # collapsed into one summary line via `_fmt_ingest_summary`.
             total = (summary["history_fetched"]
@@ -41828,6 +41831,8 @@ def ingest_cross_source(
                 console.print(f"  [yellow]·[/yellow] exit {e.code} (reintenta próximo tick)")
             else:
                 _ingest_cursors_mark(source)
+        except click.ClickException as exc:
+            console.print(f"  [yellow]·[/yellow] {exc.message} (reintenta próximo tick)")
         except Exception as exc:
             console.print(f"  [red]✗[/red] {type(exc).__name__}: {exc}")
             _silent_log(f"ingest_cross_source_{source}", exc)
@@ -51914,7 +51919,9 @@ from rag.ocr import (  # noqa: E402, F401
     _vlm_caption_budget_reset,
     _vlm_caption_calls_used,
     _vlm_caption_enabled,
+    _vlm_client,
     _vlm_describe,
+    _vlm_model_missing_warned,
     _vlm_idle_unload,
     _vlm_load,
     _VLM_LAST_USED,

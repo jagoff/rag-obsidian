@@ -178,10 +178,9 @@ def mine_hard_negatives_for_synthetic(
             if n_path == positive_path:
                 metrics["n_filtered_self"] += 1
                 continue
-            # Si el cosine al positive es muy alto, asumimos duplicate.
-            # (Aproximación: usamos cosine query→neg como proxy. Para más
-            # precisión, embedearíamos el positive y comparar; trade-off
-            # simplicidad vs. precision aceptado para Sprint 2.A.)
+            # Filtramos negatives con cosine(query, neg) alto — proxy para
+            # cosine(positive, neg). Para precisión exacta habría que embeddear
+            # el positive; trade-off velocidad/precisión aceptado en Sprint 2.A.
             if n_cosine > duplicate_cosine_threshold:
                 metrics["n_filtered_duplicate"] += 1
                 continue
@@ -219,7 +218,7 @@ def mine_hard_negatives_for_synthetic(
                 # positive no apareció en top-K del NN search — caso
                 # raro pero posible si el embedding del positive_path
                 # está marginal vs el query.
-                conn.execute(
+                cur = conn.execute(
                     "INSERT OR IGNORE INTO rag_synthetic_negatives "
                     "(ts, synthetic_query_id, query, positive_path, "
                     "neg_path, cosine_to_query, cosine_to_positive) "
@@ -230,7 +229,7 @@ def mine_hard_negatives_for_synthetic(
                         cosine_query_to_positive,
                     ),
                 )
-                if conn.total_changes > 0:
+                if cur.rowcount > 0:
                     metrics["n_negatives_inserted"] += 1
             except sqlite3.IntegrityError:
                 pass

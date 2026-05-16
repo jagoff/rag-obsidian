@@ -46,7 +46,10 @@ def clean_cache_env(monkeypatch, tmp_path):
     monkeypatch.setattr(rag, "_SEMANTIC_CACHE_DEFAULT_TTL", 86400)
     monkeypatch.setattr(rag, "_SEMANTIC_CACHE_RECENT_TTL", 600)
     monkeypatch.setattr(rag, "_SEMANTIC_CACHE_MAX_ROWS", 100)
-    yield
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    monkeypatch.setattr(rag, "_resolve_vault_path", lambda: vault)
+    yield vault
 
 
 def _emb(*floats: float, dim: int = 1024):
@@ -79,6 +82,10 @@ def test_ttl_for_intent_routing():
     assert rag._ttl_for_intent(None) == rag._SEMANTIC_CACHE_DEFAULT_TTL
     assert rag._ttl_for_intent("synthesis") == rag._SEMANTIC_CACHE_DEFAULT_TTL
     assert rag._ttl_for_intent("count") == rag._SEMANTIC_CACHE_DEFAULT_TTL
+    # Contrato semántico: recent < default (verifica el ordenamiento, no solo los valores)
+    assert rag._ttl_for_intent("recent") < rag._ttl_for_intent("semantic")
+    assert rag._ttl_for_intent("recent") > 0
+    assert rag._ttl_for_intent("semantic") > 0
 
 
 # ── 2. Corpus hash ───────────────────────────────────────────────────────────
@@ -196,6 +203,7 @@ def test_corpus_hash_cached_memoizes(monkeypatch, tmp_path):
 
 
 def test_cache_store_and_lookup_hit(clean_cache_env):
+    (clean_cache_env / "note.md").write_text("note")
     emb = _emb(1.0, 0.0)
     ok = rag.semantic_cache_store(
         emb,
@@ -465,6 +473,7 @@ def test_background_store_enqueues_and_commits(clean_cache_env):
     the rag-bg-sql-writer daemon so the caller unblocks in ~µs. Draining
     _BACKGROUND_SQL_QUEUE.join() makes the write observable via lookup.
     """
+    (clean_cache_env / "p.md").write_text("p")
     emb = _emb(1.0, 0.5, dim=32)
     t0 = time.perf_counter()
     ok = rag.semantic_cache_store(

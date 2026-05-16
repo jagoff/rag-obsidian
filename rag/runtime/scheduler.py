@@ -264,57 +264,66 @@ class Scheduler:
             logger.warning("scheduler: boot-dispatch SQL connect failed: %s", exc)
             return 0
         try:
-            for label, job in self._jobs.items():
-                # Solo cron/at (calendar) qualify — interval jobs corren
-                # frecuente y APScheduler con coalesce=True ya las maneja.
-                if job.trigger_kind not in ("cron", "calendar"):
-                    continue
+            # Batch-query last run times para todos los jobs cron/calendar de una vez
+            # (reemplaza el N+1 original de 1 SELECT por job).
+            eligible: dict[str, Any] = {
+                label: job
+                for label, job in self._jobs.items()
+                if job.trigger_kind in ("cron", "calendar")
+            }
+            if eligible:
+                phs = ",".join("?" * len(eligible))
                 try:
-                    row = conn.execute(
-                        "SELECT MAX(ts_start) FROM rag_supervisor_jobs WHERE job_label = ?",
-                        (label,),
-                    ).fetchone()
+                    last_run_rows = conn.execute(
+                        f"SELECT job_label, MAX(ts_start) FROM rag_supervisor_jobs "
+                        f"WHERE job_label IN ({phs}) GROUP BY job_label",
+                        list(eligible),
+                    ).fetchall()
+                    last_runs: dict[str, str | None] = {row[0]: row[1] for row in last_run_rows}
                 except sqlite3.Error:
-                    continue
-                if not row or not row[0]:
-                    continue
-                try:
-                    # ISO format con tz offset (ej. "2026-05-10T04:30:00+00:00")
-                    last_run = datetime.fromisoformat(row[0])
-                    if last_run.tzinfo is None:
-                        last_run = last_run.replace(tzinfo=timezone.utc)
-                    last_run_local = last_run.astimezone(tz)
-                except (ValueError, TypeError):
-                    continue
-                try:
-                    trigger = CronTrigger(timezone=tz, **job.trigger_args)
-                    next_fire = trigger.get_next_fire_time(last_run_local, last_run_local)
-                except Exception:
-                    continue
-                if next_fire is None:
-                    continue
-                if last_run_local < next_fire <= now:
-                    # Missed: encolar run inmediato. id único para no chocar
-                    # con el cron real del job (que sigue scheduled normal).
-                    missed_id = f"missed_{label}_{int(now.timestamp())}"
+                    last_runs = {}
+
+                for label, job in eligible.items():
+                    last_ts = last_runs.get(label)
+                    if not last_ts:
+                        continue
                     try:
-                        self._aps.add_job(
-                            self._make_runner(job),
-                            trigger="date",
-                            run_date=now,
-                            id=missed_id,
-                            replace_existing=False,
-                            misfire_grace_time=600,
-                        )
-                        dispatched += 1
-                        logger.info(
-                            "scheduler: boot-dispatch %s — missed at %s (last_run=%s)",
-                            label, next_fire.isoformat(), last_run_local.isoformat(),
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "scheduler: failed to enqueue missed %s: %s", label, exc,
-                        )
+                        # ISO format con tz offset (ej. "2026-05-10T04:30:00+00:00")
+                        last_run = datetime.fromisoformat(last_ts)
+                        if last_run.tzinfo is None:
+                            last_run = last_run.replace(tzinfo=timezone.utc)
+                        last_run_local = last_run.astimezone(tz)
+                    except (ValueError, TypeError):
+                        continue
+                    try:
+                        trigger = CronTrigger(timezone=tz, **job.trigger_args)
+                        next_fire = trigger.get_next_fire_time(last_run_local, last_run_local)
+                    except Exception:
+                        continue
+                    if next_fire is None:
+                        continue
+                    if last_run_local < next_fire <= now:
+                        # Missed: encolar run inmediato. id único para no chocar
+                        # con el cron real del job (que sigue scheduled normal).
+                        missed_id = f"missed_{label}_{int(now.timestamp())}"
+                        try:
+                            self._aps.add_job(
+                                self._make_runner(job, trigger="boot"),
+                                trigger="date",
+                                run_date=now,
+                                id=missed_id,
+                                replace_existing=False,
+                                misfire_grace_time=600,
+                            )
+                            dispatched += 1
+                            logger.info(
+                                "scheduler: boot-dispatch %s — missed at %s (last_run=%s)",
+                                label, next_fire.isoformat(), last_run_local.isoformat(),
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning(
+                                "scheduler: failed to enqueue missed %s: %s", label, exc,
+                            )
         finally:
             try:
                 conn.close()
@@ -334,7 +343,7 @@ class Scheduler:
                 logger.warning("scheduler shutdown raised: %s", exc)
         self._started = False
 
-    def run_now(self, label: str) -> dict[str, Any]:
+    def run_now(self, label: str, *, trigger: str = "manual") -> dict[str, Any]:
         """Dispara el handler de ``label`` sincrónicamente. Útil para
         tests, IPC ``/run/<job>`` y CLI ``rag supervisor trigger``.
 
@@ -344,7 +353,7 @@ class Scheduler:
         job = self._jobs.get(label)
         if job is None:
             return {"ok": False, "error": f"unknown job: {label}", "result": None}
-        return self._make_runner(job)()
+        return self._make_runner(job, trigger=trigger)()
 
     def _build_trigger(self, job: Job):
         if job.trigger_kind == "cron":
@@ -356,7 +365,7 @@ class Scheduler:
             return CronTrigger(**job.trigger_args)
         raise ValueError(f"trigger_kind desconocido: {job.trigger_kind}")
 
-    def _make_runner(self, job: Job) -> Callable[[], dict[str, Any]]:
+    def _make_runner(self, job: Job, *, trigger: str | None = None) -> Callable[[], dict[str, Any]]:
         """Wrap el handler con telemetría + error handling."""
         def _run() -> dict[str, Any]:
             t0 = time.time()
@@ -364,7 +373,9 @@ class Scheduler:
             result: Any = None
             try:
                 result = job.handler()
-                exit_code = 0
+                exit_code = _result_exit_code(result)
+                if exit_code != 0:
+                    error = _result_error_message(result, exit_code)
             except Exception as exc:
                 logger.exception("scheduler: job %s failed", job.label)
                 error = str(exc)
@@ -378,7 +389,15 @@ class Scheduler:
             if exit_code != 0:
                 job.fails_count += 1
             try:
-                _persist_run(job, t0, duration, exit_code, error, result)
+                _persist_run(
+                    job,
+                    t0,
+                    duration,
+                    exit_code,
+                    error,
+                    result,
+                    trigger=trigger or job.trigger_kind,
+                )
             except Exception as persist_exc:  # noqa: BLE001 — telemetría nunca debe romper job
                 logger.warning("scheduler: persist failed for %s: %s",
                                job.label, persist_exc)
@@ -389,6 +408,27 @@ class Scheduler:
                 "result": result,
             }
         return _run
+
+
+def _result_exit_code(result: Any) -> int:
+    """Deriva exit_code desde handlers que devuelven payload subprocess-like."""
+    if isinstance(result, dict) and "exit_code" in result:
+        try:
+            return int(result.get("exit_code") or 0)
+        except (TypeError, ValueError):
+            return 1
+    if isinstance(result, dict) and result.get("ok") is False:
+        return 1
+    return 0
+
+
+def _result_error_message(result: Any, exit_code: int) -> str:
+    if isinstance(result, dict):
+        for key in ("last_stderr", "stderr", "error", "reason"):
+            value = result.get(key)
+            if value:
+                return str(value)[:1000]
+    return f"exit_code={exit_code}"
 
 
 # ── Decorators ────────────────────────────────────────────────────────────
@@ -495,6 +535,8 @@ def _persist_run(
     exit_code: int,
     error: str | None,
     result: Any,
+    *,
+    trigger: str | None = None,
 ) -> None:
     """Persiste el run a ``rag_supervisor_jobs`` (telemetry.db).
 
@@ -515,4 +557,5 @@ def _persist_run(
         exit_code=exit_code,
         error=error,
         result=result,
+        trigger=trigger or job.trigger_kind,
     )

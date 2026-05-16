@@ -14,8 +14,9 @@ había movido los 7 helpers stdlib-only a `rag/cli/daemons_control.py`).
 - `stop` (Click cmd) — bootout + plist archiving de TODO el stack
   (managed + manual + RagNet + cloudflared). Default omite qdrant
   (compartido con mem-vault).
-- `start` (Click cmd) — arranque mínimo viable (5 daemons core) con
-  catch-up index si hay backlog. `--full` instala los 30 del spec.
+- `start` (Click cmd) — arranque mínimo viable con supervisor/watch/web
+  + catch-up index si hay backlog. `--full` instala todo `_services_spec`
+  (hoy mismo set post-supervisor, más explícito para compat CLI).
 - `_run_catch_up_index(ctx)` — helper extraído pre-Phase 2d (commit
   `3c67c8d`) para que `start` no atara `ctx.invoke(index)` al closure
   de Click context, destrabando esta extracción.
@@ -62,7 +63,10 @@ Los `rag.setup`, `rag.start`, `rag.stop`, `rag._setup_install`,
 
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
+import plistlib
+import re
 import shutil as _shutil
 import subprocess
 import time
@@ -93,26 +97,25 @@ __all__ = [
 #
 # El detalle por tier:
 #  - rag-net  → la cara de WhatsApp del sistema (RagNet). Drafts, listener,
-#               bridge, healthcheck, vault-sync. Default ON en `rag stop`
+#               bridge, MLX Whisper, healthcheck. Default ON en `rag stop`
 #               porque sin RagNet la UX del sistema queda a medias (web sí,
 #               WhatsApp no).
 #  - qdrant   → vector store de mem-vault. Default OFF: compartido con
 #               mem-vault y otros agentes locales.
 _RAG_NET_LABELS: tuple[str, ...] = (
     "com.fer.whatsapp-bridge",
+    "com.fer.whatsapp-listener-mlx-whisper",
     "com.fer.whatsapp-listener",
     "com.fer.whatsapp-listener-healthcheck",
-    "com.fer.whatsapp-vault-sync",
 )
 _QDRANT_LABELS: tuple[str, ...] = ("com.fer.qdrant",)
 
 # Set mínimo viable que `rag start --minimal` (default ON desde 2026-05-08)
-# instala. Sin briefs, sin learning loops, sin productividad pasiva — solo
-# lo necesario para que el chat web funcione + watch para que el corpus
-# quede al día + watchdog/wake-hook para self-healing post Mac wake +
-# maintenance para WAL checkpoint y rotación de logs. Los managed que
-# queden afuera reciben el mismo trato que `_DEPRECATED_LABELS` durante el
-# install (bootout + unlink). `rag start --full` instala los 30.
+# instala. Post-supervisor refactor, minimal == all managed: supervisor,
+# watch y web. El supervisor absorbe crons, watchdog/wake-hook y maintenance.
+# Los managed que queden afuera reciben el mismo trato que `_DEPRECATED_LABELS`
+# durante el install (bootout + unlink). `rag start --full` queda como forma
+# explícita de pedir todo `_services_spec`.
 _MINIMAL_MANAGED_LABELS: frozenset[str] = frozenset(
     {
         # Post-supervisor refactor 2026-05-09: minimal === all managed.
@@ -133,6 +136,387 @@ _MINIMAL_MANAGED_LABELS: frozenset[str] = frozenset(
 
 
 import os  # noqa: E402  (local symbol; el código abajo lo usa)
+
+
+_FALSY_ENV_VALUES = {"", "0", "false", "no", "off"}
+
+
+def _start_env_truthy(name: str, *, default: bool = True) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in _FALSY_ENV_VALUES
+
+
+@contextlib.contextmanager
+def _temporary_env_overrides(overrides: dict[str, str]):
+    old_values = {key: os.environ.get(key) for key in overrides}
+    try:
+        for key, value in overrides.items():
+            os.environ[key] = value
+        yield tuple(overrides)
+    finally:
+        for key, old in old_values.items():
+            if old is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old
+
+
+def _start_safe_env_overrides() -> dict[str, str]:
+    """Process-local hardening for the catch-up index inside `rag start`."""
+    try:
+        from rag import _index_safe_defaults  # noqa: PLC0415
+
+        defaults = dict(_index_safe_defaults())
+    except Exception:
+        defaults = {
+            "RAG_INDEX_EMBED_SLICE_SIZE": "16",
+            "RAG_INDEX_FILE_CHUNK_SLICE_SIZE": "128",
+            "RAG_INDEX_LOCAL_EMBED_BATCH": "16",
+            "RAG_INDEX_PREFLIGHT_MEMORY_GUARD": "1",
+            "RAG_INDEX_MEMORY_GUARD_INTERVAL_S": "5",
+            "RAG_INDEX_MEMORY_PRESSURE_SLEEP_S": "10",
+            "RAG_INDEX_ABORT_ON_MEMORY_PRESSURE": "1",
+            "RAG_INDEX_ABORT_USED_PCT": "92",
+            "RAG_INDEX_ABORT_SWAP_GB": "2.0",
+            "RAG_INDEX_ABORT_SELF_RSS_GB": "18.0",
+            "RAG_INDEX_BATCH_SLEEP_MS": "50",
+        }
+    defaults.update({
+        # Force safe mode for start's catch-up even if the interactive shell
+        # inherited an old opt-out. RAG_START_SAFE=0 is the explicit escape.
+        "RAG_INDEX_SAFE": "1",
+        "RAG_INDEX_FULL_SAFE": "1",
+        # Bootstrap must stay boring: no helper LLM / entity passes while
+        # launchd is also starting the long-lived services.
+        "OBSIDIAN_RAG_SKIP_CONTEXT_SUMMARY": "1",
+        "OBSIDIAN_RAG_SKIP_SYNTHETIC_Q": "1",
+        "RAG_CONTEXTUAL_RETRIEVAL": "0",
+        "RAG_EXTRACT_ENTITIES": "0",
+    })
+    return defaults
+
+
+def _parse_swap_used_gb(text: str) -> float | None:
+    m = re.search(r"used\s*=\s*([0-9.]+)([KMGTP]?)", text)
+    if not m:
+        return None
+    value = float(m.group(1))
+    unit = (m.group(2) or "B").upper()
+    factors = {
+        "K": 1 / (1024 * 1024),
+        "M": 1 / 1024,
+        "G": 1.0,
+        "T": 1024.0,
+        "P": 1024.0 * 1024.0,
+        "B": 1 / (1024 * 1024 * 1024),
+    }
+    return value * factors.get(unit, 1.0)
+
+
+def _start_memory_snapshot() -> tuple[float | None, float | None]:
+    """Return `(used_pct, swap_gb)` for macOS, best-effort."""
+    used_pct: float | None = None
+    swap_gb: float | None = None
+    try:
+        proc = subprocess.run(
+            ["memory_pressure", "-Q"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        m = re.search(r"free percentage:\s*([0-9.]+)%", proc.stdout)
+        if m:
+            used_pct = max(0.0, 100.0 - float(m.group(1)))
+    except Exception:
+        pass
+    try:
+        proc = subprocess.run(
+            ["sysctl", "vm.swapusage"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        swap_gb = _parse_swap_used_gb(proc.stdout)
+    except Exception:
+        pass
+    return used_pct, swap_gb
+
+
+def _start_float_env(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _start_memory_guard(console, where: str) -> bool:
+    """Return False when starting more work would risk machine pressure."""
+    if not _start_env_truthy("RAG_START_SAFE", default=True):
+        return True
+    if not _start_env_truthy("RAG_START_MEMORY_GUARD", default=True):
+        return True
+
+    used_pct, swap_gb = _start_memory_snapshot()
+    abort_used_pct = _start_float_env("RAG_START_ABORT_USED_PCT", 92.0)
+    abort_swap_gb = _start_float_env("RAG_START_ABORT_SWAP_GB", 2.0)
+
+    def _danger(pct: float | None, swap: float | None) -> bool:
+        return (
+            (pct is not None and abort_used_pct > 0 and pct >= abort_used_pct)
+            or (swap is not None and abort_swap_gb > 0 and swap >= abort_swap_gb)
+        )
+
+    if not _danger(used_pct, swap_gb):
+        return True
+
+    sleep_s = max(0.0, _start_float_env("RAG_START_MEMORY_PRESSURE_SLEEP_S", 10.0))
+    console.print(
+        f"[yellow]memory pressure antes de {where}[/yellow] — "
+        f"pausa {sleep_s:.0f}s (used_pct={used_pct if used_pct is not None else 'n/a'}, "
+        f"swap={swap_gb if swap_gb is not None else 'n/a'}GB)"
+    )
+    if sleep_s > 0:
+        time.sleep(sleep_s)
+    used_after, swap_after = _start_memory_snapshot()
+    if _danger(used_after, swap_after):
+        console.print(
+            f"[red]skip {where}[/red]: memory pressure persistente "
+            f"(used_pct={used_after if used_after is not None else 'n/a'}, "
+            f"swap={swap_after if swap_after is not None else 'n/a'}GB). "
+            "Reintentá `rag start` cuando baje la presión."
+        )
+        return False
+    return True
+
+
+def _start_bootstrap_stagger_s() -> float:
+    if not _start_env_truthy("RAG_START_SAFE", default=True):
+        return 0.0
+    return max(0.0, _start_float_env("RAG_START_BOOTSTRAP_STAGGER_S", 2.0))
+
+
+def _plist_program_args_valid(plist_path: Path) -> bool:
+    """Best-effort guard before restoring archived external plists.
+
+    `rag stop` archives third-party plists too. Some old archives point to
+    pre-migration paths, so `rag start` should restore only plists whose
+    absolute ProgramArguments still exist locally.
+    """
+    try:
+        data = plistlib.loads(plist_path.read_bytes())
+    except Exception:
+        return False
+    args = data.get("ProgramArguments")
+    if not isinstance(args, list) or not args:
+        return False
+    for arg in args:
+        if not isinstance(arg, str) or not arg.startswith("/"):
+            continue
+        if not Path(arg).exists():
+            return False
+    return True
+
+
+def _prepare_plist_log_dirs(plist_path: Path) -> None:
+    try:
+        data = plistlib.loads(plist_path.read_bytes())
+    except Exception:
+        return
+    for key in ("StandardOutPath", "StandardErrorPath"):
+        value = data.get(key)
+        if isinstance(value, str) and value.startswith("/"):
+            with contextlib.suppress(OSError):
+                Path(value).parent.mkdir(parents=True, exist_ok=True)
+
+
+def _plist_env_value(plist_path: Path, key: str) -> str | None:
+    try:
+        data = plistlib.loads(plist_path.read_bytes())
+    except Exception:
+        return None
+    env = data.get("EnvironmentVariables")
+    if isinstance(env, dict):
+        value = env.get(key)
+        return value if isinstance(value, str) else None
+    return None
+
+
+def _rag_net_plist_needs_regen(label: str, plist_path: Path) -> bool:
+    if label == "com.fer.whatsapp-listener":
+        ollama_url = _plist_env_value(plist_path, "OLLAMA_URL")
+        return ollama_url == "http://localhost:11435" and not (
+            Path.home() / ".local/bin/uv"
+        ).exists()
+    return False
+
+
+def _archived_external_plist_candidates(label: str) -> list[Path]:
+    from rag import _LAUNCH_AGENTS_DIR  # noqa: PLC0415
+
+    seen: set[Path] = set()
+    candidates: list[Path] = []
+    for pattern in (".archive-rag-stop-*", ".archive-*"):
+        for archive_dir in _LAUNCH_AGENTS_DIR.glob(pattern):
+            plist_path = archive_dir / f"{label}.plist"
+            if plist_path.is_file() and plist_path not in seen:
+                seen.add(plist_path)
+                candidates.append(plist_path)
+    return sorted(
+        candidates,
+        key=lambda p: (p.parent.name, p.stat().st_mtime),
+        reverse=True,
+    )
+
+
+def _restore_archived_external_plist(label: str) -> Path | None:
+    from rag import _LAUNCH_AGENTS_DIR  # noqa: PLC0415
+
+    dest = _LAUNCH_AGENTS_DIR / f"{label}.plist"
+    if dest.is_file():
+        _prepare_plist_log_dirs(dest)
+        return dest
+    for candidate in _archived_external_plist_candidates(label):
+        if not _plist_program_args_valid(candidate):
+            continue
+        _LAUNCH_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+        _shutil.copy2(candidate, dest)
+        _prepare_plist_log_dirs(dest)
+        return dest
+    return None
+
+
+def _render_rag_net_plist(label: str) -> str | None:
+    from rag.plists._render import _render_plist  # noqa: PLC0415
+
+    home = Path.home()
+    if label == "com.fer.whatsapp-bridge":
+        repo = home / "repos/whatsapp-mcp/whatsapp-bridge"
+        binary = repo / "whatsapp-bridge"
+        if not binary.is_file():
+            return None
+        log = home / ".local/share/obsidian-rag/wa-bridge.log"
+        return _render_plist({
+            "label": label,
+            "program_arguments": [str(binary)],
+            "env": {"WHATSAPP_BRIDGE_PORT": "8088"},
+            "run_at_load": True,
+            "keep_alive": True,
+            "throttle_s": 15,
+            "exit_timeout_s": 10,
+            "process_type": "Interactive",
+            "working_dir": str(repo),
+            "stdout_path": str(log),
+            "stderr_path": str(log),
+        })
+    if label == "com.fer.whatsapp-listener":
+        repo = home / "repos/whatsapp-listener"
+        bun = home / ".bun/bin/bun"
+        listener = repo / "listener.ts"
+        if not bun.is_file() or not listener.is_file():
+            return None
+        log_dir = home / ".local/share/whatsapp-listener"
+        return _render_plist({
+            "label": label,
+            "program_arguments": [str(bun), "run", str(listener)],
+            "env": {
+                "PATH": (
+                    f"/opt/homebrew/bin:{home}/.bun/bin:{home}/.local/bin:"
+                    "/usr/local/bin:/usr/bin:/bin"
+                ),
+                "OLLAMA_URL": "http://localhost:11434",
+                "WHISPER_SERVER_URL": "http://127.0.0.1:9299",
+                "RAG_STATE_SQL": "1",
+                "WA_DRAFT_ALL_CONTACTS": "1",
+                "CALENDAR_NAME": "Agenda",
+                "CALENDAR_HELPER_MODEL": "qwen2.5:3b",
+                "CALENDAR_HELPER_LONG_MODEL": "qwen2.5:7b",
+                "DRAFT_HELPER_MODEL": "qwen2.5:7b",
+                "SEND_HELPER_MODEL": "qwen2.5:7b",
+                "DIGEST_MODEL": "qwen2.5:7b",
+                "OCR_TAG_MODEL": "qwen2.5:3b",
+                "VOICE_CLASSIFIER_MODEL": "qwen2.5:7b",
+                "VOICE_CLASSIFIER_EMBED_MODEL": "bge-m3",
+            },
+            "run_at_load": True,
+            "keep_alive": True,
+            "throttle_s": 15,
+            "exit_timeout_s": 10,
+            "process_type": "Interactive",
+            "working_dir": str(repo),
+            "stdout_path": str(log_dir / "listener.log"),
+            "stderr_path": str(log_dir / "listener.error.log"),
+        })
+    if label == "com.fer.whatsapp-listener-mlx-whisper":
+        repo = home / "repos/whatsapp-listener"
+        script = repo / "scripts/mlx_whisper_server.py"
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        python = repo_root / ".venv/bin/python"
+        if not python.is_file() or not script.is_file():
+            return None
+        log_dir = home / ".local/share/mlx"
+        return _render_plist({
+            "label": label,
+            "program_arguments": [str(python), str(script), "--port", "9299"],
+            "env": {
+                "PATH": f"{home}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+                "MLX_WHISPER_MODEL": "mlx-community/whisper-large-v3-turbo",
+                "MLX_WHISPER_LANGUAGE": "es",
+            },
+            "run_at_load": True,
+            "keep_alive": True,
+            "throttle_s": 15,
+            "exit_timeout_s": 5,
+            "process_type": "Interactive",
+            "working_dir": str(repo),
+            "stdout_path": str(log_dir / "whisper.log"),
+            "stderr_path": str(log_dir / "whisper.error.log"),
+        })
+    if label == "com.fer.whatsapp-listener-healthcheck":
+        script = home / "repos/whatsapp-listener/scripts/healthcheck.sh"
+        if not script.is_file():
+            return None
+        log_dir = home / ".local/share/whatsapp-listener"
+        return _render_plist({
+            "label": label,
+            "program_arguments": ["/bin/bash", str(script)],
+            "env": {"STALE_THRESHOLD_SEC": "300"},
+            "schedule": {"interval_s": 300},
+            "run_at_load": True,
+            "process_type": "Background",
+            "stdout_path": str(log_dir / "healthcheck.stdout.log"),
+            "stderr_path": str(log_dir / "healthcheck.stderr.log"),
+        })
+    return None
+
+
+def _ensure_rag_net_plist(label: str) -> tuple[Path | None, str]:
+    from rag import _LAUNCH_AGENTS_DIR  # noqa: PLC0415
+
+    dest = _LAUNCH_AGENTS_DIR / f"{label}.plist"
+    if dest.is_file():
+        if not _plist_program_args_valid(dest) or _rag_net_plist_needs_regen(label, dest):
+            content = _render_rag_net_plist(label)
+            if content is None:
+                return None, "invalid"
+            dest.write_text(content, encoding="utf-8")
+            _prepare_plist_log_dirs(dest)
+            return dest, "regenerated"
+        _prepare_plist_log_dirs(dest)
+        return dest, "present"
+    restored = _restore_archived_external_plist(label)
+    if restored is not None:
+        return restored, "restored"
+    content = _render_rag_net_plist(label)
+    if content is None:
+        return None, "missing"
+    _LAUNCH_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+    dest.write_text(content, encoding="utf-8")
+    _prepare_plist_log_dirs(dest)
+    return dest, "generated"
 
 
 def _find_cloudflare_tunnel_labels() -> tuple[str, ...]:
@@ -177,8 +561,10 @@ def _cleanup_staled_locks() -> None:
                     # Si no levantó excepción, el proceso está vivo — no borrar
                     continue
                 # Si el contenido no es un PID válido, borrar el lock
-            # Para .lock y .sock, simplemente borrar si están viejos o si la info es corrupta
-            lock_path.unlink()
+            # Para .lock y .sock, borrar solo si el archivo tiene >30s de antigüedad —
+            # evitar borrar locks activos de daemons en medio de una operación.
+            if time.time() - lock_path.stat().st_mtime > 30:
+                lock_path.unlink()
         except ProcessLookupError:
             # PID no existe — borrar el lock
             try:
@@ -276,6 +662,7 @@ def _setup_install(
     *,
     remove: bool = False,
     only_labels: frozenset[str] | None = None,
+    bootstrap_stagger_s: float = 0.0,
 ) -> None:
     """Lógica interna de install/uninstall de los services managed.
 
@@ -486,6 +873,8 @@ def _setup_install(
                 console.print(
                     f"[red]✗[/red] falló cargar {label} (exit={res.returncode}): {stderr.strip()}"
                 )
+            if bootstrap_stagger_s > 0:
+                time.sleep(bootstrap_stagger_s)
         except Exception as exc:
             console.print(f"[red]✗[/red] falló cargar {label}: {exc}")
 
@@ -522,6 +911,8 @@ def setup(remove: bool):
         console.print(
             "[dim]Instalá primero: uv tool install --reinstall --editable '.[entities]'[/dim]"
         )
+        return
+    if remove and not click.confirm("¿Desinstalar todos los servicios RAG?", default=False):
         return
     _setup_install(rag_bin, remove=remove, only_labels=None)
 
@@ -578,7 +969,7 @@ def setup(remove: bool):
     "--with-rag-net/--without-rag-net",
     default=True,
     help="Incluir daemons de RagNet/WhatsApp (whatsapp-bridge/listener/"
-    "healthcheck/vault-sync). Default: sí.",
+    "mlx-whisper/healthcheck). Default: sí.",
 )
 @click.option(
     "--with-qdrant",
@@ -883,7 +1274,7 @@ def stop(
             "  [dim]·[/dim] RagNet       : "
             "[cyan]launchctl bootstrap gui/$(id -u) "
             "~/Library/LaunchAgents/com.fer.whatsapp-listener.plist[/cyan] "
-            "(idem bridge / healthcheck / vault-sync)"
+            "(idem bridge / mlx-whisper / healthcheck)"
         )
     if with_qdrant:
         console.print(
@@ -949,35 +1340,51 @@ def _run_catch_up_index(ctx: click.Context) -> None:
 
     console.print()
     console.print("[bold cyan]▸ catch-up index (incremental)[/bold cyan]")
-    for vault in vaults_to_index:
-        vault_label = vault if vault else "activo"
-        try:
-            # Click param names — `--full` binds a `full_flag`, `--reset` (alias
-            # legacy) a `reset_legacy`. Pasarle `reset=False` revienta con
-            # `TypeError: index() got an unexpected keyword argument 'reset'`.
-            # `contextual` y `fast` son options nuevas — defaults explícitos.
-            ctx.invoke(
-                index,
-                full_flag=False,
-                reset_legacy=False,
-                no_contradict=False,
-                source_opt=None,
-                since_opt=None,
-                dry_run=False,
-                max_chats=None,
-                vault_scope=vault,
-                contextual=False,
-                fast=False,
+    safe_overrides = (
+        _start_safe_env_overrides()
+        if _start_env_truthy("RAG_START_SAFE", default=True)
+        else {}
+    )
+    with _temporary_env_overrides(safe_overrides) as applied:
+        if applied:
+            console.print(
+                "[cyan]start safe mode[/cyan] — catch-up con `rag index` seguro "
+                "(slices, memory guard y abort limpio). Opt-out: RAG_START_SAFE=0."
             )
-        except SystemExit as e:
-            if e.code != 0:
-                console.print(
-                    f"[yellow]·[/yellow] catch-up skip [{vault_label}] "
-                    "(otro `rag index` activo, retry manual con `rag index`)"
+        for vault in vaults_to_index:
+            vault_label = vault if vault else "activo"
+            if not _start_memory_guard(console, f"catch-up index [{vault_label}]"):
+                continue
+            try:
+                # Click param names — `--full` binds a `full_flag`, `--reset` (alias
+                # legacy) a `reset_legacy`. Pasarle `reset=False` revienta con
+                # `TypeError: index() got an unexpected keyword argument 'reset'`.
+                # `start` prioriza levantar el sistema sin co-cargar helper LLMs.
+                # Las contradicciones se pueden drenar en un `rag index` manual;
+                # correrlas durante bootstrap fue lo que infló RSS a ~8 GB.
+                # `contextual` y `fast` son options nuevas — defaults explícitos.
+                ctx.invoke(
+                    index,
+                    full_flag=False,
+                    reset_legacy=False,
+                    no_contradict=True,
+                    source_opt=None,
+                    since_opt=None,
+                    dry_run=False,
+                    max_chats=None,
+                    vault_scope=vault,
+                    contextual=False,
+                    fast=False,
                 )
-        except Exception as exc:
-            console.print(f"[yellow]·[/yellow] catch-up falló [{vault_label}]: {exc!r}")
-            _silent_log("rag_start_index_failed", exc)
+            except SystemExit as e:
+                if e.code != 0:
+                    console.print(
+                        f"[yellow]·[/yellow] catch-up skip [{vault_label}] "
+                        "(otro `rag index` activo, retry manual con `rag index`)"
+                    )
+            except Exception as exc:
+                console.print(f"[yellow]·[/yellow] catch-up falló [{vault_label}]: {exc!r}")
+                _silent_log("rag_start_index_failed", exc)
 
 
 @click.command("start")
@@ -985,17 +1392,16 @@ def _run_catch_up_index(ctx: click.Context) -> None:
     "--minimal/--full",
     "minimal",
     default=True,
-    help="Mínimo viable (5 daemons: watch/web/daemon-watchdog/wake-hook/"
-    "maintenance) vs full (los 30 de _services_spec, incluyendo briefs, "
-    "learning loops y productividad pasiva). Default: mínimo. Lo NO "
-    "instalado en modo mínimo se bootouts + removido del disco — "
-    "re-correr con `--full` regenera todo.",
+    help="Mínimo viable (supervisor/watch/web) vs full (todo _services_spec; "
+    "post-supervisor hoy es el mismo set managed, mantenido como flag "
+    "explícito). Default: mínimo. Lo NO instalado en modo mínimo se "
+    "bootouts + removido del disco — re-correr con `--full` regenera todo.",
 )
 @click.option(
     "--with-rag-net/--without-rag-net",
     default=True,
     help="Levantar también daemons de RagNet/WhatsApp (whatsapp-bridge/"
-    "listener/healthcheck/vault-sync). Default: sí — sin RagNet la UX "
+    "listener/mlx-whisper/healthcheck). Default: sí — sin RagNet la UX "
     "del sistema queda a medias (web sí, WhatsApp no).",
 )
 @click.option(
@@ -1055,16 +1461,15 @@ def start(
     Simétrico a `rag stop`. Idempotente — re-correrlo recarga lo que esté
     caído sin romper lo que ya está vivo. Orden:
 
-    1. `rag setup` — regenera + carga los `obsidian-rag-*` (managed) desde
-       código (incluye watch / web / digest / morning / today / ingesters
-       cross-source / wa-tasks / online-tune / watchdog / wake-hook / ...).
-    2. Externos vía `launchctl bootstrap` desde `~/Library/LaunchAgents/`:
+    1. Catch-up index incremental (`rag index --no-contradict`, sin `--full`)
+       — re-indexa todo lo que cambió desde el último run del watcher. Corre
+       en safe mode antes de cargar daemons para evitar co-residency MLX
+       innecesaria. Skip con `--no-index`.
+    2. `rag setup` — regenera + carga los `obsidian-rag-*` managed desde
+       código (post-supervisor: supervisor/watch/web).
+    3. Externos vía `launchctl bootstrap` desde `~/Library/LaunchAgents/`:
        qdrant (si `--with-qdrant`), RagNet (whatsapp-*) si `--with-rag-net`
        (default ON).
-    3. Catch-up index incremental (`rag index`, sin `--reset`) — re-indexa
-       todo lo que cambió desde el último run del watcher (típicamente
-       minutos; si la Mac estuvo dormida varias horas, captura ese gap).
-       Skip con `--no-index`.
 
     Si un externo no tiene plist en disco, lo reporta como "missing" y
     sigue — instalalo desde su repo origen ([whatsapp-listener](https://github.com/jagoff/whatsapp-listener)
@@ -1073,6 +1478,7 @@ def start(
     """
     from rag import (  # noqa: PLC0415
         _bootstrap_label,
+        _bootout_label,
         _log_daemon_run_event,
         _rag_binary,
         _services_spec,
@@ -1097,8 +1503,8 @@ def start(
         only_labels: frozenset[str] | None = _MINIMAL_MANAGED_LABELS
         managed_count = len(_MINIMAL_MANAGED_LABELS)
         scope_label = (
-            f"[bold]mínimo[/bold] ({managed_count} de {spec_total}: watch/web/"
-            "daemon-watchdog/wake-hook/maintenance)"
+            f"[bold]mínimo[/bold] ({managed_count} de {spec_total}: "
+            "supervisor/watch/web)"
         )
     else:
         only_labels = None
@@ -1124,7 +1530,20 @@ def start(
     if no_index:
         console.print("  [dim]·[/dim] catch-up index          : [yellow]skip[/yellow] (--no-index)")
     else:
-        console.print("  [dim]·[/dim] catch-up index          : [cyan]rag index[/cyan] incremental")
+        console.print(
+            "  [dim]·[/dim] catch-up index          : "
+            "[cyan]rag index --no-contradict[/cyan] incremental"
+        )
+    if _start_env_truthy("RAG_START_SAFE", default=True):
+        console.print(
+            "  [dim]·[/dim] start safe mode         : [cyan]ON[/cyan] "
+            "(catch-up seguro, memory guard y stagger de daemons)"
+        )
+    else:
+        console.print(
+            "  [dim]·[/dim] start safe mode         : [yellow]OFF[/yellow] "
+            "(RAG_START_SAFE=0)"
+        )
 
     # ── Hook informativo con rag-harness (no toca configs) ────────────────
     # Si hay un profile activo en `.devin/mcp-profiles/.active`, lo mostramos
@@ -1199,7 +1618,7 @@ def start(
             for lbl in _RAG_NET_LABELS:
                 console.print(f"  [dim]would-bootstrap[/dim] [rag-net] {lbl}")
         if not no_index:
-            console.print("  [dim]would-call[/dim] [index] rag index (incremental)")
+            console.print("  [dim]would-call[/dim] [index] rag index --no-contradict (incremental)")
         return
 
     if not yes and not start_all:
@@ -1273,7 +1692,13 @@ def start(
     console.print()
     console.print("[bold cyan]▸ obsidian-rag-* (managed daemons)[/bold cyan]")
     try:
-        _setup_install(rag_bin, remove=False, only_labels=only_labels)
+        if _start_memory_guard(console, "obsidian-rag managed daemons"):
+            _setup_install(
+                rag_bin,
+                remove=False,
+                only_labels=only_labels,
+                bootstrap_stagger_s=_start_bootstrap_stagger_s(),
+            )
     except Exception as exc:
         console.print(f"[red]✗[/red] setup falló: {exc!r}")
         # No abortar — los externos podrían levantarse igual.
@@ -1289,16 +1714,28 @@ def start(
     if with_rag_net:
         ext_targets.extend((lbl, "rag-net") for lbl in _RAG_NET_LABELS)
 
-    ext_ok = ext_already = ext_fail = ext_missing = 0
+    ext_ok = ext_already = ext_fail = ext_missing = ext_skipped = 0
     if ext_targets:
         console.print()
         console.print("[bold cyan]▸ daemons externos[/bold cyan]")
         for label, category in ext_targets:
+            if not _start_memory_guard(console, f"daemon externo {label}"):
+                ext_skipped += 1
+                continue
+            if category == "rag-net":
+                _plist_path, plist_state = _ensure_rag_net_plist(label)
+                if plist_state in {"restored", "generated", "regenerated"}:
+                    console.print(
+                        f"[dim]·[/dim] [{category}] {label} "
+                        f"[dim](plist {plist_state})[/dim]"
+                    )
+                if plist_state == "regenerated":
+                    _bootout_label(label)
             result = _bootstrap_label(label)
             if result["missing_plist"]:
                 console.print(
                     f"[yellow]·[/yellow] [{category}] {label} "
-                    f"[dim](sin plist en disco — instalalo desde su repo)[/dim]"
+                    f"[dim](sin plist en disco ni factory local disponible)[/dim]"
                 )
                 ext_missing += 1
             elif result["ok"] and result["exit_code"] == 0:
@@ -1326,6 +1763,9 @@ def start(
                     exit_code=result["exit_code"],
                     reason="rag start (failed)",
                 )
+            stagger_s = _start_bootstrap_stagger_s()
+            if stagger_s > 0:
+                time.sleep(stagger_s)
 
     # ── Summary ──────────────────────────────────────────────────────────
     console.print()
@@ -1344,6 +1784,8 @@ def start(
             parts.append(f"{ext_already} ya estaban")
         if ext_missing:
             parts.append(f"[yellow]{ext_missing} sin plist[/yellow]")
+        if ext_skipped:
+            parts.append(f"[yellow]{ext_skipped} skip por memoria[/yellow]")
         if ext_fail:
             parts.append(f"[red]{ext_fail} fallidos[/red]")
         console.print(f"  [dim]externos:[/dim] {', '.join(parts)}")

@@ -930,7 +930,14 @@ def list_chats_for_ui(
                 ORDER BY m.timestamp DESC
                 LIMIT 1
               ) AS last_from_me,
-              COALESCE(rs.last_seen_ts, '1970-01-01T00:00:00') AS last_seen_ts
+              COALESCE(rs.last_seen_ts, '1970-01-01T00:00:00') AS last_seen_ts,
+              (
+                SELECT COUNT(*)
+                FROM br.messages m2
+                WHERE m2.chat_jid = c.jid
+                  AND m2.is_from_me = 0
+                  AND m2.timestamp > COALESCE(rs.last_seen_ts, '1970-01-01T00:00:00')
+              ) AS unread_count
             FROM br.chats c
             LEFT JOIN main.rag_wa_read_state rs ON rs.jid = c.jid
             WHERE {' AND '.join(where_clauses)}
@@ -954,17 +961,6 @@ def list_chats_for_ui(
             preview = last_content or (f"[{last_media}]" if last_media else "")
             if len(preview) > 120:
                 preview = preview[:117] + "…"
-            # Unread count: inbound msgs con ts > last_seen_ts en la chat.
-            unread = con.execute(
-                """
-                SELECT count(*) AS n
-                FROM br.messages
-                WHERE chat_jid = ?
-                  AND is_from_me = 0
-                  AND timestamp > ?
-                """,
-                (jid, r["last_seen_ts"]),
-            ).fetchone()
             is_group = jid.endswith("@g.us")
             is_pinned = jid in pinned_map
             is_archived = jid in archived_map
@@ -977,7 +973,7 @@ def list_chats_for_ui(
                 "last_ts": _normalize_bridge_ts(r["computed_last_ts"] or ""),
                 "last_preview": preview,
                 "last_from_me": bool(r["last_from_me"]),
-                "unread_count": int(unread["n"]) if unread else 0,
+                "unread_count": int(r["unread_count"]),
                 "avatar_initials": _avatar_initials(label),
                 "pinned": is_pinned,
                 "pinned_ts": pinned_map.get(jid, "") if is_pinned else "",

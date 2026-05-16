@@ -10,7 +10,7 @@ que cambiar de modelo sea trivial:
 
 | tier   | env var              | default                                       | constraint                       |
 |--------|----------------------|-----------------------------------------------|----------------------------------|
-| chat   | `RAG_CHAT_MODEL`     | `qwen2.5:7b`                                  | alias en `MLX_MODEL_ALIAS`       |
+| chat   | `RAG_CHAT_MODEL`     | `qwen3:30b-a3b`                               | alias en `MLX_MODEL_ALIAS`       |
 | helper | `RAG_HELPER_MODEL`   | `qwen2.5:3b`                                  | alias en `MLX_MODEL_ALIAS`       |
 | embed  | `RAG_EMBED_MODEL`    | `qwen3-embedding:0.6b`                        | dim 1024 (vault index lockstep)  |
 | rerank | `RAG_RERANKER_MODEL` | `BAAI/bge-reranker-v2-m3` (PT) o Qwen3 (MLX)  | depende `RAG_RERANKER_BACKEND`   |
@@ -60,7 +60,7 @@ __all__ = [
 TIERS: tuple[str, ...] = ("chat", "helper", "embed", "rerank", "stt", "vlm")
 
 DEFAULTS: dict[str, str] = {
-    "chat":   "qwen2.5:7b",
+    "chat":   "qwen3:30b-a3b",
     "helper": "qwen2.5:3b",
     "embed":  "qwen3-embedding:0.6b",
     "rerank": "qwen3-reranker:0.6b",
@@ -76,6 +76,13 @@ ENV_VARS: dict[str, str] = {tier: f"RAG_{tier.upper()}_MODEL" for tier in TIERS}
 _EMBED_WHITELIST: frozenset[str] = frozenset({
     "qwen3-embedding:0.6b",
     "mlx-community/Qwen3-Embedding-0.6B-8bit",
+})
+
+_RERANK_ALIASES: frozenset[str] = frozenset({
+    "BAAI/bge-reranker-v2-m3",
+    "qwen3-reranker:0.6b",
+    "qwen3-reranker:4b",
+    "qwen3-reranker:8b",
 })
 
 _RELOAD_HOOKS: dict[str, list[Callable[[str, str], None]]] = {
@@ -214,6 +221,13 @@ def validate(tier: str, model: str) -> str | None:
     if tier == "vlm":
         if not model.startswith("mlx-community/") and "/" not in model:
             return f"VLM esperado como HF repo (`mlx-community/...`), recibido: {model!r}"
+    if tier == "rerank":
+        if "/" not in model and model not in _RERANK_ALIASES:
+            return (
+                f"Rerank alias {model!r} desconocido. "
+                f"Conocidos: {sorted(_RERANK_ALIASES)}. "
+                f"O pasá un HF repo (`org/nombre`)."
+            )
     return None
 
 
@@ -244,7 +258,7 @@ def _list_mlx_chat_helper(tier: str) -> dict[str, list[str]]:
     from rag.llm_backend import MLX_MODEL_ALIAS
     helper_aliases = {"qwen2.5:3b", "qwen3:4b"}
     chat_aliases = {
-        "qwen2.5:7b", "qwen2.5:14b", "qwen3:30b-a3b",
+        "qwen2.5:7b", "qwen2.5:14b", "qwen3:30b", "qwen3:30b-a3b",
         "command-r", "command-r:latest",
     }
     wanted = chat_aliases if tier == "chat" else helper_aliases

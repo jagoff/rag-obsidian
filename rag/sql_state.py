@@ -243,6 +243,7 @@ def _sql_read_with_retry(
 
 _telemetry_tables_ensured: bool = False
 _telemetry_tables_ensured_mtime: float = 0.0
+_telemetry_tables_ensured_path: str | None = None
 _telemetry_tables_ensured_lock = threading.Lock()
 
 
@@ -250,6 +251,7 @@ _telemetry_tables_ensured_lock = threading.Lock()
 def _ragvec_state_conn():
     """Open a short-lived SQLite connection to telemetry.db."""
     global _telemetry_tables_ensured, _telemetry_tables_ensured_mtime
+    global _telemetry_tables_ensured_path
     if _DEPS is None:
         raise RuntimeError("sql state dependencies not configured")
     db_path = _DEPS.db_path()
@@ -281,13 +283,14 @@ def _ragvec_state_conn():
         with _telemetry_tables_ensured_lock:
             needs_ensure = (
                 not _telemetry_tables_ensured
-                or db_mtime != _telemetry_tables_ensured_mtime
+                or _telemetry_tables_ensured_path != telemetry_db_path
             )
         if needs_ensure:
             _DEPS.ensure_telemetry_tables(conn)
             with _telemetry_tables_ensured_lock:
                 _telemetry_tables_ensured = True
                 _telemetry_tables_ensured_mtime = db_mtime
+                _telemetry_tables_ensured_path = telemetry_db_path
         yield conn
     finally:
         try:

@@ -106,6 +106,24 @@ DEFAULT_WINDOW_SECONDS = 600
 DEFAULT_PARAPHRASE_TOP_SCORE_MIN = 0.1
 
 
+def _invalidate_feedback_golden_cache(conn: sqlite3.Connection) -> None:
+    """Forzar rebuild de feedback_golden después de inferir corrective_path."""
+    try:
+        conn.execute("DELETE FROM rag_feedback_golden")
+        conn.execute(
+            "DELETE FROM rag_feedback_golden_meta "
+            "WHERE k='last_built_source_ts'"
+        )
+    except sqlite3.Error:
+        pass
+    try:
+        import rag as _rag  # noqa: PLC0415
+        _rag._feedback_golden_memo = None
+        _rag._feedback_golden_source_ts_sql = None
+    except Exception:
+        pass
+
+
 def _extract_session(extra_json_str: str | None) -> str | None:
     """Devuelve el session id desde el extra_json del feedback.
 
@@ -533,7 +551,7 @@ def infer_corrective_paths_from_behavior(
                 orig_q=q,
                 top_path=top_path,
                 paths=paths,
-                follow_up_query=follow_up_q if follow_up_q else None,
+                follow_up_query=follow_up_q or None,
             )
             if corrective_path is None:
                 # Ni opens ni paráfrasis útil → bucket "no_open" sigue
@@ -570,6 +588,10 @@ def infer_corrective_paths_from_behavior(
         metrics["n_inferred"] += 1
         if corrective_source_local == "implicit_paraphrase_inference":
             metrics["n_inferred_via_paraphrase"] += 1
+
+    if not dry_run and metrics["n_inferred"] > 0:
+        conn.commit()
+        _invalidate_feedback_golden_cache(conn)
 
     return {
         **metrics,

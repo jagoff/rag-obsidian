@@ -75,6 +75,29 @@ WEAK_NEGATIVE_TRAINING_WEIGHT: float = 0.3
 WEAK_NEGATIVE_SOURCE: str = "session_outcome_weak_negative"
 
 
+def _query_dedupe_key(q: str) -> str:
+    return " ".join(q.casefold().split())
+
+
+def _feedback_row_priority(row: tuple) -> tuple[int, str, int]:
+    fb_id, ts, _turn_id, rating, _q, _paths_json, extra_json = row
+    try:
+        extra = json.loads(extra_json or "{}")
+    except (json.JSONDecodeError, TypeError):
+        extra = {}
+    if extra.get("corrective_path"):
+        strength = 3
+    elif rating in (-1, 1) and not extra.get("implicit_loss_source"):
+        strength = 2
+    else:
+        strength = 1
+    try:
+        row_id = int(fb_id or 0)
+    except (TypeError, ValueError):
+        row_id = 0
+    return (strength, str(ts or ""), row_id)
+
+
 def _candidate_to_feature_vector(
     candidate: dict[str, Any], has_recency_cue: bool
 ) -> list[float]:
@@ -211,6 +234,20 @@ def feedback_to_training_data(
         """
     ).fetchall()
 
+    best_by_query: dict[str, tuple] = {}
+    for row in rows:
+        q = row[4]
+        if not q:
+            continue
+        key = _query_dedupe_key(str(q))
+        prev = best_by_query.get(key)
+        if prev is None or _feedback_row_priority(row) > _feedback_row_priority(prev):
+            best_by_query[key] = row
+    rows = sorted(
+        best_by_query.values(),
+        key=lambda row: (str(row[1] or ""), int(row[0] or 0)),
+    )
+
     X: list[list[float]] = []
     y: list[int] = []
     group: list[int] = []
@@ -222,16 +259,9 @@ def feedback_to_training_data(
     if replay_features_fn is None:
         replay_features_fn = _default_replay_features
 
-    seen_queries: set[str] = set()
-
     for fb_id, ts, turn_id, rating, q, paths_json, extra_json in rows:
         if not q:
             continue
-        # Avoid re-replaying the same query twice (different feedbacks
-        # for the same q text).
-        if q in seen_queries:
-            continue
-        seen_queries.add(q)
 
         try:
             paths = json.loads(paths_json)
@@ -281,7 +311,7 @@ def feedback_to_training_data(
             n_skipped_no_features += 1
             continue
 
-        has_recency_cue = bool(candidates[0].get("has_recency_cue", False))
+        has_recency_cue = any(bool(c.get("has_recency_cue")) for c in candidates)
 
         group_size = 0
         for cand in candidates:
@@ -329,7 +359,7 @@ def _default_replay_features(query: str) -> list[dict[str, Any]]:
     import rag
     col = rag.get_db()
     return rag.collect_ranker_features(
-        col, query, k_pool=15, multi_query=False, auto_filter=True
+        col, query, k_pool=rag.RERANK_POOL_MAX, multi_query=False, auto_filter=True
     )
 
 
@@ -398,7 +428,7 @@ def synthetic_to_training_data(
             n_skipped_no_features += 1
             continue
 
-        has_recency_cue = bool(candidates[0].get("has_recency_cue", False))
+        has_recency_cue = any(bool(c.get("has_recency_cue")) for c in candidates)
 
         group_size = 0
         for cand in candidates:

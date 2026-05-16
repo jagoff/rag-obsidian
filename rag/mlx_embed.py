@@ -201,8 +201,10 @@ class MLXEmbedder:
         # son inalcanzables → el GC los marca como free en el próximo
         # clear_cache(). Sin el clear_cache() explícito, el allocator MLX
         # retiene la memoria Metal hasta presión externa.
-        result = np.array(emb_fp32)
-        _mx.clear_cache()
+        try:
+            result = np.array(emb_fp32)
+        finally:
+            _mx.clear_cache()
         return result
 
     def encode(

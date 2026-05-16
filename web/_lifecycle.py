@@ -50,18 +50,21 @@ def _start_idle_sweeper() -> None:
         activity. Keeps the Mac responsive when the user walks away from
         chat — 2-3 GB of unified memory freed on idle.
 
-        After eviction, schedules a deferred pre-warm 60s later so the
-        reranker is hot again before the likely next request. The
-        pre-warm runs in its own daemon thread and MUST NOT block the
-        sweeper loop.
+        By default eviction leaves the reranker unloaded until the next
+        request. Operators that prefer latency over idle memory can opt
+        back into the old deferred re-warm with
+        RAG_RERANKER_REWARM_AFTER_IDLE=1.
 
         When `RAG_RERANKER_NEVER_UNLOAD=1` (env var) the sweeper loop
         still runs but skips `maybe_unload_reranker()` entirely.
         """
-        from rag import maybe_unload_reranker, get_reranker
+        from rag import maybe_unload_local_embedder, maybe_unload_reranker
         _never_unload = os.environ.get(
             "RAG_RERANKER_NEVER_UNLOAD", "",
         ).strip() not in ("", "0", "false", "no")
+        _rewarm_after_idle = os.environ.get(
+            "RAG_RERANKER_REWARM_AFTER_IDLE", "",
+        ).strip().lower() in ("1", "true", "yes")
         if _never_unload:
             print(
                 "[idle-sweep] RAG_RERANKER_NEVER_UNLOAD=1 — reranker pinned, "
@@ -79,28 +82,31 @@ def _start_idle_sweeper() -> None:
                     continue
                 if maybe_unload_reranker():
                     print("[idle-sweep] reranker unloaded from MPS", flush=True)
+                    if _rewarm_after_idle:
+                        def _deferred_rewarm() -> None:
+                            # Mismo trato: wait con stop event, exit limpio
+                            # si el server cae antes de los 60s.
+                            if _IDLE_SWEEPER_STOP.wait(timeout=60):
+                                return
+                            try:
+                                from rag import get_reranker
+                                get_reranker()
+                                print(
+                                    "[idle-sweep] reranker pre-warmed (deferred)",
+                                    flush=True,
+                                )
+                            except Exception as exc:
+                                print(f"[reranker-rewarm] failed: {exc}", flush=True)
 
-                    def _deferred_rewarm() -> None:
-                        # Mismo trato: wait con stop event, exit limpio
-                        # si el server cae antes de los 60s.
-                        if _IDLE_SWEEPER_STOP.wait(timeout=60):
-                            return
-                        try:
-                            get_reranker()
-                            print(
-                                "[idle-sweep] reranker pre-warmed (deferred)",
-                                flush=True,
-                            )
-                        except Exception:
-                            pass
-
-                    threading.Thread(
-                        target=_deferred_rewarm,
-                        name="reranker-rewarm",
-                        daemon=True,
-                    ).start()
-            except Exception:
-                pass
+                        threading.Thread(
+                            target=_deferred_rewarm,
+                            name="reranker-rewarm",
+                            daemon=True,
+                        ).start()
+                if maybe_unload_local_embedder():
+                    print("[idle-sweep] local embedder unloaded from MLX", flush=True)
+            except Exception as exc:
+                print(f"[idle-sweep] error: {exc}", flush=True)
 
     _IDLE_SWEEPER_THREAD = threading.Thread(
         target=_idle_sweeper, name="idle-sweeper", daemon=True,
@@ -216,13 +222,21 @@ def _warmup() -> None:
                     print(f"[warmup] reranker loaded on {_rr_device}", flush=True)
                 except Exception as _exc:
                     print(f"[warmup] reranker skipped: {_exc}", flush=True)
-            # MLX chat-model prewarm (post-Ola-3 cutover, 2026-05-05): bajo
-            # RAG_LLM_BACKEND=mlx el primer /api/chat paga cold-load
-            # (~60-80s qwen2.5:7b 4-bit MPS). Cargar acá mueve la latencia
-            # fuera del path user-facing. Override: RAG_MLX_NO_PREWARM=1.
+            # MLX chat-model prewarm (post-Ola-3 cutover, 2026-05-05):
+            # opt-in only. The idle baseline must not pin ~5GB of Metal
+            # memory just because the dashboard is open. Operators that
+            # prefer hot chat startup can set RAG_MLX_PREWARM=1; the legacy
+            # negative override RAG_MLX_NO_PREWARM=1 still wins.
+            _mlx_prewarm = os.environ.get(
+                "RAG_MLX_PREWARM", "",
+            ).strip().lower() in ("1", "true", "yes")
+            _mlx_no_prewarm = os.environ.get(
+                "RAG_MLX_NO_PREWARM", "",
+            ).strip().lower() in ("1", "true", "yes")
             if (
                 os.environ.get("RAG_LLM_BACKEND", "mlx").strip().lower() == "mlx"
-                and os.environ.get("RAG_MLX_NO_PREWARM", "").strip() in ("", "0", "false", "no")
+                and _mlx_prewarm
+                and not _mlx_no_prewarm
             ):
                 try:
                     from rag.llm_backend import get_backend as _get_bk
@@ -238,7 +252,14 @@ def _warmup() -> None:
                         )
                 except Exception as _exc:
                     print(f"[warmup] mlx chat prewarm skipped: {_exc}", flush=True)
-            if os.environ.get("RAG_LOCAL_EMBED", "").strip() not in ("", "0", "false", "no"):
+            _local_embed_prewarm = os.environ.get(
+                "RAG_WEB_LOCAL_EMBED_PREWARM", "1",
+            ).strip().lower() not in ("0", "false", "no")
+            if (
+                os.environ.get("RAG_LOCAL_EMBED", "").strip()
+                not in ("", "0", "false", "no")
+                and _local_embed_prewarm
+            ):
                 try:
                     # `_warmup_local_embedder()` es el único helper que, además
                     # de cargar el modelo y hacer un dummy encode, setea el
@@ -256,6 +277,12 @@ def _warmup() -> None:
                         print("[warmup] bge-m3 local embedder skipped (load/encode failed)", flush=True)
                 except Exception as _exc:
                     print(f"[warmup] local embed skipped: {_exc}", flush=True)
+            elif os.environ.get("RAG_LOCAL_EMBED", "").strip() not in ("", "0", "false", "no"):
+                print(
+                    "[warmup] local embedder prewarm skipped "
+                    "(RAG_WEB_LOCAL_EMBED_PREWARM=0)",
+                    flush=True,
+                )
             # Drain any conversation turns that failed to persist on previous
             # runs (transient SQL busy / disk full / etc). Best-effort;
             # survivors stay in the file for the next startup.
@@ -266,21 +293,20 @@ def _warmup() -> None:
                           flush=True)
             except Exception as _exc:
                 print(f"[warmup] conversation-turn retry failed: {_exc}", flush=True)
-            # Pre-warm followup_aging cache (2026-04-30 + 2026-05-01).
+            # Hydrate followup_aging cache (2026-04-30 + 2026-05-01).
             # Cold path real medido: ~9 min (find_followup_loops + LLM-judge
-            # por cada uno de ~95 open loops). Pagar ESO en cada restart del
-            # web server era inaceptable.
+            # por cada uno de ~95 open loops) y carga el chat model en
+            # MLX/Metal. Pagar ESO en cada restart del web server es
+            # inaceptable para el baseline idle.
             #
             # Strategy en 2 fases:
             #   1. Si hay un payload fresh (<24h) en disk, hidratá in-memory
             #      desde ahí — instant. Cubre el caso "kickstart después de
             #      sesión normal" donde el cache anterior sigue siendo válido.
-            #   2. Si no hay payload fresh en disk, dispará el cold compute
-            #      en bg (esto sigue tomando ~9min para vault grande). Hasta
-            #      que termine, el primer request al panel ve `None` — no
-            #      peor que pre-fix, pero ahora el resultado SE PERSISTE
-            #      al disk al terminar, así que el próximo restart ya
-            #      hidrata sin pagar el costo.
+            #   2. Si no hay payload fresh en disk, no computar por default.
+            #      `RAG_WEB_FOLLOWUP_AGING_COMPUTE=1` restaura el cold compute
+            #      para instalaciones que prefieren pagar memoria/latencia a
+            #      cambio de tener ese panel siempre fresco.
             try:
                 hydrated = _ws._followup_aging_hydrate_from_disk_if_needed()
                 if hydrated:
@@ -290,7 +316,7 @@ def _warmup() -> None:
                         f"age={int(time.time() - _ws._FOLLOWUP_AGING_CACHE['ts'])}s)",
                         flush=True,
                     )
-                else:
+                elif _ws._followup_aging_web_compute_enabled():
                     t0_fw = time.time()
                     _compute_followup_aging_result = _ws._compute_followup_aging()
                     if _compute_followup_aging_result is not None:
@@ -308,6 +334,12 @@ def _warmup() -> None:
                             f"+ persisted to disk",
                             flush=True,
                         )
+                else:
+                    print(
+                        "[warmup] followup_aging cold compute skipped "
+                        "(RAG_WEB_FOLLOWUP_AGING_COMPUTE=0)",
+                        flush=True,
+                    )
             except Exception as _exc:
                 print(f"[warmup] followup_aging pre-warm failed: {_exc}", flush=True)
         except Exception:
@@ -338,6 +370,8 @@ def _warmup() -> None:
         _block_embed_str not in ("0", "false", "no")
         and os.environ.get("RAG_LOCAL_EMBED", "").strip()
             not in ("", "0", "false", "no")
+        and os.environ.get("RAG_WEB_LOCAL_EMBED_PREWARM", "1").strip().lower()
+            not in ("0", "false", "no")
     ):
         try:
             from rag import _local_embedder_ready

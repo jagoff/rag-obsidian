@@ -162,7 +162,7 @@ FM_SEARCHABLE_FIELDS = ("area", "cancion", "familia", "estado", "periodo", "crea
 
 def clean_md(text: str) -> str:
     """Remove YAML frontmatter, convert wiki-links to plain text."""
-    text = re.sub(r"^---\n.*?\n---\n", "", text, flags=re.DOTALL)
+    text = re.sub(r"^---\r?\n.*?\r?\n---\r?\n", "", text, flags=re.DOTALL)
     text = re.sub(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]", r"\1", text)
     return text.strip()
 

@@ -337,11 +337,11 @@ def archive_dead_notes(
             stem = Path(dst_rel).stem
             suffix = Path(dst_rel).suffix
             parent_rel = str(Path(dst_rel).parent)
+            _tag = datetime.now().strftime("%Y-%m")
             for i in range(2, 50):
-                datetime.now().strftime("%Y-%m")
                 candidate = (
-                    f"{parent_rel}/{stem}-{i}{suffix}" if parent_rel != "."
-                    else f"{stem}-{i}{suffix}"
+                    f"{parent_rel}/{stem}-{_tag}-{i}{suffix}" if parent_rel != "."
+                    else f"{stem}-{_tag}-{i}{suffix}"
                 )
                 if candidate not in seen_dst and not (vault / candidate).exists():
                     dst_rel = candidate

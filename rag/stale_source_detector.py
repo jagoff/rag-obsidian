@@ -156,6 +156,8 @@ def stale_source_hint(
     NO para reemplazarlo.
     """
     vp = vault or _rag.VAULT_PATH
+    if vp is None:
+        return None
     hits = find_stale_matches(query, vp, min_overlap=min_overlap)
     if not hits:
         return None

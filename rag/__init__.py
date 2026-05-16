@@ -19500,11 +19500,29 @@ def find_contradictions_for_note(
         return []
     from rag.llm_backend import strip_think_blocks
     helper_raw = strip_think_blocks(helper_raw)
-    m = re.search(r"\{.*\}", helper_raw, re.DOTALL)
-    if not m:
+    # Bug B fix (2026-05-15): usar balanced bracket scan en lugar de regex greedy.
+    # re.search(r"\{.*\}", re.DOTALL) con greedy .* matchea desde el primer '{'
+    # hasta el ÚLTIMO '}' del string completo, lo que funciona cuando el LLM
+    # no emite texto posterior al JSON pero falla si hay caracteres extra al final
+    # que producen JSON inválido. El scan de paréntesis balanceados extrae
+    # exactamente el primer objeto JSON completo, sin importar qué siga después.
+    _json_start = helper_raw.find("{")
+    if _json_start == -1:
+        return []
+    _depth = 0
+    _json_end = -1
+    for _i, _ch in enumerate(helper_raw[_json_start:], _json_start):
+        if _ch == "{":
+            _depth += 1
+        elif _ch == "}":
+            _depth -= 1
+            if _depth == 0:
+                _json_end = _i
+                break
+    if _json_end == -1:
         return []
     try:
-        data = json.loads(m.group(0))
+        data = json.loads(helper_raw[_json_start : _json_end + 1])
     except (json.JSONDecodeError, TypeError) as exc:
         # The followup audit explicitly flagged this: qwen2.5:3b used
         # to emit malformed JSON here, which silently dropped real
@@ -52817,10 +52835,37 @@ def _get_gliner_model():
         except Exception as exc:
             _gliner_load_failed = True
             _gliner_load_failed_ts = time.time()
-            try:
-                _silent_log("gliner_load_failed", exc)
-            except Exception:
-                pass
+            # Bug A fix (2026-05-15): distinguir "modelo no cacheado + HF_HUB_OFFLINE=1"
+            # del resto de fallos. En ese caso el mensaje de error genérico no ayuda;
+            # loguear instrucción específica de cómo cachear el modelo.
+            _model_cache = (
+                Path.home()
+                / ".cache"
+                / "huggingface"
+                / "hub"
+                / "models--urchade--gliner_multi-v2.1"
+            )
+            if (
+                os.environ.get("HF_HUB_OFFLINE") == "1"
+                and not _model_cache.exists()
+            ):
+                _hint = (
+                    "gliner model not in HF cache and HF_HUB_OFFLINE=1. "
+                    "Cache it once with: HF_HUB_OFFLINE=0 python -c "
+                    "\"from gliner import GLiNER; GLiNER.from_pretrained('urchade/gliner_multi-v2.1')\""
+                )
+                try:
+                    _silent_log("gliner_model_not_cached", Exception(_hint))
+                except Exception:
+                    pass
+                # Use a shorter sticky-fail TTL so we retry if HF_HUB_OFFLINE
+                # gets unset (e.g. operator downloads the model mid-session).
+                _gliner_load_failed_ts = time.time() - max(0.0, _GLINER_STICKY_FAIL_TTL_S - 60.0)
+            else:
+                try:
+                    _silent_log("gliner_load_failed", exc)
+                except Exception:
+                    pass
             _warn_feature_dep_once("entities", "gliner", reason="load_failed")
             return None
 

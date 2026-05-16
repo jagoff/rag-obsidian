@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from fastapi import HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 
 
 def health_check() -> dict:
@@ -76,11 +76,14 @@ def register_basic_routes(app, static_dir: Path) -> dict[str, object]:
     def home_page() -> FileResponse:
         return FileResponse(static_dir / "home.v2.html")
 
-    def home_v1_page() -> FileResponse:
-        return FileResponse(static_dir / "home.html")
+    def home_v1_page() -> RedirectResponse:
+        # home.html (pre-ESM) fue reemplazado completamente por home.v2.html + módulos ESM.
+        # /v1 redirige a / para no romper bookmarks existentes.
+        return RedirectResponse("/", status_code=301)
 
-    def home_v2_page() -> FileResponse:
-        return FileResponse(static_dir / "home.v2.html")
+    def home_v2_page() -> RedirectResponse:
+        # /v2 es alias permanente de /
+        return RedirectResponse("/", status_code=301)
 
     def chat_page() -> FileResponse:
         return FileResponse(static_dir / "index.html")
@@ -90,6 +93,9 @@ def register_basic_routes(app, static_dir: Path) -> dict[str, object]:
 
     def wa_page() -> FileResponse:
         return FileResponse(static_dir / "wa.html")
+
+    def scheduled_page() -> RedirectResponse:
+        return RedirectResponse("/dashboard#sec-wa-scheduled-card", status_code=307)
 
     def manifest() -> FileResponse:
         return FileResponse(
@@ -117,6 +123,7 @@ def register_basic_routes(app, static_dir: Path) -> dict[str, object]:
     app.get("/mirror")(mirror_page)
     app.get("/wa")(wa_page)
     app.get("/wzp")(wa_page)
+    app.get("/scheduled")(scheduled_page)
     app.get("/api/mirror")(api_mirror)
     app.get("/api/screen-capture/{obs_id}")(api_screen_capture)
     app.get("/api/mirror/insights")(api_mirror_insights)
@@ -131,6 +138,7 @@ def register_basic_routes(app, static_dir: Path) -> dict[str, object]:
         "chat_page": chat_page,
         "mirror_page": mirror_page,
         "wa_page": wa_page,
+        "scheduled_page": scheduled_page,
         "api_mirror": api_mirror,
         "api_screen_capture": api_screen_capture,
         "api_mirror_insights": api_mirror_insights,

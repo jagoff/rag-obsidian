@@ -980,16 +980,12 @@ _WEB_WORK_NUM_PREDICT = 768
 # en grounding, lo promocionamos a un knob user-facing en una segunda
 # pasada.
 #
-# NOTA (developer-1, 2026-04-25): la constante está definida pero el
-# wiring del critique pass al stream NO está aplicado todavía. El CLI
-# usa `run_parallel_post_process` post-stream con re-emisión condicional
-# del answer corregido — replicar eso en el endpoint web requiere
-# decidir UX (¿re-emitimos un `update` SSE event? ¿pre-buffereamos la
-# respuesta?) + propagar args (docs/metas/scores) al post-process. Es
-# >5 líneas de cambio + decisión de producto sobre el shape del SSE
-# stream, así que queda gateado por esta env var pero sin consumer
-# hasta que rag-llm valide el approach.
-_CRITIQUE_ENABLED = settings.critique_enabled
+# NOTA (developer-1, 2026-04-25): el wiring del critique pass al stream web
+# NO está aplicado todavía. El CLI usa `run_parallel_post_process` post-stream
+# con re-emisión condicional del answer corregido — replicar eso en el endpoint
+# web requiere decidir UX (¿re-emitimos un `update` SSE event? ¿pre-buffereamos
+# la respuesta?) + propagar args (docs/metas/scores) al post-process. Queda
+# pendiente hasta que rag-llm valide el approach en el CLI primero.
 
 
 # Side-effect action routes live in web.action_routes.
@@ -2614,7 +2610,7 @@ class _WAToneShiftRequest(BaseModel):
 
 
 @app.post("/api/wa/tone-shift")
-def wa_tone_shift(req: _WAToneShiftRequest) -> dict:
+async def wa_tone_shift(req: _WAToneShiftRequest) -> dict:
     """Reescribe `text` en `tone` vía qwen2.5:3b MLX. Cache por
     (text, tone) — re-pegar entre tonos es instant para back/forward.
 
@@ -2632,7 +2628,7 @@ def wa_tone_shift(req: _WAToneShiftRequest) -> dict:
             status_code=400,
             detail="tone debe ser formal|casual|short|warm",
         )
-    result = _wa_tone.shift_tone(text, tone)
+    result = await asyncio.to_thread(_wa_tone.shift_tone, text, tone)
     if result is None:
         raise HTTPException(status_code=500, detail="tone-shift failed")
     return result
@@ -2645,7 +2641,7 @@ class _WATranslateRequest(BaseModel):
 
 
 @app.post("/api/wa/translate")
-def wa_translate(req: _WATranslateRequest) -> dict:
+async def wa_translate(req: _WATranslateRequest) -> dict:
     """Traduce un mensaje al español rioplatense vía qwen2.5:3b MLX
     in-process. Cache por `(msg_id, target)` — re-pegar al mismo
     msg_id devuelve cached instant.
@@ -2661,7 +2657,8 @@ def wa_translate(req: _WATranslateRequest) -> dict:
 
     if not (req.content or "").strip():
         raise HTTPException(status_code=400, detail="content requerido")
-    result = _wa_tr.translate(
+    result = await asyncio.to_thread(
+        _wa_tr.translate,
         req.content,
         msg_id=(req.msg_id or "").strip(),
         target=(req.target or "es-AR").strip(),
@@ -3894,22 +3891,8 @@ async def wa_avatar(jid: str, name: str | None = None):
     )
 
 
-@app.get("/api/wa/voice/transcript/{message_id}")
-def wa_voice_transcript(message_id: str, jid: str) -> dict:
-    """Transcribe (o devuelve cacheado) un voice note inbound de WA.
-
-    Pipeline:
-      1. Cache lookup en `rag_wa_voice_transcripts` por `message_id`.
-      2. Si no hay, resuelve el media via bridge (mismo path que
-         `/api/wa/media/{id}`) y corre `transcribe_audio()` (whisper MLX).
-      3. Persiste cache + (best-effort) escribe nota .md al vault bajo
-         `99-obsidian/99-AI/external-ingest/whatsapp-voice/<jid>/...` para
-         que el indexer del vault la levante y entre al corpus.
-      4. Devuelve `{ok, text, language, duration_s, cached}`.
-
-    Errores se cachean también (fila con `error` set) para no martillar
-    whisper en loop sobre audios que no se pueden decodificar.
-    """
+def _wa_voice_transcript_impl(message_id: str, jid: str) -> dict:
+    """Implementación sync de wa_voice_transcript (ejecutada en thread)."""
     import sqlite3 as _sqlite3  # noqa: PLC0415
 
     from rag.integrations.whatsapp import (  # noqa: PLC0415
@@ -3918,11 +3901,7 @@ def wa_voice_transcript(message_id: str, jid: str) -> dict:
         fetch as _wa_fetch,
     )
     import rag as _rag  # noqa: PLC0415
-
-    if not jid or "@" not in jid:
-        raise HTTPException(status_code=400, detail="jid inválido")
-    if not message_id:
-        raise HTTPException(status_code=400, detail="message_id requerido")
+    from fastapi import HTTPException as _HTTPException  # noqa: PLC0415
 
     # 1) cache lookup.
     cached = _db_local.get_voice_transcript(message_id)
@@ -3961,7 +3940,7 @@ def wa_voice_transcript(message_id: str, jid: str) -> dict:
     # 2) resolve media (mismo flujo que /api/wa/media).
     db_path = _rag.WHATSAPP_DB_PATH
     if not db_path.is_file():
-        raise HTTPException(status_code=503, detail="bridge DB no disponible")
+        raise _HTTPException(status_code=503, detail="bridge DB no disponible")
     try:
         con = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
         row = con.execute(
@@ -3971,12 +3950,12 @@ def wa_voice_transcript(message_id: str, jid: str) -> dict:
         ).fetchone()
         con.close()
     except _sqlite3.Error:
-        raise HTTPException(status_code=500, detail="error leyendo bridge DB")
+        raise _HTTPException(status_code=500, detail="error leyendo bridge DB")
     if not row or not row[0]:
-        raise HTTPException(status_code=404, detail="media no encontrada")
+        raise _HTTPException(status_code=404, detail="media no encontrada")
     filename, media_type, sender_raw, audio_ts = row
     if (media_type or "").lower() != "audio":
-        raise HTTPException(status_code=400, detail="el mensaje no es audio")
+        raise _HTTPException(status_code=400, detail="el mensaje no es audio")
 
     path = _wa_fetch._bridge_media_path(jid, filename)
     if path is None or not path.is_file():
@@ -3986,7 +3965,7 @@ def wa_voice_transcript(message_id: str, jid: str) -> dict:
         except _bc.BridgeError:
             path = None
     if path is None or not path.is_file():
-        raise HTTPException(status_code=404, detail="media no descargada")
+        raise _HTTPException(status_code=404, detail="media no descargada")
 
     # 3) transcribe.
     from rag.whisper import transcribe_audio  # noqa: PLC0415
@@ -4037,6 +4016,26 @@ def wa_voice_transcript(message_id: str, jid: str) -> dict:
         "duration_s": duration_s,
         "model": model,
     }
+
+
+@app.get("/api/wa/voice/transcript/{message_id}")
+async def wa_voice_transcript(message_id: str, jid: str) -> dict:
+    """Transcribe (o devuelve cacheado) un voice note inbound de WA.
+
+    Pipeline:
+      1. Cache lookup en `rag_wa_voice_transcripts` por `message_id`.
+      2. Si no hay, resuelve el media via bridge y corre `transcribe_audio()` (whisper MLX).
+      3. Persiste cache + escribe nota .md al vault.
+      4. Devuelve `{ok, text, language, duration_s, cached}`.
+
+    La transcripción (whisper MLX, ~1-10s) corre en thread separado para no bloquear
+    el event loop de FastAPI.
+    """
+    if not jid or "@" not in jid:
+        raise HTTPException(status_code=400, detail="jid inválido")
+    if not message_id:
+        raise HTTPException(status_code=400, detail="message_id requerido")
+    return await asyncio.to_thread(_wa_voice_transcript_impl, message_id, jid)
 
 
 @app.post("/api/wa/typing", dependencies=[Depends(_require_admin_token)])
@@ -4342,7 +4341,7 @@ class MailSummaryRequest(BaseModel):
 
 
 @app.post("/api/mail/summary")
-def mail_summary(req: MailSummaryRequest) -> dict:
+async def mail_summary(req: MailSummaryRequest) -> dict:
     """Fetch + LLM-summarize de mails matching `query` en los últimos N días.
 
     Game Changer GC3.3 (2026-05-09): tool nueva del Mac CLI universal por
@@ -4351,6 +4350,9 @@ def mail_summary(req: MailSummaryRequest) -> dict:
 
     Read-only sobre Gmail (no manda nada). Sin auth — read paths abiertos
     por design (CLAUDE.md). Rate-limit estándar de chat bucket.
+
+    Las N llamadas a Gmail API (threads.get) se hacen en paralelo via
+    asyncio.gather para reducir latencia de ~2-5s a ~200ms.
     """
     try:
         from rag.integrations.gmail import _gmail_service
@@ -4358,7 +4360,7 @@ def mail_summary(req: MailSummaryRequest) -> dict:
     except ImportError as e:
         raise HTTPException(status_code=500, detail=f"gmail integration unavailable: {e}") from e
 
-    svc = _gmail_service()
+    svc = await asyncio.to_thread(_gmail_service)
     if svc is None:
         raise HTTPException(status_code=503, detail="Gmail no autenticado (falta ~/.gmail-mcp/credentials.json o token caducado)")
 
@@ -4370,23 +4372,29 @@ def mail_summary(req: MailSummaryRequest) -> dict:
         full_q = f"({user_q}) {full_q}"
 
     try:
-        r = svc.users().threads().list(
-            userId="me", q=full_q, maxResults=max(1, min(int(req.max_items), 30)),
-        ).execute()
+        r = await asyncio.to_thread(
+            lambda: svc.users().threads().list(
+                userId="me", q=full_q, maxResults=max(1, min(int(req.max_items), 30)),
+            ).execute()
+        )
         threads = r.get("threads", []) or []
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"gmail API failed: {str(e)[:200]}") from e
 
-    items: list[dict] = []
-    for th in threads:
-        meta = _gmail_thread_last_meta(svc, th.get("id") or "")
-        if meta:
-            items.append({
-                "subject": meta["subject"],
-                "from": meta["from"],
-                "snippet": meta["snippet"],
-                "thread_id": th.get("id"),
-            })
+    # Fetch metadata en paralelo — antes era N llamadas serializadas (~200ms × N = 2-5s).
+    metas = await asyncio.gather(*[
+        asyncio.to_thread(_gmail_thread_last_meta, svc, th.get("id") or "")
+        for th in threads
+    ])
+    items: list[dict] = [
+        {
+            "subject": m["subject"],
+            "from": m["from"],
+            "snippet": m["snippet"],
+            "thread_id": threads[i].get("id"),
+        }
+        for i, m in enumerate(metas) if m
+    ]
 
     if not items:
         return {"summary": "No encontré mails que matcheen.", "count": 0, "items": []}
@@ -4401,16 +4409,20 @@ def mail_summary(req: MailSummaryRequest) -> dict:
         f"- De: {it['from']} | Asunto: {it['subject']} | Snippet: {it['snippet']}"
         for it in items
     )
-    try:
-        resp = _summary_client().chat(
-            model=HELPER_MODEL,
-            messages=[{"role": "user", "content": prompt + mails_block}],
-            options={**HELPER_OPTIONS, "num_predict": 600, "num_ctx": 4096},
-            keep_alive=LLM_KEEP_ALIVE,
-        )
-        summary = (resp.message.content or "").strip()
-    except Exception as e:
-        summary = f"(no se pudo resumir, mails crudos abajo)\n{mails_block[:1000]}"
+
+    def _do_llm_summary() -> str:
+        try:
+            resp = _summary_client().chat(
+                model=HELPER_MODEL,
+                messages=[{"role": "user", "content": prompt + mails_block}],
+                options={**HELPER_OPTIONS, "num_predict": 600, "num_ctx": 4096},
+                keep_alive=LLM_KEEP_ALIVE,
+            )
+            return (resp.message.content or "").strip()
+        except Exception:
+            return f"(no se pudo resumir, mails crudos abajo)\n{mails_block[:1000]}"
+
+    summary = await asyncio.to_thread(_do_llm_summary)
 
     return {
         "summary": summary,
@@ -4487,7 +4499,7 @@ def mail_send(req: MailSendRequest, request: Request) -> dict:
 
 
 @app.get("/api/dossier")
-def get_dossier(name: str, days: int = 30, max_messages: int = 30) -> dict:
+async def get_dossier(name: str, days: int = 30, max_messages: int = 30) -> dict:
     """Devuelve el dossier multi-source de un contacto (on-demand).
 
     Game Changer GC6 (2026-05-09): wireup HTTP del `generate_dossier()`
@@ -4519,7 +4531,8 @@ def get_dossier(name: str, days: int = 30, max_messages: int = 30) -> dict:
         raise HTTPException(status_code=500, detail=f"dossier module unavailable: {e}") from e
 
     try:
-        result = generate_dossier(
+        result = await asyncio.to_thread(
+            generate_dossier,
             contact_name=name,
             days=days,
             max_messages=max_messages,
@@ -19291,7 +19304,7 @@ def _build_diagnose_error_prompt(req: _DiagnoseErrorRequest) -> str:
 
 
 @app.post("/api/diagnose-error")
-def diagnose_error(req: _DiagnoseErrorRequest, request: Request) -> StreamingResponse:
+async def diagnose_error(req: _DiagnoseErrorRequest, request: Request) -> StreamingResponse:
     """SSE streaming del LLM con el diagnóstico del error.
 
     Rate-limited (mismo bucket que /api/chat). El SSE emite eventos:

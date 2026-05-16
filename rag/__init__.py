@@ -1615,878 +1615,38 @@ if not os.environ.get("RAG_LOOKUP_MODEL", "").strip():
 # Chat model preference: first available wins. `RAG_CHAT_MODEL` override
 # tiene prioridad — ver `resolve_chat_model()`. Orden tras bench 2026-04-18
 # (5 queries × 2 runs warm, rerank_pool default, num_ctx=4096):
+#   qwen3:30b-a3b  — total P50 7.6s (MoE 3B activos, best quality, 18 GB)
 #   qwen2.5:7b     — total P50 5.9s, best 3.2s (dense, Q4_K_M, 4.7 GB)
-#   qwen3:30b-a3b  — total P50 7.6s (MoE 3B activos, buena quality, 18 GB)
 #   command-r:35b  — total P50 37s (RAG-trained pero prefill+decode 10x slower)
 CHAT_MODEL_PREFERENCE = (
-    "qwen2.5:7b",
     "qwen3:30b-a3b",
+    "qwen2.5:7b",
     "command-r:latest",
     "qwen2.5:14b",
     "phi4:latest",
 )
 _COLLECTION_BASE = "obsidian_notes_v12"  # v12: 1024-dim, qwen3-embedding:0.6b + pre-split chunker (2026-05-06): líneas >1500 chars se splittean antes del embed → invalida cache v11 (chunks con shape distinta post-split)
 
-# ── Cross-source corpus (Phase 1, 2026-04-20 user decisions §10) ──────────
-# The collection stays at v11 (no rename / no re-embed) — source discrimination
-# is done purely via a new `source` metadata field with "vault" as the
-# default for backward compat. Old chunks without `source` are read as
-# "vault" throughout the pipeline (see meta.get("source") or "vault").
-#
-# The actual ingest paths (WhatsApp, Gmail, Calendar, Reminders) register
-# non-vault sources and set `source` explicitly in their metadata. Retrieval
-# applies a per-source weight + recency decay in `apply_weighted_scores`
-# so non-vault chunks can be surfaced in the same pool without re-calibrating
-# the core reranker.
-#
-# OAuth Google is used for Gmail + Calendar per user override — this breaks
-# the "no cloud calls" invariant declared at the top of CLAUDE.md. Tracked
-# in docs/design-cross-source-corpus.md §10.6.
-VALID_SOURCES: frozenset[str] = frozenset(
-    {"vault", "memory", "calendar", "gmail", "whatsapp", "reminders", "messages",
-     "contacts", "calls", "safari", "drive", "pillow", "finances", "health"}
+# Cross-source retrieval scoring and filters extracted to rag.retrieval_scoring
+# (modular split 2026-05-15). Re-export keeps the historical `rag.*` API while
+# the dependency hooks keep tests monkeypatching `rag.DB_PATH`, filter cache, and
+# `_MMR_SNIPPET_CHARS` working through the facade.
+import rag.retrieval_scoring as _retrieval_scoring_mod  # noqa: E402
+from rag.retrieval_scoring import *  # noqa: E402, F401, F403
+
+_retrieval_scoring_mod.configure_retrieval_scoring(
+    db_path=lambda: DB_PATH,
+    silent_log=lambda where, exc: globals()["_silent_log"](where, exc),
+    get_cross_source_filters_cache=lambda: globals()["_CROSS_SOURCE_FILTERS_CACHE"],
+    set_cross_source_filters_cache=lambda value: globals().__setitem__(
+        "_CROSS_SOURCE_FILTERS_CACHE", value,
+    ),
+    get_cross_source_filters_mtime=lambda: globals()["_CROSS_SOURCE_FILTERS_MTIME"],
+    set_cross_source_filters_mtime=lambda value: globals().__setitem__(
+        "_CROSS_SOURCE_FILTERS_MTIME", value,
+    ),
+    mmr_snippet_chars=lambda: globals()["_MMR_SNIPPET_CHARS"],
 )
-# `pillow` (iOS sleep tracker) tiene un ingester propio en
-# `rag index --source pillow`. Sus datos viven en `rag_sleep_sessions`
-# (no en el corpus vectorial), pero la source figura en VALID_SOURCES
-# para mantener paridad con `CONFIDENCE_RERANK_MIN_PER_SOURCE` (audit
-# de invariantes, ver `test_threshold_helper_all_sources_covered`).
-
-# Per-source weight applied multiplicatively to the final rerank+feature
-# score. Vault stays at 1.00 so the default path is a no-op; anything
-# non-vault gets softly down-weighted to reflect editorial trust.
-SOURCE_WEIGHTS: dict[str, float] = {
-    "vault":     1.00,
-    "contacts":  0.95,   # editorial trust — user-curated metadata
-    "calendar":  0.95,
-    "memory":    0.90,   # memo facts/decisions/gotchas — curated by the agent,
-                         # softly down-weighted so user-authored vault notes win ties
-                         # on queries that match both. See feedback-loop guard in
-                         # `is_excluded()` rationale.
-    "reminders": 0.90,
-    "gmail":     0.85,
-    "drive":     0.85,   # Docs/Sheets/Slides: user-authored, high trust like email
-    "finances":  0.85,   # PDFs de resúmenes de tarjeta + Excels de movimientos: oficial
-    "safari":    0.80,   # browsing signal: rich titles + URLs, same band as calls
-    "calls":     0.80,   # log entries: factual but semantically thin
-    "whatsapp":  0.75,
-    "messages":  0.75,
-    # `pillow` (iOS sleep tracker, despachado en `rag index --source pillow`):
-    # los datos viven en `rag_sleep_sessions` (no escriben chunks al corpus
-    # vectorial), pero la entry queda acá para mantener paridad con
-    # `VALID_SOURCES` + `CONFIDENCE_RERANK_MIN_PER_SOURCE`. Weight nominal
-    # 0.50 — defensivo si por algún motivo escribiera chunks (no debería).
-    "pillow":    0.50,
-    # `health` (Apple Health export.xml, despachado en `rag index --source health`):
-    # los datos viven en `rag_apple_health_daily` (no escriben chunks al corpus
-    # vectorial), pero la entry queda acá para mantener paridad con
-    # `VALID_SOURCES`. Weight nominal 0.50 — defensivo.
-    "health":    0.50,
-}
-
-# Recency half-life per source, in days. None → no decay applied (chunks
-# from this source are ranked purely on semantic match + static weight).
-# A halflife of H days means a chunk aged H days old gets scored at 0.5×
-# its fresh value via recency_boost_for_source(); 2H days → 0.25×, etc.
-# Rationale per source (from §4.2 of the design doc):
-#   - vault / calendar / contacts: people/events/notes don't age, skip decay
-#   - gmail / reminders: mid-term — a 6-month old email is context, not noise
-#   - whatsapp / messages / calls: conversational — a 2-month-old trace rarely matters
-SOURCE_RECENCY_HALFLIFE_DAYS: dict[str, float | None] = {
-    "vault":     None,
-    "memory":    None,   # curated knowledge — no temporal decay
-    "contacts":  None,
-    "calendar":  None,
-    "reminders":   90.0,
-    "gmail":      180.0,
-    "drive":       90.0,   # Google Docs age between email (180d) and chat (30d)
-    "finances":   180.0,   # resúmenes de tarjeta relevantes ~6 meses
-    "safari":      90.0,   # browsing context ages mid-term
-    # WhatsApp/Messages/Calls bumpeados de 30→60 días (audit 2026-04-25
-    # R2-Cross-source #5). 30d era muy agresivo: una conversación de
-    # hace 31 días caía a 0.5× del peso, perdiendo contra notas viejas
-    # del vault aunque fuera más relevante. Caso real del audit:
-    # "qué dijo X sobre Y" devolvía nota vault de hace 90d en lugar de
-    # un WA de hace 35d (mismo tema, más reciente). 60d half-life
-    # mantiene la decadencia conversacional pero da más margen.
-    "whatsapp":    60.0,
-    "messages":    60.0,
-    "calls":       60.0,
-    # `pillow`: no aplica recency decay porque no escribe chunks al corpus.
-    # Entry presente para coverage del `set(SOURCE_RECENCY_HALFLIFE_DAYS) == VALID_SOURCES`.
-    "pillow":     None,
-}
-
-# Retention windows per source, in days. None → keep forever. Used at
-# INGEST time (the ingester drops rows older than this) + as a hard
-# upper bound for the cleanup path. Notes aren't touched by this
-# (vault retention is manual).
-SOURCE_RETENTION_DAYS: dict[str, int | None] = {
-    "vault":     None,
-    "memory":    None,   # never auto-purge memo entries
-    "contacts":  None,
-    "calendar":  None,
-    "reminders": None,
-    "gmail":      365,
-    "drive":      365,   # user's Drive docs — keep a year like email
-    "finances":   None,   # documentos financieros útiles histórico
-    "safari":     180,
-    "whatsapp":   180,
-    "messages":   180,
-    "calls":      180,
-    # `pillow`: el ingester maneja su propio retention sobre `rag_sleep_sessions`.
-    # Acá None para coverage del set check.
-    "pillow":     None,
-}
-
-
-def normalize_source(value: object, *, default: str = "vault") -> str:
-    """Return a valid source string, falling back to `default` on anything
-    that isn't in `VALID_SOURCES`. Used wherever we read `meta.get("source")`
-    from possibly-legacy metadata."""
-    if isinstance(value, str) and value in VALID_SOURCES:
-        return value
-    return default
-
-
-# Path-prefix discriminator: chunks whose vault-relative path starts with
-# `99-obsidian/99-AI/memory/` belong to the agent-curated
-# memo. They get `source="memory"` (weight=0.90) instead of
-# `source="vault"` (weight=1.00), so user-authored notes win ties on
-# overlapping queries. The carve-out exists because memo entries
-# describe THE SYSTEM ITSELF (bug patterns, decisions, gotchas) and were
-# previously dominating retrieval at >50% of top-k for technical queries.
-# See `is_excluded()` for why memories stay indexed at all.
-_MEMORY_PATH_PREFIX = "99-obsidian/99-AI/memory/"
-
-
-def _infer_vault_source(rel_path: str) -> str:
-    """`memory` for memo entries, `vault` otherwise. Called from the
-    indexer (`_index_single_file` + the rglob path in `_run_index`) so the
-    discriminator is set at write time. Cheap path-prefix check."""
-    return "memory" if (rel_path or "").startswith(_MEMORY_PATH_PREFIX) else "vault"
-
-
-def source_weight(source: str) -> float:
-    """Per-source multiplier applied to the final score. Unknown source →
-    0.50 (half the vault baseline, same band as messages/whatsapp) — this
-    is defensive and should never hit in practice since `normalize_source`
-    filters unknowns upstream."""
-    return SOURCE_WEIGHTS.get(source, 0.50)
-
-
-def source_recency_multiplier(
-    source: str, created_ts: float | str | None, *, now: float | None = None,
-) -> float:
-    """Exponential decay multiplier in [0, 1] based on the per-source
-    halflife. Returns 1.0 for sources with no halflife configured or when
-    `created_ts` is missing/unparseable. `created_ts` accepts epoch seconds
-    (float) or ISO-8601 string (matches the format used everywhere else in
-    the metadata).
-    """
-    halflife = SOURCE_RECENCY_HALFLIFE_DAYS.get(source)
-    if halflife is None or halflife <= 0:
-        return 1.0
-    if created_ts is None:
-        return 1.0
-    try:
-        if isinstance(created_ts, (int, float)):
-            ts_epoch = float(created_ts)
-        else:
-            # Accept ISO-8601 with or without timezone; naive → assume local.
-            s = str(created_ts)
-            dt = datetime.fromisoformat(s.replace("Z", "+00:00") if s.endswith("Z") else s)
-            if dt.tzinfo is not None:
-                dt = dt.astimezone().replace(tzinfo=None)
-            ts_epoch = dt.timestamp()
-    except (TypeError, ValueError):
-        return 1.0
-    now_epoch = now if now is not None else time.time()
-    age_days = max(0.0, (now_epoch - ts_epoch) / 86400.0)
-    # 2 ** -(age / halflife) → 1.0 at age=0, 0.5 at age=halflife, 0.25 at 2×halflife
-    import math as _math
-    return float(_math.pow(2.0, -(age_days / halflife)))
-
-
-# ── Quick Win #3: recency boost dinámico por intent (2026-05-04) ────────────
-# Capa de modifiers ENCIMA de SOURCE_RECENCY_HALFLIFE_DAYS. La idea: queries
-# time-sensitive ("qué hago mañana", "próximo turno", "hoy") quieren un boost
-# muchísimo más fuerte de notas recientes que queries históricas ("qué
-# hablamos el año pasado", "cuando estaba en Grecia"). En vez de tunear los
-# halflifes globales — que afectan al pipeline entero — clasificamos la
-# query como recent / historical / neutral y multiplicamos el halflife
-# default por un factor:
-#
-#   recent      → halflife × 0.3  (decay 3.3× más rápido → boost agresivo)
-#   historical  → halflife × 3.0  (decay 3× más lento → notas viejas siguen
-#                                  jugando)
-#   neutral     → halflife × 1.0  (no-op, comportamiento histórico)
-#
-# Un halflife None (vault, calendar, contacts) queda None siempre — no tiene
-# sentido decaer notas que no tienen edad relevante (un evento de calendar
-# es atemporal hasta que el filtro temporal lo selecciona).
-#
-# Detector regex-puro, case-insensitive, español + inglés, determinístico,
-# 0% LLM. Patterns ordenados de más específico a más general.
-
-_TEMPORAL_INTENT_RECENT_RE = re.compile(
-    r"\b(?:"
-    # Español temporal cercano
-    r"pr[oó]xim[oa]s?|"                       # próximo / próxima / próximos
-    r"cu[aá]ndo|"                              # cuándo (no "cuando estaba/iba")
-    r"ma[ñn]ana|"                              # mañana
-    r"hoy|"                                    # hoy
-    r"ayer|"                                   # ayer (cercano, contextual)
-    r"esta\s+semana|"                          # esta semana
-    r"este\s+mes|"                             # este mes
-    r"esta\s+tarde|esta\s+noche|"             # esta tarde / esta noche
-    r"ahora(?:\s+mismo)?|"                     # ahora / ahora mismo
-    r"pendiente(?:s)?|"                        # pendientes
-    r"sin\s+leer|"                             # sin leer (unread)
-    r"reciente(?:s|mente)?|"                   # reciente / recientes / recientemente
-    r"[uú]ltim[oa]s?|"                         # último / última / últimos
-    r"siguiente(?:s)?|"                        # siguiente / siguientes
-    # Inglés temporal cercano
-    r"next|"                                   # next (meeting, week, etc.)
-    r"upcoming|"                               # upcoming
-    r"tomorrow|"                               # tomorrow
-    r"today|"                                  # today
-    r"yesterday|"                              # yesterday
-    r"this\s+week|this\s+month|"              # this week / this month
-    r"this\s+afternoon|this\s+evening|"       # this afternoon / evening
-    r"right\s+now|"                            # right now
-    r"unread|"                                 # unread
-    r"latest|recent(?:ly)?|"                   # latest / recent / recently
-    r"current(?:ly)?"                          # current / currently
-    r")\b",
-    re.IGNORECASE,
-)
-
-# Para el patrón "próxima reunión / next meeting" pedimos co-ocurrencia con
-# un sustantivo conversacional/agenda — eso evita que "el próximo paso" en
-# notas de proyecto (sin tinte temporal) caiga en recent. NO obligatorio,
-# es un refuerzo: el regex de arriba ya cubre "próxima reunión" via "próxima"
-# stand-alone.
-
-_TEMPORAL_INTENT_HISTORICAL_RE = re.compile(
-    r"\b(?:"
-    # Español pasado lejano
-    r"el\s+a[ñn]o\s+pasado|"                   # el año pasado
-    r"a[ñn]o\s+pasado|"                        # año pasado
-    r"el\s+mes\s+pasado|mes\s+pasado|"        # el mes pasado / mes pasado
-    r"la\s+semana\s+pasada|semana\s+pasada|"  # la semana pasada
-    r"hace\s+(?:un|una|\d+|mucho|tanto)\s+|"  # hace X tiempo (un mes, 3 años, mucho)
-    r"hace\s+a[ñn]os|hace\s+meses|"           # hace años / hace meses
-    r"hace\s+rato|hace\s+tiempo|"             # hace rato / hace tiempo
-    r"antes\s+de|"                             # antes de
-    r"cuando\s+(?:estaba|era|viv[ií]a|trabajaba|estudiaba|estuve|fui|fuimos|tenia|ten[ií]a)|"  # cuando estaba/era/etc
-    r"hist[oó]ric[oa]s?|"                     # histórico / histórica
-    # Inglés pasado lejano
-    r"last\s+year|last\s+month|last\s+week|" # last year/month/week
-    r"\d+\s+(?:years?|months?|weeks?)\s+ago|" # X years ago
-    r"years?\s+ago|months?\s+ago|"            # years ago / months ago
-    r"a\s+long\s+time\s+ago|long\s+ago|"      # a long time ago
-    r"back\s+(?:in|when)|"                     # back in / back when
-    r"when\s+I\s+(?:was|lived|worked|studied|used\s+to)|"  # when I was/lived/worked
-    r"history\s+of|historical(?:ly)?|"        # history of / historical
-    r"in\s+the\s+past|"                        # in the past
-    r"previously"                              # previously
-    r")\b",
-    re.IGNORECASE,
-)
-
-# Multiplicadores per-intent. Default OFF significa "neutral" → 1.0 (no-op,
-# halflife sin cambios). Tuneables si los floors de eval lo justifican; los
-# valores actuales son conservadores (0.3 / 3.0) — un boost agresivo pero
-# acotado: un halflife de 60d en WA queda en 18d para recent, 180d para
-# historical (cabe la conversación de hace 6 meses sin colapsar a 0.5×).
-_INTENT_RECENCY_MULTIPLIERS: dict[str, float] = {
-    "recent":     0.3,
-    "historical": 3.0,
-    "neutral":    1.0,
-}
-
-
-@functools.lru_cache(maxsize=256)
-def _query_temporal_intent_cached(text: str) -> str:
-    """Pure inner — sólo el regex match. Determinístico, LRU 256."""
-    if _TEMPORAL_INTENT_HISTORICAL_RE.search(text):
-        return "historical"
-    if _TEMPORAL_INTENT_RECENT_RE.search(text):
-        return "recent"
-    return "neutral"
-
-
-def _query_temporal_intent(query: str) -> str:
-    """Clasifica la intent temporal de la query → recent | historical | neutral.
-
-    Regex puro, case-insensitive, español + inglés. Determinístico (misma
-    query → mismo intent siempre). Sin LLM, sin estado.
-
-    Reglas de precedencia:
-      1. Si matchea historical → "historical". Las pistas de pasado
-         distante son menos ambiguas que las de presente (el regex de
-         "hace X tiempo" o "el año pasado" no se confunde con prosa
-         neutra). Chequeamos primero para que "qué hablamos el año
-         pasado" no se confunda con "esta semana".
-      2. Si matchea recent → "recent".
-      3. Default → "neutral".
-
-    Empty / None / no-string input → "neutral" (defensivo, no rompe a
-    callers que olvidan validar).
-
-    Cache: LRU 256 sobre el inner — queries ya vistas vuelven en O(1)
-    sin re-evaluar 2 regex (~100-200µs por miss).
-    """
-    if not query or not isinstance(query, str):
-        return "neutral"
-    text = query.strip()
-    if not text:
-        return "neutral"
-    return _query_temporal_intent_cached(text)
-
-
-def source_recency_halflife_for_intent(
-    source: str, intent: str,
-) -> float | None:
-    """Halflife default per source ajustado por la intent temporal.
-
-    `None` halflife (vault, calendar, contacts) queda `None` SIEMPRE —
-    fuentes atemporales no tienen sentido decaer aunque la query pida
-    "lo más reciente".
-
-    Fallback defensivo:
-      - source desconocida → None (defer a `source_recency_multiplier`
-        cuyo lookup en SOURCE_RECENCY_HALFLIFE_DAYS también devuelve None).
-      - intent desconocido → multiplicador 1.0 (= halflife default).
-    """
-    base = SOURCE_RECENCY_HALFLIFE_DAYS.get(source)
-    if base is None:
-        return None
-    mult = _INTENT_RECENCY_MULTIPLIERS.get(intent, 1.0)
-    return base * mult
-
-
-def _intent_recency_enabled() -> bool:
-    """Gate del feature. Default ON desde 2026-05-04 (Quick Win #3).
-
-    Setear ``RAG_INTENT_RECENCY=0`` desactiva el wiring y `retrieve()`
-    cae al `source_recency_multiplier` legacy (sin ajuste por intent).
-    Útil para A/B contra el baseline cuando el eval gate se mueva y
-    haya que aislar la causa.
-    """
-    val = os.environ.get("RAG_INTENT_RECENCY", "").strip().lower()
-    return val not in ("0", "false", "no", "off")
-
-
-def source_recency_multiplier_with_intent(
-    source: str, created_ts: float | str | None, intent: str,
-    *, now: float | None = None,
-) -> float:
-    """Variante de `source_recency_multiplier` que respeta la intent
-    temporal de la query. Cuando el feature está apagado o el intent es
-    `neutral`, devuelve EXACTAMENTE lo mismo que `source_recency_multiplier`
-    (bit-idéntico — no introduce drift).
-
-    Usa `source_recency_halflife_for_intent` para decidir el halflife
-    efectivo y replica el cálculo de decay (epoch parsing + age en días
-    + `2 ** -(age/halflife)`) para no depender del `_*_HALFLIFE_DAYS`
-    global del módulo en este path.
-
-    Casos triviales (idénticos al legacy):
-      - halflife None (vault/calendar/contacts) → 1.0
-      - halflife <= 0 → 1.0
-      - created_ts None → 1.0
-      - parse error → 1.0
-    """
-    if not _intent_recency_enabled() or intent == "neutral":
-        return source_recency_multiplier(source, created_ts, now=now)
-    halflife = source_recency_halflife_for_intent(source, intent)
-    if halflife is None or halflife <= 0:
-        return 1.0
-    if created_ts is None:
-        return 1.0
-    try:
-        if isinstance(created_ts, (int, float)):
-            ts_epoch = float(created_ts)
-        else:
-            s = str(created_ts)
-            dt = datetime.fromisoformat(s.replace("Z", "+00:00") if s.endswith("Z") else s)
-            if dt.tzinfo is not None:
-                dt = dt.astimezone().replace(tzinfo=None)
-            ts_epoch = dt.timestamp()
-    except (TypeError, ValueError):
-        return 1.0
-    now_epoch = now if now is not None else time.time()
-    age_days = max(0.0, (now_epoch - ts_epoch) / 86400.0)
-    import math as _math
-    return float(_math.pow(2.0, -(age_days / halflife)))
-
-
-def _conv_dedup_window(
-    scored_pairs: list[tuple], *, window_s: float = 1800.0,
-) -> list[tuple]:
-    """Collapse WhatsApp (and `messages`) chunks within a time window
-    per `chat_jid`. Input: list of (candidate, expanded_text, score) tuples
-    sorted by score descending. Returns a filtered list preserving the
-    original order, dropping any WA/messages chunk whose `chat_jid`
-    already has a higher-scored representative within ±`window_s` of its
-    `first_ts`.
-
-    Rationale (design doc §3.3 option A): a single conversation can yield
-    5-10 adjacent chunks that all fire on the same query. Without dedup,
-    the top-k degenerates into "the same conversation shown 5 different
-    ways" and the LLM's context is filled with near-duplicates. Keeping
-    the top-scored chunk per conversation-window preserves granularity
-    ("the specific message where X said Y") while cutting noise.
-
-    Non-WA sources pass through unchanged — vault, calendar, gmail,
-    reminders either don't have this failure mode (vault is already deduped
-    by hash per file) or the window semantics don't apply (calendar events
-    are points in time, not windows).
-
-    Intentionally simple O(n²) scan per chat — the pool is capped at
-    ~RERANK_POOL_MAX so the constant factor is negligible (<1ms for 40
-    candidates).
-    """
-    if not scored_pairs:
-        return scored_pairs
-    # Per-chat: list of first_ts values already accepted. We compare each
-    # incoming WA candidate against these and skip if any is within window.
-    kept_by_chat: dict[str, list[float]] = {}
-    out: list[tuple] = []
-    for pair in scored_pairs:
-        candidate, expanded, score = pair
-        meta = candidate[1] if isinstance(candidate[1], dict) else {}
-        src = meta.get("source") or "vault"
-        # Only apply to conversational sources — WhatsApp today, SMS later.
-        if src not in ("whatsapp", "messages"):
-            out.append(pair)
-            continue
-        jid = meta.get("chat_jid") or meta.get("file") or ""
-        first_ts = meta.get("first_ts")
-        try:
-            first_ts = float(first_ts) if first_ts is not None else None
-        except (TypeError, ValueError):
-            first_ts = None
-        if not jid or first_ts is None:
-            # Missing metadata — can't dedup safely, keep the chunk.
-            out.append(pair)
-            continue
-        # Already accepted something in this chat within window?
-        accepted = kept_by_chat.get(jid, [])
-        if any(abs(first_ts - prior_ts) <= window_s for prior_ts in accepted):
-            continue
-        accepted.append(first_ts)
-        kept_by_chat[jid] = accepted
-        out.append(pair)
-    return out
-
-
-def _cross_source_dedup(
-    scored_pairs: list[tuple], *, jaccard_threshold: float = 0.7,
-) -> list[tuple]:
-    """Colapsa chunks de FUENTES DISTINTAS que cubren el mismo evento/decisión.
-
-    Caso real (audit 2026-04-25 R2-Cross-source #2): el user decide algo
-    en una nota del vault, lo confirma por mail, lo agenda en Calendar y
-    lo coordina por WhatsApp. Pre-fix el RAG devolvía los 4 chunks como
-    si fueran 4 evidencias separadas, llenando el contexto del LLM con
-    near-duplicates.
-
-    Algoritmo conservador: para cada par de pairs (i, j) con
-    ``source[i] != source[j]``, computa Jaccard de tokens (primeros
-    ~600 chars del expanded text, normalizados a lowercase + sin
-    puntuación). Si Jaccard >= ``jaccard_threshold``, mantiene SOLO
-    el pair de mayor score y descarta el otro.
-
-    Threshold default 0.7 (audit recomienda conservador): 2 chunks que
-    comparten 70% de tokens en sus primeros 600 chars son casi
-    seguramente la misma cosa. Bajo eso → false positives donde temas
-    relacionados pero distintos se colapsan.
-
-    Override via ``RAG_CROSS_SOURCE_DEDUP_THRESHOLD`` env var. Set a
-    1.0 para deshabilitar (escape hatch).
-
-    O(n²) en el pool — irrelevante porque el pool está capped a ~40.
-    """
-    threshold = float(os.environ.get(
-        "RAG_CROSS_SOURCE_DEDUP_THRESHOLD", str(jaccard_threshold),
-    ))
-    if threshold >= 1.0 or len(scored_pairs) < 2:
-        return scored_pairs
-
-    # Pre-compute token sets para cada pair. Usamos solo primeros 600
-    # chars: si 2 chunks comparten ese prefijo, son casi seguro la misma
-    # cosa, y reduce el costo del Jaccard.
-    def _tokenize(text: str) -> frozenset[str]:
-        # Lowercase + strip puntuación + split. Tokens de longitud >= 3
-        # para filtrar stopwords cortas (de, en, la, etc.) que generan
-        # match espurio.
-        s = (text or "")[:600].lower()
-        # Reemplazo simple de puntuación por espacios.
-        for p in ".,;:!?¿¡()[]{}\"'`-_/\\|*~":
-            s = s.replace(p, " ")
-        return frozenset(t for t in s.split() if len(t) >= 3)
-
-    sources: list[str] = []
-    tokens_list: list[frozenset[str]] = []
-    for cand, expanded, _score in scored_pairs:
-        meta = cand[1] if isinstance(cand[1], dict) else {}
-        sources.append(meta.get("source") or "vault")
-        tokens_list.append(_tokenize(str(expanded)))
-
-    # Greedy: iteramos en orden de score (input ya viene sorted desc).
-    # Para cada pair, descartamos pairs posteriores que sean cross-source
-    # near-dup. Mantiene el de mayor score por construcción.
-    # Audit 2026-04-26 (MEDIUM): docs muy cortos (<50 chars, <8 tokens)
-    # generaban falsos positivos. "Reunión Max martes 18hs" (~50 chars)
-    # vs un WA message similar producen Jaccard >0.83 con 5 tokens
-    # compartidos — uno se borra. Skipear pairs donde AMBOS son cortos.
-    # 50 chars es ~8-10 tokens significativos — suficiente para Jaccard
-    # robusto sin perder la utilidad de dedup en notas de tamaño normal.
-    _DEDUP_MIN_LEN = 50
-    pair_lens = []
-    for cand, expanded, _ in scored_pairs:
-        pair_lens.append(len(str(expanded)))
-    drop_indices: set[int] = set()
-    for i in range(len(scored_pairs)):
-        if i in drop_indices:
-            continue
-        ti = tokens_list[i]
-        if not ti:
-            continue
-        for j in range(i + 1, len(scored_pairs)):
-            if j in drop_indices:
-                continue
-            if sources[i] == sources[j]:
-                continue  # Solo cross-source — dedup intra-source es _conv_dedup_window
-            tj = tokens_list[j]
-            if not tj:
-                continue
-            # Skip pairs where both docs are short — Jaccard inflates
-            # over small token sets.
-            if min(pair_lens[i], pair_lens[j]) < _DEDUP_MIN_LEN:
-                continue
-            inter = len(ti & tj)
-            union = len(ti | tj)
-            if union == 0:
-                continue
-            if (inter / union) >= threshold:
-                drop_indices.add(j)
-
-    return [p for k, p in enumerate(scored_pairs) if k not in drop_indices]
-
-
-# ── Cross-source privacy opt-out (audit 2026-04-25 R2-Cross-source #1) ─────
-# Filtro opt-in que excluye del retrieval chunks de fuentes sensibles
-# (mails de banking/2FA, chats privados específicos, calendarios marcados,
-# etc.). El user crea ``~/.local/share/obsidian-rag/cross-source.yaml``
-# con las reglas; sin ese archivo, no hay filtro (default: indexar todo,
-# como decidió el user en §10.5 del design doc).
-#
-# Schema esperado:
-#
-#   gmail:
-#     exclude_labels: [banking, 2fa, otp]
-#     exclude_senders: ["*@bank.com", "noreply@2fa.com"]
-#   whatsapp:
-#     exclude_chats: ["+5491112345678@s.whatsapp.net"]
-#   calendar:
-#     exclude_calendars: ["Privado"]
-#
-# El glob simple ``*@bank.com`` matchea fnmatch — no full regex.
-
-_CROSS_SOURCE_FILTERS_CACHE: dict | None = None
-_CROSS_SOURCE_FILTERS_MTIME: float = 0.0
-
-
-def _cross_source_filters_path():
-    return DB_PATH / "cross-source.yaml"
-
-
-def _load_cross_source_filters() -> dict:
-    """Carga las reglas de exclusión cross-source desde YAML. Cachea
-    en memoria con invalidation por mtime — recargas el yaml en hot
-    reload sin reiniciar el server.
-
-    Devuelve ``{}`` (no filtra nada) si el archivo no existe, no parsea,
-    o contiene un schema inesperado. Silent-fail intencional: la
-    privacidad es opt-in, no queremos que un YAML malformado rompa
-    todo el retrieval.
-    """
-    global _CROSS_SOURCE_FILTERS_CACHE, _CROSS_SOURCE_FILTERS_MTIME
-    path = _cross_source_filters_path()
-    if not path.is_file():
-        return {}
-    try:
-        mtime = path.stat().st_mtime
-    except OSError:
-        return _CROSS_SOURCE_FILTERS_CACHE or {}
-    if (
-        _CROSS_SOURCE_FILTERS_CACHE is not None
-        and abs(mtime - _CROSS_SOURCE_FILTERS_MTIME) < 0.001
-    ):
-        return _CROSS_SOURCE_FILTERS_CACHE
-    try:
-        import yaml  # noqa: PLC0415
-        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict):
-            raw = {}
-    except OSError as exc:
-        # H-7 fix (2026-05-08): NO memoizar `{}` en falla transitoria.
-        # Pre-fix: un YAML parse error o read error one-shot deshabilitaba
-        # *todas* las reglas cross-source hasta el próximo restart, porque
-        # la rama de error caía al cache write final. Ahora: log + return
-        # `{}` SIN tocar el cache, así el próximo call reintenta el read.
-        _silent_log("cross_source_filters_load", exc)
-        return {}
-    # Cache solo en el success path — failure transient no envenena el slot.
-    _CROSS_SOURCE_FILTERS_CACHE = raw
-    _CROSS_SOURCE_FILTERS_MTIME = mtime
-    return raw
-
-
-def _should_exclude_chunk(meta: dict, filters: dict | None = None) -> bool:
-    """Determina si un chunk debe ser excluido del retrieval por reglas
-    de privacidad cross-source. Devuelve True para excluir.
-
-    Reglas suportadas por source:
-
-    - gmail: ``exclude_labels`` (lista de Gmail labels), ``exclude_senders``
-      (lista de glob patterns sobre el campo ``from`` del mail)
-    - whatsapp: ``exclude_chats`` (lista de jids exactos)
-    - calendar: ``exclude_calendars`` (lista de nombres de calendarios)
-
-    Si no hay filtros para el source del chunk, devuelve False (no excluye).
-    """
-    if filters is None:
-        filters = _load_cross_source_filters()
-    if not filters:
-        return False
-    source = (meta.get("source") or "vault").lower()
-    src_filters = filters.get(source)
-    if not isinstance(src_filters, dict):
-        return False
-
-    if source == "gmail":
-        # exclude_labels: matchea contra meta["labels"] (lista) o
-        # meta["label"] (singular). Case-insensitive.
-        excl_labels = src_filters.get("exclude_labels") or []
-        if excl_labels:
-            chunk_labels = meta.get("labels") or meta.get("label") or []
-            if isinstance(chunk_labels, str):
-                chunk_labels = [chunk_labels]
-            chunk_labels_lower = {str(l).lower() for l in chunk_labels}
-            for excl in excl_labels:
-                if str(excl).lower() in chunk_labels_lower:
-                    return True
-        # exclude_senders: glob patterns contra meta["from"]
-        excl_senders = src_filters.get("exclude_senders") or []
-        if excl_senders:
-            sender = (meta.get("from") or meta.get("sender") or "").lower()
-            if sender:
-                import fnmatch  # noqa: PLC0415
-                for pat in excl_senders:
-                    if fnmatch.fnmatch(sender, str(pat).lower()):
-                        return True
-    elif source in ("whatsapp", "messages"):
-        excl_chats = src_filters.get("exclude_chats") or []
-        if excl_chats:
-            jid = meta.get("chat_jid") or meta.get("jid") or ""
-            if jid in excl_chats:
-                return True
-    elif source == "calendar":
-        excl_calendars = src_filters.get("exclude_calendars") or []
-        if excl_calendars:
-            cal = meta.get("calendar") or meta.get("calendar_name") or ""
-            if cal in excl_calendars:
-                return True
-    return False
-
-
-def _filter_excluded_chunks(scored_pairs: list[tuple]) -> list[tuple]:
-    """Aplica los filtros cross-source de privacidad. Returns una lista
-    sin los chunks que matchean alguna regla de exclusión.
-
-    Logguea cuántos chunks se filtraron en silent_errors para
-    observabilidad — si el user reporta "no encuentro mi mail bancario",
-    el log dice "filtered N gmail chunks por exclude_labels".
-    """
-    filters = _load_cross_source_filters()
-    if not filters:
-        return scored_pairs
-    out: list[tuple] = []
-    excluded_count = 0
-    for pair in scored_pairs:
-        cand = pair[0]
-        meta = cand[1] if isinstance(cand[1], dict) else {}
-        if _should_exclude_chunk(meta, filters):
-            excluded_count += 1
-            continue
-        out.append(pair)
-    if excluded_count > 0:
-        try:
-            _silent_log(
-                "cross_source_filter_applied",
-                Exception(f"excluded {excluded_count} chunks by privacy filters"),
-            )
-        except Exception:
-            pass
-    return out
-
-
-# ── MMR diversity re-ranking (Feature #5 del 2026-04-23) ─────────────────
-# Post cross-encoder re-rank, re-order the candidate pool balancing
-# relevance (rerank score) vs diversity (token overlap w/ already-selected
-# docs). Reduces redundancy in top-k: if three chunks say the same thing
-# in slightly different words, MMR promotes a chunk from a different angle.
-#
-# Algorithm (Carbonell & Goldstein 1998 adapted to our tuple shape):
-#   Let D = candidate pool sorted by relevance.
-#   Pick S = {top-1}.
-#   While |S| < k and D \ S non-empty:
-#       for each d in D \ S:
-#           mmr(d) = λ · rel(d) - (1-λ) · max_{d' ∈ S} sim(d, d')
-#       pick arg-max → append to S.
-#
-# sim() here is Jaccard over word tokens of the first ~600 chars of each
-# doc. Cheap + dependency-free (no extra embeddings needed); captures
-# near-duplicates at the word level without fancy semantic similarity.
-# λ default 0.7 (bias toward relevance). 1.0 = pure relevance (MMR no-op);
-# 0.0 = pure diversity (ignores rerank scores).
-#
-# Gate:
-#   RAG_MMR_DIVERSITY=1 to enable (default OFF — conservative rollout).
-#   Operates on the pool of up to `pool_size` candidates. Remaining pool
-#   order preserved (not reordered), so the extras_pairs slice stays
-#   reranker-ordered.
-
-_MMR_DIVERSITY_ENABLED = os.environ.get(
-    "RAG_MMR_DIVERSITY", ""
-).strip().lower() in ("1", "true", "yes")
-
-_MMR_SNIPPET_CHARS = 600  # chars of each doc to tokenize for Jaccard
-_MMR_TOKEN_RE = re.compile(r"[a-záéíóúñü0-9]+", re.IGNORECASE)
-
-
-def _mmr_tokens(text: str) -> frozenset[str]:
-    """Tokens used for Jaccard similarity — first ~600 chars, word chars
-    only, lowercased. Returns frozenset (hashable, set-op friendly)."""
-    if not text:
-        return frozenset()
-    sample = text[:_MMR_SNIPPET_CHARS].lower()
-    return frozenset(_MMR_TOKEN_RE.findall(sample))
-
-
-def _jaccard(a: frozenset[str], b: frozenset[str]) -> float:
-    """Jaccard similarity — |a ∩ b| / |a ∪ b|. Empty inputs → 0.0."""
-    if not a and not b:
-        return 0.0
-    inter = len(a & b)
-    union = len(a | b)
-    if union == 0:
-        return 0.0
-    return inter / union
-
-
-def _compute_adaptive_k(
-    scores: list[float], *, k_default: int, min_k: int = 2,
-    gap_ratio: float = 0.35,
-) -> int:
-    """Decide how many top-k results to keep based on score distribution.
-
-    Feature #14 del 2026-04-23. Scans the sorted scores (highest first) and
-    finds the first significant drop: if (prev - cur) / |prev| > gap_ratio,
-    the cur candidate is "noticeably worse" and we truncate there.
-
-    Reduces prefill token consumption when the top-1 clearly dominates
-    (easy queries). Never goes below `min_k` — a rerank that returned
-    4 equally-good candidates shouldn't collapse to 1. Never exceeds
-    the input length or k_default.
-
-    Conservative: if scores are all negative, noise-level, or NaN, falls
-    back to k_default. Never raises.
-
-    Examples:
-      [1.2, 0.1, 0.05, 0.02]   gap_ratio=0.35 → k=1 but clamped to min_k=2
-      [1.2, 1.1, 0.2, 0.1]     gap_ratio=0.35 → k=2 (drop between #2 and #3)
-      [1.0, 0.9, 0.8, 0.7]     gap_ratio=0.35 → k=k_default (no clear drop)
-    """
-    if not scores:
-        return k_default
-    n = min(len(scores), k_default)
-    if n <= min_k:
-        return n
-    # Scan for the first significant drop.
-    for i in range(1, n):
-        prev = scores[i - 1]
-        cur = scores[i]
-        if prev <= 0:
-            # Avoid division surprises on negative scores — just bail to
-            # k_default. All-negative scenario = no clear signal.
-            continue
-        drop = (prev - cur) / abs(prev)
-        if drop >= gap_ratio:
-            # Found a cliff: keep up to and including index i-1.
-            return max(min_k, i)
-    return n
-
-
-def _apply_mmr_reorder(
-    scored_pairs: list[tuple],
-    *,
-    lambda_: float = 0.7,
-    pool_size: int | None = None,
-) -> list[tuple]:
-    """Re-order the first `pool_size` items of `scored_pairs` using MMR.
-
-    Input: list of (candidate, expanded_text, score) sorted by score desc.
-    Output: same length; first `pool_size` entries reordered to balance
-    relevance with diversity; remainder preserved unchanged.
-
-    O(pool_size²) — fine because pool_size is typically 15-30. The first
-    item is always kept (highest relevance), subsequent items selected
-    greedily by max MMR score.
-    """
-    if not scored_pairs:
-        return scored_pairs
-    lambda_ = max(0.0, min(1.0, lambda_))
-    if pool_size is None or pool_size >= len(scored_pairs):
-        pool = scored_pairs[:]
-        tail: list[tuple] = []
-    else:
-        pool = scored_pairs[:pool_size]
-        tail = scored_pairs[pool_size:]
-    if len(pool) <= 1:
-        return scored_pairs
-    # Precompute token sets for the pool.
-    tokens: list[frozenset[str]] = []
-    for _, expanded, _ in pool:
-        tokens.append(_mmr_tokens(expanded if isinstance(expanded, str) else ""))
-    selected_idx: list[int] = [0]  # always keep the highest-relevance first
-    remaining: set[int] = set(range(1, len(pool)))
-    while remaining:
-        best_idx = None
-        best_mmr = -1e18
-        for i in remaining:
-            rel = float(pool[i][2])
-            max_sim = 0.0
-            for j in selected_idx:
-                sim = _jaccard(tokens[i], tokens[j])
-                if sim > max_sim:
-                    max_sim = sim
-            mmr = lambda_ * rel - (1.0 - lambda_) * max_sim
-            if mmr > best_mmr:
-                best_mmr = mmr
-                best_idx = i
-        if best_idx is None:
-            break
-        selected_idx.append(best_idx)
-        remaining.discard(best_idx)
-    reordered = [pool[i] for i in selected_idx]
-    return reordered + tail
-
 
 # Separate collection for URL-context embeddings — the URL-finder pipeline
 # scores against the prose around each link, not the link string itself.
@@ -6866,14 +6026,14 @@ from rag._sql_state_io import *  # noqa: F401, F403
 # sqlite-vec adapter extracted to rag.vector_store (modular split 2026-05-15).
 from rag.vector_store import *  # noqa: E402, F401, F403
 
-_db_singleton: tuple[str, "SqliteVecCollection"] | None = None
+_db_singleton: tuple[tuple[str, str], "SqliteVecCollection"] | None = None
 _db_singleton_created_at: float = 0.0
 _db_singleton_lock = threading.Lock()
 
 
 def get_db() -> SqliteVecCollection:
     global _db_singleton, _db_singleton_created_at
-    db_key = str(DB_PATH)
+    db_key = (str(DB_PATH), COLLECTION_NAME)
     with _db_singleton_lock:
         if _db_singleton is not None and _db_singleton[0] == db_key:
             # Cheap sentinel mtime check: if another process ran `index --reset`
@@ -6886,7 +6046,7 @@ def get_db() -> SqliteVecCollection:
                 pass
         if _db_singleton is None or _db_singleton[0] != db_key:
             DB_PATH.mkdir(parents=True, exist_ok=True)
-            client = SqliteVecClient(path=db_key)
+            client = SqliteVecClient(path=db_key[0])
             col = client.get_or_create_collection(
                 name=COLLECTION_NAME,
                 metadata={"hnsw:space": "cosine"},
@@ -8195,6 +7355,10 @@ def embed(texts: list[str]) -> list[list[float]]:
         convert_to_numpy=True,
         show_progress_bar=False,
     )
+    if _local_embed_enabled():
+        _local_embedder_ready.set()
+        _touch_local_embedder()
+        _freeze_local_embed_enabled()
     fresh = arr.tolist()
     with _embed_cache_lock:
         for t, v in zip(missing_texts, fresh):
@@ -8216,6 +7380,7 @@ def embed(texts: list[str]) -> list[list[float]]:
 
 _local_embedder = None
 _local_embedder_lock = threading.Lock()
+_local_embedder_last_used = 0.0
 # Fires when `_get_local_embedder` finishes loading bge-m3 AND the first
 # encode has succeeded (via `_warmup_local_embedder` or an inline call).
 # `query_embed_local` checks this before entering the lock so a one-shot
@@ -8264,6 +7429,11 @@ def _freeze_local_embed_enabled() -> None:
     raw = os.environ.get("RAG_LOCAL_EMBED", "")
     decision = raw.strip().lower() not in ("", "0", "false", "no")
     _LOCAL_EMBED_ENABLED_CACHED = (raw, decision)
+
+
+def _touch_local_embedder() -> None:
+    global _local_embedder_last_used
+    _local_embedder_last_used = time.monotonic()
 
 
 # Kept for backwards compatibility with external code referencing the old
@@ -8339,7 +7509,7 @@ def _get_local_embedder():
 
     Singleton: subsecuentes calls son O(1).
     """
-    global _local_embedder
+    global _local_embedder, _local_embedder_last_used
     if _local_embedder is not None:
         return _local_embedder
     with _local_embedder_lock:
@@ -8526,6 +7696,7 @@ def query_embed_local(
             batch_size=len(texts),
             show_progress_bar=False,
         )
+        _touch_local_embedder()
         return [v.tolist() for v in vecs]
     except Exception:
         return None
@@ -8585,9 +7756,54 @@ def _warmup_local_embedder() -> bool:
     # add ~200ms. This gates `query_embed_local` from spinning on a model
     # that would still pay JIT on its first real call.
     _local_embedder_ready.set()
+    _touch_local_embedder()
     # Cachear el flag para saltar os.environ.get en cada query embed
     # post-warmup. La env var no cambia más en este proceso.
     _freeze_local_embed_enabled()
+    return True
+
+
+def maybe_unload_local_embedder(force: bool = False) -> bool:
+    """Unload the local query embedder after idle or under explicit pressure.
+
+    `_get_local_embedder()` is a plain singleton, separate from MLXBackend's
+    LRU/idle watchdog. Without this helper, the web process keeps the Qwen3
+    embedder weights resident forever after boot or first search.
+    """
+    global _local_embedder, _local_embedder_last_used
+    if not force:
+        try:
+            ttl = float(os.environ.get("RAG_LOCAL_EMBED_IDLE_TTL", "900"))
+        except (TypeError, ValueError):
+            ttl = 900.0
+        if ttl <= 0:
+            return False
+        if _local_embedder is None:
+            return False
+        if _local_embedder_last_used <= 0:
+            return False
+        if (time.monotonic() - _local_embedder_last_used) < ttl:
+            return False
+    with _local_embedder_lock:
+        if _local_embedder is None:
+            return False
+        _local_embedder = None
+        _local_embedder_last_used = 0.0
+        _local_embedder_ready.clear()
+    try:
+        import gc as _gc
+        _gc.collect()
+    except Exception:
+        pass
+    try:
+        import mlx.core as _mx  # type: ignore[import-not-found]
+        _mx.clear_cache()
+    except Exception:
+        pass
+    try:
+        _torch_mps_empty_cache()
+    except Exception:
+        pass
     return True
 
 
@@ -21948,10 +21164,10 @@ def _run_cross_source_etls(vault_path: Path) -> None:
     except Exception as exc:
         console.print(f"[yellow]Tarjetas sync falló: {exc}[/yellow]")
 
-    # WhatsApp ETL → reads whatsapp-bridge SQLite, writes monthly per-chat
-    # `.md` so the rglob below absorbs them. Same script that
-    # `com.fer.whatsapp-vault-sync` runs every 15 min, just on-demand here so
-    # `rag index` always reflects the latest WhatsApp state.
+    # WhatsApp ETL → reads whatsapp-bridge SQLite and writes deterministic
+    # monthly per-chat `.md` notes for human/task links. The vector corpus
+    # still uses `rag index --source whatsapp`; these notes are excluded from
+    # the normal vault rglob to avoid duplicate chunks.
     try:
         wa_stats = _sync_whatsapp_notes(vault_path)
         if wa_stats.get("ok") and wa_stats.get("files_written"):
@@ -21960,7 +21176,11 @@ def _run_cross_source_etls(vault_path: Path) -> None:
                 f"de {wa_stats['buckets']} (chat, mes) buckets · {wa_stats['chats']} chats "
                 f"→ {wa_stats['target']}/[/dim]"
             )
-        elif not wa_stats.get("ok") and wa_stats.get("reason") not in (None, "script_missing"):
+        elif not wa_stats.get("ok") and wa_stats.get("reason") not in (
+            None,
+            "script_missing",
+            "bridge_db_missing",
+        ):
             console.print(f"[yellow]WhatsApp sync: {wa_stats['reason']}[/yellow]")
     except Exception as exc:
         console.print(f"[yellow]WhatsApp sync falló: {exc}[/yellow]")
@@ -22055,11 +21275,215 @@ def _run_cross_source_etls(vault_path: Path) -> None:
         console.print(f"[yellow]Bookmarks sync falló: {exc}[/yellow]")
 
 
+_FALSY_ENV_VALUES = ("0", "false", "no", "off")
+
+
+def _env_truthy(name: str, *, default: bool = False) -> bool:
+    val = os.environ.get(name)
+    if val is None or val.strip() == "":
+        return default
+    return val.strip().lower() not in _FALSY_ENV_VALUES
+
+
+@contextlib.contextmanager
+def _temporary_env_defaults(defaults: dict[str, str]):
+    """Set env defaults only when the operator did not provide a value."""
+    old_values = {key: os.environ.get(key) for key in defaults}
+    applied: dict[str, str] = {}
+    try:
+        for key, value in defaults.items():
+            if old_values[key] in (None, ""):
+                os.environ[key] = value
+                applied[key] = value
+        yield applied
+    finally:
+        for key in applied:
+            old = old_values[key]
+            if old is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old
+
+
+def _index_safe_defaults() -> dict[str, str]:
+    """Conservative defaults for every vault `rag index` run."""
+    return {
+        # Bound MLX/SentenceTransformer peak allocations for docs and URL
+        # contexts. Incremental runs keep enrichment on, but still cap bursts.
+        "RAG_INDEX_EMBED_SLICE_SIZE": "16",
+        "RAG_INDEX_FILE_CHUNK_SLICE_SIZE": "128",
+        "RAG_INDEX_LOCAL_EMBED_BATCH": "16",
+        # Make pressure response fast enough for a one-shot CLI process.
+        "RAG_MEMORY_PRESSURE_INTERVAL": "15",
+        "RAG_MEMORY_PRESSURE_COOLDOWN_S": "45",
+        "RAG_MEMORY_PRESSURE_SWAP_GB": "1.0",
+        "RAG_MEMORY_PRESSURE_THRESHOLD": "82",
+        # Yield between flushes by default. No-op for unchanged incremental
+        # passes because skipped files never flush.
+        "RAG_INDEX_BATCH_SLEEP_MS": "50",
+        "RAG_INDEX_PREFLIGHT_MEMORY_GUARD": "1",
+        "RAG_INDEX_MEMORY_GUARD_INTERVAL_S": "5",
+        "RAG_INDEX_MEMORY_PRESSURE_SLEEP_S": "10",
+        # If pressure persists into a danger zone, abort the index cleanly.
+        # A failed index is much cheaper than a frozen machine.
+        "RAG_INDEX_ABORT_ON_MEMORY_PRESSURE": "1",
+        "RAG_INDEX_ABORT_USED_PCT": "92",
+        "RAG_INDEX_ABORT_SWAP_GB": "2.0",
+        "RAG_INDEX_ABORT_SELF_RSS_GB": "18.0",
+    }
+
+
+def _index_full_safe_defaults() -> dict[str, str]:
+    """Extra defaults that make `rag index --full` bounded.
+
+    The full rebuild still embeds every note. It skips optional enrichment and
+    uses smaller embed batches unless the operator disables safe mode with
+    `RAG_INDEX_FULL_SAFE=0` or overrides individual resource env vars.
+    """
+    out = _index_safe_defaults()
+    out.update({
+        # Optional enrichment: useful, but not worth co-loading helper LLM /
+        # GLiNER during a full rebuild while the web daemon may be resident.
+        "OBSIDIAN_RAG_SKIP_SYNTHETIC_Q": "1",
+        "RAG_EXTRACT_ENTITIES": "0",
+        "RAG_INDEX_EMBED_SLICE_SIZE": "8",
+        "RAG_INDEX_FILE_CHUNK_SLICE_SIZE": "64",
+        "RAG_INDEX_LOCAL_EMBED_BATCH": "8",
+        "RAG_INDEX_BATCH_SLEEP_MS": "150",
+    })
+    return out
+
+
+def _index_process_rss_gb() -> float | None:
+    """Current process RSS in GB, best-effort."""
+    try:
+        import psutil
+
+        return psutil.Process(os.getpid()).memory_info().rss / (1024**3)
+    except Exception:
+        return None
+
+
+def _index_preflight_memory_guard(where: str) -> None:
+    """Fail early when system memory is already unsafe for indexing."""
+    try:
+        try:
+            threshold = float(os.environ.get("RAG_MEMORY_PRESSURE_THRESHOLD", "85"))
+        except (TypeError, ValueError):
+            threshold = 85.0
+        try:
+            swap_threshold = float(os.environ.get("RAG_MEMORY_PRESSURE_SWAP_GB", "1.5"))
+        except (TypeError, ValueError):
+            swap_threshold = 1.5
+        try:
+            abort_used_pct = float(os.environ.get("RAG_INDEX_ABORT_USED_PCT", "92"))
+        except (TypeError, ValueError):
+            abort_used_pct = 92.0
+        try:
+            abort_swap_gb = float(os.environ.get("RAG_INDEX_ABORT_SWAP_GB", "2.0"))
+        except (TypeError, ValueError):
+            abort_swap_gb = 2.0
+        try:
+            abort_self_rss_gb = float(os.environ.get("RAG_INDEX_ABORT_SELF_RSS_GB", "18.0"))
+        except (TypeError, ValueError):
+            abort_self_rss_gb = 18.0
+        pct = _system_memory_used_pct()
+        swap_gb = _system_swap_used_gb()
+        rss_gb = _index_process_rss_gb()
+        trigger = (
+            (pct is not None and pct >= threshold)
+            or (swap_gb is not None and swap_threshold > 0 and swap_gb >= swap_threshold)
+            or (
+                rss_gb is not None
+                and abort_self_rss_gb > 0
+                and rss_gb >= abort_self_rss_gb
+            )
+        )
+        if not trigger:
+            return
+        try:
+            _handle_memory_pressure(pct if pct is not None else 0.0, threshold)
+        except Exception as exc:
+            _silent_log(f"index_preflight_memory_guard_handle:{where}", exc)
+        try:
+            import mlx.core as _mx_core
+            _mx_core.clear_cache()
+        except Exception:
+            pass
+        try:
+            import gc
+            gc.collect()
+        except Exception:
+            pass
+        try:
+            sleep_s = max(0.0, float(os.environ.get("RAG_INDEX_MEMORY_PRESSURE_SLEEP_S", "0")))
+        except (TypeError, ValueError):
+            sleep_s = 0.0
+        if sleep_s > 0:
+            console.print(
+                f"[yellow]memory pressure antes de {where}[/yellow] — "
+                f"pausa {sleep_s:.0f}s (pct={pct if pct is not None else 'n/a'}, "
+                f"swap={swap_gb if swap_gb is not None else 'n/a'}GB)"
+            )
+            time.sleep(sleep_s)
+        pct_after = _system_memory_used_pct()
+        swap_after = _system_swap_used_gb()
+        rss_after = _index_process_rss_gb()
+        abort = _env_truthy("RAG_INDEX_ABORT_ON_MEMORY_PRESSURE", default=True) and (
+            (
+                pct_after is not None
+                and abort_used_pct > 0
+                and pct_after >= abort_used_pct
+            )
+            or (
+                swap_after is not None
+                and abort_swap_gb > 0
+                and swap_after >= abort_swap_gb
+            )
+            or (
+                rss_after is not None
+                and abort_self_rss_gb > 0
+                and rss_after >= abort_self_rss_gb
+            )
+        )
+        if abort:
+            raise RuntimeError(
+                f"index abortado antes de {where} por memory pressure "
+                f"(used_pct={pct_after if pct_after is not None else 'n/a'}, "
+                f"swap_gb={swap_after if swap_after is not None else 'n/a'}, "
+                f"rss_gb={rss_after if rss_after is not None else 'n/a'})."
+            )
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        _silent_log(f"index_preflight_memory_guard:{where}", exc)
+
+
 def _run_index(reset: bool, no_contradict: bool) -> dict:
     """Core indexing logic. Shared by the `rag index` CLI and the in-chat
     natural-language reindex intent. Returns stats dict for callers that
     want to render their own summary.
     """
+    safe_enabled = _env_truthy("RAG_INDEX_SAFE", default=True)
+    full_safe_enabled = bool(reset) and _env_truthy("RAG_INDEX_FULL_SAFE", default=True)
+    safe_defaults: dict[str, str] = {}
+    if full_safe_enabled:
+        safe_defaults = _index_full_safe_defaults()
+    elif safe_enabled:
+        safe_defaults = _index_safe_defaults()
+    with _temporary_env_defaults(safe_defaults) as _safe_applied:
+        if _safe_applied:
+            label = "--full safe mode" if full_safe_enabled else "index safe mode"
+            console.print(
+                f"[cyan]{label}[/cyan] — embeddings acotados, "
+                "memory guard activo y abort limpio bajo presión. "
+                "Opt-out: RAG_INDEX_SAFE=0"
+                + (" / RAG_INDEX_FULL_SAFE=0." if full_safe_enabled else ".")
+            )
+        return _run_index_with_env(reset, no_contradict)
+
+
+def _run_index_with_env(reset: bool, no_contradict: bool) -> dict:
     col = get_db()
     # Arrancar memory pressure watchdog (idempotente — si ya corre, no-op).
     # Sin esto el bulk indexing fragmenta MPS allocator hasta GPU OOM
@@ -22135,10 +21559,16 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
     # RAG_INDEX_BATCH_SLEEP_MS=0 (default): sleep en ms después de cada
     # _flush_batch() para ceder tiempo de GPU/CPU entre batches.
     # Ejemplo: =200 → 200ms de pausa entre cada flush (~5 batches/s máximo).
-    _index_batch_sleep_s = max(
-        0.0,
-        float(os.environ.get("RAG_INDEX_BATCH_SLEEP_MS", "0")) / 1000.0,
-    )
+    try:
+        _index_batch_sleep_s = max(
+            0.0,
+            float(os.environ.get("RAG_INDEX_BATCH_SLEEP_MS", "0")) / 1000.0,
+        )
+    except (TypeError, ValueError):
+        _index_batch_sleep_s = 0.0
+
+    if _env_truthy("RAG_INDEX_PREFLIGHT_MEMORY_GUARD", default=False):
+        _index_preflight_memory_guard("index")
 
     _invalidate_corpus_cache()
     # Audit 2026-04-26 (BUG #23): reset VLM caption budget per-run.
@@ -22164,8 +21594,8 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
         with _collection_write_lock():
             global _db_singleton, _db_singleton_created_at
             _db_singleton = None
-            db_key = str(DB_PATH)
-            client = SqliteVecClient(path=db_key)
+            db_key = (str(DB_PATH), COLLECTION_NAME)
+            client = SqliteVecClient(path=db_key[0])
             for cname in (COLLECTION_NAME, URLS_COLLECTION_NAME):
                 try:
                     _log_collection_op("delete", cname, {"reason": "index --reset"})
@@ -22198,17 +21628,30 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
         console.print("[dim]Cross-source ETLs salteados (RAG_SKIP_CROSS_SOURCE_ETLS=1).[/dim]")
     else:
         _run_cross_source_etls(VAULT_PATH)
+        if _env_truthy("RAG_INDEX_PREFLIGHT_MEMORY_GUARD", default=False):
+            _index_preflight_memory_guard("post-etl")
 
-    # Build file → chunks_in_db map (once) so we can detect stale/orphan chunks.
-    # Performance optimization: filter to source=vault only, since cross-source
-    # chunks (whatsapp://, calendar://, etc.) are excluded from orphan cleanup
-    # anyway. Reduces data fetched from DB by ~30-50% for vaults with ingesters.
-    existing_all = col.get(where={"source": "vault"}, include=["metadatas"])
+    # Build file -> chunks_in_db map (once) so we can detect unchanged and
+    # stale vault-local files. Do not filter by source: memo/cross-source ETLs
+    # write markdown into the vault with sources like "memory", so source=vault
+    # made incremental catch-up miss their hashes and reindex them every start.
+    # Native cross-source rows keep URI file ids (gmail://, calendar://, etc.)
+    # and are filtered out below; their dedicated ingesters own stale cleanup.
+    existing_all = col.get(include=["metadatas"])
     file_to_chunks: dict[str, list[tuple[str, str]]] = {}
-    for id_, meta in zip(existing_all["ids"], existing_all["metadatas"]):
-        file_to_chunks.setdefault(meta.get("file", ""), []).append(
-            (id_, meta.get("hash", ""))
-        )
+    for id_, meta in zip(
+        existing_all.get("ids", []),
+        existing_all.get("metadatas", []),
+    ):
+        if not isinstance(meta, dict):
+            continue
+        file_value = meta.get("file", "")
+        if not isinstance(file_value, str):
+            continue
+        file_value = file_value.strip()
+        if not file_value or "://" in file_value:
+            continue
+        file_to_chunks.setdefault(file_value, []).append((id_, meta.get("hash", "")))
 
     md_files = [
         p for p in VAULT_PATH.rglob("*.md")
@@ -22309,6 +21752,174 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
     if _batch_target < 1:
         _batch_target = 1
 
+    try:
+        _embed_slice_size = int(os.environ.get("RAG_INDEX_EMBED_SLICE_SIZE", "0"))
+    except (TypeError, ValueError):
+        _embed_slice_size = 0
+    if _embed_slice_size < 0:
+        _embed_slice_size = 0
+
+    try:
+        _file_chunk_slice_size = int(
+            os.environ.get("RAG_INDEX_FILE_CHUNK_SLICE_SIZE", "0")
+        )
+    except (TypeError, ValueError):
+        _file_chunk_slice_size = 0
+    if _file_chunk_slice_size < 0:
+        _file_chunk_slice_size = 0
+
+    try:
+        _memory_guard_interval_s = float(
+            os.environ.get("RAG_INDEX_MEMORY_GUARD_INTERVAL_S", "0")
+        )
+    except (TypeError, ValueError):
+        _memory_guard_interval_s = 0.0
+    if _memory_guard_interval_s < 0:
+        _memory_guard_interval_s = 0.0
+
+    try:
+        _memory_pressure_sleep_s = max(
+            0.0,
+            float(os.environ.get("RAG_INDEX_MEMORY_PRESSURE_SLEEP_S", "0")),
+        )
+    except (TypeError, ValueError):
+        _memory_pressure_sleep_s = 0.0
+
+    _last_memory_guard_t = 0.0
+
+    def _index_memory_guard(force: bool = False) -> None:
+        """Synchronous guard between embed batches.
+
+        The watchdog thread is still useful, but a full rebuild can allocate
+        enough unified memory inside one long embed burst that waiting for the
+        next sampling tick is too late. This guard checks at bounded cadence,
+        unloads in-process models/caches under pressure, then yields briefly.
+        """
+        nonlocal _last_memory_guard_t
+        if _memory_guard_interval_s <= 0 and not force:
+            return
+        now = time.monotonic()
+        if (
+            not force
+            and _last_memory_guard_t
+            and (now - _last_memory_guard_t) < _memory_guard_interval_s
+        ):
+            return
+        _last_memory_guard_t = now
+        try:
+            try:
+                threshold = float(os.environ.get("RAG_MEMORY_PRESSURE_THRESHOLD", "85"))
+            except (TypeError, ValueError):
+                threshold = 85.0
+            try:
+                swap_threshold = float(os.environ.get("RAG_MEMORY_PRESSURE_SWAP_GB", "1.5"))
+            except (TypeError, ValueError):
+                swap_threshold = 1.5
+            try:
+                abort_used_pct = float(os.environ.get("RAG_INDEX_ABORT_USED_PCT", "92"))
+            except (TypeError, ValueError):
+                abort_used_pct = 92.0
+            try:
+                abort_swap_gb = float(os.environ.get("RAG_INDEX_ABORT_SWAP_GB", "2.0"))
+            except (TypeError, ValueError):
+                abort_swap_gb = 2.0
+            try:
+                abort_self_rss_gb = float(os.environ.get("RAG_INDEX_ABORT_SELF_RSS_GB", "18.0"))
+            except (TypeError, ValueError):
+                abort_self_rss_gb = 18.0
+            abort_enabled = _env_truthy("RAG_INDEX_ABORT_ON_MEMORY_PRESSURE", default=True)
+            pct = _system_memory_used_pct()
+            swap_gb = _system_swap_used_gb()
+            rss_gb = _index_process_rss_gb()
+            trigger_pct = pct is not None and pct >= threshold
+            trigger_swap = (
+                swap_gb is not None
+                and swap_threshold > 0
+                and swap_gb >= swap_threshold
+            )
+            trigger_rss = (
+                rss_gb is not None
+                and abort_self_rss_gb > 0
+                and rss_gb >= abort_self_rss_gb
+            )
+            if not trigger_pct and not trigger_swap and not trigger_rss:
+                return
+            try:
+                _handle_memory_pressure(pct if pct is not None else 0.0, threshold)
+            except Exception as exc:
+                _silent_log("index_memory_guard_handle", exc)
+            try:
+                import mlx.core as _mx_core
+                _mx_core.clear_cache()
+            except Exception:
+                pass
+            try:
+                import gc
+                gc.collect()
+            except Exception:
+                pass
+            if _memory_pressure_sleep_s > 0:
+                console.print(
+                    "[yellow]memory pressure durante index[/yellow] — "
+                    f"pausa {_memory_pressure_sleep_s:.0f}s "
+                    f"(pct={pct if pct is not None else 'n/a'}, "
+                    f"swap={swap_gb if swap_gb is not None else 'n/a'}GB)"
+                )
+                time.sleep(_memory_pressure_sleep_s)
+            pct_after = _system_memory_used_pct()
+            swap_after = _system_swap_used_gb()
+            rss_after = _index_process_rss_gb()
+            abort_pct = (
+                pct_after is not None
+                and abort_used_pct > 0
+                and pct_after >= abort_used_pct
+            )
+            abort_swap = (
+                swap_after is not None
+                and abort_swap_gb > 0
+                and swap_after >= abort_swap_gb
+            )
+            abort_rss = (
+                rss_after is not None
+                and abort_self_rss_gb > 0
+                and rss_after >= abort_self_rss_gb
+            )
+            if abort_enabled and (abort_pct or abort_swap or abort_rss):
+                raise RuntimeError(
+                    "index abortado por memory pressure persistente "
+                    f"(used_pct={pct_after if pct_after is not None else 'n/a'}, "
+                    f"swap_gb={swap_after if swap_after is not None else 'n/a'}, "
+                    f"rss_gb={rss_after if rss_after is not None else 'n/a'}). "
+                    "El índice queda parcial; reintentá cuando baje la presión "
+                    "o subí RAG_INDEX_ABORT_* si querés asumir el riesgo."
+                )
+        except Exception as exc:
+            if isinstance(exc, RuntimeError) and str(exc).startswith("index abortado"):
+                raise
+            _silent_log("index_memory_guard", exc)
+
+    def _index_embed_texts(texts: list[str]) -> list[list[float]]:
+        """Embed index payloads in bounded slices to cap transient memory."""
+        if not texts:
+            return []
+        if _embed_slice_size <= 0 or len(texts) <= _embed_slice_size:
+            _index_memory_guard()
+            return embed(texts)
+        out: list[list[float]] = []
+        for start in range(0, len(texts), _embed_slice_size):
+            _index_memory_guard()
+            out.extend(embed(texts[start:start + _embed_slice_size]))
+            try:
+                import mlx.core as _mx_core
+                _mx_core.clear_cache()
+            except Exception:
+                pass
+            _index_memory_guard()
+        return out
+
+    if _memory_guard_interval_s > 0:
+        _index_memory_guard(force=True)
+
     # `pending_files`: lista de dicts con todo lo necesario para hacer
     # `col.add` + entities + url-index UNA VEZ que tenemos los embeddings.
     # Cada entry: {ids, embed_texts, display_texts, metadatas, doc_id_prefix,
@@ -22343,13 +21954,13 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
             offsets.append((start, len(all_texts)))
         embeddings: list | None = None
         try:
-            embeddings = embed(all_texts)
+            embeddings = _index_embed_texts(all_texts)
         except Exception as exc:
             _silent_log("index_batch_embed", exc)
             embeddings = [None] * len(all_texts)
             for f, (start, _end) in zip(pending_files, offsets):
                 try:
-                    emb_one = embed(f["embed_texts"])
+                    emb_one = _index_embed_texts(f["embed_texts"])
                     for i, e in enumerate(emb_one):
                         embeddings[start + i] = e
                 except Exception as inner_exc:
@@ -22373,19 +21984,22 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
             batch_embs.extend(embs)
             batch_docs.extend(f["display_texts"])
             batch_metas.extend(f["metadatas"])
-            # Acumular URLs para batch processing
-            try:
-                urls = extract_urls(f["raw"])
-                if urls:
-                    pending_urls.append({
-                        "file": f["doc_id_prefix"],
-                        "note_title": f["path"].stem,
-                        "folder": f["folder"],
-                        "tags": f["tags"],
-                        "urls": urls,
-                    })
-            except Exception:
-                pass
+            # Acumular URLs para batch processing. Cuando una nota gigante se
+            # shardea en varias entries, solo la primera indexa URLs para no
+            # duplicar los records.
+            if f.get("index_urls", True):
+                try:
+                    urls = extract_urls(f["raw"])
+                    if urls:
+                        pending_urls.append({
+                            "file": f["doc_id_prefix"],
+                            "note_title": f["path"].stem,
+                            "folder": f["folder"],
+                            "tags": f["tags"],
+                            "urls": urls,
+                        })
+                except Exception:
+                    pass
             indexed_files.add(f["doc_id_prefix"])
 
         # Single col.add() → single WAL write + one lock acquisition.
@@ -22438,7 +22052,7 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
                 # Batch embed all URL contexts
                 url_embeddings: list | None = None
                 try:
-                    url_embeddings = embed(all_url_contexts)
+                    url_embeddings = _index_embed_texts(all_url_contexts)
                 except Exception as exc:
                     _silent_log("index_batch_urls_embed", exc)
                     url_embeddings = None
@@ -22495,6 +22109,42 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
         # (post-Ola 9 default) — invalidar Metal command buffers desde Python
         # mientras MLX está procesando un batch produce GPU Hang Error.
         _torch_mps_empty_cache()
+        _index_memory_guard()
+
+    def _enqueue_pending_file(file_entry: dict) -> None:
+        """Queue one indexed file, optionally split into bounded chunk shards."""
+        nonlocal pending_chunk_count
+        ids = file_entry["ids"]
+        n_chunks = len(ids)
+        if _file_chunk_slice_size <= 0 or n_chunks <= _file_chunk_slice_size:
+            shards = [(0, n_chunks)]
+        else:
+            shards = [
+                (start, min(start + _file_chunk_slice_size, n_chunks))
+                for start in range(0, n_chunks, _file_chunk_slice_size)
+            ]
+
+        for shard_idx, (start, end) in enumerate(shards):
+            if start == 0 and end == n_chunks:
+                shard = file_entry
+                shard["index_urls"] = True
+            else:
+                shard = dict(file_entry)
+                for key in ("ids", "embed_texts", "display_texts", "metadatas"):
+                    shard[key] = file_entry[key][start:end]
+                shard["index_urls"] = shard_idx == 0
+            pending_files.append(shard)
+            pending_chunk_count += len(shard["ids"])
+            if not _batch_enabled or pending_chunk_count >= _batch_target:
+                _flush_batch()
+                # Update progress fields tras flush para que la barra refleje
+                # el progreso real (chunks suben en saltos, no por nota).
+                progress.update(
+                    task_id,
+                    chunks=added_chunks,
+                    updated=updated_files,
+                    skipped=skipped_files,
+                )
 
     try:
         for path in md_files:
@@ -22614,10 +22264,9 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
                     metadatas.append(meta)
 
                 # Encolar en pending_files; el embed real corre en `_flush_batch`
-                # cuando el contador llega al target. Si batching está OFF,
-                # flusheamos inmediatamente (un file == una embed call, igual
-                # que el comportamiento legacy pre-2026-05-04).
-                pending_files.append({
+                # cuando el contador llega al target. Notas enormes se shardean
+                # para que un solo archivo no rompa el límite de memoria.
+                _enqueue_pending_file({
                     "ids": ids,
                     "embed_texts": embed_texts,
                     "display_texts": display_texts,
@@ -22628,18 +22277,6 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
                     "folder": folder,
                     "tags": tags,
                 })
-                pending_chunk_count += len(ids)
-
-                if not _batch_enabled or pending_chunk_count >= _batch_target:
-                    _flush_batch()
-                    # Update progress fields tras flush para que la barra refleje
-                    # el progreso real (chunks suben en saltos, no por nota).
-                    progress.update(
-                        task_id,
-                        chunks=added_chunks,
-                        updated=updated_files,
-                        skipped=skipped_files,
-                    )
             except OSError as exc:
                 # Aislar el daño a este archivo. Log silent + traceback (para
                 # diagnóstico del root cause del bug #4) + sumar al contador
@@ -22667,23 +22304,33 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
     finally:
         progress.stop()
 
-    # Orphan cleanup: files in DB that no longer exist on disk
-    # 2026-04-30 BUG FIX: cross-source chunks (whatsapp://X, calendar://Y, etc.)
-    # tienen `file` con URI scheme — NO son paths del vault rglob, así que el
-    # set difference los marcaba a TODOS como huérfanos y los borraba en cada
-    # `rag maintenance`. Filtramos los URI schemes para que solo los chunks
-    # source=vault sean candidatos a orphan cleanup. Los ingesters dedicados
-    # (`scripts/ingest_*.py`) son los únicos dueños de los chunks cross-source
-    # y manejan su propio stale-detect via state cursor (`rag_*_state` tables).
-    _CROSS_SOURCE_PREFIXES = (
-        "whatsapp://", "calendar://", "gmail://", "reminders://",
-        "calls://", "safari://", "contacts://", "gdrive://", "messages://",
-    )
+    # Orphan cleanup: files in DB that no longer exist on disk. `file_to_chunks`
+    # already excludes native cross-source URI rows; only vault-local markdown
+    # generated by the vault itself or by ETL syncs can be cleaned here.
     orphan_files_raw = set(file_to_chunks.keys()) - indexed_files
-    orphan_files = {
-        f for f in orphan_files_raw
-        if not any(f.startswith(p) for p in _CROSS_SOURCE_PREFIXES)
-    }
+    orphan_files = set(orphan_files_raw)
+    if (
+        orphan_files
+        and not md_files
+        and not _env_truthy("RAG_INDEX_ALLOW_EMPTY_ORPHAN_CLEANUP", default=False)
+    ):
+        console.print(
+            "[yellow]Orphan cleanup salteado[/yellow]: el scan encontró 0 notas "
+            f"pero la colección tiene {len(orphan_files)} paths locales. "
+            "Seteá RAG_INDEX_ALLOW_EMPTY_ORPHAN_CLEANUP=1 para limpiar un vault "
+            "vacío intencionalmente."
+        )
+        try:
+            _silent_log(
+                "index_orphan_cleanup_empty_scan",
+                RuntimeError(
+                    f"skipped {len(orphan_files)} orphan candidates after empty scan "
+                    f"for vault {VAULT_PATH}"
+                ),
+            )
+        except Exception:
+            pass
+        orphan_files = set()
     orphan_ids: list[str] = []
     for f in orphan_files:
         orphan_ids.extend(eid for eid, _ in file_to_chunks[f])
@@ -22805,7 +22452,8 @@ def _peek_index_lock_holder() -> str:
 @click.option("--full", "full_flag", is_flag=True,
               help="Re-embed total: borra la colección y reindexa todo el vault desde cero. "
                    "Usar tras bump de schema o cambio de modelo. Sin este flag, `rag index` "
-                   "es incremental (skippea archivos cuyo hash no cambió).")
+                   "es incremental (skippea archivos cuyo hash no cambió). Safe mode ON por "
+                   "default; RAG_INDEX_FULL_SAFE=0 re-activa enriquecimientos.")
 @click.option("--reset", "reset_legacy", is_flag=True, hidden=True,
               help="(deprecated) alias histórico de --full. Será removido en una próxima versión.")
 @click.option("--no-contradict", is_flag=True, help="Saltear el check de contradicciones en notas nuevas/modificadas")
@@ -23633,13 +23281,12 @@ def watch(debounce: float, all_vaults: bool):
     from watchdog.observers import Observer
     from watchdog.events import FileSystemEventHandler
 
-    # Exclude high-churn folders from real-time reindexing. The WhatsApp
-    # vault-sync writes new messages to `03-Resources/WhatsApp/<chat>/YYYY-MM.md`
-    # every few seconds; without this, one file can re-fire the handler
-    # 50+ times per minute and each reindex hits the backend twice (context
-    # summary via qwen2.5:3b + contradiction detector), saturating the
-    # daemon and making /api/chat queue for minutes. WA files are still
-    # picked up by periodic `rag index` (cron or manual). Override with
+    # Exclude high-churn folders from real-time reindexing. The native
+    # WhatsApp ETL writes monthly rollups under this tree; without this, one
+    # sync can re-fire the handler many times and each reindex hits the
+    # backend twice (context summary via qwen2.5:3b + contradiction detector),
+    # saturating the daemon and making /api/chat queue for minutes. WA files
+    # are still refreshed by periodic `rag index` (cron or manual). Override with
     # OBSIDIAN_RAG_WATCH_EXCLUDE_FOLDERS="a,b,c" (relative to vault root).
     _exclude_env = os.environ.get(
         "OBSIDIAN_RAG_WATCH_EXCLUDE_FOLDERS",
@@ -28049,6 +27696,58 @@ def _feedback_implicit_cases(
     return out
 
 
+def _explicit_feedback_pairs(conn) -> set[tuple[str, str]]:
+    """Return the set of (norm_q, path) tuples already covered by explicit
+    feedback in ``rag_feedback``. Used by ``_behavior_augmented_cases`` to
+    dedupe weak implicit signal against strong explicit signal — if the user
+    rated a (q, path) pair explicitly (rating ±1 OR corrective_path set), the
+    behavior open/copy/save event for that same pair adds noise (the explicit
+    signal already covers it, often with the OPPOSITE polarity that we'd
+    accidentally re-introduce by emitting both).
+
+    Conservative scope:
+      * Only paths inside ``paths_json`` for rating ±1 rows.
+      * Plus the ``corrective_path`` if present (the canonical "right answer").
+      * Session-scope feedback (``scope='session'``) is intentionally skipped:
+        it doesn't pin a specific (q, path) pair.
+
+    On SQL error: returns an empty set so caller falls back to legacy behavior
+    (no dedup) — never blocks the tune loop.
+    """
+    pairs: set[tuple[str, str]] = set()
+    sql = (
+        "SELECT q, paths_json, "
+        "       json_extract(extra_json, '$.corrective_path') AS cp "
+        "FROM rag_feedback "
+        "WHERE (scope IS NULL OR scope != 'session') "
+        "  AND q IS NOT NULL AND q != '' "
+        "  AND rating IS NOT NULL AND rating != 0"
+    )
+    try:
+        rows = conn.execute(sql).fetchall()
+    except sqlite3.Error as exc:
+        _log_sql_state_error("explicit_feedback_pairs_sql_read_failed",
+                              err=repr(exc))
+        return pairs
+    for row in rows:
+        q = row["q"] if hasattr(row, "keys") else row[0]
+        paths_json = row["paths_json"] if hasattr(row, "keys") else row[1]
+        cp = row["cp"] if hasattr(row, "keys") else row[2]
+        norm_q = " ".join((q or "").strip().lower().split())
+        if not norm_q:
+            continue
+        try:
+            paths = json.loads(paths_json) if paths_json else []
+        except (json.JSONDecodeError, TypeError):
+            paths = []
+        for p in paths:
+            if isinstance(p, str) and p:
+                pairs.add((norm_q, p))
+        if isinstance(cp, str) and cp:
+            pairs.add((norm_q, cp))
+    return pairs
+
+
 def _behavior_augmented_cases(days: int = 14) -> list[dict]:
     """Mine behavior events for implicit feedback — forms gold (query, path) tuples.
 
@@ -28060,7 +27759,20 @@ def _behavior_augmented_cases(days: int = 14) -> list[dict]:
 
     Reads from rag_behavior with `ts >= since_ts` (ISO-8601 14-day cutoff).
     SQL-only since T10. On SQL error: empty list.
+
+    **2026-05-16 — closing the implicit loop**:
+      * Env var ``RAG_BEHAVIOR_IMPLICIT=0`` disables the whole function (returns
+        ``[]``). Default ``1`` preserves the existing tune signal that the
+        nightly eval gate has been validating since 2026-04-26.
+      * Dedup against explicit feedback: any (norm_q, path) already present in
+        ``rag_feedback`` (rating ±1 or corrective_path) is skipped — the
+        explicit signal wins, the weak implicit pair gets dropped. Prevents
+        a 👎+open from the same query+path silently re-introducing the same
+        path as a positive case.
     """
+    if os.environ.get("RAG_BEHAVIOR_IMPLICIT", "1") in ("0", "false", "False"):
+        return []
+
     cutoff_ts = time.time() - days * 86400
     since_iso = datetime.fromtimestamp(cutoff_ts).isoformat(timespec="seconds")
     # Audit 2026-04-26 (BUG #4): pre-fix usaba un literal local desincronizado
@@ -28073,9 +27785,11 @@ def _behavior_augmented_cases(days: int = 14) -> list[dict]:
     pos: dict[tuple[str, str], str] = {}   # (norm_q, path) → source
     neg: dict[tuple[str, str], str] = {}   # (norm_q, path) → source
 
+    explicit_pairs: set[tuple[str, str]] = set()
     try:
         with _ragvec_state_conn() as conn:
-            rows_iter = _sql_query_window(conn, "rag_behavior", since_iso)
+            explicit_pairs = _explicit_feedback_pairs(conn)
+            rows_iter = list(_sql_query_window(conn, "rag_behavior", since_iso))
     except Exception as exc:
         _log_sql_state_error("behavior_augmented_cases_sql_read_failed",
                               err=repr(exc))
@@ -28097,6 +27811,11 @@ def _behavior_augmented_cases(days: int = 14) -> list[dict]:
         event = _g("event") or ""
         norm_q = " ".join(query.lower().split())
         key = (norm_q, path)
+        # Explicit feedback dedup: if the user already rated this exact (q, path)
+        # pair, that explicit signal wins. Skipping prevents the weak behavior
+        # case from drowning out (or contradicting) the stronger explicit one.
+        if key in explicit_pairs:
+            continue
         if event in _POSITIVE:
             pos[key] = event
         elif event in _NEGATIVE:
@@ -39145,11 +38864,12 @@ def _parse_applescript_date(s: str) -> datetime | None:
     """AppleScript `as string` dates are locale-formatted (e.g. 'lunes, 14 de abril
     de 2026, 09:00:00'). Try a few common locales/formats; return None on miss.
     """
-    s = s.strip()
+    s = s.replace("\u202f", " ").replace("\xa0", " ").strip()
     if not s:
         return None
     fmts = [
         "%A, %B %d, %Y at %I:%M:%S %p",
+        "%A, %d %B %Y at %I:%M:%S %p",
         "%A, %d %B %Y at %H:%M:%S",
         "%A %d %B %Y %H:%M:%S",
         "%Y-%m-%d %H:%M:%S",
@@ -42183,7 +41903,7 @@ _WA_BRIDGE_BINARY = _WA_BRIDGE_REPO / "whatsapp-bridge"
 _WA_BRIDGE_SESSION_DB = _WA_BRIDGE_REPO / "store/whatsapp.db"
 _WA_BRIDGE_MESSAGES_DB = _WA_BRIDGE_REPO / "store/messages.db"
 _WA_BRIDGE_SENTINEL = _WA_BRIDGE_REPO / "store/.needs-reauth"
-_WA_BRIDGE_LOG = Path.home() / ".local/share/whatsapp-bridge/bridge.log"
+_WA_BRIDGE_LOG = Path.home() / ".local/share/obsidian-rag/wa-bridge.log"
 _WA_BRIDGE_HEALTH_URL = f"http://localhost:{_WA_BRIDGE_PORT}/api/health"
 
 
@@ -42568,7 +42288,7 @@ def bridge_reauth(keep_session: bool, yes: bool):
     console.print("[yellow]⚠ daemon arrancó pero el HTTP probe sigue fallando.[/yellow]")
     console.print(f"[dim]Último detail: {detail}[/dim]")
     console.print(
-        "[dim]Mirá `tail -f ~/.local/share/whatsapp-bridge/bridge.log` "
+        "[dim]Mirá `tail -f ~/.local/share/obsidian-rag/wa-bridge.log` "
         "y reintentá si hace falta.[/dim]"
     )
 

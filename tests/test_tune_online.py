@@ -116,6 +116,124 @@ def test_behavior_ignores_events_without_query(tmp_path, monkeypatch):
     assert result[0]["expected"] == ["Note.md"]
 
 
+# ── RAG_BEHAVIOR_IMPLICIT kill switch + explicit-feedback dedup ──────────────
+#
+# Closing the implicit loop (2026-05-16): the function gained an env-var
+# master switch and dedups against explicit feedback. Tests below cover
+# both new behaviors plus the silent-fail contract on missing/empty data.
+
+
+def _seed_feedback(events: list[dict]) -> None:
+    """Seed rag_feedback rows via the same SQL primitives used by log_feedback."""
+    with rag._ragvec_state_conn() as conn:
+        for ev in events:
+            rag._sql_append_event(conn, "rag_feedback",
+                                    rag._map_feedback_row(ev))
+
+
+def test_behavior_implicit_env_var_disables(tmp_path, monkeypatch):
+    """RAG_BEHAVIOR_IMPLICIT=0 → returns [] without touching SQL."""
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    _seed_sql(tmp_path, [
+        {"event": "open", "query": "should not surface",
+         "path": "Note.md", "ts": _iso(-100)},
+    ])
+    monkeypatch.setenv("RAG_BEHAVIOR_IMPLICIT", "0")
+    assert rag._behavior_augmented_cases(days=14) == []
+    # Sanity: default ON still picks up the event.
+    monkeypatch.setenv("RAG_BEHAVIOR_IMPLICIT", "1")
+    assert len(rag._behavior_augmented_cases(days=14)) == 1
+
+
+def test_behavior_dedup_against_explicit_positive(tmp_path, monkeypatch):
+    """(q, path) already rated +1 explicitly → behavior open dropped."""
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    # Explicit thumbs-up on (q, path) — strong signal already in rag_feedback.
+    _seed_feedback([{
+        "ts": _iso(-200),
+        "turn_id": "t1",
+        "rating": 1,
+        "q": "ikigai framework",
+        "paths": ["Ikigai.md"],
+    }])
+    # Behavior open on the same (q, path) — would be redundant noise.
+    _seed_sql(tmp_path, [
+        {"event": "open", "query": "ikigai framework",
+         "path": "Ikigai.md", "ts": _iso(-100)},
+        # Unrelated open on a different (q, path) — must still surface.
+        {"event": "open", "query": "morning routine",
+         "path": "Morning.md", "ts": _iso(-100)},
+    ])
+    result = rag._behavior_augmented_cases(days=14)
+    paths = [c.get("expected", c.get("anti_expected", [None]))[0] for c in result]
+    assert "Ikigai.md" not in paths       # deduped by explicit feedback
+    assert "Morning.md" in paths           # untouched
+
+
+def test_behavior_dedup_against_explicit_negative(tmp_path, monkeypatch):
+    """(q, path) explicitly rated -1 → behavior open on same pair dropped.
+
+    Prevents a thumbs-down + later click (the user opened it to verify it
+    really was wrong) from silently re-introducing the path as a positive.
+    """
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    _seed_feedback([{
+        "ts": _iso(-200),
+        "turn_id": "t1",
+        "rating": -1,
+        "q": "wrong note",
+        "paths": ["Wrong.md"],
+    }])
+    _seed_sql(tmp_path, [
+        {"event": "open", "query": "wrong note",
+         "path": "Wrong.md", "ts": _iso(-100)},
+    ])
+    result = rag._behavior_augmented_cases(days=14)
+    assert result == []
+
+
+def test_behavior_dedup_against_corrective_path(tmp_path, monkeypatch):
+    """corrective_path in extra_json also counts as explicit feedback."""
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    _seed_feedback([{
+        "ts": _iso(-200),
+        "turn_id": "t1",
+        "rating": -1,
+        "q": "what is ikigai",
+        "paths": ["Wrong.md"],
+        "corrective_path": "Right.md",   # user pointed to the correct note
+    }])
+    _seed_sql(tmp_path, [
+        # Behavior open on the corrective path — redundant with explicit signal.
+        {"event": "open", "query": "what is ikigai",
+         "path": "Right.md", "ts": _iso(-100)},
+    ])
+    result = rag._behavior_augmented_cases(days=14)
+    assert result == []
+
+
+def test_behavior_explicit_session_scope_does_not_dedup(tmp_path, monkeypatch):
+    """Session-scope feedback doesn't pin a (q, path) → behavior signal survives."""
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    _seed_feedback([{
+        "ts": _iso(-200),
+        "turn_id": "session-1",
+        "rating": 1,
+        "q": "what is ikigai",
+        "paths": ["Ikigai.md"],
+        "scope": "session",   # session-level, not turn-level
+    }])
+    _seed_sql(tmp_path, [
+        {"event": "open", "query": "what is ikigai",
+         "path": "Ikigai.md", "ts": _iso(-100)},
+    ])
+    result = rag._behavior_augmented_cases(days=14)
+    # The behavior open survives because the explicit feedback was session
+    # scope (doesn't identify which (q, path) was the win).
+    assert len(result) == 1
+    assert result[0]["expected"] == ["Ikigai.md"]
+
+
 # ── _brief_synthetic_cases (synthetic query attachment) ──────────────────────
 
 def _seed_query(events: list[dict]) -> None:

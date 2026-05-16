@@ -13,6 +13,7 @@ import collections as _collections
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -2211,7 +2212,7 @@ def whatsapp_context(jid: str, limit: int = 5) -> dict:
     try:
         from rag.integrations.whatsapp import _fetch_whatsapp_recent_with_jid  # noqa: PLC0415
         return _fetch_whatsapp_recent_with_jid(j, limit=int(limit))
-    except ImportError as e:
+    except Exception as e:
         raise HTTPException(status_code=500, detail=f"error leyendo bridge: {e}") from e
 
 
@@ -2242,7 +2243,7 @@ def whatsapp_scheduled_list(
             limit=max(1, min(int(limit), 1000)),
         )
         return {"items": items, "count": len(items)}
-    except ImportError as e:
+    except Exception as e:
         raise HTTPException(status_code=500, detail=f"error listando scheduled: {e}") from e
 
 
@@ -2842,7 +2843,9 @@ def wa_anticipate_today(limit: int = 3, min_score: float = 0.30) -> dict:
     Si todas las signals fallan / no hay candidates → `candidates: []`
     (no error). El frontend muestra empty state.
     """
-    if settings.anticipate_disabled:
+    if settings.anticipate_disabled or os.environ.get(
+        "RAG_ANTICIPATE_DISABLED", ""
+    ).strip().lower() in ("1", "true", "yes"):
         return {
             "ok": True,
             "disabled": True,
@@ -2885,7 +2888,7 @@ def wa_anticipate_today(limit: int = 3, min_score: float = 0.30) -> dict:
 # nuevo (el SSE handler bumpea la cache para ese JID).
 
 _WZP_MEMORY_CACHE_LOCK = _threading.RLock()
-_WZP_MEMORY_CACHE: dict = {}  # jid → {"ts": float, "data": dict}
+_WZP_MEMORY_CACHE: dict = {}  # (jid, max_notes, max_wa) → {"ts": float, "data": dict}
 _WZP_MEMORY_CACHE_TTL = 300.0
 
 
@@ -2895,7 +2898,30 @@ def _wzp_memory_invalidate(jid: str) -> None:
     if not jid:
         return
     with _WZP_MEMORY_CACHE_LOCK:
-        _WZP_MEMORY_CACHE.pop(jid, None)
+        for key in list(_WZP_MEMORY_CACHE):
+            if isinstance(key, tuple) and key and key[0] == jid:
+                _WZP_MEMORY_CACHE.pop(key, None)
+            elif key == jid:  # compat con slots viejos dentro del proceso
+                _WZP_MEMORY_CACHE.pop(key, None)
+
+
+def _wzp_epoch_from_ts(value) -> int | None:
+    """Convierte ts bridge/UI a epoch seconds para el drawer de memoria."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        return int(float(s))
+    except ValueError:
+        pass
+    try:
+        return int(datetime.fromisoformat(s.replace(" ", "T", 1)).timestamp())
+    except ValueError:
+        return None
 
 
 def _wzp_memory_collect(jid: str, max_notes: int, max_wa: int) -> dict:
@@ -2962,10 +2988,11 @@ def _wzp_memory_collect(jid: str, max_notes: int, max_wa: int) -> dict:
             content = (m.get("content") or "").strip()
             if not content:
                 continue
+            ts_epoch = _wzp_epoch_from_ts(m.get("ts"))
             wa_recent.append({
                 "id": m.get("id") or "",
-                "ts": int(m.get("ts") or 0),
-                "from_me": bool(m.get("from_me")),
+                "ts": ts_epoch or 0,
+                "from_me": bool(m.get("is_from_me", m.get("from_me", False))),
                 "content": content[:300],
             })
             if wa_recent and wa_recent[0]["ts"]:
@@ -3020,10 +3047,11 @@ def wa_memory(jid: str, max_notes: int = 5, max_wa: int = 5) -> dict:
     max_notes = max(1, min(int(max_notes), 15))
     max_wa = max(1, min(int(max_wa), 20))
 
+    cache_key = (jid, max_notes, max_wa)
     cached_ts = 0.0
     cached_data: dict | None = None
     with _WZP_MEMORY_CACHE_LOCK:
-        slot = _WZP_MEMORY_CACHE.get(jid)
+        slot = _WZP_MEMORY_CACHE.get(cache_key)
         if slot:
             cached_ts = float(slot.get("ts", 0.0))
             cached_data = slot.get("data")
@@ -3033,7 +3061,7 @@ def wa_memory(jid: str, max_notes: int = 5, max_wa: int = 5) -> dict:
 
     data = _wzp_memory_collect(jid, max_notes, max_wa)
     with _WZP_MEMORY_CACHE_LOCK:
-        _WZP_MEMORY_CACHE[jid] = {"ts": time.time(), "data": data}
+        _WZP_MEMORY_CACHE[cache_key] = {"ts": time.time(), "data": data}
     return {"ok": True, "cached": False, **data}
 
 
@@ -4310,6 +4338,8 @@ async def wa_stream(request: Request) -> StreamingResponse:
                     continue
                 etype = event.get("type") or "message"
                 edata = event.get("data") or {}
+                if etype == "new_message":
+                    _wzp_memory_invalidate(str(edata.get("jid") or ""))
                 yield f"event: {etype}\ndata: {json.dumps(edata, ensure_ascii=False)}\n\n"
         finally:
             _wa_tail.unsubscribe(queue)
@@ -9346,11 +9376,14 @@ def home_api(regenerate: bool = False) -> Response:
     # Explicit user action — recompute LLM brief synchronously.
     if regenerate:
         _home_refresh(regenerate=True)
-        body = _HOME_STATE["body"] or _WARMING_BODY
+        with _HOME_LOCK:
+            body = _HOME_STATE["body"] or _WARMING_BODY
         return Response(content=body, media_type="application/json")
 
-    body = _HOME_STATE["body"]
-    age = time.time() - _HOME_STATE["ts"] if body else float("inf")
+    with _HOME_LOCK:
+        body = _HOME_STATE["body"]
+        ts = _HOME_STATE["ts"]
+    age = time.time() - ts if body else float("inf")
 
     if body and age < _HOME_SOFT_TTL:
         return Response(content=body, media_type="application/json")
@@ -9600,9 +9633,10 @@ async def home_stream(request: Request, regenerate: bool = False) -> StreamingRe
                     with suppress(Exception):
                         body = json.dumps(payload, default=str).encode()
                         now = time.time()
-                        _HOME_STATE["payload"] = payload
-                        _HOME_STATE["body"] = body
-                        _HOME_STATE["ts"] = now
+                        with _HOME_LOCK:
+                            _HOME_STATE["payload"] = payload
+                            _HOME_STATE["body"] = body
+                            _HOME_STATE["ts"] = now
                         _persist_home_cache(body, now)
                     _record_home_compute_total(time.time() - t0)
                     finished = True
@@ -10951,7 +10985,7 @@ def _resolve_redo_question(turn_id: str) -> tuple[str | None, str | None]:
                 " ORDER BY ts DESC LIMIT 1",
                 (turn_id,),
             ).fetchone()
-    except sqlite3.Error as exc:
+    except Exception as exc:
         print(f"[redo] sql lookup failed: {type(exc).__name__}: {exc}", flush=True)
         return None, None
     if row is None:
@@ -14167,7 +14201,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                         else:
                             _ret = _fn(**_filter_tool_args(_name, _args))
                             _out = _ret if isinstance(_ret, str) else json.dumps(_ret, ensure_ascii=False)
-                    except (json.JSONDecodeError, TypeError) as _exc:
+                    except Exception as _exc:
                         _out = f"Error: {_exc}"
                     _elapsed_ms = int((time.perf_counter() - _t_tool_start) * 1000)
                     _round_serial_sum_ms += _elapsed_ms
@@ -14202,7 +14236,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                             else:
                                 _ret = _fn(**_filter_tool_args(_name, _args))
                                 _out = _ret if isinstance(_ret, str) else json.dumps(_ret, ensure_ascii=False)
-                        except (json.JSONDecodeError, TypeError) as _exc:
+                        except Exception as _exc:
                             _out = f"Error: {_exc}"
                         return _name, _out, int((time.perf_counter() - _t0) * 1000)
 
@@ -14369,7 +14403,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         _first_token_logged = False
         try:
             from rag import _chat_stream_dispatch
-            for chunk in _chat_stream_dispatch(
+            final_stream = _chat_stream_dispatch(
                 model=_web_model,
                 messages=final_messages,
                 options=_stream_options,
@@ -14380,7 +14414,15 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                                # UI sees 0-token responses (measured on
                                # qwen3.6 2026-04-20).
                 keep_alive=chat_keep_alive(_web_model),
-            ):
+            )
+            if isinstance(final_stream, dict) or hasattr(final_stream, "message"):
+                final_chunks = (final_stream,)
+            else:
+                try:
+                    final_chunks = iter(final_stream)
+                except TypeError:
+                    final_chunks = (final_stream,)
+            for chunk in final_chunks:
                 delta = chunk.message.content or ""
                 if not delta:
                     continue
@@ -16254,6 +16296,7 @@ def _status_dispatch_one(entry: dict) -> dict:
 # queremos hacer 25 subprocess.run por cada request. 3s es suficiente
 # para que un F5 manual vea cambios recientes sin hammerear launchctl.
 _STATUS_CACHE = ThreadSafeCache(ttl=3.0)
+_STATUS_CACHE_LOCK = _STATUS_CACHE._lock
 
 
 def _status_build_payload() -> dict:
@@ -16438,7 +16481,7 @@ def status_action(req: StatusActionRequest) -> dict:
     # Invalidar cache para que el proximo /api/status refleje el cambio
     # (kickstart cambia state a running en <1s; sin esto la UI mostraria
     # info vieja por hasta 3s - el TTL del cache).
-    _STATUS_CACHE.put({"ts": 0.0, "payload": None})
+    _STATUS_CACHE.clear()
 
     return {
         "ok": out.returncode == 0,
@@ -16675,6 +16718,7 @@ def status_latency(nocache: int = 0) -> dict:
 #   }
 
 _ERRORS_CACHE = ThreadSafeCacheMultiKey(ttl=30.0, max_size=1)
+_ERRORS_CACHE_LOCK = _ERRORS_CACHE._lock
 
 # Cuántos `where/event` distintos mostramos en la breakdown antes de
 # colapsar el resto en `other`. 6 es el sweet spot — entra en la card
@@ -16876,6 +16920,7 @@ def status_errors(nocache: int = 0) -> dict:
 #   file missing        → unknown (no corrió nunca o el log fue borrado)
 
 _FRESHNESS_CACHE = ThreadSafeCache(ttl=30.0)
+_FRESHNESS_CACHE_LOCK = _FRESHNESS_CACHE._lock
 
 # Catálogo de fuentes. El orden acá define el orden en la UI (stable,
 # lo que permite al user aprender la tabla "de memoria"). `sla_seconds`
@@ -17503,6 +17548,7 @@ def _stop_status_probe_thread() -> None:
 # (window function sobre 50k rows agrupadas por hora), TTL más largo
 # que los otros cards porque los buckets de uptime cambian de a poco.
 _UPTIME_CACHE = ThreadSafeCache(ttl=90.0)
+_UPTIME_CACHE_LOCK = _UPTIME_CACHE._lock
 
 
 def _status_uptime_build_payload() -> dict:
@@ -17929,6 +17975,39 @@ _LOG_RECENT_ERROR_WINDOW_S = 86400
 _LOGS_INDEX_CACHE = ThreadSafeCache(ttl=10.0)
 
 
+def _cache_get_compat(cache_obj, key=None):
+    """Read cache objects or legacy `{ts, payload}` dicts used by tests."""
+    if isinstance(cache_obj, dict):
+        if key is not None and key in cache_obj and isinstance(cache_obj[key], dict):
+            entry = cache_obj[key]
+        else:
+            entry = cache_obj
+        ts = float(entry.get("ts") or 0.0)
+        payload = entry.get("payload")
+        if not ts or payload is None:
+            return None
+        return ts, payload
+    if key is None:
+        return cache_obj.get()
+    return cache_obj.get(key)
+
+
+def _cache_put_compat(cache_obj, key_or_payload, payload=None) -> None:
+    """Write cache objects or legacy dicts without leaking test internals."""
+    if isinstance(cache_obj, dict):
+        ts = time.time()
+        if payload is None:
+            cache_obj["ts"] = ts
+            cache_obj["payload"] = key_or_payload
+        else:
+            cache_obj[key_or_payload] = {"ts": ts, "payload": payload}
+        return
+    if payload is None:
+        cache_obj.put(key_or_payload)
+    else:
+        cache_obj.put(key_or_payload, payload)
+
+
 def _classify_log_line(line: str) -> str:
     """Devolver 'error' | 'warn' | 'ok' | 'info' para una línea de log."""
     if not line.strip():
@@ -18297,14 +18376,14 @@ def logs_index(nocache: int = 0) -> dict:
     """
     if nocache:
         payload = _build_logs_index_payload()
-        _LOGS_INDEX_CACHE.put(payload)
+        _cache_put_compat(_LOGS_INDEX_CACHE, payload)
         return payload
-    cached = _LOGS_INDEX_CACHE.get()
+    cached = _cache_get_compat(_LOGS_INDEX_CACHE)
     if cached:
         ts, payload = cached
         return payload
     payload = _build_logs_index_payload()
-    _LOGS_INDEX_CACHE.put(payload)
+    _cache_put_compat(_LOGS_INDEX_CACHE, payload)
     return payload
 
 
@@ -18573,14 +18652,14 @@ def logs_global_errors(
     cache_key = (window_s, level)
     if nocache:
         payload = _build_global_errors_payload(window_s, level)
-        _LOG_GLOBAL_CACHE.put(cache_key, payload)
+        _cache_put_compat(_LOG_GLOBAL_CACHE, cache_key, payload)
         return payload
-    cached = _LOG_GLOBAL_CACHE.get(cache_key)
+    cached = _cache_get_compat(_LOG_GLOBAL_CACHE, cache_key)
     if cached:
         ts, payload = cached
         return payload
     payload = _build_global_errors_payload(window_s, level)
-    _LOG_GLOBAL_CACHE.put(cache_key, payload)
+    _cache_put_compat(_LOG_GLOBAL_CACHE, cache_key, payload)
     return payload
 
 
@@ -19359,7 +19438,7 @@ async def diagnose_error(req: _DiagnoseErrorRequest, request: Request) -> Stream
                 if done:
                     yield f"data: {json.dumps({'type': 'done'})}\n\n"
                     break
-        except (json.JSONDecodeError, TypeError) as e:
+        except Exception as e:
             err_msg = f"{type(e).__name__}: {e}"
             yield f"data: {json.dumps({'type': 'error', 'message': err_msg})}\n\n"
 
@@ -23408,13 +23487,13 @@ def vault_health_api() -> dict:
     try:
         from rag.vault_health import compute_vault_health  # noqa: PLC0415
         return compute_vault_health()
-    except ImportError as exc:
+    except Exception as exc:
         # Defensa de último recurso — el módulo NUNCA debería raisear,
         # pero el endpoint promete HTTP 200 + JSON parseable a la UI.
         try:
             from rag.vault_health import WEIGHTS as _W  # noqa: PLC0415
             weights = dict(_W)
-        except ImportError:
+        except Exception:
             weights = {}
         return {
             "score":           None,

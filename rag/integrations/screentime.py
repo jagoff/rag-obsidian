@@ -377,10 +377,11 @@ def _sync_screentime_notes(
     for p in target_dir.glob("*.md"):
         if p.name in current_set:
             continue
-        if _SCREENTIME_DAILY_RE.match(p.name):
-            continue
-        if _SCREENTIME_MONTHLY_RE.match(p.name):
-            continue
+        if _SCREENTIME_DAILY_RE.match(p.name) or _SCREENTIME_MONTHLY_RE.match(p.name):
+            try:
+                p.unlink()
+            except OSError:
+                pass
 
     total_secs = sum(int(st.get("total_secs") or 0) for st in day_data.values())
     return {

@@ -11170,13 +11170,11 @@ async def home_stream(request: Request, regenerate: bool = False) -> StreamingRe
         # stream realmente wedged ata recursos 60s en lugar de 30s,
         # pero los compute lentos genuinos ya no se cortan a la mitad.
         #
-        # 2026-05-15: subido de 60s a 120s. Con regenerate=True el path
-        # ahora incluye narrative LLM (qwen2.5:7b, 20-40s) además del
-        # fan-out de señales (hasta 22s) → total puede exceder 60s en
-        # condiciones normales. 120s da margen para signals lentas +
-        # narrative sin cortar el stream legítimo. Un stream wedged real
-        # (hang total) ata recursos 2min — aceptable en un servidor local.
-        HARD_CAP_S = 120.0 if regenerate else 60.0
+        # 2026-05-15: subido de 60s a 75s (regen=True). El narrative LLM
+        # tiene su propio timeout de 50s; con stages lentas (hasta 22s)
+        # el techo real es ~72s. 75s da margen sin atar recursos 2min.
+        # regen=False no tiene narrative → 60s sigue siendo el cap.
+        HARD_CAP_S = 75.0 if regenerate else 60.0
 
         worker = threading.Thread(target=_runner, name="home-stream", daemon=True)
         worker.start()
@@ -12058,12 +12056,35 @@ def _home_compute(
             with suppress(Exception):
                 progress("narrative", "start", 0.0, None)
         _t_narrative = time.time()
-        narrative = _generate_today_narrative(prompt)
-        narrative_source = "generated" if narrative else "error"
+        # Narrative LLM con timeout: el modelo puede estar descargado (memory
+        # watchdog) y la recarga cold + generación puede exceder 60s. Con
+        # timeout=50s, si el LLM no termina a tiempo emitimos "timeout" y
+        # continuamos con cached/empty — el `done` SSE llega igual y la UI
+        # no queda colgada en 92%.
+        #
+        # IMPORTANTE: NO usar `with ThreadPoolExecutor(...)` — el __exit__
+        # hace shutdown(wait=True) que bloquea aunque result(timeout=N) haya
+        # lanzado TimeoutError. Usar shutdown(wait=False) explícito para que
+        # el thread de narrative siga en background sin bloquear el stream.
+        import concurrent.futures as _cf_narrative
+        _narrative_status = "done"
+        _ntp = _cf_narrative.ThreadPoolExecutor(max_workers=1, thread_name_prefix="narrative")
+        try:
+            _fut_nar = _ntp.submit(_generate_today_narrative, prompt)
+            try:
+                narrative = _fut_nar.result(timeout=50)
+                _narrative_status = "done" if narrative else "error"
+            except _cf_narrative.TimeoutError:
+                narrative = ""
+                _narrative_status = "timeout"
+                print("[home-stream] narrative timeout (>50s) — continuando sin LLM", file=sys.stderr)
+        finally:
+            _ntp.shutdown(wait=False)  # No bloquear — thread sigue en BG
+        narrative_source = "generated" if narrative else ("timeout" if _narrative_status == "timeout" else "error")
         _narrative_ms = (time.time() - _t_narrative) * 1000.0
         if progress is not None:
             with suppress(Exception):
-                progress("narrative", "done" if narrative else "error", _narrative_ms, None)
+                progress("narrative", _narrative_status, _narrative_ms, None)
         if narrative:
             _persist_today_brief(date_label, narrative)
 

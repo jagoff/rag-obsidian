@@ -144,10 +144,13 @@ export function initRefreshButton(onDone, onFallbackLoad) {
     });
 
     // Trickle: avance mínimo cuando el server tarda en mandar events.
+    // Límite 97% (no 100) para que el salto final al 100% sea visible
+    // cuando el SSE `done` llega. Permite avanzar past 92% (all-stages-done)
+    // mientras el narrative LLM genera (~40-60s).
     trickleTimer = setInterval(() => {
       const sinceLast = (Date.now() - lastStageTs) / 1000;
-      if (sinceLast > 1 && pct < 90) {
-        pct = Math.min(90, pct + 0.3);
+      if (sinceLast > 1 && pct < 97) {
+        pct = Math.min(97, pct + 0.3);
         setBar(progressBar, progressLabel, pct, lastStageLabel);
       }
     }, 1000);

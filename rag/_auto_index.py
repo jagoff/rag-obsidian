@@ -58,20 +58,30 @@ def _auto_index_state_load() -> dict:
     """Lee el state de auto-index. Estructura: {vault_hash: last_check_ts}.
     Tolerante a archivo faltante o corrupto — devuelve {} en cualquier error.
     """
-    if not AUTO_INDEX_STATE_PATH.is_file():
+    try:
+        import rag as _rag  # noqa: PLC0415
+        path = getattr(_rag, "AUTO_INDEX_STATE_PATH", AUTO_INDEX_STATE_PATH)
+    except Exception:
+        path = AUTO_INDEX_STATE_PATH
+    if not path.is_file():
         return {}
     try:
-        return json.loads(AUTO_INDEX_STATE_PATH.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
 
 def _auto_index_state_save(state: dict) -> None:
     from rag import _silent_log  # noqa: PLC0415
+    try:
+        import rag as _rag  # noqa: PLC0415
+        path = getattr(_rag, "AUTO_INDEX_STATE_PATH", AUTO_INDEX_STATE_PATH)
+    except Exception:
+        path = AUTO_INDEX_STATE_PATH
 
     try:
-        AUTO_INDEX_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        AUTO_INDEX_STATE_PATH.write_text(
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
             json.dumps(state, indent=2), encoding="utf-8",
         )
     except Exception as exc:
@@ -197,7 +207,9 @@ def auto_index_vault(vault_path: Path) -> dict:
         for p in candidates:
             try:
                 status = _index_single_file(col, p, skip_contradict=True)
-            except Exception:
+            except Exception as _exc:
+                from rag import _silent_log  # noqa: PLC0415
+                _silent_log("auto_index_single_file_failed", _exc)
                 continue
             if status == "indexed":
                 indexed += 1

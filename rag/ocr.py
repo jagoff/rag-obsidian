@@ -400,6 +400,7 @@ _VLM_CAPTION_MAX_CHARS = 500
 # del indexer). Override con `RAG_VLM_CAPTION_MAX_PER_RUN`.
 _VLM_CAPTION_MAX_PER_RUN = int(os.environ.get("RAG_VLM_CAPTION_MAX_PER_RUN", "500"))
 _vlm_caption_calls_used: int = 0
+_VLM_BUDGET_LOCK = threading.Lock()
 
 # Singleton mlx-vlm model + processor. Protected by _VLM_LOCK.
 _VLM_MODEL_OBJ: object | None = None
@@ -546,18 +547,21 @@ def _vlm_caption_budget_reset() -> None:
     que cada run tenga su propio budget limpio. Tests también resetean
     entre casos para aislar."""
     global _vlm_caption_calls_used
-    _vlm_caption_calls_used = 0
+    with _VLM_BUDGET_LOCK:
+        _vlm_caption_calls_used = 0
 
 
 def _vlm_caption_budget_available() -> bool:
     # Resolve via `rag` so tests can monkeypatch.setattr(rag, "_VLM_CAPTION_MAX_PER_RUN", N).
     import rag as _rag
-    return _vlm_caption_calls_used < _rag._VLM_CAPTION_MAX_PER_RUN
+    with _VLM_BUDGET_LOCK:
+        return _vlm_caption_calls_used < _rag._VLM_CAPTION_MAX_PER_RUN
 
 
 def _vlm_caption_budget_consume() -> None:
     global _vlm_caption_calls_used
-    _vlm_caption_calls_used += 1
+    with _VLM_BUDGET_LOCK:
+        _vlm_caption_calls_used += 1
 
 
 # Prompt del VLM. Español rioplatense-neutral, optimizado para retrieval:

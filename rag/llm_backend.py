@@ -1012,7 +1012,7 @@ class MLXBackend(LLMBackend):
                 embed_model, embed_tokenizer = load(canonical)
                 self._loaded_embed[canonical] = (embed_model, embed_tokenizer)
             embed_model, embed_tokenizer = self._loaded_embed[canonical]
-        self._last_used[canonical] = time.monotonic()
+            self._last_used[canonical] = time.monotonic()
 
         # mlx-lm wraps HF tokenizers in `TokenizerWrapper` (not directly
         # callable). Reach for the inner `_tokenizer` (a PreTrainedTokenizer)

@@ -298,7 +298,7 @@ def distill_conversation(
         if m:
             fm_text = m.group(1)
             if "distilled_to:" not in fm_text:
-                new_fm = fm_text + f"\ndistilled_to: {runbook_rel}"
+                new_fm = fm_text.rstrip() + f"\ndistilled_to: {runbook_rel}"
                 new_raw = f"---\n{new_fm}\n---" + raw[m.end():]
                 conv_full.write_text(new_raw, encoding="utf-8")
     except OSError:

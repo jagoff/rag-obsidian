@@ -392,8 +392,9 @@ def cleanup_old_voice_briefs(*, ttl_days: int | None = None,
         if not f.is_file():
             continue
         try:
-            if f.stat().st_mtime < cutoff:
-                size = f.stat().st_size
+            st = f.stat()
+            if st.st_mtime < cutoff:
+                size = st.st_size
                 f.unlink()
                 deleted += 1
                 bytes_freed += size

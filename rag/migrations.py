@@ -199,6 +199,7 @@ def apply_pending_migrations(conn: sqlite3.Connection) -> list[int]:
         except Exception:
             with contextlib.suppress(sqlite3.Error):
                 conn.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
+            with contextlib.suppress(sqlite3.Error):
                 conn.execute(f"RELEASE SAVEPOINT {sp_name}")
             raise
 

@@ -11,6 +11,7 @@ avoid circular-import issues.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 from pathlib import Path
 
@@ -253,8 +254,13 @@ def _atomic_write_if_changed(target: Path, body: str) -> bool:
         except OSError:
             pass
     tmp = target.with_suffix(target.suffix + ".tmp")
-    tmp.write_text(body, encoding="utf-8")
-    os.replace(tmp, target)
+    try:
+        tmp.write_text(body, encoding="utf-8")
+        os.replace(tmp, target)
+    except Exception:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
     return True
 
 

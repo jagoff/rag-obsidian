@@ -146,8 +146,9 @@ def _proactive_can_push(kind: str) -> tuple[bool, str]:
             until = datetime.fromisoformat(snooze_ts)
             if datetime.now() < until:
                 return (False, f"{kind} en snooze hasta {until.isoformat(timespec='minutes')}")
-        except Exception:
-            pass
+        except Exception as _exc:
+            from rag import _silent_log  # noqa: PLC0415
+            _silent_log("proactive_snooze_corruption", _exc)
     # Aplicar cap adecuado según el kind
     daily_cap = (PROACTIVE_ANTICIPATE_DAILY_CAP
                  if kind.startswith("anticipate-") else PROACTIVE_DAILY_CAP)

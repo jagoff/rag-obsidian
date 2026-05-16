@@ -533,7 +533,7 @@ def _enrich_commitment_with_draft(
         return candidate
     age_days = float(loop.get("age_days") or 0)
     # Promise text = loop_text limpio del wikilink trigger.
-    promise = re.sub(r"@[A-ZÁÉÍÓÚÑ][\wáéíóúñ\s]*", name, loop.get("loop_text") or "")
+    promise = re.sub(r"@[A-ZÁÉÍÓÚÑ][\wáéíóúñ]*", name, loop.get("loop_text") or "")
     try:
         result = compose_draft(
             target_jid=jid,

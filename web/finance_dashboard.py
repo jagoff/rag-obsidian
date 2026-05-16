@@ -19,11 +19,12 @@ Fuentes soportadas:
    y se deduplica por fingerprint ``(date|time|account|name|store|abs(price))``
    — el user dijo "MOZE puede estar repetida" y este es el contrato.
 
-2. ``Último resumen - <Marca> <Últimos4>.xlsx`` — los resúmenes de tarjeta
-   de crédito que emite el banco. Reutiliza ``_parse_credit_card_xlsx``
-   (web/server.py). Cada xlsx queda como una "tarjeta" en el dashboard:
-   total a pagar, vencimiento, lista de consumos del ciclo. NO se mergea
-   con MOZE — el banco emite estos por ciclo y queremos verlos aparte.
+2. ``Último resumen - <Marca> <Últimos4>.xlsx`` y
+   ``Resumen de tarjeta de crédito <Marca>-*.pdf`` — los resúmenes de
+   tarjeta de crédito que emite el banco. Cada resumen queda como una
+   "tarjeta" en el dashboard: total a pagar, vencimiento, lista de consumos
+   del ciclo. Para evitar doble conteo, los consumos ARS quedan aparte; los
+   consumos USD sí se suman a los agregados porque MOZE suele no traerlos.
 
 3. ``*Santander*.pdf`` (o cualquier PDF con tabla de transferencias) —
    listado de transferencias bancarias. Se parsea con `pdftotext -layout`
@@ -53,6 +54,7 @@ import re
 import shutil
 import subprocess
 import threading
+import unicodedata
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -447,14 +449,369 @@ def _load_income_pdfs(finance_dir: Path) -> tuple[list[dict], list[dict]]:
     return (incomes, sources)
 
 
-# ── Tarjetas de crédito (xlsx) — reutiliza el parser existente ──────────
+# ── Tarjetas de crédito (xlsx/PDF) ──────────────────────────────────────
+
+
+_CARD_PDF_AMOUNT_RE = re.compile(
+    r"(?<![\d])(?P<amount>\d[\d\.]*,\d{2})(?P<negative>-)?\s*\*?"
+)
+_CARD_PDF_FULL_DATE_RE = re.compile(
+    r"^\s*(?P<year>\d{2,4})\s+"
+    r"(?P<month>[A-Za-zÁÉÍÓÚÜÑáéíóúüñ\.]+)\s+"
+    r"(?P<day>\d{1,2})\s+(?P<rest>.+?)\s*$"
+)
+_CARD_PDF_DAY_RE = re.compile(r"^\s*(?P<day>\d{1,2})\s+(?P<rest>.+?)\s*$")
+_CARD_PDF_DATE_TOKEN = (
+    r"(\d{1,2})\s+"
+    r"([A-Za-zÁÉÍÓÚÜÑáéíóúüñ\.]+)\s+"
+    r"(\d{2,4})"
+)
+_CARD_PDF_TAX_KEYWORDS = (
+    "IMPUESTO",
+    "IIBB",
+    "IVA ",
+    "DB.RG",
+    "PERCEP",
+    "SELL",
+)
+_CARD_PDF_SKIP_KEYWORDS = (
+    "SALDO ANTERIOR",
+    "SALDO ACTUAL",
+    "PAGO MINIMO",
+    "PAGO EN PESOS",
+    "SU PAGO",
+    "TOTAL CONSUMOS",
+)
+_CARD_PDF_MONTHS = {
+    "ene": 1, "enero": 1,
+    "feb": 2, "febrero": 2,
+    "mar": 3, "marzo": 3,
+    "abr": 4, "abril": 4,
+    "may": 5, "mayo": 5,
+    "jun": 6, "junio": 6,
+    "jul": 7, "julio": 7,
+    "ago": 8, "agosto": 8,
+    "set": 9, "setiem": 9, "setiembre": 9,
+    "sep": 9, "sept": 9, "septiem": 9, "septiembre": 9,
+    "oct": 10, "octub": 10, "octubre": 10,
+    "nov": 11, "noviem": 11, "noviembre": 11,
+    "dic": 12, "diciem": 12, "diciembre": 12,
+}
+
+
+def _strip_accents(s: str) -> str:
+    """Normaliza acentos para matchear meses del PDF Santander."""
+    return "".join(
+        c for c in unicodedata.normalize("NFKD", s)
+        if not unicodedata.combining(c)
+    )
+
+
+def _pdf_card_month(token: str) -> int | None:
+    key = _strip_accents(token or "").lower().strip().strip(".")
+    if not key:
+        return None
+    if key in _CARD_PDF_MONTHS:
+        return _CARD_PDF_MONTHS[key]
+    for prefix, month in _CARD_PDF_MONTHS.items():
+        if key.startswith(prefix):
+            return month
+    return None
+
+
+def _pdf_card_year(token: str) -> int | None:
+    try:
+        y = int(token)
+    except (TypeError, ValueError):
+        return None
+    if y < 100:
+        return 2000 + y if y < 80 else 1900 + y
+    return y
+
+
+def _pdf_card_date(day_token: str, month_token: str, year_token: str) -> str | None:
+    month = _pdf_card_month(month_token)
+    year = _pdf_card_year(year_token)
+    if not month or not year:
+        return None
+    try:
+        return date(year, month, int(day_token)).isoformat()
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_pdf_card_statement_dates(text: str) -> tuple[str | None, str | None, str | None, str | None]:
+    """Extrae cierre/vencimiento actual y próximo del header Santander PDF."""
+    closing_date = due_date = next_closing_date = next_due_date = None
+    cur_re = re.compile(
+        rf"CIERRE\s+{_CARD_PDF_DATE_TOKEN}\s+VENCIMIENTO\s+{_CARD_PDF_DATE_TOKEN}",
+        re.IGNORECASE,
+    )
+    m = cur_re.search(text)
+    if m:
+        groups = m.groups()
+        closing_date = _pdf_card_date(groups[0], groups[1], groups[2])
+        due_date = _pdf_card_date(groups[3], groups[4], groups[5])
+
+    next_re = re.compile(
+        rf"Prox\.?\s*Cierre:\s+{_CARD_PDF_DATE_TOKEN}.*?"
+        rf"Prox\.?\s*Vto\.?:\s+{_CARD_PDF_DATE_TOKEN}",
+        re.IGNORECASE | re.DOTALL,
+    )
+    m = next_re.search(text)
+    if m:
+        groups = m.groups()
+        next_closing_date = _pdf_card_date(groups[0], groups[1], groups[2])
+        next_due_date = _pdf_card_date(groups[3], groups[4], groups[5])
+
+    return closing_date, due_date, next_closing_date, next_due_date
+
+
+def _parse_pdf_card_line_prefix(
+    line: str,
+    current_year: int | None,
+    current_month: int | None,
+) -> tuple[str | None, str | None, int | None, int | None]:
+    """Parsea el prefijo de fecha de una línea de movimientos VISA PDF.
+
+    Santander imprime la fecha completa una vez por mes (`26 Marzo 01`) y
+    luego solo el día (`05 006635 ...`). Heredamos año/mes de la última
+    línea completa para esas continuaciones.
+    """
+    m = _CARD_PDF_FULL_DATE_RE.match(line)
+    if m:
+        year = _pdf_card_year(m.group("year"))
+        month = _pdf_card_month(m.group("month"))
+        if not year or not month:
+            return (None, None, current_year, current_month)
+        try:
+            d = date(year, month, int(m.group("day"))).isoformat()
+        except ValueError:
+            return (None, None, year, month)
+        return (d, m.group("rest"), year, month)
+
+    m = _CARD_PDF_DAY_RE.match(line)
+    if not m or not current_year or not current_month:
+        return (None, None, current_year, current_month)
+    try:
+        d = date(current_year, current_month, int(m.group("day"))).isoformat()
+    except ValueError:
+        return (None, None, current_year, current_month)
+    return (d, m.group("rest"), current_year, current_month)
+
+
+def _parse_pdf_card_amount_from_rest(rest: str) -> tuple[float | None, int | None]:
+    matches = list(_CARD_PDF_AMOUNT_RE.finditer(rest))
+    if not matches:
+        return (None, None)
+    m = matches[-1]
+    amount = _moze_pnum(m.group("amount"))
+    if m.group("negative"):
+        amount = -amount
+    return (amount, m.start())
+
+
+def _clean_pdf_card_description(desc: str) -> str:
+    desc = re.sub(r"\s*USD\s*[\d\.]+,\d{2}\s*$", "", desc, flags=re.IGNORECASE)
+    desc = re.sub(r"^\d{6}\s+[*K]?\s*", "", desc)
+    desc = re.sub(r"\s+C\.\d{2}/\d{2}\s*$", "", desc, flags=re.IGNORECASE)
+    desc = re.sub(r"\s+", " ", desc)
+    return desc.strip(" -")
+
+
+def _parse_credit_card_pdf_text(
+    text: str,
+    source_file: str,
+    source_mtime: float | None = None,
+) -> dict | None:
+    """Parsea un resumen VISA Santander renderizado con `pdftotext -layout`.
+
+    Esta variante PDF es la que vive en `Finances/VISA/Resumen de tarjeta
+    de crédito VISA-*.pdf`. El banco imprime los importes ARS y USD en dos
+    columnas; en líneas USD aparece además el monto original junto a la
+    descripción, por eso tomamos siempre el último importe de la línea.
+    """
+    if not text.strip():
+        return None
+
+    brand = "Visa" if "VISA" in (source_file + "\n" + text[:1000]).upper() else None
+    closing_date, due_date, next_closing_date, next_due_date = _parse_pdf_card_statement_dates(text)
+
+    total_consumos_ars = None
+    total_consumos_usd = None
+    holder = None
+    last4 = None
+    total_re = re.compile(
+        r"Tarjeta\s+(?P<last4>\d{4})\s+Total\s+Consumos\s+de\s+"
+        r"(?P<holder>.+?)\s+"
+        r"(?P<ars>\d[\d\.]*,\d{2})\s*\*"
+        r"(?:\s+(?P<usd>\d[\d\.]*,\d{2})\s*\*)?",
+        re.IGNORECASE,
+    )
+    m_total = total_re.search(text)
+    if m_total:
+        last4 = m_total.group("last4")
+        holder = re.sub(r"\s+", " ", m_total.group("holder")).strip() or None
+        total_consumos_ars = _moze_pnum(m_total.group("ars"))
+        if m_total.group("usd"):
+            total_consumos_usd = _moze_pnum(m_total.group("usd"))
+    elif m := re.search(r"Tarjeta\s+(\d{4})", text, re.IGNORECASE):
+        last4 = m.group(1)
+
+    total_ars = total_consumos_ars
+    total_usd = total_consumos_usd
+    saldo_re = re.compile(
+        r"SALDO\s+ACTUAL.*?\$\s*(?P<ars>\d[\d\.]*,\d{2})"
+        r".*?U\$S\s*(?P<usd>\d[\d\.]*,\d{2})",
+        re.IGNORECASE,
+    )
+    for m_saldo in saldo_re.finditer(text):
+        total_ars = _moze_pnum(m_saldo.group("ars"))
+        total_usd = _moze_pnum(m_saldo.group("usd"))
+
+    minimum_ars = None
+    m_min = re.search(
+        r"PAGO\s+MINIMO.*?\$\s*(?P<amount>\d[\d\.]*,\d{2})",
+        text,
+        re.IGNORECASE,
+    )
+    if m_min:
+        minimum_ars = _moze_pnum(m_min.group("amount"))
+
+    purchases: list[dict] = []
+    other_charges: list[dict] = []
+    in_movements = False
+    seen_total = False
+    current_year: int | None = None
+    current_month: int | None = None
+
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        upper = _strip_accents(line).upper()
+        if "FECHA" in upper and "COMPROBANTE" in upper and "REFERENCIA" in upper:
+            if not seen_total:
+                in_movements = True
+            continue
+        if "TARJETA" in upper and "TOTAL CONSUMOS" in upper:
+            seen_total = True
+            in_movements = False
+            continue
+
+        if not in_movements and not seen_total:
+            continue
+
+        date_iso, rest, current_year, current_month = _parse_pdf_card_line_prefix(
+            line, current_year, current_month
+        )
+        if not date_iso or not rest:
+            continue
+        amount, amount_pos = _parse_pdf_card_amount_from_rest(rest)
+        if amount is None or amount_pos is None:
+            continue
+
+        if any(k in upper for k in _CARD_PDF_SKIP_KEYWORDS):
+            continue
+
+        is_tax = any(k in upper for k in _CARD_PDF_TAX_KEYWORDS)
+        desc = _clean_pdf_card_description(rest[:amount_pos])
+        if not desc:
+            continue
+
+        if is_tax:
+            if amount > 0:
+                other_charges.append({
+                    "description": desc,
+                    "amount": amount,
+                    "currency": "ARS",
+                })
+            continue
+
+        currency = "USD" if "USD" in upper or "U$S" in upper else "ARS"
+        purchases.append({
+            "date": date_iso,
+            "description": desc,
+            "amount": amount,
+            "currency": currency,
+        })
+
+    if (
+        total_ars is None and total_usd is None
+        and not closing_date and not due_date
+        and not purchases
+    ):
+        return None
+
+    def _purchase_sort_key(p: dict) -> tuple[bool, float]:
+        return (p.get("amount", 0) > 0, abs(float(p.get("amount") or 0)))
+
+    all_ars_purchases = sorted(
+        (p for p in purchases if p["currency"] == "ARS"),
+        key=_purchase_sort_key,
+        reverse=True,
+    )
+    all_usd_purchases = sorted(
+        (p for p in purchases if p["currency"] == "USD"),
+        key=_purchase_sort_key,
+        reverse=True,
+    )
+
+    return {
+        "brand": brand,
+        "last4": last4,
+        "holder": holder,
+        "closing_date": closing_date,
+        "due_date": due_date,
+        "next_closing_date": next_closing_date,
+        "next_due_date": next_due_date,
+        "total_ars": total_ars,
+        "total_usd": total_usd,
+        "minimum_ars": minimum_ars,
+        "minimum_usd": None,
+        "top_purchases_ars": all_ars_purchases[:5],
+        "top_purchases_usd": all_usd_purchases[:3],
+        "all_purchases_ars": all_ars_purchases,
+        "all_purchases_usd": all_usd_purchases,
+        "other_charges": other_charges,
+        "other_charges_total_ars": (
+            sum(c["amount"] for c in other_charges) if other_charges else 0
+        ),
+        "source_file": source_file,
+        "source_mtime": (
+            datetime.fromtimestamp(source_mtime).isoformat(timespec="seconds")
+            if source_mtime
+            else None
+        ),
+    }
+
+
+def _parse_credit_card_pdf(path: Path) -> dict | None:
+    pdftotext = shutil.which("pdftotext")
+    if not pdftotext:
+        return None
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = None
+    try:
+        res = subprocess.run(
+            [pdftotext, "-layout", str(path), "-"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if res.returncode != 0:
+        return None
+    return _parse_credit_card_pdf_text(res.stdout or "", path.name, mtime)
 
 
 def _load_credit_cards(finance_dir: Path) -> list[dict]:
-    """Llama a ``web.server._parse_credit_card_xlsx`` para cada xlsx
-    `VISA/Último resumen*.xlsx` / `VISA/Ultimo resumen*.xlsx` en el
-    subdirectorio `VISA/`, y devuelve los dicts. Sin cache propio — el
-    endpoint del dashboard cachea TODO junto.
+    """Carga resúmenes de tarjeta xlsx y PDF del subdirectorio `VISA/`.
+
+    Los xlsx siguen usando ``web.server._parse_credit_card_xlsx``; los PDF
+    Santander se parsean acá porque el dashboard tiene que leer el archivo
+    histórico real (`Resumen de tarjeta de crédito VISA-*.pdf`).
 
     Import lazy de ``web.server`` para evitar dependencia circular en
     import-time (el dashboard lo importa el server después de definir
@@ -463,20 +820,26 @@ def _load_credit_cards(finance_dir: Path) -> list[dict]:
     try:
         from web.server import _parse_credit_card_xlsx  # type: ignore
     except ImportError:
-        return []
+        _parse_credit_card_xlsx = None  # type: ignore
 
-    seen: set[Path] = set()
+    xlsx_seen: set[Path] = set()
     for pattern in ("VISA/Último resumen*.xlsx", "VISA/Ultimo resumen*.xlsx"):
         for p in finance_dir.glob(pattern):
-            seen.add(p)
-    if not seen:
-        return []
+            xlsx_seen.add(p)
+    pdfs = sorted(finance_dir.glob("VISA/*.pdf"), key=lambda p: p.name)
+
     cards: list[dict] = []
-    for p in sorted(seen, key=lambda p: p.name):
-        parsed = _parse_credit_card_xlsx(p)
+    if _parse_credit_card_xlsx:
+        for p in sorted(xlsx_seen, key=lambda p: p.name):
+            parsed = _parse_credit_card_xlsx(p)
+            if parsed:
+                cards.append(parsed)
+    for p in pdfs:
+        parsed = _parse_credit_card_pdf(p)
         if parsed:
             cards.append(parsed)
-    cards.sort(key=lambda c: (c.get("due_date") is None, c.get("due_date") or ""))
+    # En `/finance` mostramos histórico de PDFs; lo más reciente primero.
+    cards.sort(key=lambda c: c.get("due_date") or c.get("closing_date") or "", reverse=True)
     return cards
 
 
@@ -488,7 +851,21 @@ def _ym(d: str) -> str:
     return d[:7] if len(d) >= 7 else d
 
 
-def _kpi_sparks(txs: list[dict], now: datetime, n_months: int = 6) -> dict:
+def _expense_amount(t: dict) -> float:
+    """Monto a sumar para un gasto.
+
+    MOZE históricamente trae gastos con signo variable y los agregadores
+    usan `abs`. Los PDFs de tarjeta pueden traer créditos/reversos con
+    monto negativo; esos movimientos llevan `amount_is_signed=True` para
+    que resten del gasto neto en vez de inflarlo.
+    """
+    amount = float(t.get("amount") or 0.0)
+    if t.get("amount_is_signed"):
+        return amount
+    return abs(amount)
+
+
+def _kpi_sparks(txs: list[dict], now: datetime, n_months: int = 6, incomes: list[dict] | None = None) -> dict:
     """Serie mensual de los últimos N meses por KPI, alimenta el sparkline
     del frontend. Cada serie es de `n_months` puntos (rellenando con 0
     los meses sin data) terminando en el mes actual.
@@ -520,15 +897,23 @@ def _kpi_sparks(txs: list[dict], now: datetime, n_months: int = 6) -> dict:
         if t["type"] == "expense":
             txs_count[ym] += 1
             if cb == "ARS":
-                expenses_ars[ym] += abs(t["amount"])
+                expenses_ars[ym] += _expense_amount(t)
             elif cb == "USD":
-                expenses_usd[ym] += abs(t["amount"])
+                expenses_usd[ym] += _expense_amount(t)
         elif t["type"] == "income":
             txs_count[ym] += 1
             if cb == "ARS":
                 income_ars[ym] += abs(t["amount"])
             elif cb == "USD":
                 income_usd[ym] += abs(t["amount"])
+    for i in (incomes or []):
+        ym = _ym(i["date"])
+        if ym not in label_set:
+            continue
+        if i["currency"] == "ARS":
+            income_ars[ym] += abs(i["amount"])
+        elif i["currency"] == "USD":
+            income_usd[ym] += abs(i["amount"])
     balance_ars_series = [income_ars[lab] - expenses_ars[lab] for lab in labels]
     return {
         "labels": labels,
@@ -541,7 +926,7 @@ def _kpi_sparks(txs: list[dict], now: datetime, n_months: int = 6) -> dict:
     }
 
 
-def _kpis(txs: list[dict], now: datetime) -> dict:
+def _kpis(txs: list[dict], now: datetime, incomes: list[dict] | None = None) -> dict:
     """Calcula los KPI hero del dashboard: gastos del mes actual, gastos
     del mes previo, ingresos del mes, balance neto, # transacciones, top
     categoría. Cada KPI viene con `value`, `delta_pct` (vs mes previo
@@ -558,6 +943,8 @@ def _kpis(txs: list[dict], now: datetime) -> dict:
     expenses_prev: dict[str, float] = defaultdict(float)
     income_this: dict[str, float] = defaultdict(float)
     income_prev: dict[str, float] = defaultdict(float)
+    usd_expenses_by_month: dict[str, float] = defaultdict(float)
+    usd_counts_by_month: dict[str, int] = defaultdict(int)
     by_cat_this: Counter = Counter()
     n_this = 0
     n_prev = 0
@@ -566,19 +953,31 @@ def _kpis(txs: list[dict], now: datetime) -> dict:
         ym = _ym(t["date"])
         bucket = t["currency_bucket"]
         if t["type"] == "expense":
+            expense_amount = _expense_amount(t)
+            if bucket == "USD":
+                usd_expenses_by_month[ym] += expense_amount
+                usd_counts_by_month[ym] += 1
             if ym == this_ym:
-                expenses_this[bucket] += abs(t["amount"])
+                expenses_this[bucket] += expense_amount
                 if bucket == "ARS":
-                    by_cat_this[t["category"]] += abs(t["amount"])
+                    by_cat_this[t["category"]] += expense_amount
                 n_this += 1
             elif ym == prev_ym:
-                expenses_prev[bucket] += abs(t["amount"])
+                expenses_prev[bucket] += _expense_amount(t)
                 n_prev += 1
         elif t["type"] == "income":
             if ym == this_ym:
                 income_this[bucket] += abs(t["amount"])
             elif ym == prev_ym:
                 income_prev[bucket] += abs(t["amount"])
+
+    for i in (incomes or []):
+        ym = _ym(i["date"])
+        bucket = i["currency"]
+        if ym == this_ym:
+            income_this[bucket] += abs(i["amount"])
+        elif ym == prev_ym:
+            income_prev[bucket] += abs(i["amount"])
 
     def _delta(a: float, b: float) -> float | None:
         if not b:
@@ -602,13 +1001,30 @@ def _kpis(txs: list[dict], now: datetime) -> dict:
     ars_prev = expenses_prev["ARS"]
     usd_this = expenses_this["USD"]
     usd_prev = expenses_prev["USD"]
+    usd_period = this_ym
+    usd_n_samples = usd_counts_by_month.get(this_ym, 0)
+    usd_fallback_to_latest = False
+    if not usd_this:
+        nonzero_usd_months = [
+            ym for ym, amount in usd_expenses_by_month.items()
+            if abs(amount) > 0.000001
+        ]
+        if nonzero_usd_months:
+            usd_period = max(nonzero_usd_months)
+            usd_this = usd_expenses_by_month[usd_period]
+            usd_n_samples = usd_counts_by_month.get(usd_period, 0)
+            usd_prev = 0.0
+            usd_fallback_to_latest = usd_period != this_ym
 
-    sparks = _kpi_sparks(txs, now, n_months=6)
+    sparks = _kpi_sparks(txs, now, n_months=6, incomes=incomes)
 
     expenses_ars = _kpi(ars_this, _delta(ars_this, ars_prev), n_this)
     expenses_ars["spark"] = sparks["expenses_ars"]
-    expenses_usd = _kpi(usd_this, _delta(usd_this, usd_prev), n_this)
+    expenses_usd = _kpi(usd_this, _delta(usd_this, usd_prev), usd_n_samples)
     expenses_usd["spark"] = sparks["expenses_usd"]
+    expenses_usd["period"] = usd_period
+    expenses_usd["period_label"] = usd_period
+    expenses_usd["fallback_to_latest"] = usd_fallback_to_latest
     income_ars = _kpi(income_this["ARS"], _delta(income_this["ARS"], income_prev["ARS"]), n_this)
     income_ars["spark"] = sparks["income_ars"]
     balance_ars = _kpi(income_this["ARS"] - ars_this, None, n_this)
@@ -672,7 +1088,7 @@ def _by_month(txs: list[dict], months: int = 12, incomes: list[dict] | None = No
         else:
             key = None
         if key:
-            buckets[ym][key] += abs(t["amount"])
+            buckets[ym][key] += _expense_amount(t)
     # Agregar ingresos SOLO de PDF de recibos de sueldo (fuente de verdad)
     for i in incomes:
         ym = _ym(i["date"])
@@ -724,8 +1140,9 @@ def _by_category(txs: list[dict], window_days: int, now: datetime, currency: str
             continue
         if t["date"] < cutoff:
             continue
-        by_cat[t["category"]] += abs(t["amount"])
-        by_cat_subs[t["category"]][t["subcategory"]] += abs(t["amount"])
+        amount = _expense_amount(t)
+        by_cat[t["category"]] += amount
+        by_cat_subs[t["category"]][t["subcategory"]] += amount
     items = [
         {"name": name, "amount": amount}
         for name, amount in by_cat.most_common()
@@ -753,13 +1170,38 @@ def _top_stores(txs: list[dict], window_days: int, now: datetime, currency: str 
         # Si no hay store, fallback a name (algunos consumos manuales no
         # tienen Store seteado).
         key = t["store"] or t["name"] or "—"
-        by_store[key] += abs(t["amount"])
+        by_store[key] += _expense_amount(t)
         counts[key] += 1
     items = [
         {"name": name, "amount": amount, "count": counts[name]}
         for name, amount in by_store.most_common(n)
     ]
     return {"items": items, "currency": currency, "window_days": window_days}
+
+
+def _has_expenses_in_window(txs: list[dict], window_days: int, now: datetime, currency: str) -> bool:
+    cutoff = (now - timedelta(days=window_days)).date().isoformat()
+    for t in txs:
+        if t.get("type") != "expense":
+            continue
+        if t.get("currency_bucket") != currency:
+            continue
+        if t.get("date", "") < cutoff:
+            continue
+        if abs(_expense_amount(t)) > 0.000001:
+            return True
+    return False
+
+
+def _has_expenses(txs: list[dict], currency: str) -> bool:
+    for t in txs:
+        if t.get("type") != "expense":
+            continue
+        if t.get("currency_bucket") != currency:
+            continue
+        if abs(_expense_amount(t)) > 0.000001:
+            return True
+    return False
 
 
 def _by_account(txs: list[dict]) -> dict:
@@ -771,7 +1213,7 @@ def _by_account(txs: list[dict]) -> dict:
     counts: Counter = Counter()
     for t in txs:
         if t["type"] == "expense":
-            by_acc_ex[t["account"]] += abs(t["amount"])
+            by_acc_ex[t["account"]] += _expense_amount(t)
             counts[t["account"]] += 1
         elif t["type"] == "income":
             by_acc_in[t["account"]] += abs(t["amount"])
@@ -838,6 +1280,7 @@ def _normalize_transfer_to_transaction(t: dict) -> dict:
 
 def _normalize_card_purchase_to_transaction(p: dict, card_info: dict) -> dict:
     """Normaliza un consumo de tarjeta de crédito al formato de transaction."""
+    currency = (p.get("currency") or "").strip().upper()
     return {
         "date": p["date"],
         "time": "",
@@ -847,10 +1290,38 @@ def _normalize_card_purchase_to_transaction(p: dict, card_info: dict) -> dict:
         "name": p["description"],
         "store": p["description"],
         "account": f"Tarjeta {card_info.get('brand', '')} {card_info.get('last4', '')}",
-        "currency": p["currency"],
+        "currency": currency,
+        "currency_bucket": _CURRENCY_BUCKET.get(currency, currency or "ARS"),
         "amount": p["amount"],
+        "amount_is_signed": True,
+        "source": "credit_card",
+        "source_file": card_info.get("source_file", ""),
         "note": f"Resumen: {card_info.get('source_file', '')}",
     }
+
+
+def _card_purchases_for_dashboard(cards: list[dict], currency: str = "USD") -> list[dict]:
+    """Movimientos de tarjeta que entran a agregados del dashboard.
+
+    Solo se suman USD para cubrir el hueco real observado en `/finance`:
+    los gastos ARS ya suelen estar en MOZE y sumarlos acá duplicaría el
+    total. Los ARS de tarjeta siguen disponibles en `cards` y `recent`.
+    """
+    out: list[dict] = []
+    wanted = currency.upper()
+    key = "all_purchases_usd" if wanted == "USD" else "all_purchases_ars"
+    for card in cards:
+        card_info = {
+            "brand": card.get("brand", ""),
+            "last4": card.get("last4", ""),
+            "source_file": card.get("source_file", ""),
+        }
+        for p in card.get(key, []):
+            tx = _normalize_card_purchase_to_transaction(p, card_info)
+            if tx["currency_bucket"] == wanted:
+                out.append(tx)
+    out.sort(key=lambda t: (t["date"] or "", t["time"] or ""), reverse=True)
+    return out
 
 
 def _all_recent_transactions(
@@ -1026,6 +1497,7 @@ def snapshot(
         finance_files = (
             list(finance_dir.glob("VISA/Último resumen*.xlsx"))
             + list(finance_dir.glob("VISA/Ultimo resumen*.xlsx"))
+            + list(finance_dir.glob("VISA/*.pdf"))
             + list(finance_dir.glob("Debito/*.pdf"))
             + list(finance_dir.glob("Ingresos/*.pdf"))
         ) if finance_dir.exists() else []
@@ -1046,6 +1518,17 @@ def snapshot(
     transfers, pdf_sources = _load_pdf_transfers(finance_dir) if finance_dir.exists() else ([], [])
     cards = _load_credit_cards(finance_dir) if finance_dir.exists() else []
     incomes, income_sources = _load_income_pdfs(finance_dir) if finance_dir.exists() else ([], [])
+    card_dashboard_transactions = _card_purchases_for_dashboard(cards, "USD")
+    analytics_transactions = transactions + card_dashboard_transactions
+    usd_window_days = window_days
+    usd_window_fallback = False
+    if (
+        analytics_transactions
+        and not _has_expenses_in_window(analytics_transactions, window_days, now, "USD")
+        and _has_expenses(analytics_transactions, "USD")
+    ):
+        usd_window_days = max(window_days, months * 31)
+        usd_window_fallback = True
 
     if cache_key is not None:
         with _DASHBOARD_CACHE_LOCK:
@@ -1066,6 +1549,8 @@ def snapshot(
             "moze_dir": str(moze_dir),
             "months": months,
             "window_days": window_days,
+            "usd_window_days": usd_window_days,
+            "usd_window_fallback": usd_window_fallback,
             "moze_sources": moze_sources,
             "pdf_sources": pdf_sources,
             "income_sources": income_sources,
@@ -1073,15 +1558,16 @@ def snapshot(
             "n_transactions": len(transactions),
             "n_transfers": len(transfers),
             "n_cards": len(cards),
+            "n_card_transactions": len(card_dashboard_transactions),
             "n_incomes": len(incomes),
         },
-        "kpis": _kpis(transactions, now),
-        "by_month": _by_month(transactions, months, incomes=incomes),
-        "by_category_ars": _by_category(transactions, window_days, now, "ARS"),
-        "by_category_usd": _by_category(transactions, window_days, now, "USD"),
-        "top_stores_ars": _top_stores(transactions, window_days, now, "ARS"),
-        "top_stores_usd": _top_stores(transactions, window_days, now, "USD"),
-        "by_account": _by_account(transactions),
+        "kpis": _kpis(analytics_transactions, now, incomes=incomes),
+        "by_month": _by_month(analytics_transactions, months, incomes=incomes),
+        "by_category_ars": _by_category(analytics_transactions, window_days, now, "ARS"),
+        "by_category_usd": _by_category(analytics_transactions, usd_window_days, now, "USD"),
+        "top_stores_ars": _top_stores(analytics_transactions, window_days, now, "ARS"),
+        "top_stores_usd": _top_stores(analytics_transactions, usd_window_days, now, "USD"),
+        "by_account": _by_account(analytics_transactions),
         "recent": _all_recent_transactions(transactions, transfers, cards, n=50),
         "transfers": _transfers_summary(transfers, now, months=months),
         "transfers_recent": transfers[:50],
@@ -1104,12 +1590,18 @@ def _empty_payload(now: datetime, reason: str, finance_dir: str, moze_dir: str =
             "finance_dir": finance_dir,
             "moze_dir": moze_dir,
             "reason": reason,
+            "window_days": 30,
+            "usd_window_days": 30,
+            "usd_window_fallback": False,
             "moze_sources": [],
             "pdf_sources": [],
+            "income_sources": [],
             "card_files": [],
             "n_transactions": 0,
             "n_transfers": 0,
             "n_cards": 0,
+            "n_card_transactions": 0,
+            "n_incomes": 0,
         },
         "kpis": {
             "expenses_ars": {"value": 0, "delta_pct": None, "n_samples": 0, "insufficient": True, "spark": []},

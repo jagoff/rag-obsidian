@@ -123,7 +123,13 @@ class SqlChangeWatcher:
             self.state.errors_count += 1
             return None
 
-    def _max_rowid(self, conn: sqlite3.Connection) -> int:
+    def _max_rowid(self, conn: sqlite3.Connection) -> int | None:
+        """Returns the current MAX(rowid) or None on error.
+
+        Callers MUST treat None as "unknown" and NOT update last_seen_rowid —
+        returning 0 on error would cause all historical rows to fire on the
+        next successful poll (WHERE rowid > 0 matches everything).
+        """
         try:
             cur = conn.execute(f"SELECT IFNULL(MAX(rowid), 0) FROM {self.table}")
             row = cur.fetchone()
@@ -131,7 +137,7 @@ class SqlChangeWatcher:
         except sqlite3.Error as exc:
             self.state.last_error = f"max_rowid: {exc}"
             self.state.errors_count += 1
-            return 0
+            return None
 
     def _poll_once(self) -> None:
         conn = self._open_conn()
@@ -169,14 +175,34 @@ class SqlChangeWatcher:
                 pass
 
     def _loop(self) -> None:
-        # Anchor inicial — no re-disparar histórico.
+        # Anchor inicial — no re-disparar histórico al startup.
+        # Si el anchor falla (DB locked/corrupt), reintentamos hasta 3 veces
+        # con 1s de pausa antes de desistir.  Si todos los intentos fallan,
+        # last_seen_rowid queda en 0 y el primer poll emitirá todos los rows
+        # históricos — peor caso tolerable vs. silenciar events reales.
         if self._anchor_at_start:
-            conn = self._open_conn()
-            if conn is not None:
-                try:
-                    self.state.last_seen_rowid = self._max_rowid(conn)
-                finally:
-                    conn.close()
+            for _attempt in range(3):
+                conn = self._open_conn()
+                if conn is not None:
+                    try:
+                        max_rid = self._max_rowid(conn)
+                    finally:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                    if max_rid is not None:
+                        self.state.last_seen_rowid = max_rid
+                        break
+                    # _max_rowid returned None (DB error) — retry after brief pause.
+                if _attempt < 2:
+                    time.sleep(1.0)
+            else:
+                logger.warning(
+                    "sql_watcher: anchor failed for %s after 3 attempts — "
+                    "first poll will emit all historical rows",
+                    self.table,
+                )
         logger.info(
             "sql_watcher: started for %s (anchor rowid=%d, interval=%ds)",
             self.table, self.state.last_seen_rowid, self.poll_interval_s,

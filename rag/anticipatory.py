@@ -862,6 +862,11 @@ def anticipate_run_impl(
                 dedup_key=c.dedup_key,
                 snooze_hours=c.snooze_hours,
                 reason=f"{c.reason} | weight*={weighted_score / max(c.score, 1e-9):.2f}",
+                source_note=c.source_note,
+                target_jid=c.target_jid,
+                target_name=c.target_name,
+                draft=c.draft,
+                draft_meta=c.draft_meta,
             ))
     all_candidates = weighted_candidates
 

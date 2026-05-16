@@ -109,11 +109,7 @@ def detect_wa_spikes(
     if con is None:
         return []
     today_start = _start_of_today(now)
-    seven_d_ago = (now or datetime.now()).replace(
-        hour=0, minute=0, second=0, microsecond=0,
-    )
-    seven_d_ago = seven_d_ago.replace(day=seven_d_ago.day) if False else seven_d_ago  # noqa
-    # Compute "7 days before today 00:00" using SQLite (avoids tz/dst foot-guns).
+    # "7 days before today 00:00" computed by SQLite to avoid tz/dst foot-guns.
     out: list[dict] = []
     try:
         for c in candidates:

@@ -90,22 +90,29 @@ def _wal_checkpoint_once(path: str, conn=None) -> tuple[bool, int]:
         return (True, pages)
 
     # Fast path: reuse the persistent connection passed by the loop.
+    _conn_stale = False
     if conn is not None:
         try:
             return _run_checkpoint(conn)
         except Exception:
             # Connection may have gone stale (e.g. DB file replaced by
-            # rag index --reset). Fall through to open a fresh one and
-            # let the loop re-open its persistent conn on the next tick.
-            pass
+            # rag index --reset). Fall through to open a fresh one-shot
+            # connection and signal the loop to evict + re-open on the
+            # next tick (by returning ok=False).
+            _conn_stale = True
 
-    # Fallback: one-shot connection (legacy behaviour / first call).
+    # Fallback: one-shot connection (legacy behaviour / first call or after
+    # stale-conn eviction).
     try:
         tmp = _sqlite3.connect(path, isolation_level=None,
                                check_same_thread=False, timeout=10.0)
         try:
             tmp.execute("PRAGMA busy_timeout=10000")
-            return _run_checkpoint(tmp)
+            ok, pages = _run_checkpoint(tmp)
+            # If we got here because the persistent conn was stale, report
+            # ok=False so the loop drops the stale conn from its dict —
+            # even though the checkpoint itself succeeded via the one-shot.
+            return (False if _conn_stale else ok, pages)
         finally:
             try:
                 tmp.close()

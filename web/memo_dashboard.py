@@ -1042,9 +1042,8 @@ def search(query: str, limit: int = 20) -> dict:
     except sqlite3.OperationalError as e:
         out["ok"] = False
         out["error"] = f"FTS query inválida: {e}"
+        mv.close()
         return out
-    finally:
-        pass
 
     try:
         results = []

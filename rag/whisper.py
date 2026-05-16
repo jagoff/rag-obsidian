@@ -354,7 +354,7 @@ def transcribe(audio_path: str, model: str, language: str | None,
     mtime — re-correr sobre un audio sin cambios es instantáneo.
 
     Uso:
-      rag transcribe audio.m4a                 # modelo small, auto-lang
+      rag transcribe audio.m4a                 # modelo large-v3-turbo, auto-lang
       rag transcribe voice.opus --lang es      # forzar español
       rag transcribe talk.wav --model base     # modelo más chico (+rápido)
       rag transcribe note.mp3 --json           # JSON con metadata
@@ -579,10 +579,12 @@ def whisper_doctor():
         try:
             import sqlite3 as _sql
             con = _sql.connect(str(db_path))
-            tables = {r[0] for r in con.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )}
-            con.close()
+            try:
+                tables = {r[0] for r in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )}
+            finally:
+                con.close()
             required = {"rag_audio_transcripts", "rag_audio_corrections", "rag_whisper_vocab"}
             missing = required - tables
             if missing:

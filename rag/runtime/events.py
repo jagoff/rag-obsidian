@@ -132,7 +132,16 @@ class EventBus:
         for sub in subs:
             if sub.async_dispatch:
                 executor = self._get_executor()
-                executor.submit(self._invoke_safe, sub, payload)
+                try:
+                    executor.submit(self._invoke_safe, sub, payload)
+                except RuntimeError as exc:
+                    if "cannot schedule new futures after shutdown" in str(exc):
+                        logger.debug(
+                            "events: executor shutting down; dropped async handler for %s",
+                            sub.event,
+                        )
+                        continue
+                    raise
             else:
                 self._invoke_safe(sub, payload)
         return len(subs)
@@ -162,7 +171,7 @@ class EventBus:
         """Cierra el thread pool si fue creado."""
         with self._lock:
             if self._executor is not None:
-                self._executor.shutdown(wait=False)
+                self._executor.shutdown(wait=True)
                 self._executor = None
 
 

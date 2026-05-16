@@ -492,9 +492,9 @@ def _build_graph(meta_table: str, ragvec_db: Path, top_notes: int) -> dict:
         ).fetchall()
     except sqlite3.OperationalError:
         # Tabla no existe (vault sin indexar). Devolvemos vacío.
-        conn.close()
         return {"nodes": [], "links": [], "truncated": False}
-    conn.close()
+    finally:
+        conn.close()
 
     if not rows:
         return {"nodes": [], "links": [], "truncated": False}

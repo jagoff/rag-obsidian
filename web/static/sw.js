@@ -32,7 +32,7 @@
 
 // Bump cuando cambie el shell / la estrategia. El activate handler borra
 // todo cache que no matchee esta versión, así no se acumulan huérfanos.
-const CACHE_VERSION = "rag-pwa-v76-2026-05-13-peekaboo-panel-home";
+const CACHE_VERSION = "rag-pwa-v85-2026-05-16-shell-urls-complete";
 const SHELL_CACHE = `${CACHE_VERSION}-shell`;
 const STATIC_CACHE = `${CACHE_VERSION}-static`;
 
@@ -45,6 +45,10 @@ const SHELL_URLS = [
   "/dashboard",
   "/fine_tunning",
   "/wzp",
+  "/status",
+  "/learning",
+  "/mirror",
+  "/finance",
   "/manifest.webmanifest",
   "/static/manifest-wzp.webmanifest",
   "/static/pwa/icon-192.png",
@@ -138,6 +142,21 @@ function isStaticAsset(url) {
 }
 
 /**
+ * Code assets should prefer network when online. Serving cached JS/CSS first
+ * can keep a client pinned to an incompatible module graph after a hotfix,
+ * especially because ES module imports do not inherit the parent `?v=`.
+ */
+function isCodeAsset(request, url) {
+  return (
+    request.destination === "script" ||
+    request.destination === "style" ||
+    url.pathname.endsWith(".js") ||
+    url.pathname.endsWith(".mjs") ||
+    url.pathname.endsWith(".css")
+  );
+}
+
+/**
  * Helper: ¿esto es una API call que NO queremos cachear nunca?
  */
 function isApi(url) {
@@ -169,9 +188,9 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  // Static: cache-first con fallback a red, actualiza el cache oportunistamente.
+  // Static: code assets usan network-first; media/icons siguen cache-first.
   if (isStaticAsset(url)) {
-    event.respondWith(staticStrategy(event.request));
+    event.respondWith(staticStrategy(event.request, url));
     return;
   }
 
@@ -223,8 +242,22 @@ async function shellStrategy(event) {
   );
 }
 
-async function staticStrategy(request) {
+async function staticStrategy(request, url = new URL(request.url)) {
   const cache = await caches.open(STATIC_CACHE);
+  if (isCodeAsset(request, url)) {
+    try {
+      const resp = await fetch(request, { cache: "no-cache" });
+      if (resp && resp.ok && resp.type !== "opaque") {
+        cache.put(request, resp.clone()).catch(() => {});
+      }
+      return resp;
+    } catch (_) {
+      const cached = await cache.match(request);
+      if (cached) return cached;
+      return new Response("", { status: 503, statusText: "Offline" });
+    }
+  }
+
   const cached = await cache.match(request);
   if (cached) {
     // Stale refresh en background para que, si cambiaron el ?v=, la

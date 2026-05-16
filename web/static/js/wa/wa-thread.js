@@ -467,13 +467,9 @@ function renderMsg(m, ctx) {
     // Primero intentar desde Apple Contacts
     img.src = `/api/wa/avatar/${encodeURIComponent(jid)}?name=${encodeURIComponent(m.sender_label || "")}`;
 
-    // Si falla, intentar desde el bridge de WhatsApp
+    // Fallback a iniciales si el avatar no está disponible
     img.onerror = () => {
-      img.src = `/api/avatar?jid=${encodeURIComponent(jid)}`;
-      // Fallback a iniciales si ambas fuentes fallan
-      img.onerror = () => {
-        avatar.innerHTML = `<span style="font-size:12px;font-weight:600;color:var(--text-primary)">${initials}</span>`;
-      };
+      avatar.innerHTML = `<span style="font-size:12px;font-weight:600;color:var(--text-primary)">${initials}</span>`;
     };
 
     avatar.appendChild(img);

@@ -40,7 +40,12 @@ class _FakeResponse:
 
 
 class _FakeClient:
-    """Stand-in para _SUMMARY_CLIENT — `.chat()` devuelve lo que se le ponga."""
+    """Stand-in para rag._mlx_chat — devuelve lo que se le ponga en next_response.
+
+    El fixture mockea rag._mlx_chat directamente porque _generate_synthetic_questions
+    ahora llama _mlx_chat() sin pasar por _SUMMARY_CLIENT (el semáforo se adquiere
+    en el thread de llamada, no dentro del worker).
+    """
 
     def __init__(self):
         self.next_response = ""
@@ -50,11 +55,16 @@ class _FakeClient:
         self.calls.append(kwargs)
         return _FakeResponse(self.next_response)
 
+    def mlx_chat(self, **kwargs):
+        """Interfaz equivalente a rag._mlx_chat (function, no método)."""
+        return self.chat(**kwargs)
+
 
 @pytest.fixture
 def fake_client(monkeypatch):
     client = _FakeClient()
-    monkeypatch.setattr(rag, "_SUMMARY_CLIENT", client)
+    # Mockear _mlx_chat directamente: el worker ya no pasa por _SUMMARY_CLIENT.
+    monkeypatch.setattr(rag, "_mlx_chat", client.mlx_chat)
     # Reset cache + env so tests are hermetic.
     monkeypatch.setattr(rag, "_synthetic_q_cache", None)
     monkeypatch.setattr(rag, "_synthetic_q_cache_dirty", False)
@@ -117,10 +127,10 @@ def test_generator_returns_none_on_wrong_shape(fake_client):
     assert qs is None
 
 
-def test_generator_returns_none_on_ollama_failure(fake_client):
+def test_generator_returns_none_on_ollama_failure(fake_client, monkeypatch):
     def boom(**kwargs):
         raise RuntimeError("ollama down")
-    fake_client.chat = boom  # type: ignore[assignment]
+    monkeypatch.setattr(rag, "_mlx_chat", boom)
     qs = rag._generate_synthetic_questions("x" * 500, "setup", "03-Resources")
     assert qs is None
 
@@ -136,13 +146,15 @@ def test_get_synthetic_questions_does_not_cache_transient_failure(fake_client, t
     monkeypatch.setattr(rag, "_synthetic_q_cache_dirty", False)
 
     # First call: LLM fails → generator returns None → caller sees [], NOT cached.
-    original_chat = type(fake_client).chat
+    # Mockeamos rag._mlx_chat con lógica gated (falla en primer llamado, éxito en segundo).
     should_fail = {"flag": True}
-    def gated_chat(self, **kwargs):
+
+    def gated_mlx_chat(**kwargs):
         if should_fail["flag"]:
             raise RuntimeError("ollama down")
-        return original_chat(self, **kwargs)
-    monkeypatch.setattr(type(fake_client), "chat", gated_chat)
+        return _FakeResponse(json.dumps({"preguntas": ["q1?", "q2?"]}))
+
+    monkeypatch.setattr(rag, "_mlx_chat", gated_mlx_chat)
 
     first = rag.get_synthetic_questions("x" * 500, "hash1", "setup", "03-Resources")
     assert first == []
@@ -150,7 +162,6 @@ def test_get_synthetic_questions_does_not_cache_transient_failure(fake_client, t
 
     # Second call on same hash: LLM recovers → retry succeeds → cached.
     should_fail["flag"] = False
-    fake_client.next_response = json.dumps({"preguntas": ["q1?", "q2?"]})
     second = rag.get_synthetic_questions("x" * 500, "hash1", "setup", "03-Resources")
     assert second == ["q1?", "q2?"]
     assert rag._load_synthetic_q_cache()["hash1"] == ["q1?", "q2?"]

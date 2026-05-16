@@ -150,9 +150,12 @@ def _generate_synthetic_questions(text: str, title: str, folder: str) -> list[st
         exception = None
 
         def _llm_call():
+            # Semáforo ya fue adquirido por el thread de llamada.
+            # Llamamos _mlx_chat directamente para no retener el semáforo
+            # si el caller hace timeout y nos convierte en zombie.
             nonlocal result, exception
             try:
-                resp = rag._summary_client().chat(
+                resp = rag._mlx_chat(
                     model=rag.HELPER_MODEL,
                     messages=[{"role": "user", "content": prompt}],
                     options={**rag.HELPER_OPTIONS, "num_predict": 220},
@@ -164,12 +167,29 @@ def _generate_synthetic_questions(text: str, title: str, folder: str) -> list[st
             except Exception as e:
                 exception = e
 
+        # Adquirir el semáforo en el thread de llamada, no dentro del worker.
+        # Así, si el worker queda zombie tras el join, ya no retiene el
+        # semáforo — lo liberamos acá independientemente de si terminó.
+        sem = rag._HELPER_SEM
+        acquired = sem.acquire(timeout=25)
+        if not acquired:
+            rag._silent_log(
+                "synthetic_questions_timeout",
+                TimeoutError(f"sem_acquire title={title!r} folder={folder!r}"),
+            )
+            return None
+
         thread = threading.Thread(target=_llm_call, daemon=True)
         thread.start()
-        thread.join(timeout=30)  # 30 second timeout
+        thread.join(timeout=45)
+        sem.release()  # siempre liberar; el worker ya no necesita el semáforo
         if thread.is_alive():
-            # Timeout - thread still running
-            rag._silent_log("synthetic_questions_timeout", {"title": title, "folder": folder})
+            # Timeout — el thread zombie sigue corriendo pero ya soltó el
+            # semáforo, por lo que no bloquea llamadas helper subsiguientes.
+            rag._silent_log(
+                "synthetic_questions_timeout",
+                TimeoutError(f"llm_join title={title!r} folder={folder!r}"),
+            )
             return None
         if exception:
             raise exception

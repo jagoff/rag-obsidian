@@ -884,21 +884,22 @@ def test_parse_scheduled_for_garbage_raises_value_error():
 
 
 def test_wa_scheduled_send_plist_is_registered_in_services_spec():
-    """2026-05-04 consolidation: wa-scheduled-send + reminder-wa-push merged
-    into wa-fast. Test redirected to verify wa-fast is registered."""
+    """2026-05-09: wa-fast fue migrado al supervisor in-process (APScheduler).
+    Ya no aparece en _services_spec() — está en _DEPRECATED_LABELS.
+    wa-scheduled-send también está deprecated (consolidado en wa-fast el 2026-05-04)."""
     import rag as _rag
+    from rag.plists._spec import _DEPRECATED_LABELS
+
+    assert "com.fer.obsidian-rag-wa-fast" in _DEPRECATED_LABELS, (
+        "wa-fast debe estar en _DEPRECATED_LABELS (migrado al supervisor job)"
+    )
+    assert "com.fer.obsidian-rag-wa-scheduled-send" in _DEPRECATED_LABELS, (
+        "wa-scheduled-send debe estar en _DEPRECATED_LABELS (consolidado en wa-fast)"
+    )
     spec = _rag._services_spec("/Users/fer/.local/bin/rag")
     labels = [t[0] for t in spec]
-    assert "com.fer.obsidian-rag-wa-fast" in labels, (
-        "El plist consolidado wa-fast no está registrado en _services_spec. "
-        f"Plists registrados: {labels}"
-    )
+    assert "com.fer.obsidian-rag-wa-fast" not in labels
     assert "com.fer.obsidian-rag-wa-scheduled-send" not in labels
-    # Triple sanity-check: la tupla tiene la forma (label, filename, xml).
-    entry = next(t for t in spec if t[0] == "com.fer.obsidian-rag-wa-fast")
-    assert len(entry) == 3
-    assert entry[1] == "com.fer.obsidian-rag-wa-fast.plist"
-    assert "<?xml" in entry[2]
 
 
 def test_wa_scheduled_send_plist_xml_is_valid_and_has_expected_fields():

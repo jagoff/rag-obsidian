@@ -966,7 +966,7 @@ def _audit_cross_source_single_source(
     así que no sabemos QUÉ sources pidió el user vía CLI flags (`--source X,Y`).
 
     **Workaround**: miramos los sources REALES en los chunks devueltos (via `paths_json`
-    → lookup en meta_obsidian_notes_v11). Si hay ≥2 sources DISTINTOS pero uno domina
+    → lookup en meta_obsidian_notes_v12). Si hay ≥2 sources DISTINTOS pero uno domina
     >80% de los resultados, es probable que el user pidiera múltiples sources pero el
     ingester de los otros está roto/ausente. Heurística imperfecta, pero accionable.
 
@@ -1010,7 +1010,7 @@ def _audit_cross_source_single_source(
     try:
         exists = ragvec_conn.execute(
             "SELECT name FROM sqlite_master "
-            "WHERE type='table' AND name='meta_obsidian_notes_v11_741d239c'"
+            "WHERE type='table' AND name LIKE 'meta_obsidian_notes_v12%'"
         ).fetchone()
     except sqlite3.OperationalError:
         out["error"] = "metadata table inaccesible"

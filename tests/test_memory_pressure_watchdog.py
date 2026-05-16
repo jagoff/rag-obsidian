@@ -26,12 +26,21 @@ import rag  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _reset_watchdog_state():
-    """Ensure clean slate per test — watchdog global flag + reranker cache."""
-    rag._memory_watchdog_started = False
+    """Ensure clean slate per test — watchdog global flag + reranker cache.
+
+    Desde la modularización (2026-05-08), el global real vive en
+    `rag._memory_pressure_watchdog._memory_watchdog_started`, no en el
+    namespace de `rag`. Hay que resetear ambos para que el idempotency
+    check de `start_memory_pressure_watchdog` funcione correctamente.
+    """
+    import rag._memory_pressure_watchdog as _mpw
+    _mpw._memory_watchdog_started = False
+    rag._memory_watchdog_started = False  # compat con ref en __init__
     rag._CHAT_MODEL_RESOLVED = None
     rag._reranker = None
     rag._reranker_last_use = 0
     yield
+    _mpw._memory_watchdog_started = False  # cleanup post-test
     rag._memory_watchdog_started = False
 
 
@@ -78,19 +87,28 @@ def test_memory_pct_subprocess_failure_returns_none(monkeypatch):
 def test_memory_pct_parses_apple_silicon_page_size(monkeypatch):
     """Apple Silicon uses 16 KB pages — parser must pick up the declared size,
     not default to 4 KB. A 16 KB page is 4× bigger, so using 4 KB would give
-    a 4× underestimate of used memory (dangerous false-negative under pressure)."""
+    a 4× underestimate of used memory (dangerous false-negative under pressure).
+
+    El mock también maneja el PRIMARY path via memory_pressure -Q (retornando
+    vacío para forzar fallback a vm_stat). cmd es una lista, así que se usa
+    ' '.join(cmd) para substring checks."""
     monkeypatch.setattr(sys, "platform", "darwin")
 
     def _fake_run(cmd, **kwargs):
         result = MagicMock()
-        if "vm_stat" in cmd:
+        cmd_str = " ".join(cmd)  # cmd es lista, join para substring search robusta
+        if "memory_pressure" in cmd_str:
+            result.stdout = ""  # simular que memory_pressure no parsea → fallback
+        elif "vm_stat" in cmd_str:
             result.stdout = _fake_vmstat_output(
                 wired_pages=500_000, active_pages=800_000, compressed_pages=200_000,
                 page_size=16384,
             )
-        elif "sysctl" in cmd:
+        elif "sysctl" in cmd_str and "hw.memsize" in cmd_str:
             # 36 GB unified memory (user's Mac)
             result.stdout = str(36 * 1024 * 1024 * 1024) + "\n"
+        else:
+            result.stdout = ""
         return result
 
     monkeypatch.setattr(subprocess, "run", _fake_run)
@@ -108,7 +126,10 @@ def test_memory_pct_zero_total_returns_none(monkeypatch):
 
     def _fake_run(cmd, **kwargs):
         result = MagicMock()
-        if "vm_stat" in cmd:
+        cmd_str = " ".join(cmd)  # cmd es lista, join para substring search robusta
+        if "memory_pressure" in cmd_str:
+            result.stdout = ""  # forzar fallback a vm_stat
+        elif "vm_stat" in cmd_str:
             result.stdout = _fake_vmstat_output(1, 1, 1)
         else:
             result.stdout = "0\n"
@@ -192,7 +213,11 @@ def test_handle_pressure_force_unloads_reranker_when_still_high(monkeypatch):
     """Si tras unload del chat sigue ≥ threshold, force-unload del reranker."""
     monkeypatch.setattr(rag, "resolve_chat_model", lambda: "qwen2.5:7b")
     # Simulamos que el unload no alivió la presión — sigue a 88%.
+    # Patch en el módulo real (_memory_pressure_watchdog) donde la función
+    # es llamada, no solo en el namespace re-exportado de rag.
+    import rag._memory_pressure_watchdog as _mpw
     monkeypatch.setattr(rag, "_system_memory_used_pct", lambda: 88.0)
+    monkeypatch.setattr(_mpw, "_system_memory_used_pct", lambda: 88.0)
 
     class _FakeMLXBackend:
         name = "mlx"
@@ -258,11 +283,12 @@ def test_start_watchdog_skips_non_darwin(monkeypatch):
 def test_start_watchdog_idempotent(monkeypatch):
     """Second call should NOT spawn new threads — returns True (already running).
 
-    Post 2026-05-02: `start_memory_pressure_watchdog` arranca DOS daemon
-    threads en la primera llamada (watchdog + MPS cache drop loop). Los
-    calls subsiguientes son no-op porque `_memory_watchdog_started`
-    queda en True. El test cuenta threads totales: 2 en la primera
-    llamada, 0 nuevos en las siguientes.
+    Post 2026-05-09 MLX-only default: cuando RAG_EMBED_BACKEND=mlx y
+    RAG_LLM_BACKEND=mlx (defaults), el MPS cache drop thread se skippea
+    para evitar conflictos con Metal command buffers de MLX. Por eso la
+    primera llamada puede arrancar 1 thread (solo watchdog) o 2 threads
+    (watchdog + MPS drop si RAG_MPS_CACHE_DROP_INTERVAL está seteado).
+    Lo invariante es que las llamadas subsiguientes son no-op.
     """
     monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.delenv("RAG_MEMORY_PRESSURE_DISABLE", raising=False)
@@ -282,9 +308,12 @@ def test_start_watchdog_idempotent(monkeypatch):
     n_after_first = len(threads_started)
     assert rag.start_memory_pressure_watchdog() is True
     assert rag.start_memory_pressure_watchdog() is True
-    # Watchdog (1) + MPS cache drop loop (1) en la primera llamada;
-    # subsiguientes son no-op.
-    assert n_after_first == 2
+    # Al menos el watchdog principal siempre arranca.
+    # El MPS cache drop loop (segundo thread) es opcional: se skippea
+    # cuando ambos backends son MLX (default) para evitar GPU Hang.
+    assert n_after_first >= 1, "debe haber arrancado al menos el watchdog principal"
+    assert n_after_first <= 2, "máximo watchdog + MPS drop loop"
+    # Las llamadas subsiguientes son no-op — no nuevos threads.
     assert len(threads_started) == n_after_first
 
 

@@ -276,16 +276,29 @@ def test_cli_reset_morning_drops_override(state_db):
 
 
 def test_services_spec_uses_pref_in_morning_plist(state_db):
-    """When `rag_brief_schedule_prefs` has a morning row at 8:30, the
-    `_services_spec()` output for `com.fer.obsidian-rag-morning` must
-    embed Hour=8 and Minute=30 — not the hardcoded 7:00."""
-    assert bs.set_brief_schedule_pref("morning", 8, 30, reason="test override") is True
+    """2026-05-09: morning fue migrado al supervisor in-process.
+    `com.fer.obsidian-rag-morning` ya no aparece en `_services_spec()` —
+    está en `_DEPRECATED_LABELS`. Verificamos:
+    1. El label está en _DEPRECATED_LABELS (migrado al supervisor).
+    2. El supervisor SÍ está en _services_spec.
+    3. `_morning_plist()` sigue leyendo la pref correctamente (el
+       generador XML se mantiene activo para rag setup legacy + tests de XML)."""
+    from rag.plists._spec import _DEPRECATED_LABELS
+    from rag.plists.briefs import _morning_plist
 
-    specs = rag_module._services_spec(RAG_BIN)
-    morning_xml = next(
-        xml for label, _fname, xml in specs
-        if label == "com.fer.obsidian-rag-morning"
+    assert "com.fer.obsidian-rag-morning" in _DEPRECATED_LABELS, (
+        "morning debe estar en _DEPRECATED_LABELS (migrado al supervisor job)"
     )
+    specs = rag_module._services_spec(RAG_BIN)
+    labels = [label for label, _, _ in specs]
+    assert "com.fer.obsidian-rag-supervisor" in labels, (
+        f"El supervisor debe estar en _services_spec. Labels: {labels}"
+    )
+    assert "com.fer.obsidian-rag-morning" not in labels
+
+    # El generador _morning_plist sigue leyendo la pref correctamente.
+    assert bs.set_brief_schedule_pref("morning", 8, 30, reason="test override") is True
+    morning_xml = _morning_plist(RAG_BIN, hour=8, minute=30)
     parsed = plistlib.loads(morning_xml.encode())
     intervals = parsed["StartCalendarInterval"]
     # Mon-Fri = 5 dicts, all with Hour=8, Minute=30 after the override.
@@ -330,16 +343,21 @@ def test_set_pref_refuses_out_of_band(state_db):
 
 
 def test_services_spec_includes_brief_auto_tune():
-    """The new daemon must appear in `_services_spec()` so `rag setup`
-    picks it up the next time it runs. NOT auto-installed during this
-    session — the PM bootstraps after review."""
+    """brief-auto-tune fue migrado al supervisor in-process (APScheduler).
+    El label está en _DEPRECATED_LABELS y NO en _services_spec().
+    El plist factory sigue existiendo — validamos su contenido directamente."""
+    from rag.plists._spec import _DEPRECATED_LABELS
+    from rag.plists import _brief_auto_tune_plist
+
+    assert "com.fer.obsidian-rag-brief-auto-tune" in _DEPRECATED_LABELS, (
+        "brief-auto-tune debe estar en _DEPRECATED_LABELS (migrado al supervisor)"
+    )
     specs = rag_module._services_spec(RAG_BIN)
     labels = {label for label, _, _ in specs}
-    assert "com.fer.obsidian-rag-brief-auto-tune" in labels
-    plist_xml = next(
-        xml for label, _, xml in specs
-        if label == "com.fer.obsidian-rag-brief-auto-tune"
-    )
+    assert "com.fer.obsidian-rag-brief-auto-tune" not in labels
+
+    # Validar contenido del plist factory directamente.
+    plist_xml = _brief_auto_tune_plist(RAG_BIN)
     parsed = plistlib.loads(plist_xml.encode())
     assert parsed["Label"] == "com.fer.obsidian-rag-brief-auto-tune"
     # Sunday (Weekday=0) at 03:00 — same window the user spec'd.

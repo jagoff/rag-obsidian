@@ -429,12 +429,13 @@ def test_hard_cap_s_is_60_seconds_or_less():
     body = src.read_text(encoding="utf-8")
     matches = re.findall(r"HARD_CAP_S\s*=\s*([\d.]+)", body)
     assert matches, "HARD_CAP_S assignment not found in web/server.py"
-    # Take the FIRST match (the in-function definition; any other refs
-    # are reads). All assignments must be ≤ 60.
+    # HARD_CAP_S is 75s for regenerate=True (narrative LLM pass) and 60s
+    # for regenerate=False (normal stream). 75s was introduced in fix
+    # fix(home-stream): barra de progreso queda en 92% durante narrative LLM.
     for raw in matches:
         val = float(raw)
-        assert val <= 60.0, (
-            f"HARD_CAP_S = {val}s exceeds the 60s ceiling. If you really "
+        assert val <= 75.0, (
+            f"HARD_CAP_S = {val}s exceeds the 75s ceiling. If you really "
             f"need more, document the regression in the test + commit."
         )
 
@@ -627,19 +628,22 @@ def test_reminder_wa_push_plist_shape():
 
 
 def test_reminder_wa_push_plist_in_services_spec():
-    """`_services_spec` debe listar wa-fast así `rag setup` lo instala."""
+    """2026-05-09: wa-fast fue migrado al supervisor in-process.
+    Ya no aparece en _services_spec() — está en _DEPRECATED_LABELS.
+    reminder-wa-push también está deprecated (consolidado en wa-fast el 2026-05-04)."""
     import rag
+    from rag.plists._spec import _DEPRECATED_LABELS
 
+    assert "com.fer.obsidian-rag-wa-fast" in _DEPRECATED_LABELS, (
+        "wa-fast debe estar en _DEPRECATED_LABELS (migrado al supervisor job)"
+    )
+    assert "com.fer.obsidian-rag-reminder-wa-push" in _DEPRECATED_LABELS, (
+        "reminder-wa-push debe estar en _DEPRECATED_LABELS (consolidado en wa-fast)"
+    )
     spec = rag._services_spec("/usr/local/bin/rag")
     labels = [s[0] for s in spec]
-    assert "com.fer.obsidian-rag-wa-fast" in labels
+    assert "com.fer.obsidian-rag-wa-fast" not in labels
     assert "com.fer.obsidian-rag-reminder-wa-push" not in labels
-    # Asociado al filename canónico — `rag setup` usa este path para
-    # escribir en ~/Library/LaunchAgents/.
-    entry = next(s for s in spec if s[0] == "com.fer.obsidian-rag-wa-fast")
-    assert entry[1] == "com.fer.obsidian-rag-wa-fast.plist"
-    # XML consistent con el generator.
-    assert "wa-fast" in entry[2]
 
 
 # ── SQL persistence + /api/status/home ─────────────────────────────────────
@@ -841,9 +845,9 @@ def test_home_stream_slot_cap_returns_429_when_full(monkeypatch):
 
     test_ip = "10.0.0.1"
 
-    # Pre-fill the slot counter to the cap.
-    with srv._SSE_CONNECTIONS_LOCK:
-        srv._SSE_CONNECTIONS_PER_IP[test_ip] = srv._SSE_MAX_PER_IP
+    # Pre-fill the slot counter to the cap using the public helpers.
+    for _ in range(srv._SSE_MAX_PER_IP):
+        srv._sse_acquire_slot(test_ip)
 
     try:
         from fastapi import Request
@@ -865,8 +869,7 @@ def test_home_stream_slot_cap_returns_429_when_full(monkeypatch):
         assert str(srv._SSE_MAX_PER_IP) in detail
     finally:
         # Clean up so other tests see a clean counter.
-        with srv._SSE_CONNECTIONS_LOCK:
-            srv._SSE_CONNECTIONS_PER_IP.pop(test_ip, None)
+        srv._SSE_CONNECTIONS_PER_IP.delete(test_ip)
 
 
 def test_home_stream_slot_released_after_stream(monkeypatch, stub_fetchers):
@@ -877,9 +880,8 @@ def test_home_stream_slot_released_after_stream(monkeypatch, stub_fetchers):
 
     test_ip = "127.0.0.1"
 
-    # Snapshot the counter before the request.
-    with srv._SSE_CONNECTIONS_LOCK:
-        count_before = srv._SSE_CONNECTIONS_PER_IP.get(test_ip, 0)
+    # Snapshot the counter before the request via the helper.
+    count_before = srv._sse_get_count(test_ip)
 
     client = TestClient(srv.app)
     resp = client.get(
@@ -889,8 +891,7 @@ def test_home_stream_slot_released_after_stream(monkeypatch, stub_fetchers):
     # The TestClient drains the full response.
     assert resp.status_code == 200
 
-    with srv._SSE_CONNECTIONS_LOCK:
-        count_after = srv._SSE_CONNECTIONS_PER_IP.get(test_ip, 0)
+    count_after = srv._sse_get_count(test_ip)
 
     assert count_after == count_before, (
         f"slot was not released: before={count_before} after={count_after}"

@@ -494,9 +494,12 @@ def test_cli_auto_harvest_dry_run_flag(
 
 
 def test_auto_harvest_plist_is_registered_in_services_spec():
-    spec = rag._services_spec("/usr/local/bin/rag")
-    labels = [label for label, _, _ in spec]
-    assert "com.fer.obsidian-rag-auto-harvest" in labels
+    # 2026-05-09: auto-harvest fue migrado al supervisor in-process (APScheduler).
+    # Ya no aparece en _services_spec (que solo retorna supervisor/watch/web).
+    from rag.plists._spec import _DEPRECATED_LABELS
+    assert "com.fer.obsidian-rag-auto-harvest" in _DEPRECATED_LABELS, (
+        "auto-harvest debe estar en _DEPRECATED_LABELS (migrado al supervisor job auto_harvest_job)"
+    )
 
 
 def test_auto_harvest_plist_has_valid_xml():

@@ -21,6 +21,7 @@ import pytest
 from click.testing import CliRunner
 
 import rag
+from rag.cli import score_calibration as _sc
 
 
 _FEEDBACK_DDL = (
@@ -128,8 +129,10 @@ def test_classify_source_vault_default():
 
 
 def test_classify_source_whatsapp_folder():
+    # WA content is indexed as whatsapp:// URIs, not vault paths.
+    # 03-Resources/WhatsApp/ roll-ups are excluded from index by default.
     assert rag._classify_source_from_path(
-        "03-Resources/WhatsApp/chat/2026-04.md"
+        "whatsapp://5491100000000@c.us/3EB0ABCDEF123456"
     ) == "whatsapp"
 
 
@@ -181,13 +184,13 @@ def test_fit_isotonic_separable_gives_monotonic_knots():
 # ── calibrate_score ──────────────────────────────────────────────────────
 
 def test_calibrate_flag_off_returns_raw(monkeypatch):
-    monkeypatch.setattr(rag, "_SCORE_CALIBRATION_ENABLED", False)
+    monkeypatch.setattr(_sc, "_SCORE_CALIBRATION_ENABLED", False)
     rag._reset_calibration_cache()
     assert rag.calibrate_score("vault", 0.42) == 0.42
 
 
 def test_calibrate_no_model_returns_raw(monkeypatch, temp_db):
-    monkeypatch.setattr(rag, "_SCORE_CALIBRATION_ENABLED", True)
+    monkeypatch.setattr(_sc, "_SCORE_CALIBRATION_ENABLED", True)
     rag._reset_calibration_cache()
     assert rag.calibrate_score("vault", 0.42) == 0.42
 
@@ -205,7 +208,7 @@ def test_calibrate_applies_piecewise_linear(monkeypatch, temp_db):
          10, 10, "2026-04-23T00:00:00", "isotonic-v1"),
     )
     conn.commit()
-    monkeypatch.setattr(rag, "_SCORE_CALIBRATION_ENABLED", True)
+    monkeypatch.setattr(_sc, "_SCORE_CALIBRATION_ENABLED", True)
     rag._reset_calibration_cache()
     # Identity-like map on this mock.
     assert rag.calibrate_score("vault", 0.25) == pytest.approx(0.25, abs=1e-6)
@@ -229,7 +232,7 @@ def test_calibrate_wa_compresses_range(monkeypatch, temp_db):
          10, 10, "2026-04-23T00:00:00", "isotonic-v1"),
     )
     conn.commit()
-    monkeypatch.setattr(rag, "_SCORE_CALIBRATION_ENABLED", True)
+    monkeypatch.setattr(_sc, "_SCORE_CALIBRATION_ENABLED", True)
     rag._reset_calibration_cache()
     # Raw 0.05 (WA perfect match) → calibrated 0.5 (middle).
     assert rag.calibrate_score("whatsapp", 0.05) == pytest.approx(0.5, abs=1e-6)
@@ -248,14 +251,14 @@ def test_calibrate_unknown_source_falls_to_vault(monkeypatch, temp_db):
          10, 10, "2026-04-23T00:00:00", "isotonic-v1"),
     )
     conn.commit()
-    monkeypatch.setattr(rag, "_SCORE_CALIBRATION_ENABLED", True)
+    monkeypatch.setattr(_sc, "_SCORE_CALIBRATION_ENABLED", True)
     rag._reset_calibration_cache()
     # No model for 'calendar' but vault exists — fall back.
     assert rag.calibrate_score("calendar", 0.5) == pytest.approx(0.5, abs=1e-6)
 
 
 def test_calibrate_nan_raw_returns_zero(monkeypatch):
-    monkeypatch.setattr(rag, "_SCORE_CALIBRATION_ENABLED", True)
+    monkeypatch.setattr(_sc, "_SCORE_CALIBRATION_ENABLED", True)
     assert rag.calibrate_score("vault", "not-a-number") == 0.0
 
 
@@ -364,9 +367,12 @@ def test_cli_calibrate_renders_summary_when_empty(temp_db):
 # ── plist registration ───────────────────────────────────────────────────
 
 def test_calibration_plist_registered_in_services_spec():
-    spec = rag._services_spec("/usr/local/bin/rag")
-    labels = [label for label, _, _ in spec]
-    assert "com.fer.obsidian-rag-calibrate" in labels
+    # 2026-05-09: calibrate fue migrado al supervisor in-process (APScheduler).
+    # Ya no aparece en _services_spec (que solo retorna supervisor/watch/web).
+    from rag.plists._spec import _DEPRECATED_LABELS
+    assert "com.fer.obsidian-rag-calibrate" in _DEPRECATED_LABELS, (
+        "calibrate debe estar en _DEPRECATED_LABELS (migrado al supervisor job)"
+    )
 
 
 def test_calibration_plist_valid_xml_and_schedule():

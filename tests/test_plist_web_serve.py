@@ -162,8 +162,13 @@ def test_web_plist_has_rag_local_embed():
 
 
 def test_web_plist_has_rag_reranker_never_unload():
+    # 2026-05-10: RAG_RERANKER_NEVER_UNLOAD=1 fue removido del web plist porque
+    # el memory watchdog maneja el unload dinámicamente (ya no se pinea siempre).
     d = _parse(rag_module._web_plist(RAG_BIN))
-    assert d["EnvironmentVariables"].get("RAG_RERANKER_NEVER_UNLOAD") == "1"
+    assert "RAG_RERANKER_NEVER_UNLOAD" not in d["EnvironmentVariables"], (
+        "RAG_RERANKER_NEVER_UNLOAD fue removido del web plist (2026-05-10) "
+        "porque el memory watchdog maneja el unload dinámicamente"
+    )
 
 
 def test_web_plist_no_ollama_keep_alive():

@@ -72,11 +72,12 @@ def test_daemon_watchdog_plist_has_start_interval_300():
 
 
 def test_daemon_watchdog_plist_in_services_spec():
-    """El daemon-watchdog aparece en _services_spec()."""
-    specs = rag._services_spec(_RAG_BIN)
-    labels = [item[0] for item in specs]
-    assert "com.fer.obsidian-rag-daemon-watchdog" in labels, \
-        f"daemon-watchdog not in {labels}"
+    """2026-05-09: daemon-watchdog fue migrado al supervisor in-process.
+    Ya no aparece en _services_spec() — está en _DEPRECATED_LABELS."""
+    from rag.plists._spec import _DEPRECATED_LABELS
+    assert "com.fer.obsidian-rag-daemon-watchdog" in _DEPRECATED_LABELS, (
+        "daemon-watchdog debe estar en _DEPRECATED_LABELS (migrado al supervisor job)"
+    )
 
 
 def test_daemon_watchdog_plist_has_program_arguments():

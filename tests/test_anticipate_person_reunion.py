@@ -112,8 +112,9 @@ def test_today_note_without_wikilinks(mock_vault):
 
 
 def test_person_mentioned_recently_is_skipped(mock_vault):
-    """3. [[Juan]] en today + en otra nota de hace 20d + en nota de 60d.
-    La mención más reciente previa es 20d < 30d threshold → []."""
+    """3. [[Juan]] en today + en otra nota de hace 10d + en nota de 60d.
+    La mención más reciente previa es 10d < 14d threshold (bajado de 30d el
+    2026-05-09) → []."""
     _write(
         mock_vault,
         "02-Areas/today.md",
@@ -124,7 +125,7 @@ def test_person_mentioned_recently_is_skipped(mock_vault):
         mock_vault,
         "02-Areas/recent-juan.md",
         _pad("Nota previa: hablé con [[Juan]] sobre otro tema."),
-        days_ago=20,
+        days_ago=10,
     )
     _write(
         mock_vault,

@@ -538,9 +538,10 @@ def _round_timing_ms(timing: dict | None) -> dict | None:
     return {k: int(round(v)) for k, v in timing.items() if isinstance(v, (int, float))}
 
 
-def _log_writer_loop() -> None:
+def _log_writer_loop(log_queue: queue.Queue | None = None) -> None:
+    q = log_queue if log_queue is not None else _LOG_QUEUE
     while True:
-        item = _LOG_QUEUE.get()
+        item = q.get()
         try:
             if item is None:
                 return
@@ -563,10 +564,15 @@ def _log_writer_loop() -> None:
                 except ImportError:
                     pass
         finally:
-            _LOG_QUEUE.task_done()
+            q.task_done()
 
 
-_LOG_THREAD = threading.Thread(target=_log_writer_loop, daemon=True, name="rag-log-writer")
+_LOG_THREAD = threading.Thread(
+    target=_log_writer_loop,
+    args=(_LOG_QUEUE,),
+    daemon=True,
+    name="rag-log-writer",
+)
 _LOG_THREAD.start()
 
 
@@ -610,10 +616,15 @@ _BACKGROUND_SQL_QUEUE_DROPS = 0
 _BACKGROUND_SQL_SHUTDOWN = threading.Event()
 
 
-def _background_sql_writer_loop() -> None:
-    while not _BACKGROUND_SQL_SHUTDOWN.is_set():
+def _background_sql_writer_loop(
+    bg_queue: queue.Queue | None = None,
+    shutdown_event: threading.Event | None = None,
+) -> None:
+    q = bg_queue if bg_queue is not None else _BACKGROUND_SQL_QUEUE
+    stop = shutdown_event if shutdown_event is not None else _BACKGROUND_SQL_SHUTDOWN
+    while not stop.is_set():
         try:
-            item = _BACKGROUND_SQL_QUEUE.get(timeout=1.0)
+            item = q.get(timeout=1.0)
         except queue.Empty:
             continue
         try:
@@ -628,11 +639,14 @@ def _background_sql_writer_loop() -> None:
                 # (e.g. argument misuse) so the worker thread never dies.
                 _log_sql_state_error(error_tag, err=repr(exc))
         finally:
-            _BACKGROUND_SQL_QUEUE.task_done()
+            q.task_done()
 
 
 _BACKGROUND_SQL_THREAD = threading.Thread(
-    target=_background_sql_writer_loop, daemon=True, name="rag-bg-sql-writer"
+    target=_background_sql_writer_loop,
+    args=(_BACKGROUND_SQL_QUEUE, _BACKGROUND_SQL_SHUTDOWN),
+    daemon=True,
+    name="rag-bg-sql-writer",
 )
 _BACKGROUND_SQL_THREAD.start()
 
@@ -797,12 +811,21 @@ def _silent_log(where: str, exc: BaseException, *, with_traceback: bool = False)
     (at most once per _SILENT_LOG_ALERT_INTERVAL). Override threshold via
     RAG_SILENT_LOG_ALERT_THRESHOLD env var.
     """
+    def _safe_exc_text(value: BaseException) -> str:
+        try:
+            return str(value)[:500]
+        except Exception:
+            try:
+                return f"<unprintable {type(value).__name__}>"
+            except Exception:
+                return "<unprintable exception>"
+
     try:
         record = {
             "ts": datetime.now().isoformat(timespec="seconds"),
             "where": where,
             "exc_type": type(exc).__name__,
-            "exc": str(exc)[:500],
+            "exc": _safe_exc_text(exc),
         }
         if with_traceback:
             try:
@@ -813,7 +836,7 @@ def _silent_log(where: str, exc: BaseException, *, with_traceback: bool = False)
                 pass
         line = json.dumps(record, ensure_ascii=False) + "\n"
         _LOG_QUEUE.put_nowait((SILENT_ERRORS_LOG_PATH, line))
-    except (json.JSONDecodeError, TypeError):
+    except Exception:
         pass
     _bump_silent_log_counter()
 
@@ -2079,30 +2102,26 @@ CONFIDENCE_RERANK_MIN = 0.35
 # global 0.015 was calibrated against vault-only; dialing it down for
 # short-text sources avoids refusing legitimate matches.
 #
-# Status (2026-04-29, W3.9): per-source thresholds calibrated empirically.
-# Data point: agenda intent avg top_score=0.115 in 30d (vs semantic 0.324)
-# because bge-reranker-v2-m3 systematically scores short bodies (calendar
-# events, reminders, WA messages ~143 chars) much lower than vault prose.
-# The global 0.015 was calibrated against vault-only and was rejecting 26+
-# legitimate agenda/cross-source queries per 30d as "no encontré esta
-# información". Lowered short-body sources to 0.008 (well below the
-# 0.02-0.10 band where their relevant matches sit) and kept gmail / safari
-# / contacts at 0.010-0.012 (intermediate body length). Vault stays at the
-# baseline 0.015 (no regression intended for the dominant source).
+# Status (2026-05-16): MLX Qwen3 reranker probability scale. Vault/memory
+# keep the global baseline 0.35. Short-body sources stay below baseline
+# because their relevant matches cluster lower than prose chunks; structured
+# medium-length sources sit between both bands. Values are deliberately
+# conservative until the next `rag eval` calibration pass.
 CONFIDENCE_RERANK_MIN_PER_SOURCE: dict[str, float] = {
-    "vault":     0.015,   # baseline (vault-prose calibrated)
-    "memory":    0.015,   # memo prose: structured Contexto/Problema/Solución,
-                          # similar body length to vault → reuse vault threshold
-    "whatsapp":  0.008,   # bodies ~143 chars, scores 0.02-0.10 normales
-    "calendar":  0.008,   # eventos cortos, mismo problema que WA
-    "reminders": 0.008,   # ítems estructurados pero cortos
-    "messages":  0.008,   # iMessage/SMS, mismo patrón que WA
-    "calls":     0.008,   # entries muy cortas, signal factual
-    "gmail":     0.010,   # threads más largos, scores intermedios
-    "contacts":  0.012,   # bodies medianos, signal alto
-    "safari":    0.012,   # title + body de bookmark/history
-    "drive":     0.010,   # docs cortos en la fase actual del ingester
-    "pillow":    0.015,   # sleep tracker, baseline (no eval data yet)
+    "vault":     0.35,   # baseline (vault prose)
+    "memory":    0.35,   # memo prose: similar body length/trust to vault
+    "whatsapp":  0.20,   # conversational short bodies
+    "calendar":  0.20,   # structured short events
+    "reminders": 0.20,   # structured short items
+    "messages":  0.20,   # iMessage/SMS, same shape as WA
+    "calls":     0.20,   # very short factual entries
+    "gmail":     0.25,   # longer threads, intermediate scores
+    "drive":     0.25,   # docs/sheets/slides, medium body length
+    "finances":  0.25,   # extracted statements/transactions, structured
+    "contacts":  0.28,   # curated medium bodies
+    "safari":    0.28,   # title + URL/body snippets
+    "pillow":    0.35,   # sleep tracker, defensive baseline
+    "health":    0.35,   # health aggregates, defensive baseline
 }
 
 
@@ -2114,10 +2133,10 @@ def confidence_threshold_for_source(source: str | None) -> float:
         return CONFIDENCE_RERANK_MIN
     return CONFIDENCE_RERANK_MIN_PER_SOURCE.get(source, CONFIDENCE_RERANK_MIN)
 # Auto-deep threshold: below this score, retrieve() auto-triggers deep_retrieve
-# for a second pass. Between CONFIDENCE_RERANK_MIN and 0.3 (solid hit). Set at
-# 0.10 — borderline queries that would answer but weakly benefit most from
-# iterative retrieval. Above 0.10 the first pass already found strong evidence.
-CONFIDENCE_DEEP_THRESHOLD = 0.10
+# for a second pass before the refusal gate. On the MLX probability scale,
+# 0.35 is the answer gate and ~0.50 is a clearly relevant hit; 0.45 catches
+# borderline first-pass results that might be rescued by iterative retrieval.
+CONFIDENCE_DEEP_THRESHOLD = 0.45
 # Graph-expansion gate: when the top rerank score is ≤ this, retrieve() walks
 # the wikilink graph from top-3 hits and adds up to 2 related notes as
 # auxiliary context. Above the gate, the primary hits are strong enough that
@@ -2373,8 +2392,9 @@ class _SemaphoredChatClient:
     siendo útil para throttlear llamadas concurrentes al GPU.
     """
 
-    def __init__(self, semaphore: "threading.Semaphore | None" = None):
+    def __init__(self, semaphore: "threading.Semaphore | None" = None, timeout: float = 60.0):
         self._semaphore = semaphore
+        self._timeout = float(timeout)
 
     def chat(self, **kwargs):
         # Route via `_mlx_chat` (not `_mlx_chat_via_backend` directly) so
@@ -5160,6 +5180,7 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             " model TEXT NOT NULL,"
             " parsed_at REAL NOT NULL"
             ")",
+            "CREATE INDEX IF NOT EXISTS ix_vlm_receipts_parsed_at ON rag_vlm_receipts(parsed_at)",
         ),
     ),
     (
@@ -5886,6 +5907,8 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             " retry_count INTEGER DEFAULT 0,"
             " last_blocked_at REAL NOT NULL"
             ")",
+            "CREATE INDEX IF NOT EXISTS ix_yt_transcript_cooldown_blocked_until"
+            " ON rag_yt_transcript_cooldown(blocked_until_ts)",
         ),
     ),
     (
@@ -6468,8 +6491,27 @@ def _write_wiki_page(
     doesn't bump mtime.
     """
     page_path = _wiki_page_path(vault_path, source_relpath)
-    if page_path.exists() and not _is_rag_wiki_page(page_path):
-        return False  # user-authored, leave it alone
+    if page_path.exists():
+        if not _is_rag_wiki_page(page_path):
+            return False  # user-authored, leave it alone
+        try:
+            raw = page_path.read_text(encoding="utf-8", errors="ignore")
+            fm_end = raw.find("\n---", 3) if raw.startswith("---") else -1
+            frontmatter = raw[3:fm_end] if fm_end >= 0 else ""
+            existing_hash = None
+            existing_version = None
+            for line in frontmatter.splitlines():
+                if line.startswith("source_hash:"):
+                    existing_hash = line.split(":", 1)[1].strip().strip('"\'')
+                elif line.startswith("wiki_version:"):
+                    existing_version = line.split(":", 1)[1].strip().strip('"\'')
+            if (
+                existing_hash == source_hash
+                and existing_version == str(_WIKI_PAGE_VERSION)
+            ):
+                return False
+        except OSError:
+            pass
     body = _render_wiki_page_body(
         source_relpath=source_relpath,
         source_hash=source_hash,
@@ -8560,7 +8602,7 @@ def _osascript_contact_search(predicate: str, value: str) -> dict | None:
             check=False, timeout=2.0,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-    except subprocess.SubprocessError:
+    except Exception:
         # Silent-fail: si `open` falla, el osascript de abajo va a
         # fallar con -600 igual y terminamos en el warning branch.
         pass
@@ -10049,12 +10091,12 @@ atexit.register(_save_expand_cache)
 # "banco Santander información cuenta") y mueven el embed mean-pool del query
 # real. Costo skipeado: ~1-3s por query (una call a qwen2.5:3b).
 # El gate ORIGINAL era "<2 tokens skippear" (pre-2026-04-21) → se flipeó a 4
-# para skippear queries tipo "hora" o "hoy", y ahora 3 para permitir queries
-# cortas sobre finances ("ingresos abril 2026" = 3 tokens). Bajado de 6 a 4 a 3
-# (2026-05-14) para mejorar retrieval de datos financieros con queries generales.
-# Override: `RAG_EXPAND_MIN_TOKENS=6` (restore pre-fix) o `=2` (restore del
-# original) para ver el impacto A/B en producción.
-_EXPAND_MIN_TOKENS = int(os.environ.get("RAG_EXPAND_MIN_TOKENS", "3"))
+# para skippear queries tipo "hora" o "hoy". Mantener default 6: las consultas
+# financieras ya tienen short-circuit dedicado y bajar el gate mete ruido en
+# queries utilitarias cortas.
+# Override: `RAG_EXPAND_MIN_TOKENS=3` para experimentar con short queries o
+# `=2` (restore del original) para ver el impacto A/B en producción.
+_EXPAND_MIN_TOKENS = int(os.environ.get("RAG_EXPAND_MIN_TOKENS", "6"))
 
 # Dedicated single-thread executor for running `expand_queries` off the
 # retrieve() critical path. One worker is enough — we only fire one
@@ -10225,6 +10267,9 @@ def _spanish_singular_variants(question: str) -> list[str]:
     changed = False
     for t in tokens:
         low = t.lower()
+        if t[:1].isupper() or any(ch.isupper() for ch in t[1:]):
+            out.append(t)
+            continue
         # Skip stopwords + función-words conjugados (sabes, tenes, ves, ...)
         # — `_CONTENT_STOPWORDS_ES` ya cubre verbos comunes en 2da persona.
         if low in _CONTENT_STOPWORDS_ES or len(low) < 4:
@@ -10556,7 +10601,12 @@ def recency_boost(meta: dict, half_life_days: float = 90.0) -> float:
     return math.exp(-math.log(2) * age_days / half_life_days)
 
 
-_INTENT_COUNT_RE = re.compile(r"\b(cu[aá]nt[aos]s?\s+(?:archivos|notas|documentos)|how many)\b", re.IGNORECASE)
+_INTENT_COUNT_RE = re.compile(
+    r"\b(cu[aá]nt[aos]s?\s+"
+    r"(?:archivos|notas|documentos|eventos?|reuniones?|citas?|turnos?|meetings?)"
+    r"|how many)\b",
+    re.IGNORECASE,
+)
 _INTENT_LIST_RE = re.compile(
     r"\b(list[aá](?:me|r)?|dame\s+(?:todas|las\s+notas)|mostr[aá](?:me|r)?\s+notas|qu[eé]\s+notas\s+tengo)\b",
     re.IGNORECASE,
@@ -10762,7 +10812,7 @@ def _classify_intent_llm(
         )
         raw = resp.message.content.strip()
         data = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
+    except Exception:
         return None
     if not isinstance(data, dict):
         return None
@@ -11446,7 +11496,11 @@ def infer_filters(
             rf"\b(de|del|sobre|para|en|con|por|contra|tras|ante|bajo|"
             rf"acerca\s+de|respecto\s+a|relativ[oa]\s+a)\s+{esc_leaf}\b"
         )
-        if re.search(topic_prep, low):
+        explicit_folder_list = (
+            rf"\b(?:notas?|documentos?|archivos?)\s+"
+            rf"(?:de|del|sobre)\s+{esc_leaf}\b"
+        )
+        if re.search(topic_prep, low) and not re.search(explicit_folder_list, low):
             continue
         # Skip title-lookup matches: leaf appears as part of a multi-word
         # capitalized phrase (typical note title pattern). Examples:
@@ -12255,9 +12309,11 @@ def _chat_copy_to_clipboard(text: str) -> bool:
         with subprocess.Popen(
             ["pbcopy"], stdin=subprocess.PIPE,
         ) as proc:
+            if proc.stdin is None:
+                return False
             proc.stdin.write(text.encode("utf-8"))
         return True
-    except subprocess.SubprocessError:
+    except Exception:
         return False
 
 
@@ -14546,7 +14602,10 @@ def retrieve(
     # 2. Auto-filter: sniff tag/folder/date from the query against index vocabulary
     filters_applied: dict = {}
     if auto_filter and not folder and not tag:
-        known_tags, known_folders = get_vocabulary(col, hint_count=_col_count)
+        try:
+            known_tags, known_folders = get_vocabulary(col, hint_count=_col_count)
+        except TypeError:
+            known_tags, known_folders = get_vocabulary(col)
         inferred_folder, inferred_tag = infer_filters(search_query, known_tags, known_folders)
         folder = folder or inferred_folder
         tag = tag or inferred_tag
@@ -14908,6 +14967,21 @@ def retrieve(
             query_embed_local(variants, wait_ready_timeout=_wait_s)
             if _local_embed_enabled() else None
         )
+        if _local_vecs is not None:
+            try:
+                _expected_dim = int(getattr(col, "_dim", 0) or 0)
+                _actual_dim = len(_local_vecs[0]) if _local_vecs else 0
+                if _expected_dim and _actual_dim and _actual_dim != _expected_dim:
+                    _silent_log(
+                        "retrieve.local_embed_dim_mismatch",
+                        ValueError(
+                            f"expected_dim={_expected_dim} actual_dim={_actual_dim}"
+                            f" variants={len(variants)}"
+                        ),
+                    )
+                    _local_vecs = None
+            except Exception as exc:
+                _silent_log("retrieve.local_embed_dim_check", exc)
         variant_embeds = _local_vecs if _local_vecs is not None else embed(variants)
     _timing["embed_ms"] = (time.perf_counter() - _t0) * 1000
 
@@ -14977,10 +15051,28 @@ def retrieve(
         }
 
     # 4b. Feedback signals (👍/👎 del usuario sobre queries similares previas).
-    #     Usamos el embedding de la query original (el primero del batch) —
-    #     no las paraphrases — porque el cosine se compara contra las queries
-    #     que el usuario realmente tipeó en el pasado.
-    boost_paths, penalty_paths = feedback_signals_for_query(variant_embeds[0])
+    #     Usamos el embedding de la query original — no el de keywords,
+    #     singulares, paraphrases ni HyDE — porque el cosine se compara contra
+    #     las queries que el usuario realmente tipeó en el pasado. Ojo:
+    #     front_variants se insertan antes de `search_query`, así que
+    #     `variant_embeds[0]` no es necesariamente la query original.
+    _feedback_q_embed = None
+    if not _hyde_effective:
+        try:
+            _orig_variant_idx = variants.index(search_query)
+            _feedback_q_embed = variant_embeds[_orig_variant_idx]
+        except (ValueError, IndexError, TypeError):
+            _feedback_q_embed = None
+    if _feedback_q_embed is None:
+        if _hyde_effective:
+            _feedback_q_embed = variant_embeds[0] if variant_embeds else []
+        else:
+            try:
+                _feedback_q_embed = embed([search_query])[0]
+            except Exception as exc:
+                _silent_log("retrieve.feedback_query_embed", exc)
+                _feedback_q_embed = variant_embeds[0] if variant_embeds else []
+    boost_paths, penalty_paths = feedback_signals_for_query(_feedback_q_embed)
 
     # 4c. Path injection: si algún chunk de un path boosteado quedó fuera
     #     del pool (BM25 + sem no lo trajeron), lo metemos manualmente.
@@ -15728,7 +15820,10 @@ def retrieve(
     _t0 = time.perf_counter()
     if metas and top_score <= GRAPH_EXPANSION_GATE:
         try:
-            corpus = _load_corpus(col, hint_count=_col_count)
+            try:
+                corpus = _load_corpus(col, hint_count=_col_count)
+            except TypeError:
+                corpus = _load_corpus(col)
             adj = _build_graph_adj(corpus)
             pr = get_pagerank(col)
             # Defensive guards (silent_errors.jsonl 2026-04-30: 2 hits de
@@ -27125,6 +27220,19 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool,
     """
     if max_p95_ms is not None:
         latency = True
+    _eval_explore_saved = os.environ.get("RAG_EXPLORE")
+    _eval_skip_behavior_saved = os.environ.get("RAG_SKIP_BEHAVIOR_LOG")
+
+    def _restore_eval_env() -> None:
+        if _eval_explore_saved is not None:
+            os.environ["RAG_EXPLORE"] = _eval_explore_saved
+        else:
+            os.environ.pop("RAG_EXPLORE", None)
+        if _eval_skip_behavior_saved is not None:
+            os.environ["RAG_SKIP_BEHAVIOR_LOG"] = _eval_skip_behavior_saved
+        else:
+            os.environ.pop("RAG_SKIP_BEHAVIOR_LOG", None)
+
     # Strip RAG_EXPLORE from env before running — a stale parent-shell export
     # must not corrupt deterministic eval metrics. The assert below is a cheap
     # defensive sanity check that fires if the pop somehow failed (dead code in
@@ -27152,6 +27260,7 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool,
         path = pathlib.Path.cwd() / queries_file
     if not path.is_file():
         console.print(f"[red]No existe {path}[/red]")
+        _restore_eval_env()
         return
 
     data = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -27159,11 +27268,13 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool,
     chains = data.get("chains") or []
     if not queries and not chains:
         console.print(f"[yellow]Sin queries ni chains en {path}[/yellow]")
+        _restore_eval_env()
         return
 
     col = get_db()
     if col.count() == 0:
         console.print("[red]Índice vacío. Ejecuta: rag index[/red]")
+        _restore_eval_env()
         return
 
     # Trend-log snapshot: captured below inside the singles/chains blocks, then
@@ -27503,7 +27614,9 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool,
         _sql_write_with_retry(_do, "eval_sql_write_failed")
 
     if gate_failed:
+        _restore_eval_env()
         raise SystemExit(1)
+    _restore_eval_env()
 
 
 # ── RANKER AUTO-TUNING (rag tune) ────────────────────────────────────────────
@@ -36017,6 +36130,24 @@ def _parse_natural_datetime(
 
     anchor = now or datetime.now()
     s_norm = _preprocess_rioplatense_datetime(s)
+
+    # Bare local day-period idioms are common in reminders ("esta tarde")
+    # and dateparser does not resolve them reliably in Spanish. Resolve them
+    # directly before the generic parser so validation never falls through to
+    # the LLM for this high-frequency case.
+    _period_match = re.search(
+        r"\b(?:esta|hoy\s+a\s+la)\s+(ma[ñn]ana|tarde|noche)\b",
+        s_norm,
+        flags=re.IGNORECASE,
+    )
+    if _period_match:
+        period = _period_match.group(1).lower().replace("ñ", "n")
+        hour = 9 if period == "manana" else 16 if period == "tarde" else 20
+        dt_period = anchor.replace(hour=hour, minute=0, second=0, microsecond=0)
+        if prefer_future and dt_period <= anchor:
+            dt_period = dt_period + timedelta(days=1)
+        return dt_period
+
     # Timezone: explicit Argentina (UTC-3) by default, overridable via
     # RAG_TIMEZONE. Without this, dateparser's absolute-date parsing on
     # inputs with offsets or UTC Z-suffix could shift the final datetime
@@ -36556,7 +36687,7 @@ def _create_calendar_event(
                 if err is not None and hasattr(err, "localizedDescription"):
                     # No tan crítico — caemos al fallback AppleScript.
                     pass
-        except ImportError:
+        except Exception:
             # Cualquier error en EventKit → fallback silencioso.
             pass
 
@@ -36712,7 +36843,7 @@ def _delete_reminder(reminder_id: str) -> tuple[bool, str]:
             if err is not None and hasattr(err, "localizedDescription"):
                 return False, f"EventKit: {err.localizedDescription()}"
             # Falló el remove sin error útil — caer al fallback.
-    except ImportError:
+    except Exception:
         # Cualquier error en el path EventKit (framework no carga,
         # pyobjc roto, lookup falla, etc) → fallback silencioso.
         pass
@@ -36811,7 +36942,7 @@ def _delete_calendar_event(event_uid: str) -> tuple[bool, str]:
             if err is not None and hasattr(err, "localizedDescription"):
                 return False, f"EventKit: {err.localizedDescription()}"
             # Remove falló sin error útil — caer al fallback.
-    except ImportError:
+    except Exception:
         # Si el framework no cargó / pyobjc roto / etc → fallback.
         pass
 
@@ -46540,7 +46671,7 @@ def rag_health_report() -> dict:
                     report["cache_stats"]["hit_rate_24h"] = _hits / _total
             except sqlite3.Error:
                 pass
-    except sqlite3.Error:
+    except Exception:
         # _ragvec_state_conn failed to open (missing DB, locked beyond
         # retry, etc.). Leave the None defaults — `rag stats` renders
         # "cache: (unavailable)" in that branch.
@@ -52120,6 +52251,19 @@ from rag.cli.feedback_judge import (  # noqa: E402, F401
     feedback_detect_requery,
     feedback_infer_implicit,
 )
+
+# Keep this import-time flag reload-friendly. `importlib.reload(rag)` does not
+# reload `rag.cli.feedback_judge`, so tests and long-lived shells that flip the
+# env var before reloading the root package otherwise see a stale re-export.
+_AUTO_HARVEST_ENSEMBLE = os.environ.get("RAG_AUTO_HARVEST_ENSEMBLE", "0").strip()
+_AUTO_HARVEST_ENSEMBLE_ENABLED = _AUTO_HARVEST_ENSEMBLE not in ("", "0", "false", "no")
+try:
+    import rag.cli.feedback_judge as _feedback_judge_mod  # noqa: E402
+    _feedback_judge_mod._AUTO_HARVEST_ENSEMBLE = _AUTO_HARVEST_ENSEMBLE
+    _feedback_judge_mod._AUTO_HARVEST_ENSEMBLE_ENABLED = _AUTO_HARVEST_ENSEMBLE_ENABLED
+except Exception:
+    pass
+
 cli = _cli_group_root  # restaurar attribute (sub-package quedó en sys.modules)
 del _cli_group_root
 cli.add_command(vault)  # registrar el grupo extraído manualmente

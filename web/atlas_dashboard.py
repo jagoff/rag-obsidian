@@ -304,22 +304,6 @@ def _query_entities_by_type(
                     aliases = []
 
             # Sparkline: mentions por día en la ventana actual.
-            spark_rows = conn.execute(
-                """
-                SELECT CAST(ts AS INTEGER) AS bucket, COUNT(*) AS n
-                  FROM rag_entity_mentions
-                 WHERE entity_id = ? AND ts >= ?
-              GROUP BY CAST((? - ts) / 86400.0 AS INTEGER)
-                """,
-                (ent_id, window_start_ts, now.timestamp()),
-            ).fetchall()
-            # Bucket por día relativo a "ahora" (0 = hoy, window_days-1 = oldest).
-            buckets = [0] * window_days
-            for ts_int, _n in spark_rows:
-                # Recompute bucket properly — la query de arriba agrupa pero
-                # no ordena. Hacemos una segunda pasada barata por mention.
-                pass
-            # Más simple: hacer la cuenta en Python (window_days es chico, ~30).
             mention_ts_rows = conn.execute(
                 "SELECT ts FROM rag_entity_mentions WHERE entity_id = ? AND ts >= ?",
                 (ent_id, window_start_ts),
@@ -906,23 +890,26 @@ def snapshot(
     try:
         # Sanity: tabla existe?
         tconn.execute("SELECT 1 FROM rag_entities LIMIT 1").fetchone()
-    except sqlite3.OperationalError:
-        tconn.close()
-        return _empty_payload(now, "rag_entities_missing")
-
-    try:
         entities_by_type, full = _query_entities_by_type(tconn, top_entities, window_days)
         hot, stale = _hot_and_stale(full, window_days)
         cooc = _cooccurrence(tconn, full)
-    finally:
+    except sqlite3.OperationalError:
+        tconn.close()
+        return _empty_payload(now, "rag_entities_missing")
+    except Exception:
+        tconn.close()
+        raise
+    else:
         tconn.close()
 
     # Total counts para KPIs.
     try:
         tconn = sqlite3.connect(f"file:{telemetry_db}?mode=ro", uri=True, timeout=30.0)
-        n_entities = tconn.execute("SELECT COUNT(*) FROM rag_entities").fetchone()[0]
-        n_mentions = tconn.execute("SELECT COUNT(*) FROM rag_entity_mentions").fetchone()[0]
-        tconn.close()
+        try:
+            n_entities = tconn.execute("SELECT COUNT(*) FROM rag_entities").fetchone()[0]
+            n_mentions = tconn.execute("SELECT COUNT(*) FROM rag_entity_mentions").fetchone()[0]
+        finally:
+            tconn.close()
     except sqlite3.OperationalError:
         n_entities = sum(len(v) for v in entities_by_type.values())
         n_mentions = 0

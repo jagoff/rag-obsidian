@@ -159,8 +159,9 @@ def _pearson(xs: list[float], ys: list[float]) -> tuple[float, int, float]:
             # Fallback: Student's t CDF approximation. Suficiente para
             # threshold filtering aunque no sea exacto.
             # Approximation Hill 1970 — buena para n>=4.
+            # Factor 2: two-tailed (Hill da one-tailed, necesitamos two-tailed).
             x = (n - 2) / (n - 2 + t_stat * t_stat)
-            p = max(0.0, min(1.0, x ** ((n - 2) / 2)))
+            p = max(0.0, min(1.0, 2.0 * x ** ((n - 2) / 2)))
     return r, n, float(p)
 
 
@@ -320,6 +321,7 @@ def compute_correlations(
         tuple((k, len(v)) for k, v in sorted(metrics.items())),
     )
     if cache_key in _CACHE:
+        _CACHE.move_to_end(cache_key)
         return _CACHE[cache_key]
 
     names = sorted(metrics.keys())

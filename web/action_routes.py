@@ -183,16 +183,21 @@ def vlm_describe(req: VlmDescribeRequest, request: Request) -> dict:
     if not raw.is_file():
         raise HTTPException(status_code=404, detail="path no es archivo")
 
+    import os as _os  # noqa: PLC0415
+    _vault_root = _Path(
+        _os.environ.get(
+            "OBSIDIAN_RAG_VAULT",
+            _Path.home()
+            / "Library"
+            / "Mobile Documents"
+            / "iCloud~md~obsidian"
+            / "Documents"
+            / "Notes",
+        )
+    ).resolve()
     allowed_roots = [
         _Path.home() / "repos" / "whatsapp-mcp" / "whatsapp-bridge" / "store",
-        _Path.home()
-        / "Library"
-        / "Mobile Documents"
-        / "iCloud~md~obsidian"
-        / "Documents"
-        / "Notes"
-        / "00-Inbox"
-        / "attachments",
+        _vault_root / "00-Inbox" / "attachments",
     ]
     inside = False
     for root in allowed_roots:

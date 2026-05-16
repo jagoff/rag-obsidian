@@ -72,6 +72,7 @@ logger = logging.getLogger(__name__)
 _TABLE = "rag_whatsapp_scheduled"
 _VALID_STATUSES: tuple[str, ...] = (
     "pending", "processing", "sent", "sent_late", "failed", "cancelled",
+    "send_uncertain",
 )
 # Si un row queda en 'processing' por más de este threshold, asumimos
 # que el worker que lo agarró crasheó antes de finalizar. Lo reseteamos
@@ -514,8 +515,9 @@ def schedule(
         new_id = int(cur.lastrowid or 0)
         try:
             c.commit()
-        except Exception:
-            pass
+        except Exception as _commit_exc:
+            logger.exception("wa_scheduled_create_commit_failed: %r", _commit_exc)
+            raise RuntimeError(f"schedule commit failed: {_commit_exc}") from _commit_exc
 
     _log_ambient("whatsapp_scheduled_created", {
         "scheduled_id": new_id,

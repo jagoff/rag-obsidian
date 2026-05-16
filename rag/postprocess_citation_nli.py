@@ -303,7 +303,6 @@ def verify_answer_nli(
         import numpy as np
 
         # Construir todos los pares (sentence, chunk) para batch inference
-        len(sentences)
         n_chunks = len(chunks)
         pairs: list[tuple[str, str]] = []
         for sent in sentences:
@@ -379,19 +378,16 @@ def apply_nli_mode(
         return answer
 
     if mode == "mark":
-        # Reemplazar cada oración no verificada por oración + "(?)".
-        # Hacemos reemplazo simple de izquierda a derecha usando el texto
-        # original de la oración.
-        modified = answer
-        # Para no double-marcar si una oración aparece dos veces,
-        # iteramos por índice de fin para sustituir la primera ocurrencia.
+        # Reconstruir desde los results en orden para evitar el bug de
+        # substring: str.replace() con la primera oración más corta como
+        # substring de una más larga ya marcada produce doble-marcado.
+        parts = []
         for r in results:
-            if not r.verified:
-                orig = r.sentence
-                marked = orig + _NLI_UNVERIFIED_SUFFIX
-                # Solo reemplazar la primera ocurrencia en el texto actual
-                modified = modified.replace(orig, marked, 1)
-        return modified
+            if r.verified:
+                parts.append(r.sentence)
+            else:
+                parts.append(r.sentence + _NLI_UNVERIFIED_SUFFIX)
+        return " ".join(parts)
 
     if mode == "strip":
         # Conservar solo las oraciones verificadas

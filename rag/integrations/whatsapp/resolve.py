@@ -385,10 +385,6 @@ def _whatsapp_resolve_reply_target(
         )
         rows = cur.fetchall()
     except _sqlite3.Error as exc:
-        try:
-            conn.close()
-        except Exception:
-            pass
         return {"error": f"bridge_db_query_failed: {str(exc)[:80]}"}
     finally:
         try:

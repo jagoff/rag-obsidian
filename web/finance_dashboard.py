@@ -430,10 +430,10 @@ def _load_income_pdfs(finance_dir: Path) -> tuple[list[dict], list[dict]]:
                 continue
 
             # Fecha del recibo (primer día del mes)
-            date = datetime(year, month, 1).isoformat()
+            date_str = datetime(year, month, 1).isoformat()
 
             incomes.append({
-                "date": date,
+                "date": date_str,
                 "amount": amount,
                 "currency": "ARS",
                 "source": "income_pdf",
@@ -1532,11 +1532,7 @@ def snapshot(
 
     if cache_key is not None:
         with _DASHBOARD_CACHE_LOCK:
-            # Si hay archivos de ingresos, siempre regenerar para asegurar frescura
-            # (cambio reciente en la estructura)
-            if incomes:
-                pass  # No usar cache
-            elif _DASHBOARD_CACHE.get("key") == cache_key:
+            if _DASHBOARD_CACHE.get("key") == cache_key:
                 return _DASHBOARD_CACHE["payload"]
 
     if not transactions and not transfers and not cards and not incomes:

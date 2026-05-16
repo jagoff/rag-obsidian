@@ -53,6 +53,7 @@ __all__ = [
     "_moze_fmt_ars",
     "_moze_parse_latest",
     "_moze_render_month",
+    "_moze_cache_dir",
     "_sync_moze_notes",
     # Credit card helpers
     "TARJETAS_VAULT_SUBPATH",

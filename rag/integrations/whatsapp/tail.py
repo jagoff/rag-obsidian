@@ -78,12 +78,14 @@ def try_parse_due_from_text(text: str) -> str | None:
     try:
         from rag import _parse_natural_datetime  # noqa: PLC0415
         from datetime import datetime as _dt, timezone as _tz  # noqa: PLC0415
-        now = _dt.now()
+        now = _dt.now(_tz.utc)
         parsed = _parse_natural_datetime(phrase, now=now)
-        if parsed is None or parsed <= now:
+        if parsed is None:
             return None
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=_tz.utc)
+        if parsed <= now:
+            return None
         return parsed.astimezone(_tz.utc).isoformat(timespec="seconds")
     except Exception:
         return None

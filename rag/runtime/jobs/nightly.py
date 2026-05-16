@@ -211,7 +211,6 @@ def implicit_feedback_job() -> dict[str, Any]:
 def online_tune_job() -> dict[str, Any]:
     """Equivalente a ``rag tune --online --days 14 --apply --yes``.
     Schedule: 03:30 daily. Tarda ~24min warm en M-chip."""
-    repo_root = Path(__file__).resolve().parent.parent.parent.parent
     return _run_subprocess(
         [_RAG_BIN, "tune", "--online", "--days", "14", "--apply", "--yes"],
         extra_env={
@@ -416,7 +415,7 @@ def drafts_finetune_job() -> dict[str, Any]:
         with _ragvec_state_conn() as conn:
             row = conn.execute(
                 "SELECT COUNT(*) FROM rag_draft_decisions WHERE "
-                "decision IN ('approved_editar') AND sent_text IS NOT NULL "
+                "decision IN ('approved_si', 'approved_editar') AND sent_text IS NOT NULL "
                 "AND length(sent_text) >= 10"
             ).fetchone()
             n_pairs = int(row[0] or 0) if row else 0

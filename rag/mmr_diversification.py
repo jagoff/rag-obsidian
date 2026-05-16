@@ -80,7 +80,9 @@ def _cosine(a: list[float] | tuple[float, ...], b: list[float] | tuple[float, ..
     """
     if not a or not b:
         return 0.0
-    n = min(len(a), len(b))
+    if len(a) != len(b):
+        return 0.0
+    n = len(a)
     dot = 0.0
     na = 0.0
     nb = 0.0

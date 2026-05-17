@@ -137,6 +137,11 @@ class IPCServer:
                 await self._server.serve_forever()
         except asyncio.CancelledError:
             pass
+        finally:
+            try:
+                self.socket_path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("ipc: failed to unlink socket on shutdown: %s", exc)
 
     async def _handle_connection(
         self,

@@ -13060,8 +13060,8 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     f"files={_purged_files_src[:3]}",
                     flush=True,
                 )
-                result["metas"] = [_metas_in[i] for i in _keep_idx]
-                result["scores"] = [_scores_in[i] for i in _keep_idx]
+                result["metas"] = [_metas_in[i] for i in _keep_idx if i < len(_metas_in)]
+                result["scores"] = [_scores_in[i] for i in _keep_idx if i < len(_scores_in)]
                 if _docs_in:
                     result["docs"] = [_docs_in[i] for i in _keep_idx if i < len(_docs_in)]
 
@@ -20198,7 +20198,7 @@ def _recover_devin_final_message(pid: int) -> str | None:
                 if msg:
                     return msg
         return None
-    except (json.JSONDecodeError, TypeError):
+    except (json.JSONDecodeError, TypeError, OSError):
         return None
 
 
@@ -20567,19 +20567,20 @@ def _enqueue_error(
 # es conservador. Ajustable con env var.
 _AUTO_FIX_WORKER_HOURLY_CAP = settings.auto_fix_hourly_cap
 _AUTO_FIX_WORKER_INVOCATIONS: list[float] = []  # monotonic ts de invocaciones
+_AUTO_FIX_WORKER_LOCK = threading.Lock()
 
 
 def _worker_can_invoke_devin() -> tuple[bool, str]:
     """¿El worker puede disparar otra invocación de Devin ahora?"""
     now = time.monotonic()
-    # Filtrar invocaciones de la última hora.
     one_hour_ago = now - 3600
-    _AUTO_FIX_WORKER_INVOCATIONS[:] = [t for t in _AUTO_FIX_WORKER_INVOCATIONS if t > one_hour_ago]
-    if len(_AUTO_FIX_WORKER_INVOCATIONS) >= _AUTO_FIX_WORKER_HOURLY_CAP:
-        return False, (
-            f"rate limit: {_AUTO_FIX_WORKER_HOURLY_CAP} invocaciones/hora alcanzado "
-            f"(próxima slot en {int((_AUTO_FIX_WORKER_INVOCATIONS[0] + 3600 - now) / 60)}min)"
-        )
+    with _AUTO_FIX_WORKER_LOCK:
+        _AUTO_FIX_WORKER_INVOCATIONS[:] = [t for t in _AUTO_FIX_WORKER_INVOCATIONS if t > one_hour_ago]
+        if len(_AUTO_FIX_WORKER_INVOCATIONS) >= _AUTO_FIX_WORKER_HOURLY_CAP:
+            return False, (
+                f"rate limit: {_AUTO_FIX_WORKER_HOURLY_CAP} invocaciones/hora alcanzado "
+                f"(próxima slot en {int((_AUTO_FIX_WORKER_INVOCATIONS[0] + 3600 - now) / 60)}min)"
+            )
     return True, ""
 
 
@@ -20651,7 +20652,10 @@ def _process_error_with_devin(error_id: int) -> dict:
         return {"error": "row no existe"}
 
     service, file_ref, error_text, context_json, error_ts, attempts = row
-    context_lines = json.loads(context_json) if context_json else []
+    try:
+        context_lines = json.loads(context_json) if context_json else []
+    except (json.JSONDecodeError, TypeError):
+        context_lines = []
 
     # Marcar como processing + increment attempts.
     with _ragvec_state_conn() as conn:
@@ -20684,7 +20688,8 @@ def _process_error_with_devin(error_id: int) -> dict:
 
     if _DEVIN_BIN is None:
         _finalize_error(error_id, -1, "", "failed", "devin CLI no encontrado", 0.0)
-        _AUTO_FIX_WORKER_INVOCATIONS.append(time.monotonic())
+        with _AUTO_FIX_WORKER_LOCK:
+            _AUTO_FIX_WORKER_INVOCATIONS.append(time.monotonic())
         return {"error_id": error_id, "exit_code": -1, "resolution_status": "failed"}
 
     # Worker autónomo: mismas flags que el endpoint `/api/auto-fix-devin`.
@@ -20696,7 +20701,8 @@ def _process_error_with_devin(error_id: int) -> dict:
         "--respect-workspace-trust", "false",
         "--permission-mode", "dangerous",
     ]
-    _AUTO_FIX_WORKER_INVOCATIONS.append(time.monotonic())
+    with _AUTO_FIX_WORKER_LOCK:
+        _AUTO_FIX_WORKER_INVOCATIONS.append(time.monotonic())
     t0 = time.monotonic()
     proc_pid: int | None = None
     try:

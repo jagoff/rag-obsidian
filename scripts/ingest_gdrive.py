@@ -268,8 +268,8 @@ def _export_body(svc, file_id: str, mime: str, body_cap: int, file_meta: dict | 
     if not export_mime:
         return "", f"unsupported_mime:{mime}"
 
-    # Skip very large files (applies to binary exports, not Google Docs).
-    if file_meta and mime not in EXPORT_MIME:  # Non-Google-native format
+    # Skip very large files before attempting export (can timeout at 30s).
+    if file_meta:
         file_size = int((file_meta.get("size") or "0") or "0")
         if file_size > 50_000_000:  # 50 MB
             return "", "file_too_large:>50MB"
@@ -339,8 +339,8 @@ def upsert_drive_file(col, meta: dict, body: str) -> int:
         existing = col.get(where={"file": file_key}, include=[])
         if existing.get("ids"):
             col.delete(ids=existing["ids"])
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[warn] upsert_drive_file: delete prior chunks failed for {file_key}: {exc}", file=sys.stderr)
 
     if not chunks:
         # Empty doc: nothing to upsert. We already deleted any previous chunks,
@@ -404,7 +404,8 @@ def _retention_prune(col, *, now_ts: float | None = None) -> int:
     cutoff = (now_ts or time.time()) - (retention_days * 86400.0)
     try:
         got = col.get(where={"source": "drive"}, include=["metadatas"])
-    except Exception:
+    except Exception as exc:
+        print(f"[warn] _retention_prune: query failed, skipping prune: {exc}", file=sys.stderr)
         return 0
     stale_ids: list[str] = []
     for mid, meta in zip(got.get("ids", []) or [], got.get("metadatas", []) or []):
@@ -497,7 +498,7 @@ def run(
             return summary
 
         summary["files_seen"] = len(files)
-        latest_mod = since_iso
+        latest_mod = since_iso if not mode_bootstrap else ""
 
         for f in files:
             if dry_run:

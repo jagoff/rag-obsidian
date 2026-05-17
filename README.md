@@ -1,6 +1,6 @@
 # obsidian-rag
 
-Sistema de búsqueda inteligente para tu vault de Obsidian. Todo corre localmente en tu Mac: usa sqlite-vec para buscar en tus notas, MLX para procesar lenguaje natural, y sentence-transformers para entender el significado de lo que escribís. No envía nada a la nube, no tiene telemetría.
+Sistema de búsqueda inteligente para tu vault de Obsidian. Todo corre localmente en tu Mac: usa sqlite-vec para buscar en tus notas, MLX para embeddings y generación, y sentence-transformers para reranking local. No envía nada a la nube, no tiene telemetría.
 
 **¿Qué hace?**
 - Busca en tus notas usando lenguaje natural (ej: "qué ideas tengo sobre ikigai")
@@ -19,7 +19,7 @@ Sistema de búsqueda inteligente para tu vault de Obsidian. Todo corre localment
 1. [Qué es y cómo se compone](#qué-es-y-cómo-se-compone)
 2. [Instalación / setup](#instalación--setup)
 3. [Storage layout](#storage-layout-dónde-vive-cada-cosa)
-4. [Arquitectura: pipelines](#arquitectura-pipelines)
+4. [Arquitectura: servicios y pipelines](#arquitectura-servicios-y-pipelines)
 5. [Comandos — referencia completa](#comandos--referencia-completa)
 6. [Multi-vault (`rag vault`)](#multi-vault-rag-vault)
 7. [Ambient Agent (co-autor del Inbox)](#ambient-agent-co-autor-del-inbox)
@@ -41,7 +41,10 @@ Sistema de búsqueda inteligente para tu vault de Obsidian. Todo corre localment
 
 ## Qué es y cómo se compone
 
-Una sola herramienta de línea de comandos (`rag`) que vive en `/Users/fer/repos/rag/rag/` (el código principal) + un servidor MCP (`obsidian-rag-mcp`) para integración con Claude.
+Una herramienta local-first compuesta por varias superficies sobre el mismo core Python:
+CLI (`rag`), servidor web/FastAPI, servidor MCP (`obsidian-rag-mcp`), jobs launchd y ETLs de integraciones. El código principal vive en `/Users/fer/repos/rag/rag/`; la web vive en `/Users/fer/repos/rag/web/`.
+
+El proyecto todavía corre mayormente como procesos locales y no como microservicios de red separados. La arquitectura objetivo es partir primero por **servicios lógicos** con contratos chicos y testeables, y recién después evaluar si alguno merece proceso propio. El plan vivo está en [`docs/microservices-plan.md`](./docs/microservices-plan.md).
 
 > **Nota sobre los modelos de IA**: El sistema usa modelos de Apple Silicon (MLX) que corren 100% en tu Mac. Los modelos principales son Qwen2.5-3B (para tareas rápidas), Qwen2.5-7B (para respuestas principales), y Qwen3-30B (para tareas complejas). Todo corre localmente, sin nube. Detalles técnicos en [`docs/mlx-migration.md`](./docs/mlx-migration.md).
 
@@ -75,7 +78,7 @@ graph TD
         end
     end
 
-    Reranker["bge-reranker-v2-m3<br/>(MPS+fp16)"]
+    Reranker["bge-reranker-v2-m3<br/>(MPS+fp32)"]
 
     Vault --> Watch & IndexCmd
     Watch & IndexCmd --> Embed
@@ -167,9 +170,36 @@ launchctl list | grep obsidian-rag
 
 ---
 
-## Arquitectura: pipelines
+## Arquitectura: servicios y pipelines
 
 > Los diagramas viven en [`docs/diagrams/`](./docs/diagrams/) como mermaid (`.mmd`, editable) + SVG renderizado. Los bloques `mermaid` inline abajo son los mismos diagramas — GitHub los renderiza directo. Regenerar SVGs: `cd docs/diagrams && for f in *.mmd; do npx -y @mermaid-js/mermaid-cli -i "$f" -o "${f%.mmd}.svg" -t dark -b transparent; done`.
+
+### Mapa modular actual
+
+| Servicio lógico | Responsabilidad | Módulos principales |
+|---|---|---|
+| Web Gateway | FastAPI, auth/admin token, SSE, static files, uploads, request validation | `web/server.py`, `web/basic_routes.py`, `web/action_routes.py`, `web/chat_schemas.py`, `web/chat_uploads.py` |
+| Chat/Retrieval API | Orquestar intent, retrieve, rerank, postprocess, streaming y sesiones | `rag/__init__.py`, `rag/pipeline_flags.py`, `rag/response_cache.py`, `rag/rendering.py` |
+| Indexer | Recorrer vault, chunking, embeddings, URL/wiki/entity indexing, cache de embeddings | `rag/__init__.py`, `rag/vector_store.py`, `rag/contextual_retrieval.py`, `rag/embedding_cache.py`, `rag/index_etl_state.py` |
+| Integrations ETL | Importar fuentes externas a notas/index: WhatsApp, Gmail, Calendar, Reminders, Chrome, Drive, GitHub, finanzas | `rag/integrations/**`, `scripts/ingest_*.py` |
+| Runtime Scheduler | Jobs frecuentes/nocturnos, supervisor, IPC, health de daemons | `rag/runtime/**`, `rag/plists/**` |
+| Telemetry/State | SQLite state, JSONL legacy, behavior, feedback, impressions, logs | `rag/_telemetry_ddl.py`, `rag/runtime/_telemetry.py`, helpers en `rag/__init__.py` |
+| Local Model Runtime | MLX chat/embed/rerank/NLI lifecycle y warmups | `rag/llm_backend.py`, `rag/mlx_embed.py`, `rag/mlx_reranker.py`, `rag/mlx_tool_calls.py` |
+| WhatsApp Surface | Bridge, contacts, drafts, scheduled sends, voice, memory, search | `rag/integrations/whatsapp/**`, rutas `/api/wa/**` en `web/server.py` |
+
+**Regla para continuar el split:** no convertir nada en proceso separado hasta que funcione primero como módulo Python importable, con contrato explícito y tests focalizados. Si un módulo necesita importar todo `rag/__init__.py` para hacer una tarea simple, todavía no está listo como microservicio.
+
+**Cortes recientes que ya existen:**
+- `web/chat_schemas.py`: modelos/validaciones de `ChatRequest` y `ChatAttachment`.
+- `web/chat_uploads.py`: sanitización EXIF/HEIC, extracción de texto de uploads y copia al vault.
+- `rag/pipeline_flags.py`: flags de adaptive routing, NLI grounding, fast-path lookup y pools por intent.
+
+**Siguiente secuencia recomendada:**
+1. Extraer `web/whatsapp_routes.py` desde el bloque `/api/wa/**`, usando un objeto de dependencias para evitar arrastrar globals.
+2. Extraer `rag/indexing_service.py` con `_index_single_file`, `_run_index_inner`, `_do_index` y helpers de chunk/hash. El contrato debería aceptar `vault_path`, `collection`, `embed_fn` y `telemetry`.
+3. Extraer `rag/retrieval_service.py` con `retrieve`, `multi_retrieve`, `run_chat_turn` y modelos de resultado.
+4. Partir `web/static/app.js` por flujo: composer/uploads, SSE chat, sources/rendering, settings y contact commands.
+5. Unificar ETLs con contrato `discover -> normalize -> write_notes -> index_delta`.
 
 ### System overview — cómo se conectan las piezas
 
@@ -198,7 +228,7 @@ Cada operación del pipeline va a un modelo específico. El reranker vive en sen
 | Agent loop (`rag do`) | `command-r` → `Qwen3-30B-A3B` (MLX) | `_mlx_chat` tool-calling nativo |
 | Cross-encoder rerank | `BAAI/bge-reranker-v2-m3` | sentence-transformers local (**MPS+fp32**, fp16 falla — ver CLAUDE.md invariant) |
 
-Fallback resolver de `resolve_chat_model()`: `command-r:latest` → `qwen2.5:14b` → `phi4:latest`. El primero instalado gana.
+Resolver de `resolve_chat_model()`: `RAG_CHAT_MODEL` explícito gana; si no, el primer snapshot MLX disponible en `qwen3:30b-a3b` → `qwen2.5:7b` → aliases compat (`command-r:latest`, `qwen2.5:14b`). Los aliases se resuelven en [`rag/llm_backend.py`](./rag/llm_backend.py).
 
 ### Topología de servicios
 
@@ -214,20 +244,20 @@ flowchart TD
     Intent -->|count/list/recent| MetaScan[metadata scan<br/>sin LLM]
     Intent -->|semantic| Filters[infer_filters<br/>auto folder/tag]
     Filters --> History{¿hay session<br/>history?}
-    History -->|sí| Reform[reformulate_query<br/>helper]
+    History -->|sí| Reform[reformulate_query<br/>MLX helper]
     History -->|no| Expand
-    Reform --> Expand[expand_queries<br/>3 paraphrases]
-    Expand --> Embed[batch embed<br/>bge-m3]
+    Reform --> Expand[expand_queries<br/>3 paraphrases<br/>MLX helper]
+    Expand --> Embed[batch embed<br/>qwen3-embedding]
     Embed --> Per["por variante:<br/>sqlite-vec sem + BM25"]
     Per --> RRF[RRF merge + dedup]
     RRF --> Parent[expand to parent section]
-    Parent --> Rerank[cross-encoder rerank<br/>MPS+fp16]
+    Parent --> Rerank[cross-encoder rerank<br/>MPS+fp32]
     Rerank --> Gate{top_score ≥<br/>CONFIDENCE_RERANK_MIN<br/>0.015?}
     Gate -->|no, sin --force| Refuse[refuse + log]
-    Gate -->|sí| LLM[command-r streaming<br/>strict / loose]
+    Gate -->|sí| LLM[MLX chat streaming<br/>strict / loose]
     LLM --> Verify[verify_citations]
     Verify --> Counter{--counter?}
-    Counter -->|sí| FindContrad[find_contradictions<br/>command-r judgment]
+    Counter -->|sí| FindContrad[find_contradictions<br/>Qwen3-30B judgment]
     Counter -->|no| Render[render + sources + related]
     FindContrad --> Render
 ```
@@ -245,10 +275,10 @@ flowchart TD
     Bulk --> Hash
     Hash -->|igual| Skip[skip]
     Hash -->|distinto| ContrCheck{skip_contradict<br/>=False?}
-    ContrCheck -->|sí| Contr[find_contradictions_for_note<br/>vs vault] --> WriteFM[update<br/>frontmatter contradicts:<br/>+ jsonl log]
+    ContrCheck -->|sí| Contr[find_contradictions_for_note<br/>Qwen3-30B judge<br/>vs vault] --> WriteFM[update<br/>frontmatter contradicts:<br/>+ jsonl log]
     ContrCheck -->|no, o reset| Chunks
     WriteFM --> Chunks[semantic_chunks<br/>150-800 chars]
-    Chunks --> EmbedC[embed bge-m3]
+    Chunks --> EmbedC[embed qwen3-embedding]
     EmbedC --> Upsert[upsert main collection]
     Upsert --> URLs[_index_urls<br/>extract + embed contexto]
     URLs --> URLUpsert[upsert urls collection]
@@ -261,11 +291,11 @@ flowchart TD
 flowchart LR
     subgraph P1[Phase 1: query-time]
         Q[rag query/chat<br/>--counter] --> A[answer]
-        A --> Find1[find_contradictions]
+        A --> Find1[find_contradictions<br/>Qwen3-30B judge]
         Find1 --> Render[⚡ Counter-evidence block]
     end
     subgraph P2[Phase 2: index-time]
-        Edit[nota nueva/modificada] --> Find2[find_contradictions_for_note]
+        Edit[nota nueva/modificada] --> Find2[find_contradictions_for_note<br/>Qwen3-30B judge]
         Find2 --> FM["frontmatter<br/>contradicts: [path]"]
         Find2 --> JSONL[contradictions.jsonl]
     end
@@ -274,7 +304,7 @@ flowchart LR
         FM --> Collect
         JSONL --> Collect
         QLogD[queries.jsonl] --> Collect
-        Collect --> Draft[command-r drafting<br/>1ra persona]
+        Collect --> Draft[Qwen3-30B drafting<br/>1ra persona]
         Draft --> Note[99-obsidian/99-AI/reviews/YYYY-WNN.md<br/>auto-indexed]
     end
 ```
@@ -285,14 +315,14 @@ flowchart LR
 flowchart TD
     Inbox[rag inbox] --> Loop[for nota in 00-Inbox/]
     Loop --> Folder[_suggest_folder_for_note<br/>mode de neighbours]
-    Loop --> Tags[_suggest_tags_for_note<br/>helper LLM contra vocab]
+    Loop --> Tags[_suggest_tags_for_note<br/>MLX helper contra vocab]
     Loop --> Wiki[find_wikilink_suggestions]
     Loop --> Dupe[find_near_duplicates_for]
     Folder & Tags & Wiki & Dupe --> Plan[render plan]
     Plan -->|--apply| Move[shutil.move si conf ≥ 0.4]
     Move --> ApplyTags[_apply_frontmatter_tags]
     ApplyTags --> ApplyWiki[apply_wikilink_suggestions]
-    ApplyWiki --> Reidx[_index_single_file<br/>skip_contradict=True]
+    ApplyWiki --> Reidx[_index_single_file<br/>skip_contradict=True<br/>qwen3-embedding]
 ```
 
 ---
@@ -380,13 +410,13 @@ Skips: frontmatter, fenced/inline code, existing wikilinks, markdown links, HTML
 |---|---|
 | `rag capture "<texto>"` | Captura rápida al `00-Inbox/YYYY-MM-DD-HHMM-<slug>.md`. Auto-indexa. |
 | `rag capture --stdin --tag voice --source whatsapp-voice` | Leer texto de stdin. Útil para voice transcripts. |
-| `rag morning [--dry-run] [--date Y-M-D] [--lookback-hours 36]` | Brief diario: ayer + foco hoy + inbox + contradicciones nuevas + queries low-conf. command-r 120-280 palabras. Auto Mon-Fri 7:00. |
+| `rag morning [--dry-run] [--date Y-M-D] [--lookback-hours 36]` | Brief diario: ayer + foco hoy + inbox + contradicciones nuevas + queries low-conf. Usa HQ tier MLX, 120-280 palabras. Auto Mon-Fri 7:00. |
 | `rag dead [--min-age-days 365] [--query-window-days 180] [--folder X] [--plain]` | Candidatos a archivar: 0 outlinks + 0 backlinks + no recuperada + vieja. Usa frontmatter `created:` si existe (iCloud-safe). |
 | `rag dupes [--threshold 0.85] [--folder X] [--limit 50] [--plain]` | Pares de notas con centroides similares. Numpy. <1s sobre 521 notas. |
 | `rag inbox [--folder 00-Inbox] [--apply]` | Triage cada nota: folder destino + tags + wikilinks + duplicados. `--apply` mueve + escribe + reindexa (si confianza ≥ 0.4). |
 | `rag inbox --no-folder/--no-tags/--no-wikilinks` | Skip individual signals. |
 | `rag inbox --max-tags 5 --limit 20 --folder-min-conf 0.4` | Tunings. |
-| `rag prep "<topic>"` | Brief de contexto sobre persona/proyecto/tema. command-r drafts 350-550 palabras estructurado. |
+| `rag prep "<topic>"` | Brief de contexto sobre persona/proyecto/tema. HQ tier MLX, 350-550 palabras estructurado. |
 | `rag prep "<topic>" --save` | Guarda a `00-Inbox/YYYY-MM-DD-prep-<slug>.md` y auto-indexa. |
 | `rag prep "<topic>" --folder X -k 8 --no-urls --no-related --plain` | Filtros. |
 
@@ -394,7 +424,7 @@ Skips: frontmatter, fenced/inline code, existing wikilinks, markdown links, HTML
 
 | Comando | Función |
 |---|---|
-| `rag do "<instrucción>"` | Tool-calling agent con command-r. Tools: search, read_note, list_notes, propose_write. **Writes son dry-run** (acumulados en `_AGENT_PENDING_WRITES`, confirmás cada uno al final). |
+| `rag do "<instrucción>"` | Tool-calling agent con HQ tier MLX. Tools: search, read_note, list_notes, propose_write. **Writes son dry-run** (acumulados en `_AGENT_PENDING_WRITES`, confirmás cada uno al final). |
 | `rag do "..." --yes --max-iterations 12` | Skip confirmación + cap de iteraciones. |
 
 ### Multi-vault
@@ -545,7 +575,7 @@ Pipeline:
 2. Calcula cosine pairwise (`arr @ arr.T`), enmascara lower triangle.
 3. Calcula distancias en el grafo (BFS sobre wikilinks + backlinks).
 4. Filtra pares con `cosine ≥ threshold AND hops ≥ min_hops AND edad ≥ skip_young_days`.
-5. Para cada par, opcional: command-r genera una línea de "por qué este puente importa".
+5. Para cada par, opcional: el HQ tier MLX genera una línea de "por qué este puente importa".
 6. Loguea a `surface.jsonl`.
 
 **Uso típico**: cron nocturno antes del morning brief, o manual cuando se quiere densificar el grafo después de indexar mucho contenido nuevo.
@@ -586,9 +616,9 @@ Las **3 más críticas** que casi siempre vas a querer setear:
 
 | Rol | Modelo lógico | Resuelto a (default `RAG_LLM_BACKEND=mlx`) |
 |---|---|---|
-| Chat (answers + contradiction judgment + prep + digest) | `qwen2.5:7b` (default) / `command-r` o `qwen2.5:14b` (HQ tier) | [`Qwen2.5-7B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-7B-Instruct-4bit) / [`Qwen3-30B-A3B-Instruct-2507-4bit`](https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit) |
+| Chat (answers + contradiction judgment + prep + digest) | `qwen2.5:7b` (default) / `qwen3:30b-a3b` o aliases compat `command-r`, `qwen2.5:14b` (HQ tier) | [`Qwen2.5-7B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-7B-Instruct-4bit) / `mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit-DWQ` |
 | Helper (paraphrase, HyDE, history reformulation, autotag) | `qwen2.5:3b` | [`Qwen2.5-3B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-3B-Instruct-4bit) |
-| Embeddings | `qwen3-embedding:0.6b` (multilingual, 1024d) — MLX in-process | Sí, in-process via SentenceTransformer + MPS |
+| Embeddings | `qwen3-embedding:0.6b` (multilingual, 1024d) | MLX in-process via `rag.mlx_embed.MLXEmbedder` |
 | Reranker | `BAAI/bge-reranker-v2-m3` | sentence-transformers in-process, `device=mps`+`float32` |
 
 **Decoding** (deterministic — esto es retrieval, no creative writing):

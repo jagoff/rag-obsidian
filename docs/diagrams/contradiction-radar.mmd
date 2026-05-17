@@ -1,11 +1,11 @@
 flowchart LR
     subgraph P1[Phase 1: query-time]
-        Q[rag query/chat<br/>--counter] --> A[answer<br/>command-r]
-        A --> Find1["find_contradictions<br/>(ollama: command-r)"]
+        Q[rag query/chat<br/>--counter] --> A[answer<br/>MLX chat]
+        A --> Find1["find_contradictions<br/>Qwen3-30B judge"]
         Find1 --> Render[⚡ Counter-evidence block]
     end
     subgraph P2[Phase 2: index-time]
-        Edit[nota nueva/modificada] --> Find2["find_contradictions_for_note<br/>(ollama: command-r)"]
+        Edit[nota nueva/modificada] --> Find2["find_contradictions_for_note<br/>Qwen3-30B judge"]
         Find2 --> FM["frontmatter<br/>contradicts: [path]"]
         Find2 --> JSONL[contradictions.jsonl]
     end
@@ -14,6 +14,6 @@ flowchart LR
         FM --> Collect
         JSONL --> Collect
         QLogD[queries.jsonl] --> Collect
-        Collect --> Draft["command-r drafting<br/>(ollama)<br/>1ra persona"]
+        Collect --> Draft["Qwen3-30B drafting<br/>1ra persona"]
         Draft --> Note[00-Inbox/reviews/YYYY-WNN.md<br/>auto-indexed]
     end

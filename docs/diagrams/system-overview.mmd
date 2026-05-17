@@ -1,46 +1,64 @@
 graph TD
-    Vault["📁 Obsidian vault<br/>iCloud~md~obsidian"]
-
-    subgraph IDX["Indexing"]
-        Watch["rag watch<br/>(launchd)"]
-        IndexCmd["rag index"]
+    subgraph Surfaces["User/API surfaces"]
+        CLI["rag CLI"]
+        Web["FastAPI web UI<br/>web/server.py"]
+        MCP["obsidian-rag-mcp<br/>stdio"]
+        WAUI["WhatsApp app<br/>via bridge"]
     end
 
-    subgraph DB["Storage local<br/>~/.local/share/obsidian-rag/"]
-        Vec[("sqlite-vec (ragvec.db)<br/>obsidian_notes_v11<br/>+ obsidian_urls_v1")]
-        Sessions["sessions/*.json"]
-        QLog["queries.jsonl"]
-        CLog["contradictions.jsonl"]
-        ALog["ambient.jsonl"]
-        SLog["surface.jsonl"]
-        FLog["filing.jsonl"]
+    subgraph WebGateway["Web Gateway"]
+        Routes["HTTP routes + SSE"]
+        Schemas["chat_schemas.py<br/>request contracts"]
+        Uploads["chat_uploads.py<br/>file/image handling"]
     end
 
-    subgraph RT["Retrieval / generación"]
-        Query["rag query / chat<br/>prep / links"]
-        Counter["--counter<br/>(contradiction radar)"]
+    subgraph Core["RAG Core"]
+        ChatSvc["Chat/Retrieval service<br/>retrieve · multi_retrieve · run_chat_turn"]
+        Flags["pipeline_flags.py<br/>adaptive routing · NLI · fast-path"]
+        IndexSvc["Indexer<br/>chunking · embeddings · entities · URLs"]
+        ETL["Integrations ETL<br/>WA · Gmail · Calendar · Reminders · Chrome · Drive · Finance"]
+        Runtime["Runtime scheduler<br/>frequent · nightly · supervisor"]
     end
 
-    subgraph Ollama["Ollama localhost:11434<br/>keep_alive=-1"]
-        Embed["bge-m3 (1024d)"]
-        Helper["qwen2.5:3b (helper)"]
-        Chat["command-r (chat + judgment)"]
+    subgraph Models["Local model runtime"]
+        MLX["MLXBackend<br/>Qwen helper/chat/HQ"]
+        Embed["qwen3-embedding<br/>1024d"]
+        Rerank["bge-reranker-v2-m3<br/>MPS + fp32"]
+        NLI["NLI / LLM judge<br/>optional grounding"]
     end
 
-    Reranker["bge-reranker-v2-m3<br/>sentence-transformers<br/>MPS + fp16"]
+    subgraph Storage["Local storage"]
+        Vault["Obsidian vault<br/>iCloud-local files"]
+        Vec[("sqlite-vec<br/>ragvec.db")]
+        State[("telemetry/state SQLite<br/>sessions · feedback · behavior")]
+        Logs["jsonl legacy logs<br/>queries · ambient · filing · surface"]
+        Config["~/.config/obsidian-rag<br/>vaults.json · OAuth tokens"]
+    end
 
-    Vault --> Watch & IndexCmd
-    Watch & IndexCmd --> Embed
-    Embed --> Vec
-    Query --> Embed
-    Query --> Helper
-    Query --> Reranker
-    Query --> Chat
-    Vec --> Query
-    Query --> Sessions & QLog
-    Counter --> CLog
-    Watch --> ALog
-    Query --> SLog & FLog
+    CLI --> ChatSvc
+    MCP --> ChatSvc
+    Web --> Routes
+    Routes --> Schemas
+    Routes --> Uploads
+    Routes --> ChatSvc
+    WAUI --> ETL
 
-    MCP["obsidian-rag-mcp<br/>(stdio)"] -.-> Query
-    WA["WhatsApp listener<br/>(self-chat RagNet)<br/>session wa:&lt;jid&gt;"] -.-> Query
+    ChatSvc --> Flags
+    ChatSvc --> Vec
+    ChatSvc --> State
+    ChatSvc --> MLX
+    ChatSvc --> Embed
+    ChatSvc --> Rerank
+    ChatSvc --> NLI
+
+    IndexSvc --> Vault
+    IndexSvc --> Embed
+    IndexSvc --> Vec
+    ETL --> Vault
+    ETL --> State
+    Runtime --> ETL
+    Runtime --> IndexSvc
+
+    Uploads --> Vault
+    State --> Logs
+    Config --> ChatSvc

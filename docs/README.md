@@ -18,6 +18,7 @@ Esto es un índice simple. Cada archivo responde a una pregunta concreta.
 Estos son más densos. Solo abrilos si querés entender decisiones de diseño o experimentos medidos:
 
 - [design-cross-source-corpus.md](./design-cross-source-corpus.md) — diseño del corpus multi-fuente (vault + WhatsApp + Gmail + Calendar + Reminders)
+- [microservices-plan.md](./microservices-plan.md) — límites de servicio propuestos y plan de split de monolitos
 - [eval-baselines-2026-04-15.md](./eval-baselines-2026-04-15.md) — baseline medido del retriever
 - [eval-tune-2026-04-15.md](./eval-tune-2026-04-15.md) — calibración del ranker
 - [regression-investigation-2026-04-15.md](./regression-investigation-2026-04-15.md) — investigación de regresión

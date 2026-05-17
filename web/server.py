@@ -20,10 +20,8 @@ import threading
 import threading as _threading
 import time
 import uuid
-import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from xml.etree import ElementTree as _ET
 from pathlib import Path
 from typing import Callable
 
@@ -46,18 +44,10 @@ except ImportError:
 # Reuse consolidated thread-safe cache helpers (extracted 2026-05-15).
 from rag.cache import ThreadSafeCache, ThreadSafeCacheMultiKey
 
-# Register HEIC/HEIF reader in PIL once. Audit 2026-04-25 R2-OCR #4: without
-# this iPhone photos (HEIC default) were passthrough in _sanitize_image_exif
-# and kept GPS coords when copied to the iCloud vault.
-try:
-    import pillow_heif as _pillow_heif  # noqa: PLC0415
-    _pillow_heif.register_heif_opener()
-    _HEIC_AVAILABLE = True
-except ImportError:
-    _HEIC_AVAILABLE = False
-
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
@@ -482,6 +472,30 @@ app = FastAPI(
 )
 
 
+@app.exception_handler(RequestValidationError)
+async def _request_validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Keep /api/chat validation errors small.
+
+    FastAPI's default 422 payload includes the rejected ``input`` value.
+    For oversized chat prompts that can echo 64k+ chars back to the PWA,
+    making the original "question too long" error noisy and expensive.
+    Preserve FastAPI's default shape, minus raw input, only on /api/chat.
+    """
+    if request.url.path != "/api/chat":
+        return await request_validation_exception_handler(request, exc)
+    sanitized: list[dict] = []
+    for err in exc.errors():
+        item = {k: v for k, v in err.items() if k != "input"}
+        ctx = item.get("ctx")
+        if isinstance(ctx, dict):
+            item["ctx"] = {
+                k: str(v) if isinstance(v, Exception) else v
+                for k, v in ctx.items()
+            }
+        sanitized.append(item)
+    return JSONResponse(status_code=422, content={"detail": sanitized})
+
+
 # Cache-Control para /static/* — assets inmutables en prod (versionados por
 # fichero, reload del server pushea bytes nuevos al disk). Pre-2026-04-22 no
 # había header → cada reload del browser refetcheaba el bundle entero
@@ -760,168 +774,82 @@ from web.basic_routes import register_basic_routes  # noqa: E402
 globals().update(register_basic_routes(app, STATIC_DIR))
 
 
-_CHAT_SESSION_RE = re.compile(r"^[A-Za-z0-9_.:@\-]{1,80}$")
-_TURN_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
-_CHAT_QUESTION_MAX = 16000  # ~4k tokens — bumped from 8000 (2026-04-20) because users sometimes paste long doc excerpts into chat; 16000 still well under CHAT_OPTIONS num_ctx=4096 × 4 chars/token
-_CHAT_ATTACHMENT_TEXT_MAX = 13_000
+from web.chat_schemas import (  # noqa: E402
+    CHAT_ATTACHMENT_TEXT_MAX as _CHAT_ATTACHMENT_TEXT_MAX,
+    CHAT_QUESTION_MAX as _CHAT_QUESTION_MAX,
+    CHAT_QUESTION_RUNTIME_MAX as _CHAT_QUESTION_RUNTIME_MAX,
+    CHAT_SESSION_RE as _CHAT_SESSION_RE,
+    TURN_ID_RE as _TURN_ID_RE,
+    VALID_CHAT_MODES as _VALID_CHAT_MODES,
+    ChatAttachment,
+    ChatRequest,
+)
+from web.chat_uploads import (  # noqa: E402
+    CHAT_UPLOAD_DOC_SUFFIXES as _CHAT_UPLOAD_DOC_SUFFIXES,
+    CHAT_UPLOAD_IMAGE_SUFFIXES as _CHAT_UPLOAD_IMAGE_SUFFIXES,
+    CHAT_UPLOAD_TEXT_MAX_CHARS as _CHAT_UPLOAD_TEXT_MAX_CHARS,
+    CHAT_UPLOAD_TEXT_SUFFIXES as _CHAT_UPLOAD_TEXT_SUFFIXES,
+    HEIC_AVAILABLE as _HEIC_AVAILABLE,
+    SANITIZABLE_FORMATS as _CHAT_UPLOAD_SANITIZABLE_FORMATS,
+    copy_chat_upload_to_vault as _copy_chat_upload_to_vault,
+    extract_chat_upload_text as _extract_chat_upload_text,
+    read_upload_capped as _read_upload_capped,
+    safe_chat_upload_filename as _safe_chat_upload_filename,
+    sanitize_image_exif as _chat_upload_sanitize_image_exif,
+    truncate_chat_upload_text as _truncate_chat_upload_text,
+)
+
+_WORK_EXPLICIT_CREATE_RE = re.compile(
+    r"^\s*(?:por\s+favor\s+|please\s+)?(?:"
+    r"/(?:rem|evt)\b|"
+    r"(?:record[aá](?:me)?|recordáme|acordate|no\s+te\s+olvides)\b|"
+    r"(?:agend[aá](?:me|lo|la)?|calendariz[aá](?:me|lo|la)?)\b|"
+    r"(?:cre[aá]|crear|creame|creáme)\s+(?:un\s+|una\s+)?(?:evento|recordatorio|reminder|cita|reuni[oó]n)\b|"
+    r"(?:anot[aá](?:me)?|apunt[aá](?:me)?|agreg[aá]|añad[ií])\b.*\b(?:calendario|agenda|recordatorio|evento|cita|reuni[oó]n)\b|"
+    r"(?:pon[eé](?:me)?|ponete|bloque[aá])\b.*\b(?:calendario|agenda|recordatorio|evento|cita|reuni[oó]n|turno)\b"
+    r")",
+    re.IGNORECASE,
+)
 
 
-class ChatAttachment(BaseModel):
-    name: str = Field(default="archivo", max_length=220)
-    content_type: str | None = Field(default=None, max_length=160)
-    size: int | None = Field(default=None, ge=0, le=25 * 1024 * 1024)
-    text: str | None = Field(default="", max_length=_CHAT_ATTACHMENT_TEXT_MAX)
-    path: str | None = Field(default=None, max_length=600)
-    vault_path: str | None = Field(default=None, max_length=600)
-    truncated: bool = False
+def _compact_long_chat_question(
+    text: str,
+    *,
+    max_chars: int = _CHAT_QUESTION_RUNTIME_MAX,
+) -> tuple[str, bool]:
+    """Bound a pasted chat prompt for retrieval/model runtime.
 
-    @field_validator("name")
-    @classmethod
-    def _check_attachment_name(cls, v: str) -> str:
-        v = _safe_chat_upload_filename(v or "archivo")
-        return v or "archivo"
-
-    @field_validator("path", "vault_path")
-    @classmethod
-    def _check_attachment_path(cls, v: str | None) -> str | None:
-        if v is None or v == "":
-            return None
-        v = v.strip()
-        if "\x00" in v:
-            raise ValueError("invalid attachment path")
-        if len(v) > 600:
-            raise ValueError("attachment path too long")
-        return v
+    Keep the beginning and end because pasted reports usually put the ask
+    up front and operational details or conclusions near the end. The full
+    raw payload is accepted up to ``_CHAT_QUESTION_MAX`` only as transport;
+    it is not useful to push hundreds of thousands of chars through a
+    4096-token chat context.
+    """
+    if len(text) <= max_chars:
+        return text, False
+    marker = (
+        "\n\n[... contenido pegado muy largo: se omitieron "
+        f"{len(text) - max_chars:,} caracteres del medio ...]\n\n"
+    )
+    budget = max(1, max_chars - len(marker))
+    head = max(1, int(budget * 0.65))
+    tail = max(1, budget - head)
+    return text[:head].rstrip() + marker + text[-tail:].lstrip(), True
 
 
-class ChatRequest(BaseModel):
-    question: str
-    session_id: str | None = None
-    # None → vault activo; "all" → todos los registrados; "name" → ese puntual.
-    vault_scope: str | None = None
-    # Regeneration: pass a previous turn_id to re-ask that same question.
-    # The handler resolves `q` from rag_queries (by turn_id in extra_json)
-    # and uses it as the effective question, so the client can call /redo
-    # without having kept the question text locally. `hint` is an optional
-    # soft-steer that gets concatenated ("la pregunta — enfocá: <hint>")
-    # to redirect the answer without reformulating from scratch.
-    # When redo_turn_id is set, `question` becomes a placeholder — the
-    # client should still send "(redo)" or similar non-empty string to
-    # satisfy the non-empty validator.
-    redo_turn_id: str | None = Field(None, max_length=80)
-    hint: str | None = Field(None, max_length=500)
-    # User-facing mode selector: "work" | "auto" | "fast" | "deep".
-    # Gates `_fast_path` in the streaming block. None → treated as "auto"
-    # (adaptive routing from `retrieve()`). Invalid strings → silent
-    # fallback to "auto" (validated in the endpoint body, NOT in a
-    # field_validator — we explicitly tolerate garbage here so that old
-    # curl scripts, MCP clients, and PWA builds that pre-date the UI
-    # control keep working without 400s). "work" uses the full local model
-    # and disables note-only low-confidence refusal gates. The legacy
-    # /api/chat/model
-    # endpoints remain as a developer escape hatch for forcing a specific
-    # chat model tag.
-    mode: str | None = Field(None, max_length=16)
+def _normalize_chat_mode(raw: str | None) -> tuple[str, str]:
+    mode_origin = "request" if raw is not None else "default"
+    raw_mode = (raw or "").strip().lower()
+    mode = raw_mode if raw_mode in _VALID_CHAT_MODES else "auto"
+    return mode, mode_origin
 
-    # ── Feature H: scope a folder / nota específica ──────────────────────
-    # Limita el retrieval a un subset del vault. Mutuamente complementario
-    # con `vault_scope` (que elige cuál vault). `folder` es un prefix
-    # vault-relative (ej. "01-Projects/Coaching"). `path` es UNA nota
-    # vault-relative específica (ej. "01-Projects/Coaching/Autoridad.md").
-    # Si vienen los dos, `path` gana (más específico). Pasarlos vacíos /
-    # None → comportamiento legacy (vault entero). Ver sección "Feature H"
-    # en CLAUDE.md y tests/test_chat_scoped.py.
-    folder: str | None = Field(None, max_length=500)
-    path: str | None = Field(None, max_length=512)
-    # ── /Feature H ───────────────────────────────────────────────────────
 
-    # ── Force flag (2026-05-10) ──────────────────────────────────────────
-    # Cuando `force=True`, deshabilita el `low_conf_bypass` — el LLM
-    # contesta aunque la confianza del retrieve esté por debajo del
-    # threshold (`CONFIDENCE_RERANK_MIN=0.015`). Equivalente al
-    # `--force` del CLI. Lo usa `/atlas` para "preguntale al vault"
-    # donde el user prefiere una respuesta tentativa (aún si débil) a
-    # un canned "No tengo info sobre X" — el atlas le sirve además
-    # las fuentes en el grafo, así que el user evalúa relevancia
-    # visualmente. NO afecta el retrieve mismo, solo el gate del LLM.
-    force: bool = False
-    # Adjuntos subidos desde el composer. El upload endpoint ya extrajo texto
-    # y lo recortó; acá lo tratamos como DATA del usuario para el próximo turn.
-    attachments: list[ChatAttachment] = Field(default_factory=list, max_length=6)
-
-    @field_validator("question")
-    @classmethod
-    def _check_question(cls, v: str) -> str:
-        if not v or not v.strip():
-            raise ValueError("question must be non-empty")
-        if len(v) > _CHAT_QUESTION_MAX:
-            raise ValueError(f"question too long (>{_CHAT_QUESTION_MAX} chars)")
-        return v
-
-    @field_validator("redo_turn_id")
-    @classmethod
-    def _check_redo_turn_id(cls, v: str | None) -> str | None:
-        if v is None or v == "":
-            return None
-        if not _TURN_ID_RE.match(v):
-            raise ValueError("invalid redo_turn_id format")
-        return v
-
-    @field_validator("session_id")
-    @classmethod
-    def _check_session(cls, v: str | None) -> str | None:
-        if v is None or v == "":
-            return None
-        if not _CHAT_SESSION_RE.match(v):
-            raise ValueError("invalid session_id format")
-        return v
-
-    @field_validator("vault_scope")
-    @classmethod
-    def _check_vault_scope(cls, v: str | None) -> str | None:
-        if v is None or v == "":
-            return None
-        # Bug Hunt 2026-05-08 H-4: regex previo permitía `/` y `.`
-        # (`^[A-Za-z0-9_./\-]{1,200}$`), traversal-ready si algún caller
-        # futuro usaba el valor como path. Vault names registrados son
-        # slugs simples (`home`, `work-vault`, `team_a`); restringir a
-        # `[A-Za-z0-9_-]` cierra el vector sin romper setups reales.
-        if len(v) > 80 or not re.match(r"^[A-Za-z0-9_\-]{1,80}$", v):
-            raise ValueError("invalid vault_scope format")
-        return v
-
-    # ── Feature H: validators de folder/path ─────────────────────────────
-    @field_validator("folder")
-    @classmethod
-    def _check_folder(cls, v: str | None) -> str | None:
-        if v is None or v == "":
-            return None
-        v = v.strip().strip("/")
-        if not v:
-            return None
-        # Vault-relative; rechazar URI schemes y traversal. No exigimos que
-        # el folder exista — el handler hace la validación final cuando
-        # consulta el corpus (un folder vacío post-filter degrada a "no
-        # results", no a 400).
-        if "://" in v or v.startswith("/") or ".." in v.split("/"):
-            raise ValueError("folder must be vault-relative (no URI/traversal)")
-        return v
-
-    @field_validator("path")
-    @classmethod
-    def _check_path(cls, v: str | None) -> str | None:
-        if v is None or v == "":
-            return None
-        v = v.strip()
-        if not v:
-            return None
-        if "://" in v or v.startswith("/") or ".." in v.split("/"):
-            raise ValueError("path must be vault-relative (no URI/traversal)")
-        # Aceptamos cualquier extensión — el filtro post-retrieve es exact-
-        # match contra `meta.file`, así que un path sin .md simplemente no
-        # matchea nada y degrada a no-hits (mensaje claro al user).
-        return v
-    # ── /Feature H ───────────────────────────────────────────────────────
+def _detect_chat_propose_intent(question: str, mode: str) -> bool:
+    if not _detect_propose_intent(question):
+        return False
+    if mode == "work" and not _WORK_EXPLICIT_CREATE_RE.match(question):
+        return False
+    return True
 
 
 # Shared rate limiter infrastructure extracted to web.rate_limit (modular split 2026-05-15).
@@ -1019,17 +947,6 @@ _CHAT_UPLOAD_DIR = Path.home() / ".local" / "share" / "obsidian-rag" / "chat-upl
 # reminder, ahorrale el click al user".
 _CHAT_UPLOAD_AUTOCREATE_CONFIDENCE = 0.85
 _CHAT_UPLOAD_FILE_MAX_BYTES = 25 * 1024 * 1024
-_CHAT_UPLOAD_TEXT_MAX_CHARS = 12_000
-_CHAT_UPLOAD_TEXT_SUFFIXES = {
-    ".md", ".markdown", ".txt", ".log", ".csv", ".tsv", ".json", ".jsonl",
-    ".yaml", ".yml", ".xml", ".html", ".htm", ".css", ".js", ".jsx",
-    ".ts", ".tsx", ".py", ".sh", ".bash", ".zsh", ".sql", ".tf",
-    ".tfvars", ".hcl", ".ini", ".cfg", ".conf", ".env",
-}
-_CHAT_UPLOAD_DOC_SUFFIXES = {".pdf", ".docx", ".xlsx"}
-_CHAT_UPLOAD_IMAGE_SUFFIXES = {
-    ".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp", ".gif",
-}
 
 # Audit 2026-04-25 finding R2-OCR #2: si la fecha detectada está más
 # vieja que este umbral (días en el pasado), bajamos el confidence
@@ -1049,252 +966,17 @@ try:
 except (TypeError, ValueError):
     _CHAT_UPLOAD_HISTORICAL_DAYS = _CHAT_UPLOAD_HISTORICAL_DAYS_DEFAULT
 
-# Mapeo suffix → format param de PIL.save. HEIC/HEIF se agregan
-# condicionalmente si `pillow-heif` está instalado (audit 2026-04-25
-# R2-OCR #4 followup) y se mappean a "JPEG" porque PIL puede *leer* HEIC
-# con pillow-heif pero el writer HEIF requiere libheif con el encoder
-# habilitado, que no siempre está. Re-encodear a JPEG es lossy pero
-# ganamos privacidad (EXIF/GPS strippeado) + compatibilidad universal
-# (todo browser y Obsidian renderean JPEG sin plugins).
-#
-# Trade-off deliberado: el archivo en el vault termina con extensión
-# `.heic` PERO el contenido es JPEG. Es confuso pero el alternativo
-# (cambiar la extensión) requiere romper el contrato `(bytes, suffix)
-# → bytes` del sanitizer. Obsidian/Safari renderean igual porque
-# detectan por magic bytes, no por extensión. Si en el futuro queremos
-# extensión consistente, el caller (`upload_chat_image`) debería
-# decidir el suffix final basado en `_HEIC_AVAILABLE`.
-_SANITIZABLE_FORMATS: dict[str, str] = {
-    ".jpg": "JPEG",
-    ".jpeg": "JPEG",
-    ".png": "PNG",
-    ".webp": "WEBP",
-    ".gif": "GIF",
-}
-if _HEIC_AVAILABLE:
-    _SANITIZABLE_FORMATS[".heic"] = "JPEG"
-    _SANITIZABLE_FORMATS[".heif"] = "JPEG"
+# Keep this module-level copy patchable by tests that monkeypatch
+# ``web.server._SANITIZABLE_FORMATS``.
+_SANITIZABLE_FORMATS: dict[str, str] = dict(_CHAT_UPLOAD_SANITIZABLE_FORMATS)
 
 
 def _sanitize_image_exif(raw_bytes: bytes, suffix: str) -> bytes:
-    """Re-encode la imagen sin EXIF/GPS/metadata para evitar fugas de
-    privacidad cuando se copia al vault iCloud.
-
-    PIL al cargar con ``Image.open()`` lee el EXIF en ``img.info``;
-    cuando re-encodeamos creando una nueva imagen con ``putdata()`` y
-    saving sin pasar ``exif=...`` explícito, los metadatos no
-    sobreviven al roundtrip.
-
-    Args:
-      raw_bytes: bytes de la imagen original (del upload).
-      suffix: extensión con punto (ej. ``.jpg``). Determina el formato
-        de re-encoding.
-
-    Returns:
-      Bytes sanitizados si el formato es soportado, o ``raw_bytes`` sin
-      cambios si:
-
-      - El suffix no está en ``_SANITIZABLE_FORMATS`` (HEIC/HEIF solo si
-        pillow-heif está instalado; ver ``_HEIC_AVAILABLE``)
-      - PIL falla al cargar la imagen (corrupta, formato exótico)
-      - Hay cualquier otra excepción durante el re-encoding
-
-      Falla suave porque la sanitización es nice-to-have — preferimos
-      copiar la foto con EXIF a NO copiarla. Si el user pierde
-      privacidad, al menos no pierde la nota.
-    """
-    fmt = _SANITIZABLE_FORMATS.get(suffix.lower())
-    if fmt is None:
-        return raw_bytes
-    try:
-        from PIL import Image  # noqa: PLC0415
-        import io  # noqa: PLC0415
-
-        with Image.open(io.BytesIO(raw_bytes)) as img:
-            img.load()  # force decode (PIL is lazy)
-            # Crear imagen NUEVA con los mismos píxeles raw pero sin
-            # heredar el `info` dict del source (que contiene EXIF,
-            # ICC, XMP, etc.). `tobytes()` + `frombytes()` es la API
-            # estable que no usa el `getdata()` deprecated en Pillow 14.
-            stripped = Image.frombytes(img.mode, img.size, img.tobytes())
-            buf = io.BytesIO()
-            stripped.save(buf, format=fmt)
-            return buf.getvalue()
-    except Exception:
-        # Cualquier error → fallback al raw original. Privacidad degradada
-        # pero el upload no se rompe.
-        return raw_bytes
-
-
-def _safe_chat_upload_filename(name: str, fallback: str = "archivo") -> str:
-    base = Path(name or fallback).name.strip() or fallback
-    base = re.sub(r"[\x00-\x1f/\\:]+", "-", base)
-    base = re.sub(r"\s+", " ", base).strip(" .")
-    return base[:160] or fallback
-
-
-def _truncate_chat_upload_text(text: str) -> tuple[str, bool]:
-    text = (text or "").replace("\x00", "").strip()
-    if len(text) <= _CHAT_UPLOAD_TEXT_MAX_CHARS:
-        return text, False
-    marker = (
-        "\n\n[archivo truncado para el chat: se incluyeron los primeros "
-        f"{_CHAT_UPLOAD_TEXT_MAX_CHARS} caracteres]"
+    return _chat_upload_sanitize_image_exif(
+        raw_bytes,
+        suffix,
+        sanitizable_formats=_SANITIZABLE_FORMATS,
     )
-    keep = max(0, _CHAT_UPLOAD_TEXT_MAX_CHARS - len(marker))
-    return text[:keep].rstrip() + marker, True
-
-
-def _decode_chat_upload_text(raw: bytes) -> str:
-    for enc in ("utf-8-sig", "utf-8", "utf-16", "latin-1"):
-        try:
-            return raw.decode(enc)
-        except UnicodeDecodeError:
-            continue
-    return raw.decode("utf-8", errors="replace")
-
-
-def _looks_like_binary(raw: bytes) -> bool:
-    if not raw:
-        return False
-    sample = raw[:4096]
-    if b"\x00" in sample:
-        return True
-    control = sum(1 for b in sample if b < 32 and b not in (9, 10, 13))
-    return control / max(1, len(sample)) > 0.08
-
-
-def _extract_pdf_text_for_chat(path: Path) -> str:
-    try:
-        import pypdf  # noqa: PLC0415
-    except ImportError:
-        return ""
-    try:
-        reader = pypdf.PdfReader(path)
-        parts: list[str] = []
-        for page in reader.pages[:25]:
-            txt = page.extract_text() or ""
-            if txt.strip():
-                parts.append(txt.strip())
-            if sum(len(p) for p in parts) >= _CHAT_UPLOAD_TEXT_MAX_CHARS:
-                break
-        return "\n\n".join(parts)
-    except Exception:
-        return ""
-
-
-def _extract_docx_text_for_chat(path: Path) -> str:
-    try:
-        with zipfile.ZipFile(path) as zf:
-            raw_xml = zf.read("word/document.xml")
-    except (KeyError, zipfile.BadZipFile, OSError):
-        return ""
-    try:
-        root = _ET.fromstring(raw_xml)
-    except _ET.ParseError:
-        return ""
-    ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
-    paras: list[str] = []
-    for para in root.iter(f"{ns}p"):
-        bits: list[str] = []
-        for node in para.iter():
-            if node.tag == f"{ns}t" and node.text:
-                bits.append(node.text)
-            elif node.tag == f"{ns}tab":
-                bits.append("\t")
-            elif node.tag in {f"{ns}br", f"{ns}cr"}:
-                bits.append("\n")
-        line = "".join(bits).strip()
-        if line:
-            paras.append(line)
-        if sum(len(p) for p in paras) >= _CHAT_UPLOAD_TEXT_MAX_CHARS:
-            break
-    return "\n".join(paras)
-
-
-def _extract_xlsx_text_for_chat(path: Path) -> str:
-    try:
-        import openpyxl  # noqa: PLC0415
-    except ImportError:
-        return ""
-    try:
-        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-    except Exception:
-        return ""
-    parts: list[str] = []
-    try:
-        for sheet_name in wb.sheetnames[:8]:
-            ws = wb[sheet_name]
-            parts.append(f"## Hoja: {sheet_name}")
-            for row in ws.iter_rows(values_only=True):
-                vals = ["" if cell is None else str(cell) for cell in row]
-                line = "\t".join(vals).strip()
-                if line:
-                    parts.append(line)
-                if sum(len(p) for p in parts) >= _CHAT_UPLOAD_TEXT_MAX_CHARS:
-                    return "\n".join(parts)
-    finally:
-        try:
-            wb.close()
-        except Exception:
-            pass
-    return "\n".join(parts)
-
-
-def _copy_chat_upload_to_vault(raw: bytes, filename: str, file_hash: str) -> str | None:
-    try:
-        import rag as _rag  # noqa: PLC0415
-        from datetime import datetime as _dt  # noqa: PLC0415
-        vault_root = _rag.VAULT_PATH
-        if not vault_root.is_dir():
-            return None
-        target_dir = vault_root / "00-Inbox" / "chat-uploads"
-        target_dir.mkdir(parents=True, exist_ok=True)
-        safe_name = _safe_chat_upload_filename(filename)
-        ts = _dt.now().strftime("%Y%m%d-%H%M%S")
-        target = target_dir / f"{ts}-{file_hash[:8]}-{safe_name}"
-        existing = list(target_dir.glob(f"*-{file_hash[:8]}-{safe_name}"))
-        if existing:
-            return str(existing[0].relative_to(vault_root))
-        target.write_bytes(raw)
-        return str(target.relative_to(vault_root))
-    except OSError:
-        return None
-
-
-async def _read_upload_capped(file: UploadFile, max_bytes: int) -> bytes:
-    raw = await file.read(max_bytes + 1)
-    if not raw:
-        raise HTTPException(status_code=400, detail="archivo vacío")
-    if len(raw) > max_bytes:
-        raise HTTPException(
-            status_code=413,
-            detail=f"archivo muy grande (>{max_bytes} bytes)",
-        )
-    return raw
-
-
-def _extract_chat_upload_text(path: Path, raw: bytes, content_type: str) -> str:
-    suffix = path.suffix.lower()
-    ctype = (content_type or "").lower()
-    if suffix in _CHAT_UPLOAD_TEXT_SUFFIXES or ctype.startswith("text/") or ctype in {
-        "application/json",
-        "application/xml",
-        "application/x-yaml",
-        "application/yaml",
-    }:
-        if _looks_like_binary(raw):
-            return ""
-        return _decode_chat_upload_text(raw)
-    if suffix == ".pdf":
-        return _extract_pdf_text_for_chat(path)
-    if suffix == ".docx":
-        return _extract_docx_text_for_chat(path)
-    if suffix == ".xlsx":
-        return _extract_xlsx_text_for_chat(path)
-    if not _looks_like_binary(raw):
-        return _decode_chat_upload_text(raw)
-    return ""
 
 
 @app.post("/api/chat/upload-file")
@@ -11392,16 +11074,28 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         question = req.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="empty question")
+    _raw_question_len = len(question)
+    question, _question_compacted = _compact_long_chat_question(question)
+    if _question_compacted:
+        print(
+            f"[chat-question-compact] raw_chars={_raw_question_len} "
+            f"runtime_chars={len(question)} session={req.session_id or 'new'}",
+            flush=True,
+        )
     _chat_attachments = [att for att in (req.attachments or []) if att.name or att.text or att.path]
     _has_chat_attachments = bool(_chat_attachments)
     _attachment_context = _chat_attachment_prompt_block(_chat_attachments)
     _attachment_sources = _chat_attachment_sources(_chat_attachments)
+    mode, mode_origin = _normalize_chat_mode(req.mode)
+    _force_answer = bool(getattr(req, "force", False)) or mode == "work"
 
     # Detect create-intent EARLY. When true we skip emitting `sources`
     # (vault citations are noise when the user is creating something new,
     # not asking about existing notes) and we bypass the read-intent
-    # pre-router further down.
-    is_propose_intent = _detect_propose_intent(question)
+    # pre-router further down. In work/laboral mode the chat surface is
+    # free-form, so pasted reports with dates only enter the create flow
+    # when the user starts with an explicit create command.
+    is_propose_intent = _detect_chat_propose_intent(question, mode)
 
     # 2026-04-28 wave-8: track de tools y location del turno previo.
     # Se inicializan acá para que estén disponibles en todas las paths
@@ -12948,14 +12642,6 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             if _n == "weather" and isinstance(_a, dict) and _a.get("location"):
                 _last_weather_location = _a["location"]
                 break
-
-        mode_origin = "request" if req.mode is not None else "default"
-        _raw_mode = (req.mode or "").strip().lower()
-        if _raw_mode in {"work", "auto", "fast", "deep"}:
-            mode = _raw_mode
-        else:
-            mode = "auto"
-        _force_answer = bool(getattr(req, "force", False)) or mode == "work"
 
         if not result["docs"]:
             # Propose-intent turns don't need vault context — the tool

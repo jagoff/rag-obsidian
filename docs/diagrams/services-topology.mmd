@@ -1,50 +1,70 @@
 graph TD
-    subgraph User["🧑 Usuario"]
-        CLI["rag CLI<br/>(terminal)"]
-        CC["Claude Code<br/>(MCP client)"]
-        WA["WhatsApp app<br/>(self-chat RagNet)"]
+    subgraph User["Usuario"]
+        Browser["Browser / PWA"]
+        CLI["Terminal<br/>rag CLI"]
+        Claude["Claude / MCP client"]
+        WhatsApp["WhatsApp app"]
     end
 
-    subgraph Launchd["launchd services (com.fer.*)"]
-        Watch["obsidian-rag-watch<br/>RunAtLoad + KeepAlive"]
-        Digest["obsidian-rag-digest<br/>domingo 22:00"]
-        Morning["obsidian-rag-morning<br/>Lun-Vie 7:00"]
-        Bridge["whatsapp-bridge<br/>localhost:8080 + SQLite"]
-        Listener["whatsapp-listener<br/>Bun/TS polls SQLite"]
-        N8N["n8n<br/>localhost:5678"]
-    end
-
-    subgraph Core["Core (local, free)"]
-        Rag["rag.py (Python 3.13)<br/>→ ~/.local/bin/rag"]
+    subgraph Processes["Procesos locales"]
+        Web["web.server<br/>FastAPI + SSE"]
+        Rag["rag package<br/>CLI + core APIs"]
         MCP["obsidian-rag-mcp<br/>stdio"]
-        Ollama["Ollama localhost:11434<br/>bge-m3 · qwen2.5:3b · command-r · phi4"]
-        Whisper["whisper-cli<br/>~/whisper-models/ggml-small.bin"]
-        Say["macOS say -v Mónica<br/>(TTS)"]
+        Supervisor["rag.runtime.supervisor"]
     end
 
-    subgraph Storage["Storage"]
-        Vault["Obsidian vault<br/>(iCloud)"]
-        Local["~/.local/share/obsidian-rag/<br/>ragvec + jsonl + sessions"]
-        Config["~/.config/obsidian-rag/<br/>vaults.json"]
+    subgraph Launchd["launchd / background jobs"]
+        Watch["rag watch"]
+        Frequent["runtime jobs: frequent"]
+        Nightly["runtime jobs: nightly"]
+        Morning["morning brief"]
+        Bridge["whatsapp bridge<br/>localhost:8080"]
+        Listener["whatsapp listener<br/>Bun/TS + SQLite"]
     end
 
+    subgraph Logical["Servicios logicos dentro del repo"]
+        Gateway["Web Gateway<br/>routes · schemas · uploads"]
+        Retrieval["Chat/Retrieval<br/>intent · retrieve · rerank · postprocess"]
+        Indexer["Indexer<br/>chunking · embed · upsert"]
+        Integrations["Integrations ETL<br/>Gmail · Calendar · WA · Chrome · Drive"]
+        Telemetry["Telemetry/State<br/>SQLite + jsonl"]
+        Models["Local Model Runtime<br/>MLXBackend · reranker · NLI"]
+    end
+
+    subgraph Storage["Storage local"]
+        Vault["Obsidian vault<br/>iCloud local path"]
+        Ragvec[("ragvec.db<br/>sqlite-vec")]
+        State[("telemetry.db<br/>sessions/feedback/behavior")]
+        Config["~/.config/obsidian-rag<br/>vaults + tokens"]
+    end
+
+    Browser --> Web
     CLI --> Rag
-    CC --> MCP --> Rag
-
-    Watch --> Rag
-    Digest --> Rag
-    Morning --> Rag
-
-    Rag --> Ollama
-    Rag --> Vault
-    Rag --> Local
-    Rag --> Config
-
-    WA <--> Bridge
+    Claude --> MCP --> Rag
+    WhatsApp <--> Bridge
     Bridge --> Listener
-    Listener -->|voice transcript| Whisper
-    Listener -->|rag query / read / capture / followup / today| Rag
-    Listener -->|TTS reply via media_path| Say
+    Listener --> Rag
 
-    Rag -.->|"ambient POST /api/send"| Bridge
-    N8N -.->|opcional webhooks| Rag
+    Web --> Gateway
+    Gateway --> Retrieval
+    Rag --> Retrieval
+    Rag --> Indexer
+    Supervisor --> Frequent
+    Supervisor --> Nightly
+    Watch --> Indexer
+    Frequent --> Integrations
+    Nightly --> Integrations
+    Morning --> Retrieval
+
+    Retrieval --> Models
+    Retrieval --> Ragvec
+    Retrieval --> Telemetry
+    Indexer --> Models
+    Indexer --> Ragvec
+    Indexer --> Vault
+    Integrations --> Vault
+    Integrations --> Telemetry
+
+    Telemetry --> State
+    Telemetry --> Config
+    Gateway --> Vault

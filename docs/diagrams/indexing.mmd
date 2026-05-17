@@ -8,10 +8,10 @@ flowchart TD
     Bulk --> Hash
     Hash -->|igual| Skip[skip]
     Hash -->|distinto| ContrCheck{skip_contradict<br/>=False?}
-    ContrCheck -->|sí| Contr["find_contradictions_for_note<br/>(ollama: command-r)"] --> WriteFM["update<br/>frontmatter contradicts:<br/>+ jsonl log"]
+    ContrCheck -->|sí| Contr["find_contradictions_for_note<br/>Qwen3-30B judge"] --> WriteFM["update<br/>frontmatter contradicts:<br/>+ jsonl log"]
     ContrCheck -->|no, o reset| Chunks
     WriteFM --> Chunks[semantic_chunks<br/>150-800 chars]
-    Chunks --> EmbedC["embed<br/>(ollama: bge-m3)"]
+    Chunks --> EmbedC["embed<br/>qwen3-embedding"]
     EmbedC --> Upsert[upsert main collection]
     Upsert --> URLs[_index_urls<br/>extract + embed contexto]
     URLs --> URLUpsert[upsert urls collection]

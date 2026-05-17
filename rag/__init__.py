@@ -151,133 +151,36 @@ def _postprocess_options() -> dict:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# NLI grounding gate helpers (Improvement #1, Fase B — on-demand env reading)
+# Pipeline flags (adaptive routing, NLI gates, lookup fast-path)
 # ──────────────────────────────────────────────────────────────────────
-def _nli_grounding_enabled() -> bool:
-    return os.environ.get("RAG_NLI_GROUNDING", "").strip() not in ("", "0", "false", "no")
-
-
-def _nli_contradicts_threshold() -> float:
-    try:
-        return float(os.environ.get("RAG_NLI_CONTRADICTS_THRESHOLD", "0.7"))
-    except (ValueError, TypeError):
-        return 0.7
-
-
-def _nli_skip_intents() -> frozenset[str]:
-    intents_str = os.environ.get("RAG_NLI_SKIP_INTENTS", "count,list,recent,agenda")
-    return frozenset(s.strip() for s in intents_str.split(",") if s.strip())
-
-
-def _nli_max_claims() -> int:
-    try:
-        return int(os.environ.get("RAG_NLI_MAX_CLAIMS", "20"))
-    except (ValueError, TypeError):
-        return 20
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Adaptive pipeline routing (Improvement #3, Fase A — scaffolding no-op)
-# ──────────────────────────────────────────────────────────────────────
-# Per-intent dispatch: cuando RAG_ADAPTIVE_ROUTING=1 el pipeline puede
-# skipear stages (expand_queries en comparison/synthesis, citation-repair
-# en lookup fast-path) y ajustar rerank_pool / num_ctx / chat_model según
-# el intent clasificado. Default OFF = pipeline legacy bit-identical.
-# Ver docs/improvement-3-adaptive-routing-design.md.
-_LOOKUP_THRESHOLD = float(os.environ.get("RAG_LOOKUP_THRESHOLD", "0.6"))
-# `_LOOKUP_MODEL` queda como módulo-global mutable. Source of truth:
-#   1. `RAG_LOOKUP_MODEL` env var (override por-feature, gana siempre)
-#   2. `helper` tier del registry (`rag.models.get("helper")`)
-# El reload hook del tier `helper` (registrado en `rag._model_hooks`) muta
-# este atributo cuando hacés `rag model set helper X` — call sites internos
-# leen `_LOOKUP_MODEL` cada call (lookup en `globals()`), así propagan
-# automáticamente sin restart.
-_LOOKUP_MODEL = (
-    os.environ.get("RAG_LOOKUP_MODEL", "").strip()
-    or "qwen2.5:3b"  # placeholder; se sobreescribe abajo cuando models import-ea
-)
-# num_ctx para el fast-path lookup. Default 4096 tras medición 2026-04-22
-# que detectó refuses falsos con 2048: queries de alta confianza (top_score
-# 1.18) respondían "No tengo esa información" aunque el chunk relevante
-# estaba en el top-5 del rerank. Causa: system prompt + rules + 5 chunks
-# + graph neighbors frecuentemente superan los 2048 tokens, y qwen2.5:3b
-# ve un contexto truncado al primer chunk (típicamente el más corto, no el
-# más relevante). 4096 cabe el context típico sin truncation + qwen2.5:3b
-# todavía es ~2x más rápido que el modelo 7b full. Override via env.
-_LOOKUP_NUM_CTX = int(os.environ.get("RAG_LOOKUP_NUM_CTX", "4096"))
-
-# Per-intent rerank pool override. Synthesis/comparison necesitan más pool
-# porque tienen que cubrir ≥2 fuentes independientes en top-5 (SYSTEM_RULES
-# las obliga a cross-reference). Pool=15 global se midió óptimo en bench
-# 2026-04-21 para el mix completo, pero para synthesis/comparison colapsa
-# a 1 nota con múltiples chunks. Bump solo en esos intents.
-_RERANK_POOL_BY_INTENT: dict[str, int] = {
-    "comparison": int(os.environ.get("RAG_COMPARISON_POOL", "30")),
-    "synthesis": int(os.environ.get("RAG_SYNTHESIS_POOL", "30")),
-}
-
-# Intents donde expand_queries NO aporta (paraphrases del "X vs Y" meten
-# ruido lexical que empeora BM25 de los términos importantes). Precedente:
-# web/server.py ya hardcodea multi_query=False por esta razón.
-_EXPAND_SKIP_INTENTS: frozenset[str] = frozenset({"comparison", "synthesis"})
-
-# Intents donde graph expansion corre siempre (override GRAPH_EXPANSION_GATE).
-# Para cross-reference queries el 1-hop wikilink es la señal más importante
-# después del rerank — es donde aparece la nota "relacionada pero no del
-# mismo chunk" que synthesis necesita mencionar.
-_GRAPH_ALWAYS_INTENTS: frozenset[str] = frozenset({"comparison", "synthesis"})
-
-# Intents metadata-only que no necesitan reformulate_query (handlers devuelven
-# metadata directo sin LLM). Fase B skipea el helper call ~1-2s con history.
-_METADATA_ONLY_INTENTS: frozenset[str] = frozenset(
-    {"count", "list", "recent", "agenda", "entity_lookup"}
+from rag.pipeline_flags import (  # noqa: E402
+    EXPAND_SKIP_INTENTS as _EXPAND_SKIP_INTENTS,
+    GRAPH_ALWAYS_INTENTS as _GRAPH_ALWAYS_INTENTS,
+    METADATA_ONLY_INTENTS as _METADATA_ONLY_INTENTS,
+    adaptive_routing as _adaptive_routing,
+    entity_lookup_enabled as _entity_lookup_enabled,
+    lookup_model_placeholder as _lookup_model_placeholder,
+    lookup_num_ctx as _lookup_num_ctx,
+    lookup_threshold as _lookup_threshold,
+    nli_contradicts_threshold as _nli_contradicts_threshold,
+    nli_grounding_enabled as _nli_grounding_enabled,
+    nli_max_claims as _nli_max_claims,
+    nli_skip_intents as _nli_skip_intents,
+    rerank_pool_by_intent as _rerank_pool_by_intent,
+    should_skip_reformulate as _pipeline_should_skip_reformulate,
 )
 
-
-def _adaptive_routing() -> bool:
-    """True si adaptive routing está habilitado (default ON desde 2026-04-22).
-
-    Leído on demand (no cacheado) para que tests puedan monkey-patch
-    os.environ sin reload del módulo. Micro-costo de os.environ.get en el
-    hot path es negligible (~1μs).
-
-    **Default flip (2026-04-22)**: la Fase C está completa desde el commit
-    `89ccc0e` y CLAUDE.md documenta "bit-idéntico en eval ON vs OFF".  El
-    bloqueante histórico era no poder medir el efecto real — pre-fix el
-    98.4% de las queries tenía intent=NULL en `rag_queries.extra_json`.
-    El commit `cfac737` pobló esa columna para `cmd=web` y `cmd=chat`, así
-    que ya hay data para validar la ganancia (~1-2s en intents metadata-
-    only: count/list/recent/agenda/entity_lookup) sin adivinar.
-
-    Rollback: `export RAG_ADAPTIVE_ROUTING=0` → pipeline legacy bit-idéntico.
-    """
-    val = os.environ.get("RAG_ADAPTIVE_ROUTING", "").strip().lower()
-    # Default ON: empty / unset / "1" / "true" / "yes" → True.
-    # Explicit OFF: "0" / "false" / "no" → False.
-    return val not in ("0", "false", "no")
+# Keep the historical rag.* private names as the compatibility surface. Values
+# are recomputed on rag module reload, so env-override tests still exercise the
+# same contract as before the split.
+_LOOKUP_THRESHOLD = _lookup_threshold()
+_LOOKUP_MODEL = _lookup_model_placeholder()
+_LOOKUP_NUM_CTX = _lookup_num_ctx()
+_RERANK_POOL_BY_INTENT: dict[str, int] = _rerank_pool_by_intent()
 
 
 def _should_skip_reformulate(intent: str) -> bool:
-    """Fase B: cuando adaptive routing ON, metadata-only intents saltean reformulate."""
-    if not _adaptive_routing():
-        return False
-    return intent in _METADATA_ONLY_INTENTS
-
-
-def _entity_lookup_enabled() -> bool:
-    """True cuando RAG_ENTITY_LOOKUP no está seteada a "0"/"false"/"no".
-
-    **Default ON tras 2026-04-21** — backfill de entidades corrido sobre el
-    corpus (2022 entities / 6520 mentions / 71% coverage). Handler tiene
-    fall-through a semantic cuando la tabla está vacía o la entity no
-    resuelve → no hay riesgo de regresión; el peor caso es +1 SQL query
-    (~10ms) antes de caer al pipeline legacy.
-
-    Para volver al comportamiento legacy (100% semantic, sin dispatch de
-    `handle_entity_lookup`): `export RAG_ENTITY_LOOKUP=0`.
-    """
-    val = os.environ.get("RAG_ENTITY_LOOKUP", "").strip().lower()
-    return val not in ("0", "false", "no")
+    return _pipeline_should_skip_reformulate(intent, _METADATA_ONLY_INTENTS)
 
 
 # Multi-vault: `OBSIDIAN_RAG_VAULT` env var overrides the default iCloud vault.

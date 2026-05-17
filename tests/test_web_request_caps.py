@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
+from fastapi.testclient import TestClient
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -24,6 +25,7 @@ sys.path.insert(0, str(ROOT))
 _web_server = pytest.importorskip("web.server")
 FeedbackRequest = _web_server.FeedbackRequest
 ChatRequest = _web_server.ChatRequest
+app = _web_server.app
 
 
 # ── FeedbackRequest caps ──────────────────────────────────────────────────────
@@ -124,25 +126,71 @@ def test_feedback_accepts_corrective_path_at_cap():
 
 
 def test_chat_rejects_oversized_question():
-    """ChatRequest.question cap raised from 8000 to 16000 on 2026-04-20
-    (users sometimes paste long doc excerpts into chat). Test uses
-    16001 to cross the new cap — bump here AND in web/server.py's
+    """ChatRequest.question cap raised from 64000 to 512000 on 2026-05-17.
+
+    Large work-mode pastes are compacted inside the handler before retrieval
+    and model calls. Test uses 512001 to cross the transport cap — bump
+    here AND in web/server.py's
     `_CHAT_QUESTION_MAX` if you raise it again.
     Implemented via a field_validator, so Pydantic error type is
     'value_error' (not 'string_too_long' like the Field-based caps)."""
     with pytest.raises(ValidationError) as exc_info:
-        ChatRequest(question="x" * 16001)
+        ChatRequest(question="x" * 512001)
     # field_validator raises ValueError → Pydantic type is "value_error"
     # (not "string_too_long" like the Field-based caps above).
     assert "too long" in str(exc_info.value).lower()
 
 
 def test_chat_accepts_question_at_cap():
-    req = ChatRequest(question="x" * 16000)
-    assert len(req.question) == 16000
+    req = ChatRequest(question="x" * 512000)
+    assert len(req.question) == 512000
+
+
+def test_chat_accepts_large_paste_above_runtime_budget():
+    req = ChatRequest(question="x" * 100000)
+    assert len(req.question) == 100000
+
+
+def test_compact_long_chat_question_keeps_head_and_tail():
+    text = "A" * 40000 + "MIDDLE" + "Z" * 40000
+    compacted, changed = _web_server._compact_long_chat_question(
+        text, max_chars=1000,
+    )
+    assert changed is True
+    assert len(compacted) <= 1000
+    assert compacted.startswith("A" * 100)
+    assert compacted.endswith("Z" * 100)
+    assert "contenido pegado muy largo" in compacted
+
+
+def test_api_chat_oversized_question_does_not_echo_input():
+    resp = TestClient(app).post("/api/chat", json={"question": "x" * 512001})
+    assert resp.status_code == 422
+    body = resp.text
+    assert "question too long (>512000 chars)" in body
+    assert len(body) < 1000
+    assert "x" * 100 not in body
 
 
 def test_chat_rejects_empty_question():
     """Empty question is rejected by field_validator."""
     with pytest.raises(ValidationError):
         ChatRequest(question="")
+
+
+@pytest.mark.parametrize(
+    "bad_session_id",
+    [
+        "web:" + ("x" * 120),
+        "web:bad/path",
+        "web:bad space",
+    ],
+)
+def test_chat_invalid_session_id_degrades_to_new_session(bad_session_id):
+    """Stale browser sessionStorage should not make /api/chat return 422.
+
+    The handler will mint a fresh ``web:<uuid>`` when the parsed value is
+    None; the lower session storage layer still validates before disk I/O.
+    """
+    req = ChatRequest(question="hola", session_id=bad_session_id)
+    assert req.session_id is None

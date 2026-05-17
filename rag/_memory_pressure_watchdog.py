@@ -422,15 +422,16 @@ def _memory_pressure_watchdog_loop(threshold: float, interval: int) -> None:
                     actions["swap_gb"] = round(swap_gb, 2)
                 actions["trigger_pct"] = trigger_pct
                 actions["trigger_swap"] = trigger_swap
-                print(
-                    f"[memory-watchdog] pressure={actions['pct_before']}% "
-                    f"threshold={threshold}% swap={actions.get('swap_gb')}GB "
-                    f"trigger_pct={trigger_pct} trigger_swap={trigger_swap} "
-                    f"chat_unloaded={actions['chat_unloaded']} "
-                    f"reranker_unloaded={actions['reranker_unloaded']} "
-                    f"pct_after={actions.get('pct_after_chat')}%",
-                    flush=True,
-                )
+                if os.environ.get("RAG_INDEX_VERBOSE") == "1" or os.environ.get("RAG_DEBUG") == "1":
+                    print(
+                        f"[memory-watchdog] pressure={actions['pct_before']}% "
+                        f"threshold={threshold}% swap={actions.get('swap_gb')}GB "
+                        f"trigger_pct={trigger_pct} trigger_swap={trigger_swap} "
+                        f"chat_unloaded={actions['chat_unloaded']} "
+                        f"reranker_unloaded={actions['reranker_unloaded']} "
+                        f"pct_after={actions.get('pct_after_chat')}%",
+                        flush=True,
+                    )
                 # Persistir el evento de presión en system_memory_metrics para
                 # forensics post-incident. Bug #3 audit 2026-04-27: la tabla
                 # existía en el DDL pero el watchdog nunca escribía a ella —
@@ -527,7 +528,7 @@ def _torch_mps_empty_cache() -> None:
         pass
 
 
-def start_memory_pressure_watchdog() -> bool:
+def start_memory_pressure_watchdog(*, quiet: bool = False) -> bool:
     """Arrancar el watchdog como daemon thread. Idempotente.
 
     Retorna True si se arrancó (o ya estaba arrancado), False si se
@@ -592,13 +593,13 @@ def start_memory_pressure_watchdog() -> bool:
         except ValueError:
             mps_interval = 60
         if mlx_only and "RAG_MPS_CACHE_DROP_INTERVAL" not in os.environ:
-            # Auto-skip cuando backend full-MLX y el operador no forzó override.
             mps_interval = 0
-            print(
-                "[mps-cache-drop] skipped (RAG_{EMBED,LLM}_BACKEND=mlx) — "
-                "evita conflict con Metal command buffers de MLX",
-                flush=True,
-            )
+            if not quiet:
+                print(
+                    "[mps-cache-drop] skipped (RAG_{EMBED,LLM}_BACKEND=mlx) — "
+                    "evita conflict con Metal command buffers de MLX",
+                    flush=True,
+                )
         if mps_interval > 0:
             t_mps = threading.Thread(
                 target=_periodic_mps_cache_drop_loop,
@@ -607,13 +608,15 @@ def start_memory_pressure_watchdog() -> bool:
                 daemon=True,
             )
             t_mps.start()
+            if not quiet:
+                print(
+                    f"[mps-cache-drop] started interval={mps_interval}s",
+                    flush=True,
+                )
+        _memory_watchdog_started = True
+        if not quiet:
             print(
-                f"[mps-cache-drop] started interval={mps_interval}s",
+                f"[memory-watchdog] started threshold={threshold}% interval={interval}s",
                 flush=True,
             )
-        _memory_watchdog_started = True
-        print(
-            f"[memory-watchdog] started threshold={threshold}% interval={interval}s",
-            flush=True,
-        )
         return True

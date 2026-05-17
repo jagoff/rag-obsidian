@@ -21561,7 +21561,7 @@ def _index_process_rss_gb() -> float | None:
         return None
 
 
-def _index_preflight_memory_guard(where: str) -> None:
+def _index_preflight_memory_guard(where: str, *, status=None) -> None:
     """Fail early when system memory is already unsafe for indexing."""
     try:
         try:
@@ -21617,11 +21617,8 @@ def _index_preflight_memory_guard(where: str) -> None:
         except (TypeError, ValueError):
             sleep_s = 0.0
         if sleep_s > 0:
-            console.print(
-                f"[yellow]memory pressure antes de {where}[/yellow] — "
-                f"pausa {sleep_s:.0f}s (pct={pct if pct is not None else 'n/a'}, "
-                f"swap={swap_gb if swap_gb is not None else 'n/a'}GB)"
-            )
+            if status is not None:
+                status.update(f"[cyan]Preparando index[/cyan] · swap alto ({swap_gb:.1f}GB) · pausa {sleep_s:.0f}s")
             time.sleep(sleep_s)
         pct_after = _system_memory_used_pct()
         swap_after = _system_swap_used_gb()
@@ -21662,14 +21659,10 @@ def _index_preflight_memory_guard(where: str) -> None:
             if os.environ.get("RAG_EMBED_BACKEND", "mlx").lower() not in ("pytorch", "torch", "cpu"):
                 os.environ["RAG_EMBED_BACKEND"] = "pytorch"
                 os.environ["OBSIDIAN_RAG_EMBED_DEVICE"] = "cpu"
-                # Reset singleton para que el próximo _get_local_embedder() cargue CPU.
                 global _local_embedder
                 _local_embedder = None
-                console.print(
-                    f"[yellow]memory pressure antes de {where}[/yellow] — "
-                    f"fallback a embedder CPU (swap={swap_after:.1f}GB). "
-                    f"Más lento pero sin GPU."
-                )
+                if status is not None:
+                    status.update(f"[cyan]Preparando index[/cyan] · CPU fallback (swap={swap_after:.1f}GB)")
     except RuntimeError:
         raise
     except Exception as exc:
@@ -21688,15 +21681,7 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
         safe_defaults = _index_full_safe_defaults()
     elif safe_enabled:
         safe_defaults = _index_safe_defaults()
-    with _temporary_env_defaults(safe_defaults) as _safe_applied:
-        if _safe_applied:
-            label = "--full safe mode" if full_safe_enabled else "index safe mode"
-            console.print(
-                f"[cyan]{label}[/cyan] — embeddings acotados, "
-                "memory guard activo y abort limpio bajo presión. "
-                "Opt-out: RAG_INDEX_SAFE=0"
-                + (" / RAG_INDEX_FULL_SAFE=0." if full_safe_enabled else ".")
-            )
+    with _temporary_env_defaults(safe_defaults):
         return _run_index_with_env(reset, no_contradict)
 
 
@@ -21711,7 +21696,7 @@ def _run_index_with_env(reset: bool, no_contradict: bool) -> dict:
     # tras ~14min run. Audit completo en
     # `99-AI/system/embedder-fix-2026-05-06/patch-proposal-watchdog.md`.
     try:
-        start_memory_pressure_watchdog()
+        start_memory_pressure_watchdog(quiet=True)
     except Exception as exc:
         _silent_log("run_index_watchdog_start", exc)
     # Override temporal `RAG_RERANKER_NEVER_UNLOAD=0` durante el indexer:
@@ -21785,7 +21770,8 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
         _index_batch_sleep_s = 0.0
 
     if _env_truthy("RAG_INDEX_PREFLIGHT_MEMORY_GUARD", default=False):
-        _index_preflight_memory_guard("index")
+        with console.status("[cyan]Preparando index...[/cyan]") as _st:
+            _index_preflight_memory_guard("index", status=_st)
 
     _invalidate_corpus_cache()
     # Audit 2026-04-26 (BUG #23): reset VLM caption budget per-run.
@@ -21846,7 +21832,8 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
     else:
         _run_cross_source_etls(VAULT_PATH)
         if _env_truthy("RAG_INDEX_PREFLIGHT_MEMORY_GUARD", default=False):
-            _index_preflight_memory_guard("post-etl")
+            with console.status("[cyan]Preparando index...[/cyan]") as _st:
+                _index_preflight_memory_guard("post-etl", status=_st)
 
     # Build file -> chunks_in_db map (once) so we can detect unchanged and
     # stale vault-local files. Do not filter by source: memo/cross-source ETLs
@@ -22076,12 +22063,6 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
             except Exception:
                 pass
             if _memory_pressure_sleep_s > 0:
-                console.print(
-                    "[yellow]memory pressure durante index[/yellow] — "
-                    f"pausa {_memory_pressure_sleep_s:.0f}s "
-                    f"(pct={pct if pct is not None else 'n/a'}, "
-                    f"swap={swap_gb if swap_gb is not None else 'n/a'}GB)"
-                )
                 time.sleep(_memory_pressure_sleep_s)
             pct_after = _system_memory_used_pct()
             swap_after = _system_swap_used_gb()
@@ -22114,11 +22095,7 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
                     os.environ["OBSIDIAN_RAG_EMBED_DEVICE"] = "cpu"
                     global _local_embedder
                     _local_embedder = None
-                    console.print(
-                        "[yellow]memory pressure durante index[/yellow] — "
-                        f"fallback a embedder CPU (swap={swap_after:.1f}GB). "
-                        "Más lento pero sin GPU."
-                    )
+                    console.print(f"[dim]↓ CPU fallback (swap={swap_after:.1f}GB)[/dim]")
         except Exception as exc:
             if isinstance(exc, RuntimeError) and str(exc).startswith("index abortado"):
                 raise
@@ -23882,11 +23859,14 @@ def query(
         col = get_db_for(vaults_resolved[0][1])
     else:
         vaults_resolved = resolve_vault_paths(None)
-        col = get_db_for(vaults_resolved[0][1]) if vaults_resolved else get_db()
+        if len(vaults_resolved) > 1:
+            col = get_db_for(vaults_resolved[0][1])
+        else:
+            col = get_db()
     _query_multi_scope = len(vaults_resolved) > 1
 
     def _query_scope_has_chunks() -> bool:
-        if not vaults_resolved:
+        if not vaults_resolved or not _query_multi_scope:
             return col.count() > 0
         for _name, _path in vaults_resolved:
             try:

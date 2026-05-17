@@ -143,8 +143,8 @@ def _deps() -> _RetrievalScoringDeps:
 # the "no cloud calls" invariant declared at the top of CLAUDE.md. Tracked
 # in docs/design-cross-source-corpus.md §10.6.
 VALID_SOURCES: frozenset[str] = frozenset(
-    {"vault", "memory", "calendar", "gmail", "whatsapp", "reminders", "messages",
-     "contacts", "calls", "safari", "drive", "pillow", "finances", "health"}
+    {"vault", "obsidian", "memory", "calendar", "gmail", "whatsapp", "reminders",
+     "messages", "contacts", "calls", "safari", "drive", "pillow", "finances", "health"}
 )
 # `pillow` (iOS sleep tracker) tiene un ingester propio en
 # `rag index --source pillow`. Sus datos viven en `rag_sleep_sessions`
@@ -157,6 +157,7 @@ VALID_SOURCES: frozenset[str] = frozenset(
 # non-vault gets softly down-weighted to reflect editorial trust.
 SOURCE_WEIGHTS: dict[str, float] = {
     "vault":     1.00,
+    "obsidian":  1.00,   # alias de vault
     "contacts":  0.95,   # editorial trust — user-curated metadata
     "calendar":  0.95,
     "memory":    0.90,   # memo facts/decisions/gotchas — curated by the agent,
@@ -194,6 +195,7 @@ SOURCE_WEIGHTS: dict[str, float] = {
 #   - whatsapp / messages / calls: conversational — a 2-month-old trace rarely matters
 SOURCE_RECENCY_HALFLIFE_DAYS: dict[str, float | None] = {
     "vault":     None,
+    "obsidian":  None,   # alias de vault
     "memory":    None,   # curated knowledge — no temporal decay
     "contacts":  None,
     "calendar":  None,
@@ -226,6 +228,7 @@ SOURCE_RECENCY_HALFLIFE_DAYS: dict[str, float | None] = {
 # (vault retention is manual).
 SOURCE_RETENTION_DAYS: dict[str, int | None] = {
     "vault":     None,
+    "obsidian":  None,   # alias de vault
     "memory":    None,   # never auto-purge memo entries
     "contacts":  None,
     "calendar":  None,

@@ -10,18 +10,10 @@ import yaml
 
 
 @pytest.fixture(autouse=True)
-def _isolate_db_path(tmp_path):
-    """Snap+restore manual de `rag.DB_PATH` per-test. El monkeypatch in-test
-    revierte en su propio teardown DESPUÉS del `_stabilize_rag_state` y deja
-    leak hacia la prod telemetry.db (1038 rows polluted detectadas 2026-04-29).
-    Pattern documentado en CLAUDE.md §"Test DB_PATH isolation per-file"."""
+def _isolate_db_path(tmp_path, monkeypatch):
+    """Redirect `rag.DB_PATH` to tmp for this file."""
     import rag as _rag
-    snap = _rag.DB_PATH
-    _rag.DB_PATH = tmp_path / "ragvec"
-    try:
-        yield
-    finally:
-        _rag.DB_PATH = snap
+    monkeypatch.setattr(_rag, "DB_PATH", tmp_path / "ragvec")
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -56,7 +48,8 @@ def test_queries_yaml_all_paths_exist_or_placeholder():
     CROSS_SOURCE_PREFIXES = ("gmail://", "whatsapp://", "calendar://",
                              "reminders://", "messages://",
                              "contacts://", "calls://", "safari://",
-                             "drive://", "pillow://")
+                             "drive://", "pillow://", "finances://",
+                             "health://")
 
     def _path_ok(p: str) -> bool:
         if p.startswith(CROSS_SOURCE_PREFIXES):
@@ -85,11 +78,10 @@ def test_queries_yaml_cross_source_prefixes_cover_all_valid_sources():
     CROSS_SOURCE_PREFIXES = {"gmail://", "whatsapp://", "calendar://",
                              "reminders://", "messages://",
                              "contacts://", "calls://", "safari://",
-                             "drive://", "pillow://"}
-    # vault + memory are file-backed (memory lives at
-    # 99-obsidian/99-AI/memory/<slug>.md inside the vault) →
-    # neither uses a `<source>://` prefix.
-    expected_whitelisted = rag.VALID_SOURCES - {"vault", "memory"}
+                             "drive://", "pillow://", "finances://",
+                             "health://"}
+    # vault + obsidian (alias) + memory are file-backed → no `<source>://` prefix.
+    expected_whitelisted = rag.VALID_SOURCES - {"vault", "obsidian", "memory"}
     prefix_sources = {p.rstrip("://") for p in CROSS_SOURCE_PREFIXES}
     assert prefix_sources == expected_whitelisted, (
         f"Whitelist drift: prefixes {prefix_sources} vs VALID_SOURCES-{{vault,memory}} "

@@ -28,7 +28,7 @@ def test_valid_sources_contains_expected():
     # check VALID_SOURCES en `_run_index_inner`) + finances + health.
     # Anchor test so future additions don't silently grow the surface.
     assert rag.VALID_SOURCES == frozenset(
-        {"vault", "memory", "calendar", "gmail", "whatsapp", "reminders",
+        {"vault", "obsidian", "memory", "calendar", "gmail", "whatsapp", "reminders",
          "messages", "contacts", "calls", "safari", "drive", "pillow",
          "finances", "health"}
     )

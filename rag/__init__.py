@@ -2109,6 +2109,7 @@ CONFIDENCE_RERANK_MIN = 0.35
 # conservative until the next `rag eval` calibration pass.
 CONFIDENCE_RERANK_MIN_PER_SOURCE: dict[str, float] = {
     "vault":     0.35,   # baseline (vault prose)
+    "obsidian":  0.35,   # alias de vault
     "memory":    0.35,   # memo prose: similar body length/trust to vault
     "whatsapp":  0.20,   # conversational short bodies
     "calendar":  0.20,   # structured short events
@@ -22862,7 +22863,7 @@ def _do_index(reset: bool, no_contradict: bool, source_opt: str | None,
                 f"Permitidas: {sorted(VALID_SOURCES - {'vault'})} (+ vault default)."
             )
             return
-        if src == "vault":
+        if src in ("vault", "obsidian"):
             # Treat as no-op flag — vault indexing has its own path.
             with vault_write_lock("index"):
                 _run_index(reset=reset, no_contradict=no_contradict)

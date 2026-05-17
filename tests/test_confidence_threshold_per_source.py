@@ -1,10 +1,9 @@
-"""Tests for per-source confidence threshold (Phase 1.f / W3.9).
+"""Tests for per-source confidence threshold.
 
-Vault stays at the global baseline (0.015). Short-body sources
-(whatsapp / calendar / reminders / messages / calls) calibrated to
-0.008 because bge-reranker-v2-m3 systematically scores their bodies
-in the 0.02-0.10 band (vs vault's 0.10+). gmail / drive intermediate
-at 0.010, contacts / safari at 0.012.
+Vault stays at the global MLX reranker baseline (0.35). Short-body sources
+(whatsapp / calendar / reminders / messages / calls) use a lower gate because
+their relevant matches score below prose chunks. Gmail / Drive / finances are
+intermediate; contacts / safari sit slightly higher.
 
 The tests lock in the helper contract + the calibrated values so
 future tuning passes go through the explicit data-driven channel
@@ -40,22 +39,25 @@ def test_threshold_helper_all_sources_covered():
 
 
 def test_threshold_calibrated_values_w3_9():
-    """Lock in the W3.9 (2026-04-29) calibrated values. Drift here is
+    """Lock in the current MLX-scale calibrated values. Drift here is
     intentional only when accompanied by an `rag eval` run + CLAUDE.md
     doc update — fail loud otherwise."""
     expected = {
-        "vault":     0.015,   # baseline (vault-prose calibrated)
-        "memory":    0.015,   # memo prose, reuse vault threshold
-        "whatsapp":  0.008,   # bodies cortos ~143 chars
-        "calendar":  0.008,   # eventos cortos
-        "reminders": 0.008,   # ítems cortos
-        "messages":  0.008,   # iMessage/SMS, mismo patrón que WA
-        "calls":     0.008,   # entries muy cortas
-        "gmail":     0.010,   # threads más largos, scores intermedios
-        "drive":     0.010,   # docs cortos en la fase actual del ingester
-        "contacts":  0.012,   # bodies medianos, signal alto
-        "safari":    0.012,   # title + body de bookmark/history
-        "pillow":    0.015,   # sleep tracker, baseline (no eval data yet)
+        "vault":     0.35,
+        "obsidian":  0.35,
+        "memory":    0.35,
+        "whatsapp":  0.20,
+        "calendar":  0.20,
+        "reminders": 0.20,
+        "messages":  0.20,
+        "calls":     0.20,
+        "gmail":     0.25,
+        "drive":     0.25,
+        "finances":  0.25,
+        "contacts":  0.28,
+        "safari":    0.28,
+        "pillow":    0.35,
+        "health":    0.35,
     }
     assert rag.CONFIDENCE_RERANK_MIN_PER_SOURCE == expected, (
         "Per-source thresholds drifted from W3.9 calibration. "

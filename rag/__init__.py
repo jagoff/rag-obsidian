@@ -7987,7 +7987,12 @@ def _load_corpus(col: SqliteVecCollection, *, hint_count: int | None = None) -> 
                 rebuild_event = threading.Event()
                 _corpus_rebuild_inflight[target] = rebuild_event
                 record_cache_event("corpus", misses=1)
-                data = col.get(include=["documents", "metadatas"])
+                try:
+                    data = col.get(include=["documents", "metadatas"])
+                except Exception:
+                    _corpus_rebuild_inflight.pop(target, None)
+                    rebuild_event.set()
+                    raise
                 wait_event = None
         if wait_event is None:
             break  # claimed: salir del loop con `data` ya fetcheada
@@ -17695,7 +17700,7 @@ def _append_pending_contradiction(rec: dict) -> None:
         _CONTRA_PENDING_PATH.parent.mkdir(parents=True, exist_ok=True)
         with _CONTRA_PENDING_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except (json.JSONDecodeError, TypeError) as exc:
+    except Exception as exc:
         _silent_log("contradiction_pending_write", exc)
 
 
@@ -17856,7 +17861,7 @@ def _retry_pending_contradictions(col: SqliteVecCollection) -> int:
                 continue
             _spawn_contradiction_worker(col, p, rec["text"], rec["doc_id_prefix"])
             retried += 1
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError, KeyError, OSError):
             remaining.append(line)
     try:
         if remaining:

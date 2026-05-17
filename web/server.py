@@ -3436,11 +3436,13 @@ def wa_media(message_id: str, jid: str) -> FileResponse:
         raise HTTPException(status_code=503, detail="bridge DB no disponible")
     try:
         con = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
-        row = con.execute(
-            "SELECT filename, media_type FROM messages WHERE id = ? AND chat_jid = ?",
-            (message_id, jid),
-        ).fetchone()
-        con.close()
+        try:
+            row = con.execute(
+                "SELECT filename, media_type FROM messages WHERE id = ? AND chat_jid = ?",
+                (message_id, jid),
+            ).fetchone()
+        finally:
+            con.close()
     except _sqlite3.Error:
         raise HTTPException(status_code=500, detail="error leyendo bridge DB")
     if not row or not row[0]:
@@ -3971,12 +3973,14 @@ def _wa_voice_transcript_impl(message_id: str, jid: str) -> dict:
         raise _HTTPException(status_code=503, detail="bridge DB no disponible")
     try:
         con = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
-        row = con.execute(
-            "SELECT filename, media_type, sender, timestamp "
-            "FROM messages WHERE id = ? AND chat_jid = ?",
-            (message_id, jid),
-        ).fetchone()
-        con.close()
+        try:
+            row = con.execute(
+                "SELECT filename, media_type, sender, timestamp "
+                "FROM messages WHERE id = ? AND chat_jid = ?",
+                (message_id, jid),
+            ).fetchone()
+        finally:
+            con.close()
     except _sqlite3.Error:
         raise _HTTPException(status_code=500, detail="error leyendo bridge DB")
     if not row or not row[0]:
@@ -8238,8 +8242,8 @@ def _refresh_followup_aging_bg() -> None:
         payload = _compute_followup_aging()
         if payload is not None:
             now = time.time()
-            _FOLLOWUP_AGING_CACHE["ts"] = now
             _FOLLOWUP_AGING_CACHE["payload"] = payload
+            _FOLLOWUP_AGING_CACHE["ts"] = now
             _followup_aging_persist(now, payload, elapsed_s=now - t0)
     finally:
         with _FOLLOWUP_AGING_LOCK:
@@ -8292,8 +8296,8 @@ def _fetch_followup_aging() -> dict | None:
     t0 = time.time()
     payload = _compute_followup_aging()
     if payload is not None:
-        _FOLLOWUP_AGING_CACHE["ts"] = now_ts
         _FOLLOWUP_AGING_CACHE["payload"] = payload
+        _FOLLOWUP_AGING_CACHE["ts"] = now_ts
         _followup_aging_persist(now_ts, payload, elapsed_s=time.time() - t0)
         return payload
     return cached["payload"]  # serve last-known-good si compute falló
@@ -8575,8 +8579,8 @@ def _fetch_finance(now: datetime | None = None) -> dict | None:
         },
         "latest": latest,
     }
-    _FINANCE_CACHE["key"] = key
     _FINANCE_CACHE["payload"] = payload
+    _FINANCE_CACHE["key"] = key
     return payload
 
 

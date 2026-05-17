@@ -16872,28 +16872,116 @@ def apply_weighted_scores(
 # reranker en MPS serializa de todas formas + agrega overhead por task.
 
 
+def _single_file_only_vault_names(cfg: dict) -> set[str]:
+    """Names of registered vaults that are not part of the default read scope.
+
+    `single_file_only` started as a string flag for the Finances folder. Accept
+    a list too so future special vaults don't require another config shape.
+    """
+    raw = cfg.get("single_file_only")
+    if isinstance(raw, str):
+        return {raw} if raw.strip() else set()
+    if isinstance(raw, (list, tuple, set)):
+        return {str(v).strip() for v in raw if str(v).strip()}
+    return set()
+
+
+def _parse_vault_scope_names(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return []
+        if raw.lower() == "all":
+            return ["all"]
+        return [part.strip() for part in raw.split(",") if part.strip()]
+    if isinstance(value, (list, tuple, set)):
+        out: list[str] = []
+        for item in value:
+            if not isinstance(item, str):
+                continue
+            name = item.strip()
+            if not name:
+                continue
+            if name.lower() == "all":
+                return ["all"]
+            out.append(name)
+        return out
+    return []
+
+
+def _default_read_vault_names(cfg: dict) -> list[str]:
+    """Default multi-vault READ/INDEX scope.
+
+    For this installation the normal operational vaults are `home` + `work`;
+    `finances` is registered only as a `single_file_only` special source, so it
+    must not silently join every broad retrieval/index pass.
+
+    Config can pin the order/scope with any of:
+      - default_vault_scope
+      - query_vaults
+      - active_vaults
+    Missing config falls back to every registered non-special vault.
+    """
+    vaults = cfg.get("vaults") or {}
+    if not isinstance(vaults, dict) or not vaults:
+        return []
+    special = _single_file_only_vault_names(cfg)
+    normal = [name for name in vaults.keys() if name not in special]
+
+    for key in ("default_vault_scope", "query_vaults", "active_vaults"):
+        requested = _parse_vault_scope_names(cfg.get(key))
+        if not requested:
+            continue
+        if requested == ["all"]:
+            return normal or list(vaults.keys())
+        resolved = [name for name in requested if name in vaults]
+        if resolved:
+            return resolved
+
+    if normal:
+        return normal
+    cur = cfg.get("current")
+    if cur and cur in vaults:
+        return [cur]
+    return list(vaults.keys())
+
+
 def resolve_vault_paths(names: list[str] | None) -> list[tuple[str, Path]]:
     """Resuelve una lista de nombres a [(display_name, vault_path)]. Ignora
     nombres no registrados silenciosamente (el caller puede verificar el
     resultado vs input).
 
-    `names=None` → solo el vault activo (resolve_vault_path + su nombre).
-    `names=["all"]` → todos los registrados en el registry.
+    `names=None` → scope operativo por default (normalmente home + work),
+    salvo `OBSIDIAN_RAG_VAULT`, que sigue siendo override explícito.
+    `names=["all"]` → todos los vaults operativos registrados; los vaults
+    `single_file_only` quedan fuera salvo que se pidan por nombre.
     """
     cfg = _load_vaults_config()
     if names is None:
-        # Vault activo según precedencia estándar.
-        active = _resolve_vault_path()
-        # Intentamos darle un nombre legible.
+        # Env override explícito: preserva el comportamiento single-vault para
+        # scripts/tests que setean OBSIDIAN_RAG_VAULT deliberadamente.
         env = os.environ.get("OBSIDIAN_RAG_VAULT")
         if env:
+            active = Path(env)
             return [(f"env:{active.name}", active)]
+        default_names = _default_read_vault_names(cfg)
+        if default_names:
+            return [
+                (name, Path(cfg["vaults"][name]))
+                for name in default_names
+                if name in cfg["vaults"]
+            ]
+        # Sin registry: vault activo según precedencia estándar.
+        active = _resolve_vault_path()
+        # Intentamos darle un nombre legible.
         cur = cfg["current"]
         if cur and cur in cfg["vaults"]:
             return [(cur, active)]
         return [(f"default:{active.name}", active)]
     if names == ["all"]:
-        names = list(cfg["vaults"].keys())
+        names = _default_read_vault_names(cfg) or list(cfg["vaults"].keys())
     out: list[tuple[str, Path]] = []
     for n in names:
         if n in cfg["vaults"]:
@@ -21556,12 +21644,32 @@ def _index_preflight_memory_guard(where: str) -> None:
             )
         )
         if abort:
-            raise RuntimeError(
-                f"index abortado antes de {where} por memory pressure "
-                f"(used_pct={pct_after if pct_after is not None else 'n/a'}, "
-                f"swap_gb={swap_after if swap_after is not None else 'n/a'}, "
-                f"rss_gb={rss_after if rss_after is not None else 'n/a'})."
+            # Si la presión viene del swap (GPU VRAM comprimida) pero el RSS
+            # del proceso es razonable, caer a CPU embed en lugar de abortar.
+            # Evita el crash Metal OOM que ocurre cuando el embedder MLX no
+            # puede alocar VRAM con swap alto.
+            rss_abort = (
+                rss_after is not None
+                and abort_self_rss_gb > 0
+                and rss_after >= abort_self_rss_gb
             )
+            if rss_abort:
+                raise RuntimeError(
+                    f"index abortado antes de {where} por RSS excesivo del proceso "
+                    f"(rss_gb={rss_after:.1f} >= {abort_self_rss_gb:.1f})."
+                )
+            # Swap/RAM pressure pero proceso sano → fallback CPU embed.
+            if os.environ.get("RAG_EMBED_BACKEND", "mlx").lower() not in ("pytorch", "torch", "cpu"):
+                os.environ["RAG_EMBED_BACKEND"] = "pytorch"
+                os.environ["OBSIDIAN_RAG_EMBED_DEVICE"] = "cpu"
+                # Reset singleton para que el próximo _get_local_embedder() cargue CPU.
+                global _local_embedder
+                _local_embedder = None
+                console.print(
+                    f"[yellow]memory pressure antes de {where}[/yellow] — "
+                    f"fallback a embedder CPU (swap={swap_after:.1f}GB). "
+                    f"Más lento pero sin GPU."
+                )
     except RuntimeError:
         raise
     except Exception as exc:
@@ -21994,14 +22102,23 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
                 and rss_after >= abort_self_rss_gb
             )
             if abort_enabled and (abort_pct or abort_swap or abort_rss):
-                raise RuntimeError(
-                    "index abortado por memory pressure persistente "
-                    f"(used_pct={pct_after if pct_after is not None else 'n/a'}, "
-                    f"swap_gb={swap_after if swap_after is not None else 'n/a'}, "
-                    f"rss_gb={rss_after if rss_after is not None else 'n/a'}). "
-                    "El índice queda parcial; reintentá cuando baje la presión "
-                    "o subí RAG_INDEX_ABORT_* si querés asumir el riesgo."
-                )
+                if abort_rss:
+                    raise RuntimeError(
+                        "index abortado por RSS excesivo del proceso "
+                        f"(rss_gb={rss_after:.1f} >= {abort_self_rss_gb:.1f}). "
+                        "El índice queda parcial; reintentá cuando baje la presión."
+                    )
+                # Swap/RAM pressure pero proceso sano → fallback CPU embed.
+                if os.environ.get("RAG_EMBED_BACKEND", "mlx").lower() not in ("pytorch", "torch", "cpu"):
+                    os.environ["RAG_EMBED_BACKEND"] = "pytorch"
+                    os.environ["OBSIDIAN_RAG_EMBED_DEVICE"] = "cpu"
+                    global _local_embedder
+                    _local_embedder = None
+                    console.print(
+                        "[yellow]memory pressure durante index[/yellow] — "
+                        f"fallback a embedder CPU (swap={swap_after:.1f}GB). "
+                        "Más lento pero sin GPU."
+                    )
         except Exception as exc:
             if isinstance(exc, RuntimeError) and str(exc).startswith("index abortado"):
                 raise
@@ -22654,11 +22771,11 @@ def index(full_flag: bool, reset_legacy: bool, no_contradict: bool, source_opt: 
         console.print(msg)
         sys.exit(1)
     # --vault resolution: validar + swap VAULT_PATH globals via _with_vault.
-    # Aplica tanto al path `--source` (cross-source ingesters: el ingester
-    # escribe al vault target en lugar del activo) como al vault-index path
-    # de más abajo. Debe ejecutarse ANTES del source_opt branch para que
-    # el swap esté vigente dentro del ingester.
-    _vault_ctx = None
+    # Bare `rag index` ahora recorre el scope operativo completo (home + work)
+    # para que ningún vault quede stale. `--source ...` se mantiene single-
+    # vault por seguridad: esos ingesters escriben notas auxiliares y sólo
+    # deben correr contra el target canónico/corriente.
+    _target_vaults: list[tuple[str, Path]] = []
     try:
         if vault_scope:
             names = [n.strip() for n in vault_scope.split(",") if n.strip()]
@@ -22675,9 +22792,21 @@ def index(full_flag: bool, reset_legacy: bool, no_contradict: bool, source_opt: 
                     "Revisá `rag vault list`."
                 )
                 return
-            _, _vault_path = resolved[0]
-            _vault_ctx = _with_vault(_vault_path)
-            _vault_ctx.__enter__()
+            _target_vaults = resolved
+        elif source_opt:
+            _active_path = _resolve_vault_path()
+            _active_name = f"default:{_active_path.name}"
+            _cfg = _load_vaults_config()
+            for _name, _path in (_cfg.get("vaults") or {}).items():
+                try:
+                    if Path(_path).resolve() == _active_path.resolve():
+                        _active_name = _name
+                        break
+                except OSError:
+                    continue
+            _target_vaults = [(_active_name, _active_path)]
+        else:
+            _target_vaults = resolve_vault_paths(None)
         # Contextual Retrieval: el flag CLI fuerza ON el env var sólo para
         # esta invocación. Snap+restore manual para no contaminar shell
         # del user si lanzó `rag index --contextual` sin el export. Si ya
@@ -22715,7 +22844,35 @@ def index(full_flag: bool, reset_legacy: bool, no_contradict: bool, source_opt: 
                 "MPS exportá `RAG_INDEX_BATCH_SIZE=128 RAG_INDEX_LOCAL_EMBED=1`."
             )
         try:
-            _do_index(reset, no_contradict, source_opt, since_opt, dry_run, max_chats)
+            if not _target_vaults:
+                _do_index(reset, no_contradict, source_opt, since_opt, dry_run, max_chats)
+            else:
+                _multi = len(_target_vaults) > 1
+                _summaries: list[tuple[str, dict]] = []
+                for _vault_name, _vault_path in _target_vaults:
+                    if _multi:
+                        console.print(
+                            f"[bold cyan]Vault {_vault_name}[/bold cyan] "
+                            f"[dim]({_vault_path})[/dim]"
+                        )
+                    _vault_ctx = _with_vault(_vault_path)
+                    _vault_ctx.__enter__()
+                    try:
+                        _stats = _do_index(
+                            reset, no_contradict, source_opt, since_opt,
+                            dry_run, max_chats,
+                        )
+                    finally:
+                        _vault_ctx.__exit__(None, None, None)
+                    _summaries.append((_vault_name, _stats or {}))
+                if _multi:
+                    _chunks = sum(int(s.get("added_chunks", 0) or 0) for _, s in _summaries)
+                    _updated = sum(int(s.get("updated_files", 0) or 0) for _, s in _summaries)
+                    console.print(
+                        f"[green]Multi-vault listo:[/green] "
+                        f"{' + '.join(n for n, _ in _summaries)} · "
+                        f"{_chunks} chunks · {_updated} notas actualizadas."
+                    )
             if contextual:
                 snap = _contextual_retrieval.stats_snapshot()
                 console.print(
@@ -22726,8 +22883,6 @@ def index(full_flag: bool, reset_legacy: bool, no_contradict: bool, source_opt: 
                     f"skipped_short={snap.get('skipped_short', 0)}[/dim]"
                 )
         finally:
-            if _vault_ctx is not None:
-                _vault_ctx.__exit__(None, None, None)
             # Restaurar el env var aunque _do_index haya raiseado.
             if contextual:
                 if _ctx_prev_env is None:
@@ -22782,7 +22937,7 @@ def _fmt_ingest_summary(
 
 
 def _do_index(reset: bool, no_contradict: bool, source_opt: str | None,
-              since_opt: str | None, dry_run: bool, max_chats: int | None) -> None:
+              since_opt: str | None, dry_run: bool, max_chats: int | None) -> dict | None:
     """Body del comando `index`, extraído a helper para que el caller
     (`index` CLI) pueda envolverlo en `_with_vault(...)` cuando se pasa
     `--vault NAME`. Todo lo que estaba inline en `index()` — incluyendo
@@ -22866,7 +23021,7 @@ def _do_index(reset: bool, no_contradict: bool, source_opt: str | None,
         if src in ("vault", "obsidian"):
             # Treat as no-op flag — vault indexing has its own path.
             with vault_write_lock("index"):
-                _run_index(reset=reset, no_contradict=no_contradict)
+                return _run_index(reset=reset, no_contradict=no_contradict)
             return
         if src == "whatsapp":
             from scripts.ingest_whatsapp import run as _ingest_wa
@@ -23049,7 +23204,7 @@ def _do_index(reset: bool, no_contradict: bool, source_opt: str | None,
         return
 
     with vault_write_lock("index"):
-        _run_index(reset=reset, no_contradict=no_contradict)
+        return _run_index(reset=reset, no_contradict=no_contradict)
 
 
 def _watch_filter_path(
@@ -23372,15 +23527,15 @@ def vlm_backfill(vault_scope: str | None, max_captions: int | None, dry_run: boo
 @cli.command()
 @click.option("--debounce", default=3.0, help="Segundos a esperar antes de reindexar un cambio (default: 3)")
 @click.option("--all-vaults", "all_vaults", is_flag=True,
-              help="Observa todos los vaults registrados en ~/.config/obsidian-rag/vaults.yaml "
+              help="Observa todos los vaults operativos en ~/.config/obsidian-rag/vaults.json "
                    "en un único proceso (evita duplicar imports ML por vault).")
 def watch(debounce: float, all_vaults: bool):
     """Observa el/los vault(s) y reindexa incrementalmente al guardar notas.
 
-    Sin `--all-vaults`, observa el vault activo (legacy: un servicio launchd
-    por vault). Con `--all-vaults`, un único proceso observa todos los vaults
-    registrados — ahorra ~3-4 GB de swap por vault adicional porque sqlite-vec
-    + transformers se importan una sola vez.
+    Default: observa el scope operativo completo (home + work cuando están
+    registrados). `--all-vaults` queda como alias explícito para los plists
+    existentes. Los vaults `single_file_only` se excluyen salvo que se pidan
+    por nombre en comandos puntuales.
     """
     from watchdog.observers import Observer
     from watchdog.events import FileSystemEventHandler
@@ -23695,20 +23850,17 @@ def query(
     if since:
         date_range = (parse_since(since), time.time())
 
-    # `--vault NAME` — override per-invocación del vault activo. Se resuelve
-    # ANTES del `get_db()` para que todo el pipeline downstream (intent
-    # shortcuts, find_related, render_related, build_progressive_context)
-    # siga viendo un único `col` y no requiera cambios. Cross-vault queda
-    # en `rag chat --vault a,b` — `query` single-vault por ahora porque
-    # multi_retrieve + intents + related tiene suficiente divergencia para
-    # merecer un cambio separado (y el caso común "un vault puntual"
-    # justifica el flag sin ese scope).
+    # `--vault NAME` — override per-invocación a un vault puntual. Sin flag,
+    # el scope READ default es multi-vault (home + work). Mantenemos `col`
+    # como anchor para vocab/cache/metadata helpers que aún son single-col;
+    # el camino semántico usa `multi_retrieve` cuando hay >1 vault.
+    vaults_resolved: list[tuple[str, Path]]
     if vault_scope:
         names = [n.strip() for n in vault_scope.split(",") if n.strip()]
         if len(names) != 1 or names[0] == "all":
             msg = (
                 "--vault en `rag query` solo acepta UN vault por invocación. "
-                "Para cross-vault usá `rag chat --vault a,b`."
+                "Omití el flag para usar el scope default home + work."
             )
             if plain:
                 click.echo(msg)
@@ -23726,11 +23878,25 @@ def query(
             else:
                 console.print(f"[red]{msg}[/red]")
             return
-        _, _vault_path = resolved[0]
-        col = get_db_for(_vault_path)
+        vaults_resolved = resolved
+        col = get_db_for(vaults_resolved[0][1])
     else:
-        col = get_db()
-    if col.count() == 0:
+        vaults_resolved = resolve_vault_paths(None)
+        col = get_db_for(vaults_resolved[0][1]) if vaults_resolved else get_db()
+    _query_multi_scope = len(vaults_resolved) > 1
+
+    def _query_scope_has_chunks() -> bool:
+        if not vaults_resolved:
+            return col.count() > 0
+        for _name, _path in vaults_resolved:
+            try:
+                if get_db_for(_path).count() > 0:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    if not _query_scope_has_chunks():
         if plain:
             click.echo("Índice vacío. Ejecuta: rag index")
         else:
@@ -23746,7 +23912,7 @@ def query(
     # envelope than the one that produced it.
     _cache_skippable = (
         no_cache or raw or force or counter or critique or source_opt
-        or folder or tag or since or session_id or continue_
+        or folder or tag or since or session_id or continue_ or _query_multi_scope
     )
     _cache_emb = None
     _cache_hash = ""
@@ -23851,10 +24017,21 @@ def query(
         sess = ensure_session(session_id, mode="query") if session_id else None
     history = session_history(sess) if sess else None
 
-    # Early intent classification for adaptive skip-reformulate (Improvement #3 Fase B.3).
-    # Compute vocabulary once here; reused for the post-reformulate classify_intent call
-    # so we avoid calling get_vocabulary(col) twice on the hot path.
-    known_tags, known_folders = get_vocabulary(col)
+    # Early intent classification for adaptive skip-reformulate (Improvement
+    # #3 Fase B.3). En scope multi-vault combinamos vocab de todos los cols
+    # para que tags/folders de work también participen del router.
+    if _query_multi_scope:
+        known_tags: set[str] = set()
+        known_folders: set[str] = set()
+        for _name, _path in vaults_resolved:
+            try:
+                _tags, _folders = get_vocabulary(get_db_for(_path))
+                known_tags.update(_tags)
+                known_folders.update(_folders)
+            except Exception:
+                continue
+    else:
+        known_tags, known_folders = get_vocabulary(col)
     _raw_intent, _ = classify_intent(question, known_tags, known_folders)
 
     # Reformulate + expand in ONE helper-model call when session history exists.
@@ -24031,8 +24208,32 @@ def query(
         counter=counter,
     )
 
+    def _do_multi_retrieve(deep: bool = False):
+        return multi_retrieve(
+            vaults_resolved,
+            effective_question,
+            k,
+            folder,
+            history,
+            tag,
+            bool(hyde),
+            multi_query=_multi_enabled,
+            auto_filter=not no_auto_filter,
+            date_range=date_range,
+            deep=deep,
+            source=source_filter,
+            intent=intent,
+            hyde=hyde,
+            caller="query",
+            counter=counter,
+        )
+
     def _do_retrieve():
-        result = retrieve(**_retrieve_kwargs)
+        result = (
+            _do_multi_retrieve()
+            if _query_multi_scope
+            else retrieve(**_retrieve_kwargs)
+        )
         # Auto-deep: if first-pass confidence is borderline, run iterative
         # retrieval to try to surface better evidence. Threshold calibrated
         # between CONFIDENCE_RERANK_MIN (0.015, would refuse) and a "solid
@@ -24040,7 +24241,11 @@ def query(
         if (not no_deep and not raw
                 and result["docs"]
                 and result["confidence"] < CONFIDENCE_DEEP_THRESHOLD):
-            result = deep_retrieve(**_retrieve_kwargs)
+            result = (
+                _do_multi_retrieve(deep=True)
+                if _query_multi_scope
+                else deep_retrieve(**_retrieve_kwargs)
+            )
         return result
 
     if plain:
@@ -24127,7 +24332,8 @@ def query(
                 console.print(Markdown(d))
                 console.print(Rule(style="dim"))
             print_sources(result)
-            render_related(find_related(col, result["metas"]))
+            if not _query_multi_scope:
+                render_related(find_related(col, result["metas"]))
         return
 
     # Gate LLM on reranker confidence. Negative top score ≈ rerank found
@@ -24179,7 +24385,8 @@ def query(
                 console.print()
                 console.print(Markdown(stale_hint))
             print_sources(result)
-            render_related(find_related(col, result["metas"]))
+            if not _query_multi_scope:
+                render_related(find_related(col, result["metas"]))
         log_query_event({
             "cmd": "query", "q": question,
             "filters": result.get("filters_applied"),
@@ -24213,11 +24420,20 @@ def query(
             save_session(sess)
         return
 
-    # Progressive context: top-k full + extra chunks as 1-line summaries
-    context = build_progressive_context(
-        col, result["docs"], result["metas"], question,
-        extras=result.get("extras"),
-    )
+    # Progressive context: top-k full + extra chunks as 1-line summaries.
+    # Multi-vault results cannot use a single graph/corpus context anchor, so
+    # label each chunk with its vault and feed the retrieved evidence directly.
+    if _query_multi_scope:
+        context = "\n\n---\n\n".join(
+            f"[vault: {m.get('_vault', '?')}] "
+            + _format_chunk_for_llm(d, m, role="nota")
+            for d, m in zip(result["docs"], result["metas"])
+        )
+    else:
+        context = build_progressive_context(
+            col, result["docs"], result["metas"], question,
+            extras=result.get("extras"),
+        )
     # Append graph-expanded neighbors as supplementary context
     graph_docs = result.get("graph_docs", [])
     graph_metas = result.get("graph_metas", [])
@@ -24387,6 +24603,17 @@ def query(
     contrad: list[dict] = []
     if counter:
         def _run_counter():
+            if _query_multi_scope:
+                out: list[dict] = []
+                for _name, _path in vaults_resolved:
+                    try:
+                        out.extend(find_contradictions(
+                            get_db_for(_path), question, full,
+                            exclude_paths={m.get("file", "") for m in result["metas"]},
+                        ))
+                    except Exception:
+                        continue
+                return out
             return find_contradictions(
                 col, question, full,
                 exclude_paths={m.get("file", "") for m in result["metas"]},
@@ -24581,7 +24808,8 @@ def query(
 
     if not plain:
         print_sources(result)
-        render_related(find_related(col, result["metas"]))
+        if not _query_multi_scope:
+            render_related(find_related(col, result["metas"]))
 
 
 def _arrow_select(
@@ -25038,11 +25266,10 @@ def chat(
             )
             return
     else:
-        _vcfg = _load_vaults_config()
-        if len(_vcfg["vaults"]) >= 2 and not os.environ.get("OBSIDIAN_RAG_VAULT"):
-            vaults_resolved = _prompt_vault_scope_interactive(_vcfg)
-        else:
-            vaults_resolved = resolve_vault_paths(None)
+        # Default READ scope is multi-vault (home + work) when registered.
+        # Writes (/save, /inbox, etc.) still use `col = get_db()` above,
+        # which points at the current vault.
+        vaults_resolved = resolve_vault_paths(None)
 
     if not vaults_resolved:
         console.print("[red]Sin vault para consultar. Registrá uno con `rag vault add`.[/red]")

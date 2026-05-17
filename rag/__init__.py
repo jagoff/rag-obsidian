@@ -34372,7 +34372,7 @@ def _fetch_youtube_title(url: str) -> str:
         req = urllib.request.Request(endpoint, headers={"User-Agent": _READ_USER_AGENT})
         with urllib.request.urlopen(req, timeout=_READ_TIMEOUT_SECS) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
-    except (json.JSONDecodeError, TypeError):
+    except Exception:
         return ""
     title = (data.get("title") or "").strip()
     author = (data.get("author_name") or "").strip()

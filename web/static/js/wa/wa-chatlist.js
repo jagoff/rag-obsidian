@@ -355,6 +355,11 @@ function selectChat(jid) {
     item.textContent = "0";
     item.classList.add("zero");
   }
+  const active = allChats.find((c) => c.jid === jid);
+  if (active) {
+    active.unread_count = 0;
+    updateStats();
+  }
 }
 
 function escapeHtml(s) {

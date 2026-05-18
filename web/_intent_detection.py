@@ -446,8 +446,14 @@ def _detect_tool_intent(q: str) -> list[tuple[str, dict]]:
     _read = _detect_read_note_intent(q)
     if _read is not None:
         return [_read]
+    # Drive explícito tiene prioridad sobre search_vault: frases como
+    # "busca en mi drive..." o "buscame el sheet..." también matchean el
+    # verbo genérico de búsqueda, pero la fuente pedida es Google Drive.
+    for name, _args, rx in _TOOL_INTENT_COMPILED:
+        if name == "drive_search" and rx.search(q):
+            return [(name, {"query": q})]
     # search_vault explícito ("busca X / buscame X / encontrame X")
-    # tiene segunda prioridad: el LLM bias-ea a whatsapp_pending /
+    # tiene siguiente prioridad: el LLM bias-ea a whatsapp_pending /
     # reminders_due cuando no reconoce el verbo y defaultea a tools de
     # "what's pending". Forzamos search_vault con la query cruda.
     _sv = _detect_search_vault_intent(q)

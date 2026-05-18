@@ -1035,8 +1035,8 @@ def test_home_v2_bundle_includes_render_correlations():
     """El JS bundle tiene `renderCorrelations` (no `renderPatterns`)
     para evitar shadowing con el render existente del panel
     `p-patterns` (entidades cross-source)."""
-    js_path = Path(__file__).resolve().parent.parent / "web" / "static" / "home.v2.js"
-    js = js_path.read_text(encoding="utf-8")
+    home_dir = Path(__file__).resolve().parent.parent / "web" / "static" / "js" / "home"
+    js = "\n".join(p.read_text(encoding="utf-8") for p in sorted(home_dir.glob("*.mjs")))
     # Las funciones nuevas:
     assert "async function renderCorrelations" in js
     assert "fetchPatterns" in js

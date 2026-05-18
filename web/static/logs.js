@@ -1270,6 +1270,49 @@
       await fetchRankings();
     });
 
+    $("clean-all-logs").addEventListener("click", async () => {
+      const ok = window.confirm(
+        "Esto vacía todos los archivos .log actuales y limpia la queue de logs. ¿Continuar?"
+      );
+      if (!ok) return;
+      const btn = $("clean-all-logs");
+      const prev = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "limpiando…";
+      try {
+        const resp = await fetch("/api/logs/clean-all", { method: "POST" });
+        let data = {};
+        try { data = await resp.json(); } catch {}
+        if (!resp.ok) {
+          throw new Error(data.detail || `HTTP ${resp.status}`);
+        }
+        await fetchServices();
+        if (state.selectedKey === GLOBAL_KEY) {
+          await fetchAndRenderViewer(false);
+        } else if (state.selectedKey) {
+          const svc = findSelectedService();
+          renderViewerHeader(svc);
+          if (svc) await fetchAndRenderViewer(false);
+        }
+        await fetchRankings();
+        await fetchQueueNow();
+        const cleared = data.files_truncated ?? 0;
+        btn.textContent = `clean ${cleared}`;
+        if ((data.errors || []).length) {
+          showError(`clean all terminó parcial: ${data.errors.length} error(es)`);
+        } else {
+          clearError();
+        }
+        setTimeout(() => { btn.textContent = prev; }, 2500);
+      } catch (e) {
+        btn.textContent = `error`;
+        showError(`Error limpiando logs: ${e.message}`);
+        setTimeout(() => { btn.textContent = prev; }, 2500);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
     // Selector de ventana del panel de rankings. Persiste la elección
     // en localStorage. Cambiarla refetcha inmediatamente.
     const rankingsSelect = $("rankings-window");
@@ -1451,7 +1494,7 @@
       rlEl.textContent = `⚠ ${rl.reason}`;
       rlEl.classList.add("qrl-warn");
     } else {
-      rlEl.textContent = `rate: ${rl.current_hour_count || 0}/${rl.hourly_cap || 5} invocaciones de Devin en la última hora`;
+      rlEl.textContent = `rate: ${rl.current_hour_count || 0}/${rl.hourly_cap || 5} invocaciones de Codex en la última hora`;
       rlEl.classList.remove("qrl-warn");
     }
 
@@ -1459,17 +1502,19 @@
     const tbody = $("queue-tbody");
     const entries = data.entries || [];
     if (entries.length === 0) {
-      tbody.innerHTML = `<tr><td colspan="7" class="queue-empty">la queue está vacía — clickeá "↻ escanear" para ver si hay errores nuevos</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="8" class="queue-empty">la queue está vacía — clickeá "↻ escanear" para ver si hay logs nuevos</td></tr>`;
       return;
     }
     const rows = entries.map((e) => {
       const lastSeen = e.last_seen_at ? e.last_seen_at.slice(5, 16).replace("T", " ") : "—";
+      const level = e.level === "warn" ? "warn" : "error";
       const resolution = e.resolution_status
         ? `<span class="queue-status ${e.resolution_status}">${e.resolution_status}</span>`
         : "—";
       return `<tr data-id="${e.id}">
         <td style="color:var(--text-faint);font-variant-numeric:tabular-nums">${e.id}</td>
         <td><span class="queue-status ${e.status}">${e.status}</span></td>
+        <td><span class="queue-status q-level-${level}">${level}</span></td>
         <td>${escapeHtml(e.service)}</td>
         <td class="queue-error-text" title="${escapeHtml(e.error_text)}">${escapeHtml(e.error_text)}</td>
         <td class="queue-occ">${e.occurrence_count}</td>
@@ -1494,6 +1539,7 @@
         `file: ${d.file_ref}`,
         `signature: ${d.error_signature}`,
         `status: ${d.status}`,
+        `level: ${d.level || "error"}`,
         `occurrences: ${d.occurrence_count}`,
         `first seen: ${d.first_seen_at}`,
         `last seen: ${d.last_seen_at}`,
@@ -1506,7 +1552,7 @@
       lines.push(d.error_text);
       if (d.devin_output) {
         lines.push("");
-        lines.push("--- devin output ---");
+        lines.push("--- codex output ---");
         lines.push(d.devin_output);
       }
       // Simple dialog — reusamos el window.alert porque el modal serio

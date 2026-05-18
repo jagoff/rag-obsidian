@@ -23,6 +23,7 @@ Crash semantics:
 from __future__ import annotations
 
 import logging
+import os
 import signal
 import sys
 import threading
@@ -41,13 +42,25 @@ _LOG_DIR = Path.home() / ".local/share/obsidian-rag"
 _LOG_FILE = _LOG_DIR / "supervisor.log"
 
 
+def _stdout_is_log_file() -> bool:
+    """Return true when launchd already redirects stdout to supervisor.log."""
+    try:
+        stdout_stat = os.fstat(sys.stdout.fileno())
+        log_stat = _LOG_FILE.stat()
+    except Exception:
+        return False
+    return (
+        stdout_stat.st_dev == log_stat.st_dev
+        and stdout_stat.st_ino == log_stat.st_ino
+    )
+
+
 def _setup_logging() -> None:
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
     fmt = "%(asctime)s %(levelname)s %(name)s: %(message)s"
-    handlers: list[logging.Handler] = [
-        logging.FileHandler(_LOG_FILE, encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ]
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    if not _stdout_is_log_file():
+        handlers.insert(0, logging.FileHandler(_LOG_FILE, encoding="utf-8"))
     logging.basicConfig(level=logging.INFO, format=fmt, handlers=handlers)
     # Silenciar APScheduler verbose (cada misfire loggeado por default).
     logging.getLogger("apscheduler").setLevel(logging.WARNING)
@@ -72,13 +85,22 @@ def _import_jobs() -> int:
 
     import importlib  # noqa: PLC0415
     import pkgutil  # noqa: PLC0415
+    import sys  # noqa: PLC0415
 
     if not hasattr(jobs_pkg, "__path__"):
         return 0
     for finder, name, ispkg in pkgutil.iter_modules(jobs_pkg.__path__):
         full = f"rag.runtime.jobs.{name}"
         try:
-            importlib.import_module(full)
+            module = sys.modules.get(full)
+            if module is not None:
+                # Tests reset the Scheduler singleton after job modules were
+                # imported elsewhere. Reloading replays the declarative
+                # decorators against the fresh singleton; register_job() is
+                # idempotent for the production path.
+                importlib.reload(module)
+            else:
+                importlib.import_module(full)
         except Exception as exc:  # noqa: BLE001
             logger.exception("supervisor: failed to import %s: %s", full, exc)
 

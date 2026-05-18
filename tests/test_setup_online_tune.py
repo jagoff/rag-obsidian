@@ -435,6 +435,6 @@ def test_setup_remove_skips_warmup(tmp_path, monkeypatch):
         lambda ttl_s=86400: called.update({"n": called["n"] + 1}) or {},
     )
 
-    result = CliRunner().invoke(rag_module.setup, ["--remove"])
+    result = CliRunner().invoke(rag_module.setup, ["--remove"], input="y\n")
     assert result.exit_code == 0, result.output
     assert called["n"] == 0, "--remove must not trigger warmup"

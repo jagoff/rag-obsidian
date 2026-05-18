@@ -14,7 +14,7 @@ class ThreadSafeCache:
     """Thread-safe cache with TTL and single-flight refresh."""
 
     def __init__(self, ttl: float = 60.0):
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._cache: dict = {"ts": 0.0, "payload": None}
         self._ttl = ttl
         self._refreshing = False
@@ -43,6 +43,24 @@ class ThreadSafeCache:
             self._cache = {"ts": time.time(), "payload": payload}
             self._refreshing = False
 
+    def clear(self) -> None:
+        """Reset the cache to an empty single-entry state."""
+        with self._lock:
+            self._cache = {"ts": 0.0, "payload": None}
+            self._refreshing = False
+
+    def __getitem__(self, key: str) -> Any:
+        """Dict-style compatibility for older tests/call sites."""
+        with self._lock:
+            return self._cache[key]
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        """Dict-style compatibility for older tests/call sites."""
+        if key not in ("ts", "payload"):
+            raise KeyError(key)
+        with self._lock:
+            self._cache[key] = value
+
     def is_refreshing(self) -> bool:
         """Check if a refresh is in progress (single-flight guard)."""
         with self._lock:
@@ -64,7 +82,7 @@ class ThreadSafeCacheMultiKey:
     """
 
     def __init__(self, ttl: float = 60.0, max_size: int | None = None):
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._cache: dict[Any, dict] = {}
         self._ttl = ttl
         self._max_size = max_size
@@ -113,6 +131,22 @@ class ThreadSafeCacheMultiKey:
         with self._lock:
             self._cache.pop(key, None)
             self._refreshing.pop(key, None)
+
+    def __getitem__(self, key: str) -> Any:
+        """Single-entry dict compatibility over the `default` key."""
+        if key not in ("ts", "payload"):
+            raise KeyError(key)
+        with self._lock:
+            entry = self._cache.get("default") or {"ts": 0.0, "payload": None}
+            return entry[key]
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        """Single-entry dict compatibility over the `default` key."""
+        if key not in ("ts", "payload"):
+            raise KeyError(key)
+        with self._lock:
+            entry = self._cache.setdefault("default", {"ts": 0.0, "payload": None})
+            entry[key] = value
 
     def start_refresh(self, key: Any) -> bool:
         """Mark refresh as in progress for key. Returns True if we won the race."""

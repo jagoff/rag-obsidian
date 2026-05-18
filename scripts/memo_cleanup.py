@@ -4,9 +4,9 @@
 Dead memorias: nunca usadas (recall_count = 0) + creadas hace > N días.
 Near-dupes: pares con distancia < threshold (default 0.12).
 
-Este script es read-safe: usa las funciones de memo_dashboard.py para
-detectar, luego llama `memo delete` para borrar. Todas las acciones se
-loguean para auditoría.
+Este script es read-safe durante la detección: usa las funciones de
+memo_dashboard.py para detectar y el mismo helper directo de `/api/memo/delete`
+para borrar. Todas las acciones se loguean para auditoría.
 
 Usage:
     python scripts/memo_cleanup.py --dry-run
@@ -16,10 +16,10 @@ Usage:
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 # Agregar el repo al path para importar rag
 repo_root = Path(__file__).parent.parent
@@ -54,27 +54,19 @@ _DEAD_MAX_SCORE = 40  # memorias con score >= 40 se preservan aunque estén dead
 
 
 def _memo_delete(memo_id: str, dry_run: bool = False) -> bool:
-    """Llama `memo delete` para borrar una memoria."""
-    cmd = ["memo", "delete", "--yes", memo_id]
+    """Borra una memoria usando el mismo path directo que el dashboard web."""
     if dry_run:
         print(f"  [DRY-RUN] Would delete: {memo_id}")
         return True
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if result.returncode == 0:
-            return True
-        print(f"  [ERROR] memo delete {memo_id} failed: {result.stderr}")
-        return False
-    except subprocess.TimeoutExpired:
-        print(f"  [ERROR] memo delete {memo_id} timed out")
-        return False
+        from web.memo_routes import _delete_memo_direct
+
+        deleted_id, warnings = _delete_memo_direct(memo_id)
+        for warning in warnings:
+            print(f"  [WARN] {memo_id}: {warning}")
+        return bool(deleted_id)
     except Exception as e:
-        print(f"  [ERROR] memo delete {memo_id} exception: {e}")
+        print(f"  [ERROR] delete {memo_id} exception: {type(e).__name__}: {e}")
         return False
 
 

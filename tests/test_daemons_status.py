@@ -37,12 +37,11 @@ def _isolate_db_path(tmp_path):
 
 # ── 1. _services_spec_manual() shape y count ──────────────────────────────────
 
-def test_services_spec_manual_returns_7_entries():
-    # 2026-05-04 consolidation: 7 → 3 manual entries.
-    # 2026-05-04 segunda limpieza: removido `spotify-poll` (no había plist real),
-    # quedan 2 manual_keep: synth-refresh + log-rotate.
+def test_services_spec_manual_empty_after_cleanup():
+    # 2026-05-10 cleanup: synth-refresh + log-rotate dejaron de tener
+    # plist/log real, así que manual_keep vuelve a estar vacío.
     specs = rag._services_spec_manual()
-    assert len(specs) == 2
+    assert specs == []
 
 
 def test_services_spec_manual_shape():
@@ -55,17 +54,11 @@ def test_services_spec_manual_shape():
 
 
 def test_services_spec_manual_known_labels():
-    # 2026-05-04 consolidation: cloudflare-tunnel*, lgbm-train, paraphrases-train
-    # removidos del manual spec. Quedan 3.
-    # 2026-05-04 segunda limpieza: spotify-poll también removido (sin plist real),
-    # quedan 2 manual_keep.
+    # Sin daemons manual_keep activos: todos los labels viven en
+    # _services_spec(), _DEPRECATED_LABELS o catálogos externos.
     specs = rag._services_spec_manual()
     labels = {s["label"] for s in specs}
-    expected = {
-        "com.fer.obsidian-rag-synth-refresh",
-        "com.fer.obsidian-rag-log-rotate",
-    }
-    assert labels == expected
+    assert labels == set()
 
 
 # ── 2. No overlap con _services_spec() ─────────────────────────────────────────

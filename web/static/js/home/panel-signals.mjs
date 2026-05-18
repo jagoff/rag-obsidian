@@ -5,18 +5,41 @@
 import {
   escapeHTML, fmtTimeAgo,
   isBotOrSelf, parseSenderName,
+  isActionableWhatsApp,
   obsidianUrl, gmailThreadUrl, whatsappUrl,
   isReminderDueTomorrow, reminderTitle,
   renderPanelList,
 } from "./core.mjs";
+
+function isNoiseMail(m) {
+  const text = `${m.from || m.sender || ""} ${m.subject || ""}`.toLowerCase();
+  return isBotOrSelf(m.from || m.sender)
+    || /\b(receipt|invoice|factura|comprobante)\b/.test(text)
+    || /\b(compraste|prueba gratis|bienvenido al plan)\b/.test(text)
+    || /mercado\s*libre|meli\+|mail\.anthropic\.com/.test(text);
+}
+
+function isUsefulTopic(topic) {
+  const t = String(topic || "").trim().toLowerCase();
+  if (!t || t.length < 4) return false;
+  return !/^(estoy|esta|este|eso|algo|tema|cosas?|info|notas?|hoy|ayer|mañana|mail|gmail|whatsapp)$/.test(t);
+}
+
+const dateKey = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+function isTodayValue(value) {
+  if (!value) return false;
+  const d = new Date(value);
+  return !Number.isNaN(d.getTime()) && dateKey(d) === dateKey(new Date());
+}
 
 export function renderInbox(payload) {
   const evidence = payload.today?.evidence || {};
   const signals = payload.signals || {};
   const inboxToday = evidence.inbox_today || [];
   const gmailRecent = signals.gmail?.recent || [];
-  const waUnreplied = [...(signals.whatsapp_unreplied || [])]
-    .sort((a, b) => (b.hours_waiting || 0) - (a.hours_waiting || 0));
+  const gmailActionable = gmailRecent.filter((m) =>
+    !isNoiseMail(m) && isTodayValue(Number(m.internal_date_ms))
+  );
   const mailUnread = signals.mail_unread || [];
   const fromName = (s) => (s || "").split("<")[0].trim() || s || "";
   const truncate = (s, n) => (s || "").length > n ? (s || "").slice(0, n) + "…" : (s || "");
@@ -33,21 +56,11 @@ export function renderInbox(payload) {
       href: obsidianUrl(it.path, it.vault),
     });
   }
-  for (const m of gmailRecent.slice(0, 3)) {
+  for (const m of gmailActionable.slice(0, 3)) {
     rows.push({
       title: `📧 ${fromName(m.from)}: ${truncate(m.subject || "", 70)}`,
       meta: [m.internal_date_ms ? fmtTimeAgo(new Date(m.internal_date_ms).toISOString()) : null].filter(Boolean),
       href: gmailThreadUrl(m.thread_id),
-    });
-  }
-  for (const w of waUnreplied.slice(0, 3)) {
-    rows.push({
-      title: `💬 ${w.name || ""}`,
-      meta: [
-        w.hours_waiting != null ? `${Math.round(w.hours_waiting)}h esperando` : null,
-        truncate(w.last_snippet || "", 60),
-      ].filter(Boolean),
-      href: whatsappUrl(w.jid),
     });
   }
   if (!rows.length && mailUnread.length) {
@@ -60,7 +73,7 @@ export function renderInbox(payload) {
     }
   }
 
-  const total = inboxToday.length + gmailRecent.length + waUnreplied.length + mailUnread.length;
+  const total = inboxToday.length + gmailActionable.length + mailUnread.length;
   renderPanelList("p-inbox", rows, {
     emptyText: "todo el inbox procesado ✓",
     capChip: rows.length > 5 ? "warning" : "info",
@@ -71,47 +84,28 @@ export function renderInbox(payload) {
 export function renderQuestions(payload) {
   const signals = payload.signals || {};
   const evidence = payload.today?.evidence || {};
-  const lowConf = signals.low_conf || [];
-  const newContrad = evidence.new_contradictions || [];
-  const contradictions = signals.contradictions || [];
-  const loopsActivo = signals.loops_activo || [];
-  const truncate = (s, n) => (s || "").length > n ? (s || "").slice(0, n) + "…" : (s || "");
+  const seen = new Set();
+  const lowConf = [];
+  for (const it of [...(evidence.low_conf_queries || []), ...(signals.low_conf || [])]) {
+    const text = (it.q || it.question || it.text || "").trim();
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    lowConf.push({ ...it, q: text });
+  }
 
   const rows = [];
   for (const it of lowConf.slice(0, 4)) {
     const text = it.q || it.question || it.text || "";
+    const rawScore = it.score ?? it.top_score;
+    const scoreNum = Number(rawScore);
     rows.push({
       title: `❓ ${text}`,
       meta: [
-        it.score != null ? `score ${(typeof it.score === "number" ? it.score : Number(it.score)).toFixed(2)}` : null,
+        Number.isFinite(scoreNum) ? `score ${scoreNum.toFixed(2)}` : null,
         it.ts ? fmtTimeAgo(it.ts) : null,
       ].filter(Boolean),
       href: text ? `/chat?q=${encodeURIComponent(text)}` : null,
     });
-  }
-  const contradList = newContrad.length ? newContrad : (Array.isArray(contradictions) ? contradictions : []);
-  for (const c of contradList.slice(0, 3)) {
-    const text = c.text || c.summary || c.title || c.note_a || c.subject_path || "";
-    if (!text) continue;
-    rows.push({
-      title: `⚠ ${truncate(text, 90)}`,
-      meta: [c.ts ? fmtTimeAgo(c.ts) : null].filter(Boolean),
-      href: obsidianUrl(c.subject_path || c.path, c.vault),
-    });
-  }
-  if (!rows.length) {
-    for (const l of loopsActivo.slice(0, 4)) {
-      const text = l.loop_text || l.text || l.title || "";
-      if (!text) continue;
-      rows.push({
-        title: `🔄 ${truncate(text, 90)}`,
-        meta: [
-          l.age_days != null ? `${l.age_days}d` : null,
-          l.source_note ? l.source_note.split("/").pop().replace(/\.md$/, "") : null,
-        ].filter(Boolean),
-        href: obsidianUrl(l.source_note, l.vault),
-      });
-    }
   }
   renderPanelList("p-questions", rows, {
     emptyText: "no hay preguntas sin respuesta",
@@ -149,7 +143,7 @@ export function renderTomorrow(payload) {
 }
 
 export function renderWAUnreplied(payload) {
-  const items = payload.signals?.whatsapp_unreplied || [];
+  const items = (payload.signals?.whatsapp_unreplied || []).filter(isActionableWhatsApp);
   const cleanSnippet = (s) => {
     if (!s) return null;
     const trimmed = s.trim();
@@ -195,7 +189,7 @@ export function renderLoopsUrgent(payload) {
 }
 
 export function renderContradictions(payload) {
-  const items = payload.signals?.contradictions || [];
+  const items = payload.today?.evidence?.new_contradictions || [];
   const slugToTitle = (s) => {
     if (!s) return "";
     const stem = s.split("/").pop().replace(/\.md$/, "");
@@ -233,7 +227,7 @@ export function renderPatterns(payload) {
     || payload.signals?.correlations
     || {};
   const people = correlations.people || [];
-  const topics = correlations.topics || [];
+  const topics = (correlations.topics || []).filter((it) => isUsefulTopic(it.topic));
   const overlaps = correlations.time_overlaps || [];
   const gaps = correlations.gaps || [];
   const total = people.length + topics.length + overlaps.length + gaps.length;
@@ -243,14 +237,14 @@ export function renderPatterns(payload) {
     const signals = payload.signals || {};
     const counts = new Map();
     for (const m of signals.gmail?.recent || []) {
-      if (isBotOrSelf(m.from)) continue;
+      if (isNoiseMail(m)) continue;
       const n = parseSenderName(m.from);
       if (!n) continue;
       const e = counts.get(n) || { sources: new Set(), mentions: 0 };
       e.sources.add("📧"); e.mentions++;
       counts.set(n, e);
     }
-    for (const w of signals.whatsapp_unreplied || []) {
+    for (const w of (signals.whatsapp_unreplied || []).filter(isActionableWhatsApp)) {
       const n = (w.name || "").trim();
       if (!n || isBotOrSelf(n)) continue;
       const e = counts.get(n) || { sources: new Set(), mentions: 0 };
@@ -258,6 +252,7 @@ export function renderPatterns(payload) {
       counts.set(n, e);
     }
     const tops = Array.from(counts.entries())
+      .filter(([, e]) => e.sources.size > 1 || e.mentions > 1)
       .sort((a, b) => (b[1].sources.size - a[1].sources.size) || (b[1].mentions - a[1].mentions))
       .slice(0, 5);
     if (tops.length === 0) {
@@ -337,7 +332,7 @@ export function renderAuthority(payload) {
   const signals = payload.signals || {};
   const counts = new Map();
   for (const m of signals.gmail?.recent || []) {
-    if (isBotOrSelf(m.from)) continue;
+    if (isNoiseMail(m)) continue;
     const n = parseSenderName(m.from);
     if (!n) continue;
     const e = counts.get(n) || { sources: new Set(), count: 0, lastTs: 0 };
@@ -345,7 +340,7 @@ export function renderAuthority(payload) {
     e.lastTs = Math.max(e.lastTs, m.internal_date_ms || 0);
     counts.set(n, e);
   }
-  for (const w of signals.whatsapp_unreplied || []) {
+  for (const w of (signals.whatsapp_unreplied || []).filter(isActionableWhatsApp)) {
     const n = (w.name || "").trim();
     if (!n || isBotOrSelf(n)) continue;
     const e = counts.get(n) || { sources: new Set(), count: 0, lastTs: 0 };
@@ -354,7 +349,7 @@ export function renderAuthority(payload) {
   }
   for (const m of signals.mail_unread || []) {
     const sender = m.from || m.sender || "";
-    if (isBotOrSelf(sender)) continue;
+    if (isNoiseMail(m)) continue;
     const n = parseSenderName(sender);
     if (!n) continue;
     const e = counts.get(n) || { sources: new Set(), count: 0, lastTs: 0 };
@@ -362,6 +357,7 @@ export function renderAuthority(payload) {
     counts.set(n, e);
   }
   const tops = Array.from(counts.entries())
+    .filter(([, e]) => e.sources.size > 1 || e.count > 1)
     .sort((a, b) =>
       (b[1].sources.size - a[1].sources.size) ||
       (b[1].count - a[1].count) ||

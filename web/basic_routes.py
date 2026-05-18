@@ -1,6 +1,8 @@
 """Basic static, health, mirror, and PWA route registration."""
 from __future__ import annotations
 
+import time
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import HTTPException
@@ -69,6 +71,23 @@ def api_mirror_insights(date: str | None = None) -> dict:
     return {"date": mirror.get("date"), **insights}
 
 
+def api_mirror_whatsapp(date: str | None = None) -> dict:
+    from rag.mirror import _source_whatsapp
+
+    if date is None:
+        try:
+            from rag import mood as _mood
+
+            date = _mood._today_local()
+        except Exception:
+            date = datetime.now().date().isoformat()
+    return {
+        "date": date,
+        "computed_at": time.time(),
+        "whatsapp": _source_whatsapp(date),
+    }
+
+
 def register_basic_routes(app, static_dir: Path) -> dict[str, object]:
     """Register basic routes and return handlers for web.server compatibility."""
     static_dir = Path(static_dir)
@@ -127,6 +146,7 @@ def register_basic_routes(app, static_dir: Path) -> dict[str, object]:
     app.get("/api/mirror")(api_mirror)
     app.get("/api/screen-capture/{obs_id}")(api_screen_capture)
     app.get("/api/mirror/insights")(api_mirror_insights)
+    app.get("/api/mirror/whatsapp")(api_mirror_whatsapp)
     app.get("/manifest.webmanifest")(manifest)
     app.get("/sw.js")(service_worker)
 

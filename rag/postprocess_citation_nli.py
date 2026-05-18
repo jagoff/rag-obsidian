@@ -66,6 +66,16 @@ _CITATION_NLI_MODEL_NAME = "cross-encoder/nli-deberta-v3-small"
 _CITATION_NLI_LOAD_FAILED = False  # Sticky flag: si falla el load, no reintentamos
 
 
+def _torch_mps_empty_cache() -> None:
+    """Best-effort PyTorch MPS cache cleanup after CrossEncoder predicts."""
+    try:
+        import torch
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+    except Exception:
+        pass
+
+
 def _get_citation_nli_model():
     """Lazy-load del CrossEncoder para verificación de citaciones.
 
@@ -103,6 +113,23 @@ def _get_citation_nli_model():
                 max_length=512,
                 device=device,
             )
+            if device == "mps" and os.environ.get("RAG_NLI_NO_CLEANUP", "").strip() not in ("1", "true", "yes"):
+                _orig_predict = _citation_nli_model.predict
+                try:
+                    from rag.llm_backend import _MLX_FORWARD_LOCK as _fwd_lock  # noqa: PLC0415
+                except Exception:
+                    _fwd_lock = None
+
+                def _predict_with_metal_guard(*args, **kwargs):
+                    try:
+                        if _fwd_lock is not None:
+                            with _fwd_lock:
+                                return _orig_predict(*args, **kwargs)
+                        return _orig_predict(*args, **kwargs)
+                    finally:
+                        _torch_mps_empty_cache()
+
+                _citation_nli_model.predict = _predict_with_metal_guard
         except Exception as exc:
             _CITATION_NLI_LOAD_FAILED = True
             import warnings

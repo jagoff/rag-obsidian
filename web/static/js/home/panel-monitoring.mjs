@@ -190,50 +190,7 @@ export function renderCaptured(payload) {
     return;
   }
 
-  const vaultAct = payload.signals?.vault_activity || {};
-  const allItems = [];
-  for (const [vaultName, items] of Object.entries(vaultAct)) {
-    if (!Array.isArray(items)) continue;
-    for (const it of items) {
-      allItems.push({ ...it, _vault: vaultName });
-    }
-  }
-  allItems.sort((a, b) => (b.modified || "").localeCompare(a.modified || ""));
-
-  const inboxOnly = allItems.filter((it) => {
-    const p = it.path || "";
-    return /(?:^|\/)(00-Inbox|0-Inbox|Inbox|Clippings)\//.test(p)
-      || /^(00-Inbox|0-Inbox|Inbox|Clippings)\//.test(p);
-  });
-
-  let rows;
-  let footHint;
-  if (inboxOnly.length > 0) {
-    rows = inboxOnly.slice(0, 6);
-    footHint = "items en Inbox/Clippings · últimas 48h";
-  } else if (allItems.length > 0) {
-    rows = allItems.slice(0, 6);
-    footHint = "últimas notas tocadas · 48h";
-  } else {
-    renderPanelList("p-captured", [], {
-      emptyText: "sin actividad en los últimos 2 días",
-    });
-    return;
-  }
-
-  const hasMultipleVaults = Object.keys(vaultAct).length > 1;
-  const formattedRows = rows.map((it) => ({
-    title: it.title || it.path,
-    meta: [
-      hasMultipleVaults ? `[${it._vault}]` : null,
-      it.path ? it.path.split("/").slice(0, -1).join("/") : null,
-      ...(it.tags || []).slice(0, 2).map((t) => `#${t}`),
-      fmtTimeAgo(it.modified),
-    ].filter(Boolean),
-    href: obsidianUrl(it.path, it._vault || it.vault),
-  }));
-  renderPanelList("p-captured", formattedRows, {
-    emptyText: "sin actividad reciente",
-    footText: footHint,
+  renderPanelList("p-captured", [], {
+    emptyText: "nada capturado hoy",
   });
 }

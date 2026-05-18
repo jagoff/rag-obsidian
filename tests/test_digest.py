@@ -173,7 +173,7 @@ def test_collect_evidence_reads_query_log(digest_sql_env):
     conn.execute(
         "INSERT INTO rag_queries (ts, cmd, q, top_score, extra_json) VALUES (?, ?, ?, ?, ?)",
         (
-            "2026-04-09T10:00:00", "query", "¿qué es X?", 0.35,
+            "2026-04-09T10:00:00", "query", "¿qué es X?", 0.50,
             json.dumps({"contradictions": [{"path": "a.md", "why": "X vs Y"}]}),
         ),
     )

@@ -13,7 +13,7 @@ que cambiar de modelo sea trivial:
 | chat   | `RAG_CHAT_MODEL`     | `qwen3:30b-a3b`                               | alias en `MLX_MODEL_ALIAS`       |
 | helper | `RAG_HELPER_MODEL`   | `qwen2.5:3b`                                  | alias en `MLX_MODEL_ALIAS`       |
 | embed  | `RAG_EMBED_MODEL`    | `qwen3-embedding:0.6b`                        | dim 1024 (vault index lockstep)  |
-| rerank | `RAG_RERANKER_MODEL` | `BAAI/bge-reranker-v2-m3` — CrossEncoder vía torch/MPS (default). MLX: `resolve_mlx_reranker_path` mapea `BAAI/*` → `DEFAULT_MLX_RERANKER` | depende `RAG_RERANKER_BACKEND`   |
+| rerank | `RAG_RERANKER_MODEL` | `BAAI/bge-reranker-v2-m3` compat alias; default runtime MLX via `resolve_mlx_reranker_path` → `DEFAULT_MLX_RERANKER` | `RAG_RERANKER_BACKEND=mlx` default, `torch` rollback |
 | stt    | `RAG_STT_MODEL`      | `small`                                       | alias en `_WHISPER_NAME_TO_HF`   |
 | vlm    | `RAG_VLM_MODEL`      | `mlx-community/granite-vision-3.2-2b-4bit`    | mlx-vlm compatible               |
 

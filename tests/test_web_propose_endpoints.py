@@ -300,6 +300,26 @@ def test_detect_propose_intent_negative(q):
     assert web_server._detect_propose_intent(q or "") is False
 
 
+def test_work_mode_does_not_route_report_summary_to_calendar():
+    q = (
+        "haceme un resumen de este reporte:\n"
+        "El lunes a las 10 hay reunión de kickoff con el equipo. "
+        "Después se revisan métricas, riesgos y próximos pasos."
+    )
+    assert web_server._detect_propose_intent(q) is True
+    assert web_server._detect_chat_propose_intent(q, "work") is False
+
+
+def test_work_mode_allows_explicit_calendar_command():
+    q = "agendá reunión con Pedro el miércoles a las 4pm"
+    assert web_server._detect_chat_propose_intent(q, "work") is True
+
+
+def test_auto_mode_keeps_implicit_calendar_statement():
+    q = "mañana tengo una daily meeting a las 10am"
+    assert web_server._detect_chat_propose_intent(q, "auto") is True
+
+
 # ── _maybe_emit_proposal ────────────────────────────────────────────────────
 
 

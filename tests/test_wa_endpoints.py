@@ -122,11 +122,11 @@ def test_mark_read_persists(client):
     body = resp.json()
     assert body["ok"] is True
     assert body["jid"] == jid
-    assert body["last_seen_ts"] == "2026-05-11T12:00:00-03:00"
+    assert body["last_seen_ts"] == "2026-05-11 12:00:00-03:00"
 
     # Confirmar que efectivamente quedó persistido.
     from rag.integrations.whatsapp import _db_local
-    assert _db_local.get_last_seen(jid) == "2026-05-11T12:00:00-03:00"
+    assert _db_local.get_last_seen(jid) == "2026-05-11 12:00:00-03:00"
 
 
 def test_mark_read_uses_now_if_no_ts(client):
@@ -144,6 +144,89 @@ def test_mark_read_uses_now_if_no_ts(client):
 def test_mark_read_rejects_bad_jid(client):
     resp = client.post("/api/wa/mark_read", json={"jid": "bad"})
     assert resp.status_code == 400
+
+
+def _seed_bridge_db(path: Path):
+    import sqlite3
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE chats (jid TEXT PRIMARY KEY, name TEXT)")
+    con.execute(
+        "CREATE TABLE messages ("
+        "id TEXT PRIMARY KEY, chat_jid TEXT, sender TEXT, content TEXT, "
+        "timestamp TEXT, is_from_me INTEGER, media_type TEXT, filename TEXT, "
+        "quoted_message_id TEXT, quoted_text TEXT)"
+    )
+    return con
+
+
+def test_chats_pagination_accepts_iso_before_ts(tmp_path, monkeypatch):
+    """`before_ts` viene del frontend en ISO; el helper debe compararlo
+    contra timestamps bridge sin caer en HAVING inválido ni orden lex roto.
+    """
+    import rag as _rag
+
+    bridge = tmp_path / "bridge" / "messages.db"
+    con = _seed_bridge_db(bridge)
+    con.executemany(
+        "INSERT INTO chats (jid, name) VALUES (?, ?)",
+        [
+            ("5491111111111@s.whatsapp.net", "Maria"),
+            ("5491222222222@s.whatsapp.net", "Grecia"),
+        ],
+    )
+    con.executemany(
+        "INSERT INTO messages "
+        "(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, "
+        "quoted_message_id, quoted_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            ("a1", "5491111111111@s.whatsapp.net", "5491111111111@s.whatsapp.net",
+             "más nuevo", "2026-05-11 12:00:00-03:00", 0, "", "", "", ""),
+            ("b1", "5491222222222@s.whatsapp.net", "5491222222222@s.whatsapp.net",
+             "más viejo", "2026-05-11 11:00:00-03:00", 0, "", "", "", ""),
+        ],
+    )
+    con.commit()
+    con.close()
+    monkeypatch.setattr(_rag, "WHATSAPP_DB_PATH", bridge)
+
+    from rag.integrations.whatsapp import fetch as _wa_fetch
+
+    page1 = _wa_fetch.list_chats_for_ui(limit=1)
+    assert [c["label"] for c in page1] == ["Maria"]
+    page2 = _wa_fetch.list_chats_for_ui(limit=1, before_ts=page1[0]["last_ts"])
+    assert [c["label"] for c in page2] == ["Grecia"]
+
+
+def test_mark_read_same_day_unread_comparison_uses_bridge_format(tmp_path, monkeypatch):
+    """Unread usa comparación string contra bridge timestamps. Guardar `T`
+    hacía que mensajes nuevos del mismo día no contaran como unread.
+    """
+    import rag as _rag
+
+    bridge = tmp_path / "bridge" / "messages.db"
+    jid = "5491111111111@s.whatsapp.net"
+    con = _seed_bridge_db(bridge)
+    con.execute("INSERT INTO chats (jid, name) VALUES (?, ?)", (jid, "Maria"))
+    con.executemany(
+        "INSERT INTO messages "
+        "(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, "
+        "quoted_message_id, quoted_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            ("m1", jid, jid, "leído", "2026-05-11 12:00:00-03:00", 0, "", "", "", ""),
+            ("m2", jid, jid, "nuevo", "2026-05-11 12:30:00-03:00", 0, "", "", "", ""),
+        ],
+    )
+    con.commit()
+    con.close()
+    monkeypatch.setattr(_rag, "WHATSAPP_DB_PATH", bridge)
+
+    from rag.integrations.whatsapp import fetch as _wa_fetch
+
+    _wa_fetch.mark_read_for_ui(jid, "2026-05-11T12:00:00-03:00")
+    chats = _wa_fetch.list_chats_for_ui(limit=10)
+    assert chats[0]["unread_count"] == 1
 
 
 # ── /api/wa/search ────────────────────────────────────────────────────────────

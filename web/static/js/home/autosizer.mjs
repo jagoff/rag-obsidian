@@ -10,7 +10,17 @@
 // { "p-inbox": { "w": "full", "h": "full" }, ... }. Si existe, el
 // autosizer respeta el override y no toca data-w/data-h.
 
+import {
+  applySizeDataset,
+  hasSizeOverrides,
+  isValidSizeOverride,
+  readSizeOverrides,
+  removeKey,
+  writeSizeOverrides,
+} from "../layout-persistence.mjs?v=103";
+
 export const LS_PANEL_SIZES = "home.v2.panel-sizes.v1";
+const PANEL_SIZE_OPTIONS = { widths: ["half", "full"], heights: ["half", "full", "xl"] };
 const RESIZE_DEBOUNCE_MS = 200;
 
 // Altura del .panel-body disponible en un cell de data-h=half:
@@ -23,12 +33,7 @@ const HEIGHT_HALF_FITS_PX = 190;
 const _pending = new Map(); // panelId -> timeoutId
 
 function readOverrides() {
-  try {
-    const raw = localStorage.getItem(LS_PANEL_SIZES);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw);
-    return (parsed && typeof parsed === "object") ? parsed : {};
-  } catch { return {}; }
+  return readSizeOverrides(LS_PANEL_SIZES, PANEL_SIZE_OPTIONS);
 }
 
 function measureBodyContent(panel) {
@@ -60,30 +65,20 @@ function classifyByContent(panel) {
 }
 
 function applySize(panel, w, h) {
-  if (panel.dataset.w !== w) panel.dataset.w = w;
-  if (panel.dataset.h !== h) panel.dataset.h = h;
-}
-
-function isValidSizeOverride(ov) {
-  return (
-    ov &&
-    (ov.w === "half" || ov.w === "full") &&
-    (ov.h === "half" || ov.h === "full" || ov.h === "xl")
-  );
+  applySizeDataset(panel, { w, h });
 }
 
 export function applySavedPanelSize(panel) {
   if (!panel || !panel.id) return false;
   const overrides = readOverrides();
   const ov = overrides[panel.id];
-  if (!isValidSizeOverride(ov)) return false;
+  if (!isValidSizeOverride(ov, PANEL_SIZE_OPTIONS)) return false;
   applySize(panel, ov.w, ov.h);
   return true;
 }
 
 export function hasPanelSizeOverrides() {
-  return Object.entries(readOverrides())
-    .some(([key, ov]) => !!key && isValidSizeOverride(ov));
+  return hasSizeOverrides(LS_PANEL_SIZES, PANEL_SIZE_OPTIONS);
 }
 
 function resizePanel(panel) {
@@ -131,7 +126,9 @@ export function observePanel(panel) {
 }
 
 export function observeAllPanels(root = document) {
-  root.querySelectorAll(".section-body > .panel").forEach(observePanel);
+  root
+    .querySelectorAll("#today-hero-body > .panel, #home-cmdbar > .panel, .section-body > .panel")
+    .forEach(observePanel);
 }
 
 // Manual override API — desde DevTools o un botón futuro:
@@ -141,18 +138,12 @@ export function setPanelSize(panelId, w, h) {
   const overrides = readOverrides();
   if (!w && !h) {
     delete overrides[panelId];
-  } else {
+  } else if (isValidSizeOverride({ w, h }, PANEL_SIZE_OPTIONS)) {
     overrides[panelId] = { w, h };
+  } else {
+    delete overrides[panelId];
   }
-  try {
-    if (Object.keys(overrides).length === 0) {
-      localStorage.removeItem(LS_PANEL_SIZES);
-    } else {
-      localStorage.setItem(LS_PANEL_SIZES, JSON.stringify(overrides));
-    }
-  } catch (e) {
-    console.warn("[home.v2] no pude persistir override de tamaño:", e);
-  }
+  writeSizeOverrides(LS_PANEL_SIZES, overrides, PANEL_SIZE_OPTIONS);
   const panel = document.getElementById(panelId);
   if (panel) {
     if (!applySavedPanelSize(panel)) resizePanel(panel);
@@ -160,8 +151,10 @@ export function setPanelSize(panelId, w, h) {
 }
 
 export function clearPanelSizeOverrides() {
-  try { localStorage.removeItem(LS_PANEL_SIZES); } catch {}
-  document.querySelectorAll(".section-body > .panel").forEach(resizePanel);
+  removeKey(LS_PANEL_SIZES);
+  document
+    .querySelectorAll("#today-hero-body > .panel, #home-cmdbar > .panel, .section-body > .panel")
+    .forEach(resizePanel);
 }
 
 // Expose para debugging desde la console.

@@ -54,6 +54,25 @@ def test_fetch_reminders_due_returns_empty_on_blank_osascript_output(monkeypatch
     assert out == []
 
 
+def test_fetch_reminders_due_uses_configurable_osascript_timeout(monkeypatch):
+    import rag
+
+    monkeypatch.setattr(rag, "_apple_enabled", lambda: True)
+    monkeypatch.setenv("RAG_REMINDERS_OSASCRIPT_TIMEOUT_S", "3.5")
+    captured: dict[str, float | None] = {}
+
+    def fake_osascript(_script, *, timeout=None):
+        captured["timeout"] = timeout
+        return ""
+
+    monkeypatch.setattr(rag, "_osascript", fake_osascript)
+
+    out = rem_mod._fetch_reminders_due(datetime(2026, 4, 25, 12, 0))
+
+    assert out == []
+    assert captured["timeout"] == 3.5
+
+
 # ── Pipe-shape parsing ──────────────────────────────────────────────────
 
 

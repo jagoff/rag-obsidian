@@ -143,13 +143,23 @@ echo $OBSIDIAN_RAG_WATCH_EXCLUDE_FOLDERS
 
 **Esperable hasta cierto punto**. Un full reconstruye embeddings para todos los chunks del vault. En un vault de ~5000 chunks puede tardar 10-30 minutos (según el modelo y tu Mac).
 
-Desde 2026-05-16, todo `rag index` activa safe mode por default: usa batches de embedding chicos, shardea notas grandes, chequea memory pressure antes y durante la corrida, y aborta limpio si la presión persiste. Además, `rag index --full` desactiva synthetic questions + entities en esa corrida. Para correr full con esos enriquecimientos pero manteniendo las guardas base:
+Desde 2026-05-16, todo `rag index` activa safe mode por default: shardea notas grandes, saltea entities, chequea memory pressure antes y durante la corrida, y aborta limpio si el proceso crece demasiado. Desde 2026-05-17, safe mode también saltea enriquecimientos LLM opcionales (synthetic questions, context summary, contextual retrieval y contradictions) para que el index sea parse + embed por default.
+
+El index mantiene además una cache persistente exact-match de embeddings (`RAG_INDEX_EMBED_CACHE=1`). Un primer full llena esa cache; los full posteriores pueden reconstruir la base y las URLs reutilizando vectores idénticos por hash de texto + modelo/backend. El batching MLX queda en `auto` por default, así que en Macs de ~36 GB usa batches más grandes (`batch=96`, `slice=48`, `local_batch=48`) sin cambiar el contenido indexado.
+
+También mide y acota los pre-syncs cross-source antes del scan del vault. El output muestra `Cross-source timing` y el `Timing index` separa `etl`, `embed`, `write` y `urls`. Por default los ETLs externos corren en paralelo, Reminders tiene timeout corto durante safe index, y los ETLs que ya escribieron snapshots recientes se saltean por `RAG_INDEX_ETL_FRESH_TTL_S=600`. Para medir una pasada fresca completa sin cache de ETL:
 
 ```bash
-RAG_INDEX_FULL_SAFE=0 rag index --full
+RAG_INDEX_ETL_FRESH_TTL_S=0 rag index --full
 ```
 
-Para desactivar también las guardas base existe `RAG_INDEX_SAFE=0`, pero no es recomendable en una Mac que ya se colgó por presión de memoria.
+Para reactivar esos enriquecimientos explícitamente:
+
+```bash
+RAG_INDEX_LLM_ENRICHMENTS=1 RAG_CONTEXT_SUMMARY=1 rag index --full --contextual
+```
+
+Para desactivar las guardas base existe `RAG_INDEX_SAFE=0`, pero no es recomendable en una Mac que ya se colgó por presión de memoria.
 
 Si querés recuperar entidades después de un full seguro, corré el backfill aislado:
 

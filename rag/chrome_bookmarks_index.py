@@ -210,7 +210,26 @@ def _index_chrome_bookmarks(
         batch_ids = ids[i:i + batch_size]
         batch_docs = docs[i:i + batch_size]
         batch_metas = metas[i:i + batch_size]
-        embeddings = rag.embed(batch_docs)
+        embeddings = None
+        try:
+            cache_enabled = rag._index_embed_cache_enabled()
+        except Exception:
+            cache_enabled = False
+        if cache_enabled:
+            try:
+                from rag.embedding_cache import embed_texts_cached  # noqa: PLC0415
+
+                embeddings, _stats = embed_texts_cached(
+                    batch_docs,
+                    db_dir=rag.DB_PATH,
+                    model_id=rag._index_embed_cache_model_id(),
+                    namespace="bookmark-url-v1",
+                    embed_fn=rag.embed,
+                )
+            except Exception:
+                embeddings = None
+        if embeddings is None:
+            embeddings = rag.embed(batch_docs)
         col_urls.add(
             ids=batch_ids,
             embeddings=embeddings,

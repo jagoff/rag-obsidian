@@ -199,6 +199,29 @@ def test_index_chrome_bookmarks_empty_clears_profile(tmp_urls_col):
     assert got["ids"] == []
 
 
+def test_index_chrome_bookmarks_uses_persistent_embedding_cache(
+    tmp_urls_col,
+    tmp_path,
+    monkeypatch,
+):
+    col = tmp_urls_col
+    calls = {"n": 0}
+
+    def fake_counting_embed(texts):
+        calls["n"] += 1
+        return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
+
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path / "ragvec-cache")
+    monkeypatch.setenv("RAG_INDEX_EMBED_CACHE", "1")
+    monkeypatch.setattr(rag, "embed", fake_counting_embed)
+
+    bookmarks = _bms(("https://a.example", "A"), ("https://b.example", "B"))
+    assert rag._index_chrome_bookmarks(col, "Default", bookmarks) == 2
+    assert rag._index_chrome_bookmarks(col, "Default", bookmarks) == 2
+
+    assert calls["n"] == 1
+
+
 # ── sync_chrome_bookmarks (end-to-end with fake Chrome dir) ──────────────────
 
 

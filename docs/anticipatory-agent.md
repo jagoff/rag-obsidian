@@ -154,6 +154,7 @@ Fuente: [[2026-04-13 - family.md]]
 | `RAG_ANTICIPATE_ECHO_MIN_COSINE` | `0.70` | Cosine threshold entre nota-hoy y nota-vieja |
 | `RAG_ANTICIPATE_COMMITMENT_MIN_AGE_DAYS` | `7` | Age mínimo de un loop stale para push |
 | `RAG_ANTICIPATE_DISABLED` | — | Si `1/true/yes`: agent hace early-return (kill switch) |
+| `RAG_ANTICIPATE_LOCK_PATH` | `~/.local/share/obsidian-rag/anticipate.lock` | Override del lockfile cooperativo; útil para tests/sandboxes |
 
 Todos son `os.environ.get()` al import — hay que reiniciar el daemon para que tomen efecto nuevos valores. Para probar en runtime, usar `rag anticipate explain` + `--force`.
 

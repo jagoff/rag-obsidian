@@ -49,7 +49,7 @@ El proyecto está en **buen estado operativo** pero con varios bugs documentados
 |---|---|---|---|
 | **001** | 2026-04-26 | Loky semaphore leak en daemons | Pre-set tqdm lock a threading.RLock antes de heavy imports |
 | **002** | 2026-05-08 | MLX-LM race condition (non-main thread) | Force mlx_lm import en main thread antes de prewarm threads |
-| **003** | 2026-04-20 | HuggingFace offline + fastembed cache GC | Set HF_HUB_OFFLINE, TRANSFORMERS_OFFLINE, FASTEMBED_CACHE_PATH antes de imports |
+| **003** | 2026-04-20 | HuggingFace offline import race | Set HF_HUB_OFFLINE y TRANSFORMERS_OFFLINE antes de imports |
 
 ### 🔴 Abiertos (Audit 2026-04-26)
 

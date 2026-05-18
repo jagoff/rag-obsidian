@@ -579,7 +579,8 @@
       margin: 0;
       flex: 1;
     }
-    .collapse-btn {
+    .collapse-btn,
+    .section-size-btn {
       background: none;
       border: 1px solid var(--border);
       color: var(--text-dim);
@@ -593,8 +594,11 @@
       display: inline-flex;
       align-items: center;
       justify-content: center;
+      flex-shrink: 0;
     }
-    .collapse-btn:hover { color: var(--text); border-color: var(--border-strong); }
+    .collapse-btn:hover,
+    .section-size-btn:hover { color: var(--text); border-color: var(--border-strong); }
+    .learn-section-body[hidden],
     .learn-section-body.collapsed { display: none; }
 
     /* ── Chart grid + cards (mismo look que dashboard.html) ───────── */
@@ -631,6 +635,15 @@
       min-height: 240px;
     }
     .chart-card canvas { max-height: 280px; }
+    .learn-section[data-h="normal"] .chart-card { min-height: 300px; }
+    .learn-section[data-h="normal"] .chart-card .chart-wrap { min-height: 240px; }
+    .learn-section[data-h="normal"] .chart-card canvas { max-height: 280px; }
+    .learn-section[data-h="tall"] .chart-card { min-height: 420px; }
+    .learn-section[data-h="tall"] .chart-card .chart-wrap { min-height: 340px; }
+    .learn-section[data-h="tall"] .chart-card canvas { max-height: 400px; }
+    .learn-section[data-h="xl"] .chart-card { min-height: 560px; }
+    .learn-section[data-h="xl"] .chart-card .chart-wrap { min-height: 480px; }
+    .learn-section[data-h="xl"] .chart-card canvas { max-height: 540px; }
 
     /* Insufficient placeholder — sustituye al canvas cuando series.insufficient=true */
     .insufficient {
@@ -806,15 +819,25 @@
     @media (max-width: 640px) {
       header.hdr { padding: 12px 16px; gap: 6px 10px; }
       .hdr-l { font-size: 16px; }
-      .hdr-r { gap: 8px; font-size: 11px; }
+      .hdr-r { gap: 8px; font-size: 11px; width: 100%; }
+      .hdr-nav {
+        width: 100%;
+        flex-wrap: nowrap;
+        overflow-x: auto;
+        padding-bottom: 4px;
+        scrollbar-width: none;
+      }
+      .hdr-nav::-webkit-scrollbar { display: none; }
+      .hdr-nav a { flex: 0 0 auto; }
       .seg-btn { padding: 4px 8px; }
       .kpi-hero { padding: 12px 16px; gap: 12px; }
       .kpi-value { font-size: 24px; }
       .learn-section { padding: 14px 16px; }
       .chart-card { padding: 14px; }
+      .tx-table { min-width: 560px; }
     }
     @media (pointer: coarse), (max-width: 640px) {
-      .btn-icon, .seg-btn, .collapse-btn, .hdr-nav a {
+      .btn-icon, .seg-btn, .collapse-btn, .section-size-btn, .hdr-nav a {
         min-height: 36px;
       }
     }
@@ -887,6 +910,7 @@
     .tx-table {
       width: 100%; border-collapse: collapse;
       font-size: 12px; font-variant-numeric: tabular-nums;
+      min-width: 520px;
     }
     .tx-table thead th {
       text-align: left; color: var(--text-faint); font-weight: 500;
@@ -911,10 +935,14 @@
     .tx-table .tx-cat { color: var(--text-dim); white-space: nowrap; }
     .tx-table .tx-store { color: var(--text-dim); }
     .tx-scroll {
-      max-height: 480px; overflow-y: auto;
+      max-height: 480px; overflow: auto;
       border: 1px solid var(--border); border-radius: 10px;
       background: var(--bg-card);
+      -webkit-overflow-scrolling: touch;
     }
+    .learn-section[data-h="normal"] .tx-scroll { max-height: 480px; }
+    .learn-section[data-h="tall"] .tx-scroll { max-height: 660px; }
+    .learn-section[data-h="xl"] .tx-scroll { max-height: 860px; }
     /* Pill para la categoría en la tabla */
     .tx-cat-pill {
       display: inline-block;
@@ -1081,6 +1109,45 @@
       border-radius: 10px;
       padding: 12px 14px;
       display: flex; flex-direction: column; gap: 10px;
+    }
+    .cc-detail-group {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: color-mix(in srgb, var(--bg-elev) 72%, transparent);
+      overflow: hidden;
+    }
+    .cc-detail-group + .cc-detail-group { margin-top: -4px; }
+    .cc-detail-group > summary {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 11px 14px;
+      cursor: pointer;
+      color: var(--text);
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      user-select: none;
+    }
+    .cc-detail-group > summary::-webkit-details-marker { display: none; }
+    .cc-detail-group > summary::after {
+      content: "+";
+      color: var(--text-faint);
+      font-size: 14px;
+      line-height: 1;
+    }
+    .cc-detail-group[open] > summary {
+      border-bottom: 1px solid var(--border);
+      color: var(--cyan);
+    }
+    .cc-detail-group[open] > summary::after { content: "−"; }
+    .cc-detail-group-body {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      padding: 12px;
     }
     .cc-section-title {
       font-size: 11px; color: var(--text-dim);
@@ -1373,7 +1440,7 @@
       to { opacity: 1; transform: translateY(0); }
     }
 
-    /* ── Finance layout: drag & drop + collapse ───────────────────── */
+    /* ── Finance layout: drag & drop + collapse + resize ──────────── */
     .learn-section { position: relative; }
     .learn-section-hdr { cursor: grab; }
     .learn-section-hdr:active { cursor: grabbing; }
@@ -1398,11 +1465,40 @@
       border-style: dashed;
       border-color: var(--accent, #79ddff);
     }
+    .learn-section.is-resizing {
+      border-color: var(--accent, #79ddff);
+      box-shadow: inset 0 -1px 0 var(--accent, #79ddff);
+    }
     .learn-section.drop-before {
-      box-shadow: inset 2px 0 0 var(--accent, #79ddff);
+      box-shadow: inset 0 2px 0 var(--accent, #79ddff);
     }
     .learn-section.drop-after {
-      box-shadow: inset -2px 0 0 var(--accent, #79ddff);
+      box-shadow: inset 0 -2px 0 var(--accent, #79ddff);
+    }
+    .finance-resize-handle {
+      position: absolute;
+      left: 24px;
+      right: 24px;
+      bottom: 0;
+      height: 10px;
+      cursor: ns-resize;
+      touch-action: none;
+      opacity: 0;
+      transition: opacity 120ms ease;
+    }
+    .finance-resize-handle::before {
+      content: "";
+      position: absolute;
+      left: 40%;
+      right: 40%;
+      bottom: 3px;
+      height: 2px;
+      border-radius: 999px;
+      background: var(--text-faint);
+    }
+    .learn-section:hover .finance-resize-handle,
+    .learn-section.is-resizing .finance-resize-handle {
+      opacity: 0.75;
     }
     .reset-layout-btn {
       background: var(--bg-elev, #222228);
@@ -1451,13 +1547,17 @@
         <span id="theme-icon" aria-hidden="true"></span>
       </button>
       <nav class="hdr-nav" aria-label="Navegación principal">
+        <a href="/chat">chat</a>
+        <a href="/wzp">wzp</a>
         <a href="/mirror">mirror</a>
         <a href="/dashboard">dashboard</a>
         <a href="/learning">learning</a>
         <a href="/atlas">atlas</a>
         <a href="/status">status</a>
+        <a href="/logs">logs</a>
         <a href="/memo">memory</a>
         <a href="/fine_tunning">fine_tunning</a>
+        <a href="/blacklist">blacklist</a>
       </nav>
     </div>
   </header>
@@ -1688,9 +1788,9 @@
   <span id="finance-status" class="sr-only" role="status" aria-live="polite">Cargando datos del dashboard de finanzas</span>
 
   <script src="/static/finance.js?v=20260516-usd2" defer></script>
-  <script type="module" src="/static/js/finance-layout.mjs"></script>
+  <script type="module" src="/static/js/finance-layout.mjs?v=20260516-layout1"></script>
   <script type="module">
-    import { initFinanceLayout } from "/static/js/finance-layout.mjs";
+    import { initFinanceLayout } from "/static/js/finance-layout.mjs?v=20260516-layout1";
     document.addEventListener("DOMContentLoaded", () => {
       initFinanceLayout();
     });

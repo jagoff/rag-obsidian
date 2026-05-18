@@ -35,7 +35,17 @@ from pathlib import Path
 from fastapi import HTTPException, Request
 
 
-_ADMIN_TOKEN_PATH = Path.home() / ".config" / "obsidian-rag" / "admin_token.txt"
+def _default_admin_token_path() -> Path:
+    config_dir = os.environ.get("OBSIDIAN_RAG_CONFIG_DIR", "").strip()
+    if config_dir:
+        return Path(config_dir).expanduser() / "admin_token.txt"
+    state_dir = os.environ.get("OBSIDIAN_RAG_STATE_DIR", "").strip()
+    if state_dir:
+        return Path(state_dir).expanduser() / "config" / "admin_token.txt"
+    return Path.home() / ".config" / "obsidian-rag" / "admin_token.txt"
+
+
+_ADMIN_TOKEN_PATH = _default_admin_token_path()
 
 
 def _resolve_token_path() -> Path:
@@ -111,7 +121,7 @@ def _require_admin_token(request: Request) -> None:
             status_code=401,
             detail=(
                 "Se requiere Authorization: Bearer <admin_token>. "
-                "El token está en ~/.config/obsidian-rag/admin_token.txt"
+                f"El token está en {_resolve_token_path()}"
             ),
         )
 

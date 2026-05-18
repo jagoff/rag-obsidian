@@ -4,10 +4,20 @@
 
 import {
   escapeHTML, fmtTimeAgo,
-  obsidianUrl, gmailThreadUrl, whatsappUrl, youtubeUrl,
+  obsidianUrl, gmailThreadUrl, whatsappUrl,
   getCurrentPayload,
+  isBotOrSelf,
   isReminderDueToday, isReminderDueTomorrow, reminderTitle,
 } from "./core.mjs";
+import {
+  readJSON,
+  readObject,
+  readString,
+  removeKey,
+  writeJSON,
+  writeObjectOrRemove,
+  writeString,
+} from "../layout-persistence.mjs?v=103";
 
 // ── Wikilinks → Markdown links ────────────────────────────────────────────────
 
@@ -97,6 +107,11 @@ export function renderHighlights(h) {
   if (!h || typeof h !== "object") return "";
   const chips = [];
   const truncate = (s, n) => (s || "").length > n ? (s || "").slice(0, n) + "…" : (s || "");
+  const usefulTopic = (topic) => {
+    const t = String(topic || "").trim().toLowerCase();
+    if (!t || t.length < 4) return false;
+    return !/^(estoy|esta|este|eso|algo|tema|cosas?|info|notas?|hoy|ayer|mañana|mail|gmail|whatsapp)$/.test(t);
+  };
 
   // Chip 1: top WhatsApp chat del día
   if (h.wa_top_chat && h.wa_top_chat.count > 0) {
@@ -189,7 +204,11 @@ export function renderHighlights(h) {
   }
 
   // Chip 8: top topic cross-source
-  if (h.top_topic && (h.top_topic.sources_count || (h.top_topic.sources || []).length) >= 2) {
+  if (
+    h.top_topic
+    && usefulTopic(h.top_topic.topic)
+    && (h.top_topic.sources_count || (h.top_topic.sources || []).length) >= 2
+  ) {
     const t = h.top_topic;
     const sources = (t.sources || []).join(" + ");
     chips.push(`
@@ -212,8 +231,9 @@ export function renderPatternsSub(p) {
   const truncate = (s, n) => (s || "").length > n ? (s || "").slice(0, n) + "…" : (s || "");
 
   // Spikes — chats WA hot del día
-  if ((p.spikes || []).length) {
-    const items = p.spikes.map((s) => {
+  const spikes = (p.spikes || []).filter((s) => Number(s.avg_7d || 0) > 0);
+  if (spikes.length) {
+    const items = spikes.map((s) => {
       const url = whatsappUrl(s.jid);
       const inner = `
         <strong>${escapeHTML(s.name)}</strong>
@@ -291,6 +311,14 @@ export function renderPatternsSub(p) {
   return `<div class="hero-patterns">${cards.join("")}</div>`;
 }
 
+function shouldRenderNarrative(payload, md) {
+  if (!String(md || "").trim()) return false;
+  const source = payload.today?.narrative_source || "";
+  if (source === "cached" || source === "stale") return false;
+  const text = String(md).toLowerCase();
+  return !/mercado\s*libre|meli\+|netflix|pinterest|youtube|prueba gratis|receipt|invoice|factura|comprobante/.test(text);
+}
+
 // ── Render del today hero ─────────────────────────────────────────────────────
 
 // Set de textos de reminder creados en esta sesión (evita doble-create en re-renders).
@@ -302,13 +330,27 @@ export function renderTodayHero(payload) {
   const bodyEl = document.getElementById("today-hero-body");
   if (!dateEl || !bodyEl) return;
 
+  // Estas cajas pueden haber sido movidas a otros contenedores por el layout
+  // persistido. Cada refresh reconstruye el hero desde el payload; removemos
+  // las instancias viejas para no dejar IDs duplicados antes de aplicar el
+  // orden global desde layout.mjs.
+  document
+    .querySelectorAll("#home-cmdbar > .hero-section, .section-body > .hero-section")
+    .forEach((sec) => sec.remove());
+  const preservedHeroBodyItems = document.createDocumentFragment();
+  Array.from(bodyEl.children).forEach((el) => {
+    if (el.classList?.contains("panel") || el.classList?.contains("kpi")) {
+      preservedHeroBodyItems.appendChild(el);
+    }
+  });
+
   dateEl.textContent = payload.date || "—";
 
-  const counts = payload.today?.counts || {};
   const evidence = payload.today?.evidence || {};
   const signals = payload.signals || {};
+  const heroSection = bodyEl.closest(".today-hero");
   const inboxItems = evidence.inbox_today || [];
-  const lowConfItems = signals.low_conf || [];
+  const lowConfItems = evidence.low_conf_queries || [];
   const tomorrowEvents = Array.isArray(payload.tomorrow_calendar)
     ? payload.tomorrow_calendar
     : [];
@@ -316,13 +358,8 @@ export function renderTodayHero(payload) {
     ? payload.today_calendar
     : [];
 
-  const totalThings = (counts.total) ||
-    ((evidence.recent_notes?.length || 0) +
-     (inboxItems.length) +
-     (lowConfItems.length));
-  countsEl.textContent = `${totalThings} señales · ${inboxItems.length} inbox · ${lowConfItems.length} preguntas`;
-
-  const md = payload.today?.narrative || "";
+  const rawNarrative = payload.today?.narrative || "";
+  const md = shouldRenderNarrative(payload, rawNarrative) ? rawNarrative : "";
   const split = splitNarrative(md);
 
   // Si el cuadro queda sin contenido real, NO lo renderizamos — preferimos
@@ -342,6 +379,22 @@ export function renderTodayHero(payload) {
 
   const fromName = (s) => (s || "").split("<")[0].trim() || s || "";
   const truncate = (s, n) => (s || "").length > n ? (s || "").slice(0, n) + "…" : (s || "");
+  const dateKey = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  const todayKey = dateKey(new Date());
+  const isTodayValue = (value) => {
+    if (!value) return false;
+    const d = new Date(value);
+    return !Number.isNaN(d.getTime()) && dateKey(d) === todayKey;
+  };
+  const isNoiseMail = (m) => {
+    const text = `${m.from || ""} ${m.subject || ""}`.toLowerCase();
+    return isBotOrSelf(m.from)
+      || /\b(receipt|invoice|factura|comprobante)\b/.test(text)
+      || /\b(compraste|prueba gratis|bienvenido al plan)\b/.test(text)
+      || /mercado\s*libre|meli\+|mail\.anthropic\.com/.test(text);
+  };
+  const isUsefulMail = (m) =>
+    !isNoiseMail(m) && (!m.internal_date_ms || isTodayValue(Number(m.internal_date_ms)));
 
   const vaultsInPlay = new Set();
   for (const item of [...(evidence.recent_notes || []), ...inboxItems, ...(evidence.todos || [])]) {
@@ -352,43 +405,18 @@ export function renderTodayHero(payload) {
     ? ` <span class="vault-tag">[${escapeHTML(item.vault)}]</span>`
     : "";
 
-  const highlights = payload.today?.highlights || {};
+  const highlights = { ...(payload.today?.highlights || {}) };
+  highlights.youtube_videos = (signals.youtube_watched || [])
+    .filter((v) => isTodayValue(v.last_visit_iso))
+    .length;
   const patterns = payload.today?.patterns || {};
-  let narrativeHTML = renderHighlights(highlights);
+  let narrativeHTML = "";
 
   if (split.narrative) {
+    narrativeHTML += renderHighlights(highlights);
     narrativeHTML += `<div class="hero-prose">${mdToHTML(split.narrative)}</div>`;
-  } else {
-    const lines = [];
-    const recent = (evidence.recent_notes || []).slice(0, 3);
-    if (recent.length) {
-      lines.push("<p>Notas tocadas hoy:</p><ul>" + recent.map((n) => {
-        const url = obsidianUrl(n.path, n.vault);
-        const titleHTML = `<strong>${escapeHTML(n.title || n.path)}</strong>${vaultTag(n)}`;
-        return `<li>${url ? `<a class="wikilink" href="${escapeHTML(url)}">${titleHTML}</a>` : titleHTML}</li>`;
-      }).join("") + "</ul>");
-    }
-    const ytWatched = (signals.youtube_watched || []).slice(0, 3);
-    if (ytWatched.length) {
-      lines.push("<p>Videos que viste:</p><ul>" + ytWatched.map((v) => {
-        const url = youtubeUrl(v.video_id);
-        const txt = escapeHTML(v.title || v.video_id || "");
-        return `<li>${url ? `<a href="${escapeHTML(url)}" target="_blank" rel="noopener">${txt}</a>` : txt}</li>`;
-      }).join("") + "</ul>");
-    }
-    const gmailRecent = (signals.gmail?.recent || []).slice(0, 3);
-    if (gmailRecent.length) {
-      lines.push("<p>Mails recibidos:</p><ul>" + gmailRecent.map((m) => {
-        const url = gmailThreadUrl(m.thread_id);
-        const inner = `<strong>${escapeHTML(fromName(m.from))}</strong>: ${escapeHTML(truncate(m.subject || "", 70))}`;
-        return `<li>${url ? `<a href="${escapeHTML(url)}" target="_blank" rel="noopener">${inner}</a>` : inner}</li>`;
-      }).join("") + "</ul>");
-    }
-    if (lines.length) {
-      narrativeHTML += `<div class="hero-prose">${lines.join("")}</div>`;
-    }
+    narrativeHTML += renderPatternsSub(patterns);
   }
-  narrativeHTML += renderPatternsSub(patterns);
 
   // Sub-section: inbox
   let inboxHTML = "";
@@ -408,17 +436,9 @@ export function renderTodayHero(payload) {
       const inner = `📝 <strong>${escapeHTML(it.title || it.path)}</strong>${vaultTag(it)}${tags ? " " + tags : ""}`;
       items.push(`<li>${wrapLink(obsidianUrl(it.path, it.vault), inner, true)}</li>`);
     }
-    for (const m of (signals.gmail?.recent || []).slice(0, 3)) {
+    for (const m of (signals.gmail?.recent || []).filter(isUsefulMail).slice(0, 3)) {
       const inner = `📧 <strong>${escapeHTML(fromName(m.from))}</strong>: ${escapeHTML(truncate(m.subject || "", 80))}`;
       items.push(`<li>${wrapLink(gmailThreadUrl(m.thread_id), inner)}</li>`);
-    }
-    const wa = [...(signals.whatsapp_unreplied || [])]
-      .sort((a, b) => (b.hours_waiting || 0) - (a.hours_waiting || 0))
-      .slice(0, 3);
-    for (const w of wa) {
-      const hrs = w.hours_waiting != null ? ` <em>(${Math.round(w.hours_waiting)}h)</em>` : "";
-      const inner = `💬 <strong>${escapeHTML(w.name || "")}</strong>${hrs}: ${escapeHTML(truncate(w.last_snippet || "", 70))}`;
-      items.push(`<li>${wrapLink(whatsappUrl(w.jid), inner)}</li>`);
     }
     const mailUnread = (signals.mail_unread || []).slice(0, 2);
     if (!signals.gmail?.recent?.length && mailUnread.length) {
@@ -443,37 +463,14 @@ export function renderTodayHero(payload) {
     };
     for (const q of lowConfItems.slice(0, 3)) {
       const text = q.q || q.question || q.text || "";
-      const score = q.score != null
-        ? ` <em>(${(typeof q.score === "number" ? q.score : Number(q.score)).toFixed(2)})</em>`
+      const rawScore = q.score ?? q.top_score;
+      const scoreNum = Number(rawScore);
+      const score = Number.isFinite(scoreNum)
+        ? ` <em>(${scoreNum.toFixed(2)})</em>`
         : "";
       const inner = `❓ ${escapeHTML(text)}${score}`;
       const url = text ? `/chat?q=${encodeURIComponent(text)}` : null;
       items.push(`<li>${wrapLink(url, inner)}</li>`);
-    }
-    const aging = signals.followup_aging || {};
-    const stalePlus = aging.stale_30plus || aging.stale_count || 0;
-    if (!items.length && stalePlus > 0) {
-      items.push(`<li>⚠️ <strong>${stalePlus}</strong> loops STALE (≥30d sin avance)</li>`);
-    }
-    const contrad = signals.contradictions || [];
-    const newContrad = (evidence.new_contradictions || []).slice(0, 2);
-    const allContrad = newContrad.length ? newContrad : (Array.isArray(contrad) ? contrad.slice(0, 2) : []);
-    for (const c of allContrad) {
-      const text = c.text || c.summary || c.title || c.note_a || "";
-      if (!text) continue;
-      const inner = `⚠ ${escapeHTML(truncate(text, 100))}`;
-      const url = obsidianUrl(c.subject_path || c.path, c.vault);
-      items.push(`<li>${wrapLink(url, inner, true)}</li>`);
-    }
-    if (!items.length) {
-      const activo = (signals.loops_activo || []).slice(0, 3);
-      for (const l of activo) {
-        const txt = l.loop_text || l.text || l.title || "";
-        if (!txt) continue;
-        const inner = `🔄 ${escapeHTML(truncate(txt, 100))}`;
-        const url = obsidianUrl(l.source_note, l.vault);
-        items.push(`<li>${wrapLink(url, inner, true)}</li>`);
-      }
     }
     questionsHTML = items.length ? `<ul>${items.join("")}</ul>` : "";
   }
@@ -512,11 +509,8 @@ export function renderTodayHero(payload) {
   }
 
   const inboxCount = inboxItems.length
-    + (signals.gmail?.recent?.length || 0)
-    + (signals.whatsapp_unreplied?.length || 0);
-  const questionsCount = lowConfItems.length
-    + ((signals.followup_aging?.stale_30plus || 0) > 0 ? 1 : 0)
-    + (evidence.new_contradictions?.length || 0);
+    + ((signals.gmail?.recent || []).filter(isUsefulMail).length);
+  const questionsCount = lowConfItems.length;
   const todayCount = todayEvents.length
     + (signals.reminders || []).filter(isReminderDueToday).length;
   const tomorrowCount = tomorrowEvents.length
@@ -554,13 +548,27 @@ export function renderTodayHero(payload) {
     sectionHTML("s-questions", "🔍", "Preguntas abiertas", questionsCount || null, questionsHTML, ""),
     agendaHTML,
   ].filter((s) => (s || "").trim().length > 0);
+  const actionableCount = (split.narrative ? 1 : 0)
+    + (inboxCount || 0)
+    + (questionsCount || 0)
+    + (todayCount || 0)
+    + (tomorrowCount || 0);
+  countsEl.textContent = heroPieces.length
+    ? `${actionableCount} accionables · ${inboxItems.length} inbox · ${questionsCount} preguntas`
+    : "";
+
+  const hasPreservedHeroItems = preservedHeroBodyItems.childNodes.length > 0;
+  if (heroSection) heroSection.hidden = heroPieces.length === 0 && !hasPreservedHeroItems;
   // Cuando TODOS los cuadros están vacíos, mostrar un solo placeholder para
   // el caso pre-brief (no dejar el hero completamente en blanco sin pista
   // de cómo arrancarlo).
   if (heroPieces.length === 0) {
-    bodyEl.innerHTML = `<div class="empty">Aún sin brief — pulsá ↻ arriba para generar</div>`;
+    bodyEl.innerHTML = "";
   } else {
     bodyEl.innerHTML = heroPieces.join("");
+  }
+  if (preservedHeroBodyItems.firstChild) {
+    bodyEl.appendChild(preservedHeroBodyItems);
   }
 
   // Inyectar botones inline "crear reminder" en cada <li> de "Para mañana"
@@ -607,12 +615,8 @@ function _heroSectionKey(el) {
 }
 
 function _readHeroOrder() {
-  try {
-    const raw = localStorage.getItem(LS_HERO_ORDER);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : null;
-  } catch { return null; }
+  const parsed = readJSON(LS_HERO_ORDER, null);
+  return Array.isArray(parsed) ? parsed : null;
 }
 
 function _saveHeroOrder() {
@@ -621,10 +625,8 @@ function _saveHeroOrder() {
   const order = Array.from(body.querySelectorAll(":scope > .hero-section"))
     .map(_heroSectionKey)
     .filter(Boolean);
-  try {
-    localStorage.setItem(LS_HERO_ORDER, JSON.stringify(order));
-  } catch (e) {
-    console.warn("[home.v2] no pude persistir hero order:", e);
+  if (!writeJSON(LS_HERO_ORDER, order)) {
+    console.warn("[home.v2] no pude persistir hero order");
   }
   try { window._updateResetButtonVisibility?.(); } catch {}
 }
@@ -641,25 +643,14 @@ export function applyHeroOrder() {
 }
 
 function _readHeroSubCollapsed() {
-  try {
-    const raw = localStorage.getItem(LS_HERO_SUB_COLLAPSED);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw);
-    return (parsed && typeof parsed === "object") ? parsed : {};
-  } catch { return {}; }
+  return readObject(LS_HERO_SUB_COLLAPSED, {});
 }
 
 function _writeHeroSubCollapsed(map) {
-  try {
-    const trimmed = {};
-    for (const [k, v] of Object.entries(map)) if (v) trimmed[k] = true;
-    if (Object.keys(trimmed).length === 0) {
-      localStorage.removeItem(LS_HERO_SUB_COLLAPSED);
-    } else {
-      localStorage.setItem(LS_HERO_SUB_COLLAPSED, JSON.stringify(trimmed));
-    }
-  } catch (e) {
-    console.warn("[home.v2] no pude persistir hero sub collapse:", e);
+  const trimmed = {};
+  for (const [k, v] of Object.entries(map)) if (v) trimmed[k] = true;
+  if (!writeObjectOrRemove(LS_HERO_SUB_COLLAPSED, trimmed)) {
+    console.warn("[home.v2] no pude persistir hero sub collapse");
   }
   try { window._updateResetButtonVisibility?.(); } catch {}
 }
@@ -704,7 +695,93 @@ function _toggleHeroSubCollapse(sec) {
 
 let _draggingHero = null;
 
+function _heroDropPlacement(ev, el) {
+  const rect = el.getBoundingClientRect();
+  const x = rect.width ? (ev.clientX - rect.left) / rect.width : 0.5;
+  const y = rect.height ? (ev.clientY - rect.top) / rect.height : 0.5;
+  if (y < 0.33) return { before: true, axis: "y" };
+  if (y > 0.67) return { before: false, axis: "y" };
+  return { before: x < 0.5, axis: "x" };
+}
+
+function _setHeroDropMark(el, placement) {
+  const before = !!placement?.before;
+  const axis = placement?.axis === "y" ? "y" : "x";
+  el.classList.toggle("drop-before", before);
+  el.classList.toggle("drop-after", !before);
+  el.classList.toggle("drop-axis-x", axis === "x");
+  el.classList.toggle("drop-axis-y", axis === "y");
+}
+
+function _clearHeroDropMark(el) {
+  el.classList.remove("drop-before", "drop-after", "drop-axis-x", "drop-axis-y");
+}
+
+function _heroSections(body) {
+  return Array.from(body?.querySelectorAll(":scope > .hero-section") || [])
+    .filter((el) => el !== _draggingHero);
+}
+
+function _heroInsertionFromPoint(body, ev) {
+  const items = _heroSections(body)
+    .map((el) => ({ el, rect: el.getBoundingClientRect() }))
+    .sort((a, b) => {
+      const dy = a.rect.top - b.rect.top;
+      if (Math.abs(dy) > 8) return dy;
+      return a.rect.left - b.rect.left;
+    });
+  const rows = [];
+  for (const item of items) {
+    let row = rows.find((r) => Math.abs(r.top - item.rect.top) <= 12);
+    if (!row) {
+      row = { top: item.rect.top, bottom: item.rect.bottom, items: [] };
+      rows.push(row);
+    }
+    row.top = Math.min(row.top, item.rect.top);
+    row.bottom = Math.max(row.bottom, item.rect.bottom);
+    row.items.push(item);
+  }
+  for (const row of rows) {
+    row.items.sort((a, b) => a.rect.left - b.rect.left);
+    if (ev.clientY < row.top) {
+      return { target: row.items[0].el, before: true, axis: "y" };
+    }
+    if (ev.clientY <= row.bottom) {
+      for (const item of row.items) {
+        const midX = item.rect.left + item.rect.width / 2;
+        if (ev.clientX < midX) return { target: item.el, before: true, axis: "x" };
+      }
+      return { target: row.items[row.items.length - 1].el, before: false, axis: "x" };
+    }
+  }
+  const last = items[items.length - 1]?.el || null;
+  return { target: last, before: false, axis: "y" };
+}
+
+function _clearAllHeroDropMarks() {
+  document.querySelectorAll(".hero-section.drop-before, .hero-section.drop-after")
+    .forEach(_clearHeroDropMark);
+}
+
+function _moveHeroAtPlacement(body, placement) {
+  if (!_draggingHero || !body || !placement?.target) return false;
+  if (placement.target === _draggingHero) return false;
+  if (placement.before) {
+    body.insertBefore(_draggingHero, placement.target);
+  } else {
+    body.insertBefore(_draggingHero, placement.target.nextSibling);
+  }
+  _saveHeroOrder();
+  return true;
+}
+
 function _onHeroDragStart(ev) {
+  if (ev.target && ev.target.closest(
+    ".hero-collapse-btn, .panel-resize-handle, button, input, select, textarea",
+  )) {
+    ev.preventDefault();
+    return;
+  }
   const sec = ev.currentTarget;
   _draggingHero = sec;
   sec.classList.add("is-dragging");
@@ -717,8 +794,7 @@ function _onHeroDragStart(ev) {
 function _onHeroDragEnd() {
   if (_draggingHero) _draggingHero.classList.remove("is-dragging");
   _draggingHero = null;
-  document.querySelectorAll(".hero-section.drop-before, .hero-section.drop-after")
-    .forEach((el) => el.classList.remove("drop-before", "drop-after"));
+  _clearAllHeroDropMarks();
 }
 
 function _onHeroDragOver(ev) {
@@ -727,25 +803,24 @@ function _onHeroDragOver(ev) {
   if (sec === _draggingHero) return;
   ev.preventDefault();
   try { ev.dataTransfer.dropEffect = "move"; } catch {}
-  const rect = sec.getBoundingClientRect();
-  const before = (ev.clientX - rect.left) < rect.width / 2;
-  sec.classList.toggle("drop-before", before);
-  sec.classList.toggle("drop-after", !before);
+  _setHeroDropMark(sec, _heroDropPlacement(ev, sec));
 }
 
 function _onHeroDragLeave(ev) {
   const sec = ev.currentTarget;
   if (sec.contains(ev.relatedTarget)) return;
-  sec.classList.remove("drop-before", "drop-after");
+  _clearHeroDropMark(sec);
 }
 
 function _onHeroDrop(ev) {
   ev.preventDefault();
+  ev.stopPropagation();
   if (!_draggingHero) return;
   const target = ev.currentTarget;
   if (target === _draggingHero) return;
-  const before = target.classList.contains("drop-before");
-  target.classList.remove("drop-before", "drop-after");
+  const placement = _heroDropPlacement(ev, target);
+  const before = placement.before;
+  _clearHeroDropMark(target);
   if (before) {
     target.parentNode.insertBefore(_draggingHero, target);
   } else {
@@ -754,20 +829,33 @@ function _onHeroDrop(ev) {
   _saveHeroOrder();
 }
 
+function _onHeroBodyDragOver(ev) {
+  if (!_draggingHero) return;
+  const body = ev.currentTarget;
+  ev.preventDefault();
+  try { ev.dataTransfer.dropEffect = "move"; } catch {}
+  if (ev.target !== body) return;
+  _clearAllHeroDropMarks();
+  const placement = _heroInsertionFromPoint(body, ev);
+  if (placement.target) _setHeroDropMark(placement.target, placement);
+}
+
+function _onHeroBodyDrop(ev) {
+  if (!_draggingHero) return;
+  const body = ev.currentTarget;
+  if (ev.target !== body) return;
+  ev.preventDefault();
+  _clearAllHeroDropMarks();
+  _moveHeroAtPlacement(body, _heroInsertionFromPoint(body, ev));
+}
+
 export function wireHeroLayout() {
   const body = document.getElementById("today-hero-body");
   if (!body) return;
   body.querySelectorAll(":scope > .hero-section").forEach((sec) => {
-    // Drag grip + collapse btn dentro del h3 — solo si no existen ya.
+    // Collapse btn dentro del h3 — drag/resize/orden lo maneja layout.mjs
+    // con el mismo motor que paneles y KPIs.
     const h3 = sec.querySelector(":scope > h3");
-    if (h3 && !h3.querySelector(".hero-drag-grip")) {
-      const grip = document.createElement("span");
-      grip.className = "hero-drag-grip";
-      grip.setAttribute("aria-hidden", "true");
-      grip.title = "arrastrá para reordenar";
-      grip.textContent = "⋮⋮";
-      h3.insertBefore(grip, h3.firstChild);
-    }
     if (h3 && !h3.querySelector(".hero-collapse-btn")) {
       const btn = document.createElement("button");
       btn.type = "button";
@@ -787,20 +875,9 @@ export function wireHeroLayout() {
       // derecha del count.
       h3.appendChild(btn);
     }
-    // Drag handlers — idempotente vía data flag.
-    if (sec.dataset.heroDragInit !== "1") {
-      sec.dataset.heroDragInit = "1";
-      sec.setAttribute("draggable", "true");
-      sec.addEventListener("dragstart", _onHeroDragStart);
-      sec.addEventListener("dragend", _onHeroDragEnd);
-      sec.addEventListener("dragover", _onHeroDragOver);
-      sec.addEventListener("dragleave", _onHeroDragLeave);
-      sec.addEventListener("drop", _onHeroDrop);
-    }
     // Anchors/imgs dentro de `.prose` son draggable=true por default en
-    // HTML5 — eso secuestra el dragstart del panel cuando el user agarra
-    // sobre el contenido en lugar del header. Forzar draggable=false en
-    // los hijos para que el drag siempre dispare en `.hero-section`.
+    // HTML5 — eso secuestra el dragstart de la caja cuando el user agarra
+    // sobre el contenido. Forzar draggable=false en los hijos.
     // Re-corre cada render porque innerHTML del body se regenera.
     sec.querySelectorAll("a, img").forEach((el) => {
       el.setAttribute("draggable", "false");
@@ -878,21 +955,17 @@ export function initHeroCollapse() {
   if (!heroToggle) return;
   const hero = heroToggle.closest(".today-hero");
   if (!hero) return;
-  try {
-    if (localStorage.getItem(LS_HERO_COLLAPSED) === "1") {
-      hero.setAttribute("data-collapsed", "true");
-      heroToggle.setAttribute("aria-expanded", "false");
-    }
-  } catch {}
+  if (readString(LS_HERO_COLLAPSED) === "1") {
+    hero.setAttribute("data-collapsed", "true");
+    heroToggle.setAttribute("aria-expanded", "false");
+  }
   heroToggle.addEventListener("click", () => {
     const collapsed = hero.getAttribute("data-collapsed") === "true";
     const next = !collapsed;
     hero.setAttribute("data-collapsed", next ? "true" : "false");
     heroToggle.setAttribute("aria-expanded", next ? "false" : "true");
-    try {
-      if (next) localStorage.setItem(LS_HERO_COLLAPSED, "1");
-      else localStorage.removeItem(LS_HERO_COLLAPSED);
-    } catch {}
+    if (next) writeString(LS_HERO_COLLAPSED, "1");
+    else removeKey(LS_HERO_COLLAPSED);
     try { window._updateResetButtonVisibility?.(); } catch {}
   });
 }

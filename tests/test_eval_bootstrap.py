@@ -1,5 +1,6 @@
 """Tests for bootstrap CI and expanded queries.yaml."""
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -38,6 +39,9 @@ def test_queries_yaml_all_paths_exist_or_placeholder():
     Marked `@pytest.mark.real_vault` — opts out of the `_isolate_vault_path`
     autouse so `rag.VAULT_PATH` points at the real vault. READ-ONLY.
     """
+    if os.environ.get("RAG_TEST_REAL_VAULT", "").strip() not in ("1", "true", "yes"):
+        pytest.skip("real vault check is opt-in: set RAG_TEST_REAL_VAULT=1")
+
     import rag
     vault = rag.VAULT_PATH
     if not vault.is_dir():

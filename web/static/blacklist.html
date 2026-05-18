@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#0b0b0b" />
+  <title>Blacklist · obsidian-rag</title>
+  <link rel="stylesheet" href="/static/blacklist.css?v=20260517-1" />
+</head>
+<body>
+  <div id="app">
+    <header class="topbar">
+      <div class="title"><span class="hash">#</span>blacklist</div>
+      <div id="status" class="status">cargando</div>
+    </header>
+
+    <nav class="nav" aria-label="paginas">
+      <a href="/">home</a>
+      <a href="/mirror">mirror</a>
+      <a href="/chat">chat</a>
+      <a href="/dashboard">dashboard</a>
+      <a href="/wa">wzp</a>
+      <a href="/status">status</a>
+    </nav>
+
+    <main id="lists" class="lists" aria-live="polite"></main>
+
+    <footer>
+      <span>config</span>
+      <code id="config-path">-</code>
+    </footer>
+  </div>
+
+  <script src="/static/admin-auth.js?v=20260517-1"></script>
+  <script type="module" src="/static/blacklist.js?v=20260517-1"></script>
+</body>
+</html>

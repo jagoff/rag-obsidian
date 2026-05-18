@@ -15,9 +15,23 @@ Uso:
 from __future__ import annotations
 
 from contextlib import contextmanager
+import os
 from pathlib import Path
 
 LOCK_PATH = Path.home() / ".local/share/obsidian-rag/anticipate.lock"
+
+
+def resolve_lock_path() -> Path:
+    """Return the active anticipate lock path.
+
+    `LOCK_PATH` stays as the production default and as the legacy monkeypatch
+    point for tests. `RAG_ANTICIPATE_LOCK_PATH` lets test runs and sandboxes
+    isolate themselves from a real launchd daemon on the same machine.
+    """
+    override = os.environ.get("RAG_ANTICIPATE_LOCK_PATH", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return LOCK_PATH
 
 
 @contextmanager
@@ -30,14 +44,14 @@ def anticipate_lock(*, timeout_seconds: float = 0.0):
     yields True si acquired, False si no se pudo.
     Always releases on exit (even on exception)."""
     import fcntl
-    import os
     import time
 
-    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = resolve_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = None
     acquired = False
     try:
-        fd = os.open(str(LOCK_PATH), os.O_RDWR | os.O_CREAT, 0o644)
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
         deadline = time.time() + timeout_seconds
         while True:
             try:
@@ -66,17 +80,17 @@ def anticipate_lock(*, timeout_seconds: float = 0.0):
 
 def lock_status() -> dict:
     """Diagnostic — read lockfile contents sin acquirir."""
-    if not LOCK_PATH.is_file():
+    lock_path = resolve_lock_path()
+    if not lock_path.is_file():
         return {"held": False, "pid": None, "ts": None}
     try:
-        content = LOCK_PATH.read_text(encoding="utf-8").strip()
+        content = lock_path.read_text(encoding="utf-8").strip()
         # Parse "pid=N ts=T"
         parts = dict(p.split("=", 1) for p in content.split() if "=" in p)
         # Try acquiring non-blocking to see if held
         import fcntl
-        import os
 
-        fd = os.open(str(LOCK_PATH), os.O_RDWR)
+        fd = os.open(str(lock_path), os.O_RDWR)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             held = False

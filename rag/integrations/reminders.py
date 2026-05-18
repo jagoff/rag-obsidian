@@ -68,6 +68,13 @@ def _reminders_cache_ttl() -> float:
         return 30.0
 
 
+def _reminders_osascript_timeout_s() -> float:
+    try:
+        return max(0.5, float(os.environ.get("RAG_REMINDERS_OSASCRIPT_TIMEOUT_S", "45")))
+    except (ValueError, TypeError):
+        return 45.0
+
+
 def _reminders_cache_clear() -> None:
     """Test helper — wipes the cache between cases."""
     with _REMINDERS_CACHE_LOCK:
@@ -149,7 +156,7 @@ def _fetch_reminders_due(now: datetime, horizon_days: int = 1, max_items: int = 
             if _entry is not None and (_now_mono - _entry[0]) < _ttl:
                 out = _entry[1]
     if not out:
-        out = _osascript(_REMINDERS_SCRIPT, timeout=45.0)
+        out = _osascript(_REMINDERS_SCRIPT, timeout=_reminders_osascript_timeout_s())
         if _ttl > 0 and out:
             with _REMINDERS_CACHE_LOCK:
                 # Guardamos el raw script output (no la lista filtrada) —

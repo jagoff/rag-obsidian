@@ -45,6 +45,7 @@ def tmp_lock(tmp_path, monkeypatch):
     """
     p = tmp_path / "anticipate.lock"
     monkeypatch.setattr(lockfile, "LOCK_PATH", p)
+    monkeypatch.setenv("RAG_ANTICIPATE_LOCK_PATH", str(p))
     return p
 
 
@@ -60,6 +61,7 @@ def _hold_then_release(lock_path: str, hold_seconds: float, ready_path: str) -> 
     from rag_anticipate import lockfile as _lf
 
     _lf.LOCK_PATH = Path(lock_path)
+    os.environ["RAG_ANTICIPATE_LOCK_PATH"] = lock_path
     with _lf.anticipate_lock() as ok:
         Path(ready_path).write_text("1" if ok else "0", encoding="utf-8")
         if ok:
@@ -71,6 +73,7 @@ def _try_acquire_blocking(lock_path: str, timeout_seconds: float, result_path: s
     from rag_anticipate import lockfile as _lf
 
     _lf.LOCK_PATH = Path(lock_path)
+    os.environ["RAG_ANTICIPATE_LOCK_PATH"] = lock_path
     with _lf.anticipate_lock(timeout_seconds=timeout_seconds) as ok:
         Path(result_path).write_text("true" if ok else "false", encoding="utf-8")
 
@@ -80,6 +83,7 @@ def _try_acquire_nonblocking(lock_path: str, result_path: str) -> None:
     from rag_anticipate import lockfile as _lf
 
     _lf.LOCK_PATH = Path(lock_path)
+    os.environ["RAG_ANTICIPATE_LOCK_PATH"] = lock_path
     with _lf.anticipate_lock() as ok:
         Path(result_path).write_text("true" if ok else "false", encoding="utf-8")
 
@@ -100,6 +104,21 @@ def test_acquire_when_no_lockfile(tmp_lock):
         assert acquired is True
     # Después del context el lockfile sigue existiendo (sólo se libera el lock).
     assert tmp_lock.exists()
+
+
+def test_env_override_wins_over_default_lock_path(tmp_path, monkeypatch):
+    """RAG_ANTICIPATE_LOCK_PATH aísla callers directos de LOCK_PATH productivo."""
+    default_path = tmp_path / "default" / "anticipate.lock"
+    env_path = tmp_path / "isolated" / "anticipate.lock"
+    monkeypatch.setattr(lockfile, "LOCK_PATH", default_path)
+    monkeypatch.setenv("RAG_ANTICIPATE_LOCK_PATH", str(env_path))
+
+    assert lockfile.resolve_lock_path() == env_path
+    with lockfile.anticipate_lock() as acquired:
+        assert acquired is True
+
+    assert env_path.exists()
+    assert not default_path.exists()
 
 
 def test_writes_pid_and_ts(tmp_lock):

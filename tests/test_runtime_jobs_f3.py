@@ -1,13 +1,13 @@
 """Tests F3 — migración de 18 jobs adicionales al supervisor.
 
 Cubren:
-- ``frequent.py`` — 8 hot-path frecuentes registrados con schedules
+- ``frequent.py`` — 11 hot-path frecuentes registrados con schedules
   matcheando los plists viejos.
 - ``proactive.py`` — 7 weekly/monthly registrados con day_of_week +
   hour + minute correctos.
 - ``briefs.py`` — 3 briefs Mon-Fri / Sun.
 - ``housekeeping.py`` — 3 housekeeping daily/weekly.
-- Total post-F3: 28 jobs (incluyendo drift_watcher F1 + 6 nightly F2).
+- Total post-F3: 34 jobs (incluyendo drift_watcher F1 + 9 nightly F2/Gx).
 
 NO testeamos invocación real — eso es shadow A/B en producción.
 """
@@ -51,9 +51,11 @@ def test_total_jobs_post_f3():
         # F2 nightly
         "auto_harvest", "whisper_vocab", "implicit_feedback",
         "online_tune", "maintenance", "calibrate",
+        "identity_fingerprint_refresh", "reranker_finetune", "drafts_finetune",
         # F3.1 frequent
         "anticipate", "routing_rules", "wa_fast", "ingest_whatsapp",
         "ingest_cross_source", "mood_poll", "spotify_poll", "wa_tasks",
+        "vault_image_captioner", "wa_voice_backfill", "screen_observer",
         # F3.2 proactive
         "emergent", "patterns", "archive", "distill",
         "active_learning_nudge", "active_learning_suggest_goldens",
@@ -91,6 +93,122 @@ def test_frequent_intervals():
             assert job.trigger_args.get(k) == v, (
                 f"{label}: {k}={job.trigger_args.get(k)} esperado {v}"
             )
+
+
+def test_anticipate_skips_when_swap_pressure(monkeypatch):
+    import rag.runtime.jobs.frequent as frequent
+
+    monkeypatch.delenv("RAG_ANTICIPATE_DISABLED", raising=False)
+    monkeypatch.setenv("RAG_ANTICIPATE_PRESSURE_GUARD", "1")
+    monkeypatch.setenv("RAG_ANTICIPATE_MAX_MEMORY_PCT", "90")
+    monkeypatch.setenv("RAG_ANTICIPATE_MAX_SWAP_GB", "1.5")
+    monkeypatch.setattr(frequent, "_running_process_count", lambda needle: 0)
+    monkeypatch.setattr(frequent, "_runtime_pressure_snapshot", lambda: (75.0, 2.7))
+    monkeypatch.setattr(
+        frequent,
+        "_run_guarded_subprocess",
+        lambda *a, **kw: pytest.fail("anticipate should not start under swap"),
+    )
+
+    result = frequent.anticipate_job()
+
+    assert result["skipped"] is True
+    assert result["skip_reason"] == "swap_pressure"
+    assert result["swap_gb"] == 2.7
+
+
+def test_anticipate_allows_stale_swap_when_memory_clear(monkeypatch):
+    import rag.runtime.jobs.frequent as frequent
+
+    monkeypatch.delenv("RAG_ANTICIPATE_DISABLED", raising=False)
+    monkeypatch.setenv("RAG_ANTICIPATE_PRESSURE_GUARD", "1")
+    monkeypatch.setenv("RAG_ANTICIPATE_MAX_SWAP_GB", "1.5")
+    monkeypatch.setattr(frequent, "_running_process_count", lambda needle: 0)
+    monkeypatch.setattr(frequent, "_runtime_pressure_snapshot", lambda: (12.0, 5.1))
+    monkeypatch.setattr(
+        frequent,
+        "_run_guarded_subprocess",
+        lambda *a, **kw: {"exit_code": 0, "guarded": True},
+    )
+
+    result = frequent.anticipate_job()
+
+    assert result == {"exit_code": 0, "guarded": True}
+
+
+def test_anticipate_skips_when_existing_run(monkeypatch):
+    import rag.runtime.jobs.frequent as frequent
+
+    monkeypatch.delenv("RAG_ANTICIPATE_DISABLED", raising=False)
+    monkeypatch.setattr(frequent, "_running_process_count", lambda needle: 1)
+    monkeypatch.setattr(
+        frequent,
+        "_run_guarded_subprocess",
+        lambda *a, **kw: pytest.fail("anticipate should not start twice"),
+    )
+
+    result = frequent.anticipate_job()
+
+    assert result["skipped"] is True
+    assert result["skip_reason"] == "already_running"
+    assert result["running_instances"] == 1
+
+
+def test_anticipate_process_match_ignores_prompt_text():
+    import rag.runtime.jobs.frequent as frequent
+
+    cmd = (
+        "/opt/homebrew/bin/codex exec --color never "
+        "error='/Users/fer/repos/rag/.venv/bin/rag anticipate run: swap high'"
+    )
+
+    assert frequent._command_matches_needle(
+        cmd,
+        frequent._ANTICIPATE_PROCESS_NEEDLE,
+    ) is False
+
+
+def test_anticipate_process_match_accepts_real_invocations():
+    import rag.runtime.jobs.frequent as frequent
+
+    assert frequent._command_matches_needle(
+        "/Users/fer/repos/rag/.venv/bin/rag anticipate run",
+        frequent._ANTICIPATE_PROCESS_NEEDLE,
+    ) is True
+    assert frequent._command_matches_needle(
+        "/Users/fer/repos/rag/.venv/bin/python "
+        "/Users/fer/repos/rag/.venv/bin/rag anticipate run",
+        frequent._ANTICIPATE_PROCESS_NEEDLE,
+    ) is True
+    assert frequent._command_matches_needle(
+        "/Users/fer/repos/rag/.venv/bin/python -m rag anticipate run",
+        frequent._ANTICIPATE_PROCESS_NEEDLE,
+    ) is True
+
+
+def test_anticipate_uses_guarded_runner_when_pressure_clear(monkeypatch):
+    import rag.runtime.jobs.frequent as frequent
+
+    seen: dict[str, object] = {}
+
+    def fake_guarded(args, *, timeout, extra_env=None, poll_interval=5.0):
+        seen["args"] = args
+        seen["timeout"] = timeout
+        seen["extra_env"] = extra_env
+        return {"exit_code": 0, "guarded": True}
+
+    monkeypatch.delenv("RAG_ANTICIPATE_DISABLED", raising=False)
+    monkeypatch.setenv("RAG_ANTICIPATE_TIMEOUT_S", "123")
+    monkeypatch.setattr(frequent, "_running_process_count", lambda needle: 0)
+    monkeypatch.setattr(frequent, "_runtime_pressure_snapshot", lambda: (10.0, 0.0))
+    monkeypatch.setattr(frequent, "_run_guarded_subprocess", fake_guarded)
+
+    result = frequent.anticipate_job()
+
+    assert result == {"exit_code": 0, "guarded": True}
+    assert seen["args"][-2:] == ["anticipate", "run"]
+    assert seen["timeout"] == 123
+    assert seen["extra_env"]["RAG_ANTICIPATE_PRESSURE_GUARD"] == "1"
 
 
 def test_proactive_calendar_schedules():

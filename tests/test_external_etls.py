@@ -678,6 +678,64 @@ def test_run_cross_source_etls_chrome_bookmarks_silent_when_no_chrome(tmp_path, 
     rag._run_cross_source_etls(tmp_path)
 
 
+def test_run_cross_source_etls_freshness_skips_recent_source(tmp_path, monkeypatch):
+    from rag.index_etl_state import record_source
+
+    db_dir = tmp_path / "ragvec"
+    target = tmp_path / "99-obsidian/99-AI/external-ingest/Reminders"
+    target.mkdir(parents=True)
+    (target / "2026-05-17.md").write_text("cached snapshot", encoding="utf-8")
+
+    monkeypatch.setattr(rag, "DB_PATH", db_dir)
+    monkeypatch.setenv("RAG_INDEX_ETL_FRESHNESS", "1")
+    monkeypatch.setenv("RAG_INDEX_ETL_FRESH_TTL_S", "999")
+    monkeypatch.setenv("RAG_INDEX_ETL_PARALLEL", "0")
+    monkeypatch.setattr(rag, "_is_cross_source_target", lambda _vp: True)
+    record_source(
+        db_dir,
+        "reminders",
+        stats={
+            "ok": True,
+            "files_written": 1,
+            "target": "99-obsidian/99-AI/external-ingest/Reminders",
+        },
+        duration_ms=12,
+    )
+
+    called: list[str] = []
+
+    def should_not_run(_vp):
+        raise AssertionError("fresh reminders ETL should have been skipped")
+
+    monkeypatch.setattr(rag, "_sync_reminders_notes", should_not_run)
+    for fn_name in (
+        "_sync_moze_notes", "_sync_credit_cards_notes", "_sync_whatsapp_notes",
+        "_sync_apple_calendar_notes", "_sync_chrome_history", "_sync_gmail_notes",
+        "_sync_github_activity", "_sync_claude_code_transcripts",
+        "_sync_claude_web_conversations", "_sync_youtube_transcripts",
+        "_sync_spotify_notes", "_sync_screentime_notes",
+    ):
+        if fn_name == "_sync_reminders_notes" or not hasattr(rag, fn_name):
+            continue
+
+        def _ok(_vp, _name=fn_name):
+            called.append(_name)
+            return {"ok": True, "files_written": 0, "reason": "test"}
+
+        monkeypatch.setattr(rag, fn_name, _ok)
+    monkeypatch.setattr(rag, "sync_chrome_bookmarks", lambda profile=None: {
+        "profiles": 0,
+        "total": 0,
+        "per_profile": {},
+    })
+
+    summary = rag._run_cross_source_etls(tmp_path)
+
+    reminders = [r for r in summary["records"] if r["kind"] == "reminders"]
+    assert reminders and reminders[0]["freshness_skip"] is True
+    assert "_sync_chrome_history" in called
+
+
 def test_decode_gmail_body_strips_style_and_script_blocks():
     import base64
     raw = (

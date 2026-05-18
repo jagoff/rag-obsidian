@@ -1510,22 +1510,43 @@ function renderCards(cards) {
       </div>
     ` : "";
 
+    const analysisSections = [
+      dailySection,
+      compoSection,
+      catSection,
+      recurringSection,
+      extraSection,
+    ].filter(Boolean).join("");
+    const analysisGroup = analysisSections ? `
+      <details class="cc-detail-group">
+        <summary>Analítica del resumen</summary>
+        <div class="cc-detail-group-body">${analysisSections}</div>
+      </details>
+    ` : "";
+    const consumosGroup = consumosSection ? `
+      <details class="cc-detail-group">
+        <summary>Consumos del ciclo</summary>
+        <div class="cc-detail-group-body">${consumosSection}</div>
+      </details>
+    ` : "";
+
     detail.innerHTML = `
       ${headerHtml}
       ${forecastSection}
       ${subsSection}
-      ${dailySection}
-      ${compoSection}
-      ${catSection}
-      ${recurringSection}
-      ${extraSection}
-      ${consumosSection}
+      ${analysisGroup}
+      ${consumosGroup}
       <div class="muted" style="font-size: 11px;">
         Origen: <code>${escapeHtml(card.source_file || "—")}</code>
       </div>
     `;
     wrap.appendChild(detail);
     container.appendChild(wrap);
+    detail.querySelectorAll(".cc-detail-group").forEach((group) => {
+      group.addEventListener("toggle", () => {
+        requestAnimationFrame(() => window.dispatchEvent(new Event("resize")));
+      });
+    });
 
     // ── Post-mount: charts + handlers.
     if ((totalConsumosARS + otherARS) > 0) {

@@ -268,6 +268,19 @@ def test_validate_location_skips_unknown(known_places_files: tuple[Path, Path]):
     assert _validate_location_or_demote("casa", "location") is None
 
 
+def test_validate_location_skip_is_not_logged(
+    known_places_files: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """El skip del allowlist es ruido esperado durante backfills grandes."""
+    canonical, _extra = known_places_files
+    canonical.write_text(json.dumps({"places": ["argentina"]}), encoding="utf-8")
+    calls: list[tuple] = []
+    monkeypatch.setattr(rag_mod, "_silent_log", lambda *args, **kwargs: calls.append(args))
+    assert _validate_location_or_demote("Mac", "location") is None
+    assert calls == []
+
+
 def test_validate_location_uses_extra_file(known_places_files: tuple[Path, Path]):
     """Lugares en `extra` se aceptan igual que canonical."""
     canonical, extra = known_places_files

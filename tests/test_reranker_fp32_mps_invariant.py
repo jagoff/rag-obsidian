@@ -20,8 +20,9 @@ MPS, que:
       "vivo" (> 0.01) — descarta el score-collapse observacionalmente, no
       solo por dtype.
 
-Skips completos cuando no hay MPS (Linux/CI). El test slow corre el
-modelo real (~5-10s cold load + 1 pair predict) y se marca con
+Skips completos cuando no hay MPS (Linux/CI) o cuando no se habilita la
+invariante real con RAG_RUN_REAL_RERANKER_INVARIANT=1. El test slow corre
+el modelo real (~5-10s cold load + 1 pair predict) y se marca con
 `@pytest.mark.slow` para poder correrlo con `pytest -m "not slow"` en
 feedback loops rápidos.
 """
@@ -46,12 +47,15 @@ def _mps_available() -> bool:
 
 
 pytestmark = pytest.mark.skipif(
-    not _mps_available(),
-    reason="MPS-only invariant (Apple Silicon). Linux/CI/Intel → skip.",
+    (os.environ.get("RAG_RUN_REAL_RERANKER_INVARIANT") != "1") or (not _mps_available()),
+    reason=(
+        "Real MPS reranker invariant is opt-in. Set "
+        "RAG_RUN_REAL_RERANKER_INVARIANT=1 on Apple Silicon to run it."
+    ),
 )
 
 
-def test_reranker_device_and_dtype_are_mps_fp32():
+def test_reranker_device_and_dtype_are_mps_fp32(monkeypatch):
     """Carga el reranker real y verifica device + dtype sobre todos los
     parámetros. No corre forward — solo toca el struct. ~5s cold, ~50ms
     warm.
@@ -61,7 +65,9 @@ def test_reranker_device_and_dtype_are_mps_fp32():
     se quiere observar el objeto real para proteger la invariante.
     """
     import torch
+    monkeypatch.setenv("RAG_RERANKER_BACKEND", "torch")
     import rag
+    rag._reranker = None
 
     r = rag.get_reranker()
     # sentence-transformers.CrossEncoder expone `.model` (HF module) y
@@ -88,7 +94,7 @@ def test_reranker_device_and_dtype_are_mps_fp32():
 
 
 @pytest.mark.slow
-def test_reranker_scores_not_collapsed_real_pair():
+def test_reranker_scores_not_collapsed_real_pair(monkeypatch):
     """Corre `.predict()` real sobre un par (query, doc) razonable y
     confirma que el score NO colapsó al ~0.001 característico del modo
     fp16-roto. Umbral conservador: > 0.01 (el doc es literalmente la
@@ -96,10 +102,13 @@ def test_reranker_scores_not_collapsed_real_pair():
 
     Marcado slow porque implica el cold-load de bge-reranker-v2-m3 + un
     forward pass en MPS (~5-10s). Correr con:
+      RAG_RUN_REAL_RERANKER_INVARIANT=1 \\
       .venv/bin/python -m pytest tests/test_reranker_fp32_mps_invariant.py \\
           -m slow -q
     """
+    monkeypatch.setenv("RAG_RERANKER_BACKEND", "torch")
     import rag
+    rag._reranker = None
 
     r = rag.get_reranker()
     pairs = [("qué lenguaje es seguro y rápido", "Rust es un lenguaje seguro y rápido")]

@@ -54,11 +54,7 @@ def test_resolve_diagnose_model_prefers_command_r(monkeypatch):
 
     fake_ids = {MLX_MODEL_ALIAS["command-r:latest"], MLX_MODEL_ALIAS["qwen2.5:7b"]}
 
-    class _FakeBackend:
-        def list_available(self):
-            return list(fake_ids)
-
-    monkeypatch.setattr("rag.llm_backend.MLXBackend", lambda: _FakeBackend())
+    monkeypatch.setattr("rag.llm_backend.list_cached_mlx_models", lambda: list(fake_ids))
     assert _server._resolve_diagnose_model() == "command-r:latest"
     _server.__dict__["_DIAGNOSE_MODEL_RESOLVED"] = None
 
@@ -67,11 +63,7 @@ def test_resolve_diagnose_model_falls_back_to_chat_model(monkeypatch):
     """Sin ningún command-r disponible, cae a resolve_chat_model()."""
     _server.__dict__["_DIAGNOSE_MODEL_RESOLVED"] = None
 
-    class _FakeBackend:
-        def list_available(self):
-            return []
-
-    monkeypatch.setattr("rag.llm_backend.MLXBackend", lambda: _FakeBackend())
+    monkeypatch.setattr("rag.llm_backend.list_cached_mlx_models", lambda: [])
     monkeypatch.setattr(_server, "resolve_chat_model", lambda: "phi4:latest")
     assert _server._resolve_diagnose_model() == "phi4:latest"
     _server.__dict__["_DIAGNOSE_MODEL_RESOLVED"] = None
@@ -85,12 +77,11 @@ def test_resolve_diagnose_model_caches_per_process(monkeypatch):
 
     call_count = {"n": 0}
 
-    class _FakeBackend:
-        def list_available(self):
-            call_count["n"] += 1
-            return [MLX_MODEL_ALIAS["command-r:latest"]]
+    def _fake_cached_models():
+        call_count["n"] += 1
+        return [MLX_MODEL_ALIAS["command-r:latest"]]
 
-    monkeypatch.setattr("rag.llm_backend.MLXBackend", lambda: _FakeBackend())
+    monkeypatch.setattr("rag.llm_backend.list_cached_mlx_models", _fake_cached_models)
     _server._resolve_diagnose_model()
     _server._resolve_diagnose_model()
     _server._resolve_diagnose_model()

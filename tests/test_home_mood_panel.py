@@ -285,14 +285,17 @@ def test_drift_active_passes_through(mood_enabled, monkeypatch, fetch_mood):
 # ── Frontend bundle smoke ────────────────────────────────────────────────
 
 
+def _home_js_bundle() -> str:
+    home_dir = Path(__file__).resolve().parent.parent / "web" / "static" / "js" / "home"
+    return "\n".join(p.read_text(encoding="utf-8") for p in sorted(home_dir.glob("*.mjs")))
+
+
 def test_home_v2_bundle_includes_mood_render():
     """El bundle JS servido al browser debe contener los nuevos
     helpers que renderizan el panel `p-mood` con buttons + tooltips +
     placeholder. Smoke estático contra el archivo en disco — si alguien
     rompe el render, este test salta antes de que lo veamos en prod."""
-    js_path = Path(__file__).resolve().parent.parent / "web" / "static" / "home.v2.js"
-    assert js_path.exists(), f"missing {js_path}"
-    js = js_path.read_text(encoding="utf-8")
+    js = _home_js_bundle()
     # Funciones nuevas del commit de UI mejorada.
     for sym in (
         "renderMoodSparkline",
@@ -534,8 +537,7 @@ def _dt_now_str() -> str:
 
 def test_home_v2_bundle_includes_modal_logic():
     """El bundle JS debe contener el código del modal de historial."""
-    js_path = Path(__file__).resolve().parent.parent / "web" / "static" / "home.v2.js"
-    js = js_path.read_text(encoding="utf-8")
+    js = _home_js_bundle()
     for sym in (
         "openMoodHistoryModal",
         "renderMoodHistory",

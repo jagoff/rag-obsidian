@@ -62,6 +62,17 @@ from rich.rule import Rule
 from rag import cli, console
 
 
+def _pendientes_ignore_loop_source(rel: str) -> bool:
+    parts = Path(rel).parts
+    if parts and parts[0] in {"04-Archive", ".trash"}:
+        return True
+    lower = rel.replace("\\", "/").lower()
+    name = Path(rel).name.lower()
+    if "/prompts ai/" in lower or name.startswith(("prompt -", "template -")):
+        return True
+    return False
+
+
 def _pendientes_collect(
     col,
     now: datetime,
@@ -181,6 +192,8 @@ def _pendientes_extract_loops_fast(
         except ValueError:
             continue
         if is_excluded(rel):
+            continue
+        if _pendientes_ignore_loop_source(rel):
             continue
         # Regla 2026-05-11: NUNCA surfacear loops desde notas bajo
         # `99-obsidian/**` — son artefactos del sistema (memorias del

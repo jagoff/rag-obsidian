@@ -33,7 +33,7 @@
         media="(device-width: 402px) and (device-height: 874px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
   <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-16-pro-max.png"
         media="(device-width: 440px) and (device-height: 956px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
-  <link rel="stylesheet" href="/static/home.v2.css?v=84">
+  <link rel="stylesheet" href="/static/home.v2.css?v=107">
   <!-- marked@18 vendored — same SRI as the v1 home. Used to parse the
        today/tomorrow narrative which has 4 H2 sub-sections that need
        real markdown rendering (lists, headers) — not the regex hack. -->
@@ -58,6 +58,7 @@
       <a class="topnav-link" href="/memo">memory</a>
       <a class="topnav-link" href="/transcripts">transcripts</a>
       <a class="topnav-link" href="/fine_tunning">fine_tunning</a>
+      <a class="topnav-link" href="/blacklist">blacklist</a>
       <a class="topnav-link" href="/status">status</a>
       <a class="topnav-link" href="/logs">logs</a>
       <a class="topnav-link" href="http://localhost:8501" target="_blank" rel="noopener">sqlite-vec</a>
@@ -74,6 +75,29 @@
   </header>
 
   <main class="shell" id="main">
+    <section class="quick-chat" aria-labelledby="quick-chat-label">
+      <form class="quick-chat-form" action="/chat" method="get" autocomplete="off">
+        <label class="quick-chat-label" id="quick-chat-label" for="quick-chat-input">
+          Texto libre
+        </label>
+        <div class="quick-chat-shell">
+          <input
+            class="quick-chat-input"
+            id="quick-chat-input"
+            name="q"
+            type="text"
+            required
+            enterkeyhint="send"
+            placeholder="Preguntá o pedí algo..."
+          >
+          <button class="quick-chat-submit" type="submit"
+                  aria-label="Abrir chat" title="Abrir chat">
+            ↵
+          </button>
+        </div>
+      </form>
+    </section>
+
     <!-- ╔═══════════ TODAY BRIEF — narrativo con 4-6 sub-secciones ═══════════╗ -->
     <!-- El narrative del LLM viene como markdown con 4-6 H2: Lo que pasó hoy /
          Sin procesar / Preguntas abiertas / Para mañana / 🔗 Conexiones /
@@ -109,10 +133,9 @@
       </div>
     </section>
 
-    <!-- ╔═══════════ COMMAND BAR — 3 KPIs críticos ═══════════╗ -->
-    <!-- KPI WhatsApp removido (era duplicado del panel "WhatsApp · sin
-         responder" en Accionable). 3 KPIs deja más espacio horizontal por
-         tarjeta + reduce sameness con la sección de abajo. -->
+    <!-- ╔═══════════ COMMAND BAR — KPIs críticos no-cero ═══════════╗ -->
+    <!-- Sólo se muestran señales accionables. Los "0" se ocultan para no
+         llenar el primer viewport con estado decorativo. -->
     <section class="cmdbar" id="home-cmdbar" aria-label="indicadores críticos">
       <article class="kpi" id="kpi-inbox" data-kpi="inbox">
         <a class="kpi-link" href="#p-inbox" aria-label="ir al panel inbox">
@@ -124,6 +147,13 @@
       <article class="kpi" id="kpi-reminders" data-kpi="reminders">
         <a class="kpi-link" href="#p-tomorrow" aria-label="ir a reminders">
           <div class="kpi-label">Reminders hoy</div>
+          <div class="kpi-value" data-value>—</div>
+          <div class="kpi-meta" data-meta>cargando…</div>
+        </a>
+      </article>
+      <article class="kpi" id="kpi-wa" data-kpi="whatsapp" hidden>
+        <a class="kpi-link" href="#p-wa-unreplied" aria-label="ir a WhatsApp sin responder">
+          <div class="kpi-label">WhatsApp espera</div>
           <div class="kpi-value" data-value>—</div>
           <div class="kpi-meta" data-meta>cargando…</div>
         </a>
@@ -267,7 +297,7 @@
           <footer class="panel-foot" data-foot></footer>
         </article>
         <!-- Apple Health · daily aggregates desde export.xml iCloud Drive.
-             Source: rag_apple_health_daily (poblada por `rag health-import`,
+             Source: rag_apple_health_daily (poblada por `rag index --source health`,
              manual o cron F4-followup). Métricas: pasos, kcal activas,
              ejercicio min, stand hours, HR resting, HRV, workouts. Hidden
              via JS si signals.health es null (export nunca corrió). -->
@@ -453,7 +483,7 @@
   </dialog>
 
   <script>
-    window.__RAG_HOME_ASSET_VERSION__ = "83";
+    window.__RAG_HOME_ASSET_VERSION__ = "107";
     window.__RAG_HOME_CACHE_READY__ = (async function () {
       const version = window.__RAG_HOME_ASSET_VERSION__;
       const key = "rag.home.asset.version";
@@ -475,7 +505,7 @@
     const ready = window.__RAG_HOME_CACHE_READY__ || Promise.resolve();
     ready
       .catch(() => {})
-      .then(() => import("/static/js/home/app.mjs?v=83"))
+      .then(() => import("/static/js/home/app.mjs?v=107"))
       .catch((err) => {
         console.error("[home.v2] module boot failed:", err);
         const serveText = document.getElementById("serve-text");
@@ -488,6 +518,6 @@
        deployamos al frontend no se propagan: el SW viejo sirve assets
        cacheados y el JS viejo sigue corriendo aunque haya versión
        nueva disponible. -->
-  <script src="/static/pwa/register-sw.js?v=83" defer></script>
+  <script src="/static/pwa/register-sw.js?v=107" defer></script>
 </body>
 </html>

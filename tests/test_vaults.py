@@ -240,6 +240,17 @@ def test_resolve_vault_paths_none_returns_active_single(tmp_registry, tmp_path):
     assert result[0][1] == v
 
 
+def test_resolve_vault_paths_none_returns_default_scope_multi(tmp_registry, tmp_path):
+    v1 = tmp_path / "home"; v1.mkdir()
+    v2 = tmp_path / "work"; v2.mkdir()
+    rag._save_vaults_config({
+        "vaults": {"home": str(v1), "work": str(v2)},
+        "current": "home",
+    })
+    result = rag.resolve_vault_paths(None)
+    assert [name for name, _ in result] == ["home", "work"]
+
+
 def test_resolve_vault_paths_all_expands_registry(tmp_registry, tmp_path):
     v1 = tmp_path / "v1"; v1.mkdir()
     v2 = tmp_path / "v2"; v2.mkdir()
@@ -250,6 +261,23 @@ def test_resolve_vault_paths_all_expands_registry(tmp_registry, tmp_path):
     result = rag.resolve_vault_paths(["all"])
     names = sorted(n for n, _ in result)
     assert names == ["home", "work"]
+
+
+def test_resolve_vault_paths_all_excludes_single_file_only(tmp_registry, tmp_path):
+    home = tmp_path / "home"; home.mkdir()
+    work = tmp_path / "work"; work.mkdir()
+    finances = tmp_path / "finances"; finances.mkdir()
+    rag._save_vaults_config({
+        "vaults": {
+            "home": str(home),
+            "work": str(work),
+            "finances": str(finances),
+        },
+        "current": "home",
+        "single_file_only": "finances",
+    })
+    assert [name for name, _ in rag.resolve_vault_paths(["all"])] == ["home", "work"]
+    assert rag.resolve_vault_paths(["finances"]) == [("finances", finances)]
 
 
 def test_resolve_vault_paths_filters_unknown(tmp_registry, tmp_path):
@@ -683,6 +711,39 @@ def test_index_vault_flag_routes_to_named_vault(tmp_registry, tmp_path, monkeypa
     assert captured["vault_path"].resolve() == v_work.resolve()
 
 
+def test_index_without_vault_indexes_default_scope(tmp_registry, tmp_path, monkeypatch):
+    """Bare `rag index` debe recorrer home + work para no dejar un vault stale."""
+    v_home = tmp_path / "home"; v_home.mkdir()
+    v_work = tmp_path / "work"; v_work.mkdir()
+    v_fin = tmp_path / "finances"; v_fin.mkdir()
+    rag._save_vaults_config({
+        "vaults": {
+            "home": str(v_home),
+            "work": str(v_work),
+            "finances": str(v_fin),
+        },
+        "current": "home",
+        "single_file_only": "finances",
+    })
+
+    seen: list[Path] = []
+
+    def fake_run_index(reset, no_contradict):
+        seen.append(rag.VAULT_PATH)
+        return {"added_chunks": 0, "updated_files": 0}
+
+    monkeypatch.setattr(rag, "_run_index", fake_run_index)
+    import contextlib
+    monkeypatch.setattr(
+        rag, "vault_write_lock", lambda *a, **kw: contextlib.nullcontext(),
+    )
+
+    result = CliRunner().invoke(rag.cli, ["index"])
+
+    assert result.exit_code == 0, result.output
+    assert [p.resolve() for p in seen] == [v_home.resolve(), v_work.resolve()]
+
+
 def test_index_vault_flag_unknown_name_errors_without_running(
     tmp_registry, tmp_path, monkeypatch,
 ):
@@ -758,3 +819,55 @@ def test_query_vault_flag_rejects_multi_vault_scope(
     assert result.exit_code == 0, result.output
     out = result.output.lower()
     assert "rag chat" in out or "un vault" in out or "solo acepta" in out, result.output
+
+
+def test_query_without_vault_uses_default_multi_scope(
+    tmp_registry, tmp_path, monkeypatch,
+):
+    """Sin `--vault`, `rag query` debe recuperar de home + work."""
+    v_home = tmp_path / "home"; v_home.mkdir()
+    v_work = tmp_path / "work"; v_work.mkdir()
+    rag._save_vaults_config({
+        "vaults": {"home": str(v_home), "work": str(v_work)},
+        "current": "home",
+    })
+
+    class FakeCol:
+        def count(self):
+            return 1
+
+    captured: dict = {}
+
+    def fake_multi_retrieve(vaults, *args, **kwargs):
+        captured["vaults"] = vaults
+        return {
+            "docs": ["contenido"],
+            "metas": [{
+                "file": "nota.md",
+                "note": "nota",
+                "source": "vault",
+                "_vault": "home",
+            }],
+            "scores": [0.5],
+            "confidence": 0.5,
+            "filters_applied": {},
+            "query_variants": ["test"],
+            "timing": {},
+        }
+
+    monkeypatch.setattr(rag, "warmup_async", lambda: None)
+    monkeypatch.setattr(rag, "get_db_for", lambda path: FakeCol())
+    monkeypatch.setattr(rag, "get_vocabulary", lambda col: (set(), set()))
+    monkeypatch.setattr(rag, "_corpus_hash_cached", lambda col: "hash")
+    monkeypatch.setattr(rag, "retrieve", lambda *a, **kw: (_ for _ in ()).throw(
+        AssertionError("retrieve single-vault no debería llamarse"),
+    ))
+    monkeypatch.setattr(rag, "multi_retrieve", fake_multi_retrieve)
+    monkeypatch.setattr(rag, "log_query_event", lambda ev: None)
+
+    result = CliRunner().invoke(
+        rag.cli, ["query", "--raw", "--plain", "test"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [name for name, _ in captured["vaults"]] == ["home", "work"]

@@ -19,6 +19,7 @@ logic it now delegates to.
 from __future__ import annotations
 
 import threading
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -190,6 +191,30 @@ def test_drain_continues_after_per_file_error(vstate, tmp_path, monkeypatch):
     assert all(row[1] == "indexed" and row[3] is None for row in good_rows)
     # Pending still drained.
     assert vstate["pending"] == set()
+
+
+def test_drain_retries_transient_database_locked(vstate, tmp_path, monkeypatch):
+    """A short sqlite write-lock race should retry before surfacing an error."""
+    note = tmp_path / "locked.md"
+    note.write_text("", encoding="utf-8")
+    vstate["pending"] = {note}
+    calls = {"n": 0}
+    sleeps: list[float] = []
+
+    def fake_index(col, path, *, vault_path):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise sqlite3.OperationalError("database is locked")
+        return "indexed"
+
+    monkeypatch.setattr(rag, "_index_single_file", fake_index)
+    monkeypatch.setattr(rag.time, "sleep", lambda secs: sleeps.append(secs))
+
+    out = rag._watch_drain_once(vstate, threading.Lock())
+
+    assert calls["n"] == 3
+    assert sleeps == [0.25, 0.5]
+    assert out == [("main", "indexed", Path("locked.md"), None)]
 
 
 def test_drain_reports_vault_relative_path(vstate, tmp_path, monkeypatch):

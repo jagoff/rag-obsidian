@@ -59,6 +59,7 @@ def ft_home(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
     monkeypatch.delenv("RAG_RERANKER_FT", raising=False)
     monkeypatch.delenv("RAG_RERANKER_FT_PATH", raising=False)
+    monkeypatch.setenv("RAG_RERANKER_BACKEND", "torch")
     # The module-level constant was bound at import time (computed from
     # `Path.home()` ANTES de patcharlo), so we also patch the module
     # attribute so callers that read `rag.RERANKER_FT_ADAPTER_DIR` see

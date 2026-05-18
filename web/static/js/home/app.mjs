@@ -2,27 +2,27 @@
 // Fetches /api/home, despacha todos los renderers, orquesta el auto-refresh.
 
 import { $, setCurrentPayload, startAutoRefresh } from "./core.mjs";
-import { renderCmdBar } from "./command-bar.mjs";
+import { renderCmdBar } from "./command-bar.mjs?v=103";
 import {
   renderTodayHero, initHeroCollapse, initReminderButtonHandler,
-} from "./panel-today.mjs";
+} from "./panel-today.mjs?v=105";
 import {
   renderInbox, renderQuestions, renderTomorrow,
   renderWAUnreplied, renderLoopsUrgent, renderContradictions,
   renderPatterns, renderAuthority,
-} from "./panel-signals.mjs";
+} from "./panel-signals.mjs?v=103";
 import { renderFinance, renderCards } from "./panel-finance.mjs";
 import {
   renderRetrievalHealth, renderLoopsAging, renderEvalTrend,
   renderVaultActivity, renderCaptured,
-} from "./panel-monitoring.mjs";
+} from "./panel-monitoring.mjs?v=103";
 import {
   renderWeather, renderWeb, renderBookmarks,
   renderYouTube, renderDrive, renderSpotify, renderHealth, renderPeekaboo,
-} from "./panel-ambient.mjs";
+} from "./panel-ambient.mjs?v=105";
 import { renderSleep } from "./panel-sleep.mjs";
 import { renderMood, renderCorrelations } from "./panel-mood.mjs";
-import { initLayout, updateResetButtonVisibility } from "./layout.mjs";
+import { initLayout, refreshLayoutControls, updateResetButtonVisibility } from "./layout.mjs?v=103";
 import { initRefreshButton } from "./refresh.mjs";
 
 // ── Topbar ─────────────────────────────────────────────────────────────────────
@@ -76,6 +76,7 @@ function render(payload) {
   // renderCorrelations: panel `p-correlations` (Pearson cross-source entre métricas).
   // Distinto de renderPatterns que rendea `p-patterns` (entidades cross-source).
   renderCorrelations(payload);
+  refreshLayoutControls();
 }
 
 // ── Fetch + load ───────────────────────────────────────────────────────────────
@@ -98,10 +99,14 @@ async function load(opts = {}) {
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 
-function boot() {
+async function boot() {
   // Layout (drag/drop, collapse, reset) — ANTES del primer load para que
   // el orden persistido se aplique antes de que los renderers escriban.
-  initLayout();
+  try {
+    await initLayout();
+  } catch (err) {
+    console.warn("[home.v2] layout init failed:", err);
+  }
   // Hero collapse toggle
   initHeroCollapse();
   // Handler para botones inline "crear reminder"

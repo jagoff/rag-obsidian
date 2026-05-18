@@ -111,6 +111,30 @@ def test_retrieve_default_returns_mixed_sources(multi_source_col):
     assert len(sources) >= 2, f"expected mixed sources, got {sources}"
 
 
+def test_retrieve_local_embed_dim_mismatch_falls_back_to_embed(multi_source_col, monkeypatch):
+    """A stale local-embed fast path must not query an 8-dim test collection."""
+    calls = {"embed": 0}
+
+    def fake_embed(texts):
+        calls["embed"] += 1
+        return [_vec_for(t) for t in texts]
+
+    monkeypatch.setattr(rag, "_local_embed_enabled", lambda: True)
+    monkeypatch.setattr(
+        rag,
+        "query_embed_local",
+        lambda texts, wait_ready_timeout=None: [[0.0] * 1024 for _ in texts],
+    )
+    monkeypatch.setattr(rag, "embed", fake_embed)
+
+    out = rag.retrieve(multi_source_col, "alpha", k=6, folder=None,
+                       auto_filter=False, multi_query=False)
+
+    assert calls["embed"] >= 1
+    sources = {m.get("source", "vault") for m in out["metas"]}
+    assert len(sources) >= 2
+
+
 def test_retrieve_source_whatsapp_only(multi_source_col):
     """source='whatsapp' → vault + calendar dropped."""
     out = rag.retrieve(multi_source_col, "alpha discussion", k=6, folder=None,

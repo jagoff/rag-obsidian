@@ -113,6 +113,73 @@ def test_queue_includes_retrieval_answer_high_score(client, seeded_conn):
     assert "pregunta con respuesta del modelo" in labels
 
 
+def test_queue_includes_web_answer_without_answer_len(client, seeded_conn):
+    """Regresión: la telemetry real puede tener respuestas web válidas con
+    answer_len NULL. Si existe conversación/cache/response_hash, el panel debe
+    mostrar el item igual; si no, /fine_tunning queda casi vacío."""
+    seeded_conn.execute(
+        """
+        INSERT INTO rag_queries
+            (ts, q, top_score, answer_len, paths_json, cmd, session, extra_json)
+        VALUES
+            (datetime('now', '-1 hour'),
+             'respuesta web con answer_len faltante', 0.03, NULL,
+             '["low-score.md"]', 'web', 'web:missing-answer-len',
+             '{"turn_id":"turn-missing-answer-len","response_hash":"abc123"}')
+        """
+    )
+    seeded_conn.execute(
+        """
+        INSERT INTO rag_conversations_index(session_id, relative_path, updated_at)
+        VALUES (
+            'web:missing-answer-len',
+            '99-obsidian/99-AI/conversations/test-missing-answer-len.md',
+            datetime('now')
+        )
+        """
+    )
+    seeded_conn.commit()
+
+    r = client.get("/api/fine_tunning/queue")
+    assert r.status_code == 200
+    answer_items = [
+        i for i in r.json()["items"]
+        if i["stream"] == "retrieval_answer"
+    ]
+    row = next(
+        i for i in answer_items
+        if i["label"] == "respuesta web con answer_len faltante"
+    )
+    assert row["top_score"] == 0.03
+    assert row["meta"]["conversation_path"].endswith("test-missing-answer-len.md")
+
+
+def test_queue_dedupes_repeated_retrieval_questions(client, seeded_conn):
+    """El panel no debe pedir puntuar tres veces la misma pregunta exacta:
+    sobre-entrena duplicados y el fan-out igual deduplica por q cercana."""
+    for minutes_ago in (3, 2, 1):
+        seeded_conn.execute(
+            """
+            INSERT INTO rag_queries
+                (ts, q, top_score, answer_len, paths_json, cmd)
+            VALUES
+                (datetime('now', ?),
+                 'pregunta repetida para fine tuning', 0.04, 300,
+                 '["repeat.md"]', 'web')
+            """,
+            (f"-{minutes_ago} minutes",),
+        )
+    seeded_conn.commit()
+
+    r = client.get("/api/fine_tunning/queue")
+    assert r.status_code == 200
+    labels = [
+        i["label"] for i in r.json()["items"]
+        if i["stream"] == "retrieval_answer"
+    ]
+    assert labels.count("pregunta repetida para fine tuning") == 1
+
+
 # ── Test 4 ─────────────────────────────────────────────────────────────────
 
 def test_queue_excludes_query_without_answer(client, seeded_conn):

@@ -43,7 +43,7 @@ def test_run_catch_up_index_forces_safe_index_env(monkeypatch, tmp_path):
     assert captured == {
         "no_contradict": "True",
         "RAG_INDEX_SAFE": "1",
-        "RAG_INDEX_EMBED_SLICE_SIZE": "16",
+        "RAG_INDEX_EMBED_SLICE_SIZE": "auto",
         "RAG_INDEX_ABORT_ON_MEMORY_PRESSURE": "1",
         "OBSIDIAN_RAG_SKIP_CONTEXT_SUMMARY": "1",
         "OBSIDIAN_RAG_SKIP_SYNTHETIC_Q": "1",
@@ -100,6 +100,38 @@ def test_start_memory_guard_skips_when_pressure_persists(monkeypatch):
 
     assert setup_cli._start_memory_guard(DummyConsole(), "daemon test") is False
     assert any("skip daemon test" in message for message in messages)
+
+
+def test_start_memory_guard_ignores_stale_swap_by_default(monkeypatch):
+    from rag.cli import setup as setup_cli
+
+    class DummyConsole:
+        def print(self, message):
+            raise AssertionError(message)
+
+    monkeypatch.delenv("RAG_START_SAFE", raising=False)
+    monkeypatch.delenv("RAG_START_ABORT_SWAP_GB", raising=False)
+    monkeypatch.setattr(setup_cli, "_start_memory_snapshot", lambda: (10.0, 2.8))
+
+    assert setup_cli._start_memory_guard(DummyConsole(), "daemon test") is True
+
+
+def test_start_memory_guard_allows_explicit_swap_abort(monkeypatch):
+    from rag.cli import setup as setup_cli
+
+    messages: list[str] = []
+
+    class DummyConsole:
+        def print(self, message):
+            messages.append(str(message))
+
+    monkeypatch.delenv("RAG_START_SAFE", raising=False)
+    monkeypatch.setenv("RAG_START_MEMORY_PRESSURE_SLEEP_S", "0")
+    monkeypatch.setenv("RAG_START_ABORT_SWAP_GB", "2.0")
+    monkeypatch.setattr(setup_cli, "_start_memory_snapshot", lambda: (10.0, 2.8))
+
+    assert setup_cli._start_memory_guard(DummyConsole(), "daemon test") is False
+    assert any("swap=2.8GB" in message for message in messages)
 
 
 def test_start_memory_guard_can_be_disabled(monkeypatch):

@@ -22,10 +22,9 @@ Usage::
 Idempotence
 -----------
 ``rag_entity_mentions`` uses ``INSERT OR IGNORE`` keyed on
-``(entity_id, chunk_id)``, so re-running does **not** create duplicate mention
-rows.  ``mention_count`` on ``rag_entities`` IS incremented on each pass even
-for already-processed chunks, so the count will be inflated after multiple runs.
-For a fully clean re-run, manually truncate both tables before invoking.
+``(entity_id, chunk_id)``. The shared upsert helper increments
+``rag_entities.mention_count`` only when that pair is genuinely new, so
+re-running the backfill is safe and does not inflate counts.
 
 Side-effects
 ------------

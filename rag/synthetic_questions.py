@@ -130,7 +130,8 @@ def _generate_synthetic_questions(text: str, title: str, folder: str) -> list[st
 
     Bypass: set OBSIDIAN_RAG_SKIP_SYNTHETIC_Q=1 (returns []).
     """
-    if os.environ.get("OBSIDIAN_RAG_SKIP_SYNTHETIC_Q"):
+    skip_env = os.environ.get("OBSIDIAN_RAG_SKIP_SYNTHETIC_Q", "").strip().lower()
+    if skip_env and skip_env not in ("0", "false", "no", "off"):
         return []
     import rag  # noqa: PLC0415
 

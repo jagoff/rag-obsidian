@@ -40,12 +40,7 @@ function init() {
     listEl, loadingEl, searchEl,
     onSelect: (jid) => {
       document.body.dataset.pane = "thread";
-      thread.open(jid).then(() => {
-        // Después de que el header renderee el nombre, montar el botón 🧠
-        // Recordar para que `wa-memory` apunte al contacto activo.
-        const name = document.getElementById("wa-thread-name")?.textContent || "";
-        memory.mountTrigger(jid, name);
-      });
+      thread.open(jid).then(() => mountThreadContext(jid));
     },
   });
 
@@ -62,13 +57,7 @@ function init() {
   cmdk.init({
     onChatSelect: (jid /* , messageId */) => {
       document.body.dataset.pane = "thread";
-      thread.open(jid).then(() => {
-        const name = document.getElementById("wa-thread-name")?.textContent || "";
-        memory.mountTrigger(jid, name);
-        promises.mountTrigger(jid, name);
-        moodCheck.setActiveJid(jid);
-        tts.setActiveJid(jid);
-      });
+      thread.open(jid).then(() => mountThreadContext(jid));
     },
   });
 
@@ -82,13 +71,7 @@ function init() {
   anticipate.init({
     onChatSelect: (jid) => {
       document.body.dataset.pane = "thread";
-      thread.open(jid).then(() => {
-        const name = document.getElementById("wa-thread-name")?.textContent || "";
-        memory.mountTrigger(jid, name);
-        promises.mountTrigger(jid, name);
-        moodCheck.setActiveJid(jid);
-        tts.setActiveJid(jid);
-      });
+      thread.open(jid).then(() => mountThreadContext(jid));
     },
   });
 
@@ -111,6 +94,14 @@ function init() {
   moodSummary.init();
 
   // Cmd+K también dispara `thread.open` — propagar al memory drawer.
+}
+
+function mountThreadContext(jid) {
+  const name = document.getElementById("wa-thread-name")?.textContent || "";
+  memory.mountTrigger(jid, name);
+  promises.mountTrigger(jid, name);
+  moodCheck.setActiveJid(jid);
+  tts.setActiveJid(jid);
 }
 
 // Cada 30s re-fetcheamos el chatlist. SSE entrega chat_update events

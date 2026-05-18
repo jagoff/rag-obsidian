@@ -46,8 +46,9 @@ from rag.runtime.scheduler import cron
 logger = logging.getLogger(__name__)
 
 
-_RAG_BIN = str(Path.home() / ".local/bin/rag")
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+_VENV_RAG = _REPO_ROOT / ".venv" / "bin" / "rag"
+_RAG_BIN = str(_VENV_RAG if _VENV_RAG.exists() else Path.home() / ".local/bin/rag")
 _VENV_PY = _REPO_ROOT / ".venv" / "bin" / "python"
 _SUBPROCESS_TIMEOUT_S = 1800  # 30 min — generous, online-tune tarda 24min warm
 

@@ -41,31 +41,31 @@ Las del último audit de seguridad/perf. Citadas explícitamente porque son las 
 | `OBSIDIAN_RAG_ALLOW_LAN` | unset (off) | `web/server.py:1246` | Si `1`/`true`/`yes`, permite que el web server acepte conexiones de la LAN (CORS + bind). Necesario para abrir desde el iPhone en la misma red. |
 | `OBSIDIAN_RAG_STATIC_NO_CACHE` | unset (off) | `web/server.py:1221` | Si `1`, sirve los assets estáticos con `Cache-Control: max-age=0`. Útil cuando estás iterando sobre el frontend para evitar el cache del browser. |
 | `OBSIDIAN_RAG_HOME_PREWARM` | `1` (on) | `web/server.py:5990` | Si `0`/`false`/`no`, desactiva el prewarm del home page (`/`) que carga el corpus + reranker en startup. Apagarlo si el server arranca demasiado lento en cold-boot. |
-| `OBSIDIAN_RAG_CHAT_PREWARM_INTERVAL` | `240` (s) | `web/server.py:6034` | Cada cuántos segundos el web server hace un keep-alive call al chat model para evitar que Ollama lo descargue por inactividad. |
+| `OBSIDIAN_RAG_CHAT_PREWARM_INTERVAL` | `240` (s) | `web/server.py` | Cada cuántos segundos el web server hace un keep-alive call al chat model para evitar cold-starts bajo MLX. |
 
 ---
 
-## Modelos / memoria / Ollama
+## Modelos / memoria / MLX
 
 | Variable | Default | Archivo | Descripción |
 |---|---|---|---|
-| `OLLAMA_KEEP_ALIVE` | `-1` (forever) | `rag/__init__.py:2581` | Cuánto Ollama mantiene los modelos en memoria entre llamadas. Acepta int (segundos) o duration string (`30m`, `24h`). `-1` = pinear forever (default), `0` = liberar inmediato. |
-| `RAG_KEEP_ALIVE_LARGE_MODEL` | unset (clamp automático) | `rag/__init__.py:2633` | Override del auto-clamp que el sistema aplica a modelos grandes (command-r) cuando `OLLAMA_KEEP_ALIVE=-1` y la RAM es justa. Solo lo necesitás con >64 GB y querer pinear "forever" sin clamping. |
+| `RAG_LLM_KEEP_ALIVE` / `OLLAMA_KEEP_ALIVE` | `-1` (compat) | `rag/__init__.py`, `rag/llm_backend.py` | Compat de firma. En MLX es no-op: la residencia real la controla el backend con LRU + `RAG_MLX_IDLE_TTL`. |
+| `RAG_KEEP_ALIVE_LARGE_MODEL` | unset (compat) | `rag/__init__.py` | Compat histórica para modelos grandes. En MLX los modelos HQ son single-tenant y se descargan por LRU/idle/memory pressure. |
 | `RAG_MEMORY_PRESSURE_DISABLE` | unset (off) | `rag/__init__.py:13048` | Si `1`, apaga el watchdog que libera modelos cuando macOS reporta memory pressure. Setear en CI/tests donde no querés flapping. |
 | `RAG_MEMORY_PRESSURE_THRESHOLD` | `85` (%) | `rag/__init__.py:13055` | % de RAM usada que dispara el watchdog. Bajalo (75) para liberar antes; subilo (90) si tenés RAM de sobra. |
 | `RAG_MEMORY_PRESSURE_INTERVAL` | `60` (s) | `rag/__init__.py:13059` | Cada cuántos segundos el watchdog mira la presión de memoria. |
-| `RAG_RERANKER_IDLE_TTL` | `900` (15 min) | `rag/__init__.py:12638` | Segundos que el cross-encoder se queda en MPS sin uso antes de descargarse. Idle-unload reduce ~2-3 GB de VRAM ocupada cuando no estás queriando. |
+| `RAG_RERANKER_IDLE_TTL` | `900` (15 min) | `rag/__init__.py` | Segundos que el reranker queda cargado sin uso antes de descargarse. Default actual: MLX (`MLXReranker`); rollback torch/MPS con `RAG_RERANKER_BACKEND=torch`. |
 | `RAG_RERANKER_NEVER_UNLOAD` | unset (off) | `rag/__init__.py` (ver `web/server.py:1605`, 1662) | Si truthy, pinea el reranker en memoria para siempre. Cuesta ~2-3 GB pero elimina el ~9s de re-load en cold queries. |
 | `RAG_RERANKER_FT_PATH` | unset (off) | `rag/__init__.py:12654` | Path al cross-encoder fine-tuned (gate GC#2.C). Cuando hay model promovido apunta al symlink `~/.cache/obsidian-rag/reranker-ft-current`. |
-| `RAG_LOCAL_EMBED` | unset (auto-on en CLI one-shot) | `rag/__init__.py:10952` | Si truthy, embebe queries en-proceso con sentence-transformers (10-30 ms) en vez de Ollama (~140 ms). Requiere bge-m3 cacheado en HuggingFace. |
-| `RAG_LOCAL_EMBED_WAIT_MS` | `6000` | `rag/__init__.py:18530` | Milisegundos que `retrieve()` espera a que el warmup del embedder local dispare el `Event` antes de fallback a Ollama. Bumped 4000→6000 el 2026-04-23 tras observar embed_ms=4005 exacto en producción. |
+| `RAG_LOCAL_EMBED` | unset (auto-on en CLI one-shot) | `rag/__init__.py` | Si truthy, embebe queries en-proceso. Default actual: MLX (`MLXEmbedder` + `qwen3-embedding:0.6b`); rollback puntual con `RAG_EMBED_BACKEND=pytorch`. |
+| `RAG_LOCAL_EMBED_WAIT_MS` | `6000` | `rag/__init__.py` | Milisegundos que `retrieve()` espera a que el warmup del embedder local dispare el `Event` antes de usar el fallback de embedding del backend. |
 | `OBSIDIAN_RAG_WEB_CHAT_MODEL` | `qwen2.5:7b` | `rag/__init__.py:39220`, `web/server.py:1280` | Override del chat model del web server. Generado al plist en `rag setup`. |
 | `RAG_POSTPROCESS_MODEL` | unset (= chat model) | `rag/__init__.py:136` | Override del LLM usado en stages de postprocess (citation-repair, NLI repair, critique). `helper` = qwen2.5:3b, `chat`/`legacy` = command-r. |
 | `RAG_LOOKUP_MODEL` | `qwen2.5:3b` | `rag/__init__.py:196` | Modelo del fast-path dispatch. Swap por otro model si querés probar. |
 | `RAG_LOOKUP_NUM_CTX` | `4096` | `rag/__init__.py:205` | num_ctx del fast-path. Bumped 2048→4096 el 2026-04-22 por refuses falsos cuando el CONTEXTO se inflaba con tools. |
 | `RAG_LOOKUP_THRESHOLD` | `0.6` | `rag/__init__.py:195` | Top-1 rerank score mínimo para activar el fast-path (qwen2.5:3b + num_ctx=4096, skip citation-repair). |
 | `YOUTUBE_API_KEY` | `""` | `rag/__init__.py:39215`, `web/server.py:3732` | API key opcional para YouTube transcript fetching. Sin esto, fallback a `yt-dlp --write-auto-sub`. |
-| `RAG_VLM_MODEL` | `qwen2.5vl:3b` | `rag/ocr.py:364` | Modelo VLM para captioning de imágenes embebidas (complementario a OCR). |
+| `RAG_VLM_MODEL` | `mlx-community/granite-vision-3.2-2b-4bit` | `rag/ocr.py` | Modelo MLX/VLM para captioning de imágenes embebidas (complementario a OCR). |
 
 ---
 
@@ -112,9 +112,11 @@ Las del último audit de seguridad/perf. Citadas explícitamente porque son las 
 | `RAG_PARALLEL_POSTPROCESS` | `1` (on) | `rag/__init__.py:49639` | Paraleliza stages de postprocess (citation repair + NLI + diversity en threads). `0` desactiva — debug. |
 | `RAG_WIKILINK_EXPANSION` | unset (off) | `rag/__init__.py:10452` | Expande wikilinks en el CONTEXT del retrieve (resolver link targets a body). Experimental. |
 | `RAG_UNIFIED_CHAT` | `1` (on) | `rag/__init__.py:17852` | Activa el unified chat pipeline (`run_chat_turn`) para CLI `rag chat` — alineación con web/serve. |
-| `RAG_CONTEXT_SUMMARY` | `1` (on) | `rag/__init__.py:3075` | Master switch del context summary prefix en chunks. `0` desactiva. |
-| `OBSIDIAN_RAG_SKIP_CONTEXT_SUMMARY` | unset | `rag/__init__.py:3073` | Override binario — usado por tests para desactivar el context summary sin tocar `RAG_CONTEXT_SUMMARY`. |
-| `OBSIDIAN_RAG_SKIP_SYNTHETIC_Q` | unset | `rag/__init__.py:3246` | Idem para synthetic questions. |
+| `RAG_CONTEXT_SUMMARY` | unset (off) | `rag/__init__.py` | Opt-in para context summary prefix en chunks. En `rag index` safe mode también requiere `RAG_INDEX_LLM_ENRICHMENTS=1`. |
+| `RAG_INDEX_LLM_ENRICHMENTS` | unset (off) | `rag/__init__.py` | Opt-in para enrichment LLM durante indexing, incluidos synthetic/context/contextual y contradictions. Default off para que `rag index` sea parse + embed. |
+| `RAG_INDEX_SKIP_CONTRADICTIONS` | `1` en safe mode | `rag/__init__.py` | Saltea checks de contradicción index-time en `rag index`; `0` los reactiva. |
+| `OBSIDIAN_RAG_SKIP_CONTEXT_SUMMARY` | unset | `rag/__init__.py` | Override binario para desactivar context summary; `0/false/no/off` no desactiva. |
+| `OBSIDIAN_RAG_SKIP_SYNTHETIC_Q` | unset | `rag/synthetic_questions.py` | Override binario para desactivar synthetic questions; `0/false/no/off` no desactiva. |
 | `RAG_TOKENS_PER_CHAR` | `0.25` | `rag/__init__.py:46552` | Factor char→token para estimar prompt budget sin llamar al tokenizer real (~4 chars/token, qwen2.5 promedio). |
 | `RAG_CONTEXT_BUDGET_WARN` | `0.80` | `rag/__init__.py:46553` | % del num_ctx que dispara warning `_silent_log` cuando el prompt se acerca al límite. |
 | `RAG_EXPLORE` | unset (off) | `rag/__init__.py:19080` | ε-exploration: 10% chance de meter un resultado de menor rank entre los top-3. Sirve para counterfactuals. **No activar durante `rag eval`**. |
@@ -154,6 +156,7 @@ Las del último audit de seguridad/perf. Citadas explícitamente porque son las 
 |---|---|---|---|
 | `RAG_AMBIENT_DISABLED` | unset | `rag/__init__.py:20903` | Kill switch global del ambient hook (ver sección Recientes). |
 | `RAG_ANTICIPATE_DISABLED` | unset | `rag/anticipatory.py:525` | Kill switch del anticipatory agent (sub-feature del ambient). |
+| `RAG_ANTICIPATE_LOCK_PATH` | `~/.local/share/obsidian-rag/anticipate.lock` | `rag_anticipate/lockfile.py` | Override del lockfile cooperativo; usado por tests/sandboxes para no chocar con el daemon real. |
 | `RAG_ANTICIPATE_MIN_SCORE` | `0.35` | `rag/anticipatory.py:110` | Score mínimo para que una señal anticipatoria entre al digest. |
 | `RAG_ANTICIPATE_DEDUP_WINDOW_HOURS` | `24` | `rag/anticipatory.py:112` | Ventana de dedup de señales — la misma signal no dispara 2 veces en N horas. |
 | `RAG_ANTICIPATE_CALENDAR_MIN_MIN` | `15` | `rag/anticipatory.py:115` | Minutos mínimos antes del evento de calendar para empezar a emitir prep signals. |
@@ -174,8 +177,8 @@ Las del último audit de seguridad/perf. Citadas explícitamente porque son las 
 | Variable | Default | Archivo | Descripción |
 |---|---|---|---|
 | `RAG_OCR` | unset (on) | `rag/ocr.py:272` | Master switch de OCR de imágenes (Apple Vision). `0` desactiva. |
-| `RAG_VLM_CAPTION` | unset (off) | `rag/ocr.py:393` | Activa captioning con qwen2.5-vl en imágenes embebidas. Complementa OCR (no lo reemplaza). |
-| `RAG_VLM_MODEL` | `qwen2.5vl:3b` | `rag/ocr.py:364` | Modelo VLM. |
+| `RAG_VLM_CAPTION` | unset (off) | `rag/ocr.py` | Activa captioning MLX/VLM en imágenes embebidas. Complementa OCR (no lo reemplaza). |
+| `RAG_VLM_MODEL` | `mlx-community/granite-vision-3.2-2b-4bit` | `rag/ocr.py` | Modelo VLM cargado vía `mlx-vlm`. |
 | `RAG_VLM_CAPTION_MAX_PER_RUN` | `500` | `rag/ocr.py:379` | Cap de imágenes captioned por corrida. Bound contra runs multi-hora en vaults grandes. |
 | `RAG_CITA_DETECT` | unset (off) | `rag/ocr.py:757` | Activa detector de citas médicas/judiciales en chunks (flag de fechas de vencimiento). |
 | `RAG_OCR_HISTORICAL_MAX_DAYS` | `90` (default constant) | `web/server.py:2528` | Tope de días hacia atrás para reprocesar OCR sobre uploads históricos (ver sección Recientes). |
@@ -227,7 +230,6 @@ Las del último audit de seguridad/perf. Citadas explícitamente porque son las 
 |---|---|---|---|
 | `HF_HUB_OFFLINE` | (recomendado `1`) | (HuggingFace lib) | Reranker se carga del caché local de HuggingFace, sin tocar la red. |
 | `TRANSFORMERS_OFFLINE` | (recomendado `1`) | (HuggingFace lib) | Idem para `transformers`. |
-| `FASTEMBED_CACHE_PATH` | `~/.cache/fastembed` | `rag/__init__.py:44`, plists | Directorio persistente para los modelos ONNX que carga `fastembed` (usado por `mem0` para BM25 sparse vectors / hybrid search en Qdrant). El default upstream es `tempfile.gettempdir()/fastembed_cache` → en macOS resuelve a `/var/folders/.../T/fastembed_cache`, que el SO limpia periódicamente. Pinearlo a `$HOME` evita que `HF_HUB_OFFLINE=1` + cache miss tras GC dejen al encoder sin poder cargar (ver web.error.log 2026-04-29). Población inicial: `python -c 'from fastembed import SparseTextEmbedding; SparseTextEmbedding("Qdrant/bm25")'` con offline mode desactivado. |
 | `RAG_FT_DEVICE` | `cpu` | `scripts/finetune_reranker.py:238` | Device para entrenar el cross-encoder fine-tuned. `cpu`/`mps`/`cuda`. |
 | `RAG_FINETUNE_MIN_CORRECTIVES` | `20` | `scripts/finetune_reranker.py:481` | Cap mínimo de feedback rows correctivos para que el fine-tune dispare. Gate GC#2.C. |
 | `RAG_AUTO_HARVEST_MIN_CONF` | `0.8` | `rag/__init__.py:48936` | Confidence mínimo del LLM-as-judge para aceptar una query low-conf como label en el auto-harvest nightly. |

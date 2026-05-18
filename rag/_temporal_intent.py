@@ -33,6 +33,7 @@ Preserva 100% compat con `rag.detect_temporal_intent`,
 from __future__ import annotations
 
 import re
+import sys
 from datetime import datetime, timedelta
 
 import click
@@ -109,15 +110,28 @@ def _now_dt() -> datetime:
     return datetime.now()
 
 
+def _current_now() -> datetime:
+    """Root-package override for back-compat with `monkeypatch(rag._now_dt)`.
+
+    `rag.__init__` re-exports this module, so historical tests patch the root
+    binding. Internal helpers must honor that patched binding.
+    """
+    root = sys.modules.get("rag")
+    fn = getattr(root, "_now_dt", None) if root is not None else None
+    if callable(fn) and fn is not _now_dt:
+        return fn()
+    return _now_dt()
+
+
 def _range_last_n_days(n: int) -> tuple[float, float]:
-    now = _now_dt()
+    now = _current_now()
     start = now.timestamp() - n * 86400
     return start, now.timestamp()
 
 
 def _range_this_period(unit: str) -> tuple[float, float]:
     """Start-of-current calendar period → now. `unit` ∈ semana|mes|año."""
-    now = _now_dt()
+    now = _current_now()
     if unit.startswith("sem"):
         # ISO week: Monday = 0. Start of the current week at 00:00.
         start_dt = (now - timedelta(days=now.weekday())).replace(
@@ -135,7 +149,7 @@ def _range_month(month: int) -> tuple[float, float]:
     today, assume the user meant last year's occurrence (covers "qué escribí
     en noviembre" asked in March).
     """
-    now = _now_dt()
+    now = _current_now()
     year = now.year if month <= now.month else now.year - 1
     start_dt = datetime(year, month, 1)
     if month == 12:
@@ -165,12 +179,12 @@ def detect_temporal_intent(text: str) -> tuple[tuple[float, float] | None, str]:
             if days:
                 rng = _range_last_n_days(n * days)
         elif unit and unit.lower() in ("ayer",):
-            now = _now_dt()
+            now = _current_now()
             start = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
             end = now.replace(hour=0, minute=0, second=0, microsecond=0)
             rng = (start.timestamp(), end.timestamp())
         elif unit and unit.lower() in ("hoy",):
-            now = _now_dt()
+            now = _current_now()
             start = now.replace(hour=0, minute=0, second=0, microsecond=0)
             rng = (start.timestamp(), now.timestamp())
         elif groups.get("month"):
@@ -207,7 +221,7 @@ def parse_since(value: str) -> float:
         n = int(m.group(1))
         unit = m.group(2).lower()
         days = {"d": 1, "w": 7, "m": 30, "y": 365}[unit]
-        return _now_dt().timestamp() - n * days * 86400
+        return _current_now().timestamp() - n * days * 86400
     for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
         try:
             return datetime.strptime(s, fmt).timestamp()

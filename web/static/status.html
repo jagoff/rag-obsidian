@@ -1012,6 +1012,18 @@
       .container { padding: 16px 14px 40px; }
       header { margin-bottom: 16px; padding: 10px 0 12px; }
       header h1 { font-size: 16px; }
+      .header-meta {
+        width: 100%;
+        gap: 8px;
+        flex-wrap: nowrap;
+        overflow-x: auto;
+        padding-bottom: 4px;
+        white-space: nowrap;
+        scrollbar-width: none;
+      }
+      .header-meta::-webkit-scrollbar { display: none; }
+      .header-meta > * { flex: 0 0 auto; }
+      #meta-updated { max-width: 150px; overflow: hidden; text-overflow: ellipsis; }
       .overall { grid-template-columns: auto 1fr; padding: 14px 16px; }
       .overall-counts { grid-column: 1 / -1; justify-content: space-around; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--sep); }
       .services { grid-template-columns: 1fr; }
@@ -1081,6 +1093,7 @@
         <a href="/">home</a>
         <a href="/mirror">mirror</a>
         <a href="/chat">chat</a>
+        <a href="/wzp">wzp</a>
         <a href="/dashboard">dashboard</a>
         <a href="/learning">learning</a>
         <a href="/finance">finance</a>
@@ -1089,6 +1102,7 @@
         <a href="/logs">logs</a>
         <a href="/transcripts">transcripts</a>
         <a href="/fine_tunning">fine_tunning</a>
+        <a href="/blacklist">blacklist</a>
         <a href="https://ra.ai/agents/">agents</a>
       </div>
     </header>

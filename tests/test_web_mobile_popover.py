@@ -24,10 +24,26 @@ Cubre regresiones reales que tuvimos:
 """
 from __future__ import annotations
 from pathlib import Path
+import re
 
 
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "web" / "static"
-_STYLE_CSS = (_STATIC_DIR / "style.css").read_text(encoding="utf-8")
+
+
+def _read_css_bundle() -> str:
+    """Read style.css plus its local @import targets.
+
+    The production file is now a CSS barrel, so static contract tests need to
+    inspect the effective local bundle rather than only the tiny entry point.
+    """
+    entry = (_STATIC_DIR / "style.css").read_text(encoding="utf-8")
+    parts = [entry]
+    for rel in re.findall(r'@import url\("([^"]+)"\);', entry):
+        parts.append((_STATIC_DIR / rel).read_text(encoding="utf-8"))
+    return "\n".join(parts)
+
+
+_STYLE_CSS = _read_css_bundle()
 _INDEX_HTML = (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
 
 

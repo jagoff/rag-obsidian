@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from rag import mirror as mirror_mod
+from rag.integrations import peekaboo as peekaboo_mod
 from rag.mirror import _SOURCES, _source_screen_context
 
 
@@ -64,9 +65,58 @@ def test_source_registered_in_aggregator():
 # ── empty / no-table paths ──────────────────────────────────────────────────
 
 
-def test_empty_table_returns_zeros(isolated_telemetry):
+def test_empty_table_reports_disabled_when_observer_not_configured(
+    isolated_telemetry,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.delenv("RAG_SCREEN_OBSERVE", raising=False)
+    monkeypatch.setattr(
+        peekaboo_mod,
+        "_OBSERVE_STATE_FILE",
+        tmp_path / "screen_observe_enabled",
+    )
     out = _source_screen_context("2026-05-13")
-    assert out == {"recent": [], "today": [], "count_today": 0, "count_7d": 0}
+    assert out["recent"] == []
+    assert out["today"] == []
+    assert out["count_today"] == 0
+    assert out["count_7d"] == 0
+    assert out["observer_enabled"] is False
+    assert out["reason"] == "observer_disabled"
+
+
+def test_empty_table_uses_observer_state_file_not_web_env(
+    isolated_telemetry,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.delenv("RAG_SCREEN_OBSERVE", raising=False)
+    state_file = tmp_path / "screen_observe_enabled"
+    state_file.write_text("")
+    monkeypatch.setattr(peekaboo_mod, "_OBSERVE_STATE_FILE", state_file)
+    out = _source_screen_context("2026-05-13")
+    assert out["recent"] == []
+    assert out["today"] == []
+    assert out["count_today"] == 0
+    assert out["count_7d"] == 0
+    assert out["observer_enabled"] is True
+    assert out["reason"] == "no_observations"
+
+
+def test_empty_table_env_enabled_without_state_file(
+    isolated_telemetry,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("RAG_SCREEN_OBSERVE", "1")
+    monkeypatch.setattr(
+        peekaboo_mod,
+        "_OBSERVE_STATE_FILE",
+        tmp_path / "screen_observe_enabled",
+    )
+    out = _source_screen_context("2026-05-13")
+    assert out["observer_enabled"] is True
+    assert out["reason"] == "no_observations"
 
 
 def test_missing_table_handled_gracefully(tmp_path, monkeypatch):
@@ -78,6 +128,7 @@ def test_missing_table_handled_gracefully(tmp_path, monkeypatch):
     assert out["recent"] == []
     assert out["count_today"] == 0
     assert out["count_7d"] == 0
+    assert out["reason"] == "table_missing"
 
 
 # ── recent window ───────────────────────────────────────────────────────────

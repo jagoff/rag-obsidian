@@ -31,6 +31,7 @@ import threading
 import time
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
+from hashlib import sha1
 from pathlib import Path
 
 # Cache compartido — clave incluye (window_days, top_entities, graph_top_notes,
@@ -249,6 +250,39 @@ def _empty_payload(now: datetime, reason: str) -> dict:
     }
 
 
+def _stable_entity_id(entity_type: str, name: str) -> int:
+    digest = sha1(f"{entity_type}:{name.lower()}".encode("utf-8")).hexdigest()[:12]
+    return -int(digest, 16)
+
+
+def _atlas_node_id(vault_name: str | None, path: str) -> str:
+    if not vault_name:
+        return path
+    return f"{vault_name}:{path}"
+
+
+def _split_atlas_node_id(ref: str) -> tuple[str | None, str]:
+    """Split `vault:path` ids used by multi-vault Atlas nodes.
+
+    Bare paths remain valid for older clients/tests and resolve to the active
+    vault. Only prefixes that match registered vault names are treated as a
+    vault id, so note paths containing a colon are not accidentally mangled.
+    """
+    text = str(ref or "")
+    if ":" not in text:
+        return None, text
+    prefix, rest = text.split(":", 1)
+    try:
+        from rag import resolve_vault_paths  # type: ignore  # noqa: PLC0415
+
+        known = {name for name, _path in (resolve_vault_paths(["all"]) or [])}
+    except Exception:
+        known = set()
+    if prefix in known and rest:
+        return prefix, rest
+    return None, text
+
+
 # ── 1. Entidades ────────────────────────────────────────────────────────────
 
 
@@ -452,7 +486,14 @@ def _cooccurrence(conn: sqlite3.Connection, full: dict[int, dict], top: int = 30
 # ── 2. Graph estilo Obsidian (notas + wikilinks) ────────────────────────────
 
 
-def _build_graph(meta_table: str, ragvec_db: Path, top_notes: int) -> dict:
+def _build_graph(
+    meta_table: str,
+    ragvec_db: Path,
+    top_notes: int,
+    *,
+    vault_name: str | None = None,
+    vault_path: Path | None = None,
+) -> dict:
     """Lee `meta_<collection>` y reconstruye nodos (notas) + edges (wikilinks).
 
     Cada nota tiene una columna `outlinks` con los TARGETS de los
@@ -508,8 +549,10 @@ def _build_graph(meta_table: str, ragvec_db: Path, top_notes: int) -> dict:
 
     for row in rows:
         file_path, folder, all_outlinks, title, area, ntype, created_ts, n_chunks = row
+        node_id = _atlas_node_id(vault_name, file_path)
         notes[file_path] = {
-            "id": file_path,
+            "id": node_id,
+            "path": file_path,
             "label": title or Path(file_path).stem,
             "folder": folder or "",
             "area": area or "",
@@ -517,6 +560,20 @@ def _build_graph(meta_table: str, ragvec_db: Path, top_notes: int) -> dict:
             "created_ts": created_ts,
             "n_chunks": int(n_chunks or 0),
         }
+        if vault_name:
+            notes[file_path]["vault_name"] = vault_name
+        if vault_path:
+            notes[file_path]["vault_path"] = str(vault_path)
+            try:
+                from urllib.parse import quote as _quote
+
+                obsidian_vault = Path(vault_path).name
+                notes[file_path]["vault_uri"] = (
+                    f"obsidian://open?vault={_quote(obsidian_vault, safe='')}"
+                    f"&file={_quote(file_path, safe='')}"
+                )
+            except Exception:
+                pass
         # GROUP_CONCAT puede traer duplicados; dedupe acá.
         targets = set()
         if all_outlinks:
@@ -574,7 +631,7 @@ def _build_graph(meta_table: str, ragvec_db: Path, top_notes: int) -> dict:
                 reverse=True,
             )
             for n in extras[: top_notes - len(keep_ids)]:
-                keep_ids.add(n["id"])
+                keep_ids.add(n["path"])
     else:
         keep_ids = set(notes.keys())
 
@@ -588,7 +645,11 @@ def _build_graph(meta_table: str, ragvec_db: Path, top_notes: int) -> dict:
     nodes.sort(key=lambda n: n["degree"], reverse=True)
 
     links = [
-        {"source": a, "target": b, "weight": int(w)}
+        {
+            "source": notes[a]["id"],
+            "target": notes[b]["id"],
+            "weight": int(w),
+        }
         for (a, b), w in edges.items()
         if a in keep_ids and b in keep_ids
     ]
@@ -600,6 +661,270 @@ def _build_graph(meta_table: str, ragvec_db: Path, top_notes: int) -> dict:
         "total_notes": len(notes),
         "total_edges": len(edges),
     }
+
+
+def _merge_graphs(graphs: list[dict], top_notes: int) -> dict:
+    """Merge per-vault graph payloads while preserving representation."""
+    if not graphs:
+        return {"nodes": [], "links": [], "truncated": False, "total_notes": 0, "total_edges": 0}
+
+    total_notes = sum(int(g.get("total_notes") or len(g.get("nodes", []) or [])) for g in graphs)
+    total_edges = sum(int(g.get("total_edges") or len(g.get("links", []) or [])) for g in graphs)
+    all_nodes: list[dict] = []
+    selected: dict[str, dict] = {}
+
+    # Fair first pass: each vault gets a visible slice before the global
+    # degree ranking fills the rest. Without this, one densely-linked vault can
+    # starve every other vault and look like Atlas "lost" data.
+    fair_cap = max(1, top_notes // max(1, len(graphs)))
+    for graph in graphs:
+        nodes = list(graph.get("nodes") or [])
+        nodes.sort(key=lambda n: (n.get("degree", 0), n.get("n_chunks", 0)), reverse=True)
+        for node in nodes[:fair_cap]:
+            selected[node["id"]] = node
+        all_nodes.extend(nodes)
+
+    remaining = max(0, top_notes - len(selected))
+    if remaining:
+        for node in sorted(
+            all_nodes,
+            key=lambda n: (n.get("degree", 0), n.get("n_chunks", 0)),
+            reverse=True,
+        ):
+            if node["id"] in selected:
+                continue
+            selected[node["id"]] = node
+            remaining -= 1
+            if remaining <= 0:
+                break
+
+    keep_ids = set(selected)
+    nodes = sorted(
+        selected.values(),
+        key=lambda n: (n.get("degree", 0), n.get("n_chunks", 0)),
+        reverse=True,
+    )
+    links = [
+        link
+        for graph in graphs
+        for link in (graph.get("links") or [])
+        if link.get("source") in keep_ids and link.get("target") in keep_ids
+    ]
+    return {
+        "nodes": nodes,
+        "links": links,
+        "truncated": total_notes > len(nodes) or any(bool(g.get("truncated")) for g in graphs),
+        "total_notes": total_notes,
+        "total_edges": total_edges,
+        "vaults": [
+            {
+                "name": g.get("vault_name"),
+                "path": g.get("vault_path"),
+                "total_notes": int(g.get("total_notes") or len(g.get("nodes", []) or [])),
+                "total_edges": int(g.get("total_edges") or len(g.get("links", []) or [])),
+            }
+            for g in graphs
+        ],
+    }
+
+
+_ONE_ON_ONE_RE = re.compile(
+    r"(?:team\s*-\s*|1\s*a\s*1\s*[-:]?\s*|1-1\s*[-:]?\s*)([A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚÜÑáéíóúüñ'._-]{2,})",
+    re.IGNORECASE,
+)
+_EVENT_WORDS_RE = re.compile(
+    r"\b(curso|workshop|taller|evento|meetup|conferencia|charla|webinar|summit|hackathon|retiro|offsite|training|capacitación|capacitacion)\b",
+    re.IGNORECASE,
+)
+_LOCATION_WORDS_RE = re.compile(
+    r"\b(argentina|buenos aires|córdoba|cordoba|santa fe|rosario|mendoza|uruguay|chile|brasil|barcelona|madrid|roma|paris|londres|new york|san francisco)\b",
+    re.IGNORECASE,
+)
+_PERSON_FALLBACK_STOPWORDS = {
+    "notas",
+    "octubre",
+    "preguntas",
+    "vacaciones",
+    "energizing people",
+    "plan",
+    "track",
+    "our",
+    "our culture",
+    "people",
+    "team",
+    "company",
+}
+
+
+def _title_from_path(path: str) -> str:
+    return Path(path or "").stem.replace("_", " ").strip()
+
+
+def _entity_candidates_from_node(node: dict) -> list[tuple[str, str]]:
+    """Heuristic entities from indexed note metadata when GLiNER has no rows."""
+    path = str(node.get("path") or node.get("id") or "")
+    title = str(node.get("label") or _title_from_path(path))
+    folder = str(node.get("folder") or "")
+    haystack = f"{folder} {title}"
+    candidates: list[tuple[str, str]] = []
+
+    parts = [p for p in path.split("/") if p]
+    if "Companies" in parts:
+        idx = parts.index("Companies")
+        if idx + 1 < len(parts):
+            org = parts[idx + 1].strip()
+            org = re.sub(r"^\d+\s+", "", org)
+            if org:
+                candidates.append(("organization", org))
+    if re.search(r"\b(company|companies|clientes|clients|startup|empresa)\b", haystack, re.IGNORECASE):
+        prefix = re.split(r"\s+-\s+", title, maxsplit=1)[0].strip()
+        if prefix and len(prefix) <= 40:
+            candidates.append(("organization", prefix))
+
+    for match in _ONE_ON_ONE_RE.finditer(title):
+        name = match.group(1).strip(" -_")
+        if (
+            name
+            and name.lower() not in _PERSON_FALLBACK_STOPWORDS
+            and not re.search(r"\d", name)
+        ):
+            candidates.append(("person", name))
+    if re.search(r"\b(contactos|contacts|1 a 1|1-1)\b|team\s*-", haystack, re.IGNORECASE):
+        bits = re.split(r"\s+-\s+", title)
+        tail = bits[-1].strip() if bits else title
+        tail = re.sub(r"\b(1[- ]?1|1\s*a\s*1|one[- ]?on[- ]?one)\b", "", tail, flags=re.IGNORECASE).strip(" -")
+        if (
+            2 <= len(tail) <= 35
+            and len(tail.split()) <= 2
+            and tail.lower() not in _PERSON_FALLBACK_STOPWORDS
+            and not re.search(r"\d", tail)
+        ):
+            candidates.append(("person", tail))
+
+    if _EVENT_WORDS_RE.search(haystack):
+        candidates.append(("event", title))
+
+    loc = _LOCATION_WORDS_RE.search(haystack)
+    if loc:
+        candidates.append(("location", loc.group(1).title()))
+
+    # Last-resort topic so the card is not empty when NER is unavailable.
+    if not candidates and title:
+        if len(title) <= 70 and not title.startswith("_"):
+            candidates.append(("event", title))
+
+    out: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for entity_type, name in candidates:
+        clean = re.sub(r"\s+", " ", str(name or "")).strip(" -")
+        if _is_junk_entity_name(clean):
+            continue
+        key = (entity_type, clean.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((entity_type, clean))
+    return out
+
+
+def _fallback_entities_from_graph(
+    graph: dict,
+    *,
+    window_days: int,
+    top_per_type: int,
+) -> tuple[dict[str, list[dict]], dict[int, dict], dict[str, list[int]]]:
+    """Build usable Atlas entity cards from note metadata when NER is empty."""
+    types = ("person", "location", "organization", "event")
+    by_key: dict[tuple[str, str], dict] = {}
+    node_entities: dict[str, list[int]] = defaultdict(list)
+    now = _utc_now().timestamp()
+    window_start = now - window_days * 86400
+
+    for node in graph.get("nodes", []) or []:
+        weight = max(1, int(node.get("degree") or 0) + int(node.get("n_chunks") or 0))
+        ts = float(node.get("created_ts") or 0)
+        for entity_type, name in _entity_candidates_from_node(node):
+            key = (entity_type, name.lower())
+            ent = by_key.get(key)
+            if ent is None:
+                ent = {
+                    "id": _stable_entity_id(entity_type, name),
+                    "name": name,
+                    "type": entity_type,
+                    "mention_count": 0,
+                    "recent_mentions": 0,
+                    "prev_mentions": 0,
+                    "first_seen_ts": ts or now,
+                    "last_seen_ts": ts or now,
+                    "aliases": [],
+                    "sparkline": [0] * window_days,
+                    "source": "graph_fallback",
+                }
+                by_key[key] = ent
+            ent["mention_count"] += weight
+            if ts:
+                ent["first_seen_ts"] = min(float(ent.get("first_seen_ts") or ts), ts)
+                ent["last_seen_ts"] = max(float(ent.get("last_seen_ts") or ts), ts)
+                if ts >= window_start:
+                    ent["recent_mentions"] += weight
+                    age_days = int((now - ts) / 86400.0)
+                    idx = window_days - 1 - age_days
+                    if 0 <= idx < window_days:
+                        ent["sparkline"][idx] += weight
+            label = str(node.get("label") or "")
+            aliases = ent.setdefault("aliases", [])
+            if label and label != name and label not in aliases:
+                aliases.append(label)
+                ent["aliases"] = aliases[:5]
+            node_entities[str(node.get("id"))].append(ent["id"])
+
+    result: dict[str, list[dict]] = {t: [] for t in types}
+    full: dict[int, dict] = {}
+    for ent in by_key.values():
+        ent["mention_count"] = int(ent.get("mention_count") or 0)
+        ent["recent_mentions"] = int(ent.get("recent_mentions") or 0)
+        result[ent["type"]].append(ent)
+    for entity_type in types:
+        result[entity_type].sort(key=lambda e: e.get("mention_count", 0), reverse=True)
+        result[entity_type] = result[entity_type][:top_per_type]
+        for ent in result[entity_type]:
+            full[int(ent["id"])] = ent
+    return result, full, node_entities
+
+
+def _cooccurrence_from_graph(
+    graph: dict,
+    full: dict[int, dict],
+    node_entities: dict[str, list[int]],
+    top: int = 30,
+) -> list[dict]:
+    if not full:
+        return []
+    pairs: Counter = Counter()
+    for link in graph.get("links", []) or []:
+        ids = sorted(set(node_entities.get(str(link.get("source")), []) + node_entities.get(str(link.get("target")), [])))
+        ids = [i for i in ids if i in full]
+        if len(ids) < 2:
+            continue
+        weight = int(link.get("weight") or 1)
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                pairs[(ids[i], ids[j])] += weight
+    out: list[dict] = []
+    for (a, b), cnt in pairs.most_common(top):
+        ea = full[a]
+        eb = full[b]
+        out.append({
+            "a_id": a,
+            "a_name": ea["name"],
+            "a_type": ea["type"],
+            "b_id": b,
+            "b_name": eb["name"],
+            "b_type": eb["type"],
+            "count": int(cnt),
+            "source": "graph_fallback",
+        })
+    return out
 
 
 # ── note_detail (side-panel del frontend al click en un nodo del grafo) ─────
@@ -644,6 +969,12 @@ def note_detail(
         out["error"] = "invalid_path"
         return out
 
+    node_vault_name, raw_path = _split_atlas_node_id(path)
+    if node_vault_name:
+        path = raw_path
+        out["meta"]["path"] = path
+        out["meta"]["node_id"] = _atlas_node_id(node_vault_name, path)
+
     try:
         from rag import (  # type: ignore
             DB_PATH,
@@ -651,18 +982,27 @@ def note_detail(
             _TELEMETRY_DB_FILENAME,
             get_db,
             get_db_for,
+            resolve_vault_paths,
         )
     except Exception as e:
         out["error"] = f"rag_import_failed:{e}"
         return out
 
     if vault_path is None:
-        vault_path = VAULT_PATH
+        if node_vault_name:
+            vaults = dict(resolve_vault_paths(["all"]) or [])
+            vault_path = vaults.get(node_vault_name, VAULT_PATH)
+        else:
+            vault_path = VAULT_PATH
     note_full = Path(vault_path) / path
+    out["meta"]["vault_name"] = node_vault_name
+    out["meta"]["vault_path"] = str(vault_path)
+    note_exists = False
 
     # 1) Preview del cuerpo (skip frontmatter YAML).
     try:
         if note_full.exists() and note_full.is_file():
+            note_exists = True
             text = note_full.read_text(encoding="utf-8", errors="replace")
             # Skip YAML frontmatter si está al inicio.
             if text.startswith("---"):
@@ -727,6 +1067,26 @@ def note_detail(
                 tconn.close()
         except sqlite3.OperationalError as e:
             out["error"] = f"entities_query_failed:{e}"
+
+    if note_exists and not out["entities"]:
+        fallback_node = {
+            "id": _atlas_node_id(node_vault_name, path),
+            "path": path,
+            "label": _title_from_path(path),
+            "folder": str(Path(path).parent),
+            "degree": 1,
+            "n_chunks": 1,
+            "created_ts": 0,
+        }
+        for entity_type, name in _entity_candidates_from_node(fallback_node)[:max_entities]:
+            out["entities"].append({
+                "id": _stable_entity_id(entity_type, name),
+                "name": name,
+                "type": entity_type,
+                "mention_count": 1,
+                "chunks_in_note": 1,
+                "source": "graph_fallback",
+            })
 
     # 4) Vecinos 1-hop (in + out wikilinks). Reusamos el mismo path que
     # `_build_graph` pero filtrado al `path` solicitado, así no inflamos
@@ -856,7 +1216,7 @@ def snapshot(
 
     # Resolve DB paths via rag.* — respeta env overrides + multi-vault.
     try:
-        from rag import DB_PATH, _TELEMETRY_DB_FILENAME, get_db, get_db_for, VAULT_PATH  # type: ignore
+        from rag import DB_PATH, _TELEMETRY_DB_FILENAME, get_db, get_db_for, resolve_vault_paths, VAULT_PATH  # type: ignore
     except Exception as e:
         return _empty_payload(now, f"rag_import_failed:{e}")
 
@@ -866,11 +1226,18 @@ def snapshot(
     if not telemetry_db.exists() or not ragvec_db.exists():
         return _empty_payload(now, "dbs_missing")
 
-    # Cache key: incluye mtimes de ambas DBs + parámetros + vault path.
+    # Cache key: incluye mtimes de ambas DBs + parámetros + vault scope.
     if vault_path is None:
-        vault_path = VAULT_PATH
+        try:
+            vaults = resolve_vault_paths(None) or [("default", VAULT_PATH)]
+        except Exception:
+            vaults = [("default", VAULT_PATH)]
+    else:
+        vaults = [(Path(vault_path).name, vault_path)]
+    vaults = [(name, Path(path)) for name, path in vaults]
+    vault_key = tuple((name, str(path)) for name, path in vaults)
     cache_key = (
-        str(vault_path),
+        vault_key,
         _safe_mtime(telemetry_db),
         _safe_mtime(ragvec_db),
         window_days,
@@ -881,7 +1248,7 @@ def snapshot(
         if _DASHBOARD_CACHE.get("key") == cache_key and _DASHBOARD_CACHE.get("payload"):
             return _DASHBOARD_CACHE["payload"]
 
-    # 1) Entities + sparklines + hot/stale
+    # 1) Entities + sparklines from GLiNER tables when available.
     try:
         tconn = sqlite3.connect(f"file:{telemetry_db}?mode=ro", uri=True, timeout=30.0)
     except sqlite3.OperationalError as e:
@@ -891,8 +1258,6 @@ def snapshot(
         # Sanity: tabla existe?
         tconn.execute("SELECT 1 FROM rag_entities LIMIT 1").fetchone()
         entities_by_type, full = _query_entities_by_type(tconn, top_entities, window_days)
-        hot, stale = _hot_and_stale(full, window_days)
-        cooc = _cooccurrence(tconn, full)
     except sqlite3.OperationalError:
         tconn.close()
         return _empty_payload(now, "rag_entities_missing")
@@ -900,6 +1265,8 @@ def snapshot(
         tconn.close()
         raise
     else:
+        hot, stale = _hot_and_stale(full, window_days)
+        cooc = _cooccurrence(tconn, full)
         tconn.close()
 
     # Total counts para KPIs.
@@ -914,43 +1281,53 @@ def snapshot(
         n_entities = sum(len(v) for v in entities_by_type.values())
         n_mentions = 0
 
-    # 2) Graph de notas
-    try:
-        col = get_db_for(vault_path) if vault_path else get_db()
-        meta_table = col._meta  # type: ignore[attr-defined]
-    except Exception:
-        meta_table = "meta_obsidian_notes_v11"
+    # 2) Graph de notas, multi-vault por default.
+    graphs: list[dict] = []
+    meta_tables: list[str] = []
+    for vault_name, vp in vaults:
+        try:
+            col = get_db_for(vp) if vp else get_db()
+            meta_table = col._meta  # type: ignore[attr-defined]
+        except Exception:
+            meta_table = "meta_obsidian_notes_v11"
+        meta_tables.append(meta_table)
+        g = _build_graph(
+            meta_table,
+            ragvec_db,
+            graph_top_notes,
+            vault_name=vault_name if len(vaults) > 1 else None,
+            vault_path=vp,
+        )
+        g["vault_name"] = vault_name
+        g["vault_path"] = str(vp)
+        graphs.append(g)
 
-    graph = _build_graph(meta_table, ragvec_db, graph_top_notes)
+    graph = graphs[0] if len(graphs) == 1 else _merge_graphs(graphs, graph_top_notes)
 
-    # Enriquecer cada nodo con `vault_uri` (deep link `obsidian://`) para que
-    # el frontend pueda abrir la nota directo en Obsidian al click sin
-    # tener que hacer un fetch extra a /api/atlas/note. Mismo formato que
-    # genera `note_detail()` arriba.
-    try:
-        from urllib.parse import quote as _quote
-        _vault_name = Path(vault_path).name if vault_path else ""
-        if _vault_name:
-            for n in graph.get("nodes", []) or []:
-                p = n.get("id") or ""
-                if p:
-                    n["vault_uri"] = (
-                        f"obsidian://open?vault={_quote(_vault_name, safe='')}"
-                        f"&file={_quote(p, safe='')}"
-                    )
-    except Exception:
-        # Si falla el quote por algún path raro, los demás nodos siguen
-        # funcionando — el frontend chequea `vault_uri` opcional.
-        pass
+    entity_source = "gliner"
+    if not any(entities_by_type.values()):
+        entities_by_type, full, node_entities = _fallback_entities_from_graph(
+            graph,
+            window_days=window_days,
+            top_per_type=top_entities,
+        )
+        hot, stale = _hot_and_stale(full, window_days)
+        cooc = _cooccurrence_from_graph(graph, full, node_entities)
+        entity_source = "graph_fallback"
+        n_entities = len(full)
+        n_mentions = sum(int(e.get("mention_count") or 0) for e in full.values())
 
     payload = {
         "meta": {
             "generated_at": now.isoformat(timespec="seconds"),
-            "vault_path": str(vault_path),
-            "meta_table": meta_table,
+            "vault_path": str(vaults[0][1]) if len(vaults) == 1 else None,
+            "vault_scope": [{"name": name, "path": str(path)} for name, path in vaults],
+            "meta_table": meta_tables[0] if len(meta_tables) == 1 else None,
+            "meta_tables": meta_tables,
             "window_days": window_days,
             "top_entities": top_entities,
             "graph_top_notes": graph_top_notes,
+            "entity_source": entity_source,
         },
         "kpis": {
             "n_entities": int(n_entities or 0),
@@ -1028,6 +1405,57 @@ def semantic_layout(
             "n_notes": 0,
             "explained_variance_ratio": [],
             "missing": [],
+        }
+
+    # Multi-vault Atlas nodes use `vault:path` ids. Group them by vault and
+    # reuse the single-vault implementation recursively with raw paths, then
+    # re-key the output back to the original node ids expected by the frontend.
+    grouped: dict[tuple[str | None, str], list[tuple[str, str]]] = defaultdict(list)
+    saw_prefixed = False
+    try:
+        from rag import resolve_vault_paths, VAULT_PATH  # type: ignore  # noqa: PLC0415
+
+        vault_map = {name: Path(path) for name, path in (resolve_vault_paths(["all"]) or [])}
+        default_vault = VAULT_PATH
+    except Exception:
+        vault_map = {}
+        default_vault = vault_path
+    for ref in paths:
+        vault_name, raw_path = _split_atlas_node_id(ref)
+        if vault_name:
+            saw_prefixed = True
+        resolved_vault = vault_map.get(vault_name) if vault_name else vault_path or default_vault
+        grouped[(vault_name, str(resolved_vault) if resolved_vault else "")].append((ref, raw_path))
+
+    if saw_prefixed or len(grouped) > 1:
+        combined_layout: dict[str, list[float]] = {}
+        combined_missing: list[str] = []
+        evrs: list[list[float]] = []
+        total_notes = 0
+        for (vault_name, vault_path_s), refs in grouped.items():
+            raw_paths = [raw for _ref, raw in refs]
+            ref_by_raw = {raw: ref for ref, raw in refs}
+            vp = Path(vault_path_s) if vault_path_s else None
+            sub = semantic_layout(paths=raw_paths, vault_path=vp)
+            for raw, coords in (sub.get("layout") or {}).items():
+                combined_layout[ref_by_raw.get(raw, raw)] = coords
+            missing_raw = set(sub.get("missing") or [])
+            for ref, raw in refs:
+                if raw in missing_raw:
+                    combined_missing.append(ref)
+            total_notes += int(sub.get("n_notes") or 0)
+            if sub.get("explained_variance_ratio"):
+                evrs.append(list(sub["explained_variance_ratio"]))
+        if evrs:
+            evr = [sum(vals[i] for vals in evrs if len(vals) > i) / len(evrs) for i in range(3)]
+        else:
+            evr = []
+        return {
+            "layout": combined_layout,
+            "method": "pca",
+            "n_notes": total_notes,
+            "explained_variance_ratio": evr,
+            "missing": combined_missing,
         }
 
     # Cache key: hash del set de paths (orden no importa) + vault.

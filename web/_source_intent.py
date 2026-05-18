@@ -58,7 +58,8 @@ _SOURCE_INTENT_META: dict[str, dict[str, str]] = {
         "digest_hint": (
             "Si en el CONTEXTO hay notas del vault del tipo "
             "`99-obsidian/99-AI/external-ingest/Gmail/YYYY-MM-DD.md` (cada `## <asunto>` "
-            "dentro es UN mail, con su **From:**, **Date:** y **Snippet:**), "
+            "dentro es UN mail, con su **From:**, **Date:** y **Snippet:**) "
+            "o del path legacy `03-Resources/Gmail/`, "
             "extraé esos asuntos y listálos uno por línea — son LITERALMENTE "
             "los últimos mails del usuario. NO digas 'en tu nota' ni "
             "menciones la ruta de la nota: los asuntos SON los mails."

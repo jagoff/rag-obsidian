@@ -157,7 +157,28 @@ def test_today_excludes_reviews_folder(tmp_vault):
         contradiction_log=tmp_path / "c.jsonl",
     )
     paths = {r["path"] for r in ev["recent_notes"]}
+    inbox_paths = {r["path"] for r in ev["inbox_today"]}
     assert "00-Inbox/reviews/2026-04-15.md" not in paths
+    assert "00-Inbox/reviews/2026-04-15.md" not in inbox_paths
+
+
+def test_today_excludes_generated_whatsapp_inbox(tmp_vault):
+    vault, _, tmp_path = tmp_vault
+    p = vault / "00-Inbox" / "WA-2026-04-15.md"
+    p.write_text(
+        "# WhatsApp\n\n"
+        "### 99-obsidian/99-AI/external-ingest/WhatsApp/Maria/2026-04\n\n"
+        "- [ ] traer torta\n"
+    )
+    now = _FROZEN_NOW
+    _set_mtime(p, now - timedelta(minutes=10))
+    ev = rag._collect_today_evidence(
+        now, vault,
+        query_log=tmp_path / "q.jsonl",
+        contradiction_log=tmp_path / "c.jsonl",
+    )
+    paths = {r["path"] for r in ev["inbox_today"]}
+    assert "00-Inbox/WA-2026-04-15.md" not in paths
 
 
 def test_today_inbox_capture_routed_to_inbox_bucket(tmp_vault):
@@ -175,6 +196,47 @@ def test_today_inbox_capture_routed_to_inbox_bucket(tmp_vault):
     recent_paths = {r["path"] for r in ev["recent_notes"]}
     assert "00-Inbox/cap.md" in inbox_paths
     assert "00-Inbox/cap.md" not in recent_paths
+
+
+def test_today_inbox_empty_capture_is_not_actionable(tmp_vault):
+    vault, _, tmp_path = tmp_vault
+    p = vault / "00-Inbox" / "2026-04-15.md"
+    p.write_text("")
+    now = _FROZEN_NOW.replace(hour=10, minute=30, second=0, microsecond=0)
+    _set_mtime(p, now)
+    ev = rag._collect_today_evidence(
+        now + timedelta(minutes=5), vault,
+        query_log=tmp_path / "q.jsonl",
+        contradiction_log=tmp_path / "c.jsonl",
+    )
+    inbox_paths = {r["path"] for r in ev["inbox_today"]}
+    assert "00-Inbox/2026-04-15.md" not in inbox_paths
+
+
+def test_vault_activity_skips_inbox_and_empty_notes(tmp_vault, monkeypatch):
+    vault, _, _tmp_path = tmp_vault
+    inbox = vault / "00-Inbox" / "capture.md"
+    inbox.write_text("captura sin procesar")
+    empty = vault / "02-Areas" / "empty.md"
+    empty.write_text("")
+    real = vault / "02-Areas" / "real.md"
+    real.write_text("nota real tocada")
+    secret = vault / "02-Areas" / "Personal" / "Passwords" / "generic.md"
+    secret.parent.mkdir(parents=True, exist_ok=True)
+    secret.write_text("password hunter2")
+
+    now = datetime.now()
+    for p in (inbox, empty, real, secret):
+        _set_mtime(p, now)
+    monkeypatch.setattr(rag, "resolve_vault_paths", lambda _which: [("home", vault)])
+
+    act = rag._fetch_vault_activity(hours=48, n_per_vault=10)
+    paths = {r["path"] for r in act["home"]}
+
+    assert "02-Areas/real.md" in paths
+    assert "00-Inbox/capture.md" not in paths
+    assert "02-Areas/empty.md" not in paths
+    assert "02-Areas/Personal/Passwords/generic.md" not in paths
 
 
 def test_today_inbox_untagged_flag(tmp_vault):
@@ -311,6 +373,15 @@ def test_render_today_prompt_no_extras_backward_compatible():
     assert "## 💬 WhatsApp — recibido HOY" not in prompt
     assert "## 💬 WhatsApp — esperando" not in prompt
     assert "## 📺 YouTube" not in prompt
+
+
+def test_render_today_prompt_asks_for_expanded_today_narrative():
+    prompt = rag._render_today_prompt("2026-04-21", _ev_minimal())
+
+    assert "## 🪞 Lo que pasó hoy" in prompt
+    assert "2-3 párrafos breves" in prompt
+    assert "No escribas un listado" in prompt
+    assert "3-4 líneas concretas" not in prompt
 
 
 def test_render_today_prompt_includes_gmail_when_provided():

@@ -700,6 +700,7 @@ def _cross_source_dedup(
 #     exclude_senders: ["*@bank.com", "noreply@2fa.com"]
 #   whatsapp:
 #     exclude_chats: ["+5491112345678@s.whatsapp.net"]
+#     exclude_chat_names: ["Cloud Services"]
 #   calendar:
 #     exclude_calendars: ["Privado"]
 #
@@ -753,7 +754,12 @@ def _load_cross_source_filters() -> dict:
     return raw
 
 
-def _should_exclude_chunk(meta: dict, filters: dict | None = None) -> bool:
+def _should_exclude_chunk(
+    meta: dict,
+    filters: dict | None = None,
+    *,
+    text: str | None = None,
+) -> bool:
     """Determina si un chunk debe ser excluido del retrieval por reglas
     de privacidad cross-source. Devuelve True para excluir.
 
@@ -768,9 +774,37 @@ def _should_exclude_chunk(meta: dict, filters: dict | None = None) -> bool:
     """
     if filters is None:
         filters = _load_cross_source_filters()
+    try:
+        from rag.exclusions import should_exclude_record  # noqa: PLC0415
+
+        text_bits = [
+            text or "",
+            str(meta.get("title") or meta.get("note") or ""),
+            str(meta.get("subject") or meta.get("summary") or ""),
+        ]
+        if should_exclude_record(
+            path=meta.get("file") or meta.get("path") or meta.get("source_path"),
+            chat_name=meta.get("chat_name") or meta.get("chat") or meta.get("group"),
+            person=meta.get("person") or meta.get("contact") or meta.get("sender_name"),
+            text=" ".join(bit for bit in text_bits if bit),
+        ):
+            return True
+    except Exception:
+        pass
+    source = (meta.get("source") or "vault").lower()
+    if source in ("whatsapp", "messages"):
+        try:
+            from rag.integrations.whatsapp._constants import (  # noqa: PLC0415
+                normalize_whatsapp_chat_name,
+                whatsapp_chat_name_excluded,
+            )
+        except Exception:
+            normalize_whatsapp_chat_name = lambda name: " ".join(str(name or "").strip().casefold().split())
+            whatsapp_chat_name_excluded = lambda name: False
+        if whatsapp_chat_name_excluded(meta.get("chat_name")):
+            return True
     if not filters:
         return False
-    source = (meta.get("source") or "vault").lower()
     src_filters = filters.get(source)
     if not isinstance(src_filters, dict):
         return False
@@ -802,6 +836,13 @@ def _should_exclude_chunk(meta: dict, filters: dict | None = None) -> bool:
             jid = meta.get("chat_jid") or meta.get("jid") or ""
             if jid in excl_chats:
                 return True
+        excl_names = src_filters.get("exclude_chat_names") or []
+        if excl_names:
+            chat_name = normalize_whatsapp_chat_name(meta.get("chat_name"))
+            if chat_name and chat_name in {
+                normalize_whatsapp_chat_name(n) for n in excl_names
+            }:
+                return True
     elif source == "calendar":
         excl_calendars = src_filters.get("exclude_calendars") or []
         if excl_calendars:
@@ -820,14 +861,24 @@ def _filter_excluded_chunks(scored_pairs: list[tuple]) -> list[tuple]:
     el log dice "filtered N gmail chunks por exclude_labels".
     """
     filters = _load_cross_source_filters()
-    if not filters:
-        return scored_pairs
     out: list[tuple] = []
     excluded_count = 0
     for pair in scored_pairs:
         cand = pair[0]
-        meta = cand[1] if isinstance(cand[1], dict) else {}
-        if _should_exclude_chunk(meta, filters):
+        meta = (
+            cand[1]
+            if isinstance(cand, (tuple, list)) and len(cand) > 1 and isinstance(cand[1], dict)
+            else {}
+        )
+        text_bits: list[str] = []
+        if isinstance(cand, (tuple, list)) and cand and isinstance(cand[0], str):
+            text_bits.append(cand[0])
+        for value in pair[1:]:
+            if isinstance(value, str):
+                text_bits.append(value)
+                break
+        text = " ".join(bit for bit in text_bits if bit)
+        if _should_exclude_chunk(meta, filters, text=text):
             excluded_count += 1
             continue
         out.append(pair)

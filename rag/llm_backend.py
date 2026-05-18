@@ -35,6 +35,7 @@ la ausencia de `tool_calls` en la respuesta y degrada gracefully.
 
 from __future__ import annotations
 
+import builtins as _builtins
 import os
 import re
 import threading
@@ -300,16 +301,51 @@ class LLMBackend(ABC):
 
 
 # ---------------------------------------------------------------------------
-# Forward lock global — serializa cualquier inference Metal MLX in-process
+# Forward lock global — serializa cualquier trabajo Metal MLX in-process
 # (chat / chat_stream / generate / embed). Compartido por MLXBackend y
 # por MLXEmbedder (rag/mlx_embed.py) para que un forward de embed y uno de
 # chat NO colisionen en el mismo device. Sin este lock, el ThreadPool de
 # `_home_compute` (web/server.py) lanza ~14 fetchers concurrentes — varios
 # invocan MLX → command buffers Metal colisionan → kIOGPUCommandBufferCallback
-# ErrorHang + InnocentVictim. El cold-load (`_load`) queda fuera del lock
-# para que cargas paralelas de modelos distintos no se serialicen.
-# ---------------------------------------------------------------------------
-_MLX_FORWARD_LOCK = threading.Lock()
+# ErrorHang + InnocentVictim. Los cache clears también pasan por este lock
+# porque tocar el allocator Metal mientras otro thread despacha kernels puede
+# abortar el proceso.
+# Keep the Metal lock stable across `importlib.reload(rag.llm_backend)`.
+# Several tests reload `rag` while daemon/warmup threads from an older module
+# instance can still be alive. If each reload creates a fresh lock, old chat
+# forwards and new embed forwards can run concurrently and abort the process.
+# `builtins` gives us one process-wide lock without introducing another module
+# just to hold this state.
+_MLX_FORWARD_LOCK_NAME = "_OBSIDIAN_RAG_MLX_FORWARD_LOCK"
+if not hasattr(_builtins, _MLX_FORWARD_LOCK_NAME):
+    setattr(_builtins, _MLX_FORWARD_LOCK_NAME, threading.Lock())
+_MLX_FORWARD_LOCK = getattr(_builtins, _MLX_FORWARD_LOCK_NAME)
+
+
+def clear_mlx_cache_safely(*, collect: bool = False) -> None:
+    """Clear MLX's Metal allocator without racing active MLX work.
+
+    `mx.clear_cache()` can abort the process if it runs while another thread
+    is dispatching MLX kernels. Keep every cache clear behind the same global
+    lock used by chat/embed/rerank/VLM forwards.
+    """
+    try:
+        import mlx.core as mx  # type: ignore[import-not-found]
+    except Exception:
+        mx = None
+    if mx is not None:
+        try:
+            with _MLX_FORWARD_LOCK:
+                mx.clear_cache()
+        except Exception:
+            pass
+    if collect:
+        try:
+            import gc
+
+            gc.collect()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -340,9 +376,9 @@ class MLXBackend(LLMBackend):
     - Otherwise: LRU cap at `_MAX_LOADED` (default 3 small models OR
       1 big + 0 small).
 
-    `_idle_ttl` (env `RAG_MLX_IDLE_TTL`, default 1800s) is a hint for
-    a future watchdog thread; not yet enforced. Eviction today is
-    purely capacity-driven.
+    `_idle_ttl` (env `RAG_MLX_IDLE_TTL`, default 1800s) is enforced by
+    a watchdog thread. Eviction also happens synchronously before loading
+    another model when the LRU/big-model policy requires it.
 
     ## Streaming semantics (`chat_stream`)
 
@@ -400,18 +436,16 @@ class MLXBackend(LLMBackend):
         # `unload()` could pop a tuple while another thread is reading it.
         #
         # RLock (not Lock) because `_load()` calls `_evict_for()` while holding
-        # the lock — re-entrancy avoids deadlock. Note: the heavy `mlx_lm.load()`
-        # call itself is intentionally OUT of the lock (see `_load()` docstring)
-        # so concurrent `chat()` calls on already-resident models don't block
-        # behind a 3-8s cold load running in another thread.
+        # the lock — re-entrancy avoids deadlock. The heavy `mlx_lm.load()`
+        # call stays OUT of this dict lock (see `_load()` docstring), but is
+        # serialized with Metal forwards via `_MLX_FORWARD_LOCK`.
         self._loaded_lock = threading.RLock()
         # Forward lock compartido a nivel módulo (`_MLX_FORWARD_LOCK`) — el
         # mismo lock vive en `rag.mlx_embed.MLXEmbedder` para que un embed y
         # un chat NO colisionen en Metal. Memo `obsidian_rag_web_service_gpu_hang_loop`
         # (2026-05-06): residual del web crash loop por concurrencia MLX en
         # `_home_compute`. El HTTP shim resuelve qwen2.5:7b puntual (proc aparte);
-        # este lock cubre lo que queda in-process. NO toca `_load()` — solo el
-        # forward — para que cold-load en otro thread no serialice contra forwards.
+        # este lock cubre lo que queda in-process, incluyendo cache clears.
         self._forward_lock = _MLX_FORWARD_LOCK
         self._last_used: dict[str, float] = {}
         self._watchdog_thread: threading.Thread | None = None
@@ -423,6 +457,7 @@ class MLXBackend(LLMBackend):
         # interference (embedder is small ~400MB; chat models LRU at _MAX_SMALL_LOADED).
         # `_last_used` tracks idle time for the same watchdog as chat models.
         self._loaded_embed: dict[str, tuple[Any, Any]] = {}
+        self._embed_load_lock = threading.Lock()
         self._start_watchdog()
 
     def _start_watchdog(self) -> None:
@@ -495,17 +530,8 @@ class MLXBackend(LLMBackend):
             for mid in orphan:
                 self._last_used.pop(mid, None)
         if stale:
-            # Liberar VRAM Metal — fuera del lock para no bloquear
-            # otros load/chat. mx.clear_cache + gc.collect es safe
-            # cuando no hay refs vivas a buffers MLX (las refs se
-            # dropearon arriba al pop).
-            try:
-                import gc as _gc
-                import mlx.core as _mx  # type: ignore[import-not-found]
-                _mx.clear_cache()
-                _gc.collect()
-            except Exception:
-                pass
+            # Liberar VRAM Metal sin pisar forwards concurrentes.
+            clear_mlx_cache_safely(collect=True)
 
     def _load(self, model_id: str) -> tuple[Any, Any]:
         """Get or load (model, tokenizer) for `model_id`. LRU bump on hit.
@@ -515,8 +541,9 @@ class MLXBackend(LLMBackend):
         1. The fast-path lookup + LRU bump runs under `_loaded_lock` — atomic.
         2. Eviction (`_evict_for`) runs under the same lock (re-entrant via RLock).
         3. The heavy `mlx_lm.load(canonical)` call (3-8s cold load) is OUT of
-           the lock so concurrent `chat()` calls on already-resident models
-           do NOT block behind it.
+           `_loaded_lock` so resident-model lookups do not block behind it.
+           It is still serialized by `_MLX_FORWARD_LOCK` because cold-load
+           allocates Metal buffers on the same device as active forwards.
         4. After loading, a double-check inside the lock ensures that if a
            second thread loaded the same model during the unlocked window,
            we discard the duplicate and return the version stored first.
@@ -533,13 +560,21 @@ class MLXBackend(LLMBackend):
                 self._last_used[canonical] = time.monotonic()
                 return self._loaded[canonical]
             # Eviction BEFORE load (free RAM first); reentrant via RLock.
-            self._evict_for(canonical)
+            evicted_any = self._evict_for(canonical)
+
+        if evicted_any:
+            # Dropping Python refs is not enough on Apple Silicon: MLX/Metal
+            # keeps allocator pages reserved until clear_cache. Do this
+            # outside `_loaded_lock` to avoid lock-order inversions with
+            # active forwards that later bump `_last_used`.
+            clear_mlx_cache_safely(collect=True)
 
         # Heavy I/O OUTSIDE the lock so concurrent chats on resident models
         # don't block behind a 3-8s cold load.
         from mlx_lm import load  # type: ignore[import-not-found]
 
-        model, tokenizer = load(canonical)
+        with self._forward_lock:
+            model, tokenizer = load(canonical)
 
         # Double-check under lock: another thread may have loaded the same
         # model while we were waiting on `mlx_lm.load`. If so, return the
@@ -553,14 +588,18 @@ class MLXBackend(LLMBackend):
             self._last_used[canonical] = time.monotonic()
             return (model, tokenizer)
 
-    def _evict_for(self, incoming: str) -> None:
+    def _evict_for(self, incoming: str) -> bool:
         """Evict resident models to make room for `incoming`.
 
         Holds `_loaded_lock` (RLock) — safe to call while already holding it
         from `_load()`. Direct external callers are also protected.
+
+        Returns True iff anything was evicted so callers can clear the MLX
+        Metal allocator after releasing `_loaded_lock`.
         """
         with self._loaded_lock:
             is_big = incoming in self._BIG_MODELS
+            evicted_any = False
 
             if is_big:
                 # Big models are single-tenant: evict everything else,
@@ -570,20 +609,25 @@ class MLXBackend(LLMBackend):
                     if k != incoming:
                         self._loaded.pop(k, None)
                         self._last_used.pop(k, None)
+                        evicted_any = True
                 for k in list(self._loaded_embed.keys()):
                     self._loaded_embed.pop(k, None)
                     self._last_used.pop(k, None)
-                return
+                    evicted_any = True
+                return evicted_any
 
             # Incoming is small: evict any big, then LRU-trim small ones.
             for k in list(self._loaded.keys()):
                 if k in self._BIG_MODELS:
                     self._loaded.pop(k, None)
                     self._last_used.pop(k, None)
+                    evicted_any = True
 
             while len(self._loaded) >= self._MAX_SMALL_LOADED:
                 k, _ = self._loaded.popitem(last=False)  # evict LRU (oldest)
                 self._last_used.pop(k, None)
+                evicted_any = True
+            return evicted_any
 
     def chat(
         self,
@@ -656,10 +700,6 @@ class MLXBackend(LLMBackend):
         prompt = self._apply_chat_template(tokenizer, messages, format=format)
 
         sampler = make_sampler(temp=opts.temperature, top_p=opts.top_p)
-        if opts.temperature > 0:
-            import mlx.core as mx  # type: ignore[import-not-found]
-
-            mx.random.seed(opts.seed)
 
         short_name = to_short_name(model)
         # acquire/release explícito (no `with`) para garantizar que el lock se
@@ -667,6 +707,10 @@ class MLXBackend(LLMBackend):
         # (GeneratorExit) — el `finally` corre en ambos paths.
         self._forward_lock.acquire()
         try:
+            if opts.temperature > 0:
+                import mlx.core as mx  # type: ignore[import-not-found]
+
+                mx.random.seed(opts.seed)
             for response in stream_generate(
                 mlx_model,
                 tokenizer,
@@ -937,8 +981,9 @@ class MLXBackend(LLMBackend):
         gc.collect() runs which is non-deterministic.
 
         Concurrency: the `_loaded` mutation runs under `_loaded_lock`
-        (P1 fix 2026-05-05). `mx.clear_cache()` and `gc.collect()` run
-        OUTSIDE the lock — they can be slow and don't touch the dict.
+        (P1 fix 2026-05-05). Cache clear runs outside that dict lock but
+        under `_MLX_FORWARD_LOCK`, because clearing Metal while a forward is
+        active can abort the process under load.
 
         Returns True iff anything was unloaded.
         """
@@ -962,19 +1007,11 @@ class MLXBackend(LLMBackend):
                         self._loaded_embed.pop(canonical, None)
                         self._last_used.pop(canonical, None)
                         unloaded_any = True
-            # Cache-clear + GC outside the lock: slow ops, no `_loaded` access.
-            try:
-                import mlx.core as mx  # type: ignore[import-not-found]
-
-                mx.clear_cache()
-            except Exception:
-                pass
-            try:
-                import gc
-
-                gc.collect()
-            except Exception:
-                pass
+            # Cache-clear + GC outside the dict lock, but serialized with
+            # active MLX forwards. Calling `mx.clear_cache()` while
+            # `mlx_lm.generate()` is dispatching can abort the interpreter on
+            # Metal under load.
+            clear_mlx_cache_safely(collect=True)
             return unloaded_any
         except Exception:
             return False
@@ -1001,18 +1038,42 @@ class MLXBackend(LLMBackend):
 
         canonical = to_mlx(model)
 
-        # Load (or retrieve cached) embedder model + tokenizer.
-        # Double-checked under lock: concurrent requests can both pass the
-        # `not in` check and trigger two mlx_lm.load() calls without the
-        # lock, wasting ~5-8s and potentially leaving a dangling reference.
+        # Load (or retrieve cached) embedder model + tokenizer. Cold-load is
+        # serialized separately from `_loaded_lock`: `mlx_lm.load()` can
+        # allocate Metal buffers, so it must not overlap active forwards, but
+        # holding `_loaded_lock` while waiting on `_MLX_FORWARD_LOCK` would
+        # invert the order used by chat/generate when they bump `_last_used`.
         with self._loaded_lock:
-            if canonical not in self._loaded_embed:
-                from mlx_lm import load  # type: ignore[import-not-found]
+            if canonical in self._loaded_embed:
+                embed_model, embed_tokenizer = self._loaded_embed[canonical]
+                self._last_used[canonical] = time.monotonic()
+            else:
+                embed_model = None
+                embed_tokenizer = None
 
-                embed_model, embed_tokenizer = load(canonical)
-                self._loaded_embed[canonical] = (embed_model, embed_tokenizer)
-            embed_model, embed_tokenizer = self._loaded_embed[canonical]
-            self._last_used[canonical] = time.monotonic()
+        if embed_model is None or embed_tokenizer is None:
+            with self._embed_load_lock:
+                with self._loaded_lock:
+                    if canonical in self._loaded_embed:
+                        embed_model, embed_tokenizer = self._loaded_embed[canonical]
+                        self._last_used[canonical] = time.monotonic()
+                    else:
+                        embed_model = None
+                        embed_tokenizer = None
+
+                if embed_model is None or embed_tokenizer is None:
+                    from mlx_lm import load  # type: ignore[import-not-found]
+
+                    clear_mlx_cache_safely(collect=True)
+                    with self._forward_lock:
+                        embed_model, embed_tokenizer = load(canonical)
+
+                    with self._loaded_lock:
+                        if canonical in self._loaded_embed:
+                            embed_model, embed_tokenizer = self._loaded_embed[canonical]
+                        else:
+                            self._loaded_embed[canonical] = (embed_model, embed_tokenizer)
+                        self._last_used[canonical] = time.monotonic()
 
         # mlx-lm wraps HF tokenizers in `TokenizerWrapper` (not directly
         # callable). Reach for the inner `_tokenizer` (a PreTrainedTokenizer)
@@ -1030,51 +1091,54 @@ class MLXBackend(LLMBackend):
             truncation=True,
             return_tensors="np",
         )
-        input_ids = mx.array(encoded["input_ids"])           # (batch, seq)
-        attention_mask = mx.array(encoded["attention_mask"])  # (batch, seq)
-
-        batch_size = input_ids.shape[0]
-
-        # Forward pass through the embedding body (bypass lm_head). Bajo el
-        # lock global para no colisionar con un chat MLX concurrente.
         with self._forward_lock:
-            hidden = embed_model.model(input_ids)  # (batch, seq, hidden_dim)
+            try:
+                input_ids = mx.array(encoded["input_ids"])           # (batch, seq)
+                attention_mask = mx.array(encoded["attention_mask"])  # (batch, seq)
+                batch_size = input_ids.shape[0]
 
-        # Last-real-token pooling. For each row find the index of the last
-        # non-pad token. `attention_mask` is 1 for real tokens, 0 for pads.
-        # sum(axis=1) gives the count of real tokens; subtract 1 for 0-based index.
-        seq_lengths = mx.sum(attention_mask, axis=1) - 1  # shape (batch,)
+                # Forward pass through the embedding body (bypass lm_head). Bajo el
+                # lock global para no colisionar con un chat MLX concurrente.
+                hidden = embed_model.model(input_ids)  # (batch, seq, hidden_dim)
 
-        # mx.eval needed so seq_lengths is concrete before the index gather
-        mx.eval(seq_lengths)
-        seq_lengths_np = seq_lengths.tolist()
+                # Last-real-token pooling. For each row find the index of the
+                # last non-pad token. `attention_mask` is 1 for real tokens,
+                # 0 for pads. sum(axis=1) gives the count of real tokens;
+                # subtract 1 for 0-based index.
+                seq_lengths = mx.sum(attention_mask, axis=1) - 1  # shape (batch,)
 
-        # Gather pooled[b] = hidden[b, seq_lengths[b], :]
-        pooled_rows: list[Any] = []
-        for b in range(batch_size):
-            pooled_rows.append(hidden[b, int(seq_lengths_np[b]), :])
-        # Stack into (batch, hidden_dim)
-        pooled = mx.stack(pooled_rows, axis=0)
+                # mx.eval needed so seq_lengths is concrete before the index gather
+                mx.eval(seq_lengths)
+                seq_lengths_np = seq_lengths.tolist()
 
-        # L2-normalise each row
-        norms = mx.sqrt(mx.sum(pooled * pooled, axis=-1, keepdims=True))
-        normalised = pooled / norms
+                # Gather pooled[b] = hidden[b, seq_lengths[b], :]
+                pooled_rows: list[Any] = []
+                for b in range(batch_size):
+                    pooled_rows.append(hidden[b, int(seq_lengths_np[b]), :])
+                # Stack into (batch, hidden_dim)
+                pooled = mx.stack(pooled_rows, axis=0)
 
-        # Validate output dimension (1024 for qwen3-embedding:0.6b)
-        hidden_dim = normalised.shape[-1]
-        if hidden_dim != 1024:
-            raise RuntimeError(
-                f"MLXBackend.embed: expected 1024-dim output, got {hidden_dim}. "
-                f"Model: {canonical}"
-            )
+                # L2-normalise each row
+                norms = mx.sqrt(mx.sum(pooled * pooled, axis=-1, keepdims=True))
+                normalised = pooled / norms
 
-        mx.eval(normalised)
-        result = normalised.tolist()
-        # Liberar tensores MLX (hidden B×T×D, pooled B×D, normalised B×D)
-        # antes de retornar. Sin clear_cache los buffers Metal permanecen
-        # hasta presión externa → fragmentation acumulada en embed calls
-        # frecuentes (queries, tune, etc.).
-        mx.clear_cache()
+                # Validate output dimension (1024 for qwen3-embedding:0.6b)
+                hidden_dim = normalised.shape[-1]
+                if hidden_dim != 1024:
+                    raise RuntimeError(
+                        f"MLXBackend.embed: expected 1024-dim output, got {hidden_dim}. "
+                        f"Model: {canonical}"
+                    )
+
+                mx.eval(normalised)
+                result = normalised.tolist()
+            finally:
+                # Liberar tensores MLX (hidden B×T×D, pooled B×D,
+                # normalised B×D) sin pisar otro forward concurrente.
+                try:
+                    mx.clear_cache()
+                except Exception:
+                    pass
         return {"embeddings": result}
 
     def _get_sampler(self, temperature: float, top_p: float) -> Any:

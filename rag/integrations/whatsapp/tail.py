@@ -31,6 +31,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from ._constants import whatsapp_chat_name_excluded
+
 logger = logging.getLogger("rag.wa.tail")
 
 # Intervalo de poll. Override via env para tests / debug.
@@ -78,13 +80,20 @@ def try_parse_due_from_text(text: str) -> str | None:
     try:
         from rag import _parse_natural_datetime  # noqa: PLC0415
         from datetime import datetime as _dt, timezone as _tz  # noqa: PLC0415
-        now = _dt.now(_tz.utc)
-        parsed = _parse_natural_datetime(phrase, now=now)
+        from zoneinfo import ZoneInfo as _ZoneInfo  # noqa: PLC0415
+        local_tz = _ZoneInfo(
+            os.environ.get("RAG_TIMEZONE", "").strip()
+            or "America/Argentina/Buenos_Aires"
+        )
+        now_local = _dt.now(local_tz).replace(tzinfo=None)
+        parsed = _parse_natural_datetime(phrase, now=now_local)
         if parsed is None:
             return None
         if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=_tz.utc)
-        if parsed <= now:
+            if parsed <= now_local:
+                return None
+            parsed = parsed.replace(tzinfo=local_tz)
+        elif parsed <= _dt.now(parsed.tzinfo):
             return None
         return parsed.astimezone(_tz.utc).isoformat(timespec="seconds")
     except Exception:
@@ -264,13 +273,15 @@ def _poll_once(hwm: dict[str, str]) -> tuple[list[dict[str, Any]], dict[str, str
         # ── messages
         rows = con.execute(
             """
-            SELECT id, chat_jid, sender, content, timestamp, is_from_me,
-                   media_type, filename, quoted_message_id, quoted_text
-            FROM messages
-            WHERE timestamp > ?
-              AND chat_jid != ?
-              AND chat_jid NOT LIKE '%status@broadcast'
-            ORDER BY timestamp ASC
+            SELECT m.id, m.chat_jid, m.sender, m.content, m.timestamp, m.is_from_me,
+                   m.media_type, m.filename, m.quoted_message_id, m.quoted_text,
+                   COALESCE(c.name, '') AS chat_name
+            FROM messages m
+            LEFT JOIN chats c ON c.jid = m.chat_jid
+            WHERE m.timestamp > ?
+              AND m.chat_jid != ?
+              AND m.chat_jid NOT LIKE '%status@broadcast'
+            ORDER BY m.timestamp ASC
             LIMIT 200
             """,
             (hwm["messages"], bot_jid),
@@ -291,6 +302,7 @@ def _poll_once(hwm: dict[str, str]) -> tuple[list[dict[str, Any]], dict[str, str
             filename = (r["filename"] or "").strip()
             quoted_id = (r["quoted_message_id"] or "").strip()
             quoted_text = (r["quoted_text"] or "").strip()
+            excluded_chat = whatsapp_chat_name_excluded(r["chat_name"] or "")
             msg_payload = {
                 "id": msg_id,
                 "chat_jid": jid,
@@ -309,7 +321,7 @@ def _poll_once(hwm: dict[str, str]) -> tuple[list[dict[str, Any]], dict[str, str
             # Promise Tracker inbound — si llega un mensaje del peer y
             # matchea el regex hint rioplatense, persistimos a rag_promises
             # con direction='inbound'. Silent-fail. No bloquea el SSE emit.
-            if not is_from_me and content:
+            if not is_from_me and content and not excluded_chat:
                 try:
                     _persist_inbound_promise_if_match(jid, content, msg_payload.get("id"))
                 except Exception:

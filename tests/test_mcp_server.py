@@ -111,6 +111,38 @@ def test_rag_query_happy_path_shape_and_session_persistence(mock_rag):
     rag.save_session.assert_called_once()
 
 
+def test_rag_query_uses_default_multi_vault_scope(mock_rag, tmp_path):
+    """MCP read path debe respetar el scope operativo default (home+work)
+    y exponer de qué vault salió cada chunk cuando el resultado es multi."""
+    work = tmp_path / "work"
+    work.mkdir()
+    mock_rag.resolve_vault_paths.return_value = [
+        ("home", mock_rag.VAULT_PATH),
+        ("work", work),
+    ]
+    mock_rag.get_db.return_value.count.return_value = 10
+    mock_rag.get_db_for.return_value.count.return_value = 20
+    mock_rag.multi_retrieve.return_value = {
+        "docs": ["contenido work"],
+        "metas": [{
+            "file": "01-Projects/x.md", "note": "X",
+            "folder": "01-Projects", "tags": "",
+            "_vault": "work",
+        }],
+        "scores": [0.91],
+        "confidence": 0.91,
+    }
+
+    out = mcp_server.rag_query("dev cycles", k=5)
+
+    mock_rag.multi_retrieve.assert_called_once()
+    assert [name for name, _ in mock_rag.multi_retrieve.call_args.args[0]] == [
+        "home", "work",
+    ]
+    assert out[0]["vault"] == "work"
+    assert out[0]["path"] == "01-Projects/x.md"
+
+
 def test_rag_query_error_invalid_session_id_returns_empty(mock_rag):
     """Audit R2-2 #4: session_ids con caracteres prohibidos rebotan con
     `[]` ANTES de tocar filesystem o invocar el módulo rag."""
@@ -127,6 +159,25 @@ def test_rag_read_note_happy_path_returns_content(mock_rag):
     out = mcp_server.rag_read_note("01-Notes/ejemplo.md")
     assert "Nota de ejemplo para tests" in out
     assert not out.startswith("Error:")
+
+
+def test_rag_read_note_supports_vault_prefixed_paths(mock_rag, tmp_path):
+    work = tmp_path / "work"
+    (work / "01-Notes").mkdir(parents=True)
+    (work / "01-Notes" / "ejemplo.md").write_text(
+        "# Work\n\nNota de work.\n",
+        encoding="utf-8",
+    )
+    mock_rag.resolve_vault_paths.return_value = [
+        ("home", mock_rag.VAULT_PATH),
+        ("work", work),
+    ]
+
+    ambiguous = mcp_server.rag_read_note("01-Notes/ejemplo.md")
+    assert ambiguous.startswith("Error: note path is ambiguous")
+
+    out = mcp_server.rag_read_note("work:01-Notes/ejemplo.md")
+    assert "Nota de work" in out
 
 
 def test_rag_read_note_error_path_traversal_rejected(mock_rag):
@@ -211,6 +262,25 @@ def test_rag_stats_happy_path_returns_metadata(mock_rag):
     assert out["embed_model"] == "bge-m3"
     assert out["reranker"] == "bge-reranker-v2-m3"
     assert "vault" in out["vault_path"] or out["vault_path"].endswith("vault")
+
+
+def test_rag_stats_reports_multi_vault_scope(mock_rag, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    mock_rag.resolve_vault_paths.return_value = [
+        ("home", mock_rag.VAULT_PATH),
+        ("work", work),
+    ]
+    mock_rag.get_db.return_value.count.return_value = 7
+    mock_rag.get_db_for.return_value.count.return_value = 11
+    mock_rag._collection_name_for_vault.side_effect = lambda p: f"col_{p.name}"
+
+    out = mcp_server.rag_stats()
+
+    assert out["chunks"] == 18
+    assert out["vault_scope"] == ["home", "work"]
+    assert out["vaults"][0]["chunks"] == 7
+    assert out["vaults"][1]["chunks"] == 11
 
 
 def test_rag_stats_error_zero_chunks_still_returns_dict(mock_rag):

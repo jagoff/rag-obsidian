@@ -37,7 +37,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
+import unicodedata
 from pathlib import Path
 
 __all__ = [
@@ -103,12 +105,14 @@ def _ocr_hash_key(ocr_text: str) -> str:
 
 
 _CITA_PROMPT_SYSTEM = (
-    "Sos un clasificador de tareas agendables a partir de texto OCR "
-    "crudo. El texto viene de una imagen — puede tener errores de "
-    "reconocimiento (acentos perdidos, palabras cortadas, líneas "
-    "mezcladas, chrome de app). Tu trabajo es decidir si el texto "
-    "describe un EVENTO de calendario, un RECORDATORIO/tarea, o "
-    "simplemente INFORMACIÓN sin acción agendable. Y extraer los datos."
+    "Sos el router de información de Ra para imágenes reenviadas por "
+    "WhatsApp. Recibís texto OCR crudo de capturas, fotos, circulares, "
+    "recetas, facturas, turnos, flyers, tickets, pizarras o notas "
+    "manuscritas. El OCR puede tener errores de reconocimiento (acentos "
+    "perdidos, palabras cortadas, líneas mezcladas, chrome de app). "
+    "Tu trabajo es elegir UNA acción principal: crear EVENTO de calendario, "
+    "crear RECORDATORIO/tarea, o dejarlo como NOTA en Obsidian 00-Inbox. "
+    "Extraé solo datos apoyados por el OCR."
 )
 
 _CITA_PROMPT_USER_TEMPLATE = (
@@ -118,13 +122,22 @@ _CITA_PROMPT_USER_TEMPLATE = (
     "---\n\n"
     "Devolvé EXACTAMENTE un objeto JSON con estas keys:\n"
     "  - kind: \"event\" | \"reminder\" | \"note\"\n"
-    "      * event: tiene fecha/hora específica (cita, turno, vuelo, "
-    "reunión, cumple, evento programado).\n"
-    "      * reminder: tarea o acción a hacer, con o sin fecha "
-    "(comprar X, llamar a Y, pagar factura, leer artículo).\n"
-    "      * note: info sin acción agendable (receta médica vieja, "
-    "snippet de código, captura de chrome de app, meme, texto "
-    "informativo sin call-to-action).\n"
+    "      * event: algo que pertenece al calendario porque ocurre en "
+    "un día/horario o rango concreto: cita, turno médico, reunión, "
+    "acto escolar, clase, taller, vuelo, viaje, cumpleaños, partido, "
+    "evento programado. Si el OCR trae un evento con fecha, event tiene "
+    "prioridad aunque también haya instrucciones accesorias como "
+    "\"traer\", \"llevar\" o \"venir vestidos\".\n"
+    "      * reminder: una acción que Ra/Fer tiene que hacer o no olvidar: "
+    "pagar, comprar, llamar, enviar, responder, completar, firmar, "
+    "retirar, llevar/traer algo, revisar una factura o trámite. Puede "
+    "tener vencimiento o no. Si solo hay una fecha de emisión o del "
+    "documento, NO la uses como vencimiento.\n"
+    "      * note: información útil para guardar en Obsidian 00-Inbox pero "
+    "sin acción principal ni evento calendarizable: receta/instrucciones "
+    "médicas sin turno, comprobante o ticket ya realizado, QR/código, "
+    "captura de una app/web, menú, lista informativa, apunte, referencia, "
+    "foto de texto, meme o circular meramente informativa.\n"
     "  - title: string corto descriptivo (≤ 100 chars). Para event: "
     "qué evento. Para reminder: qué hay que hacer. Para note: tema.\n"
     "  - when: string (ISO 8601 si podés, o lenguaje natural si no — "
@@ -134,8 +147,146 @@ _CITA_PROMPT_USER_TEMPLATE = (
     "clasificación. < 0.5 si dudás, > 0.8 si es claro.\n\n"
     "Si el texto OCR está vacío o es solo símbolos/números sin "
     "contexto, devolvé `kind=\"note\"` con `confidence=0.0`.\n\n"
+    "Reglas de precisión:\n"
+    "  - No inventes fechas relativas ni horarios: si el OCR dice "
+    "\"viernes 22 de mayo\", devolvé esa fecha, no \"mañana\".\n"
+    "  - Si el OCR no muestra una hora, no agregues una hora.\n"
+    "  - No conviertas fechas de emisión, impresión, captura, ticket o "
+    "encabezado en fecha de evento/reminder salvo que el texto diga que "
+    "esa es la fecha del evento o vencimiento.\n"
+    "  - Si hay duda real entre reminder y note, elegí note con menor "
+    "confidence. Si hay duda real entre event y reminder, elegí event "
+    "solo cuando el OCR describe algo que ocurre en esa fecha.\n\n"
+    "Ejemplos:\n"
+    "  - \"viernes 22 de mayo se llevará a cabo el acto\" → event, "
+    "when=\"viernes 22 de mayo\".\n"
+    "  - \"vencimiento 15/06 pagar Edenor\" → reminder, "
+    "title=\"pagar Edenor\", when=\"15/06\".\n"
+    "  - \"receta ibuprofeno cada 8hs\" → note, when=\"\".\n"
+    "  - \"comprobante de transferencia realizada\" → note, when=\"\".\n\n"
     "Respondé SOLO el JSON, sin texto antes ni después."
 )
+
+_SPANISH_MONTH_RE = (
+    r"enero|febrero|marzo|abril|mayo|junio|julio|agosto|"
+    r"septiembre|setiembre|octubre|noviembre|diciembre"
+)
+_SPANISH_WEEKDAY_RE = (
+    r"lunes|martes|mi[eé]rcoles|jueves|viernes|s[áa]bado|domingo"
+)
+_OCR_TEXTUAL_DATE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        rf"\b(?:el\s+)?(?:d[ií]a\s+)?"
+        rf"(({_SPANISH_WEEKDAY_RE})\s+\d{{1,2}}\s+de\s+"
+        rf"(?:{_SPANISH_MONTH_RE}))\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b(\d{{1,2}}\s+de\s+(?:{_SPANISH_MONTH_RE}))\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?)\b"),
+)
+_CLOCK_RE = re.compile(
+    r"\b(?:a\s+las|desde\s+las|hasta\s+las)\s+"
+    r"(?:[01]?\d|2[0-3])(?:[:.][0-5]\d)?"
+    r"(?:\s*(?:h|hs|hrs|am|pm))?\b"
+    r"|\b(?:[01]?\d|2[0-3])[:.][0-5]\d\b"
+    r"|\b(?:[01]?\d|2[0-3])(?:[:.][0-5]\d)?\s*"
+    r"(?:h|hs|hrs|am|pm)\b",
+    re.IGNORECASE,
+)
+_EVENT_NOUN_RE = re.compile(
+    r"\b(?:acto|evento|reunion|turno|cita|clase|taller|charla|"
+    r"cumple|cumpleanos|ceremonia|funcion|presentacion|viaje|"
+    r"vuelo|partido|conmemoracion)\b",
+)
+_EVENT_SCHEDULE_CUE_RE = re.compile(
+    r"\b(?:se\s+llevara\s+a\s+cabo|se\s+realizara|tendra\s+lugar|"
+    r"sera\s+el|sera\s+la|sera\s+en)\b",
+)
+
+
+def _fold_for_match(text: str) -> str:
+    """Lowercase + sin tildes para regexes internas conservadoras."""
+    normalized = unicodedata.normalize("NFKD", text or "")
+    return "".join(ch for ch in normalized if not unicodedata.combining(ch)).lower()
+
+
+def _clean_when_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "")).strip(" \t\r\n,;:-")
+
+
+def _relative_day_terms(text: str) -> set[str]:
+    folded = _fold_for_match(text)
+    terms: set[str] = set()
+    if re.search(r"\bpasado\s+manana\b", folded):
+        terms.add("pasado manana")
+    folded_without_pasado = re.sub(r"\bpasado\s+manana\b", " ", folded)
+    if re.search(r"\bmanana\b", folded_without_pasado):
+        terms.add("manana")
+    if re.search(r"\bhoy\b", folded):
+        terms.add("hoy")
+    return terms
+
+
+def _extract_explicit_ocr_date_phrase(ocr_text: str) -> str:
+    for pattern in _OCR_TEXTUAL_DATE_PATTERNS:
+        match = pattern.search(ocr_text or "")
+        if match:
+            return _clean_when_text(match.group(1))
+    return ""
+
+
+def _extract_clock_phrase(text: str) -> str:
+    match = _CLOCK_RE.search(text or "")
+    if not match:
+        return ""
+    return _clean_when_text(match.group(0))
+
+
+def _drop_clock_phrase(text: str) -> str:
+    return _clean_when_text(_CLOCK_RE.sub(" ", text or ""))
+
+
+def _validate_cita_when_against_ocr(when: str, ocr_text: str) -> str:
+    """Evita que el helper convierta fechas explícitas del OCR en
+    relativos/hora inventada (ej. "viernes 22 de mayo" -> "mañana 15hs").
+    """
+    fixed = _clean_when_text(when)
+    if not fixed:
+        return ""
+
+    ocr_relative = _relative_day_terms(ocr_text)
+    when_relative = _relative_day_terms(fixed)
+    explicit_ocr_date = _extract_explicit_ocr_date_phrase(ocr_text)
+    ocr_has_clock = bool(_extract_clock_phrase(ocr_text))
+
+    if when_relative and not (when_relative & ocr_relative):
+        if explicit_ocr_date:
+            clock = _extract_clock_phrase(fixed) if ocr_has_clock else ""
+            fixed = _clean_when_text(f"{explicit_ocr_date} {clock}")
+        else:
+            # Si el OCR no contiene el relativo ni una fecha clara, no
+            # dejamos que "mañana" pase como vencimiento/evento inventado.
+            fixed = ""
+
+    if fixed and _extract_clock_phrase(fixed) and not ocr_has_clock:
+        fixed = _drop_clock_phrase(fixed)
+
+    if not fixed and explicit_ocr_date and when_relative:
+        fixed = explicit_ocr_date
+    return fixed
+
+
+def _maybe_promote_cita_kind(kind: str, title: str, when: str, ocr_text: str) -> str:
+    if kind != "reminder" or not when:
+        return kind
+    folded_title = _fold_for_match(title)
+    folded_ocr = _fold_for_match(ocr_text)
+    if _EVENT_NOUN_RE.search(folded_title) or _EVENT_SCHEDULE_CUE_RE.search(folded_ocr):
+        return "event"
+    return kind
 
 
 def _detect_cita_from_ocr(ocr_text: str) -> dict | None:
@@ -213,6 +364,8 @@ def _detect_cita_from_ocr(ocr_text: str) -> dict | None:
                 conf_raw = 0.0
         confidence = float(conf_raw or 0.0)
         confidence = max(0.0, min(1.0, confidence))
+        when = _validate_cita_when_against_ocr(when, text)[:200]
+        kind = _maybe_promote_cita_kind(kind, title, when, text)
     except Exception as exc:
         _silent_log("cita_detect_normalize", exc)
         return None

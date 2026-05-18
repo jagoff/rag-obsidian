@@ -105,6 +105,23 @@ def test_async_dispatch_does_not_block():
     bus.shutdown()
 
 
+def test_async_publish_drops_cleanly_during_executor_shutdown(monkeypatch):
+    """Interpreter shutdown can reject new futures; publish must stay quiet."""
+    bus = EventBus()
+
+    @bus.subscribe("late", async_dispatch=True)
+    def late_handler(p):
+        raise AssertionError("should not run")
+
+    class _ShutdownExecutor:
+        def submit(self, *args, **kwargs):
+            raise RuntimeError("cannot schedule new futures after shutdown")
+
+    monkeypatch.setattr(bus, "_get_executor", lambda: _ShutdownExecutor())
+
+    assert bus.publish("late", {"x": 1}) == 1
+
+
 def test_unsubscribe_all_specific_event():
     bus = EventBus()
 

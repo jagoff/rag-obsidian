@@ -88,6 +88,17 @@ function toast({ title, detail = "", kind = "info", ttl = 5000 }) {
   return { dismiss };
 }
 
+function compactErrors(errors, maxChars = 900) {
+  const items = (errors || []).slice(0, 3).map((err) => {
+    const id = err.id || err.pair?.a || "";
+    const suffix = err.pair?.b ? ` / ${err.pair.b}` : "";
+    const label = id ? `${id}${suffix}: ` : "";
+    return `${label}${err.error || err.warning || "error desconocido"}`;
+  });
+  const text = items.join("\n\n");
+  return text.length > maxChars ? `${text.slice(0, maxChars)}…` : text;
+}
+
 // Confirm inline en lugar del modal del navegador. Reemplaza el botón
 // `btn` por un span con "¿Seguro? [sí] [no]". Resuelve true/false.
 function inlineConfirm(btn, question) {
@@ -271,6 +282,7 @@ function renderTopRecalled(usage) {
             · max score ${m.max_score}
             · último recall ${escapeHTML(m.last_recalled_ago)} atrás
           </div>
+          <div class="meta-line">${memoPathLinkHTML(m, "inline-path")}</div>
         </div>
       </div>`
     )
@@ -324,6 +336,7 @@ function renderDeadList(usage) {
           <span class="type-tag" data-type="${escapeHTML(m.type)}">${escapeHTML(m.type)}</span>
           · creado ${escapeHTML(m.age)} atrás · nunca matcheó un prompt
         </div>
+        <div class="meta-line">${memoPathLinkHTML(m, "inline-path")}</div>
       </div>
       <button class="dead-btn-row" data-id="${escapeHTML(m.id)}" title="Borrar esta memoria">🗑</button>
     </div>
@@ -423,9 +436,12 @@ async function deleteMemoIds(ids, label) {
     }
     const d = result.deleted?.length || 0;
     const e = result.errors?.length || 0;
+    const w = result.warnings?.length || 0;
     const kind = e > 0 ? (d > 0 ? "warn" : "error") : "success";
-    const summary = `${d} borrada${d === 1 ? '' : 's'}` + (e ? ` · ${e} errores` : "");
-    const detail = e && result.errors[0] ? `${result.errors[0].error?.slice(0, 120)}` : undefined;
+    const summary = `${d} borrada${d === 1 ? '' : 's'}`
+      + (e ? ` · ${e} errores` : "")
+      + (w ? ` · ${w} warnings` : "");
+    const detail = e ? compactErrors(result.errors) : (w ? compactErrors(result.warnings) : undefined);
     toast({ title: summary, detail, kind, ttl: 5000 });
     // Limpiar selección de los efectivamente borrados
     for (const id of (result.deleted || [])) DEAD_SELECTION.delete(id);
@@ -496,6 +512,114 @@ function renderStats(s) {
   `;
 }
 
+function clampPct(value) {
+  const n = Number(value) || 0;
+  return Math.max(0, Math.min(100, n));
+}
+
+function utilityClass(pctValue, goodAt, warnAt) {
+  if (pctValue >= goodAt) return "good";
+  if (pctValue >= warnAt) return "warn";
+  return "bad";
+}
+
+function renderUtilityCharts(s) {
+  const total = s.totals?.all || 0;
+  const coverage = s.utility?.coverage || {};
+  const buckets = s.utility?.quality_buckets || [];
+  if (!total) {
+    $("#utility-charts").innerHTML = `<div class="loading">Sin memorias para graficar.</div>`;
+    return;
+  }
+
+  const recallPct = clampPct(coverage.recall_hit_rate_pct);
+  const activePct = clampPct(coverage.active_7d_pct);
+  const deadPct = clampPct(coverage.dead_pct);
+  const recallClass = utilityClass(recallPct, 30, 15);
+  const healthyPct = clampPct(
+    buckets
+      .filter((b) => b.label === "Alta" || b.label === "Media")
+      .reduce((acc, b) => acc + Number(b.pct || 0), 0)
+  );
+  const healthyClass = utilityClass(healthyPct, 70, 50);
+
+  const funnelRows = [
+    {
+      label: "Usadas",
+      count: coverage.recalled || 0,
+      pct: recallPct,
+      kind: "recalled",
+    },
+    {
+      label: "Activas 7d",
+      count: coverage.active_7d || 0,
+      pct: activePct,
+      kind: "active",
+    },
+    {
+      label: "Muertas",
+      count: coverage.dead || 0,
+      pct: deadPct,
+      kind: "dead",
+    },
+  ];
+  const funnelHTML = funnelRows.map((row) => `
+    <div class="funnel-row">
+      <div class="funnel-label">${escapeHTML(row.label)}</div>
+      <div class="funnel-track">
+        <div class="funnel-fill ${row.kind}" style="width:${row.pct}%;"></div>
+      </div>
+      <div class="funnel-value">${row.count} · ${row.pct}%</div>
+    </div>
+  `).join("");
+
+  const safeBuckets = buckets.length
+    ? buckets
+    : ["Alta", "Media", "Baja", "Ruido"].map((label) => ({ label, count: 0, pct: 0 }));
+  const stackHTML = safeBuckets.map((b) => `
+    <div
+      class="quality-seg ${escapeHTML(b.label)}"
+      style="width:${clampPct(b.pct)}%;"
+      title="${escapeHTML(b.label)} · ${b.count} (${b.pct}%)"
+    ></div>
+  `).join("");
+  const qualityRows = safeBuckets.map((b) => `
+    <div class="quality-row">
+      <div class="quality-label">${escapeHTML(b.label)}</div>
+      <div class="quality-track">
+        <div class="quality-fill ${escapeHTML(b.label)}" style="width:${clampPct(b.pct)}%;"></div>
+      </div>
+      <div class="quality-value">${b.count} · ${b.pct}%</div>
+    </div>
+  `).join("");
+
+  $("#utility-charts").innerHTML = `
+    <div class="utility-card">
+      <div class="utility-head">
+        <div class="utility-title">Uso real</div>
+        <div class="utility-kpi ${recallClass}">${recallPct}%</div>
+      </div>
+      ${funnelHTML}
+      <div class="utility-caption">
+        ${coverage.recalled || 0} de ${total} memorias aparecieron en prompts;
+        ${coverage.active_7d || 0} siguen vivas esta semana.
+      </div>
+    </div>
+    <div class="utility-card">
+      <div class="utility-head">
+        <div class="utility-title">Calidad del corpus</div>
+        <div class="utility-kpi ${healthyClass}">${healthyPct.toFixed(1)}%</div>
+      </div>
+      <div class="quality-stack">${stackHTML}</div>
+      <div class="quality-bars">${qualityRows}</div>
+      <div class="utility-caption">
+        Porcentaje de memorias con score alto o medio. "Ruido" combina bajo score,
+        falta de tags, tamaño pobre o duplicación.
+      </div>
+    </div>
+  `;
+}
+
 function renderTypes(s) {
   const byType = new Map((s.totals.by_type || []).map((r) => [r.type, r.count]));
   const allCount = s.totals.all || 0;
@@ -547,10 +671,25 @@ function flagsHTML(m) {
   return flags.join(" ");
 }
 
+function memoPathLinkHTML(m, extraClass = "") {
+  const label = m.full_path || m.path || "";
+  if (!label) return "";
+  const href = m.obsidian_url || `obsidian://open?path=${encodeURIComponent(label)}`;
+  const className = extraClass ? ` ${extraClass}` : "";
+  return `
+    <a
+      class="memo-path-link${escapeHTML(className)}"
+      href="${escapeHTML(href)}"
+      title="${escapeHTML(label)}"
+      onclick="event.stopPropagation()"
+    >${escapeHTML(label)}</a>`;
+}
+
 function rowHTML(m) {
   const tags = (m.tags || []).slice(0, 3).map((t) => `<span class="tag-chip">${escapeHTML(t)}</span>`).join("");
   const flags = flagsHTML(m);
   const preview = m.body_preview ? escapeHTML(m.body_preview) + "…" : "";
+  const pathLink = memoPathLinkHTML(m, "inline-path");
   const recallCount = m.recall_count ?? 0;
   const recallHTML = recallCount > 0
     ? `<span style="color: var(--cyan); font-weight:600;">${recallCount}×</span><div style="font-size:10.5px; color:var(--text-faint);">${escapeHTML(m.last_recalled_ago || "")}</div>`
@@ -560,6 +699,7 @@ function rowHTML(m) {
       <td><span class="type-tag" data-type="${escapeHTML(m.type)}">${escapeHTML(m.type)}</span></td>
       <td class="title-cell">
         <div class="title">${escapeHTML(m.title)}</div>
+        ${pathLink ? `<div class="path-inline">${pathLink}</div>` : ""}
         <div class="preview">${preview}</div>
         <div class="flags">${tags} ${flags}</div>
       </td>
@@ -820,7 +960,7 @@ async function selectMemo(id) {
         ${flags ? `<span>·</span> ${flags}` : ""}
       </div>
       <div>${tags}</div>
-      <div class="path">${escapeHTML(m.path || "")}</div>
+      <div class="path">${memoPathLinkHTML(m)}</div>
 
       <div style="display:flex; align-items:center; gap:12px; margin-top:14px;">
         <div style="font-size: 24px; font-weight: 600; color: var(--${scoreLabel(m.score) === "good" ? "green" : scoreLabel(m.score) === "warn" ? "yellow" : "red"});">
@@ -884,6 +1024,7 @@ async function refresh() {
     }
     renderVerdict(s.verdict);
     renderStats(s);
+    renderUtilityCharts(s);
     renderTypes(s);
     renderRecent(s);
     renderTopRecalled(s.usage || {});
@@ -955,9 +1096,9 @@ $("#merge-all-btn").addEventListener("click", async () => {
         + (sk ? ` · ${sk} skipped` : "");
       let detail = "";
       if (sk) detail += `${sk} pares saltados (overlap con otros ya borrados). `;
-      if (w) detail += `${w} sin merge de tags (bug del CLI). `;
-      if (e && result.errors[0]) {
-        detail += `Primer error: ${(result.errors[0].error || "").slice(0, 120)}`;
+      if (w) detail += compactErrors(result.warnings) + " ";
+      if (e) {
+        detail += compactErrors(result.errors);
       }
       toast({ title: summary, detail: detail.trim() || undefined, kind, ttl: 7000 });
     } else {
@@ -1080,6 +1221,7 @@ async function applyTimeMachine() {
     $("#tm-summary").textContent = "Snapshot del corpus en cualquier fecha pasada (memo v0.6 time-machine).";
     $("#diff-panel").style.display = "none";
     $("#verdict-banner").style.display = "";
+    $("#utility-charts").style.display = "";
     refresh();
     return;
   }
@@ -1087,6 +1229,7 @@ async function applyTimeMachine() {
   $("#tm-summary").innerHTML =
     `Viendo memoria al <strong>${escapeHTML(date)}</strong> — verdict/dupes/recall son live, ocultos en vista histórica.`;
   $("#verdict-banner").style.display = "none";
+  $("#utility-charts").style.display = "none";
 
   const [snap, diff] = await Promise.all([
     fetchTimeMachine(date),
@@ -1156,7 +1299,7 @@ async function fetchGraph() {
   return api(`/api/memo/graph?limit_nodes=80&min_count=1`);
 }
 
-function renderGraph(data) {
+async function renderGraph(data) {
   const wrap = $("#graph-wrap");
   if (!data || !data.ok) {
     wrap.innerHTML = `<div class="graph-empty-state">graph error: ${escapeHTML((data && data.error) || "?")}</div>`;
@@ -1173,175 +1316,114 @@ function renderGraph(data) {
   $("#graph-meta").textContent =
     `${data.nodes.length} entidades · ${data.edges.length} edges · ${data.stats.entities} total`;
 
-  const W = wrap.clientWidth || 700;
-  const H = 460;
-  const nodes = data.nodes.map((n) => ({
-    ...n,
-    x: W / 2 + (Math.random() - 0.5) * 200,
-    y: H / 2 + (Math.random() - 0.5) * 200,
-    vx: 0, vy: 0,
-    r: nodeRadius(n.count),
-  }));
-  const edges = data.edges;
+  // ── Esperar hasta 3s a que las libs 3D estén disponibles ─────
+  const libsReady = async () => {
+    for (let i = 0; i < 30; i++) {
+      if (typeof ForceGraph3D === "function" && typeof THREE !== "undefined") return true;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    return false;
+  };
+  if (!(await libsReady())) {
+    wrap.innerHTML = `<div class="graph-empty-state">No se pudo cargar el motor 3D (three.js / 3d-force-graph).</div>`;
+    return;
+  }
+
+  const nodes = data.nodes.map((n) => ({ ...n }));
+  const links = data.edges.map((e) => ({ source: e.source, target: e.target, weight: e.weight }));
 
   wrap.innerHTML = `
-    <svg class="graph-svg" id="gsvg" viewBox="0 0 ${W} ${H}">
-      <g id="g-edges"></g>
-      <g id="g-nodes"></g>
-      <g id="g-labels"></g>
-    </svg>
+    <div id="graph-3d-container"></div>
     <div class="graph-legend">
       ${Object.entries(NODE_COLOR_BY_TYPE).map(([k, c]) =>
     `<div class="row"><span class="sw" style="background:${c}"></span>${k}</div>`).join("")}
     </div>
+    <div class="graph-zoom-controls">
+      <button class="gzoom-btn" id="gzoom-in"  title="Zoom in">+</button>
+      <button class="gzoom-btn" id="gzoom-reset" title="Reset">⟳</button>
+      <button class="gzoom-btn" id="gzoom-out" title="Zoom out">−</button>
+      <button class="gzoom-btn active" id="gzoom-labels" title="Toggle labels" style="font-size:11px;letter-spacing:-0.5px">aA</button>
+    </div>
+    <div class="graph-hint">drag → rotar · scroll → zoom · click → foco</div>
   `;
-  const svg = $("#gsvg");
-  const gEdges = $("#g-edges");
-  const gNodes = $("#g-nodes");
-  const gLabels = $("#g-labels");
 
-  const adj = new Map();
-  for (const e of edges) {
-    if (!adj.has(e.source)) adj.set(e.source, []);
-    if (!adj.has(e.target)) adj.set(e.target, []);
-    adj.get(e.source).push(e.target);
-    adj.get(e.target).push(e.source);
-  }
+  const container = document.getElementById("graph-3d-container");
+  container.style.width = "100%";
+  container.style.height = "100%";
 
-  const edgeElems = edges.map((e) => {
-    const el = document.createElementNS("http://www.w3.org/2000/svg", "line");
-    el.setAttribute("class", "gedge");
-    el.setAttribute("stroke-width", String(0.4 + Math.min(2.5, e.weight * 0.4)));
-    el.setAttribute("stroke-opacity", String(0.25 + Math.min(0.55, e.weight * 0.12)));
-    gEdges.appendChild(el);
-    return el;
-  });
-  const nodeElems = nodes.map((n, i) => {
-    const el = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-    el.setAttribute("class", "gnode");
-    el.setAttribute("r", String(n.r));
-    el.setAttribute("fill", NODE_COLOR_BY_TYPE[n.type] || "#aaa");
-    el.setAttribute("stroke", "var(--bg)");
-    el.setAttribute("stroke-width", "1.5");
-    el.dataset.idx = String(i);
-    gNodes.appendChild(el);
-    el.addEventListener("mouseenter", () => highlight(i, true));
-    el.addEventListener("mouseleave", () => highlight(i, false));
-    return el;
-  });
-  const labelElems = nodes.map((n, i) => {
-    const el = document.createElementNS("http://www.w3.org/2000/svg", "text");
-    el.setAttribute("class", "glabel");
-    el.textContent = n.name;
-    el.dataset.idx = String(i);
-    gLabels.appendChild(el);
-    return el;
-  });
+  const bg = getComputedStyle(document.documentElement).getPropertyValue("--bg").trim() || "#14141a";
+  let showLabels = true;
 
-  function highlight(idx, on) {
-    const neighbors = new Set(adj.get(idx) || []);
-    neighbors.add(idx);
-    nodeElems.forEach((el, i) => {
-      el.setAttribute("opacity", on && !neighbors.has(i) ? "0.18" : "1");
-    });
-    labelElems.forEach((el, i) => {
-      el.classList.toggle("focused", on && neighbors.has(i));
-      el.setAttribute("opacity", on && !neighbors.has(i) ? "0.18" : "1");
-    });
-    edgeElems.forEach((el, i) => {
-      const e = edges[i];
-      const touched = e.source === idx || e.target === idx;
-      el.classList.toggle("focused", on && touched);
-      el.setAttribute("opacity", on && !touched ? "0.08" : "1");
-    });
-  }
-
-  const repulse = 1800;
-  const linkLen = 80;
-  const linkK = 0.04;
-  const center = 0.005;
-  const damping = 0.82;
-  let cooling = 1.0;
-
-  function step() {
-    cooling *= 0.992;
-    for (let i = 0; i < nodes.length; i++) {
-      let fx = 0, fy = 0;
-      for (let j = 0; j < nodes.length; j++) {
-        if (i === j) continue;
-        const dx = nodes[i].x - nodes[j].x;
-        const dy = nodes[i].y - nodes[j].y;
-        const d2 = dx * dx + dy * dy + 0.01;
-        const f = repulse / d2;
-        fx += dx * f / Math.sqrt(d2);
-        fy += dy * f / Math.sqrt(d2);
+  const Graph = ForceGraph3D({ controlType: "trackball" })
+    (container)
+    .backgroundColor(bg)
+    .graphData({ nodes, links })
+    .nodeId("id")
+    .nodeVal((n) => Math.max(1, n.count || 1))
+    .nodeRelSize(3.5)
+    .nodeOpacity(1.0)
+    .nodeLabel((n) => `
+      <div style="background:#1c1c24;border:1px solid #3e3e46;border-radius:6px;padding:6px 10px;font-size:11px;color:#ececed;font-family:system-ui,sans-serif;max-width:220px;">
+        <strong style="color:#fff">${escapeHTML(n.name)}</strong>
+        <div style="color:#8a8a94;margin-top:3px;">${escapeHTML(n.type)} · ${n.count} mención${n.count === 1 ? "" : "es"}</div>
+      </div>`)
+    .nodeThreeObject((n) => {
+      const radius = Math.max(2.5, Math.min(14, Math.sqrt(n.count || 1) * 1.9));
+      const geo = new THREE.SphereGeometry(radius, 14, 14);
+      const color = NODE_COLOR_BY_TYPE[n.type] || "#aaaaaa";
+      const mat = new THREE.MeshBasicMaterial({ color: new THREE.Color(color) });
+      const sphere = new THREE.Mesh(geo, mat);
+      n._material = mat;
+      n._radius = radius;
+      if (typeof SpriteText === "function") {
+        const sprite = new SpriteText(n.name || "");
+        sprite.material.depthWrite = false;
+        sprite.color = "#d0d0d8";
+        sprite.textHeight = 3;
+        sprite.padding = 0.8;
+        sprite.position.set(0, radius + 4, 0);
+        sprite.visible = showLabels;
+        sphere.add(sprite);
+        n._labelSprite = sprite;
       }
-      fx += (W / 2 - nodes[i].x) * center;
-      fy += (H / 2 - nodes[i].y) * center;
-      nodes[i].vx = (nodes[i].vx + fx * 0.001) * damping;
-      nodes[i].vy = (nodes[i].vy + fy * 0.001) * damping;
-    }
-    for (const e of edges) {
-      const a = nodes[e.source], b = nodes[e.target];
-      const dx = b.x - a.x, dy = b.y - a.y;
-      const d = Math.sqrt(dx * dx + dy * dy) + 0.01;
-      const k = linkK * (1 + Math.log(1 + e.weight));
-      const f = (d - linkLen) * k;
-      const fx = (dx / d) * f, fy = (dy / d) * f;
-      a.vx += fx; a.vy += fy;
-      b.vx -= fx; b.vy -= fy;
-    }
-    for (const n of nodes) {
-      n.x += n.vx * cooling;
-      n.y += n.vy * cooling;
-      n.x = Math.max(n.r + 4, Math.min(W - n.r - 4, n.x));
-      n.y = Math.max(n.r + 12, Math.min(H - n.r - 4, n.y));
-    }
-    edges.forEach((e, i) => {
-      const a = nodes[e.source], b = nodes[e.target];
-      edgeElems[i].setAttribute("x1", a.x);
-      edgeElems[i].setAttribute("y1", a.y);
-      edgeElems[i].setAttribute("x2", b.x);
-      edgeElems[i].setAttribute("y2", b.y);
-    });
-    nodes.forEach((n, i) => {
-      nodeElems[i].setAttribute("cx", n.x);
-      nodeElems[i].setAttribute("cy", n.y);
-      labelElems[i].setAttribute("x", n.x);
-      labelElems[i].setAttribute("y", n.y - n.r - 3);
-    });
-    if (cooling > 0.05) {
-      requestAnimationFrame(step);
-    }
-  }
-  requestAnimationFrame(step);
+      return sphere;
+    })
+    .nodeThreeObjectExtend(false)
+    .linkColor(() => "rgba(110,110,140,0.35)")
+    .linkWidth((l) => Math.max(0.3, Math.min(2.8, Math.sqrt(l.weight || 1) * 0.55)))
+    .linkOpacity(0.5)
+    .onNodeClick((node) => {
+      const distance = 85;
+      const r = Math.hypot(node.x || 0, node.y || 0, node.z || 0);
+      const distRatio = r > 0 ? 1 + distance / r : 1;
+      Graph.cameraPosition(
+        { x: (node.x || 0) * distRatio, y: (node.y || 0) * distRatio, z: ((node.z || 0) * distRatio) || distance },
+        node,
+        900
+      );
+    })
+    .onNodeHover((node) => { container.style.cursor = node ? "pointer" : ""; });
 
-  let dragIdx = null;
-  let dragOff = [0, 0];
-  svg.addEventListener("mousedown", (e) => {
-    const target = e.target;
-    if (target.classList.contains("gnode")) {
-      dragIdx = +target.dataset.idx;
-      const pt = svg.createSVGPoint();
-      pt.x = e.clientX; pt.y = e.clientY;
-      const lp = pt.matrixTransform(svg.getScreenCTM().inverse());
-      dragOff = [lp.x - nodes[dragIdx].x, lp.y - nodes[dragIdx].y];
-      cooling = Math.max(cooling, 0.4);
-    }
+  Graph.d3Force("charge").strength(-130);
+  Graph.d3Force("link").distance(32);
+  Graph.cooldownTicks(160);
+  Graph.onEngineStop(() => Graph.zoomToFit(400, 50));
+
+  // Zoom buttons
+  const camMove = (factor) => {
+    const { x, y, z } = Graph.cameraPosition();
+    Graph.cameraPosition({ x: x * factor, y: y * factor, z: z * factor }, null, 300);
+  };
+  document.getElementById("gzoom-in").addEventListener("click", () => camMove(0.7));
+  document.getElementById("gzoom-out").addEventListener("click", () => camMove(1.43));
+  document.getElementById("gzoom-reset").addEventListener("click", () => Graph.zoomToFit(600, 50));
+
+  // Labels toggle
+  document.getElementById("gzoom-labels").addEventListener("click", (ev) => {
+    showLabels = !showLabels;
+    nodes.forEach((n) => { if (n._labelSprite) n._labelSprite.visible = showLabels; });
+    ev.currentTarget.classList.toggle("active", showLabels);
   });
-  svg.addEventListener("mousemove", (e) => {
-    if (dragIdx == null) return;
-    const pt = svg.createSVGPoint();
-    pt.x = e.clientX; pt.y = e.clientY;
-    const lp = pt.matrixTransform(svg.getScreenCTM().inverse());
-    nodes[dragIdx].x = lp.x - dragOff[0];
-    nodes[dragIdx].y = lp.y - dragOff[1];
-    nodes[dragIdx].vx = 0; nodes[dragIdx].vy = 0;
-    cooling = Math.max(cooling, 0.3);
-    requestAnimationFrame(step);
-  });
-  svg.addEventListener("mouseup", () => { dragIdx = null; });
-  svg.addEventListener("mouseleave", () => { dragIdx = null; });
 }
 
 // ─────────────────────────────────────────────────────────────────────

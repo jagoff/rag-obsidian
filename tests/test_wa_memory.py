@@ -98,6 +98,29 @@ def test_respects_query_params(client, monkeypatch):
     assert calls == [("x@y", 10, 7)]
 
 
+def test_cache_key_includes_limits(client, monkeypatch):
+    """Mismo JID con límites distintos debe recomputar, no devolver un
+    payload cacheado con menos notas/mensajes que los pedidos.
+    """
+    calls = []
+
+    def fake_collect(jid, max_notes, max_wa):
+        calls.append((jid, max_notes, max_wa))
+        return _stub_collect(jid, max_notes, max_wa, notes=[], wa=[
+            {"id": f"m{max_wa}", "ts": 1746163320, "from_me": False, "content": str(max_wa)}
+        ])
+
+    monkeypatch.setattr(_web_server, "_wzp_memory_collect", fake_collect)
+
+    r1 = client.get("/api/wa/memory/x@y?max_notes=1&max_wa=1")
+    r2 = client.get("/api/wa/memory/x@y?max_notes=1&max_wa=7")
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+    assert r1.json()["cached"] is False
+    assert r2.json()["cached"] is False
+    assert calls == [("x@y", 1, 1), ("x@y", 1, 7)]
+
+
 def test_caps_query_params(client, monkeypatch):
     """max_notes capa 15, max_wa capa 20, ambos floor 1."""
     calls = []
@@ -173,3 +196,35 @@ def test_empty_notes_does_not_break(client, monkeypatch):
     body = r.json()
     assert body["notes"] == []
     assert body["wa_recent"] == []
+
+
+def test_collect_converts_thread_messages(monkeypatch):
+    """El collector real debe aceptar el shape de `fetch_thread_for_ui`:
+    ISO ts + `is_from_me`. Antes intentaba `int(iso)` y dejaba WA vacío.
+    """
+    from rag.integrations.whatsapp import fetch as _wa_fetch
+
+    monkeypatch.setattr(_wa_fetch, "_wa_display_name", lambda jid, name: "Mariana")
+    monkeypatch.setattr(_web_server, "resolve_vault_paths", lambda _vault: [])
+    monkeypatch.setattr(_wa_fetch, "fetch_thread_for_ui", lambda jid, limit, before_ts: {
+        "messages": [
+            {
+                "id": "m1",
+                "ts": "2026-05-11T11:00:00-03:00",
+                "is_from_me": False,
+                "content": "te paso el deck",
+            },
+            {
+                "id": "m2",
+                "ts": "2026-05-11T12:00:00-03:00",
+                "is_from_me": True,
+                "content": "gracias",
+            },
+        ]
+    })
+
+    data = _web_server._wzp_memory_collect("5491155556666@s.whatsapp.net", 5, 5)
+    assert data["wa_recent"][0]["id"] == "m2"
+    assert data["wa_recent"][0]["from_me"] is True
+    assert isinstance(data["wa_recent"][0]["ts"], int)
+    assert data["stats"]["wa_recent_count"] == 2

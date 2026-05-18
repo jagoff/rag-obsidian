@@ -240,12 +240,12 @@ def test_hot_respects_min_occurrences():
 
 def test_hot_avg_score_rounded_to_3dp():
     entries = [
-        _hot_entry("q", 0.1),
-        _hot_entry("q", 0.2),
-        _hot_entry("q", 0.3),
+        _hot_entry("q", 0.4),
+        _hot_entry("q", 0.5),
+        _hot_entry("q", 0.6),
     ]
     out = rag.detect_hot_queries(entries, min_occurrences=3)
-    assert out[0]["avg_score"] == pytest.approx(0.2)
+    assert out[0]["avg_score"] == pytest.approx(0.5)
     assert out[0]["count"] == 3
 
 

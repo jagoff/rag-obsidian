@@ -48,6 +48,7 @@ from typing import Iterable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import rag  # noqa: E402
+from rag.integrations.whatsapp._constants import whatsapp_chat_name_excluded  # noqa: E402
 
 
 # ── Config ─────────────────────────────────────────────────────────────────
@@ -71,8 +72,12 @@ PARENT_MAX_CHARS = 1200               # cap (vault convention)
 # even if the bridge DB compacts.
 DOC_ID_PREFIX = "whatsapp"
 
-# Chat JIDs we never want to index regardless of user opt-out decision.
+# Chats we never want to index regardless of user opt-out decision.
 #
+# Name blacklist lives in `whatsapp_chat_name_excluded()` so every WA path
+# (vector ingest, mirror search, briefs/tasks) uses the same exact-name rule.
+#
+# JID blacklist:
 # - `status@broadcast` — WhatsApp's internal story/status feed. Not
 #   conversational, not something the user "said", just ambient noise.
 # - `rag.WHATSAPP_BOT_JID` (RagNet group `120363426178035051@g.us`) —
@@ -283,7 +288,7 @@ def read_messages(
     """Load messages from the bridge DB. `since_ts` filters by epoch (exclusive,
     `> since_ts`) to cleanly implement incremental reads from the cursor.
     `chat_jid`, when given, restricts to one chat (mainly for tests).
-    Skips empty-content rows and excluded JIDs. Sorted (chat_jid, timestamp)."""
+    Skips empty-content rows and excluded chats. Sorted (chat_jid, timestamp)."""
     if not bridge_db.is_file():
         return []
     conn = sqlite3.connect(f"file:{bridge_db}?mode=ro&immutable=1", uri=True)
@@ -309,6 +314,9 @@ def read_messages(
         jid = r["chat_jid"]
         if jid in exclude_jids:
             continue
+        chat_name = str(r["chat_name"] or "")
+        if whatsapp_chat_name_excluded(chat_name):
+            continue
         content = str(r["content"] or "")
         # Skip the bot's own anti-loop output. The listener prefixes every
         # outbound bot message with U+200B so it can ignore its own echoes;
@@ -322,7 +330,7 @@ def read_messages(
         out.append(WAMessage(
             id=str(r["id"]),
             chat_jid=jid,
-            chat_name=str(r["chat_name"] or jid),
+            chat_name=chat_name or jid,
             sender=str(r["sender"] or ""),
             content=content,
             timestamp=ts,
@@ -654,9 +662,11 @@ def _read_recent_image_messages(
     try:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            "SELECT chat_jid, filename, timestamp FROM messages "
-            "WHERE media_type = 'image' AND filename IS NOT NULL "
-            "AND filename != '' "
+            "SELECT m.chat_jid, m.filename, m.timestamp, "
+            "COALESCE(c.name, '') AS chat_name "
+            "FROM messages m LEFT JOIN chats c ON c.jid = m.chat_jid "
+            "WHERE m.media_type = 'image' AND m.filename IS NOT NULL "
+            "AND m.filename != '' "
             "ORDER BY timestamp ASC"
         ).fetchall()
     finally:
@@ -665,6 +675,8 @@ def _read_recent_image_messages(
     for r in rows:
         jid = str(r["chat_jid"])
         if jid in exclude_jids:
+            continue
+        if whatsapp_chat_name_excluded(str(r["chat_name"] or "")):
             continue
         ts = _parse_bridge_ts(r["timestamp"])
         if ts is None or ts <= since_ts:

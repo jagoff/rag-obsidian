@@ -30,7 +30,7 @@ queries:
   - 02-Areas/Coaching/Fer coach - Bio.md
 - question: podcast primer episodio coaching
   expected:
-  - 01-Projects/Podcast-Coaching-Ep01/Podcast - Episodio 01 - Coaching.md
+  - 02-Areas/Coaching/Podcast-Coaching-Ep01/Podcast - Episodio 01 - Coaching.md
 - question: letra de muros fractales
   expected:
   - 01-Projects/Album-Muros-Fractales/Muros Fractales 1.1 (AI).md

@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -71,6 +72,7 @@ _PER_SOURCE_TIMEOUT_S = 3.0
 _CACHE_LOCK = threading.Lock()
 _CACHE_TTL_S = 1800  # 30 min
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_LIVE_SOURCE_NAMES = ("whatsapp",)
 
 
 # ── Cache helpers ──────────────────────────────────────────────────────────
@@ -113,6 +115,38 @@ def _cache_set(key: str, value: dict[str, Any]) -> None:
                 oldest = sorted(_CACHE.items(), key=lambda x: x[1][0])
                 for k, _ in oldest[: len(_CACHE) - _CACHE_MAX_KEYS]:
                     _CACHE.pop(k, None)
+
+
+def _is_live_mirror_date(date: str) -> bool:
+    try:
+        from rag import mood as _mood  # noqa: PLC0415
+        today = _mood._today_local()
+    except Exception:
+        today = datetime.now().date().isoformat()
+    return date == today
+
+
+def _refresh_live_sources(response: dict[str, Any], date: str) -> dict[str, Any]:
+    """Overlay minute-level sources on top of the slower mirror cache."""
+    if not _is_live_mirror_date(date):
+        return response
+    sources = dict(response.get("sources") or {})
+    refreshed: list[str] = []
+    for name in _LIVE_SOURCE_NAMES:
+        fn = _SOURCES.get(name)
+        if fn is None:
+            continue
+        try:
+            sources[name] = fn(date)
+        except Exception as exc:
+            logger.warning("mirror: live source %s failed: %s", name, exc)
+            sources[name] = {"error": str(exc)[:200]}
+        refreshed.append(name)
+    if refreshed:
+        response["sources"] = sources
+        response["live_refreshed"] = refreshed
+        response["live_computed_at"] = time.time()
+    return response
 
 
 # ── DB helper ──────────────────────────────────────────────────────────────
@@ -177,9 +211,14 @@ def _source_active_projects(date: str) -> dict[str, Any]:
             for project_dir in projects_dir.iterdir():
                 if not project_dir.is_dir() or project_dir.name.startswith("."):
                     continue
+                rel_project = _blacklist_relpath(project_dir, Path(vault))
+                if _blacklisted_record(path=rel_project, text=project_dir.name):
+                    continue
                 note_count = 0
                 most_recent_mtime = 0.0
                 for note in project_dir.rglob("*.md"):
+                    if _blacklisted_record(path=_blacklist_relpath(note, Path(vault))):
+                        continue
                     try:
                         mt = note.stat().st_mtime
                     except OSError:
@@ -217,7 +256,7 @@ def _source_top_entities(date: str) -> dict[str, Any]:
     """Top 8 entidades más mencionadas últimos 7d."""
     conn = _open_telemetry_ro()
     if conn is None:
-        return {"items": []}
+        return _source_top_entities_fallback()
 
     try:
         cutoff = time.time() - 7 * 86400
@@ -238,6 +277,11 @@ def _source_top_entities(date: str) -> dict[str, Any]:
         items = []
         for row in cur.fetchall():
             name, kind, n, last_seen, n_sources = row
+            if _blacklisted_record(
+                person=name if str(kind or "").lower() in {"person", "people"} else None,
+                text=name,
+            ):
+                continue
             items.append({
                 "name": name,
                 "kind": kind,
@@ -250,15 +294,54 @@ def _source_top_entities(date: str) -> dict[str, Any]:
                 ),
                 "n_sources": int(n_sources),
             })
-        return {"items": items}
+        if items:
+            return {"items": items}
+        return _source_top_entities_fallback(reason="no_entities_indexed")
     except sqlite3.Error as exc:
         logger.warning("mirror: top_entities sql failed: %s", exc)
-        return {"items": [], "error": str(exc)}
+        fallback = _source_top_entities_fallback(reason="entity_sql_failed")
+        fallback["error"] = str(exc)
+        return fallback
     finally:
         try:
             conn.close()
         except Exception:
             pass
+
+
+def _source_top_entities_fallback(reason: str = "telemetry_unavailable") -> dict[str, Any]:
+    """Fallback for the "Quién está en tu cabeza" card when NER has no rows.
+
+    Entity extraction is optional/backfilled, but WhatsApp activity is often
+    the clearest live signal for "who is top of mind". Keep the card useful
+    instead of rendering an empty block.
+    """
+    try:
+        from rag.integrations.whatsapp import _fetch_whatsapp_today  # noqa: PLC0415
+
+        chats = _fetch_whatsapp_today(max_chats=8) or []
+    except Exception as exc:
+        return {"items": [], "reason": reason, "error": str(exc)[:200]}
+
+    items: list[dict[str, Any]] = []
+    for chat in chats[:8]:
+        if not isinstance(chat, dict):
+            continue
+        name = str(chat.get("name") or "").strip()
+        if not name:
+            continue
+        if _wa_chat_name_excluded(name) or _blacklisted_record(chat_name=name, text=name):
+            continue
+        count = int(chat.get("count") or 0)
+        items.append({
+            "name": name,
+            "kind": "chat",
+            "n_mentions_7d": count,
+            "n_sources": 1,
+            "meta": f"{count} msgs hoy" if count else "chat activo hoy",
+            "fallback": "whatsapp_today",
+        })
+    return {"items": items, "reason": reason, "fallback": "whatsapp_today"}
 
 
 def _source_mood_today(date: str) -> dict[str, Any]:
@@ -275,7 +358,6 @@ def _source_mood_today(date: str) -> dict[str, Any]:
 
     try:
         target_date = date or _mood._today_local()
-        feature_enabled = bool(_mood._is_mood_enabled())
         daemon_enabled = bool(_mood.is_daemon_enabled())
         row = _mood.get_score_for_date(target_date)
         stale = False
@@ -286,15 +368,14 @@ def _source_mood_today(date: str) -> dict[str, Any]:
                 None,
             )
             if stale_row is None:
-                reason = "daemon_disabled" if not daemon_enabled else "no_data"
                 return {
                     "score": None,
                     "n_signals": 0,
                     "sources_used": [],
                     "date": target_date,
-                    "feature_enabled": feature_enabled,
+                    "feature_enabled": True,
                     "daemon_enabled": daemon_enabled,
-                    "reason": reason,
+                    "reason": "no_data",
                 }
             row = _mood.get_score_for_date(stale_row["date"]) or stale_row
             stale = True
@@ -304,7 +385,7 @@ def _source_mood_today(date: str) -> dict[str, Any]:
             "sources_used": row.get("sources_used", []),
             "date": row.get("date", target_date),
             "requested_date": target_date,
-            "feature_enabled": feature_enabled,
+            "feature_enabled": True,
             "daemon_enabled": daemon_enabled,
             "stale": stale,
         }
@@ -321,7 +402,7 @@ def _source_mood_timeline(date: str) -> dict[str, Any]:
     """Últimos 30d de mood score para sparkline."""
     conn = _open_telemetry_ro()
     if conn is None:
-        return {"days": []}
+        return {"days": [], "reason": "telemetry_unavailable"}
     try:
         cutoff_date = (
             datetime.now(tz=timezone.utc) - timedelta(days=30)
@@ -335,7 +416,9 @@ def _source_mood_timeline(date: str) -> dict[str, Any]:
             {"date": d, "score": float(s) if s is not None else 0.0}
             for d, s in cur.fetchall()
         ]
-        return {"days": days, "n": len(days)}
+        if days:
+            return {"days": days, "n": len(days)}
+        return {"days": [], "n": 0, "reason": "no_data"}
     except sqlite3.Error as exc:
         return {"days": [], "error": str(exc)}
     finally:
@@ -346,13 +429,77 @@ def _source_mood_timeline(date: str) -> dict[str, Any]:
 
 
 def _source_pendientes(date: str) -> dict[str, Any]:
-    """Pendientes — calendar events próximos + Apple Reminders due hoy.
+    """Pendientes — compact, timeout-safe view for Mirror.
 
-    El helper ``_pendientes_collect`` requiere argumentos no triviales
-    (DB collection, now datetime, lookback days); evitamos importarlo
-    para mantener este source liviano. Hacemos query directa al
-    integration de Apple Reminders + Calendar.
+    `/api/pendientes` can spend ~8-10s collecting Mail/Gmail/WhatsApp/Apple
+    services. Mirror has a 3s per-source budget, so this card uses the cheap
+    Reminder/Calendar fallback plus fast vault-loop extraction across the
+    default home + work scope. The full evidence endpoint remains richer; the
+    Mirror card must never disappear because one service is slow.
     """
+    payload = _source_pendientes_light(date)
+    try:
+        import rag as _rag  # noqa: PLC0415
+
+        try:
+            vaults = _rag.resolve_vault_paths(None) or []
+        except Exception:
+            vaults = []
+
+        loops: list[dict[str, Any]] = []
+        for vault_name, vault_path in vaults:
+            try:
+                found = _rag._pendientes_extract_loops_fast(
+                    Path(vault_path), days=14, max_items=12,
+                )
+            except Exception:
+                continue
+            for loop in found or []:
+                loop["_vault"] = vault_name
+                loop["_vault_path"] = str(vault_path)
+                loops.append(loop)
+        loops.sort(key=lambda x: x.get("age_days", 0), reverse=True)
+
+        for loop in loops[:5]:
+            title = _clip(loop.get("loop_text"), 120)
+            if not title:
+                continue
+            source_note = Path(str(loop.get("source_note") or ""))
+            source_path = str(source_note)
+            try:
+                source_path = _blacklist_relpath(source_note, Path(loop.get("_vault_path") or ""))
+            except Exception:
+                pass
+            if _blacklisted_record(path=source_path, text=title):
+                continue
+            vault = f"[{loop.get('_vault')}] " if loop.get("_vault") else ""
+            src = source_note.stem
+            age = f"{loop.get('age_days', 0)}d"
+            payload.setdefault("items", []).append({
+                "category": "vault loop",
+                "title": title,
+                "meta": f"{vault}{age} · {src}".strip(),
+                "when": "",
+            })
+
+        counts = payload.setdefault("counts", {})
+        counts["loops"] = len(loops)
+        if loops:
+            services = payload.setdefault("services_consulted", [])
+            if "Vault loops" not in services:
+                services.append("Vault loops")
+        payload["items"] = (payload.get("items") or [])[:10]
+        payload["vault_scope"] = [name for name, _ in vaults]
+        payload["reason"] = "mirror_fast_collector"
+        return payload
+    except Exception as exc:
+        logger.warning("mirror: pendientes collector failed: %s", exc)
+        payload["error"] = str(exc)[:200]
+        return payload
+
+
+def _source_pendientes_light(date: str) -> dict[str, Any]:
+    """Cheap fallback used only if the full pendientes collector fails."""
     items: list[dict[str, Any]] = []
 
     # Apple Reminders due hoy/mañana.
@@ -373,10 +520,14 @@ def _source_pendientes(date: str) -> dict[str, Any]:
                 continue
             if due_dt > cutoff_72h:
                 continue
+            title = str(r.get("title", ""))[:120]
+            if _blacklisted_record(text=title):
+                continue
             items.append({
                 "category": "reminder",
-                "title": str(r.get("title", ""))[:120],
+                "title": title,
                 "when": due_dt.isoformat(timespec="minutes"),
+                "meta": "due",
             })
     except Exception as exc:
         logger.debug("mirror: reminders skip: %s", exc)
@@ -399,16 +550,337 @@ def _source_pendientes(date: str) -> dict[str, Any]:
                 continue
             if start_dt < now or start_dt > cutoff_12h:
                 continue
+            title = str(ev.get("title") or ev.get("summary", ""))[:120]
+            if _blacklisted_record(text=title):
+                continue
             items.append({
                 "category": "calendar",
-                "title": str(ev.get("title") or ev.get("summary", ""))[:120],
+                "title": title,
                 "when": start_dt.isoformat(timespec="minutes"),
+                "meta": "calendar",
             })
     except Exception as exc:
         logger.debug("mirror: calendar skip: %s", exc)
 
     items.sort(key=lambda x: x.get("when", ""))
-    return {"items": items[:10]}
+    counts = {
+        "calendar": sum(1 for i in items if i.get("category") == "calendar"),
+        "reminders": sum(1 for i in items if i.get("category") == "reminder"),
+    }
+    return {
+        "items": items[:10],
+        "counts": counts,
+        "services_consulted": [
+            label for key, label in (("calendar", "Calendar"), ("reminders", "Reminders"))
+            if counts.get(key)
+        ],
+        "reason": "collector_failed_fallback",
+    }
+
+
+def _clip(value: Any, limit: int = 120) -> str:
+    text = str(value or "").strip().replace("\n", " ")
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)] + "…"
+
+
+def _pendientes_services_from_evidence(ev: dict[str, Any]) -> list[str]:
+    services: list[str] = []
+    if (ev.get("gmail") or {}).get("awaiting_reply"):
+        services.append("Gmail")
+    if ev.get("mail_unread"):
+        services.append("Apple Mail")
+    if ev.get("whatsapp"):
+        services.append("WhatsApp")
+    if ev.get("reminders"):
+        services.append("Reminders")
+    if ev.get("calendar_range") or ev.get("calendar"):
+        services.append("Calendar")
+    if ev.get("loops_stale") or ev.get("loops_activo"):
+        services.append("Vault loops")
+    return services
+
+
+def _shape_pendientes_payload(
+    ev: dict[str, Any],
+    urgent: list[str],
+    services: list[str],
+) -> dict[str, Any]:
+    items: list[dict[str, Any]] = []
+
+    def add(category: str, title: Any, *, meta: Any = "", when: Any = "") -> None:
+        clean_title = _clip(title)
+        if not clean_title:
+            return
+        if _blacklisted_record(text=f"{clean_title} {meta}".strip()):
+            return
+        items.append({
+            "category": category,
+            "title": clean_title,
+            "meta": _clip(meta, 90),
+            "when": str(when or ""),
+        })
+
+    for line in urgent[:3]:
+        add("urgente", line)
+
+    calendar = ev.get("calendar_range") or ev.get("calendar") or []
+    for event in calendar[:3]:
+        when_bits = [event.get("date_label"), event.get("time_range")]
+        when = " · ".join(str(x) for x in when_bits if x) or event.get("start") or ""
+        add(
+            "calendar",
+            event.get("title") or event.get("summary"),
+            meta=when,
+            when=event.get("start") or "",
+        )
+
+    reminders = ev.get("reminders") or []
+    bucket_order = {"overdue": 0, "today": 1, "upcoming": 2, "undated": 3}
+    reminders_sorted = sorted(reminders, key=lambda r: bucket_order.get(r.get("bucket"), 9))
+    for reminder in reminders_sorted[:4]:
+        bucket = reminder.get("bucket") or "reminder"
+        bits = [bucket]
+        if reminder.get("list"):
+            bits.append(reminder["list"])
+        if reminder.get("due"):
+            bits.append(reminder["due"])
+        add("reminder", reminder.get("name") or reminder.get("title"), meta=" · ".join(bits))
+
+    gmail = (ev.get("gmail") or {}).get("awaiting_reply") or []
+    for mail in gmail[:2]:
+        who = mail.get("from") or ""
+        age = f"{mail.get('days_old', 0)}d" if mail.get("days_old") is not None else ""
+        add("gmail", mail.get("subject"), meta=" · ".join(x for x in (age, who) if x))
+
+    unread = ev.get("mail_unread") or []
+    for mail in unread[:2]:
+        prefix = "VIP · " if mail.get("is_vip") else ""
+        add("mail", mail.get("subject"), meta=f"{prefix}{mail.get('sender', '')}")
+
+    loops = (ev.get("loops_activo") or [])[:3] + (ev.get("loops_stale") or [])[:2]
+    for loop in loops[:4]:
+        vault = f"[{loop.get('_vault')}] " if loop.get("_vault") else ""
+        src = Path(str(loop.get("source_note") or "")).stem
+        age = f"{loop.get('age_days', 0)}d"
+        add("vault loop", loop.get("loop_text"), meta=f"{vault}{age} · {src}".strip())
+
+    whatsapp = ev.get("whatsapp") or []
+    for chat in whatsapp[:3]:
+        count = int(chat.get("count") or 0)
+        snippet = _clip(chat.get("last_snippet"), 70)
+        meta = f"{count} msgs · {snippet}" if snippet else f"{count} msgs"
+        add("whatsapp", chat.get("name"), meta=meta)
+
+    counts = {
+        "urgent": len(urgent),
+        "calendar": len(calendar),
+        "reminders": len(reminders),
+        "gmail_awaiting": len(gmail),
+        "mail_unread": len(unread),
+        "whatsapp": len(whatsapp),
+        "loops": len(ev.get("loops_activo") or []) + len(ev.get("loops_stale") or []),
+        "contradictions": len(ev.get("contradictions") or []),
+    }
+    nonzero_counts = {k: v for k, v in counts.items() if v}
+    return {
+        "items": items[:10],
+        "urgent": urgent[:5],
+        "counts": counts,
+        "services_consulted": services,
+        "summary": " · ".join(f"{k}: {v}" for k, v in nonzero_counts.items()),
+    }
+
+
+_WA_MEDIA_LABELS = {
+    "image": "imagen",
+    "video": "video",
+    "audio": "audio",
+    "document": "archivo",
+    "sticker": "sticker",
+}
+
+
+def _wa_message_snippet(
+    content: Any,
+    media_type: Any = None,
+    filename: Any = None,
+    *,
+    limit: int = 120,
+) -> str:
+    text = str(content or "").strip().replace("\n", " ")
+    if not text:
+        media = str(media_type or "").strip().lower()
+        label = _WA_MEDIA_LABELS.get(media, media or "")
+        if label:
+            text = f"[{label}]"
+            if filename:
+                text += f" {Path(str(filename)).name}"
+    return _clip(text, limit)
+
+
+def _wa_chat_name_excluded(name: Any) -> bool:
+    try:
+        from rag.integrations.whatsapp import whatsapp_chat_name_excluded  # noqa: PLC0415
+
+        return bool(whatsapp_chat_name_excluded(str(name or "")))
+    except Exception:
+        return False
+
+
+def _blacklisted_record(
+    *,
+    path: Any = None,
+    chat_name: Any = None,
+    person: Any = None,
+    text: Any = None,
+) -> bool:
+    try:
+        from rag.exclusions import should_exclude_record  # noqa: PLC0415
+
+        return bool(
+            should_exclude_record(
+                path=path,
+                chat_name=chat_name,
+                person=person,
+                text=text,
+            )
+        )
+    except Exception:
+        return False
+
+
+def _blacklist_relpath(path: Path, vault: Path) -> str:
+    try:
+        return str(path.relative_to(vault))
+    except ValueError:
+        return str(path)
+
+
+def _wa_item_excluded(item: dict[str, Any]) -> bool:
+    snippets: list[str] = [
+        str(item.get("last_snippet") or ""),
+        str(item.get("topic_hint") or ""),
+    ]
+    for msg in item.get("recent_context") or []:
+        if isinstance(msg, dict):
+            snippets.append(str(msg.get("snippet") or ""))
+    return _blacklisted_record(
+        chat_name=item.get("name"),
+        text=" ".join(s for s in snippets if s),
+    )
+
+
+def _filter_whatsapp_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        item for item in items
+        if not _wa_chat_name_excluded(item.get("name")) and not _wa_item_excluded(item)
+    ]
+
+
+def _whatsapp_recent_context(
+    con: sqlite3.Connection,
+    jid: str,
+    *,
+    hours: int = 12,
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    try:
+        rows = con.execute(
+            """
+            SELECT timestamp, is_from_me, content, media_type, filename
+            FROM messages
+            WHERE chat_jid = ?
+              AND datetime(timestamp) > datetime('now', ?)
+            ORDER BY datetime(timestamp) DESC
+            LIMIT ?
+            """,
+            (jid, f"-{int(hours)} hours", int(limit)),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+
+    items: list[dict[str, Any]] = []
+    for row in reversed(rows):
+        snippet = _wa_message_snippet(
+            row["content"],
+            row["media_type"],
+            row["filename"],
+            limit=140,
+        )
+        if not snippet:
+            continue
+        items.append({
+            "ts": row["timestamp"],
+            "who": "yo" if int(row["is_from_me"] or 0) else "ellos",
+            "snippet": snippet,
+            "media_type": row["media_type"] or "",
+        })
+    return items
+
+
+def _whatsapp_topic_hint(context: list[dict[str, Any]]) -> str:
+    joined = " ".join(str(item.get("snippet") or "") for item in context).lower()
+    has_media = any(item.get("media_type") for item in context)
+    bits: list[str] = []
+    if any(k in joined for k in ("cumple", "cumpleaños", "astor", "regalo")):
+        bits.append("cumpleaños/regalos de Astor")
+    if any(k in joined for k in ("invitación", "invitaciones", "dibujo", "logo", "foto de referencia")):
+        bits.append("invitaciones y referencia visual")
+    if any(k in joined for k in ("trato", "seca", "normal", "indiferente", "traumático")):
+        bits.append("tono de la conversación")
+    if any(k in joined for k in ("post update", "tareas", "update", "confirmo")):
+        bits.append("coordinación operativa")
+    if has_media:
+        bits.append("intercambio de medios")
+    if bits:
+        return "; ".join(dict.fromkeys(bits))
+    for item in reversed(context):
+        snippet = str(item.get("snippet") or "")
+        if snippet and not snippet.startswith("["):
+            return _clip(snippet, 90)
+    return ""
+
+
+def _enrich_whatsapp_items(
+    today: list[dict[str, Any]],
+    recent: list[dict[str, Any]],
+    unreplied: list[dict[str, Any]],
+) -> None:
+    try:
+        from rag import WHATSAPP_DB_PATH  # noqa: PLC0415
+    except Exception:
+        return
+    if not WHATSAPP_DB_PATH.is_file():
+        return
+
+    by_jid: dict[str, list[dict[str, Any]]] = {}
+    for collection in (unreplied, recent, today):
+        for item in collection:
+            jid = str(item.get("jid") or "")
+            if jid:
+                by_jid.setdefault(jid, []).append(item)
+    if not by_jid:
+        return
+
+    try:
+        con = sqlite3.connect(f"file:{WHATSAPP_DB_PATH}?mode=ro", uri=True, timeout=5.0)
+        con.row_factory = sqlite3.Row
+    except sqlite3.Error:
+        return
+    try:
+        for jid, items in list(by_jid.items())[:8]:
+            context = _whatsapp_recent_context(con, jid)
+            if not context:
+                continue
+            topic = _whatsapp_topic_hint(context)
+            for item in items:
+                item["recent_context"] = context
+                if topic:
+                    item["topic_hint"] = topic
+    finally:
+        con.close()
 
 
 def _mirror_whatsapp_unreplied(hours: int = 48, max_chats: int = 5) -> list[dict[str, Any]]:
@@ -432,7 +904,7 @@ def _mirror_whatsapp_unreplied(hours: int = 48, max_chats: int = 5) -> list[dict
         rows = con.execute(
             """
             WITH last_msg AS (
-              SELECT chat_jid, content, is_from_me, timestamp,
+              SELECT chat_jid, content, media_type, filename, is_from_me, timestamp,
                      ROW_NUMBER() OVER (
                        PARTITION BY chat_jid
                        ORDER BY datetime(timestamp) DESC
@@ -445,6 +917,8 @@ def _mirror_whatsapp_unreplied(hours: int = 48, max_chats: int = 5) -> list[dict
             SELECT lm.chat_jid   AS jid,
                    c.name        AS name,
                    lm.content    AS last_content,
+                   lm.media_type AS media_type,
+                   lm.filename   AS filename,
                    lm.timestamp  AS last_ts
             FROM last_msg lm
             LEFT JOIN chats c ON c.jid = lm.chat_jid
@@ -467,9 +941,9 @@ def _mirror_whatsapp_unreplied(hours: int = 48, max_chats: int = 5) -> list[dict
         display_name = raw_name or jid_prefix
         if not any(ch.isalpha() for ch in display_name):
             continue
-        snippet = (row["last_content"] or "").strip().replace("\n", " ")
-        if len(snippet) > 120:
-            snippet = snippet[:117] + "…"
+        if _wa_chat_name_excluded(display_name):
+            continue
+        snippet = _wa_message_snippet(row["last_content"], row["media_type"], row["filename"])
         try:
             last_dt = datetime.fromisoformat((row["last_ts"] or "").replace("Z", "+00:00"))
             hours_waiting = max(0.0, (now_ts - last_dt.timestamp()) / 3600.0)
@@ -519,6 +993,13 @@ def _source_whatsapp(date: str) -> dict[str, Any]:
     except Exception as exc:
         logger.debug("mirror: whatsapp unreplied failed: %s", exc)
         unreplied = []
+    try:
+        _enrich_whatsapp_items(today, recent, unreplied)
+    except Exception as exc:
+        logger.debug("mirror: whatsapp enrich failed: %s", exc)
+    today = _filter_whatsapp_items(today)
+    recent = _filter_whatsapp_items(recent)
+    unreplied = _filter_whatsapp_items(unreplied)
 
     return {
         "today": today,
@@ -549,6 +1030,9 @@ def _source_dormant_notes(date: str) -> dict[str, Any]:
                 if not d.is_dir():
                     continue
                 for note in d.rglob("*.md"):
+                    rel_note = _blacklist_relpath(note, Path(vault))
+                    if _blacklisted_record(path=rel_note, text=note.stem):
+                        continue
                     try:
                         st = note.stat()
                     except OSError:
@@ -570,6 +1054,8 @@ def _source_dormant_notes(date: str) -> dict[str, Any]:
             rel = note.relative_to(vault)
         except ValueError:
             rel = note
+        if _blacklisted_record(path=str(rel), text=note.stem):
+            continue
         items.append({
             "path": str(rel),
             "title": note.stem,
@@ -586,7 +1072,7 @@ def _source_spotify_top(date: str) -> dict[str, Any]:
     """Top 5 artistas últimos 7d."""
     conn = _open_telemetry_ro()
     if conn is None:
-        return {"items": []}
+        return _source_spotify_fallback(reason="telemetry_unavailable")
     try:
         cutoff = time.time() - 7 * 86400
         cur = conn.execute(
@@ -599,14 +1085,200 @@ def _source_spotify_top(date: str) -> dict[str, Any]:
             {"artist": a, "plays": int(n), "distinct_tracks": int(t)}
             for a, n, t in cur.fetchall()
         ]
-        return {"items": items}
+        if items:
+            return {"items": items, "mode": "top_artists"}
+        return _source_spotify_fallback(reason="no_spotify_log")
     except sqlite3.Error as exc:
-        return {"items": [], "error": str(exc)}
+        fallback = _source_spotify_fallback(reason="spotify_sql_failed")
+        fallback["error"] = str(exc)
+        return fallback
     finally:
         try:
             conn.close()
         except Exception:
             pass
+
+
+def _source_spotify_fallback(reason: str) -> dict[str, Any]:
+    """Use local Spotify state/history when the aggregate log is empty."""
+    try:
+        from rag.integrations.spotify_local import (  # noqa: PLC0415
+            now_playing,
+            recent_tracks_lookback,
+        )
+
+        recent = recent_tracks_lookback(days=14, limit=5) or []
+        if recent:
+            return {
+                "items": [
+                    {
+                        "artist": t.get("artist") or "",
+                        "track": t.get("name") or "",
+                        "album": t.get("album") or "",
+                        "plays": 1,
+                        "distinct_tracks": 1,
+                        "last_seen": t.get("last_seen"),
+                    }
+                    for t in recent
+                ],
+                "mode": "recent_tracks",
+                "reason": reason,
+            }
+        current = now_playing(timeout=1.0)
+        if current:
+            return {
+                "items": [{
+                    "artist": current.get("artist") or "",
+                    "track": current.get("name") or "",
+                    "album": current.get("album") or "",
+                    "plays": 1,
+                    "distinct_tracks": 1,
+                    "state": current.get("state") or "",
+                }],
+                "mode": "now_playing",
+                "reason": reason,
+            }
+    except Exception as exc:
+        snapshot = _source_spotify_snapshot_fallback(reason=reason)
+        if snapshot.get("items"):
+            snapshot["apple_script_error"] = str(exc)[:200]
+            return snapshot
+        return {"items": [], "reason": reason, "error": str(exc)[:200]}
+
+    snapshot = _source_spotify_snapshot_fallback(reason=reason)
+    if snapshot.get("items"):
+        return snapshot
+    return {"items": [], "reason": reason}
+
+
+_SPOTIFY_TRACK_RE = re.compile(
+    r"^-\s+(?:`(?P<played>[^`]+)`\s+)?"
+    r"\[(?P<track>[^\]]+)\]\((?P<url>[^)]+)\)\s+—\s+"
+    r"(?P<artist>[^·\n]+)"
+)
+_SPOTIFY_ARTIST_RE = re.compile(r"^-\s+\[(?P<artist>[^\]]+)\]\((?P<url>[^)]+)\)")
+
+
+def _source_spotify_snapshot_fallback(reason: str) -> dict[str, Any]:
+    """Read the latest Spotify ingest notes from the vault.
+
+    The live desktop log can be empty when Spotify is closed or the listener
+    has not observed a track yet. The external-ingest notes still contain the
+    last synced top/recent snapshot, which is better signal than an empty card.
+    """
+    for _vault_name, vault in _mirror_vaults():
+        spotify_dir = Path(vault) / "99-obsidian/99-AI/external-ingest/Spotify"
+        top_path = spotify_dir / "_top.md"
+        top = _parse_spotify_top_note(top_path)
+        if top.get("items"):
+            top["reason"] = reason
+            return top
+
+        recent_files = sorted(
+            (p for p in spotify_dir.glob("*.md") if p.name != "_top.md"),
+            key=lambda p: p.stat().st_mtime if p.exists() else 0,
+            reverse=True,
+        )
+        for path in recent_files[:3]:
+            recent = _parse_spotify_recent_note(path)
+            if recent.get("items"):
+                recent["reason"] = reason
+                return recent
+    return {"items": [], "reason": reason}
+
+
+def _frontmatter_value(raw: str, key: str) -> str:
+    m = re.search(rf"^{re.escape(key)}:\s*(.+?)\s*$", raw, flags=re.MULTILINE)
+    return m.group(1).strip() if m else ""
+
+
+def _parse_spotify_top_note(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {"items": []}
+    try:
+        raw = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return {"items": []}
+
+    items: list[dict[str, Any]] = []
+    in_tracks = False
+    for line in raw.splitlines():
+        if line.startswith("## Top tracks"):
+            in_tracks = True
+            continue
+        if line.startswith("## Top artists"):
+            break
+        if not in_tracks:
+            continue
+        m = _SPOTIFY_TRACK_RE.match(line.strip())
+        if not m:
+            continue
+        items.append({
+            "track": m.group("track").strip(),
+            "artist": m.group("artist").strip(),
+            "url": m.group("url").strip(),
+            "plays": 1,
+            "distinct_tracks": 1,
+        })
+        if len(items) >= 5:
+            break
+
+    if not items:
+        in_artists = False
+        for line in raw.splitlines():
+            if line.startswith("## Top artists"):
+                in_artists = True
+                continue
+            if not in_artists:
+                continue
+            m = _SPOTIFY_ARTIST_RE.match(line.strip())
+            if not m:
+                continue
+            items.append({
+                "artist": m.group("artist").strip(),
+                "url": m.group("url").strip(),
+                "plays": 1,
+                "distinct_tracks": 1,
+            })
+            if len(items) >= 5:
+                break
+
+    return {
+        "items": items,
+        "mode": "top_snapshot",
+        "snapshot_date": _frontmatter_value(raw, "refreshed_date"),
+    }
+
+
+def _parse_spotify_recent_note(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {"items": []}
+    try:
+        raw = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return {"items": []}
+
+    items: list[dict[str, Any]] = []
+    for line in raw.splitlines():
+        m = _SPOTIFY_TRACK_RE.match(line.strip())
+        if not m:
+            continue
+        items.append({
+            "track": m.group("track").strip(),
+            "artist": m.group("artist").strip(),
+            "url": m.group("url").strip(),
+            "played_at": (m.group("played") or "").strip(),
+            "plays": 1,
+            "distinct_tracks": 1,
+        })
+        if len(items) >= 5:
+            break
+
+    return {
+        "items": items,
+        "mode": "recent_snapshot",
+        "snapshot_date": _frontmatter_value(raw, "snapshot_date") or path.stem,
+    }
 
 
 def _source_screen_time(date: str) -> dict[str, Any]:
@@ -697,6 +1369,23 @@ def _source_screen_time(date: str) -> dict[str, Any]:
         return {"apps": [], "error": str(exc)}
 
 
+def _screen_observer_enabled() -> bool:
+    """Return whether the passive screen observer is configured for this user.
+
+    The Mirror web process does not necessarily inherit the supervisor plist
+    env, so the state file is the source of truth for user intent. Keep the
+    env fallback for manual shells and tests that run the observer directly.
+    """
+    env = os.environ.get("RAG_SCREEN_OBSERVE", "").strip().lower()
+    if env in {"1", "true", "yes", "on"}:
+        return True
+    try:
+        from rag.integrations.peekaboo import _observe_state_enabled  # noqa: PLC0415
+        return bool(_observe_state_enabled())
+    except Exception:
+        return False
+
+
 def _source_screen_context(date: str) -> dict[str, Any]:
     """Últimas 3 observaciones de pantalla del Peekaboo observer (Fase 2).
 
@@ -713,16 +1402,28 @@ def _source_screen_context(date: str) -> dict[str, Any]:
     Cap recent=3 para mantener el response liviano. El caption se trunca a
     140 chars (suficiente para preview, full body queda en la tabla).
     """
+    observer_enabled = _screen_observer_enabled()
+
+    def _empty(reason: str) -> dict[str, Any]:
+        return {
+            "recent": [],
+            "today": [],
+            "count_today": 0,
+            "count_7d": 0,
+            "observer_enabled": observer_enabled,
+            "reason": reason,
+        }
+
     conn = _open_telemetry_ro()
     if conn is None:
-        return {"recent": [], "count_today": 0, "count_7d": 0}
+        return _empty("telemetry_unavailable")
     try:
         # Verificá que la tabla existe — feature recién agregado, DB viejas
         # pueden no tenerla todavía.
         try:
             conn.execute("SELECT 1 FROM rag_screen_observations LIMIT 0")
         except sqlite3.Error:
-            return {"recent": [], "count_today": 0, "count_7d": 0}
+            return _empty("table_missing")
 
         now_ts = int(time.time())
         cutoff_live = now_ts - 4 * 3600  # ventana "live": últimas 4h
@@ -804,15 +1505,25 @@ def _source_screen_context(date: str) -> dict[str, Any]:
         except sqlite3.Error:
             count_7d = 0
 
-        return {
+        reason = None
+        if not recent and not today_gallery and count_today == 0 and count_7d == 0:
+            reason = "no_observations" if observer_enabled else "observer_disabled"
+
+        out = {
             "recent": recent,
             "today": today_gallery,
             "count_today": count_today,
             "count_7d": count_7d,
+            "observer_enabled": observer_enabled,
         }
+        if reason:
+            out["reason"] = reason
+        return out
     except Exception as exc:
         logger.warning("mirror: screen_context failed: %s", exc)
-        return {"recent": [], "today": [], "count_today": 0, "count_7d": 0, "error": str(exc)[:200]}
+        out = _empty("source_failed")
+        out["error"] = str(exc)[:200]
+        return out
     finally:
         conn.close()
 
@@ -931,8 +1642,9 @@ def assemble_mirror(
         cached = _cache_get(cache_key)
         if cached is not None:
             response = dict(cached)
+            response["sources"] = dict(cached.get("sources") or {})
             response["cache_hit"] = True
-            return response
+            return _refresh_live_sources(response, date)
 
     t0 = time.time()
     sources_data: dict[str, Any] = {}
@@ -983,25 +1695,225 @@ Te paso un snapshot del estado actual:
 
 {summary}
 
-Generá 3-5 insights en español rioplatense (voseo). Cada insight debe ser:
-- Específico (mencionar names, numbers, dates).
-- Personal (vos pensás como si CONOCIERAS al user).
-- Accionable o reflexivo (no obvio).
-- Si hay bloque WhatsApp/WZP, evaluá actividad, chats sin responder,
-  urgencia y tono con cuidado. No inventes intención: citá solo lo que
-  aparece en el snippet.
+Generá 3-5 insights en español rioplatense (voseo). Cada insight debe tener
+2 frases y 180-450 caracteres: una observación concreta y una lectura o acción
+prudente.
+
+Reglas de grounding:
+- Usá SOLO datos presentes en el snapshot. No inventes fechas, emociones,
+  intenciones, queries, correlaciones ni actividad que no esté ahí.
+- No escribas "mencionaste", "dijiste", "prometiste" ni "te comprometiste"
+  salvo que el snapshot traiga una cita literal de una fuente conversacional.
+- Los ítems `vault loop` son pendientes detectados por regex en notas: no son
+  frases dichas hoy. Presentalos como "aparece como pendiente detectado" o
+  omitilos si parecen ejemplos, plantillas o texto citado.
+- No digas "sigue sin dedicar tiempo" o "no respondiste" salvo que el snapshot
+  incluya evidencia explícita para sostenerlo.
+- Si hay bloque WhatsApp/WZP, evaluá actividad, chats sin responder, urgencia y
+  tono con cuidado. Citá solo snippets presentes.
+- Si no hay evidencia suficiente para un insight, omitilo.
 
 Formato JSON estricto: ``{{"insights": ["...", "...", "..."]}}``. Sin markdown.
-
-Ejemplos válidos:
-- "Notaste que estás escuchando 80% Charly García esta semana? El finde pasado solo escuchabas Spinetta."
-- "Hace 3 semanas mencionaste 'llamar al dentista' — sigue sin agenda."
-- "Tu mood promedio bajó de +0.8 a +0.3 en los últimos 7d. Coincide con el aumento de queries 'ansiedad'."
 
 Generá SOLO el JSON, nada más:"""
 
 
 _INSIGHTS_TIMEOUT_S = 8.0
+_INSIGHT_MAX_CHARS = 800
+_UNGROUNDED_CLAIM_RE = re.compile(
+    r"\b(?:hoy\s+)?(?:mencionaste|dijiste|contaste|prometiste)\b"
+    r"|\bte comprometiste\b"
+    r"|\bsigue sin dedicar tiempo\b",
+    re.IGNORECASE,
+)
+_QUOTED_TEXT_RE = re.compile(r"[\"'“”‘’]([^\"'“”‘’]{3,120})[\"'“”‘’]")
+
+
+def _insight_grounded(summary: str, insight: str) -> bool:
+    """Conservative post-filter for common helper hallucinations."""
+    if len(insight.strip(" .…")) < 24:
+        return False
+    if _blacklisted_record(text=insight):
+        return False
+    summary_l = summary.lower()
+    insight_l = insight.lower()
+    if _UNGROUNDED_CLAIM_RE.search(insight_l):
+        return False
+    for quoted in _QUOTED_TEXT_RE.findall(insight):
+        quote = quoted.strip().lower()
+        if quote and quote not in summary_l:
+            return False
+    return True
+
+
+def _format_wait(hours: Any) -> str:
+    try:
+        value = float(hours or 0)
+    except (TypeError, ValueError):
+        value = 0.0
+    if value < 0.05:
+        return "recién"
+    if value < 1:
+        return f"{max(1, round(value * 60))}m"
+    if value < 24:
+        return f"{value:.1f}h"
+    return f"{int(value // 24)}d"
+
+
+def _format_days_ago(days: Any) -> str:
+    try:
+        value = int(days)
+    except (TypeError, ValueError):
+        return f"hace {days}d"
+    if value <= 0:
+        return "hoy"
+    if value == 1:
+        return "ayer"
+    return f"hace {value}d"
+
+
+def _merge_insights(primary: list[str], secondary: list[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for item in [*primary, *secondary]:
+        text = str(item or "").strip()
+        key = text.lower()
+        if not text or key in seen or _blacklisted_record(text=text):
+            continue
+        seen.add(key)
+        merged.append(text[:_INSIGHT_MAX_CHARS])
+        if len(merged) >= 5:
+            break
+    return merged
+
+
+def _whatsapp_chat_brief(chat: dict[str, Any]) -> str:
+    name = str(chat.get("name") or "chat")
+    topic = _clip(chat.get("topic_hint"), 120)
+    context = chat.get("recent_context") or []
+    bits: list[str] = []
+    for msg in context[-4:]:
+        snippet = _clip(msg.get("snippet"), 70)
+        if snippet:
+            bits.append(f"{msg.get('who', '?')}: \"{snippet}\"")
+    detail = " / ".join(bits[-3:])
+    if topic and detail:
+        return f"{name}: {topic}; {detail}"
+    if topic:
+        return f"{name}: {topic}"
+    if detail:
+        return f"{name}: {detail}"
+    snippet = _clip(chat.get("last_snippet"), 90)
+    return f"{name}: \"{snippet}\"" if snippet else name
+
+
+def _deterministic_insights(mirror_data: dict[str, Any]) -> list[str]:
+    """Grounded insights from the structured snapshot, no generation."""
+    s = mirror_data.get("sources", {})
+    out: list[str] = []
+
+    wa = s.get("whatsapp", {}) if isinstance(s.get("whatsapp"), dict) else {}
+    wa_counts = wa.get("counts") or {}
+    unreplied = wa.get("unreplied") or []
+    if unreplied:
+        first = unreplied[0]
+        top_today = wa.get("today") or []
+        names = ", ".join(
+            str(x.get("name") or "chat") for x in unreplied[:3]
+        )
+        snippet = _clip(first.get("last_snippet"), 90)
+        detail = f"El más reciente es {first.get('name', 'un chat')} ({_format_wait(first.get('hours_waiting'))})"
+        if snippet:
+            detail += f": \"{snippet}\"."
+        else:
+            detail += "."
+        active_bits: list[str] = []
+        for chat in top_today[:2]:
+            topic = _clip(chat.get("topic_hint"), 130)
+            if not topic:
+                topic = _clip(_whatsapp_chat_brief(chat), 130)
+            if topic:
+                active_bits.append(
+                    f"{chat.get('name', 'chat')} ({chat.get('count', 0)}) gira alrededor de {topic}"
+                )
+        active_text = ""
+        if active_bits:
+            active_text = " Los chats más activos no son genéricos: " + "; ".join(active_bits) + "."
+        out.append(
+            f"WZP está movido: {wa_counts.get('today_chats', len(wa.get('today') or []))} chats hoy y "
+            f"{wa_counts.get('unreplied_chats', len(unreplied))} con respuesta tuya pendiente. "
+            f"{detail}{active_text} Si tenés poco margen, priorizá {names} según el bloqueo real de cada charla."
+        )
+
+    pend = s.get("pendientes", {}) if isinstance(s.get("pendientes"), dict) else {}
+    pend_items = pend.get("items") or []
+    if pend_items:
+        cats: dict[str, int] = {}
+        for item in pend_items:
+            cat = str(item.get("category") or "otro")
+            cats[cat] = cats.get(cat, 0) + 1
+        cat_text = ", ".join(f"{v} señales de {k}" for k, v in sorted(cats.items()))
+        first = pend_items[0]
+        meta = f" ({_clip(first.get('meta'), 80)})" if first.get("meta") else ""
+        out.append(
+            f"Tus pendientes visibles mezclan {cat_text}. El primero que aparece es "
+            f"\"{_clip(first.get('title'), 120)}\"{meta}; conviene tratar los `vault loop` "
+            "como señales para revisar la fuente, no como compromisos textuales."
+        )
+
+    mood = s.get("mood_today", {}) if isinstance(s.get("mood_today"), dict) else {}
+    timeline = (
+        s.get("mood_timeline", {}).get("days", [])
+        if isinstance(s.get("mood_timeline"), dict) else []
+    )
+    if mood.get("score") is not None:
+        text = (
+            f"El mood de hoy aparece en {float(mood.get('score')):+.2f} con "
+            f"{int(mood.get('n_signals') or 0)} señales."
+        )
+        scores_recent = [d.get("score", 0) for d in timeline[-7:] if d.get("score") is not None]
+        scores_old = [d.get("score", 0) for d in timeline[-14:-7] if d.get("score") is not None]
+        if scores_recent and scores_old:
+            avg_recent = sum(scores_recent) / len(scores_recent)
+            avg_old = sum(scores_old) / len(scores_old)
+            text += (
+                f" En la ventana de 14 días la tendencia va de {avg_old:+.2f} a "
+                f"{avg_recent:+.2f}; miralo como contexto, no como diagnóstico."
+            )
+        else:
+            text += " Todavía no hay suficiente serie reciente para comparar tendencia con confianza."
+        out.append(text)
+
+    projects = (
+        s.get("active_projects", {}).get("items", [])
+        if isinstance(s.get("active_projects"), dict) else []
+    )
+    if projects:
+        top = projects[0]
+        others = ", ".join(str(p.get("name") or "?") for p in projects[1:3])
+        tail = f" También aparecen {others}." if others else ""
+        out.append(
+            f"Tu actividad de notas está concentrada en {top.get('name', '?')}: "
+            f"{top.get('note_count_30d', 0)} notas tocadas en 30 días y último movimiento "
+            f"{_format_days_ago(top.get('days_ago'))}.{tail} Es una buena señal de dónde está el foco real."
+        )
+
+    dormant = (
+        s.get("dormant_notes", {}).get("items", [])
+        if isinstance(s.get("dormant_notes"), dict) else []
+    )
+    if dormant:
+        names = ", ".join(str(d.get("title") or "?") for d in dormant[:3])
+        out.append(
+            f"Hay memoria útil quedando atrás: {names}. Están dormidas hace más de 30 días, "
+            "así que pueden ser buen material para rescatar si conectan con lo que estás moviendo ahora."
+        )
+
+    return [
+        x[:_INSIGHT_MAX_CHARS]
+        for x in out
+        if not _blacklisted_record(text=x)
+    ][:5]
 
 
 def generate_insights(mirror_data: dict[str, Any]) -> dict[str, Any]:
@@ -1012,9 +1924,14 @@ def generate_insights(mirror_data: dict[str, Any]) -> dict[str, Any]:
     from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout  # noqa: PLC0415
 
     summary = _summarize_for_llm(mirror_data)
+    grounded = _deterministic_insights(mirror_data)
+    if len(grounded) >= 3:
+        return {"insights": grounded[:5], "model": "grounded-rules"}
     try:
         from rag.llm_backend import get_backend  # noqa: PLC0415
     except ImportError:
+        if grounded:
+            return {"insights": grounded, "model": "grounded-rules"}
         return {"insights": [], "error": "llm_backend no disponible"}
 
     def _call() -> dict[str, Any]:
@@ -1023,12 +1940,22 @@ def generate_insights(mirror_data: dict[str, Any]) -> dict[str, Any]:
     try:
         with ThreadPoolExecutor(max_workers=1) as ex:
             fut = ex.submit(_call)
-            return fut.result(timeout=_INSIGHTS_TIMEOUT_S)
+            result = fut.result(timeout=_INSIGHTS_TIMEOUT_S)
+            if grounded:
+                result["insights"] = _merge_insights(
+                    grounded, result.get("insights") or [],
+                )
+                result["model"] = f"grounded-rules+{result.get('model', 'llm')}"
+            return result
     except FuturesTimeout:
         logger.warning("mirror insights LLM timed out after %ss", _INSIGHTS_TIMEOUT_S)
+        if grounded:
+            return {"insights": grounded, "model": "grounded-rules", "warning": "llm timeout"}
         return {"insights": [], "error": "timeout"}
     except Exception as exc:
         logger.warning("mirror insights LLM failed: %s", exc)
+        if grounded:
+            return {"insights": grounded, "model": "grounded-rules", "warning": str(exc)[:200]}
         return {"insights": [], "error": str(exc)[:200]}
 
 
@@ -1049,11 +1976,29 @@ def _generate_insights_inner(summary: str) -> dict[str, Any]:
         except Exception:
             helper_model = "qwen2.5:3b"
         from rag.llm_backend import ChatOptions  # noqa: PLC0415
+
+        def _insights_option_int(
+            env_name: str, helper_key: str, default: int, minimum: int,
+        ) -> int:
+            env_raw = os.environ.get(env_name)
+            raw = env_raw if env_raw is not None else HELPER_OPTIONS.get(helper_key, default)
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                value = default
+            if env_raw is not None:
+                return max(1, value)
+            return max(minimum, value)
+
         helper_opts = ChatOptions(
             temperature=float(HELPER_OPTIONS.get("temperature", 0)),
             seed=int(HELPER_OPTIONS.get("seed", 42)),
-            num_ctx=int(HELPER_OPTIONS.get("num_ctx", 1024)),
-            num_predict=int(HELPER_OPTIONS.get("num_predict", 128)),
+            num_ctx=_insights_option_int(
+                "RAG_MIRROR_INSIGHTS_NUM_CTX", "num_ctx", 2048, 2048,
+            ),
+            num_predict=_insights_option_int(
+                "RAG_MIRROR_INSIGHTS_NUM_PREDICT", "num_predict", 384, 384,
+            ),
         )
         resp = backend.chat(
             model=helper_model,
@@ -1083,10 +2028,12 @@ def _generate_insights_inner(summary: str) -> dict[str, Any]:
         insights = parsed.get("insights", [])
         if not isinstance(insights, list):
             insights = []
-        return {
-            "insights": [str(s)[:500] for s in insights[:5]],
-            "model": helper_model,
-        }
+        grounded = [
+            text[:_INSIGHT_MAX_CHARS]
+            for s in insights
+            if (text := str(s).strip()) and _insight_grounded(summary, text)
+        ]
+        return {"insights": grounded[:5], "model": helper_model}
     except Exception as exc:
         logger.warning("mirror insights LLM failed: %s", exc)
         return {"insights": [], "error": str(exc)[:200]}
@@ -1133,9 +2080,14 @@ def _summarize_for_llm(mirror: dict[str, Any]) -> str:
 
     pend = s.get("pendientes", {}).get("items", [])
     if pend:
-        lines.append("\nPendientes:")
+        lines.append("\nPendientes detectados (no asumir que fueron mencionados hoy):")
         for p in pend[:5]:
-            lines.append(f"- {p.get('title', '?')} [{p.get('category', '?')}]")
+            bits = [str(p.get("category") or "?")]
+            if p.get("meta"):
+                bits.append(str(p["meta"]))
+            if p.get("when"):
+                bits.append(f"when={p['when']}")
+            lines.append(f"- {p.get('title', '?')} [{'; '.join(bits)}]")
 
     wa = s.get("whatsapp", {})
     wa_today = wa.get("today", []) if isinstance(wa, dict) else []
@@ -1146,10 +2098,10 @@ def _summarize_for_llm(mirror: dict[str, Any]) -> str:
         lines.append(
             "\nWhatsApp/WZP:"
             f" {counts.get('today_chats', len(wa_today))} chats hoy,"
-            f" {counts.get('unreplied_chats', len(wa_unreplied))} sin responder"
+            f" {counts.get('unreplied_chats', len(wa_unreplied))} con respuesta tuya pendiente"
         )
         if wa_unreplied:
-            lines.append("Chats WZP esperando respuesta:")
+            lines.append("Chats WZP esperando respuesta tuya (último mensaje inbound):")
             for w in wa_unreplied[:4]:
                 name = w.get("name", "?")
                 hours = w.get("hours_waiting", 0)

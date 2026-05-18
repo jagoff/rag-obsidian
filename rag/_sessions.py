@@ -34,6 +34,7 @@ import fcntl
 import json
 import re
 import secrets
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -83,6 +84,25 @@ SESSION_SUMMARY_VERSION = 1      # bump if compressor prompt/format changes (inv
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.@:-]{1,80}$")
 
 
+def _rag_attr(name: str, default):
+    """Return root-package overrides for back-compat with `monkeypatch(rag.X)`.
+
+    This module is re-exported from `rag.__init__`; older tests and callers
+    patch symbols on `rag`, not on `rag._sessions`. Keep that contract while
+    still allowing the extracted module to own the implementation.
+    """
+    root = sys.modules.get("rag")
+    return getattr(root, name, default) if root is not None else default
+
+
+def _sessions_dir() -> Path:
+    return Path(_rag_attr("SESSIONS_DIR", SESSIONS_DIR))
+
+
+def _last_session_file() -> Path:
+    return Path(_rag_attr("LAST_SESSION_FILE", LAST_SESSION_FILE))
+
+
 def new_session_id() -> str:
     """Short opaque id: hex timestamp + 6 random hex chars (sortable + unique)."""
     return f"{int(time.time()):x}-{secrets.token_hex(3)}"
@@ -95,7 +115,7 @@ def _valid_session_id(sid: str) -> bool:
 def session_path(sid: str) -> Path:
     if not _valid_session_id(sid):
         raise ValueError(f"invalid session id: {sid!r}")
-    return SESSIONS_DIR / f"{sid}.json"
+    return _sessions_dir() / f"{sid}.json"
 
 
 def load_session(sid: str) -> dict | None:
@@ -161,7 +181,7 @@ def save_session(sess: dict) -> None:
     read-modify-write bajo el mismo lock, que es un refactor mayor
     documentado en el issue tracker.
     """
-    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    _sessions_dir().mkdir(parents=True, exist_ok=True)
     sess["updated_at"] = datetime.now().isoformat(timespec="seconds")
     p = session_path(sess["id"])
     tmp = p.with_suffix(".json.tmp")
@@ -219,14 +239,17 @@ def append_turn(sess: dict, turn: dict) -> None:
         "ts": datetime.now().isoformat(timespec="seconds"),
         **turn,
     })
-    if len(sess["turns"]) > SESSION_MAX_TURNS:
-        sess["turns"] = sess["turns"][-SESSION_MAX_TURNS:]
+    max_turns = int(_rag_attr("SESSION_MAX_TURNS", SESSION_MAX_TURNS))
+    if len(sess["turns"]) > max_turns:
+        sess["turns"] = sess["turns"][-max_turns:]
 
 
-def session_history(sess: dict, window: int = SESSION_HISTORY_WINDOW) -> list[dict]:
+def session_history(sess: dict, window: int | None = None) -> list[dict]:
     """Flatten session turns into `[{role, content}]` for reformulate_query /
     the chat LLM. Returns the last `window` messages.
     """
+    if window is None:
+        window = int(_rag_attr("SESSION_HISTORY_WINDOW", SESSION_HISTORY_WINDOW))
     msgs: list[dict] = []
     for turn in sess.get("turns", []):
         q = turn.get("q")
@@ -241,8 +264,8 @@ def session_history(sess: dict, window: int = SESSION_HISTORY_WINDOW) -> list[di
 def session_summary(
     sess: dict,
     *,
-    window: int = SESSION_HISTORY_WINDOW,
-    threshold: int = SESSION_COMPRESSION_THRESHOLD,
+    window: int | None = None,
+    threshold: int | None = None,
 ) -> str | None:
     """Lazily compute / cache a compressed summary of turns aged out of the
     raw history window. Returns the summary string, or None when the session
@@ -258,6 +281,12 @@ def session_summary(
     """
     from rag import _compress_turns  # noqa: PLC0415
 
+    if window is None:
+        window = int(_rag_attr("SESSION_HISTORY_WINDOW", SESSION_HISTORY_WINDOW))
+    if threshold is None:
+        threshold = int(_rag_attr("SESSION_COMPRESSION_THRESHOLD", SESSION_COMPRESSION_THRESHOLD))
+    summary_version = int(_rag_attr("SESSION_SUMMARY_VERSION", SESSION_SUMMARY_VERSION))
+
     turns = sess.get("turns") or []
     n = len(turns)
     if n < threshold:
@@ -267,7 +296,7 @@ def session_summary(
         return None
     cached = sess.get("compressed_history") or {}
     if (
-        cached.get("version") == SESSION_SUMMARY_VERSION
+        cached.get("version") == summary_version
         and cached.get("covers_until_idx", 0) >= need_until
     ):
         return cached.get("summary") or None
@@ -275,7 +304,7 @@ def session_summary(
     if not summary_text:
         return cached.get("summary") if cached else None
     sess["compressed_history"] = {
-        "version": SESSION_SUMMARY_VERSION,
+        "version": summary_version,
         "covers_until_idx": need_until,
         "summary": summary_text,
         "ts": datetime.now().isoformat(timespec="seconds"),
@@ -285,7 +314,7 @@ def session_summary(
 
 def last_session_id() -> str | None:
     try:
-        sid = LAST_SESSION_FILE.read_text(encoding="utf-8").strip()
+        sid = _last_session_file().read_text(encoding="utf-8").strip()
     except Exception:
         return None
     return sid or None
@@ -300,10 +329,11 @@ def _set_last_session(sid: str) -> None:
     from rag import _silent_log  # noqa: PLC0415
 
     try:
-        LAST_SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = LAST_SESSION_FILE.with_suffix(LAST_SESSION_FILE.suffix + ".tmp")
+        last_file = _last_session_file()
+        last_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp = last_file.with_suffix(last_file.suffix + ".tmp")
         tmp.write_text(sid, encoding="utf-8")
-        tmp.replace(LAST_SESSION_FILE)
+        tmp.replace(last_file)
     except Exception as exc:
         _silent_log("last_session_write", exc)
 
@@ -312,10 +342,11 @@ def list_sessions(limit: int = 20) -> list[dict]:
     """Return recent session summaries (newest first) — id, turn count, first question."""
     from rag import _silent_log  # noqa: PLC0415
 
-    if not SESSIONS_DIR.is_dir():
+    sessions_dir = _sessions_dir()
+    if not sessions_dir.is_dir():
         return []
     out: list[dict] = []
-    for p in SESSIONS_DIR.glob("*.json"):
+    for p in sessions_dir.glob("*.json"):
         try:
             s = json.loads(p.read_text(encoding="utf-8"))
         except Exception as exc:
@@ -337,11 +368,12 @@ def list_sessions(limit: int = 20) -> list[dict]:
 
 def cleanup_sessions(ttl_days: int = SESSION_TTL_DAYS) -> int:
     """Remove session files older than `ttl_days` by mtime. Returns count removed."""
-    if not SESSIONS_DIR.is_dir():
+    sessions_dir = _sessions_dir()
+    if not sessions_dir.is_dir():
         return 0
     cutoff = time.time() - ttl_days * 86400
     removed = 0
-    for p in SESSIONS_DIR.glob("*.json"):
+    for p in sessions_dir.glob("*.json"):
         try:
             if p.stat().st_mtime < cutoff:
                 p.unlink()

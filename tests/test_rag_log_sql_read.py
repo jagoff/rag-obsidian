@@ -238,7 +238,7 @@ def test_read_feedback_map_normalizes_ratings(sql_env):
     _insert_feedback(conn, turn_id="t2", rating=-1, q="a")
     _insert_feedback(conn, turn_id="t3", rating=3, q="a")
     _insert_feedback(conn, turn_id="t4", rating=-2, q="a")
-    fb = rag._read_feedback_map_for_log()
+    fb = rag._read_feedback_map_for_log(["t1", "t2", "t3", "t4"])
     assert fb == {"t1": 1, "t2": -1, "t3": 1, "t4": -1}
 
 
@@ -248,7 +248,7 @@ def test_read_feedback_map_skips_null_turn_id(sql_env):
     _, conn = sql_env
     _insert_feedback(conn, turn_id="t1", rating=1, q="a")
     _insert_feedback(conn, turn_id=None, rating=-1, scope="global", q="b")
-    fb = rag._read_feedback_map_for_log()
+    fb = rag._read_feedback_map_for_log(["t1"])
     assert fb == {"t1": 1}
 
 
@@ -260,5 +260,5 @@ def test_read_feedback_map_latest_rating_wins(sql_env):
                       ts="2026-04-21T10:00:00")
     _insert_feedback(conn, turn_id="tx", rating=-1, q="a",
                       ts="2026-04-21T14:00:00")
-    fb = rag._read_feedback_map_for_log()
+    fb = rag._read_feedback_map_for_log(["tx"])
     assert fb == {"tx": -1}

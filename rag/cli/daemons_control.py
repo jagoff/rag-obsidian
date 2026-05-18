@@ -301,7 +301,7 @@ def _bootstrap_label(label: str, *, dry_run: bool = False, timeout: int = 30) ->
     """`launchctl bootstrap gui/$UID <plist>` con timeout + manejo de exit codes.
 
     Simétrico a `_bootout_label` — usado por `rag start` para levantar daemons
-    EXTERNOS (RagNet whatsapp-*, qdrant) cuyos plists viven en
+    EXTERNOS (RagNet whatsapp-*) cuyos plists viven en
     `~/Library/LaunchAgents/` pero NO están managed por `_services_spec`.
     Para los managed (`obsidian-rag-*`) seguimos por `setup.callback()` que
     los regenera desde código y los carga vía `launchctl load`.

@@ -518,6 +518,18 @@ def _wa_fetch_outbound_chars(
             "WHERE is_from_me=1 AND timestamp >= ? AND timestamp < ?",
             (since_bound, until_bound),
         ).fetchall()
+        if not rows:
+            # Unit tests and a few legacy bridge snapshots used ISO timestamps
+            # with a `T` separator and no offset. The live bridge writes
+            # `YYYY-MM-DD HH:MM:SS-03:00`; keep the indexed hot path above and
+            # only fall back when it found nothing.
+            since_iso = datetime.fromtimestamp(since_ts).strftime("%Y-%m-%dT%H:%M:%S")
+            until_iso = datetime.fromtimestamp(until_ts).strftime("%Y-%m-%dT%H:%M:%S")
+            rows = conn.execute(
+                "SELECT content FROM messages "
+                "WHERE is_from_me=1 AND timestamp >= ? AND timestamp < ?",
+                (since_iso, until_iso),
+            ).fetchall()
     except Exception as exc:
         _silent_log_safe("mood_wa_query_failed", exc)
         return []

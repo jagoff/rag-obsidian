@@ -37,8 +37,9 @@ necesita reindex (`_COLLECTION_BASE` queda en `obsidian_notes_v11`).
 
 ## Threading
 
-`MLXEmbedder` es thread-safe para concurrent `.encode()` — el forward de
-`mlx_lm` es reentrante. El lazy `load()` está guardado por `_load_lock`.
+`MLXEmbedder` es thread-safe para concurrent `.encode()`. Los forwards MLX
+se serializan con `_MLX_FORWARD_LOCK` compartido con chat/rerank/VLM para no
+pisar Metal command buffers. El lazy `load()` está guardado por `_load_lock`.
 """
 
 from __future__ import annotations
@@ -135,7 +136,11 @@ class MLXEmbedder:
                 return
             _import_mlx()
             assert _mlx_load is not None
-            model, tokenizer = _mlx_load(self.repo_id)
+            from rag.llm_backend import _MLX_FORWARD_LOCK, clear_mlx_cache_safely
+
+            clear_mlx_cache_safely(collect=True)
+            with _MLX_FORWARD_LOCK:
+                model, tokenizer = _mlx_load(self.repo_id)
             self._model = model
             self._mlx_tokenizer = tokenizer
             self.tokenizer = _TokenizerProxy(tokenizer)
@@ -183,28 +188,28 @@ class MLXEmbedder:
         if pad_id is None:
             pad_id = getattr(self._mlx_tokenizer, "eos_token_id", None) or 0
         padded = [ids + [int(pad_id)] * (max_len - len(ids)) for ids in ids_list]
-        ids_arr = _mx.array(padded)
         with _MLX_FORWARD_LOCK:
-            # Backbone forward (sin lm_head). Devuelve hidden states (B, T, D).
-            h = self._model.model(ids_arr)
-            batch_idx = _mx.arange(len(texts))
-            last_idx = _mx.array([L - 1 for L in lengths])
-            last = h[batch_idx, last_idx, :]  # (B, D)
-            norm = _mx.linalg.norm(last, axis=-1, keepdims=True)
-            # Guard contra division-by-zero: norm 0 implica hidden state nulo
-            # (no debería pasar en práctica, pero el wrapper aplica un floor).
-            emb = last / (norm + 1e-12)
-            emb_fp32 = emb.astype(_mx.float32)
-            _mx.eval(emb_fp32)
-        # Convertir a numpy y liberar tensores MLX. `np.array()` copia los
-        # datos a CPU RAM; después del return, `emb_fp32`, `h`, `last`, `emb`
-        # son inalcanzables → el GC los marca como free en el próximo
-        # clear_cache(). Sin el clear_cache() explícito, el allocator MLX
-        # retiene la memoria Metal hasta presión externa.
-        try:
-            result = np.array(emb_fp32)
-        finally:
-            _mx.clear_cache()
+            try:
+                ids_arr = _mx.array(padded)
+                # Backbone forward (sin lm_head). Devuelve hidden states (B, T, D).
+                h = self._model.model(ids_arr)
+                batch_idx = _mx.arange(len(texts))
+                last_idx = _mx.array([L - 1 for L in lengths])
+                last = h[batch_idx, last_idx, :]  # (B, D)
+                norm = _mx.linalg.norm(last, axis=-1, keepdims=True)
+                # Guard contra division-by-zero: norm 0 implica hidden state nulo
+                # (no debería pasar en práctica, pero el wrapper aplica un floor).
+                emb = last / (norm + 1e-12)
+                emb_fp32 = emb.astype(_mx.float32)
+                _mx.eval(emb_fp32)
+                # `np.array()` copia los datos a CPU RAM; hacerlo bajo el lock
+                # evita que la sincronización MLX/Metal se mezcle con otro forward.
+                result = np.array(emb_fp32)
+            finally:
+                try:
+                    _mx.clear_cache()
+                except Exception:
+                    pass
         return result
 
     def encode(

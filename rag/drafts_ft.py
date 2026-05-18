@@ -197,13 +197,32 @@ def _generate_draft_preview_mlx(
     except ImportError as exc:
         rag._silent_log("drafts_ft_mlx_import_missing", exc)
         return bot_draft_baseline
+
     try:
-        model, tokenizer = _mlx_load(
-            rag.DRAFTS_FT_BASE_MODEL_MLX,
-            adapter_path=str(rag.DRAFTS_FT_ADAPTER_DIR_MLX),
+        from rag.llm_backend import (  # noqa: PLC0415
+            _MLX_FORWARD_LOCK,
+            clear_mlx_cache_safely,
         )
     except Exception as exc:
+        rag._silent_log("drafts_ft_mlx_runtime_guard_missing", exc)
+        return bot_draft_baseline
+
+    model = None
+    tokenizer = None
+    try:
+        clear_mlx_cache_safely(collect=True)
+        # `mlx_lm.load()` also allocates large Metal buffers. Keep the one-off
+        # adapter load serialized with chat/embed/rerank/VLM work, then clear
+        # after the preview so repeated A/B calls do not accumulate allocator
+        # pressure.
+        with _MLX_FORWARD_LOCK:
+            model, tokenizer = _mlx_load(
+                rag.DRAFTS_FT_BASE_MODEL_MLX,
+                adapter_path=str(rag.DRAFTS_FT_ADAPTER_DIR_MLX),
+            )
+    except Exception as exc:
         rag._silent_log("drafts_ft_mlx_load_failed", exc)
+        clear_mlx_cache_safely(collect=True)
         return bot_draft_baseline
     prompt = (
         f"{original_conversation}\n\n"
@@ -212,12 +231,13 @@ def _generate_draft_preview_mlx(
         f"## Mensaje final que mandó Fer:\n"
     )
     try:
-        out = _mlx_generate(
-            model, tokenizer,
-            prompt=prompt,
-            max_tokens=max_new_tokens,
-            verbose=False,
-        )
+        with _MLX_FORWARD_LOCK:
+            out = _mlx_generate(
+                model, tokenizer,
+                prompt=prompt,
+                max_tokens=max_new_tokens,
+                verbose=False,
+            )
         text = str(out or "").strip()
         if text.startswith(prompt):
             text = text[len(prompt):].strip()
@@ -225,6 +245,10 @@ def _generate_draft_preview_mlx(
     except Exception as exc:
         rag._silent_log("drafts_ft_mlx_generate_failed", exc)
         return bot_draft_baseline
+    finally:
+        model = None
+        tokenizer = None
+        clear_mlx_cache_safely(collect=True)
 
 
 def generate_draft_preview(

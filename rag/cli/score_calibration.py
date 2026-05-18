@@ -457,9 +457,18 @@ def train_calibration(
         "trained_at": datetime.now().isoformat(timespec="seconds"),
     }
     try:
+        import rag as _rag_root  # noqa: PLC0415
+        _real_pairs_fn = getattr(
+            _rag_root, "_gather_calibration_pairs", _gather_calibration_pairs,
+        )
+        _synth_pairs_fn = getattr(
+            _rag_root,
+            "_gather_synthetic_calibration_pairs",
+            _gather_synthetic_calibration_pairs,
+        )
         with _ragvec_state_conn() as conn:
             for src in _CALIBRATION_SOURCES:
-                real_pairs = _gather_calibration_pairs(
+                real_pairs = _real_pairs_fn(
                     conn, src, since_days=since_days,
                 )
                 pairs = list(real_pairs)
@@ -474,7 +483,7 @@ def train_calibration(
                     and len(real_pairs) < SYNTH_FALLBACK_THRESHOLD
                 ):
                     try:
-                        synth_pairs = _gather_synthetic_calibration_pairs(
+                        synth_pairs = _synth_pairs_fn(
                             conn, src,
                         )
                     except Exception:

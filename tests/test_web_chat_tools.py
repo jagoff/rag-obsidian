@@ -118,7 +118,7 @@ def _isolate_db_path(tmp_path):
         _rag_isolate.DB_PATH = _snap
 
 @pytest.fixture
-def chat_env(monkeypatch):
+def chat_env(monkeypatch, tmp_path):
     """Shared monkeypatches for `/api/chat` invocations.
 
     - Stub `multi_retrieve` with canned output.
@@ -139,6 +139,13 @@ def chat_env(monkeypatch):
     # arranque con el budget lleno. TestClient usa "testclient" como
     # client IP por defecto.
     server_mod._CHAT_BUCKETS.clear()
+    vault = tmp_path / "vault"
+    (vault / "01-Projects").mkdir(parents=True, exist_ok=True)
+    (vault / "02-Areas").mkdir(parents=True, exist_ok=True)
+    (vault / "01-Projects" / "a.md").write_text("doc 1 body", encoding="utf-8")
+    (vault / "02-Areas" / "b.md").write_text("doc 2 body", encoding="utf-8")
+    monkeypatch.setattr(server_mod, "VAULT_PATH", vault)
+    monkeypatch.setattr(_rag_mod, "VAULT_PATH", vault)
     monkeypatch.setattr(
         server_mod, "multi_retrieve",
         lambda *a, **kw: _canned_retrieve_result(a[1] if len(a) >= 2 else "x"),
@@ -175,23 +182,16 @@ def _post_chat(question: str = "hola") -> tuple[list[tuple[str, dict]], str]:
 
 
 def test_tools_module_exports():
-    # 23 = 18 originales + 3 nuevas de gestión de mensajes WA programados
-    # (whatsapp_list_scheduled, propose_whatsapp_cancel_scheduled,
-    # propose_whatsapp_reschedule_scheduled — issue #4 audit 2026-04-25)
-    # + 1 para resúmenes de tarjetas (credit_cards_summary — 2026-04-26
-    # cuando el user mudó la fuente financiera a /Finances y agregó xlsx)
-    # + 1 para anotar observaciones de contactos en el vault
-    # (record_contact_observation — 2026-04-26, hace que las notas de
-    # 99-Contacts/ sean "vivas" y el chat web pueda capturar info sobre
-    # personas de forma persistente).
-    assert len(CHAT_TOOLS) == 23
-    assert len(TOOL_FNS) == 23
+    # 26 tools: read/search/freshness sources, WhatsApp actions, direct
+    # vault note creation, URL ingestion, mail proposals, and stats.
+    assert len(CHAT_TOOLS) == 26
+    assert len(TOOL_FNS) == 26
     assert PARALLEL_SAFE == {
         "weather", "finance_summary", "credit_cards_summary", "calendar_ahead",
         "reminders_due", "gmail_recent", "drive_search",
         "whatsapp_pending", "whatsapp_search", "whatsapp_thread",
         "whatsapp_list_scheduled",  # query-only contra SQLite local — safe.
-        "propose_reminder", "propose_calendar_event",
+        "rag_stats", "propose_reminder", "propose_calendar_event",
         # `propose_whatsapp_send` / `_cancel_scheduled` / `_reschedule_scheduled`
         # intentionally NOT here — see web/tools.py comment: destructive
         # action + osascript-heavy lookup, mejor aislados.
@@ -616,7 +616,6 @@ def test_chat_endpoint_serial_then_parallel(chat_env, capsys):
             _mk_tool_call("search_vault", {"query": "foo"}),
             _mk_tool_call("weather", {}),
         ]),
-        _mk_msg(tool_calls=[]),
         _mk_stream(["done"]),
     ])
     chat_env.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
@@ -843,10 +842,11 @@ def test_chat_endpoint_round_cap_respected(chat_env, capsys):
     # de 3 rounds ya no se alcanza porque el loop rompe tras 1 ejecución.
     assert len(mock.calls) == 2, mock.calls
 
-    # 2da call es el final streaming (stream=True) y NO debe incluir el
-    # nudge porque el loop rompió clean (sin alcanzar cap).
+    # 2da call es la síntesis final y NO debe incluir el nudge porque el loop
+    # rompió clean (sin alcanzar cap). En MLX el dispatcher streaming no pasa
+    # `stream=True`; la señal estable es que no manda `tools=`.
     final_call = mock.calls[1]
-    assert final_call.get("stream") is True
+    assert not final_call.get("tools")
     final_msgs = final_call["messages"]
     nudge = "Alcanzado cap de herramientas; respondé con lo que tenés."
     assert not any(
@@ -1364,7 +1364,7 @@ def test_done_event_flags_source_specific_false_for_weather_only(
 
 
 @pytest.fixture
-def chat_env_prod(monkeypatch):
+def chat_env_prod(monkeypatch, tmp_path):
     """Variante del fixture `chat_env` SIN `RAG_WEB_TOOL_LLM_DECIDE=1`,
     replicando el comportamiento de producción donde el LLM tool-decide
     está apagado por default. Así podemos testear el gate de fallback
@@ -1375,6 +1375,13 @@ def chat_env_prod(monkeypatch):
     monkeypatch.delenv("RAG_WEB_TOOL_LLM_DECIDE", raising=False)
     # Reset rate-limit bucket (ver comentario en `chat_env` para detalle).
     server_mod._CHAT_BUCKETS.clear()
+    vault = tmp_path / "vault"
+    (vault / "01-Projects").mkdir(parents=True, exist_ok=True)
+    (vault / "02-Areas").mkdir(parents=True, exist_ok=True)
+    (vault / "01-Projects" / "a.md").write_text("doc 1 body", encoding="utf-8")
+    (vault / "02-Areas" / "b.md").write_text("doc 2 body", encoding="utf-8")
+    monkeypatch.setattr(server_mod, "VAULT_PATH", vault)
+    monkeypatch.setattr(_rag_mod, "VAULT_PATH", vault)
     monkeypatch.setattr(server_mod, "_fetch_whatsapp_unread", lambda *a, **kw: [])
     import rag as _rag
     monkeypatch.setattr(_rag, "build_person_context", lambda q: None)
@@ -1398,17 +1405,19 @@ def test_llm_tool_decide_fires_when_pre_router_misses_and_vault_weak(
 
     Este test usa una query ("qué correspondencia tengo?") que NO matchea
     ningún pattern del pre-router, stubbea multi_retrieve para devolver
-    confidence baja (< CONFIDENCE_DEEP_THRESHOLD=0.10), y verifica que
+    confidence débil (entre el answer gate y CONFIDENCE_DEEP_THRESHOLD), y verifica que
     el LLM tool-decide round efectivamente corrió (mock recibió al menos
     la call no-streaming del tool-deciding phase).
     """
-    # Retrieve con confidence baja (vault really failed: < 0.10).
+    # Retrieve débil: suficiente para no disparar low_conf_bypass, pero debajo
+    # del deep threshold para activar el safety-net.
     def _low_conf_retrieve(*a, **kw):
         r = _canned_retrieve_result(a[1] if len(a) >= 2 else "x")
-        r["confidence"] = 0.05  # debajo del threshold
-        r["scores"] = [0.05, 0.04]
+        r["confidence"] = 0.40
+        r["scores"] = [0.40, 0.39]
         return r
     monkeypatch.setattr(server_mod, "multi_retrieve", _low_conf_retrieve)
+    monkeypatch.setenv("RAG_MLX_KEEP_FALLBACK", "1")
 
     mock = _OllamaMock([
         _mk_msg(tool_calls=[]),   # tool-deciding call (no tool picked)
@@ -1482,8 +1491,8 @@ def test_llm_tool_decide_skipped_when_pre_router_matches(
         f"LLM tool-decide round corrió cuando no debía (pre-router "
         f"matcheó → path rápido esperado). Calls: {len(mock.calls)}"
     )
-    # Y esa call es el streaming, no el tool-decide.
-    assert mock.calls[0].get("stream") is True
+    # Y esa call es la síntesis final, no el tool-decide.
+    assert not mock.calls[0].get("tools")
 
 
 @pytest.mark.requires_chat_model
@@ -1516,7 +1525,7 @@ def test_llm_tool_decide_skipped_when_vault_strong(
         f"LLM tool-decide corrió cuando vault strong (conf=0.85): "
         f"{len(mock.calls)} calls"
     )
-    assert mock.calls[0].get("stream") is True
+    assert not mock.calls[0].get("tools")
 
 
 # ── 11. Metachat SSE: `metachat: true` flag in sources + done ─────────────

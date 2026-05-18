@@ -1,6 +1,6 @@
 # obsidian-rag
 
-Sistema de búsqueda inteligente para tu vault de Obsidian. Todo corre localmente en tu Mac: usa sqlite-vec para buscar en tus notas, MLX para embeddings y generación, y sentence-transformers para reranking local. No envía nada a la nube, no tiene telemetría.
+Sistema de búsqueda inteligente para tu vault de Obsidian. Todo corre localmente en tu Mac: usa sqlite-vec para buscar en tus notas y MLX para embeddings, reranking, generación, VLM y STT. No envía nada a la nube, no tiene telemetría.
 
 **¿Qué hace?**
 - Busca en tus notas usando lenguaje natural (ej: "qué ideas tengo sobre ikigai")
@@ -209,14 +209,14 @@ launchctl list | grep obsidian-rag
 
 > **Stack MLX (Olas 0-8 cerradas 2026-05-06)**: el código activo es 100% MLX. La tabla de abajo conserva los nombres cortos `qwen2.5:Xb` / `command-r` como aliases — bajo `RAG_LLM_BACKEND=mlx` (único disponible), [`rag/llm_backend.py`](./rag/llm_backend.py) los resuelve a sus equivalentes MLX 4bit en runtime. Detalle: [`docs/mlx-migration.md`](./docs/mlx-migration.md).
 
-Cada operación del pipeline va a un modelo específico. El reranker vive en sentence-transformers aparte (MPS+float32, **no fp16** — colapsó en 2 A/Bs).
+Cada operación del pipeline va a un modelo específico. El reranker también es MLX por default (`MLXReranker`); el path torch/MPS queda como rollback explícito con `RAG_RERANKER_BACKEND=torch`.
 
 ![LLM interactions](./docs/diagrams/ollama-interactions.svg) <!-- legacy filename, content currently shows the MLX/embedder graph -->
 
 | Operación | Modelo | Vía |
 |---|---|---|
-| Index embeddings (chunks + URL contexts) | `qwen3-embedding:0.6b` | SentenceTransformer in-process |
-| Query embeddings (variantes) | `qwen3-embedding:0.6b` | SentenceTransformer in-process |
+| Index embeddings (chunks + URL contexts) | `qwen3-embedding:0.6b` | MLX in-process (`MLXEmbedder`) |
+| Query embeddings (variantes) | `qwen3-embedding:0.6b` | MLX in-process (`MLXEmbedder`) |
 | Expand queries (3 paraphrases) | `qwen2.5:3b` (MLX) | `_mlx_chat` |
 | Reformulate con session history | `qwen2.5:3b` (MLX) | `_mlx_chat` |
 | HyDE (opt-in `--hyde`) | `qwen2.5:3b` (MLX) | `_mlx_chat` |
@@ -226,7 +226,7 @@ Cada operación del pipeline va a un modelo específico. El reranker vive en sen
 | Weekly digest / morning brief / prep | `command-r` → `Qwen3-30B-A3B` (MLX) | `_mlx_chat` |
 | Surface "por qué este puente" | `command-r` → `Qwen3-30B-A3B` (MLX) | `_mlx_chat` |
 | Agent loop (`rag do`) | `command-r` → `Qwen3-30B-A3B` (MLX) | `_mlx_chat` tool-calling nativo |
-| Cross-encoder rerank | `BAAI/bge-reranker-v2-m3` | sentence-transformers local (**MPS+fp32**, fp16 falla — ver CLAUDE.md invariant) |
+| Cross-encoder rerank | `qwen3-reranker:0.6b` | MLX in-process (`MLXReranker`) |
 
 Resolver de `resolve_chat_model()`: `RAG_CHAT_MODEL` explícito gana; si no, el primer snapshot MLX disponible en `qwen3:30b-a3b` → `qwen2.5:7b` → aliases compat (`command-r:latest`, `qwen2.5:14b`). Los aliases se resuelven en [`rag/llm_backend.py`](./rag/llm_backend.py).
 
@@ -489,10 +489,10 @@ Skips: frontmatter, fenced/inline code, existing wikilinks, markdown links, HTML
 
 | Comando | Función |
 |---|---|
-| `rag start [--all] [--without-rag-net] [--no-index] [-y] [--dry-run]` | **Levanta TODO el sistema** y reindexa al último minuto de uso. Simétrico a `rag stop`. Orden: (1) `rag setup` regenera + carga los 35 `obsidian-rag-*` managed; (2) opcionalmente bootstrap-ea daemons externos (RagNet `whatsapp-*` default ON, qdrant default OFF); (3) corre `rag index` incremental para capturar cambios de archivos editados desde el último tick del watcher (cubre el gap si la Mac estuvo dormida). Idempotente. |
+| `rag start [--all] [--without-rag-net] [--no-index] [-y] [--dry-run]` | **Levanta TODO el sistema** y reindexa al último minuto de uso. Simétrico a `rag stop`. Orden: (1) `rag setup` regenera + carga los `obsidian-rag-*` managed; (2) opcionalmente bootstrap-ea daemons externos (RagNet `whatsapp-*` default ON); (3) corre `rag index` incremental para capturar cambios de archivos editados desde el último tick del watcher (cubre el gap si la Mac estuvo dormida). Idempotente. |
 | `rag setup` | Instala los 16 launchd plists `com.fer.obsidian-rag-*` (watch, web, digest, morning, today, anticipate, ingest-{whatsapp,gmail,calendar,reminders}, wa-tasks, reminder-wa-push, **wa-scheduled-send**, maintenance, calibrate, auto-harvest, online-tune, …). Idempotente — re-correr recarga. Subset de `rag start` (no incluye externos ni catch-up). Ver tabla completa en [§Automation (launchd)](#automation-launchd). |
 | `rag setup --remove` | Desinstala todos los servicios obsidian-rag-* (borra plists del disco). |
-| `rag stop [--all] [--without-rag-net] [--with-qdrant] [-y] [--dry-run]` | **Para TODO el sistema** en un solo comando. Inverso de `rag start`. Orden: watchdog/wake-hook primero (para que no rebootstrap-een), después el resto de obsidian-rag-*, opcional RagNet (default ON), opcional qdrant (default OFF — legacy, memo es el standard actual). |
+| `rag stop [--all] [--without-rag-net] [-y] [--dry-run]` | **Para TODO el sistema** en un solo comando. Inverso de `rag start`. Orden: watchdog/wake-hook primero (para que no rebootstrap-een), después el resto de obsidian-rag-*, opcional RagNet (default ON). |
 | `rag wa-scheduled-send [--dry-run] [--late-threshold-min 5] [--max-retries 5] [--max-per-run 20]` | Worker manual del envío de mensajes de WhatsApp programados. Lo dispara automáticamente el plist `com.fer.obsidian-rag-wa-scheduled-send` cada 5 min, pero podés correrlo a mano para debug — `--dry-run` calcula sin enviar ni mover status. Idempotente: cada row se mueve `pending`→`sent`/`sent_late`/`failed` en una sola transacción. |
 | `rag remind-wa [--dry-run] [--window-min 5] [--max-overdue-min 1440]` | Worker manual del push de Apple Reminders próximos a vencer al JID ambient. Cron equivalente: `com.fer.obsidian-rag-reminder-wa-push` cada 5 min. Idempotente vía `rag_reminder_wa_pushed`. |
 | `rag ambient {status,disable,test,log}` | Manage del ambient hook (ver [§Ambient Agent](#ambient-agent-co-autor-del-inbox)). |
@@ -619,7 +619,7 @@ Las **3 más críticas** que casi siempre vas a querer setear:
 | Chat (answers + contradiction judgment + prep + digest) | `qwen2.5:7b` (default) / `qwen3:30b-a3b` o aliases compat `command-r`, `qwen2.5:14b` (HQ tier) | [`Qwen2.5-7B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-7B-Instruct-4bit) / `mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit-DWQ` |
 | Helper (paraphrase, HyDE, history reformulation, autotag) | `qwen2.5:3b` | [`Qwen2.5-3B-Instruct-4bit`](https://huggingface.co/mlx-community/Qwen2.5-3B-Instruct-4bit) |
 | Embeddings | `qwen3-embedding:0.6b` (multilingual, 1024d) | MLX in-process via `rag.mlx_embed.MLXEmbedder` |
-| Reranker | `BAAI/bge-reranker-v2-m3` | sentence-transformers in-process, `device=mps`+`float32` |
+| Reranker | `qwen3-reranker:0.6b` (`mku64/Qwen3-Reranker-0.6B-mlx-8Bit`) | MLX in-process (`MLXReranker`); rollback torch con `RAG_RERANKER_BACKEND=torch` |
 
 **Decoding** (deterministic — esto es retrieval, no creative writing):
 
@@ -699,12 +699,12 @@ Expuestos por `obsidian-rag-mcp` vía stdio. Registro en `~/.claude.json` (Claud
 
 ```bash
 rag start                      # levanta TODO el sistema + reindex al último minuto (RagNet incluido)
-rag start --all                # idem + qdrant
+rag start --all                # alias de compatibilidad; incluye RagNet
 rag start --no-index -y        # solo bootstrap, sin catch-up index
 rag start --dry-run            # mostrar qué levantaría sin ejecutar
 
 rag stop                       # para TODO en un solo comando (inverso de rag start)
-rag stop --all -y              # incluye qdrant + sin confirmación
+rag stop --all -y              # incluye RagNet + sin confirmación
 
 rag setup                      # subset de rag start: install/recarga managed (los 35 servicios)
 rag setup --remove             # uninstall

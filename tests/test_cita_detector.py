@@ -204,6 +204,47 @@ def test_detect_reminder_returns_normalized_dict(monkeypatch):
     assert out["confidence"] == 0.85
 
 
+def test_detect_replaces_hallucinated_relative_with_ocr_date(monkeypatch):
+    """El OCR manda: viernes 22 de mayo. Si el helper inventa
+    "mañana 15hs", el postproceso usa la fecha real y descarta la hora."""
+    ocr = (
+        "15/05 Estimadas familias: Les informamos que el día viernes 22 "
+        "de mayo se llevará a cabo el acto en conmemoración del 25 de Mayo."
+    )
+    _mock_helper_client(monkeypatch, content=(
+        '{"kind": "reminder", "title": "acto conmemoración", '
+        '"when": "mañana 15hs", "location": "", "confidence": 0.95}'
+    ))
+    out = rag._detect_cita_from_ocr(ocr)
+    assert out is not None
+    assert out["kind"] == "event"
+    assert out["when"] == "viernes 22 de mayo"
+
+
+def test_detect_preserves_true_relative_date_and_time(monkeypatch):
+    _mock_helper_client(monkeypatch, content=(
+        '{"kind": "event", "title": "Turno dentista", '
+        '"when": "mañana 15hs", "location": "", "confidence": 0.92}'
+    ))
+    out = rag._detect_cita_from_ocr("Turno dentista mañana a las 15hs")
+    assert out is not None
+    assert out["kind"] == "event"
+    assert out["when"] == "mañana 15hs"
+
+
+def test_detect_replaces_relative_but_keeps_ocr_time(monkeypatch):
+    _mock_helper_client(monkeypatch, content=(
+        '{"kind": "event", "title": "Acto", '
+        '"when": "mañana 15hs", "location": "", "confidence": 0.92}'
+    ))
+    out = rag._detect_cita_from_ocr(
+        "El día viernes 22 de mayo a las 15hs se llevará a cabo el acto."
+    )
+    assert out is not None
+    assert out["kind"] == "event"
+    assert out["when"] == "viernes 22 de mayo 15hs"
+
+
 def test_detect_note_returns_normalized_dict(monkeypatch):
     """Info sin acción → kind='note'."""
     _mock_helper_client(monkeypatch, content=(

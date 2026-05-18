@@ -432,6 +432,7 @@ def test_freshness_build_classifies_by_drift(tmp_path, monkeypatch):
     import time as _time
     log_dir = tmp_path / ".local" / "share" / "obsidian-rag"
     log_dir.mkdir(parents=True)
+    monkeypatch.setenv("OBSIDIAN_RAG_STATE_DIR", str(log_dir))
     la_dir = tmp_path / "LaunchAgents"
     la_dir.mkdir()
 

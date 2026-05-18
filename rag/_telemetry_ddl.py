@@ -461,28 +461,32 @@ def _ensure_telemetry_tables(conn) -> None:
         # `/api/status/errors`. Seguimos NO re-raising — el INSERT del writer
         # es defensivo y usa el subset de columnas que sí existen.
         try:
-            _migrate_cita_detections_add_kind(conn)
+            import rag as _rag  # noqa: PLC0415
+            getattr(_rag, "_migrate_cita_detections_add_kind", _migrate_cita_detections_add_kind)(conn)
         except Exception as _migrate_exc:
             try:
                 _silent_log("migration_cita_detections_failed", _migrate_exc)
             except Exception:  # pragma: no cover - log path itself failed
                 pass
         try:
-            _migrate_audio_transcripts_phase2(conn)
+            import rag as _rag  # noqa: PLC0415
+            getattr(_rag, "_migrate_audio_transcripts_phase2", _migrate_audio_transcripts_phase2)(conn)
         except Exception as _migrate_exc:
             try:
                 _silent_log("migration_audio_transcripts_failed", _migrate_exc)
             except Exception:  # pragma: no cover - log path itself failed
                 pass
         try:
-            _migrate_trace_id_columns(conn)
+            import rag as _rag  # noqa: PLC0415
+            getattr(_rag, "_migrate_trace_id_columns", _migrate_trace_id_columns)(conn)
         except Exception as _migrate_exc:
             try:
                 _silent_log("migration_trace_id_failed", _migrate_exc)
             except Exception:  # pragma: no cover
                 pass
         try:
-            _migrate_screen_obs_add_image_path(conn)
+            import rag as _rag  # noqa: PLC0415
+            getattr(_rag, "_migrate_screen_obs_add_image_path", _migrate_screen_obs_add_image_path)(conn)
         except Exception as _migrate_exc:
             try:
                 _silent_log("migration_screen_obs_image_path_failed", _migrate_exc)

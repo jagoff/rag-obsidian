@@ -73,18 +73,9 @@ def test_log_impressions_not_throttled_across_queries(behavior_env):
     assert len(rows) == 2
 
 
-def test_log_impressions_propagates_caller_to_source(behavior_env):
-    """Source field se setea desde el ``source`` kwarg. Verificá que pasar
-    distintos callers (anticipate-calendar, followup, eval, web) deja un
-    trail con el source correcto en rag_behavior — necesario para que el
-    training pairs miner pueda filtrar bot-initiated impressions del
-    user-initiated training set.
-
-    Cerrado 2026-04-28: pre-fix `retrieve()` siempre llamaba
-    ``log_impressions(source="cli")`` hardcodeado, así que rows del bot se
-    mezclaban con rows del user en `rag_behavior` y el ranker training las
-    consumía como signal del user. Ahora `retrieve(caller=X)` propaga X
-    como source."""
+def test_log_impressions_propagates_user_caller_to_source(behavior_env):
+    """User-visible callers keep their source. Bot/eval impressions are skipped
+    upstream so ranker training does not ingest non-human exposure signal."""
     rag.log_impressions("q1", ["a.md"], source="anticipate-calendar")
     rag.log_impressions("q2", ["b.md"], source="followup")
     rag.log_impressions("q3", ["c.md"], source="eval")
@@ -93,11 +84,11 @@ def test_log_impressions_propagates_caller_to_source(behavior_env):
 
     rows = _rows(behavior_env)
     by_path = {r["path"]: r["source"] for r in rows}
-    assert by_path["a.md"] == "anticipate-calendar"
-    assert by_path["b.md"] == "followup"
-    assert by_path["c.md"] == "eval"
     assert by_path["d.md"] == "web"
     assert by_path["e.md"] == "cli"
+    assert "a.md" not in by_path
+    assert "b.md" not in by_path
+    assert "c.md" not in by_path
 
 
 def test_retrieve_caller_default_is_cli_for_backward_compat(behavior_env, monkeypatch):

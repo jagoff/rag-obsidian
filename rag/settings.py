@@ -74,6 +74,8 @@ class RAGSettings:
     # ---- auto-fix worker ----
     auto_fix_worker: bool = _bool_env_opt("RAG_AUTO_FIX_WORKER")
     auto_fix_hourly_cap: int = _int_env("RAG_AUTO_FIX_HOURLY_CAP", 12)
+    auto_fix_scanner_period_s: float = _float_env("RAG_AUTO_FIX_SCANNER_PERIOD_S", 30.0)
+    auto_fix_worker_period_s: float = _float_env("RAG_AUTO_FIX_WORKER_PERIOD_S", 15.0)
 
     # ---- prewarm ----
     home_prewarm: bool = _bool_env("OBSIDIAN_RAG_HOME_PREWARM")

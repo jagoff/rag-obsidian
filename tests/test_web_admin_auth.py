@@ -57,7 +57,12 @@ _ADMIN_ENDPOINTS = [
     "/api/diagnose-error/execute",
     "/api/auto-fix",
     "/api/auto-fix-devin",
+    "/api/logs/clean-all",
+    "/api/logs/queue/process-next",
+    "/api/logs/queue/scan-now",
+    "/api/logs/queue/config",
     "/api/chat/model",
+    "/api/blacklist",
     "/api/memo/delete",
     "/api/memo/merge",
     "/api/reminders/create",
@@ -97,19 +102,17 @@ def test_admin_endpoint_401_wrong_token(client, endpoint):
     )
 
 
-@pytest.mark.parametrize("endpoint", _ADMIN_ENDPOINTS)
-def test_admin_endpoint_not_401_with_correct_token(client, valid_token, endpoint):
-    """Con token correcto, el endpoint no debe devolver 401.
-    (Puede devolver 422 por payload vacío, 500 por falta de ollama, etc. — lo
-    importante es que la capa de auth no bloquea.)"""
-    resp = client.post(
-        endpoint,
-        json={},
-        headers={"Authorization": f"Bearer {valid_token}"},
-    )
-    assert resp.status_code != 401, (
-        f"{endpoint} devolvió 401 con token correcto — el Depends no está funcionando"
-    )
+def test_admin_dependency_accepts_correct_token(valid_token):
+    """El token correcto pasa la dependency sin invocar handlers mutadores."""
+    from starlette.requests import Request
+
+    req = Request({
+        "type": "http",
+        "headers": [(b"authorization", f"Bearer {valid_token}".encode("utf-8"))],
+        "client": ("127.0.0.1", 12345),
+    })
+
+    assert _web_server._require_admin_token(req) is None
 
 
 def test_admin_token_file_created_on_boot(tmp_path, monkeypatch):

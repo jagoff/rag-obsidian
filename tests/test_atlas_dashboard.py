@@ -22,6 +22,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -306,3 +307,81 @@ def test_build_graph_truncated_when_over_cap(tmp_path: Path):
     assert graph["truncated"] is True
     assert graph["total_notes"] == 10
     assert len(graph["nodes"]) == 5
+
+
+def test_snapshot_multivault_uses_all_registered_vaults_and_entity_fallback(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """Atlas no debe quedar limitado al vault default ni vacío si GLiNER no pobló entities."""
+    _create_minimal_dbs(tmp_path)
+    rconn = sqlite3.connect(str(tmp_path / "ragvec.db"))
+    for table, company in (("meta_home", "Moka"), ("meta_work", "WorkCo")):
+        rconn.execute(f"""
+            CREATE TABLE {table} (
+                rowid INTEGER PRIMARY KEY,
+                chunk_id TEXT UNIQUE NOT NULL,
+                file TEXT,
+                folder TEXT,
+                outlinks TEXT,
+                title TEXT,
+                area TEXT,
+                type TEXT,
+                created_ts REAL
+            )
+        """)
+        rconn.execute(
+            f"INSERT INTO {table} (chunk_id, file, folder, outlinks, title, area, type, created_ts) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "a::0",
+                f"04-Archive/Companies/{company}/{company} Company.md",
+                f"04-Archive/Companies/{company}",
+                f"04-Archive/Companies/{company}/{company} team - Ana 1-1.md",
+                f"{company} Company",
+                "",
+                "",
+                datetime.now(timezone.utc).timestamp(),
+            ),
+        )
+        rconn.execute(
+            f"INSERT INTO {table} (chunk_id, file, folder, outlinks, title, area, type, created_ts) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "b::0",
+                f"04-Archive/Companies/{company}/{company} team - Ana 1-1.md",
+                f"04-Archive/Companies/{company}/1 a 1",
+                f"04-Archive/Companies/{company}/{company} Company.md",
+                f"{company} team - Ana 1-1",
+                "",
+                "",
+                datetime.now(timezone.utc).timestamp(),
+            ),
+        )
+    rconn.commit()
+    rconn.close()
+
+    import rag
+
+    home = tmp_path / "home"
+    work = tmp_path / "work"
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    monkeypatch.setattr(rag, "resolve_vault_paths", lambda _names=None: [("home", home), ("work", work)])
+    monkeypatch.setattr(
+        rag,
+        "get_db_for",
+        lambda p: SimpleNamespace(_meta="meta_home" if Path(p) == home else "meta_work"),
+    )
+    ad._DASHBOARD_CACHE["key"] = None
+    ad._DASHBOARD_CACHE["payload"] = None
+
+    payload = ad.snapshot(window_days=30, top_entities=10, graph_top_notes=50)
+
+    assert payload["meta"]["entity_source"] == "graph_fallback"
+    assert [v["name"] for v in payload["meta"]["vault_scope"]] == ["home", "work"]
+    assert payload["kpis"]["n_notes"] == 4
+    node_ids = {n["id"] for n in payload["graph"]["nodes"]}
+    assert any(i.startswith("home:") for i in node_ids)
+    assert any(i.startswith("work:") for i in node_ids)
+    assert payload["entities_by_type"]["organization"]
+    assert payload["entities_by_type"]["person"]

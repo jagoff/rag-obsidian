@@ -10,23 +10,15 @@ from click.testing import CliRunner
 
 
 @pytest.fixture(autouse=True)
-def _isolate_db_path(tmp_path):
-    """Snap+restore manual de `rag.DB_PATH` per-test. El monkeypatch in-test
-    revierte en su propio teardown DESPUÉS del `_stabilize_rag_state` y deja
-    leak hacia la prod telemetry.db (1038 rows polluted detectadas 2026-04-29).
-    Pattern documentado en CLAUDE.md §"Test DB_PATH isolation per-file"."""
+def _isolate_db_path(tmp_path, monkeypatch):
+    """Redirect `rag.DB_PATH` to tmp for this file."""
     import rag as _rag
-    snap = _rag.DB_PATH
-    _rag.DB_PATH = tmp_path / "ragvec"
-    try:
-        yield
-    finally:
-        _rag.DB_PATH = snap
+    monkeypatch.setattr(_rag, "DB_PATH", tmp_path / "ragvec")
 
 
 @pytest.fixture
 def fake_queries_yaml(tmp_path):
-    path = tmp_path / "q.yaml"
+    path = tmp_path / "queries.yaml"
     path.write_text(
         """queries:
   - question: one
@@ -84,6 +76,7 @@ def test_latency_flag_adds_table_and_snapshot(fake_queries_yaml, tmp_path, monke
     monkeypatch.setattr(rag, "EVAL_LOG_PATH", eval_log)
     # Post-T10: eval log writes to rag_eval_runs (SQL).
     monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    monkeypatch.chdir(tmp_path)
 
     runner = CliRunner()
     res = runner.invoke(rag.eval, ["--file", str(fake_queries_yaml), "--latency"])

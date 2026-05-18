@@ -453,7 +453,18 @@ def _vlm_load() -> tuple[object, object]:
     with _VLM_LOCK:
         if _VLM_MODEL_OBJ is None:
             from mlx_vlm import load as _mlx_load  # noqa: PLC0415
-            _VLM_MODEL_OBJ, _VLM_PROCESSOR = _mlx_load(hf_id)
+            from rag.llm_backend import (  # noqa: PLC0415
+                _MLX_FORWARD_LOCK,
+                clear_mlx_cache_safely,
+            )
+
+            # VLM cold-load allocates several GB on the same Metal device as
+            # chat/embed/rerank. Serialize it with active MLX work and drain
+            # the allocator first so loading granite-vision is an actual
+            # memory win instead of racing another forward.
+            clear_mlx_cache_safely(collect=True)
+            with _MLX_FORWARD_LOCK:
+                _VLM_MODEL_OBJ, _VLM_PROCESSOR = _mlx_load(hf_id)
         _VLM_LAST_USED = time.time()
         return _VLM_MODEL_OBJ, _VLM_PROCESSOR
 
@@ -469,8 +480,8 @@ def _vlm_idle_unload(idle_seconds: float = 600) -> bool:
         _VLM_MODEL_OBJ = None
         _VLM_PROCESSOR = None
         try:
-            import mlx.core as mx  # noqa: PLC0415
-            mx.clear_cache()
+            from rag.llm_backend import clear_mlx_cache_safely  # noqa: PLC0415
+            clear_mlx_cache_safely()
         except Exception:
             pass
     return True

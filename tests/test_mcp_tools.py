@@ -227,11 +227,13 @@ def test_links_clamps_k_and_returns_normalised_shape(fake_rag):
 
 def test_stats_returns_expected_keys(fake_rag):
     out = mcp_server.rag_stats()
-    assert set(out.keys()) == {
+    assert {
         "chunks", "collection", "embed_model", "reranker", "vault_path"
-    }
+    }.issubset(out.keys())
     assert out["chunks"] == 42
     assert out["collection"] == "obsidian_notes_v9_test"
+    assert out["vault_scope"] == ["default"]
+    assert out["vaults"][0]["chunks"] == 42
 
 
 # ── Internals ────────────────────────────────────────────────────────────────

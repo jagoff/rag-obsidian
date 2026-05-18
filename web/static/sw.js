@@ -32,7 +32,7 @@
 
 // Bump cuando cambie el shell / la estrategia. El activate handler borra
 // todo cache que no matchee esta versión, así no se acumulan huérfanos.
-const CACHE_VERSION = "rag-pwa-v85-2026-05-16-shell-urls-complete";
+const CACHE_VERSION = "rag-pwa-v106-2026-05-17-home-signal-quality";
 const SHELL_CACHE = `${CACHE_VERSION}-shell`;
 const STATIC_CACHE = `${CACHE_VERSION}-static`;
 
@@ -48,6 +48,7 @@ const SHELL_URLS = [
   "/status",
   "/learning",
   "/mirror",
+  "/blacklist",
   "/finance",
   "/manifest.webmanifest",
   "/static/manifest-wzp.webmanifest",
@@ -104,19 +105,18 @@ self.addEventListener("activate", (event) => {
           .map((n) => caches.delete(n))
       );
 
-      // Forzar reload de las tabs ya abiertas. Necesario cuando el SW
-      // anterior no tenía el `controllerchange` listener (deploys
-      // pre-v31): el JS cargado de esas tabs no sabe que el SW se
-      // actualizó, y a menos que el user refresque manualmente, sigue
-      // corriendo con assets stale. `client.navigate(client.url)` lo
-      // recarga desde el SW directamente. Wrap en try/catch porque
-      // navigate() puede rebotar si la URL cambió mid-flight (rarísimo).
-      const wins = await self.clients.matchAll({ type: "window" });
-      await Promise.all(
-        wins.map(async (win) => {
-          try { await win.navigate(win.url); } catch (_) {}
-        })
-      );
+      // Pedir reload de tabs ya abiertas sin bloquear `activate`.
+      // Await-ear `client.navigate()` dentro de `waitUntil()` puede dejar
+      // una navegación esperando al SW que todavía está activando.
+      setTimeout(() => {
+        self.clients.matchAll({ type: "window" })
+          .then((wins) => Promise.all(
+            wins.map(async (win) => {
+              try { await win.navigate(win.url); } catch (_) {}
+            })
+          ))
+          .catch(() => {});
+      }, 0);
     })()
   );
 });

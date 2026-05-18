@@ -5,34 +5,51 @@ import {
   LS_HERO_COLLAPSED,
   LS_HERO_ORDER,
   LS_HERO_SUB_COLLAPSED,
-} from "./panel-today.mjs";
+} from "./panel-today.mjs?v=103";
 import {
+  LS_PANEL_SIZES,
   applySavedPanelSize,
   clearPanelSizeOverrides,
   hasPanelSizeOverrides,
   observeAllPanels,
   observePanel,
   setPanelSize,
-} from "./autosizer.mjs";
+} from "./autosizer.mjs?v=103";
+import {
+  clearServerLayout,
+  compactBooleanMap,
+  hydrateServerLayout,
+  readObject,
+  readString,
+  removeKeys,
+  writeJSON,
+  writeObjectOrRemove,
+} from "../layout-persistence.mjs?v=103";
 
 // ── Constantes de localStorage ─────────────────────────────────────────────────
 
 const LS_PANELS_ORDER = "home.v2.panels.order.v1";
 const LS_PANELS_COLLAPSED = "home.v2.panels.collapsed.v1";
 const LS_SECTIONS_COLLAPSED = "home.v2.sections.collapsed.v1";
+const HERO_BODY_ID = "today-hero-body";
 const SECTION_BODY_IDS = ["sec-acc-body", "sec-mon-body", "sec-amb-body"];
-const ORDER_CONTAINER_IDS = ["home-cmdbar", ...SECTION_BODY_IDS];
+const ORDER_CONTAINER_IDS = [HERO_BODY_ID, "home-cmdbar", ...SECTION_BODY_IDS];
+const ORDER_ITEM_SELECTOR = ":scope > .panel, :scope > .kpi, :scope > .hero-section";
+const SERVER_LAYOUT_PAGE = "home.v2";
+const SERVER_LAYOUT_KEYS = [
+  LS_PANELS_ORDER,
+  LS_PANELS_COLLAPSED,
+  LS_SECTIONS_COLLAPSED,
+  LS_PANEL_SIZES,
+  LS_HERO_COLLAPSED,
+  LS_HERO_ORDER,
+  LS_HERO_SUB_COLLAPSED,
+];
 
 // ── Orden persistido ───────────────────────────────────────────────────────────
 
 function readSavedOrder() {
-  try {
-    const raw = localStorage.getItem(LS_PANELS_ORDER);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object") return null;
-    return parsed;
-  } catch { return null; }
+  return readObject(LS_PANELS_ORDER, null);
 }
 
 function saveCurrentOrder() {
@@ -40,17 +57,38 @@ function saveCurrentOrder() {
   for (const secId of ORDER_CONTAINER_IDS) {
     const sec = document.getElementById(secId);
     if (!sec) continue;
-    const itemSelector = secId === "home-cmdbar" ? ":scope > .kpi" : ":scope > .panel";
-    order[secId] = Array.from(sec.querySelectorAll(itemSelector))
+    order[secId] = Array.from(sec.querySelectorAll(ORDER_ITEM_SELECTOR))
       .map((p) => p.id)
       .filter(Boolean);
   }
-  try {
-    localStorage.setItem(LS_PANELS_ORDER, JSON.stringify(order));
-  } catch (e) {
-    console.warn("[home.v2] no pude persistir el orden de paneles:", e);
+  if (!writeJSON(LS_PANELS_ORDER, order)) {
+    console.warn("[home.v2] no pude persistir el orden de paneles");
   }
   updateResetButtonVisibility();
+}
+
+function layoutContainers() {
+  return ORDER_CONTAINER_IDS
+    .map((id) => document.getElementById(id))
+    .filter(Boolean);
+}
+
+function queryLayoutItems(selector) {
+  return layoutContainers().flatMap((container) => (
+    Array.from(container.querySelectorAll(`:scope > ${selector}`))
+  ));
+}
+
+function isLayoutItem(node) {
+  return !!(
+    node
+    && node.nodeType === 1
+    && (
+      node.classList?.contains("panel")
+      || node.classList?.contains("kpi")
+      || node.classList?.contains("hero-section")
+    )
+  );
 }
 
 export function applySavedOrder() {
@@ -69,39 +107,30 @@ export function applySavedOrder() {
 }
 
 function clearSavedOrder() {
-  try { localStorage.removeItem(LS_PANELS_ORDER); } catch {}
-  try { localStorage.removeItem(LS_PANELS_COLLAPSED); } catch {}
-  try { localStorage.removeItem(LS_HERO_COLLAPSED); } catch {}
-  try { localStorage.removeItem(LS_HERO_ORDER); } catch {}
-  try { localStorage.removeItem(LS_HERO_SUB_COLLAPSED); } catch {}
-  try { localStorage.removeItem(LS_SECTIONS_COLLAPSED); } catch {}
+  clearServerLayout(SERVER_LAYOUT_PAGE);
+  removeKeys([
+    LS_PANELS_ORDER,
+    LS_PANELS_COLLAPSED,
+    LS_HERO_COLLAPSED,
+    LS_HERO_ORDER,
+    LS_HERO_SUB_COLLAPSED,
+    LS_SECTIONS_COLLAPSED,
+  ]);
   clearPanelSizeOverrides();
   // Más simple recargar que reconstruir el orden hard-coded del HTML.
-  window.location.reload();
+  window.setTimeout(() => window.location.reload(), 150);
 }
 
 // ── Collapse por panel ─────────────────────────────────────────────────────────
 
 function readCollapsedMap() {
-  try {
-    const raw = localStorage.getItem(LS_PANELS_COLLAPSED);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw);
-    return (parsed && typeof parsed === "object") ? parsed : {};
-  } catch { return {}; }
+  return readObject(LS_PANELS_COLLAPSED, {});
 }
 
 function saveCollapsedMap(map) {
-  try {
-    const trimmed = {};
-    for (const [k, v] of Object.entries(map)) if (v) trimmed[k] = true;
-    if (Object.keys(trimmed).length === 0) {
-      localStorage.removeItem(LS_PANELS_COLLAPSED);
-    } else {
-      localStorage.setItem(LS_PANELS_COLLAPSED, JSON.stringify(trimmed));
-    }
-  } catch (e) {
-    console.warn("[home.v2] no pude persistir collapse de paneles:", e);
+  const trimmed = compactBooleanMap(map);
+  if (!writeObjectOrRemove(LS_PANELS_COLLAPSED, trimmed)) {
+    console.warn("[home.v2] no pude persistir collapse de paneles");
   }
 }
 
@@ -158,7 +187,10 @@ export function injectCollapseButton(panel) {
 }
 
 function injectKpiControls(kpi) {
-  if (kpi.dataset.kpiControlsInit === "1") return;
+  if (kpi.querySelector(":scope > .kpi-layout-controls")) {
+    kpi.dataset.kpiControlsInit = "1";
+    return;
+  }
   kpi.dataset.kpiControlsInit = "1";
   const controls = document.createElement("div");
   controls.className = "kpi-layout-controls";
@@ -245,10 +277,10 @@ function refreshChipLabels(panel) {
 }
 
 export function injectSizeChips(panel) {
-  const head = panel.querySelector(".panel-head");
+  const head = panel.querySelector(".panel-head") || panel.querySelector(":scope > h3");
   if (!head || head.querySelector(".panel-size-chip")) return;
   // Insertar ANTES del botón collapse (que queda al final).
-  const collapseBtn = head.querySelector(".panel-collapse-btn");
+  const collapseBtn = head.querySelector(".panel-collapse-btn, .hero-collapse-btn");
   const ref = collapseBtn || null;
   for (const dim of ["w", "h"]) {
     const chip = document.createElement("button");
@@ -342,6 +374,10 @@ function setupPanel(panel) {
   observePanel(panel);
 }
 
+function allPanels() {
+  return queryLayoutItems(".panel");
+}
+
 export function injectResizeHandles(panel) {
   if (panel.dataset.resizeInit === "1") return;
   panel.dataset.resizeInit = "1";
@@ -363,20 +399,103 @@ export function injectResizeHandles(panel) {
 
 let _draggingPanel = null;
 
+function disableNativeChildDrag(root) {
+  root.querySelectorAll("a, img").forEach((el) => {
+    el.setAttribute("draggable", "false");
+  });
+}
+
+function _dropPlacement(ev, el) {
+  const rect = el.getBoundingClientRect();
+  const x = rect.width ? (ev.clientX - rect.left) / rect.width : 0.5;
+  const y = rect.height ? (ev.clientY - rect.top) / rect.height : 0.5;
+  if (y < 0.33) return { before: true, axis: "y" };
+  if (y > 0.67) return { before: false, axis: "y" };
+  return { before: x < 0.5, axis: "x" };
+}
+
+function _setDropMark(el, placement) {
+  const before = !!placement?.before;
+  const axis = placement?.axis === "y" ? "y" : "x";
+  el.classList.toggle("drop-before", before);
+  el.classList.toggle("drop-after", !before);
+  el.classList.toggle("drop-axis-x", axis === "x");
+  el.classList.toggle("drop-axis-y", axis === "y");
+}
+
+function _clearDropMark(el) {
+  el.classList.remove("drop-before", "drop-after", "drop-axis-x", "drop-axis-y");
+}
+
+function _allDropMarked() {
+  return document.querySelectorAll(
+    ".panel.drop-before, .panel.drop-after, .kpi.drop-before, .kpi.drop-after, .hero-section.drop-before, .hero-section.drop-after",
+  );
+}
+
+function _orderItems(container) {
+  return Array.from(container?.querySelectorAll(ORDER_ITEM_SELECTOR) || [])
+    .filter((el) => el !== _draggingPanel);
+}
+
+function _containerInsertionFromPoint(container, ev) {
+  const items = _orderItems(container)
+    .map((el) => ({ el, rect: el.getBoundingClientRect() }))
+    .sort((a, b) => {
+      const dy = a.rect.top - b.rect.top;
+      if (Math.abs(dy) > 8) return dy;
+      return a.rect.left - b.rect.left;
+    });
+  if (!items.length) return { target: null, before: false, axis: "y" };
+  const rows = [];
+  for (const item of items) {
+    let row = rows.find((r) => Math.abs(r.top - item.rect.top) <= 12);
+    if (!row) {
+      row = { top: item.rect.top, bottom: item.rect.bottom, items: [] };
+      rows.push(row);
+    }
+    row.top = Math.min(row.top, item.rect.top);
+    row.bottom = Math.max(row.bottom, item.rect.bottom);
+    row.items.push(item);
+  }
+  for (const row of rows) {
+    row.items.sort((a, b) => a.rect.left - b.rect.left);
+    if (ev.clientY < row.top) {
+      return { target: row.items[0].el, before: true, axis: "y" };
+    }
+    if (ev.clientY <= row.bottom) {
+      for (const item of row.items) {
+        const midX = item.rect.left + item.rect.width / 2;
+        if (ev.clientX < midX) return { target: item.el, before: true, axis: "x" };
+      }
+      return { target: row.items[row.items.length - 1].el, before: false, axis: "x" };
+    }
+  }
+  return { target: items[items.length - 1].el, before: false, axis: "y" };
+}
+
+function _insertDraggingAt(container, placement) {
+  if (!_draggingPanel || !container) return false;
+  if (!placement?.target) {
+    container.appendChild(_draggingPanel);
+    return true;
+  }
+  if (placement.target === _draggingPanel) return false;
+  if (placement.before) {
+    container.insertBefore(_draggingPanel, placement.target);
+  } else {
+    container.insertBefore(_draggingPanel, placement.target.nextSibling);
+  }
+  return true;
+}
+
 function onPanelDragStart(ev) {
   // Si el drag se origina en un control interactivo del header (chips
   // de resize, botón collapse), cancelar — el browser propaga dragstart
   // desde el child al panel padre cuando el child no es draggable.
   if (ev.target && ev.target.closest(
-    ".panel-size-chip, .panel-collapse-btn, .kpi-layout-controls",
+    ".panel-size-chip, .panel-collapse-btn, .hero-collapse-btn, .kpi-size-btn, .panel-resize-handle",
   )) {
-    ev.preventDefault();
-    return;
-  }
-  if (
-    ev.currentTarget?.classList?.contains("kpi") &&
-    !ev.target?.closest(".kpi-drag-grip")
-  ) {
     ev.preventDefault();
     return;
   }
@@ -393,9 +512,8 @@ function onPanelDragEnd(ev) {
   const panel = ev.currentTarget;
   panel.classList.remove("is-dragging");
   _draggingPanel = null;
-  document.querySelectorAll(".panel.drop-before, .panel.drop-after")
-    .forEach((p) => p.classList.remove("drop-before", "drop-after"));
-  document.querySelectorAll(".section-body.drop-zone")
+  _allDropMarked().forEach(_clearDropMark);
+  document.querySelectorAll(".section-body.drop-zone, .cmdbar.drop-zone, .today-hero-body.drop-zone")
     .forEach((s) => s.classList.remove("drop-zone"));
 }
 
@@ -405,19 +523,13 @@ function onPanelDragOver(ev) {
   if (panel === _draggingPanel) return;
   ev.preventDefault();
   try { ev.dataTransfer.dropEffect = "move"; } catch {}
-  const rect = panel.getBoundingClientRect();
-  const useX = rect.width > rect.height * 1.2;
-  const before = useX
-    ? (ev.clientX - rect.left) < rect.width / 2
-    : (ev.clientY - rect.top) < rect.height / 2;
-  panel.classList.toggle("drop-before", before);
-  panel.classList.toggle("drop-after", !before);
+  _setDropMark(panel, _dropPlacement(ev, panel));
 }
 
 function onPanelDragLeave(ev) {
   const panel = ev.currentTarget;
   if (panel.contains(ev.relatedTarget)) return;
-  panel.classList.remove("drop-before", "drop-after");
+  _clearDropMark(panel);
 }
 
 function onPanelDrop(ev) {
@@ -425,8 +537,9 @@ function onPanelDrop(ev) {
   if (!_draggingPanel) return;
   const target = ev.currentTarget;
   if (target === _draggingPanel) return;
-  const before = target.classList.contains("drop-before");
-  target.classList.remove("drop-before", "drop-after");
+  const placement = _dropPlacement(ev, target);
+  const before = placement.before;
+  _clearDropMark(target);
   if (before) {
     target.parentNode.insertBefore(_draggingPanel, target);
   } else {
@@ -436,11 +549,12 @@ function onPanelDrop(ev) {
 }
 
 export function makePanelDraggable(panel) {
+  disableNativeChildDrag(panel);
   if (panel.dataset.draggableInit === "1") return;
   panel.dataset.draggableInit = "1";
   panel.setAttribute("draggable", "true");
-  const head = panel.querySelector(".panel-head");
-  if (head && !head.querySelector(".drag-grip")) {
+  const head = panel.querySelector(".panel-head") || panel.querySelector(":scope > h3");
+  if (head && !head.querySelector(".drag-grip, .hero-drag-grip")) {
     const grip = document.createElement("span");
     grip.className = "drag-grip";
     grip.setAttribute("aria-hidden", "true");
@@ -457,9 +571,44 @@ export function makePanelDraggable(panel) {
 
 function setupKpi(kpi) {
   applySavedPanelSize(kpi);
+  disableNativeChildDrag(kpi);
   injectKpiControls(kpi);
   injectResizeHandles(kpi);
   makePanelDraggable(kpi);
+}
+
+function allKpis() {
+  return queryLayoutItems(".kpi");
+}
+
+function allHeroSections() {
+  return queryLayoutItems(".hero-section");
+}
+
+function setupHeroSection(sec) {
+  applySavedPanelSize(sec);
+  makePanelDraggable(sec);
+  injectSizeChips(sec);
+  injectResizeHandles(sec);
+}
+
+function setupLayoutItem(item) {
+  if (!isLayoutItem(item)) return;
+  if (item.classList.contains("panel")) {
+    setupPanel(item);
+  } else if (item.classList.contains("kpi")) {
+    setupKpi(item);
+  } else if (item.classList.contains("hero-section")) {
+    setupHeroSection(item);
+  }
+}
+
+export function refreshLayoutControls() {
+  applySavedOrder();
+  allPanels().forEach(setupPanel);
+  allKpis().forEach(setupKpi);
+  allHeroSections().forEach(setupHeroSection);
+  observeAllPanels();
 }
 
 export function makeSectionDroppable(secId) {
@@ -470,6 +619,9 @@ export function makeSectionDroppable(secId) {
     if (ev.target !== sec) return;
     ev.preventDefault();
     try { ev.dataTransfer.dropEffect = "move"; } catch {}
+    _allDropMarked().forEach(_clearDropMark);
+    const placement = _containerInsertionFromPoint(sec, ev);
+    if (placement.target) _setDropMark(placement.target, placement);
     sec.classList.add("drop-zone");
   });
   sec.addEventListener("dragleave", (ev) => {
@@ -481,9 +633,33 @@ export function makeSectionDroppable(secId) {
     if (ev.target !== sec) return;
     ev.preventDefault();
     sec.classList.remove("drop-zone");
-    sec.appendChild(_draggingPanel);
-    saveCurrentOrder();
+    const placement = _containerInsertionFromPoint(sec, ev);
+    _allDropMarked().forEach(_clearDropMark);
+    if (_insertDraggingAt(sec, placement)) saveCurrentOrder();
   });
+}
+
+function observeLayoutContainer(sec) {
+  if (!sec || sec.dataset.layoutObserverInit === "1") return;
+  sec.dataset.layoutObserverInit = "1";
+  const observeItem = (item) => {
+    if (!isLayoutItem(item)) return;
+    setupLayoutItem(item);
+    mo.observe(item, { attributes: true, attributeFilter: ["hidden"] });
+  };
+  const mo = new MutationObserver((mutations) => {
+    for (const m of mutations) {
+      if (m.type === "childList") {
+        for (const n of m.addedNodes) observeItem(n);
+        continue;
+      }
+      if (m.type !== "attributes" || m.attributeName !== "hidden") continue;
+      const item = m.target;
+      if (isLayoutItem(item) && !item.hidden) setupLayoutItem(item);
+    }
+  });
+  Array.from(sec.children).forEach(observeItem);
+  mo.observe(sec, { childList: true });
 }
 
 // ── Botón reset + visibilidad ──────────────────────────────────────────────────
@@ -492,13 +668,11 @@ function hasCustomLayout() {
   if (readSavedOrder()) return true;
   const map = readCollapsedMap();
   if (map && Object.keys(map).length > 0) return true;
-  try {
-    if (localStorage.getItem(LS_HERO_COLLAPSED) === "1") return true;
-    if (localStorage.getItem(LS_HERO_ORDER)) return true;
-    if (localStorage.getItem(LS_HERO_SUB_COLLAPSED)) return true;
-    if (localStorage.getItem(LS_SECTIONS_COLLAPSED)) return true;
-    if (hasPanelSizeOverrides()) return true;
-  } catch {}
+  if (readString(LS_HERO_COLLAPSED) === "1") return true;
+  if (readString(LS_HERO_ORDER)) return true;
+  if (readString(LS_HERO_SUB_COLLAPSED)) return true;
+  if (readString(LS_SECTIONS_COLLAPSED)) return true;
+  if (hasPanelSizeOverrides()) return true;
   return false;
 }
 
@@ -530,24 +704,27 @@ export function injectResetButton() {
 // ── Collapse por sección ───────────────────────────────────────────────────────
 
 function readSectionsCollapsed() {
-  try {
-    const raw = localStorage.getItem(LS_SECTIONS_COLLAPSED);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw);
-    return (parsed && typeof parsed === "object") ? parsed : {};
-  } catch { return {}; }
+  return readObject(LS_SECTIONS_COLLAPSED, {});
+}
+
+function compactSectionCollapseMap(map) {
+  const trimmed = {};
+  if (!map || typeof map !== "object") return trimmed;
+  for (const [key, value] of Object.entries(map)) {
+    if (key && typeof value === "boolean") trimmed[key] = value;
+  }
+  return trimmed;
 }
 
 function writeSectionsCollapsed(map) {
-  try {
-    const trimmed = {};
-    for (const [k, v] of Object.entries(map)) if (v) trimmed[k] = true;
-    if (Object.keys(trimmed).length === 0) {
-      localStorage.removeItem(LS_SECTIONS_COLLAPSED);
-    } else {
-      localStorage.setItem(LS_SECTIONS_COLLAPSED, JSON.stringify(trimmed));
-    }
-  } catch {}
+  writeObjectOrRemove(LS_SECTIONS_COLLAPSED, compactSectionCollapseMap(map));
+}
+
+function setSectionCollapsed(section, btn, collapsed) {
+  section.setAttribute("data-collapsed", collapsed ? "true" : "false");
+  btn.setAttribute("aria-expanded", collapsed ? "false" : "true");
+  const icon = btn.querySelector(".toggle-icon");
+  if (icon) icon.textContent = collapsed ? "▶" : "▼";
 }
 
 export function initCollapsibleSections() {
@@ -568,16 +745,12 @@ export function initCollapsibleSections() {
         key === "section-monitoring" || key === "section-ambient"
       );
     }
-    if (shouldCollapse) {
-      section.setAttribute("data-collapsed", "true");
-      btn.setAttribute("aria-expanded", "false");
-    }
+    setSectionCollapsed(section, btn, shouldCollapse);
     btn.addEventListener("click", (e) => {
       e.preventDefault();
       const collapsed = section.getAttribute("data-collapsed") === "true";
       const next = !collapsed;
-      section.setAttribute("data-collapsed", next ? "true" : "false");
-      btn.setAttribute("aria-expanded", next ? "false" : "true");
+      setSectionCollapsed(section, btn, next);
       const map = readSectionsCollapsed();
       map[key] = next;
       writeSectionsCollapsed(map);
@@ -588,36 +761,33 @@ export function initCollapsibleSections() {
 
 // ── Init principal del layout ──────────────────────────────────────────────────
 
-export function initLayout() {
+export async function initLayout() {
   // Exponer updateResetButtonVisibility globalmente para que panel-today.mjs la llame.
   window._updateResetButtonVisibility = updateResetButtonVisibility;
+  // 0. Hidratar desde SQLite del servidor antes de leer localStorage.
+  await hydrateServerLayout(SERVER_LAYOUT_PAGE, SERVER_LAYOUT_KEYS);
   // 1. Aplicar orden persistido ANTES de que los renderers escriban.
   applySavedOrder();
   // 2. Hacer cada panel draggable + insertar grip + chips + handles + collapse
-  document.querySelectorAll(".section-body > .panel").forEach((panel) => {
+  allPanels().forEach((panel) => {
     setupPanel(panel);
   });
-  document.querySelectorAll("#home-cmdbar > .kpi").forEach((kpi) => {
+  allKpis().forEach((kpi) => {
     setupKpi(kpi);
   });
   // 2b. Mismo tratamiento para las .hero-section (LO QUE PASÓ / SIN PROCESAR
-  //     / PREGUNTAS / AGENDA) — son los 4 sub-bloques del today-hero-body
-  //     y el user los quiere resizables individualmente como las panels.
-  //     Skip drag/collapse — esos ya tienen su propio sistema en panel-today.mjs.
+  //     / PREGUNTAS / AGENDA). El hero usa el mismo drag/resize/persistencia
+  //     que paneles y KPIs.
   const heroBody = document.getElementById("today-hero-body");
   if (heroBody) {
-    heroBody.querySelectorAll(":scope > .hero-section").forEach((sec) => {
-      applySavedPanelSize(sec);
-      injectResizeHandles(sec);
-    });
+    heroBody.querySelectorAll(":scope > .hero-section").forEach(setupHeroSection);
     // El hero-body se re-renderiza cuando llega el brief — watch nuevas
-    // hero-sections para aplicar handles también.
+    // hero-sections para aplicar el mismo setup.
     const heroMo = new MutationObserver((muts) => {
       for (const m of muts) {
         for (const n of m.addedNodes) {
           if (n.nodeType === 1 && n.classList?.contains("hero-section")) {
-            applySavedPanelSize(n);
-            injectResizeHandles(n);
+            setupHeroSection(n);
           }
         }
       }
@@ -626,38 +796,16 @@ export function initLayout() {
   }
   // 3. Aplicar estado de collapse persistido
   applySavedCollapse();
+  initCollapsibleSections();
   // 4. Hacer cada section-body/cmdbar un drop zone para "soltar al final"
   ORDER_CONTAINER_IDS.forEach(makeSectionDroppable);
   // 5. Inyectar botón reset en la topbar
   injectResetButton();
   // 6. Auto-sizing por content (4-col grid + 2 alturas).
   observeAllPanels();
-  // 6b. Watcher para paneles hidden que aparecen tarde (p-mood, p-sleep,
-  //     p-spotify, p-correlations, p-patterns) — se enganchan cuando el
-  //     renderer correspondiente los unhide.
-  SECTION_BODY_IDS.forEach((secId) => {
-    const sec = document.getElementById(secId);
-    if (!sec) return;
-    const mo = new MutationObserver((mutations) => {
-      for (const m of mutations) {
-        if (m.type === "childList") {
-          for (const n of m.addedNodes) {
-            if (n.nodeType !== 1 || !n.classList?.contains("panel")) continue;
-            setupPanel(n);
-            mo.observe(n, { attributes: true, attributeFilter: ["hidden"] });
-          }
-          continue;
-        }
-        if (m.type !== "attributes" || m.attributeName !== "hidden") continue;
-        const panel = m.target;
-        if (panel?.classList?.contains("panel") && !panel.hidden) {
-          setupPanel(panel);
-        }
-      }
-    });
-    sec.querySelectorAll(":scope > .panel").forEach((p) => {
-      mo.observe(p, { attributes: true, attributeFilter: ["hidden"] });
-    });
-    mo.observe(sec, { childList: true });
+  // 6b. Watcher para cualquier caja que aparezca tarde o quede movida por
+  //     layout persistido: panel, KPI y hero-section comparten wiring.
+  ORDER_CONTAINER_IDS.forEach((secId) => {
+    observeLayoutContainer(document.getElementById(secId));
   });
 }

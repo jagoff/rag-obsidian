@@ -16,6 +16,7 @@ import os
 import threading
 
 import pytest
+from click.testing import CliRunner
 
 from rag import (
     _index_process_lock,
@@ -146,6 +147,19 @@ def test_wait_seconds_zero_acts_as_legacy_nb(isolated_lock_path):
         with pytest.raises(BlockingIOError):
             with _index_process_lock(wait_seconds=0):
                 pass
+
+
+def test_index_cli_reports_lock_holder_without_silent_wait(isolated_lock_path, monkeypatch):
+    """CLI should explain lock contention immediately when configured not to wait."""
+    import rag
+
+    monkeypatch.setenv("RAG_INDEX_LOCK_WAIT_SECONDS", "0")
+    with _index_process_lock():
+        result = CliRunner().invoke(rag.index, [])
+
+    assert result.exit_code == 1
+    assert "Otro `rag index` ya está activo" in result.output
+    assert "No esperé" in result.output
 
 
 def test_wait_seconds_acquires_when_holder_releases_within_window(isolated_lock_path):

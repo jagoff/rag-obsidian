@@ -574,6 +574,50 @@ def test_orchestrator_disabled_env_returns_immediately(monkeypatch, state_db):
     assert res["all"] == []
 
 
+def test_orchestrator_pressure_guard_skips_before_signals(monkeypatch, state_db):
+    import rag.anticipatory as anticipatory_mod
+
+    called = {"signal": False}
+
+    def signal(_now):
+        called["signal"] = True
+        return [rag.AnticipatoryCandidate(
+            kind="anticipate-echo", score=0.9, message="m",
+            dedup_key="k", snooze_hours=72, reason="r",
+        )]
+
+    monkeypatch.delenv("RAG_ANTICIPATE_DISABLED", raising=False)
+    monkeypatch.setenv("RAG_ANTICIPATE_PRESSURE_GUARD", "1")
+    monkeypatch.setenv("RAG_ANTICIPATE_MAX_MEMORY_PCT", "90")
+    monkeypatch.setenv("RAG_ANTICIPATE_MAX_SWAP_GB", "1.5")
+    monkeypatch.setattr(
+        anticipatory_mod,
+        "_anticipate_pressure_snapshot",
+        lambda: (75.0, 2.0),
+    )
+    monkeypatch.setattr(rag, "_ANTICIPATE_SIGNALS", (("would_have_fired", signal),))
+
+    res = rag.anticipate_run_impl(dry_run=True)
+
+    assert res["skip_reason"] == "swap_pressure"
+    assert called["signal"] is False
+
+
+def test_orchestrator_pressure_guard_allows_stale_swap(monkeypatch, state_db):
+    import rag.anticipatory as anticipatory_mod
+
+    monkeypatch.delenv("RAG_ANTICIPATE_DISABLED", raising=False)
+    monkeypatch.setenv("RAG_ANTICIPATE_PRESSURE_GUARD", "1")
+    monkeypatch.setenv("RAG_ANTICIPATE_MAX_SWAP_GB", "1.5")
+    monkeypatch.setattr(
+        anticipatory_mod,
+        "_anticipate_pressure_snapshot",
+        lambda: (12.0, 5.1),
+    )
+
+    assert anticipatory_mod._anticipate_pressure_guard_skip() is None
+
+
 def test_orchestrator_pushes_when_not_dry_run(monkeypatch, state_db):
     cand = rag.AnticipatoryCandidate(
         kind="anticipate-calendar", score=0.9, message="m",

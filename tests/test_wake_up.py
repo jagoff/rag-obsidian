@@ -1,4 +1,4 @@
-"""Tests del orquestador `rag wake-up` + el plist que lo dispara a las 04:00.
+"""Tests del orquestador `rag wake-up` + su scheduling supervisor/legacy.
 
 Regresiones que atrapan:
   - El comando se registra en Click y aparece en `rag --help`.
@@ -12,8 +12,8 @@ Regresiones que atrapan:
     marque rojo en /status).
   - El plist tiene shape correcta: label, schedule 04:00, program args,
     env vars (LLM_KEEP_ALIVE=-1 crítico para que el warmup persista).
-  - El plist está registrado en `_services_spec` (sino `rag setup` no lo
-    instala).
+  - El plist legacy sigue parseable y su label está deprecado en setup.
+  - El job `wake_up` está registrado en el supervisor.
   - /api/status incluye la entry `com.fer.obsidian-rag-wake-up` en la
     categoría briefs.
 
@@ -28,7 +28,6 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
 from click.testing import CliRunner
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -307,26 +306,39 @@ def test_wake_up_plist_logs_to_rag_log_dir():
     assert d["StandardErrorPath"].endswith("/wake-up.error.log")
 
 
-# ── _services_spec wiring ───────────────────────────────────────────
+# ── Supervisor wiring ───────────────────────────────────────────────
 
-def test_wake_up_in_services_spec():
-    """`rag setup` instala wake-up via _services_spec — sino el user
-    hace `rag setup` y nunca se crea el plist."""
+def _reload_supervisor_jobs():
+    """Reset + re-import jobs so decorators bind to a fresh Scheduler."""
+    from rag.runtime.scheduler import Scheduler
+    from rag.runtime.supervisor import _import_jobs
+
+    Scheduler.reset_global()
+    for mod in list(sys.modules):
+        if mod.startswith("rag.runtime.jobs"):
+            del sys.modules[mod]
+    sched = Scheduler.global_instance()
+    _import_jobs()
+    return sched
+
+
+def test_wake_up_not_in_services_spec_after_supervisor_refactor():
+    """El plist standalone se removió de _services_spec; setup lo limpia como
+    deprecated y el scheduling real vive en el supervisor."""
     spec = rag_module._services_spec(RAG_BIN)
     labels = [label for label, _, _ in spec]
-    assert "com.fer.obsidian-rag-wake-up" in labels
+    assert "com.fer.obsidian-rag-wake-up" not in labels
+    assert "com.fer.obsidian-rag-wake-up" in rag_module._DEPRECATED_LABELS
 
 
-def test_wake_up_services_spec_entry_shape():
-    """La entry en _services_spec tiene (label, filename, xml)."""
-    spec = rag_module._services_spec(RAG_BIN)
-    for label, fname, content in spec:
-        if label == "com.fer.obsidian-rag-wake-up":
-            assert fname == "com.fer.obsidian-rag-wake-up.plist"
-            assert "<key>Label</key>" in content
-            assert "wake-up" in content
-            return
-    pytest.fail("no encontré wake-up en _services_spec")
+def test_wake_up_job_registered_in_supervisor():
+    """El supervisor registra `wake_up` como cron diario 04:00."""
+    sched = _reload_supervisor_jobs()
+    job = sched.jobs().get("wake_up")
+    assert job is not None, "wake_up job no registrado en supervisor"
+    assert job.trigger_kind == "cron"
+    assert job.trigger_args.get("hour") == 4
+    assert job.trigger_args.get("minute") == 0
 
 
 # ── /api/status integration ─────────────────────────────────────────

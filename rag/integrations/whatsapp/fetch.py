@@ -18,6 +18,8 @@ Invariantes:
 - Silent-fail: missing DB / locked SQLite / network → `[]` o `{...empty}`.
   Nunca raise.
 - Skip bot's own group (``WHATSAPP_BOT_JID``) y ``status@broadcast``.
+- Skip exact-name blacklisted chats such as ``Cloud Services`` so they
+  never feed briefs/tasks/context enrichment.
 - Skip messages que arrancan con U+200B (anti-loop marker — son nuestros
   propios outputs).
 - Drop unnamed contacts (raw phone-number-like JIDs) — un nombre "real"
@@ -34,7 +36,10 @@ respetan monkey-patches de tests.
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import os
 from pathlib import Path
+
+from ._constants import whatsapp_chat_name_excluded
 
 
 # Bridge guarda `timestamp` como string `YYYY-MM-DD HH:MM:SS-03:00` (Go default
@@ -71,6 +76,24 @@ def _bridge_ts_bound(dt: datetime) -> str:
     return dt.strftime(_BRIDGE_TS_FMT) + _BRIDGE_TZ_OFFSET
 
 
+def _bridge_ts_from_ui(ts: str | None) -> str:
+    """Normaliza timestamps recibidos desde `/wa` al formato del bridge.
+
+    La UI consume ISO (`YYYY-MM-DDTHH:MM:SS-03:00`), pero la SQLite del
+    bridge guarda `YYYY-MM-DD HH:MM:SS-03:00`. Como varias queries hacen
+    comparación lexicográfica para usar índices, guardar o comparar con `T`
+    rompe unread/paginación dentro del mismo día.
+    """
+    s = (ts or "").strip()
+    if not s:
+        return ""
+    if "T" in s:
+        s = s.replace("T", " ", 1)
+    if s.endswith("Z") or s.endswith("z"):
+        s = s[:-1] + "+00:00"
+    return s
+
+
 import contextlib  # noqa: E402
 
 
@@ -105,7 +128,11 @@ def _ocr_image_safe(image_path: Path, *, label: str = "wa") -> str:
     """
     try:
         from rag.ocr import _image_text_or_caption  # noqa: PLC0415
-        text = _image_text_or_caption(image_path) or ""
+        result = _image_text_or_caption(image_path) or ""
+        if isinstance(result, tuple):
+            text = result[0] or ""
+        else:
+            text = result or ""
     except Exception as exc:
         try:
             import rag as _rag
@@ -115,7 +142,7 @@ def _ocr_image_safe(image_path: Path, *, label: str = "wa") -> str:
         return ""
     if not text:
         return ""
-    text = text.strip().replace("\n", " ")
+    text = str(text).strip().replace("\n", " ")
     if len(text) > _WA_OCR_TEXT_MAX_CHARS:
         text = text[:_WA_OCR_TEXT_MAX_CHARS - 1] + "…"
     return text
@@ -186,9 +213,12 @@ def _enrich_chats_with_lastcontent(
     out: list[dict] = []
     for r in grouped_rows:
         jid = r["jid"]
+        chat_name = name_map.get(jid, "")
+        if whatsapp_chat_name_excluded(chat_name):
+            continue
         out.append({
             "jid": jid,
-            "name": name_map.get(jid, ""),
+            "name": chat_name,
             "cnt": r["cnt"],
             "last_content": last_content_map.get(jid, ""),
         })
@@ -405,7 +435,17 @@ def _wa_chat_label(raw_name: str, jid: str) -> str:
     return f"Contacto …{tail}" if tail else "Contacto"
 
 
-_SENDER_OVERRIDES_PATH = Path.home() / ".config/obsidian-rag/wa_sender_overrides.json"
+def _obsidian_rag_config_dir() -> Path:
+    explicit = os.environ.get("OBSIDIAN_RAG_CONFIG_DIR", "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    state_dir = os.environ.get("OBSIDIAN_RAG_STATE_DIR", "").strip()
+    if state_dir:
+        return Path(state_dir).expanduser() / "config"
+    return Path.home() / ".config" / "obsidian-rag"
+
+
+_SENDER_OVERRIDES_PATH = _obsidian_rag_config_dir() / "wa_sender_overrides.json"
 _SENDER_OVERRIDES_CACHE: dict[str, str] = {}
 _SENDER_OVERRIDES_MTIME: float = -1.0
 
@@ -613,6 +653,8 @@ def _fetch_whatsapp_window(
     ocr_calls_used = 0  # cap defensivo OCR/VLM por invocación (A4)
     for r in rows:
         jid = r["jid"] or ""
+        if whatsapp_chat_name_excluded(r["chat_name"] or ""):
+            continue
         label = _wa_chat_label(r["chat_name"] or "", jid)
         # Drop unnamed contacts — same policy as morning brief.
         if label.startswith("Contacto …") and not any(ch.isalpha() for ch in (r["chat_name"] or "")):
@@ -758,6 +800,8 @@ def _fetch_whatsapp_recent_with_jid(jid: str, limit: int = 5) -> dict:
         return empty
 
     chat_label = _wa_chat_label((rows[0]["chat_name"] or ""), jid)
+    if whatsapp_chat_name_excluded(chat_label):
+        return empty
     # Bridge guarda timestamps con offset incluido y space separator
     # ("2024-11-28 20:59:45-03:00"). Solo normalizamos el separador a
     # "T" para que sea ISO8601 estricto y `Date.parse` del browser lo
@@ -894,10 +938,16 @@ def list_chats_for_ui(
         elif view_norm == "archived":
             # No hay archivados — return early sin tocar el bridge.
             return []
-        having_clause = ""
         if before_ts:
-            having_clause = "HAVING computed_last_ts IS NOT NULL AND computed_last_ts < ?"
-            params.append(before_ts)
+            before_bound = _bridge_ts_from_ui(before_ts)
+            where_clauses.append(
+                "(SELECT MAX(m.timestamp) FROM br.messages m WHERE m.chat_jid = c.jid) "
+                "IS NOT NULL"
+            )
+            where_clauses.append(
+                "(SELECT MAX(m.timestamp) FROM br.messages m WHERE m.chat_jid = c.jid) < ?"
+            )
+            params.append(before_bound)
         params.append(cap)
 
         sql = f"""
@@ -941,7 +991,6 @@ def list_chats_for_ui(
             FROM br.chats c
             LEFT JOIN main.rag_wa_read_state rs ON rs.jid = c.jid
             WHERE {' AND '.join(where_clauses)}
-            {having_clause}
             ORDER BY computed_last_ts DESC NULLS LAST
             LIMIT ?
         """
@@ -1357,7 +1406,7 @@ def fetch_thread_for_ui(
             "is_group": is_group,
             "messages": messages,
             "next_before_ts": next_before_ts,
-            "last_seen_ts": last_seen_ts,
+            "last_seen_ts": _normalize_bridge_ts(last_seen_ts),
         }
     except sqlite3.Error:
         return empty
@@ -1377,7 +1426,9 @@ def mark_read_for_ui(jid: str, last_seen_ts: str | None = None) -> str:
 
     if not jid or "@" not in jid:
         return ""
-    ts = (last_seen_ts or "").strip() or _dt.now().strftime("%Y-%m-%dT%H:%M:%S") + _BRIDGE_TZ_OFFSET
+    ts = _bridge_ts_from_ui(last_seen_ts)
+    if not ts:
+        ts = _dt.now().strftime(_BRIDGE_TS_FMT) + _BRIDGE_TZ_OFFSET
     _db_local.set_last_seen(jid, ts)
     return ts
 
@@ -1393,4 +1444,5 @@ __all__ = [
     "mark_read_for_ui",
     "_normalize_bridge_ts",
     "_avatar_initials",
+    "_bridge_ts_from_ui",
 ]

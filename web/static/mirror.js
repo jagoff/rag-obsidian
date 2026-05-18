@@ -1,11 +1,12 @@
 // Personal Mirror — frontend renderer.
 //
 // Flow:
-//   1. fetch /api/mirror → render 8 blocks sólidos.
+//   1. fetch /api/mirror → render blocks sólidos.
 //   2. fetch /api/mirror/insights (lazy) → render block "lo que el sistema notó".
-//   3. auto-refresh cada 5min.
+//   3. WZP live poll cada 30s; mirror completo cada 5min.
 
 const REFRESH_INTERVAL_MS = 5 * 60 * 1000;
+const WZP_REFRESH_INTERVAL_MS = 30 * 1000;
 const SPARK_CHARS = "▁▂▃▄▅▆▇█";
 
 const $ = (sel) => document.querySelector(sel);
@@ -34,6 +35,14 @@ function fmtTime(iso) {
   }
 }
 
+function fmtWait(hours) {
+  const n = Number(hours || 0);
+  if (n < 0.05) return "recién";
+  if (n < 1) return `${Math.max(1, Math.round(n * 60))}m`;
+  if (n < 24) return `${n.toFixed(1)}h`;
+  return `${Math.floor(n / 24)}d`;
+}
+
 function fmtDateLong(isoDate) {
   if (!isoDate) return "";
   try {
@@ -52,7 +61,10 @@ function makeRow(name, meta, badge) {
 
   const nameEl = document.createElement("span");
   nameEl.className = "name";
-  nameEl.textContent = name;
+  const textEl = document.createElement("span");
+  textEl.className = "name-text";
+  textEl.textContent = name;
+  nameEl.appendChild(textEl);
   if (badge) {
     const b = document.createElement("span");
     b.className = "badge";
@@ -74,6 +86,13 @@ function emptyState(text) {
   const div = document.createElement("div");
   div.className = "empty";
   div.textContent = text || "—";
+  return div;
+}
+
+function sourceNote(text) {
+  const div = document.createElement("div");
+  div.className = "source-note";
+  div.textContent = text;
   return div;
 }
 
@@ -118,15 +137,69 @@ function renderTopEntities(data) {
   clear(el);
   const items = data?.items || [];
   if (!items.length) {
-    el.appendChild(emptyState("sin entidades extraídas"));
+    const reason = data?.reason;
+    el.appendChild(emptyState(
+      reason === "no_entities_indexed"
+        ? "sin entidades indexadas; mostrando chats cuando haya actividad"
+        : "sin entidades extraídas",
+    ));
     return;
+  }
+  if (data?.fallback === "whatsapp_today") {
+    el.appendChild(sourceNote("fallback live · WhatsApp hoy"));
   }
   for (const e of items) {
     el.appendChild(makeRow(
       e.name,
-      `${e.n_mentions_7d} menciones · ${e.n_sources} fuentes`,
+      e.meta || `${e.n_mentions_7d} menciones · ${e.n_sources} fuentes`,
       e.kind || null,
     ));
+  }
+}
+
+function renderWhatsApp(data) {
+  const el = $("#whatsapp .content");
+  clear(el);
+  const unreplied = data?.unreplied || [];
+  const recent = data?.recent_inbound || [];
+  const today = data?.today || [];
+  const counts = data?.counts || {};
+
+  if (!unreplied.length && !recent.length && !today.length) {
+    el.appendChild(emptyState("sin actividad WZP reciente"));
+    return;
+  }
+
+  el.appendChild(sourceNote(
+    `${counts.today_chats || today.length} chats hoy · ${counts.unreplied_chats || unreplied.length} con respuesta pendiente`,
+  ));
+
+  const shown = new Set();
+  for (const chat of unreplied.slice(0, 5)) {
+    shown.add(chat.name);
+    const topic = chat.topic_hint ? ` · ${chat.topic_hint}` : "";
+    const snippet = chat.last_snippet ? ` · "${chat.last_snippet}"` : "";
+    el.appendChild(makeRow(
+      chat.name || "chat",
+      `${fmtWait(chat.hours_waiting)}${topic}${snippet}`,
+      "pendiente",
+    ));
+  }
+
+  for (const chat of recent.slice(0, 4)) {
+    if (shown.has(chat.name)) continue;
+    shown.add(chat.name);
+    const topic = chat.topic_hint ? ` · ${chat.topic_hint}` : "";
+    const snippet = chat.last_snippet ? ` · "${chat.last_snippet}"` : "";
+    el.appendChild(makeRow(chat.name || "chat", `${chat.count || 1} msgs${topic}${snippet}`, "entró"));
+  }
+
+  for (const chat of today.slice(0, 4)) {
+    if (shown.has(chat.name)) continue;
+    shown.add(chat.name);
+    const topic = chat.topic_hint ? ` · ${chat.topic_hint}` : "";
+    const snippet = chat.last_snippet ? ` · "${chat.last_snippet}"` : "";
+    el.appendChild(makeRow(chat.name || "chat", `${chat.count || 1} msgs hoy${topic}${snippet}`, "hoy"));
   }
 }
 
@@ -176,12 +249,20 @@ function renderPendientes(data) {
   clear(el);
   const items = data?.items || [];
   if (!items.length) {
-    el.appendChild(emptyState("nada pendiente próximas 12-72h"));
+    const services = data?.services_consulted || [];
+    el.appendChild(emptyState(
+      services.length
+        ? `sin urgentes; servicios activos: ${services.join(", ")}`
+        : "nada pendiente próximas 12-72h",
+    ));
     return;
   }
+  if (data?.summary) {
+    el.appendChild(sourceNote(data.summary));
+  }
   for (const p of items) {
-    const when = p.when ? fmtTime(p.when) : "";
-    el.appendChild(makeRow(p.title, when, p.category));
+    const when = p.meta || (p.when ? fmtTime(p.when) : "");
+    el.appendChild(makeRow(p.title, when, p.category || null));
   }
 }
 
@@ -190,7 +271,11 @@ function renderMoodTimeline(data) {
   clear(el);
   const days = data?.days || [];
   if (!days.length) {
-    el.appendChild(emptyState("sin data histórica de mood"));
+    el.appendChild(emptyState(
+      data?.reason === "daemon_disabled"
+        ? "mood desactivado"
+        : "sin data histórica de mood",
+    ));
     return;
   }
   const scores = days.map((d) => d.score);
@@ -228,13 +313,33 @@ function renderSpotifyTop(data) {
   clear(el);
   const items = data?.items || [];
   if (!items.length) {
-    el.appendChild(emptyState("sin escucha registrada"));
+    const reason = data?.reason;
+    el.appendChild(emptyState(
+      reason === "no_spotify_log"
+        ? "sin escucha registrada en telemetry"
+        : "sin escucha registrada",
+    ));
     return;
   }
+  if (data?.mode === "recent_tracks") {
+    el.appendChild(sourceNote("últimas escuchas registradas"));
+  } else if (data?.mode === "now_playing") {
+    el.appendChild(sourceNote("Spotify ahora"));
+  } else if (data?.mode === "top_snapshot") {
+    const date = data?.snapshot_date ? ` · ${data.snapshot_date}` : "";
+    el.appendChild(sourceNote(`snapshot Spotify top${date}`));
+  } else if (data?.mode === "recent_snapshot") {
+    const date = data?.snapshot_date ? ` · ${data.snapshot_date}` : "";
+    el.appendChild(sourceNote(`snapshot Spotify reciente${date}`));
+  }
   for (const s of items) {
+    const name = s.track || s.artist;
+    const meta = s.track
+      ? [s.artist, s.played_at, s.state].filter(Boolean).join(" · ")
+      : `${s.plays} plays · ${s.distinct_tracks} tracks`;
     el.appendChild(makeRow(
-      s.artist,
-      `${s.plays} plays · ${s.distinct_tracks} tracks`,
+      name,
+      meta,
     ));
   }
 }
@@ -271,8 +376,11 @@ function renderScreenContext(data) {
   const today = data?.today || [];
   if (!recent.length && !today.length) {
     const todayCount = data?.count_today ?? 0;
+    const reason = data?.reason;
     el.appendChild(emptyState(todayCount > 0
       ? `sin captura reciente (hoy: ${todayCount})`
+      : reason === "observer_disabled"
+        ? "observación de pantalla sin activar"
       : "sin captura reciente"));
     return;
   }
@@ -375,13 +483,19 @@ function renderInsights(data) {
 
 async function fetchMirror(refresh = false) {
   const url = refresh ? "/api/mirror?refresh=1" : "/api/mirror";
-  const resp = await fetch(url);
+  const resp = await fetch(url, { cache: "no-store" });
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   return resp.json();
 }
 
 async function fetchInsights() {
-  const resp = await fetch("/api/mirror/insights");
+  const resp = await fetch("/api/mirror/insights", { cache: "no-store" });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  return resp.json();
+}
+
+async function fetchWhatsApp() {
+  const resp = await fetch("/api/mirror/whatsapp", { cache: "no-store" });
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   return resp.json();
 }
@@ -414,6 +528,7 @@ async function load(refresh = false) {
 
     renderActiveProjects(s.active_projects);
     renderTopEntities(s.top_entities);
+    renderWhatsApp(s.whatsapp || {});
     renderMood(s.mood_today);
     renderPendientes(s.pendientes);
     renderMoodTimeline(s.mood_timeline);
@@ -437,6 +552,17 @@ async function load(refresh = false) {
   }
 }
 
+async function refreshWhatsAppOnly() {
+  try {
+    const data = await fetchWhatsApp();
+    renderWhatsApp(data.whatsapp || {});
+  } catch (err) {
+    const el = $("#whatsapp .content");
+    clear(el);
+    el.appendChild(emptyState(`WZP error: ${String(err).slice(0, 80)}`));
+  }
+}
+
 // ── Init ────────────────────────────────────────────────────────
 
 $("#refresh-btn").addEventListener("click", async () => {
@@ -447,4 +573,5 @@ $("#refresh-btn").addEventListener("click", async () => {
 });
 
 load();
+setInterval(refreshWhatsAppOnly, WZP_REFRESH_INTERVAL_MS);
 setInterval(() => load(false), REFRESH_INTERVAL_MS);

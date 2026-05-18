@@ -3,7 +3,7 @@
 
 import os
 
-# ADR-003: HF Offline + Fastembed Cache Bootstrap — docs/adr/003-hf-offline-env-bootstrap.md
+# ADR-003: HF Offline Bootstrap — docs/adr/003-hf-offline-env-bootstrap.md
 # Must run BEFORE any import that transitively pulls huggingface_hub.
 for _k, _v in {
     "HF_HUB_OFFLINE": "1",
@@ -14,7 +14,6 @@ for _k, _v in {
     "TRANSFORMERS_NO_ADVISORY_WARNINGS": "1",
     "TRANSFORMERS_VERBOSITY": "error",
     "TQDM_DISABLE": "1",
-    "FASTEMBED_CACHE_PATH": os.path.join(os.path.expanduser("~"), ".cache", "fastembed"),
 }.items():
     os.environ.setdefault(_k, _v)
 del _k, _v
@@ -1812,6 +1811,13 @@ def is_excluded(rel_path: str) -> bool:
       conversations/` — el legacy prefix sigue excluido más abajo por
       defense-in-depth para archivos viejos que el user no haya migrado.)
     """
+    try:
+        from rag.exclusions import is_path_blocked  # noqa: PLC0415
+
+        if is_path_blocked(rel_path):
+            return True
+    except Exception:
+        pass
     if any(seg.startswith(".") for seg in rel_path.split("/") if seg):
         return True
     if "/99-AI/skills/" in f"/{rel_path}":
@@ -2376,7 +2382,8 @@ def _context_summary_enabled() -> bool:
     # Legacy opt-out sigue ganando (defensivo: plists/scripts viejos que
     # lo setean no deben tener comportamiento ambiguo si alguien también
     # setea el opt-in nuevo).
-    if os.environ.get("OBSIDIAN_RAG_SKIP_CONTEXT_SUMMARY"):
+    skip_env = os.environ.get("OBSIDIAN_RAG_SKIP_CONTEXT_SUMMARY", "").strip().lower()
+    if skip_env and skip_env not in _FALSY_ENV_VALUES:
         return False
     val = os.environ.get("RAG_CONTEXT_SUMMARY", "").strip().lower()
     return val in ("1", "true", "yes")
@@ -3508,21 +3515,35 @@ def new_turn_id() -> str:
 _ignored_paths_cache: tuple[float, set[str]] = (0.0, set())
 
 
+def _blacklist_exact_paths() -> set[str]:
+    try:
+        from rag.exclusions import load_blacklist  # noqa: PLC0415
+
+        return {
+            str(p).strip().replace("\\", "/").lstrip("/")
+            for p in load_blacklist().get("paths", [])
+            if str(p).strip()
+        }
+    except Exception:
+        return set()
+
+
 def load_ignored_paths() -> set[str]:
     """Lee la lista de paths hard-ignored. Mtime-cached in-process."""
     global _ignored_paths_cache
+    central_paths = _blacklist_exact_paths()
     if not IGNORED_NOTES_PATH.is_file():
-        return set()
+        return central_paths
     try:
         mt = IGNORED_NOTES_PATH.stat().st_mtime
         if mt == _ignored_paths_cache[0]:
-            return _ignored_paths_cache[1]
+            return set(_ignored_paths_cache[1]) | central_paths
         data = json.loads(IGNORED_NOTES_PATH.read_text(encoding="utf-8"))
         result = set(data.get("paths", []))
         _ignored_paths_cache = (mt, result)
-        return result
+        return set(result) | central_paths
     except (json.JSONDecodeError, TypeError):
-        return set()
+        return central_paths
 
 
 def save_ignored_paths(paths: set[str]) -> None:
@@ -5985,12 +6006,12 @@ def get_db() -> SqliteVecCollection:
 
 def _db_quick_check(db_path: Path, db_name: str = "ragvec.db") -> bool:
     """Run PRAGMA quick_check on startup to detect corruption.
-    
+
     D5 (audit 2026-05-14): Corruption like "database disk image is malformed"
     can go undetected until a write fails. quick_check scans the database
     structure and returns 'ok' if valid, or a list of errors. We run this
     once at daemon startup to fail fast if the DB is corrupt.
-    
+
     Args:
         db_path: Path to the database directory (e.g., DB_PATH)
         db_name: Name of the database file (default "ragvec.db")
@@ -6634,7 +6655,7 @@ def _index_urls(
 
     ids = [f"{doc_id_prefix}::url::{i}" for i in range(len(urls))]
     contexts = [u["context"] for u in urls]
-    embeddings = embed(contexts)
+    embeddings = _embed_index_payloads_with_persistent_cache(contexts)
     metas = [
         {
             "file": doc_id_prefix,
@@ -7297,7 +7318,7 @@ def embed(texts: list[str]) -> list[list[float]]:
     arr = _model.encode(
         missing_texts,
         normalize_embeddings=True,
-        batch_size=int(os.environ.get("RAG_INDEX_LOCAL_EMBED_BATCH", "64")),
+        batch_size=_index_local_embed_batch_size(),
         convert_to_numpy=True,
         show_progress_bar=False,
     )
@@ -7432,6 +7453,89 @@ def _resolve_embed_backend() -> str:
     if raw and raw != "mlx" and os.environ.get("RAG_DEBUG"):
         print(f"[local-embed] RAG_EMBED_BACKEND={raw!r} no reconocido, usando 'mlx'", flush=True)
     return "mlx"
+
+
+def _index_system_memory_gb() -> float:
+    """Best-effort physical memory size used for index batch auto-tuning."""
+    try:
+        import psutil
+
+        return float(psutil.virtual_memory().total) / (1024**3)
+    except Exception:
+        pass
+    try:
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        page_count = int(os.sysconf("SC_PHYS_PAGES"))
+        if page_size > 0 and page_count > 0:
+            return float(page_size * page_count) / (1024**3)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _index_auto_batch_target(
+    *, backend: str | None = None, mem_gb: float | None = None
+) -> int:
+    """Auto-tuned flush size for index chunks before embedding."""
+    backend = backend or _resolve_embed_backend()
+    mem = _index_system_memory_gb() if mem_gb is None else float(mem_gb or 0.0)
+    if backend == "mlx":
+        if mem and mem < 16:
+            return 32
+        if mem and mem < 24:
+            return 64
+        if mem and mem < 48:
+            return 96
+        return 128
+    if mem and mem < 16:
+        return 16
+    if mem and mem < 32:
+        return 32
+    return 64
+
+
+def _index_auto_local_embed_batch_size(
+    *, backend: str | None = None, mem_gb: float | None = None
+) -> int:
+    """Auto-tuned internal forward batch for the local embedder."""
+    backend = backend or _resolve_embed_backend()
+    mem = _index_system_memory_gb() if mem_gb is None else float(mem_gb or 0.0)
+    if backend == "mlx":
+        if mem and mem < 16:
+            return 16
+        if mem and mem < 24:
+            return 32
+        if mem and mem < 48:
+            return 48
+        return 64
+    if mem and mem < 16:
+        return 16
+    if mem and mem < 32:
+        return 32
+    return 64
+
+
+def _index_auto_embed_slice_size(
+    batch_target: int,
+    *,
+    backend: str | None = None,
+    mem_gb: float | None = None,
+) -> int:
+    """Auto-tuned external slice size for index embed calls."""
+    local_batch = _index_auto_local_embed_batch_size(backend=backend, mem_gb=mem_gb)
+    return max(1, min(max(1, int(batch_target)), local_batch))
+
+
+def _index_local_embed_batch_size() -> int:
+    """Parse RAG_INDEX_LOCAL_EMBED_BATCH, supporting the safe-mode 'auto' value."""
+    raw = os.environ.get("RAG_INDEX_LOCAL_EMBED_BATCH", "64").strip().lower()
+    if raw in ("", "auto"):
+        return _index_auto_local_embed_batch_size()
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _index_auto_local_embed_batch_size()
+    return max(1, value)
 
 
 def _get_local_embedder():
@@ -7742,8 +7846,8 @@ def maybe_unload_local_embedder(force: bool = False) -> bool:
     except Exception:
         pass
     try:
-        import mlx.core as _mx  # type: ignore[import-not-found]
-        _mx.clear_cache()
+        from rag.llm_backend import clear_mlx_cache_safely  # noqa: PLC0415
+        clear_mlx_cache_safely()
     except Exception:
         pass
     try:
@@ -9607,14 +9711,12 @@ def get_reranker():
         # que necesiten determinismo del MPS allocator).
         if device == "mps" and os.environ.get("RAG_RERANKER_NO_CLEANUP", "").strip() not in ("1", "true", "yes"):
             _orig_predict = _reranker.predict
-            # Forward lock global — comparte con MLXBackend chat/embed
-            # (`_MLX_FORWARD_LOCK`). reranker bge corre en PyTorch MPS, NO MLX,
-            # pero comparte el mismo Metal device físico — un `predict()` en
-            # paralelo a un forward MLX de chat o embed colisiona en el
-            # command-buffer driver y dispara `kIOGPUCommandBufferCallback
-            # ErrorHang` (memo `obsidian_rag_web_service_gpu_hang_loop`,
-            # 2026-05-06, residual). Importamos lazy para no acoplar el
-            # CLI standalone al import de mlx_lm.
+            # Forward lock global — comparte con MLXBackend chat/embed.
+            # Este fallback PyTorch/MPS ya no es el default (el reranker
+            # operativo es MLX), pero si se fuerza comparte el mismo Metal
+            # device físico: un `predict()` en paralelo a un forward MLX puede
+            # disparar `kIOGPUCommandBufferCallbackErrorHang`. Importamos lazy
+            # para no acoplar el CLI standalone al import de mlx_lm.
             try:
                 from rag.llm_backend import _MLX_FORWARD_LOCK as _fwd_lock
             except ImportError:
@@ -17316,7 +17418,7 @@ def file_hash(raw: str) -> str:
 
 # Sidecar log for contradiction events. Phase 3 (weekly digest) reads this.
 # Schema (per-line JSON): {ts, subject_path, contradicts: [{path, why}], helper_raw}.
-CONTRADICTION_LOG_PATH = Path.home() / ".local/share/obsidian-rag/contradictions.jsonl"
+CONTRADICTION_LOG_PATH = _STATE_DIR / "contradictions.jsonl"
 
 
 def find_contradictions_for_note(
@@ -17652,7 +17754,7 @@ def _check_and_flag_contradictions(
 # tests already stub `_check_and_flag_contradictions` to a no-op so they
 # are unaffected.
 
-_CONTRA_PENDING_PATH = Path.home() / ".local/share/obsidian-rag" / "contradiction_pending.jsonl"
+_CONTRA_PENDING_PATH = _STATE_DIR / "contradiction_pending.jsonl"
 _CONTRA_WRITERS_LOCK = threading.Lock()
 _CONTRA_WRITERS: "set[threading.Thread]" = set()
 # Set during shutdown so workers that haven't entered the chat call yet
@@ -17663,12 +17765,12 @@ _CONTRA_SHUTDOWN_EVENT = threading.Event()
 # Cap concurrent contradiction workers (2026-05-12 audit). Pre-fix:
 # `_dispatch_contradiction_check` spawn-eaba 1 daemon thread por archivo sin
 # bound — 681 archivos => potencialmente 681 threads concurrentes, cada uno
-# cargando reranker bge MPS (~600MB), LLM helper, embed call. El `_MLX_FORWARD_LOCK`
-# secuencializa forwards Metal pero NO previene que 681 threads carguen el
-# reranker PyTorch MPS en paralelo. Este semaphore se adquiere DENTRO del
-# wrapper (no en el spawn) — el spawn sigue siendo non-blocking, las threads
-# quedan en queue dormida (~1MB stack c/u) hasta que el slot abre. Default 2
-# = mismo orden de magnitud que `_HELPER_SEM`.
+# intentando usar reranker, LLM y embeddings. El `_MLX_FORWARD_LOCK`
+# secuencializa forwards Metal, pero no conviene crear cientos de threads
+# esperando GPU. Este semaphore se adquiere DENTRO del wrapper (no en el
+# spawn): el spawn sigue siendo non-blocking y las threads quedan en queue
+# dormida (~1MB stack c/u) hasta que el slot abre. Default 2 = mismo orden
+# de magnitud que `_HELPER_SEM`.
 try:
     _CONTRA_MAX_WORKERS = max(1, int(os.environ.get("RAG_CONTRADICTION_MAX_WORKERS", "2")))
 except ValueError:
@@ -17928,10 +18030,10 @@ def _dispatch_contradiction_check(
 # State file para idempotencia: `~/.local/share/obsidian-rag/ambient_state.jsonl`
 # con `{path, hash, analyzed_at}`. Skip si la misma combinación corrió hace <5min.
 
-AMBIENT_CONFIG_PATH = Path.home() / ".local/share/obsidian-rag/ambient.json"
-AMBIENT_STATE_PATH = Path.home() / ".local/share/obsidian-rag/ambient_state.jsonl"
+AMBIENT_CONFIG_PATH = _STATE_DIR / "ambient.json"
+AMBIENT_STATE_PATH = _STATE_DIR / "ambient_state.jsonl"
 AMBIENT_DEDUP_WINDOW_SEC = 300   # 5 min
-AMBIENT_LOG_PATH = Path.home() / ".local/share/obsidian-rag/ambient.jsonl"
+AMBIENT_LOG_PATH = _STATE_DIR / "ambient.jsonl"
 # WhatsApp bridge local HTTP endpoint (whatsapp-mcp/whatsapp-bridge).
 # Default :8088 desde 2026-05-07 — Caddy holds :8080 como redirector HTTP
 # (pfctl 80→8080). El bridge Go lee `WHATSAPP_BRIDGE_PORT` env, default
@@ -18063,10 +18165,9 @@ def health_import_cmd(days: int, export_path: str | None):
     final. Setup: en iPhone → Health → tap profile → "Export Health Data"
     → "Save to Files" → iCloud Drive/Health/.
     """
-    console.print(
+    Console(stderr=True).print(
         "[yellow][deprecated][/yellow] `rag health-import` está deprecated. "
-        "Usá `rag index --source health` en su lugar.",
-        err=True,
+        "Usá `rag index --source health` en su lugar."
     )
     from rag.integrations.apple_health import import_export_xml
     from pathlib import Path as _Path
@@ -20861,6 +20962,134 @@ def _ambient_hook(
 # resolved on `rag` namespace by the shim.
 
 
+def _merge_index_tags(fm_tags: list[str], inline_tags: list[str]) -> list[str]:
+    """Merge frontmatter and inline tags preserving first-seen order."""
+    tags = list(fm_tags)
+    seen = {t for t in tags}
+    for t in inline_tags:
+        if t not in seen:
+            tags.append(t)
+            seen.add(t)
+    return tags
+
+
+def _read_indexable_note_raw(path: Path, doc_id_prefix: str) -> str:
+    """Read markdown as the indexer sees it, including source-specific filters."""
+    raw = path.read_text(encoding="utf-8", errors="ignore")
+    if _conversations_indexable(doc_id_prefix):
+        raw = _strip_conversation_user_queries(raw)
+    return raw
+
+
+def _prepare_index_file_entry(
+    *,
+    col: SqliteVecCollection,
+    path: Path,
+    vault: Path,
+    doc_id_prefix: str,
+    raw: str,
+    file_hash: str,
+    folder: str,
+    check_contradictions: bool,
+) -> dict | None:
+    """Build the chunk/metadata payload for one markdown file, without embedding.
+
+    This is shared by `_index_single_file` and the bulk `rag index` loop so the
+    two paths do not drift on aliases, inline tags, tasks, wikilink expansion,
+    `created_ts`, or optional enrichment gates. Returns `None` when the file
+    legitimately produces no chunks.
+    """
+    h = file_hash
+    fm = parse_frontmatter(raw)
+    fm_tags = _normalize_fm_tags(fm)
+    outlinks = extract_wikilinks(raw)
+    text = clean_md(raw)
+    text = _enrich_body_with_ocr(text, path, vault, images_source=raw)
+
+    inline_tags = extract_inline_tags(text)
+    tags = _merge_index_tags(fm_tags, inline_tags)
+
+    if check_contradictions:
+        updated = _dispatch_contradiction_check(col, path, text, doc_id_prefix)
+        if updated:
+            raw, h = updated
+            fm = parse_frontmatter(raw)
+            fm_tags = _normalize_fm_tags(fm)
+            outlinks = extract_wikilinks(raw)
+            tags = _merge_index_tags(fm_tags, inline_tags)
+
+    aliases = _normalize_fm_aliases(fm)
+    task_stats = extract_tasks(text)
+    wikilink_bits: list[str] = []
+    if _wikilink_expansion_enabled():
+        wikilink_bits = _wikilink_expansion_bits(outlinks, vault, path)
+
+    ctx_summary = get_context_summary(text, h, path.stem, folder)
+    synth_qs = get_synthetic_questions(text, h, path.stem, folder)
+
+    chunks = semantic_chunks(
+        text, path.stem, folder, tags, fm,
+        context_summary=ctx_summary,
+        synthetic_questions=synth_qs,
+        aliases=aliases,
+        task_stats=task_stats,
+        wikilink_bits=wikilink_bits,
+    )
+    if not chunks:
+        return None
+
+    ids = [f"{doc_id_prefix}::{i}" for i in range(len(chunks))]
+    embed_texts = [c[0] for c in chunks]
+    display_texts = [c[1] for c in chunks]
+    parent_texts = [c[2] for c in chunks]
+    embed_texts = _contextual_retrieval.contextualize_chunks(
+        embed_texts=embed_texts,
+        display_texts=display_texts,
+        doc_id=doc_id_prefix,
+        parent_doc_text=text,
+        doc_metadata={"title": path.stem, "folder": folder, "note": path.stem},
+    )
+
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = time.time()
+    created_ts = _note_created_ts(raw, mtime)
+
+    base_meta = {
+        "file": doc_id_prefix,
+        "note": path.stem,
+        "folder": folder,
+        "tags": ",".join(tags),
+        "hash": h,
+        "outlinks": ",".join(outlinks),
+        "created_ts": created_ts,
+        "source": _infer_vault_source(doc_id_prefix),
+    }
+    if aliases:
+        base_meta["aliases"] = aliases
+    if task_stats["open"] or task_stats["done"]:
+        base_meta["open_tasks"] = task_stats["open"]
+        base_meta["done_tasks"] = task_stats["done"]
+    for fm_key in FM_SEARCHABLE_FIELDS:
+        v = fm.get(fm_key)
+        if v not in (None, ""):
+            base_meta[fm_key] = str(v)
+
+    return {
+        "ids": ids,
+        "embed_texts": embed_texts,
+        "display_texts": display_texts,
+        "metadatas": [dict(base_meta, parent=p) for p in parent_texts],
+        "doc_id_prefix": doc_id_prefix,
+        "raw": raw,
+        "path": path,
+        "folder": folder,
+        "tags": tags,
+        "hash": h,
+    }
+
+
 def _index_single_file(
     col: SqliteVecCollection, path: Path, skip_contradict: bool = False,
     vault_path: Path | None = None,
@@ -20873,7 +21102,7 @@ def _index_single_file(
 
     `vault_path` lets callers (multi-vault `watch`) target a non-default
     vault without swapping the `VAULT_PATH` global. Defaults to `VAULT_PATH`.
-    
+
     `existing_hashes` is an optional pre-fetched dict mapping file paths to their
     current hashes in the collection. When provided, avoids a per-file SQL query.
     Used by `_run_index_inner` for batch optimization.
@@ -20909,194 +21138,47 @@ def _index_single_file(
             return "removed"
         return "empty"
 
-    raw = path.read_text(encoding="utf-8", errors="ignore")
-    # Conversations bot-only mode: si el path es de 99-AI/conversations/ y
-    # `RAG_INDEX_CONVERSATIONS_BOT_ONLY=1`, transformamos el raw antes de
-    # cualquier procesamiento. Eso asegura que el hash refleja el contenido
-    # destinado al index (sólo bot answers), no el original con queries.
-    if _conversations_indexable(doc_id_prefix):
-        raw = _strip_conversation_user_queries(raw)
-    # Hash incluye mtimes de imágenes embebidas — si una screenshot en la
-    # nota se updateó pero el .md no cambió, seguimos forzando reindex
-    # para picar el OCR nuevo. `_file_hash_with_images` devuelve el hash
-    # base cuando la nota no tiene embeds (no overhead para la mayoría).
+    raw = _read_indexable_note_raw(path, doc_id_prefix)
     h = _file_hash_with_images(raw, path, vault)
     if existing_hash == h:
         return "skipped"
 
     folder = str(path.relative_to(vault).parent)
-    fm = parse_frontmatter(raw)
-    fm_tags = _normalize_fm_tags(fm)
-    outlinks = extract_wikilinks(raw)  # parsed on raw; clean_md strips the syntax
-    text = clean_md(raw)
-    # Enriquecimiento OCR: texto de imágenes embebidas se concatena al body
-    # antes del chunking. `images_source=raw` porque clean_md() strippea
-    # los `![[img.png]]` y el extractor los necesita intactos. No-op
-    # cuando la nota no tiene embeds o ocrmac no está disponible. Cache
-    # SQL por (image_path, mtime) evita re-OCR en reruns.
-    text = _enrich_body_with_ocr(text, path, vault, images_source=raw)
-
-    # Inline tags — ``#tag`` escritos en el body (post 2026-04-22). Se
-    # mergean con los de frontmatter preservando orden (FM primero,
-    # inline después) y deduplicando. Antes de este cambio el indexer
-    # los ignoraba, así que notas como "journal con #idea" eran
-    # invisibles al filtrado por tag.
-    inline_tags = extract_inline_tags(text)
-    tags = list(fm_tags)
-    seen_tags = {t for t in tags}
-    for t in inline_tags:
-        if t not in seen_tags:
-            tags.append(t)
-            seen_tags.add(t)
-
-    # Contradiction check runs before re-embedding so we only pay once. The
-    # collection still holds the old version of this note if any — we exclude
-    # `doc_id_prefix` from the candidate set regardless.
-    #
-    # `_dispatch_contradiction_check` is sync (returns `(raw, hash)` tuple)
-    # when `_CONTRADICTION_ASYNC=0` is set (tests / debug), or async (returns
-    # `None`, spawns daemon thread) in production. On the async path the
-    # frontmatter `contradicts:` lands seconds later and watch re-indexes
-    # naturally; idempotence inside `_check_and_flag_contradictions` prevents
-    # the loop from repeating when the set hasn't changed.
-    if not skip_contradict:
-        updated = _dispatch_contradiction_check(col, path, text, doc_id_prefix)
-        if updated:
-            raw, h = updated
-            fm = parse_frontmatter(raw)
-            fm_tags = _normalize_fm_tags(fm)
-            outlinks = extract_wikilinks(raw)
-            # Re-merge inline tags — the body text is derived from clean_md
-            # (no frontmatter mutation) so inline_tags stays valid.
-            tags = list(fm_tags)
-            seen_tags = {t for t in tags}
-            for t in inline_tags:
-                if t not in seen_tags:
-                    tags.append(t)
-                    seen_tags.add(t)
-
-    # Aliases (generalizado post 2026-04-22) — antes sólo se parseaban en
-    # `99-Mentions/`; ahora cualquier nota con `aliases:` en el FM los
-    # surface al prefix + extra_json. Handle both scalar and list forms.
-    aliases = _normalize_fm_aliases(fm)
-
-    # Tasks — contar pendientes + recoger texto de las primeras N abiertas
-    # para que el embedding las vea. Ver `extract_tasks` para los caps.
-    task_stats = extract_tasks(text)
-
-    # Wikilink expansion (opt-in via `RAG_WIKILINK_EXPANSION=1`). Resolve
-    # cada outlink al .md del vault y extrae una firma corta (clean body
-    # truncado) que se concatena al prefix. Caps arriba evitan que un hub
-    # con 50 links explote el prefix.
-    wikilink_bits: list[str] = []
-    if _wikilink_expansion_enabled():
-        wikilink_bits = _wikilink_expansion_bits(outlinks, vault, path)
-
-    # Contextual embedding: generate or retrieve cached document-level summary
-    # Parallelize context_summary and synthetic_questions calls (both are independent)
-    # Performance optimization: reduces cold-path time from ~1-2s to ~0.5-1s per file
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    
-    ctx_summary: str = ""
-    synth_qs: list[str] | None = None
-    
-    def _get_ctx():
-        return get_context_summary(text, h, path.stem, folder)
-    
-    def _get_synth():
-        return get_synthetic_questions(text, h, path.stem, folder)
-    
-    try:
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            future_ctx = executor.submit(_get_ctx)
-            future_synth = executor.submit(_get_synth)
-            
-            ctx_summary = future_ctx.result(timeout=30)
-            synth_qs = future_synth.result(timeout=30)
-    except Exception:
-        # Fallback to sequential if parallelization fails
-        ctx_summary = get_context_summary(text, h, path.stem, folder)
-        synth_qs = get_synthetic_questions(text, h, path.stem, folder)
-
-    chunks = semantic_chunks(
-        text, path.stem, folder, tags, fm,
-        context_summary=ctx_summary,
-        synthetic_questions=synth_qs,
-        aliases=aliases,
-        task_stats=task_stats,
-        wikilink_bits=wikilink_bits,
+    entry = _prepare_index_file_entry(
+        col=col,
+        path=path,
+        vault=vault,
+        doc_id_prefix=doc_id_prefix,
+        raw=raw,
+        file_hash=h,
+        folder=folder,
+        check_contradictions=not skip_contradict,
     )
-    if not chunks:
+    if entry is None:
+        if existing_ids:
+            with _collection_write_lock():
+                col.delete(ids=existing_ids)
+            try:
+                get_urls_db().delete(where={"file": doc_id_prefix})
+            except Exception as exc:
+                _silent_log("index_single_empty_urls_delete", exc)
         _invalidate_corpus_cache()
         return "empty"
 
-    ids = [f"{doc_id_prefix}::{i}" for i in range(len(chunks))]
-    embed_texts = [c[0] for c in chunks]
-    display_texts = [c[1] for c in chunks]
-    parent_texts = [c[2] for c in chunks]
-    # Contextual Retrieval (Anthropic, Sept 2024) — gated por
-    # `RAG_CONTEXTUAL_RETRIEVAL=1`. Si está OFF (default), `contextualize_chunks`
-    # devuelve `embed_texts` sin tocar (bit-idéntico al pre-feature).
-    # Si ON, prependea al embed_text un summary corto que ubica al chunk
-    # dentro del documento. Display_texts NO se modifican — el contexto
-    # vive sólo en el embedding, no en snippets ni en parent_text.
-    embed_texts = _contextual_retrieval.contextualize_chunks(
-        embed_texts=embed_texts,
-        display_texts=display_texts,
-        doc_id=doc_id_prefix,
-        parent_doc_text=text,
-        doc_metadata={"title": path.stem, "folder": folder, "note": path.stem},
-    )
-    embeddings = embed(embed_texts)
-
-    try:
-        mtime = path.stat().st_mtime
-    except OSError:
-        mtime = time.time()
-    created_ts = _note_created_ts(raw, mtime)
-
-    base_meta = {
-        "file": doc_id_prefix, "note": path.stem, "folder": folder,
-        "tags": ",".join(tags), "hash": h,
-        "outlinks": ",".join(outlinks),
-        "created_ts": created_ts,
-        # Cross-source discriminator (Phase 1). Old rows without this field
-        # default to "vault" via `normalize_source` at read time, so this is
-        # pure forward-compat — no re-embed required on upgrade.
-        # `_infer_vault_source` carves out `99-AI/memory/` → source="memory"
-        # so memo entries don't dominate top-k via vault's weight=1.00.
-        "source": _infer_vault_source(doc_id_prefix),
-    }
-    # Aliases → `extra_json` (list form preserved). Downstream readers
-    # merge `extra_json` into the meta dict via `_row_to_meta`, so
-    # `meta["aliases"]` comes back as the original list.
-    if aliases:
-        base_meta["aliases"] = aliases
-    # Task counts → `extra_json` as primitive ints. `open_tasks` is the
-    # useful signal; `done_tasks` is bookkeeping (nice-to-have for
-    # analytics / "qué cerré esta semana").
-    if task_stats["open"] or task_stats["done"]:
-        base_meta["open_tasks"] = task_stats["open"]
-        base_meta["done_tasks"] = task_stats["done"]
-    for fm_key in FM_SEARCHABLE_FIELDS:
-        v = fm.get(fm_key)
-        if v not in (None, ""):
-            base_meta[fm_key] = str(v)
-
-    metadatas = [dict(base_meta, parent=p) for p in parent_texts]
-    # Serialize delete+add so concurrent indexers can't leave the collection
-    # in a half-written state. existing_ids is stale at this point (another
-    # process may have just re-indexed the same file with the same hash —
-    # which would have landed on identical ids, so deleting them is safe).
+    ids = entry["ids"]
+    display_texts = entry["display_texts"]
+    metadatas = entry["metadatas"]
+    embeddings = embed(entry["embed_texts"])
+    stale_ids = [eid for eid in existing_ids if eid not in set(ids)]
     with _collection_write_lock():
-        if existing_ids:
-            col.delete(ids=existing_ids)
         col.add(
             ids=ids,
             embeddings=embeddings,
             documents=display_texts,
             metadatas=metadatas,
         )
+        if stale_ids:
+            col.delete(ids=stale_ids)
     # Entity extraction — populates rag_entities + rag_entity_mentions so
     # `RAG_ENTITY_LOOKUP` (default ON post-2026-04-21) stays fresh as the
     # vault evolves. Gated by `_entity_extraction_enabled()` + silent-fail
@@ -21105,9 +21187,16 @@ def _index_single_file(
     _extract_and_index_entities_for_chunks(display_texts, ids, metadatas, "vault")
     # URL sub-index runs in lockstep — same hash gate, same liveness window.
     try:
-        _index_urls(get_urls_db(), doc_id_prefix, raw, path.stem, folder, tags)
-    except Exception:
-        pass
+        _index_urls(
+            get_urls_db(),
+            doc_id_prefix,
+            entry["raw"],
+            path.stem,
+            folder,
+            entry["tags"],
+        )
+    except Exception as exc:
+        _silent_log("index_single_urls", exc)
     # Persist context summary cache after each file in watch/incremental mode.
     _save_context_cache()
     _save_synthetic_q_cache()
@@ -21117,7 +21206,7 @@ def _index_single_file(
     # related/dupe analysis. Pure best-effort; any failure is logged, never
     # blocks indexing.
     try:
-        _ambient_hook(col, path, doc_id_prefix, h)
+        _ambient_hook(col, path, doc_id_prefix, entry["hash"])
     except Exception as e:
         _ambient_log_event({
             "cmd": "ambient_hook_error",
@@ -21198,7 +21287,42 @@ _ETL_QUIET_REASONS = frozenset({
 })
 
 
-def _run_cross_source_etls(vault_path: Path) -> None:
+def _index_etl_freshness_enabled() -> bool:
+    raw = os.environ.get("RAG_INDEX_ETL_FRESHNESS")
+    if raw is None and os.environ.get("PYTEST_CURRENT_TEST"):
+        return False
+    return _env_truthy("RAG_INDEX_ETL_FRESHNESS", default=True)
+
+
+def _index_etl_parallel_enabled() -> bool:
+    raw = os.environ.get("RAG_INDEX_ETL_PARALLEL")
+    if raw is None and os.environ.get("PYTEST_CURRENT_TEST"):
+        return False
+    return _env_truthy("RAG_INDEX_ETL_PARALLEL", default=True)
+
+
+def _index_etl_fresh_ttl_s() -> float:
+    try:
+        return max(0.0, float(os.environ.get("RAG_INDEX_ETL_FRESH_TTL_S", "600")))
+    except (TypeError, ValueError):
+        return 600.0
+
+
+def _index_etl_target_has_snapshot(vault_path: Path, target: object) -> bool:
+    if not isinstance(target, str) or not target.strip():
+        return False
+    root = vault_path / target
+    if root.is_file():
+        return True
+    if not root.is_dir():
+        return False
+    try:
+        return any(root.rglob("*.md"))
+    except OSError:
+        return False
+
+
+def _run_cross_source_etls(vault_path: Path, *, reset: bool = False) -> dict:
     """Pre-index hook: corre los 12 ETLs cross-source que escriben `.md`
     al vault para que el rglob posterior los absorba (MOZE, WhatsApp,
     Reminders, Calendar, Chrome, Gmail, GitHub, Claude, YouTube,
@@ -21227,19 +21351,129 @@ def _run_cross_source_etls(vault_path: Path) -> None:
             f"seteá `cross_source_target` en ~/.config/obsidian-rag/vaults.json "
             f"para opt-in)[/dim]"
         )
-        return
+        return {"total_ms": 0, "records": [], "skipped": True}
+
+    _run_t0 = time.perf_counter()
+    _records: list[dict] = []
+
+    def _record(label: str, kind: str, stats: dict, ms: int) -> None:
+        _records.append({
+            "label": label,
+            "kind": kind,
+            "ok": bool(stats.get("ok")),
+            "reason": stats.get("reason"),
+            "duration_ms": int(ms),
+            "files_written": int(stats.get("files_written") or 0),
+            "freshness_skip": bool(stats.get("freshness_skip")),
+            "stale_snapshot": bool(stats.get("stale_snapshot")),
+            "target": stats.get("target"),
+        })
+
+    def _maybe_fresh_skip(label: str, kind: str) -> dict | None:
+        if not _index_etl_freshness_enabled():
+            return None
+        ttl_s = _index_etl_fresh_ttl_s()
+        if ttl_s <= 0:
+            return None
+        try:
+            from rag.index_etl_state import freshness_decision  # noqa: PLC0415
+
+            decision = freshness_decision(DB_PATH, kind, ttl_s=ttl_s)
+        except Exception as exc:
+            _silent_log("index_etl_freshness_decision", exc)
+            return None
+        if not decision.should_skip:
+            return None
+        previous = decision.previous or {}
+        target = previous.get("target")
+        if target and not _index_etl_target_has_snapshot(vault_path, target):
+            return None
+        age_s = 0.0 if decision.age_s is None else max(0.0, decision.age_s)
+        return {
+            "ok": True,
+            "files_written": 0,
+            "reason": f"fresh {age_s:.0f}s",
+            "freshness_skip": True,
+            "target": target,
+        }
+
+    def _persist_source_state(kind: str, stats: dict, ms: int) -> None:
+        if stats.get("freshness_skip"):
+            return
+        try:
+            from rag.index_etl_state import record_source  # noqa: PLC0415
+
+            record_source(DB_PATH, kind, stats=stats, duration_ms=ms)
+        except Exception as exc:
+            _silent_log("index_etl_record_source", exc)
+
+    def _run_measured_etl(label: str, fn, kind: str) -> tuple[str, str, dict, int]:
+        skipped = _maybe_fresh_skip(label, kind)
+        if skipped is not None:
+            return label, kind, skipped, 0
+        _t_etl = time.perf_counter()
+        try:
+            stats = fn(vault_path)
+            if not isinstance(stats, dict):
+                stats = {"ok": False, "reason": f"bad_stats:{type(stats).__name__}"}
+        except Exception as exc:
+            stats = {"ok": False, "reason": str(exc)[:160], "exception": True}
+        _ms = int((time.perf_counter() - _t_etl) * 1000)
+        if (
+            not stats.get("ok")
+            and stats.get("target")
+            and _index_etl_target_has_snapshot(vault_path, stats.get("target"))
+        ):
+            stats["stale_snapshot"] = True
+        return label, kind, stats, _ms
+
+    def _print_measured_etl(label: str, kind: str, stats: dict, ms: int) -> None:
+        if stats.get("freshness_skip"):
+            console.print(
+                f"[dim]{label} sync: skip ({stats.get('reason', 'fresh')}, cache-state)[/dim]"
+            )
+            return
+        if stats.get("ok") and stats.get("files_written"):
+            detail = _format_etl_detail(kind, stats)
+            console.print(
+                f"[dim]{label} sync: {stats['files_written']} archivo(s) → "
+                f"{stats['target']}/ ({detail}, {ms}ms)[/dim]"
+            )
+        elif stats.get("ok"):
+            _reason = stats.get("reason") or "sin cambios"
+            console.print(
+                f"[dim]{label} sync: skip ({_reason}, {ms}ms)[/dim]"
+            )
+        elif (
+            not stats.get("ok")
+            and stats.get("reason") is not None
+            and stats.get("reason") not in _ETL_QUIET_REASONS
+        ):
+            suffix = " · stale snapshot" if stats.get("stale_snapshot") else ""
+            console.print(f"[yellow]{label} sync: {stats['reason']} ({ms}ms){suffix}[/yellow]")
+        else:
+            stale = " · stale snapshot" if stats.get("stale_snapshot") else ""
+            console.print(
+                f"[dim]{label} sync: skip ({stats.get('reason','no-data')}, {ms}ms){stale}[/dim]"
+            )
 
     # MOZE export → monthly markdown notes, in-place under the vault so the
     # regular rglob picks them up. Silent if no CSV; hash-skip keeps reruns
     # free when nothing changed.
+    _t_moze = time.perf_counter()
     try:
         moze_stats = _sync_moze_notes(vault_path)
+        _ms = int((time.perf_counter() - _t_moze) * 1000)
+        _persist_source_state("moze", moze_stats if isinstance(moze_stats, dict) else {"ok": False}, _ms)
+        _record("MOZE", "moze", moze_stats if isinstance(moze_stats, dict) else {"ok": False}, _ms)
         if moze_stats.get("ok") and moze_stats.get("months_written"):
             console.print(
                 f"[dim]MOZE sync: {moze_stats['months_written']} notas nuevas/modificadas "
                 f"de {moze_stats['months_total']} meses → {moze_stats['target']}/[/dim]"
             )
     except Exception as exc:
+        _ms = int((time.perf_counter() - _t_moze) * 1000)
+        _record("MOZE", "moze", {"ok": False, "reason": str(exc)[:160]}, _ms)
         console.print(f"[yellow]MOZE sync falló: {exc}[/yellow]")
 
     # Tarjetas de crédito (xlsx del banco) → 1 nota .md por (tarjeta, ciclo).
@@ -21249,8 +21483,12 @@ def _run_cross_source_etls(vault_path: Path) -> None:
     # Ahora indexamos las notas para habilitar retrieval semántico:
     # `retrieve("gastos visa marzo")` levanta la nota correcta aunque el
     # pre-router no fire. El tool live se mantiene en paralelo (REGLA 1.b).
+    _t_cards = time.perf_counter()
     try:
         cards_stats = _sync_credit_cards_notes(vault_path)
+        _ms = int((time.perf_counter() - _t_cards) * 1000)
+        _persist_source_state("credit-cards", cards_stats if isinstance(cards_stats, dict) else {"ok": False}, _ms)
+        _record("Tarjetas", "credit-cards", cards_stats if isinstance(cards_stats, dict) else {"ok": False}, _ms)
         if cards_stats.get("ok") and cards_stats.get("files_written"):
             console.print(
                 f"[dim]Tarjetas sync: {cards_stats['files_written']} notas nuevas/modificadas "
@@ -21262,14 +21500,20 @@ def _run_cross_source_etls(vault_path: Path) -> None:
                 f"{cards_stats['files_total']} sin cambios)[/dim]"
             )
     except Exception as exc:
+        _ms = int((time.perf_counter() - _t_cards) * 1000)
+        _record("Tarjetas", "credit-cards", {"ok": False, "reason": str(exc)[:160]}, _ms)
         console.print(f"[yellow]Tarjetas sync falló: {exc}[/yellow]")
 
     # WhatsApp ETL → reads whatsapp-bridge SQLite and writes deterministic
     # monthly per-chat `.md` notes for human/task links. The vector corpus
     # still uses `rag index --source whatsapp`; these notes are excluded from
     # the normal vault rglob to avoid duplicate chunks.
+    _t_wa = time.perf_counter()
     try:
         wa_stats = _sync_whatsapp_notes(vault_path)
+        _ms = int((time.perf_counter() - _t_wa) * 1000)
+        _persist_source_state("whatsapp", wa_stats if isinstance(wa_stats, dict) else {"ok": False}, _ms)
+        _record("WhatsApp", "whatsapp", wa_stats if isinstance(wa_stats, dict) else {"ok": False}, _ms)
         if wa_stats.get("ok") and wa_stats.get("files_written"):
             console.print(
                 f"[dim]WhatsApp sync: {wa_stats['files_written']} notas nuevas/modificadas "
@@ -21283,13 +21527,15 @@ def _run_cross_source_etls(vault_path: Path) -> None:
         ):
             console.print(f"[yellow]WhatsApp sync: {wa_stats['reason']}[/yellow]")
     except Exception as exc:
+        _ms = int((time.perf_counter() - _t_wa) * 1000)
+        _record("WhatsApp", "whatsapp", {"ok": False, "reason": str(exc)[:160]}, _ms)
         console.print(f"[yellow]WhatsApp sync falló: {exc}[/yellow]")
 
     # External-source ETLs (Phase 1, no auth): Apple Reminders, Apple Calendar,
     # Chrome history (+ derived YouTube). All silent-fail when the source is
     # unavailable (no Apple, no icalBuddy, Chrome locked) so `rag index` keeps
     # working on hosts without these tools.
-    for label, fn, kind in (
+    _external_etls = (
         ("Reminders",  _sync_reminders_notes,        "reminders"),
         ("Calendar",   _sync_apple_calendar_notes,   "events"),
         ("Chrome",     _sync_chrome_history,         "urls"),
@@ -21315,40 +21561,47 @@ def _run_cross_source_etls(vault_path: Path) -> None:
         # como notas .md al vault. macOS rota el db cada ~30d, las notas
         # son la única forma de tener histórico más allá de eso.
         ("Screentime", _sync_screentime_notes,       "screentime"),
-    ):
-        _t_etl = time.perf_counter()
+    )
+    _parallel = _index_etl_parallel_enabled()
+    _max_workers = 1
+    if _parallel:
         try:
-            stats = fn(vault_path)
-            _ms = int((time.perf_counter() - _t_etl) * 1000)
-            if stats.get("ok") and stats.get("files_written"):
-                detail = _format_etl_detail(kind, stats)
-                console.print(
-                    f"[dim]{label} sync: {stats['files_written']} archivo(s) → "
-                    f"{stats['target']}/ ({detail}, {_ms}ms)[/dim]"
-                )
-            elif stats.get("ok"):
-                # Hash-skip path: nothing changed. Print compact line con la
-                # razón explícita ("sin cambios" o equivalente del stats) para
-                # que el user no se pregunte por qué skipeó (antes: solo
-                # mostraba el ms sin contexto).
-                _reason = stats.get("reason") or "sin cambios"
-                console.print(
-                    f"[dim]{label} sync: skip ({_reason}, {_ms}ms)[/dim]"
-                )
-            elif (
-                not stats.get("ok")
-                and stats.get("reason") is not None
-                and stats.get("reason") not in _ETL_QUIET_REASONS
-            ):
-                console.print(f"[yellow]{label} sync: {stats['reason']} ({_ms}ms)[/yellow]")
-            else:
-                # Skipped silently (no creds / no source available). Still
-                # show one dim line so the count of ETLs in the run is clear.
-                console.print(
-                    f"[dim]{label} sync: skip ({stats.get('reason','no-data')})[/dim]"
-                )
-        except Exception as exc:
-            console.print(f"[yellow]{label} sync falló: {exc}[/yellow]")
+            _max_workers = max(1, int(os.environ.get("RAG_INDEX_ETL_MAX_WORKERS", "6")))
+        except (TypeError, ValueError):
+            _max_workers = 6
+    _results: list[tuple[str, str, dict, int] | None] = [None] * len(_external_etls)
+    if _parallel and len(_external_etls) > 1 and _max_workers > 1:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(_max_workers, len(_external_etls)),
+            thread_name_prefix="rag-index-etl",
+        ) as _pool:
+            _futs = {
+                _pool.submit(_run_measured_etl, label, fn, kind): idx
+                for idx, (label, fn, kind) in enumerate(_external_etls)
+            }
+            for _fut in concurrent.futures.as_completed(_futs):
+                idx = _futs[_fut]
+                try:
+                    _results[idx] = _fut.result()
+                except Exception as exc:
+                    label, _fn, kind = _external_etls[idx]
+                    _results[idx] = (
+                        label,
+                        kind,
+                        {"ok": False, "reason": str(exc)[:160], "exception": True},
+                        0,
+                    )
+    else:
+        for idx, (label, fn, kind) in enumerate(_external_etls):
+            _results[idx] = _run_measured_etl(label, fn, kind)
+
+    for result in _results:
+        if result is None:
+            continue
+        label, kind, stats, _ms = result
+        _print_measured_etl(label, kind, stats, _ms)
+        _persist_source_state(kind, stats, _ms)
+        _record(label, kind, stats, _ms)
 
     # Chrome bookmarks: actualizan la collection URLs (no escriben `.md` al
     # vault, a diferencia de las ETLs de arriba). Idempotente — borra y
@@ -21360,6 +21613,8 @@ def _run_cross_source_etls(vault_path: Path) -> None:
     try:
         bm_stats = sync_chrome_bookmarks()
         _ms = int((time.perf_counter() - _t_bm) * 1000)
+        _persist_source_state("bookmarks", {"ok": True, **bm_stats}, _ms)
+        _record("Bookmarks", "bookmarks", {"ok": True, **bm_stats}, _ms)
         profiles = bm_stats.get("profiles", 0)
         total = bm_stats.get("total", 0)
         if profiles > 0:
@@ -21372,7 +21627,35 @@ def _run_cross_source_etls(vault_path: Path) -> None:
         else:
             console.print(f"[dim]Bookmarks sync: skip (no Chrome) ({_ms}ms)[/dim]")
     except Exception as exc:
+        _ms = int((time.perf_counter() - _t_bm) * 1000)
+        _record("Bookmarks", "bookmarks", {"ok": False, "reason": str(exc)[:160]}, _ms)
         console.print(f"[yellow]Bookmarks sync falló: {exc}[/yellow]")
+
+    _total_ms = int((time.perf_counter() - _run_t0) * 1000)
+    if _records:
+        _top = sorted(_records, key=lambda r: int(r.get("duration_ms") or 0), reverse=True)[:5]
+        _parts = [
+            f"{r['label']}={int(r.get('duration_ms') or 0)}ms"
+            + (" fresh" if r.get("freshness_skip") else "")
+            for r in _top
+        ]
+        console.print(
+            f"[dim]Cross-source timing: total={_total_ms}ms · "
+            f"{' · '.join(_parts)}[/dim]"
+        )
+    try:
+        from rag.index_etl_state import record_run  # noqa: PLC0415
+
+        record_run(
+            DB_PATH,
+            vault=str(vault_path),
+            reset=reset,
+            total_ms=_total_ms,
+            records=_records,
+        )
+    except Exception as exc:
+        _silent_log("index_etl_record_run", exc)
+    return {"total_ms": _total_ms, "records": _records, "skipped": False}
 
 
 _FALSY_ENV_VALUES = ("0", "false", "no", "off")
@@ -21407,51 +21690,121 @@ def _temporary_env_defaults(defaults: dict[str, str]):
 
 def _index_safe_defaults() -> dict[str, str]:
     """Conservative defaults for every vault `rag index` run."""
-    return {
+    out = {
         # Bound MLX/SentenceTransformer peak allocations for docs and URL
-        # contexts. Incremental runs keep enrichment on, but still cap bursts.
-        "RAG_INDEX_EMBED_SLICE_SIZE": "16",
+        # contexts. LLM enrichments are controlled separately below.
+        "RAG_INDEX_EMBED_SLICE_SIZE": "auto",
         "RAG_INDEX_FILE_CHUNK_SLICE_SIZE": "128",
-        "RAG_INDEX_LOCAL_EMBED_BATCH": "16",
+        "RAG_INDEX_LOCAL_EMBED_BATCH": "auto",
+        "RAG_INDEX_BATCH_EMBEDS": "1",
+        "RAG_INDEX_BATCH_SIZE": "auto",
+        "RAG_EXTRACT_ENTITIES": "0",
         # Make pressure response fast enough for a one-shot CLI process.
         "RAG_MEMORY_PRESSURE_INTERVAL": "15",
         "RAG_MEMORY_PRESSURE_COOLDOWN_S": "45",
-        "RAG_MEMORY_PRESSURE_SWAP_GB": "1.0",
+        # Existing macOS swap can stay high long after the pressure event that
+        # created it. Do not turn stale system swap into per-file sleeps or a
+        # backend switch; guard on used% and this process RSS instead.
+        "RAG_MEMORY_PRESSURE_SWAP_GB": "0",
         "RAG_MEMORY_PRESSURE_THRESHOLD": "82",
         # Yield between flushes by default. No-op for unchanged incremental
         # passes because skipped files never flush.
         "RAG_INDEX_BATCH_SLEEP_MS": "50",
         "RAG_INDEX_PREFLIGHT_MEMORY_GUARD": "1",
         "RAG_INDEX_MEMORY_GUARD_INTERVAL_S": "5",
-        "RAG_INDEX_MEMORY_PRESSURE_SLEEP_S": "10",
+        "RAG_INDEX_MEMORY_PRESSURE_SLEEP_S": "1",
+        # Pre-sync ETLs: keep repeated full rebuilds measurable and bounded.
+        "RAG_INDEX_ETL_FRESHNESS": "1",
+        "RAG_INDEX_ETL_FRESH_TTL_S": "600",
+        "RAG_INDEX_ETL_PARALLEL": "1",
+        "RAG_INDEX_ETL_MAX_WORKERS": "6",
+        "RAG_REMINDERS_OSASCRIPT_TIMEOUT_S": "5",
         # If pressure persists into a danger zone, abort the index cleanly.
         # A failed index is much cheaper than a frozen machine.
         "RAG_INDEX_ABORT_ON_MEMORY_PRESSURE": "1",
-        "RAG_INDEX_ABORT_USED_PCT": "92",
-        "RAG_INDEX_ABORT_SWAP_GB": "2.0",
+        "RAG_INDEX_ABORT_USED_PCT": "0",
+        "RAG_INDEX_ABORT_SWAP_GB": "0",
         "RAG_INDEX_ABORT_SELF_RSS_GB": "18.0",
     }
+    if not _env_truthy("RAG_INDEX_LLM_ENRICHMENTS", default=False):
+        # LLM/helper enrichments are optional index-time hints and dominate
+        # wallclock when many notes changed. Keep normal `rag index` as a pure
+        # parse+embed pass unless the operator explicitly opts in.
+        out["OBSIDIAN_RAG_SKIP_CONTEXT_SUMMARY"] = "1"
+        out["OBSIDIAN_RAG_SKIP_SYNTHETIC_Q"] = "1"
+        out["RAG_CONTEXTUAL_RETRIEVAL"] = "0"
+        out["RAG_INDEX_SKIP_CONTRADICTIONS"] = "1"
+    return out
 
 
 def _index_full_safe_defaults() -> dict[str, str]:
     """Extra defaults that make `rag index --full` bounded.
 
-    The full rebuild still embeds every note. It skips optional enrichment and
-    uses smaller embed batches unless the operator disables safe mode with
+    The full rebuild still embeds every note. It disables heavy non-LLM
+    enrichment unless the operator disables safe mode with
     `RAG_INDEX_FULL_SAFE=0` or overrides individual resource env vars.
     """
     out = _index_safe_defaults()
     out.update({
         # Optional enrichment: useful, but not worth co-loading helper LLM /
         # GLiNER during a full rebuild while the web daemon may be resident.
-        "OBSIDIAN_RAG_SKIP_SYNTHETIC_Q": "1",
         "RAG_EXTRACT_ENTITIES": "0",
-        "RAG_INDEX_EMBED_SLICE_SIZE": "8",
-        "RAG_INDEX_FILE_CHUNK_SLICE_SIZE": "64",
-        "RAG_INDEX_LOCAL_EMBED_BATCH": "8",
-        "RAG_INDEX_BATCH_SLEEP_MS": "150",
     })
+    if not _env_truthy("RAG_INDEX_LLM_ENRICHMENTS", default=False):
+        out["OBSIDIAN_RAG_SKIP_SYNTHETIC_Q"] = "1"
     return out
+
+
+def _index_embed_cache_enabled() -> bool:
+    """Whether index-time persistent embedding cache should be used.
+
+    Default is ON for real runs. During pytest the default is OFF unless a test
+    explicitly sets RAG_INDEX_EMBED_CACHE=1, so unit tests with fake 1-dim
+    embedders never pollute the user's real cache.
+    """
+    raw = os.environ.get("RAG_INDEX_EMBED_CACHE")
+    if raw is None and os.environ.get("PYTEST_CURRENT_TEST"):
+        return False
+    return _env_truthy("RAG_INDEX_EMBED_CACHE", default=True)
+
+
+def _index_embed_cache_model_id() -> str:
+    """Exact cache identity for index embeddings."""
+    max_seq = os.environ.get("RAG_LOCAL_EMBED_MAX_SEQ_LEN", "512").strip() or "512"
+    return (
+        f"index-embedding-v1|model={EMBED_MODEL}|"
+        f"backend={_resolve_embed_backend()}|max_seq={max_seq}"
+    )
+
+
+def _embed_index_payloads_with_persistent_cache(texts: list[str]) -> list[list[float]]:
+    """Embed index payloads with persistent exact-match cache when enabled."""
+    if not texts:
+        return []
+    if not _index_embed_cache_enabled():
+        return embed(texts)
+    try:
+        from rag.embedding_cache import embed_texts_cached  # noqa: PLC0415
+
+        vectors, stats = embed_texts_cached(
+            texts,
+            db_dir=DB_PATH,
+            model_id=_index_embed_cache_model_id(),
+            namespace="index-payload-v1",
+            embed_fn=embed,
+        )
+        try:
+            record_cache_event(
+                "index_embed_persistent",
+                hits=stats.hits,
+                misses=stats.misses,
+            )
+        except Exception:
+            pass
+        return vectors
+    except Exception as exc:
+        _silent_log("index_embed_cache_direct", exc)
+        return embed(texts)
 
 
 def _index_process_rss_gb() -> float | None:
@@ -21462,6 +21815,13 @@ def _index_process_rss_gb() -> float | None:
         return psutil.Process(os.getpid()).memory_info().rss / (1024**3)
     except Exception:
         return None
+
+
+def _index_contradictions_enabled(*, reset: bool, no_contradict: bool) -> bool:
+    """Whether bulk indexing should run index-time contradiction checks."""
+    if reset or no_contradict:
+        return False
+    return not _env_truthy("RAG_INDEX_SKIP_CONTRADICTIONS", default=False)
 
 
 def _index_preflight_memory_guard(where: str, *, status=None) -> None:
@@ -21506,8 +21866,8 @@ def _index_preflight_memory_guard(where: str, *, status=None) -> None:
         except Exception as exc:
             _silent_log(f"index_preflight_memory_guard_handle:{where}", exc)
         try:
-            import mlx.core as _mx_core
-            _mx_core.clear_cache()
+            from rag.llm_backend import clear_mlx_cache_safely  # noqa: PLC0415
+            clear_mlx_cache_safely()
         except Exception:
             pass
         try:
@@ -21521,7 +21881,20 @@ def _index_preflight_memory_guard(where: str, *, status=None) -> None:
             sleep_s = 0.0
         if sleep_s > 0:
             if status is not None:
-                status.update(f"[cyan]Preparando index[/cyan] · swap alto ({swap_gb:.1f}GB) · pausa {sleep_s:.0f}s")
+                if (
+                    swap_gb is not None
+                    and swap_threshold > 0
+                    and swap_gb >= swap_threshold
+                ):
+                    pressure_label = f"swap alto ({swap_gb:.1f}GB)"
+                elif pct is not None:
+                    pressure_label = f"memoria alta ({pct:.1f}%)"
+                else:
+                    pressure_label = "presión de memoria"
+                status.update(
+                    f"[cyan]Preparando index[/cyan] · {pressure_label} · "
+                    f"pausa {sleep_s:.0f}s"
+                )
             time.sleep(sleep_s)
         pct_after = _system_memory_used_pct()
         swap_after = _system_swap_used_gb()
@@ -21544,10 +21917,6 @@ def _index_preflight_memory_guard(where: str, *, status=None) -> None:
             )
         )
         if abort:
-            # Si la presión viene del swap (GPU VRAM comprimida) pero el RSS
-            # del proceso es razonable, caer a CPU embed en lugar de abortar.
-            # Evita el crash Metal OOM que ocurre cuando el embedder MLX no
-            # puede alocar VRAM con swap alto.
             rss_abort = (
                 rss_after is not None
                 and abort_self_rss_gb > 0
@@ -21558,14 +21927,26 @@ def _index_preflight_memory_guard(where: str, *, status=None) -> None:
                     f"index abortado antes de {where} por RSS excesivo del proceso "
                     f"(rss_gb={rss_after:.1f} >= {abort_self_rss_gb:.1f})."
                 )
-            # Swap/RAM pressure pero proceso sano → fallback CPU embed.
-            if os.environ.get("RAG_EMBED_BACKEND", "mlx").lower() not in ("pytorch", "torch", "cpu"):
-                os.environ["RAG_EMBED_BACKEND"] = "pytorch"
-                os.environ["OBSIDIAN_RAG_EMBED_DEVICE"] = "cpu"
-                global _local_embedder
-                _local_embedder = None
-                if status is not None:
-                    status.update(f"[cyan]Preparando index[/cyan] · CPU fallback (swap={swap_after:.1f}GB)")
+            abort_pct = (
+                pct_after is not None
+                and abort_used_pct > 0
+                and pct_after >= abort_used_pct
+            )
+            abort_swap = (
+                swap_after is not None
+                and abort_swap_gb > 0
+                and swap_after >= abort_swap_gb
+            )
+            if abort_pct:
+                raise RuntimeError(
+                    f"index abortado antes de {where} por presión de memoria "
+                    f"del sistema (used_pct={pct_after:.1f} >= {abort_used_pct:.1f})."
+                )
+            if abort_swap:
+                raise RuntimeError(
+                    f"index abortado antes de {where} por swap alto "
+                    f"(swap_gb={swap_after:.1f} >= {abort_swap_gb:.1f})."
+                )
     except RuntimeError:
         raise
     except Exception as exc:
@@ -21685,7 +22066,10 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
     except Exception as exc:
         _silent_log("vlm_caption_budget_reset", exc)
     # Contradiction check only runs in incremental mode and when not opted out.
-    check_contradictions = not reset and not no_contradict
+    check_contradictions = _index_contradictions_enabled(
+        reset=reset,
+        no_contradict=no_contradict,
+    )
 
     # Drain any contradiction checks that got spilled to the pending JSONL on
     # a previous exit (ctrl-C mid-index, backend down mid-run, etc). No-op if
@@ -21721,6 +22105,8 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
 
     col_urls = get_urls_db()
     urls_indexed = 0
+    etl_time_s = 0.0
+    etl_records: list[dict] = []
 
     # Cross-source ETLs (MOZE, WhatsApp, Gmail, Calendar, Reminders, Chrome,
     # Drive, GitHub, Claude, YT, Spotify) escriben `.md` al vault para que
@@ -21733,7 +22119,13 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
     if os.environ.get("RAG_SKIP_CROSS_SOURCE_ETLS", "").strip().lower() not in ("", "0", "false", "no"):
         console.print("[dim]Cross-source ETLs salteados (RAG_SKIP_CROSS_SOURCE_ETLS=1).[/dim]")
     else:
-        _run_cross_source_etls(VAULT_PATH)
+        _etl_summary = _run_cross_source_etls(VAULT_PATH, reset=reset)
+        try:
+            etl_time_s = float(_etl_summary.get("total_ms") or 0) / 1000.0
+            etl_records = list(_etl_summary.get("records") or [])
+        except Exception:
+            etl_time_s = 0.0
+            etl_records = []
         if _env_truthy("RAG_INDEX_PREFLIGHT_MEMORY_GUARD", default=False):
             with console.status("[cyan]Preparando index...[/cyan]") as _st:
                 _index_preflight_memory_guard("post-etl", status=_st)
@@ -21774,10 +22166,30 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
                 md_files = [max(md_files, key=lambda p: p.stat().st_mtime)]
     console.print(f"[cyan]Indexando {len(md_files)} notas...[/cyan]")
 
-    indexed_files = set()
+    # For orphan cleanup, "indexed_files" means files that still exist in the
+    # current scan, not files that embedded successfully. A per-file failure
+    # must not make valid old chunks look orphaned and get deleted.
+    indexed_files = {str(p.relative_to(VAULT_PATH)) for p in md_files}
     added_chunks = 0
     updated_files = 0
     skipped_files = 0
+    empty_files = 0
+    failed_files = 0
+    prep_time_s = 0.0
+    embed_time_s = 0.0
+    write_time_s = 0.0
+    url_time_s = 0.0
+    embed_cache_hits = 0
+    embed_cache_misses = 0
+    embed_cache_stores = 0
+    embed_cache_errors = 0
+    try:
+        _slow_file_threshold_s = max(
+            0.0,
+            float(os.environ.get("RAG_INDEX_SLOW_FILE_LOG_S", "5")),
+        )
+    except (TypeError, ValueError):
+        _slow_file_threshold_s = 5.0
     # Progress bar explícito — antes usábamos `rich.progress.track`, pero
     # rich detecta `is_terminal=False` en algunos wrappers (Ghostty + pipes,
     # Devin terminal, `rag chat /reindex` desde un Live group) y silencia
@@ -21794,6 +22206,7 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
         TimeElapsedColumn(),
         TextColumn("•"),
         TimeRemainingColumn(),
+        TextColumn("• [dim]{task.fields[file]}[/dim]"),
         TextColumn("• [dim]+{task.fields[chunks]} chunks · "
                    "~{task.fields[updated]} upd · "
                    "={task.fields[skipped]} skip[/dim]"),
@@ -21802,7 +22215,7 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
     )
     task_id = progress.add_task(
         "indexing", total=len(md_files),
-        chunks=0, updated=0, skipped=0,
+        chunks=0, updated=0, skipped=0, file="",
     )
     progress.start()
 
@@ -21811,56 +22224,49 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
     # del embed call (in-process MPS encode amortiza el setup del kernel
     # sobre el batch entero). Para 6157 chunks: 2101 calls → ~400 calls.
     #
-    # Gateado por `RAG_INDEX_BATCH_EMBEDS`. Default depende del backend:
-    #
-    #   - PyTorch/MPS embedder (`RAG_EMBED_BACKEND=pytorch`): default ON.
-    #     El batched path acumula chunks de N notas y manda `embed()` en
-    #     batches grandes. Reduce overhead del kernel setup MPS y baja
-    #     2101→400 calls para 6157 chunks.
-    #   - MLX embedder (default post-Ola 9): default OFF (mantenido por
-    #     precaución). El bug original (2026-05-08, GPU Hang en batched path)
-    #     fue causado por Metal memory acumulada entre embed de docs y embed
-    #     de URLs sin `mx.clear_cache()` entre ellos. Arreglado en 2026-05-15
-    #     en `_flush_batch` (clear_cache entre embeds) y en `_encode_batch`
-    #     (clear_cache post-forward). Para habilitar el batched path MLX:
-    #     `RAG_INDEX_BATCH_EMBEDS=1 RAG_INDEX_BATCH_SIZE=8`.
-    #     Probá primero con un vault pequeño antes de aplicar a full vault.
+    # Gateado por `RAG_INDEX_BATCH_EMBEDS`. Default ON para PyTorch y MLX.
+    # El bug original MLX (2026-05-08, GPU Hang en batched path) fue causado
+    # por Metal memory acumulada entre embed de docs y embed de URLs sin
+    # `mx.clear_cache()` entre ellos. Arreglado en 2026-05-15 en `_flush_batch`
+    # (clear_cache entre embeds) y en `_encode_batch` (clear_cache post-forward).
+    # Safe mode mantiene slices chicos, así que batching reduce overhead sin
+    # volver al pico de memoria del path viejo.
     #
     # Override manual: `RAG_INDEX_BATCH_EMBEDS=1` fuerza el batched path.
     # `=0` fuerza no-batched aunque PyTorch.
     #
-    # Tamaño configurable via `RAG_INDEX_BATCH_SIZE` (default auto-tuned based
-    # on available memory). Solo aplica cuando batched está ON.
-    # Auto-tuning heuristic: 16 chunks for <16GB RAM, 32 for 16-32GB, 64 for >32GB.
-    # Override via env var if needed.
-    _embed_backend = os.environ.get("RAG_EMBED_BACKEND", "mlx").strip().lower()
-    _batch_default = "0" if _embed_backend == "mlx" else "1"
+    # Tamaño configurable via `RAG_INDEX_BATCH_SIZE` (default "auto", tuned
+    # by backend + available memory). Solo aplica cuando batched está ON.
+    _batch_default = "1"
     _batch_enabled = os.environ.get(
         "RAG_INDEX_BATCH_EMBEDS", _batch_default
     ).strip().lower() not in ("0", "false", "no")
     
-    # Auto-tune batch size based on available memory
-    try:
-        import psutil
-        mem_gb = psutil.virtual_memory().total / (1024**3)
-        if mem_gb < 16:
-            _batch_auto = 16
-        elif mem_gb < 32:
-            _batch_auto = 32
-        else:
-            _batch_auto = 64
-    except ImportError:
-        _batch_auto = 16  # fallback if psutil unavailable
+    # Auto-tune batch size based on backend + available memory. MLX benefits
+    # from larger flushes now that the persistent cache makes many texts cheap
+    # cache lookups and _index_embed_texts still slices the actual forward.
+    mem_gb = _index_system_memory_gb()
+    backend = _resolve_embed_backend()
+    _batch_auto = _index_auto_batch_target(backend=backend, mem_gb=mem_gb)
     
     try:
-        _batch_target = int(os.environ.get("RAG_INDEX_BATCH_SIZE", str(_batch_auto)))
+        _batch_raw = os.environ.get("RAG_INDEX_BATCH_SIZE", "auto").strip().lower()
+        _batch_target = _batch_auto if _batch_raw in ("", "auto") else int(_batch_raw)
     except (TypeError, ValueError):
         _batch_target = _batch_auto
     if _batch_target < 1:
         _batch_target = 1
 
     try:
-        _embed_slice_size = int(os.environ.get("RAG_INDEX_EMBED_SLICE_SIZE", "0"))
+        _slice_raw = os.environ.get("RAG_INDEX_EMBED_SLICE_SIZE", "0").strip().lower()
+        if _slice_raw in ("", "auto"):
+            _embed_slice_size = _index_auto_embed_slice_size(
+                _batch_target,
+                backend=backend,
+                mem_gb=mem_gb,
+            )
+        else:
+            _embed_slice_size = int(_slice_raw)
     except (TypeError, ValueError):
         _embed_slice_size = 0
     if _embed_slice_size < 0:
@@ -21874,6 +22280,17 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
         _file_chunk_slice_size = 0
     if _file_chunk_slice_size < 0:
         _file_chunk_slice_size = 0
+
+    try:
+        _local_embed_batch_size = _index_local_embed_batch_size()
+    except Exception:
+        _local_embed_batch_size = 0
+    console.print(
+        "[dim]Index tuning: "
+        f"backend={backend} · batch={_batch_target if _batch_enabled else 0} · "
+        f"slice={_embed_slice_size or 0} · local_batch={_local_embed_batch_size} · "
+        f"cache={'on' if _index_embed_cache_enabled() else 'off'}[/dim]"
+    )
 
     try:
         _memory_guard_interval_s = float(
@@ -21956,8 +22373,8 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
             except Exception as exc:
                 _silent_log("index_memory_guard_handle", exc)
             try:
-                import mlx.core as _mx_core
-                _mx_core.clear_cache()
+                from rag.llm_backend import clear_mlx_cache_safely  # noqa: PLC0415
+                clear_mlx_cache_safely()
             except Exception:
                 pass
             try:
@@ -21992,19 +22409,24 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
                         f"(rss_gb={rss_after:.1f} >= {abort_self_rss_gb:.1f}). "
                         "El índice queda parcial; reintentá cuando baje la presión."
                     )
-                # Swap/RAM pressure pero proceso sano → fallback CPU embed.
-                if os.environ.get("RAG_EMBED_BACKEND", "mlx").lower() not in ("pytorch", "torch", "cpu"):
-                    os.environ["RAG_EMBED_BACKEND"] = "pytorch"
-                    os.environ["OBSIDIAN_RAG_EMBED_DEVICE"] = "cpu"
-                    global _local_embedder
-                    _local_embedder = None
-                    console.print(f"[dim]↓ CPU fallback (swap={swap_after:.1f}GB)[/dim]")
+                if abort_pct:
+                    raise RuntimeError(
+                        "index abortado por presión de memoria del sistema "
+                        f"(used_pct={pct_after:.1f} >= {abort_used_pct:.1f}). "
+                        "El índice queda parcial; reintentá cuando baje la presión."
+                    )
+                if abort_swap:
+                    raise RuntimeError(
+                        "index abortado por swap alto "
+                        f"(swap_gb={swap_after:.1f} >= {abort_swap_gb:.1f}). "
+                        "El índice queda parcial; reintentá cuando baje la presión."
+                    )
         except Exception as exc:
             if isinstance(exc, RuntimeError) and str(exc).startswith("index abortado"):
                 raise
             _silent_log("index_memory_guard", exc)
 
-    def _index_embed_texts(texts: list[str]) -> list[list[float]]:
+    def _index_embed_texts_uncached(texts: list[str]) -> list[list[float]]:
         """Embed index payloads in bounded slices to cap transient memory."""
         if not texts:
             return []
@@ -22016,12 +22438,53 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
             _index_memory_guard()
             out.extend(embed(texts[start:start + _embed_slice_size]))
             try:
-                import mlx.core as _mx_core
-                _mx_core.clear_cache()
+                from rag.llm_backend import clear_mlx_cache_safely  # noqa: PLC0415
+                clear_mlx_cache_safely()
             except Exception:
                 pass
             _index_memory_guard()
         return out
+
+    def _index_embed_texts(texts: list[str]) -> list[list[float]]:
+        """Embed index payloads, reusing persistent exact-match cache."""
+        nonlocal embed_cache_hits, embed_cache_misses
+        nonlocal embed_cache_stores, embed_cache_errors
+        if not texts:
+            return []
+        if not _index_embed_cache_enabled():
+            return _index_embed_texts_uncached(texts)
+        try:
+            from rag.embedding_cache import embed_texts_cached  # noqa: PLC0415
+
+            vectors, stats = embed_texts_cached(
+                texts,
+                db_dir=DB_PATH,
+                model_id=_index_embed_cache_model_id(),
+                namespace="index-payload-v1",
+                embed_fn=_index_embed_texts_uncached,
+            )
+            embed_cache_hits += stats.hits
+            embed_cache_misses += stats.misses
+            embed_cache_stores += stats.stores
+            embed_cache_errors += stats.errors
+            try:
+                record_cache_event(
+                    "index_embed_persistent",
+                    hits=stats.hits,
+                    misses=stats.misses,
+                )
+            except Exception:
+                pass
+            if len(vectors) != len(texts):
+                raise RuntimeError(
+                    "embedding cache returned wrong length: "
+                    f"{len(vectors)} for {len(texts)}"
+                )
+            return vectors
+        except Exception as exc:
+            embed_cache_errors += 1
+            _silent_log("index_embed_cache", exc)
+            return _index_embed_texts_uncached(texts)
 
     if _memory_guard_interval_s > 0:
         _index_memory_guard(force=True)
@@ -22036,6 +22499,7 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
     # `pending_urls`: acumular URLs de múltiples archivos para batch index.
     # Cada entry: {file, note_title, folder, tags, urls: [{url, anchor, line, context}]}
     pending_urls: list[dict] = []
+    pending_url_deletes: list[str] = []
 
     def _flush_batch():
         """Embed all pending files en una llamada y commit a la collection.
@@ -22050,6 +22514,8 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
         WAL overhead y el lock contention en reindex de vault grande.
         """
         nonlocal added_chunks, urls_indexed, pending_chunk_count
+        nonlocal failed_files, skipped_files
+        nonlocal embed_time_s, write_time_s, url_time_s
         if not pending_files:
             return
         all_texts: list[str] = []
@@ -22059,6 +22525,7 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
             all_texts.extend(f["embed_texts"])
             offsets.append((start, len(all_texts)))
         embeddings: list | None = None
+        _t_embed = time.perf_counter()
         try:
             embeddings = _index_embed_texts(all_texts)
         except Exception as exc:
@@ -22072,6 +22539,7 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
                 except Exception as inner_exc:
                     _silent_log("index_batch_embed_per_file", inner_exc)
                     f["_failed"] = True
+        embed_time_s += time.perf_counter() - _t_embed
 
         # Collect valid chunks across ALL files for a single col.add() call.
         # One SQLite transaction for the entire flush instead of N.
@@ -22079,22 +22547,34 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
         batch_embs: list = []
         batch_docs: list[str] = []
         batch_metas: list[dict] = []
+        stale_ids: list[str] = []
 
         for f, (start, end) in zip(pending_files, offsets):
             if f.get("_failed"):
+                failed_files += 1
+                skipped_files += 1
                 continue
             embs = embeddings[start:end]
             if any(e is None for e in embs):
+                failed_files += 1
+                skipped_files += 1
                 continue
             batch_ids.extend(f["ids"])
             batch_embs.extend(embs)
             batch_docs.extend(f["display_texts"])
             batch_metas.extend(f["metadatas"])
+            if f.get("delete_stale", True):
+                keep_ids = set(f.get("all_ids") or f["ids"])
+                stale_ids.extend(
+                    eid for eid in (f.get("existing_ids") or [])
+                    if eid not in keep_ids
+                )
             # Acumular URLs para batch processing. Cuando una nota gigante se
             # shardea en varias entries, solo la primera indexa URLs para no
             # duplicar los records.
             if f.get("index_urls", True):
                 try:
+                    pending_url_deletes.append(f["doc_id_prefix"])
                     urls = extract_urls(f["raw"])
                     if urls:
                         pending_urls.append({
@@ -22106,22 +22586,28 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
                         })
                 except Exception:
                     pass
-            indexed_files.add(f["doc_id_prefix"])
-
         # Single col.add() → single WAL write + one lock acquisition.
+        wrote_main = not batch_ids
         if batch_ids:
+            _t_write = time.perf_counter()
             try:
-                col.add(ids=batch_ids, embeddings=batch_embs,
-                        documents=batch_docs, metadatas=batch_metas)
+                with _collection_write_lock():
+                    col.add(ids=batch_ids, embeddings=batch_embs,
+                            documents=batch_docs, metadatas=batch_metas)
+                    if stale_ids:
+                        col.delete(ids=stale_ids)
                 added_chunks += len(batch_ids)
+                wrote_main = True
             except Exception as exc:
                 _silent_log("index_flush_col_add", exc)
-            try:
-                _extract_and_index_entities_for_chunks(
-                    batch_docs, batch_ids, batch_metas, "vault"
-                )
-            except Exception as exc:
-                _silent_log("index_batch_entities", exc)
+            write_time_s += time.perf_counter() - _t_write
+            if wrote_main:
+                try:
+                    _extract_and_index_entities_for_chunks(
+                        batch_docs, batch_ids, batch_metas, "vault"
+                    )
+                except Exception as exc:
+                    _silent_log("index_batch_entities", exc)
 
         pending_files.clear()
         pending_chunk_count = 0
@@ -22131,19 +22617,19 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
         # fragmentado por el primero y dispara GPU Hang en MLX.
         # `mx.clear_cache()` es no-op si mlx no está importado.
         try:
-            import mlx.core as _mx_core
-            _mx_core.clear_cache()
+            from rag.llm_backend import clear_mlx_cache_safely  # noqa: PLC0415
+            clear_mlx_cache_safely()
         except Exception:
             pass
 
         # Batch process URLs: delete old + embed + add new
-        if pending_urls:
+        if wrote_main and (pending_url_deletes or pending_urls):
+            _t_url = time.perf_counter()
             try:
                 # Delete stale URLs for ALL files en UN SOLO query via $in.
                 # Era un loop get+delete por archivo (N queries → 1 query).
-                all_files_with_urls = [u["file"] for u in pending_urls]
                 try:
-                    col_urls.delete(where={"file": {"$in": all_files_with_urls}})
+                    col_urls.delete(where={"file": {"$in": list(set(pending_url_deletes))}})
                 except Exception as exc:
                     _silent_log("index_batch_urls_delete", exc)
 
@@ -22202,6 +22688,11 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
             except Exception as exc:
                 _silent_log("index_batch_urls", exc)
             pending_urls.clear()
+            pending_url_deletes.clear()
+            url_time_s += time.perf_counter() - _t_url
+        elif pending_url_deletes or pending_urls:
+            pending_urls.clear()
+            pending_url_deletes.clear()
 
         # Throttle: ceder CPU/GPU entre batches cuando RAG_INDEX_BATCH_SLEEP_MS > 0.
         # Permite que el web server, WA listener y otras tareas sigan respondiendo
@@ -22229,16 +22720,21 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
                 (start, min(start + _file_chunk_slice_size, n_chunks))
                 for start in range(0, n_chunks, _file_chunk_slice_size)
             ]
+        last_shard_idx = len(shards) - 1
 
         for shard_idx, (start, end) in enumerate(shards):
             if start == 0 and end == n_chunks:
                 shard = file_entry
                 shard["index_urls"] = True
+                shard["delete_stale"] = True
+                shard["all_ids"] = file_entry["ids"]
             else:
                 shard = dict(file_entry)
                 for key in ("ids", "embed_texts", "display_texts", "metadatas"):
                     shard[key] = file_entry[key][start:end]
                 shard["index_urls"] = shard_idx == 0
+                shard["delete_stale"] = shard_idx == last_shard_idx
+                shard["all_ids"] = file_entry["ids"]
             pending_files.append(shard)
             pending_chunk_count += len(shard["ids"])
             if not _batch_enabled or pending_chunk_count >= _batch_target:
@@ -22254,12 +22750,17 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
 
     try:
         for path in md_files:
-            progress.advance(task_id)
+            file_t0 = time.perf_counter()
+            try:
+                _rel_for_progress = str(path.relative_to(VAULT_PATH))
+            except Exception:
+                _rel_for_progress = path.name
             progress.update(
                 task_id,
                 chunks=added_chunks,
                 updated=updated_files,
                 skipped=skipped_files,
+                file=_rel_for_progress[-80:],
             )
             # Per-file try/except (bug #4 fix, 2026-05-06): proteger el
             # cuerpo del loop ante exceptions levantadas por archivos
@@ -22271,133 +22772,76 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
             # skip + continuar con el próximo archivo. Audit completo:
             # `99-AI/system/embedder-fix-2026-05-06/iteration-bug-audit-fk0sbr29.md`.
             try:
-                doc_id_prefix = str(path.relative_to(VAULT_PATH))
+                doc_id_prefix = _rel_for_progress
                 folder = str(path.relative_to(VAULT_PATH).parent)
-                raw = path.read_text(encoding="utf-8", errors="ignore")
-                # Hash con mtimes de imágenes embebidas — paridad con
-                # `_index_single_file`: una screenshot updateada (sin cambio en el
-                # .md) fuerza reindex para picar el OCR nuevo.
+                raw = _read_indexable_note_raw(path, doc_id_prefix)
                 h = _file_hash_with_images(raw, path, VAULT_PATH)
 
                 # Skip unchanged files (hash matches what's stored)
                 existing = file_to_chunks.get(doc_id_prefix, [])
                 if existing and all(eh == h for _, eh in existing):
-                    indexed_files.add(doc_id_prefix)
                     skipped_files += 1
                     continue
 
-                fm = parse_frontmatter(raw)
-                tags = _normalize_fm_tags(fm)
-                outlinks = extract_wikilinks(raw)
-                text = clean_md(raw)
-                # OCR enrichment: concat el texto de imágenes embebidas al body
-                # antes del chunking. `images_source=raw` porque clean_md() strippea
-                # los `![[img.png]]`. Gated por cache + ocrmac availability.
-                text = _enrich_body_with_ocr(text, path, VAULT_PATH, images_source=raw)
-
-                # Before touching the collection for this file, check whether the
-                # incoming content contradicts anything already in the vault. When
-                # it does, the note's frontmatter is rewritten in place and we pick
-                # up the new raw/hash here.
-                #
-                # Uses `_dispatch_contradiction_check` so bulk `rag index` doesn't
-                # block on a 5-10s chat-model call per file — the daemon thread
-                # writes `contradicts:` in the background and the next incremental
-                # pass picks it up (idempotent if unchanged).
-                if check_contradictions:
-                    updated = _dispatch_contradiction_check(col, path, text, doc_id_prefix)
-                    if updated:
-                        raw, h = updated
-                        fm = parse_frontmatter(raw)
-                        tags = _normalize_fm_tags(fm)
-                        outlinks = extract_wikilinks(raw)
-
-                # File changed (or new) — remove any stale chunks first
-                if existing:
-                    col.delete(ids=[eid for eid, _ in existing])
-                    updated_files += 1
-
-                # Contextual embedding: generate or retrieve cached document-level summary
-                ctx_summary = get_context_summary(text, h, path.stem, folder)
-                synth_qs = get_synthetic_questions(text, h, path.stem, folder)
-
-                chunks = semantic_chunks(
-                    text, path.stem, folder, tags, fm,
-                    context_summary=ctx_summary,
-                    synthetic_questions=synth_qs,
+                _t_prep = time.perf_counter()
+                entry = _prepare_index_file_entry(
+                    col=col,
+                    path=path,
+                    vault=VAULT_PATH,
+                    doc_id_prefix=doc_id_prefix,
+                    raw=raw,
+                    file_hash=h,
+                    folder=folder,
+                    check_contradictions=check_contradictions,
                 )
-                if not chunks:
-                    indexed_files.add(doc_id_prefix)
+                prep_time_s += time.perf_counter() - _t_prep
+
+                existing_ids = [eid for eid, _ in existing]
+                if entry is None:
+                    empty_files += 1
+                    if existing_ids:
+                        with _collection_write_lock():
+                            col.delete(ids=existing_ids)
+                        try:
+                            col_urls.delete(where={"file": doc_id_prefix})
+                        except Exception as exc:
+                            _silent_log("index_empty_urls_delete", exc)
+                        updated_files += 1
                     continue
-
-                ids = [f"{doc_id_prefix}::{i}" for i in range(len(chunks))]
-                embed_texts = [c[0] for c in chunks]
-                display_texts = [c[1] for c in chunks]
-                parent_texts = [c[2] for c in chunks]
-                # Contextual Retrieval (Anthropic, Sept 2024) — mismo wrap que
-                # `_index_single_file`. Gated por `RAG_CONTEXTUAL_RETRIEVAL=1`.
-                # Display_texts/parent_texts no se mutan — el contexto vive
-                # sólo en el embedding.
-                embed_texts = _contextual_retrieval.contextualize_chunks(
-                    embed_texts=embed_texts,
-                    display_texts=display_texts,
-                    doc_id=doc_id_prefix,
-                    parent_doc_text=text,
-                    doc_metadata={"title": path.stem, "folder": folder, "note": path.stem},
-                )
-
-                # Metadata carries hash + searchable frontmatter fields for filtering.
-                base_meta = {
-                    "file": doc_id_prefix,
-                    "note": path.stem,
-                    "folder": folder,
-                    "tags": ",".join(tags),
-                    "hash": h,
-                    "outlinks": ",".join(outlinks),
-                    # Cross-source discriminator (Phase 1). See `_index_single_file`
-                    # for the same field on the incremental path.
-                    "source": _infer_vault_source(doc_id_prefix),
-                }
-                for fm_key in FM_SEARCHABLE_FIELDS:
-                    v = fm.get(fm_key)
-                    if v not in (None, ""):
-                        base_meta[fm_key] = str(v)
-
-                metadatas = []
-                for p in parent_texts:
-                    meta = dict(base_meta)
-                    meta["parent"] = p
-                    metadatas.append(meta)
 
                 # Encolar en pending_files; el embed real corre en `_flush_batch`
                 # cuando el contador llega al target. Notas enormes se shardean
                 # para que un solo archivo no rompa el límite de memoria.
-                _enqueue_pending_file({
-                    "ids": ids,
-                    "embed_texts": embed_texts,
-                    "display_texts": display_texts,
-                    "metadatas": metadatas,
-                    "doc_id_prefix": doc_id_prefix,
-                    "raw": raw,
-                    "path": path,
-                    "folder": folder,
-                    "tags": tags,
-                })
-            except OSError as exc:
+                entry["existing_ids"] = existing_ids
+                _enqueue_pending_file(entry)
+                if existing:
+                    updated_files += 1
+            except Exception as exc:
                 # Aislar el daño a este archivo. Log silent + traceback (para
                 # diagnóstico del root cause del bug #4) + sumar al contador
                 # de skips para que el resumen final muestre cuántos quedaron
                 # afuera. Continúa con el próximo archivo.
-                try:
-                    rel = str(path.relative_to(VAULT_PATH))
-                except Exception:
-                    rel = str(path)
                 _silent_log(
-                    f"run_index_per_file:{rel[:120]}",
+                    f"run_index_per_file:{_rel_for_progress[:120]}",
                     exc,
                     with_traceback=True,
                 )
+                failed_files += 1
                 skipped_files += 1
+            finally:
+                file_dt = time.perf_counter() - file_t0
+                if _slow_file_threshold_s > 0 and file_dt >= _slow_file_threshold_s:
+                    console.print(
+                        f"[dim]slow index file: {file_dt:.1f}s · "
+                        f"{_rel_for_progress}[/dim]"
+                    )
+                progress.advance(task_id)
+                progress.update(
+                    task_id,
+                    chunks=added_chunks,
+                    updated=updated_files,
+                    skipped=skipped_files,
+                )
         # Final flush — drena el pending de la última batch parcial.
         _flush_batch()
         # Final flush of postfix counters antes de stop().
@@ -22459,12 +22903,39 @@ def _run_index_inner(reset: bool, no_contradict: bool, col) -> dict:
         f"{urls_indexed} URLs indexadas · "
         f"{len(orphan_files)} huérfanas limpiadas.[/green]"
     )
+    _cache_suffix = ""
+    if embed_cache_hits or embed_cache_misses or embed_cache_stores or embed_cache_errors:
+        _cache_suffix = (
+            f" · cache={embed_cache_hits}h/{embed_cache_misses}m/"
+            f"{embed_cache_stores}s"
+        )
+        if embed_cache_errors:
+            _cache_suffix += f"/{embed_cache_errors}e"
+    console.print(
+        f"[dim]Timing index: prep={prep_time_s:.1f}s · "
+        f"etl={etl_time_s:.1f}s · "
+        f"embed={embed_time_s:.1f}s · write={write_time_s:.1f}s · "
+        f"urls={url_time_s:.1f}s · empty={empty_files} · "
+        f"failed={failed_files}{_cache_suffix}[/dim]"
+    )
     return {
         "added_chunks": added_chunks,
         "updated_files": updated_files,
         "urls_indexed": urls_indexed,
         "orphans": len(orphan_files),
         "total_files": len(md_files),
+        "empty_files": empty_files,
+        "failed_files": failed_files,
+        "etl_time_s": etl_time_s,
+        "etl_records": etl_records,
+        "prep_time_s": prep_time_s,
+        "embed_time_s": embed_time_s,
+        "write_time_s": write_time_s,
+        "url_time_s": url_time_s,
+        "embed_cache_hits": embed_cache_hits,
+        "embed_cache_misses": embed_cache_misses,
+        "embed_cache_stores": embed_cache_stores,
+        "embed_cache_errors": embed_cache_errors,
     }
 
 
@@ -22559,7 +23030,7 @@ def _peek_index_lock_holder() -> str:
               help="Re-embed total: borra la colección y reindexa todo el vault desde cero. "
                    "Usar tras bump de schema o cambio de modelo. Sin este flag, `rag index` "
                    "es incremental (skippea archivos cuyo hash no cambió). Safe mode ON por "
-                   "default; RAG_INDEX_FULL_SAFE=0 re-activa enriquecimientos.")
+                   "default; RAG_INDEX_LLM_ENRICHMENTS=1 re-activa enriquecimientos LLM.")
 @click.option("--reset", "reset_legacy", is_flag=True, hidden=True,
               help="(deprecated) alias histórico de --full. Será removido en una próxima versión.")
 @click.option("--no-contradict", is_flag=True, help="Saltear el check de contradicciones en notas nuevas/modificadas")
@@ -22582,11 +23053,10 @@ def _peek_index_lock_holder() -> str:
                    "internamente. Combinar con --full para full re-embed "
                    "con contextos chunk-level (~1 LLM call por chunk).")
 @click.option("--fast", is_flag=True,
-              help="Modo rápido: saltea enriquecimientos LLM opcionales "
+              help="Modo rápido extra: saltea enriquecimientos LLM opcionales "
                    "(context summary, synthetic questions, contextual retrieval) "
                    "y los pre-syncs cross-source (gmail/calendar/whatsapp/etc). "
-                   "Acelera ~10x el `--full` a cambio de un index sin "
-                   "summaries enriquecidos. Los chunks se embeben igual.")
+                   "Útil para `--full` o catch-up manual: los chunks se embeben igual.")
 def index(full_flag: bool, reset_legacy: bool, no_contradict: bool, source_opt: str | None,
           since_opt: str | None, dry_run: bool, max_chats: int | None,
           vault_scope: str | None, contextual: bool, fast: bool):
@@ -22638,18 +23108,36 @@ def index(full_flag: bool, reset_legacy: bool, no_contradict: bool, source_opt: 
     except (TypeError, ValueError):
         _wait_s = 300.0
     try:
-        _index_lock_ctx = _index_process_lock(wait_seconds=_wait_s)
+        _index_lock_ctx = _index_process_lock(wait_seconds=0)
         _index_lock_ctx.__enter__()
     except BlockingIOError:
         holder = _peek_index_lock_holder()
-        msg = (
-            "[yellow]Otro `rag index` ya está activo[/yellow] "
-            f"(holder: {holder or 'desconocido'}). Esperé {_wait_s:.0f}s y no "
-            f"liberó el lock. Probá de nuevo cuando termine, o liberá el lock "
-            f"con `rm {INDEX_PROCESS_LOCK}` si sabés que el holder murió mal."
-        )
-        console.print(msg)
-        sys.exit(1)
+        if _wait_s > 0:
+            console.print(
+                "[yellow]Otro `rag index` ya está activo[/yellow] "
+                f"(holder: {holder or 'desconocido'}). "
+                f"Esperando hasta {_wait_s:.0f}s para tomar el lock..."
+            )
+            try:
+                _index_lock_ctx = _index_process_lock(wait_seconds=_wait_s)
+                _index_lock_ctx.__enter__()
+            except BlockingIOError:
+                holder = _peek_index_lock_holder()
+                console.print(
+                    "[yellow]Otro `rag index` ya está activo[/yellow] "
+                    f"(holder: {holder or 'desconocido'}). Esperé {_wait_s:.0f}s "
+                    "y no liberó el lock. Probá de nuevo cuando termine, o "
+                    f"liberá el lock con `rm {INDEX_PROCESS_LOCK}` si sabés "
+                    "que el holder murió mal."
+                )
+                sys.exit(1)
+        else:
+            console.print(
+                "[yellow]Otro `rag index` ya está activo[/yellow] "
+                f"(holder: {holder or 'desconocido'}). "
+                "No esperé porque RAG_INDEX_LOCK_WAIT_SECONDS<=0."
+            )
+            sys.exit(1)
     # --vault resolution: validar + swap VAULT_PATH globals via _with_vault.
     # Bare `rag index` ahora recorre el scope operativo completo (home + work)
     # para que ningún vault quede stale. `--source ...` se mantiene single-
@@ -22720,8 +23208,8 @@ def index(full_flag: bool, reset_legacy: bool, no_contradict: bool, source_opt: 
             console.print(
                 "[cyan]--fast activo[/cyan] — context summary, synthetic "
                 "questions, contextual retrieval y cross-source pre-syncs "
-                "salteados. Para activar batching más agresivo y embed local "
-                "MPS exportá `RAG_INDEX_BATCH_SIZE=128 RAG_INDEX_LOCAL_EMBED=1`."
+                "salteados. Batching MLX y cache persistente quedan activos "
+                "por default."
             )
         try:
             if not _target_vaults:
@@ -23121,6 +23609,38 @@ def _watch_filter_path(
     return p
 
 
+_WATCH_TRANSIENT_INDEX_ATTEMPTS = 3
+_WATCH_TRANSIENT_INDEX_RETRY_BASE_S = 0.25
+_WATCH_TRANSIENT_INDEX_ERROR_RE = re.compile(
+    r"(database is locked|database table is locked|database is busy|disk I/O error)",
+    re.IGNORECASE,
+)
+
+
+def _watch_transient_index_error(exc: BaseException) -> bool:
+    return bool(_WATCH_TRANSIENT_INDEX_ERROR_RE.search(str(exc) or type(exc).__name__))
+
+
+def _watch_index_single_file_with_retry(
+    col,
+    path: Path,
+    *,
+    vault_path: Path,
+) -> str | None:
+    for attempt in range(_WATCH_TRANSIENT_INDEX_ATTEMPTS):
+        try:
+            return _index_single_file(col, path, vault_path=vault_path)
+        except Exception as exc:
+            if (
+                attempt + 1 < _WATCH_TRANSIENT_INDEX_ATTEMPTS
+                and _watch_transient_index_error(exc)
+            ):
+                time.sleep(_WATCH_TRANSIENT_INDEX_RETRY_BASE_S * (attempt + 1))
+                continue
+            raise
+    return None
+
+
 def _watch_drain_once(
     vstate: dict,
     pending_lock: threading.Lock,
@@ -23150,7 +23670,9 @@ def _watch_drain_once(
     out: list[tuple[str, str | None, Path, str | None]] = []
     for p in batch:
         try:
-            status = _index_single_file(vstate["col"], p, vault_path=vstate["path"])
+            status = _watch_index_single_file_with_retry(
+                vstate["col"], p, vault_path=vstate["path"]
+            )
             err_s: str | None = None
         except Exception as e:
             status = None
@@ -23435,7 +23957,7 @@ def watch(debounce: float, all_vaults: bool):
         f.strip().rstrip("/") for f in _exclude_env.split(",") if f.strip()
     )
     if exclude_folders:
-        console.print(f"[dim]watch excluye folders: {', '.join(exclude_folders)}[/dim]")
+        print(f"watch excluye folders: {', '.join(exclude_folders)}", flush=True)
 
     if all_vaults:
         vaults = resolve_vault_paths(["all"])
@@ -23532,9 +24054,9 @@ def watch(debounce: float, all_vaults: bool):
     observer = Observer()
     for vs in vault_state:
         observer.schedule(Handler(vs), str(vs["path"]), recursive=True)
-        console.print(f"[cyan]Watching[/cyan] [{vs['name']}] {vs['path']}")
+        print(f"Watching [{vs['name']}] {vs['path']}", flush=True)
     observer.start()
-    console.print(f"[dim]debounce={debounce}s · Ctrl+C para salir[/dim]")
+    print(f"debounce={debounce}s · Ctrl+C para salir", flush=True)
 
     multi = len(vault_state) > 1
     # Heartbeat cadence: cada 5min el watcher imprime un "heartbeat
@@ -23566,14 +24088,13 @@ def watch(debounce: float, all_vaults: bool):
             for vs in vault_state:
                 for name, status, rel, err in _watch_drain_once(vs, pending_lock):
                     if err is not None:
-                        console.print(f"  [red]error[/red] [{name}] {rel.name}: {err}")
+                        print(f"  error [{name}] {rel.name}: {err}", flush=True)
                         any_real_work = True
                         continue
                     if status == "skipped":
                         continue
-                    color = {"indexed": "green", "removed": "yellow", "empty": "dim"}.get(status, "white")
-                    tag = f"[dim][{name}][/dim] " if multi else ""
-                    console.print(f"  {tag}[{color}]{status:>8}[/{color}] {rel}")
+                    tag = f"[{name}] " if multi else ""
+                    print(f"  {tag}{status:>8} {rel}", flush=True)
                     any_real_work = True
             if any_real_work:
                 empty_cycles = 0
@@ -23608,7 +24129,7 @@ def watch(debounce: float, all_vaults: bool):
     finally:
         observer.stop()
         observer.join()
-        console.print("[yellow]Watch detenido.[/yellow]")
+        print("Watch detenido.", flush=True)
 
 
 @cli.command()
@@ -31065,6 +31586,17 @@ def _agent_tool_read_note(path: str) -> str:
     if not path.endswith(".md"):
         return "Error: el path debe terminar en .md"
 
+    def _read_note_file(p: Path) -> str:
+        content = p.read_text(encoding="utf-8", errors="ignore")
+        target_raw = content.strip()
+        if len(target_raw) < 300 and target_raw.startswith("@"):
+            target = Path(target_raw[1:].strip()).expanduser()
+            if not target.is_absolute():
+                target = (p.parent / target).resolve()
+            if target.is_file():
+                return target.read_text(encoding="utf-8", errors="ignore")
+        return content
+
     # Intento 1: vault path
     full = (VAULT_PATH / path).resolve()
     try:
@@ -31101,7 +31633,7 @@ def _agent_tool_read_note(path: str) -> str:
         except ValueError:
             return f"Error: nota no encontrada: {path}"
         if fallback.is_file():
-            return fallback.read_text(encoding="utf-8", errors="ignore")
+            return _read_note_file(fallback)
 
     # Ni vault ni project root: devolver mensaje claro para que el LLM
     # NO hallucine. El mensaje incluye el path para que el LLM lo
@@ -34107,6 +34639,49 @@ def capture(text: str | None, from_stdin: bool, tags: tuple[str, ...],
         console.print(f"[green]✓ Capturado:[/green] [bold cyan]{rel}[/bold cyan]")
 
 
+@cli.command(name="cita-from-ocr")
+@click.option("--image", "image_path", type=click.Path(file_okay=True,
+                                                      dir_okay=False,
+                                                      path_type=Path),
+              required=True,
+              help="Path de la imagen origen, usado para notas/dedup.")
+@click.option("--source", default="cli", show_default=True,
+              help="Fuente auditada en rag_cita_detections.")
+@click.option("--min-confidence", "min_conf", type=float, default=None,
+              help="Override del umbral de confianza del detector.")
+def cita_from_ocr(image_path: Path, source: str, min_conf: float | None):
+    """Crear evento/reminder desde texto OCR leído por stdin.
+
+    Pensado para integraciones que ya hicieron OCR (ej. WhatsApp listener)
+    y solo necesitan reutilizar el detector + los creadores Apple sin volver
+    a leer la imagen ni capturar otra nota.
+
+    Devuelve siempre JSON en stdout. Los errores no levantan traceback para
+    que callers daemonizados puedan tratarlo como best-effort.
+    """
+    import sys
+    text = sys.stdin.read()
+    payload: dict = {"ok": True, "result": None}
+    if not text or len(text.strip()) < _CITA_MIN_CHARS:
+        payload["reason"] = "ocr_empty_or_short"
+        click.echo(json.dumps(payload, ensure_ascii=False))
+        return
+    try:
+        result = _maybe_create_cita_from_ocr(
+            text,
+            image_path,
+            source=source or "cli",
+            min_confidence=min_conf,
+        )
+        payload["result"] = result
+        if result is None:
+            payload["reason"] = "no_cita_detected"
+    except Exception as exc:
+        _silent_log(f"cita_from_ocr:{image_path}", exc)
+        payload = {"ok": False, "error": str(exc)[:500]}
+    click.echo(json.dumps(payload, ensure_ascii=False))
+
+
 # ── SCAN-CITAS (rag scan-citas) ──────────────────────────────────────────────
 # Barrido masivo de un folder arbitrario (NO acotado al vault) buscando
 # citas en screenshots. Usa el mismo _ocr_image + _detect_cita_from_ocr +
@@ -35121,6 +35696,39 @@ def _is_daemon_generated_path(rel_path: str) -> bool:
     return any(rel.startswith(p) for p in _DAEMON_GENERATED_PREFIXES)
 
 
+def _home_public_snippet(raw: str, limit: int) -> str:
+    """Snippet for home/brief surfaces: no raw system paths, one readable line."""
+    text = clean_md(raw)
+    public_lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if "99-obsidian/99-AI/" in stripped or "/99-obsidian/99-AI/" in stripped:
+            continue
+        public_lines.append(stripped)
+    text = re.sub(r"\s+", " ", " ".join(public_lines)).strip()
+    return text[:limit].strip()
+
+
+def _home_is_sensitive_path(rel_path: str) -> bool:
+    """True for private/sensitive notes that must not appear on home surfaces."""
+    rel = str(rel_path or "").replace("\\", "/").strip("/").casefold()
+    parts = [p for p in rel.split("/") if p]
+    sensitive_parts = {
+        "password",
+        "passwords",
+        "secret",
+        "secrets",
+        "private",
+        "privado",
+        "privada",
+        "credenciales",
+        "credentials",
+    }
+    return any(p in sensitive_parts for p in parts)
+
+
 # Alias semántico para call sites donde "system path" comunica mejor la
 # intención que "daemon-generated path" (ej. contradicciones cuyo
 # subject_path apunta a `99-obsidian/...` no fueron "generadas por un
@@ -35219,6 +35827,9 @@ _RIOPLATENSE_REWRITES: tuple[tuple[str, str], ...] = (
         r"agosto|septiembre|setiembre|octubre|noviembre|diciembre)\b)",
         r"\1",
     ),
+    # "en 2 hs" is a relative duration, not a clock time. Normalize before
+    # the bare "18hs" rule below rewrites it as "2:00".
+    (r"\b(en|dentro\s+de)\s+(\d+)\s*(?:hs?|h)\b\.?", r"\1 \2 horas"),
     # "18hs" / "18 hs" / "18h" / "18:30hs" → "18:00" / "18:30"
     # Handles bare "Xhs" by appending ":00"; leaves "X:Yhs" intact (just strips
     # the hs suffix). Only 1-2 digit hour blocks to avoid eating IDs/dates.
@@ -37912,6 +38523,8 @@ def _resolve_person_aliases(name: str) -> tuple[str, ...]:
             for (chat_name,) in rows or []:
                 if not chat_name:
                     continue
+                if whatsapp_chat_name_excluded(chat_name):
+                    continue
                 cn_clean = _clean_alias(chat_name.lower())
                 if cn_clean:
                     candidates.add(cn_clean)
@@ -38124,6 +38737,8 @@ def _agent_tool_whatsapp_search(
     messages: list[dict] = []
     for doc, meta, score in zip(docs, metas, scores):
         meta = meta or {}
+        if whatsapp_chat_name_excluded(meta.get("chat_name")):
+            continue
         chat_jid = str(meta.get("chat_jid") or "")
         if jid_suffixes:
             jid_local = chat_jid.split("@")[0]
@@ -38543,7 +39158,11 @@ def _fetch_vault_activity(hours: int = 48, n_per_vault: int = 5) -> dict:
                     continue
                 if rel.startswith(f"{MORNING_FOLDER}/"):
                     continue
+                if rel.startswith(f"{_CAPTURE_FOLDER}/"):
+                    continue
                 if _is_daemon_generated_path(rel):
+                    continue
+                if _home_is_sensitive_path(rel):
                     continue
                 try:
                     mtime = datetime.fromtimestamp(p.stat().st_mtime)
@@ -38555,11 +39174,14 @@ def _fetch_vault_activity(hours: int = 48, n_per_vault: int = 5) -> dict:
                     raw = p.read_text(encoding="utf-8", errors="ignore")
                 except OSError:
                     raw = ""
+                snippet = _home_public_snippet(raw, 140) if raw else ""
+                if not snippet:
+                    continue
                 items.append({
                     "path": rel,
                     "title": p.stem,
                     "modified": mtime.isoformat(timespec="seconds"),
-                    "snippet": clean_md(raw)[:140].strip() if raw else "",
+                    "snippet": snippet,
                 })
         except OSError:
             continue
@@ -38920,6 +39542,8 @@ def _lookup_wa_mentions_for_entity(
         if not content:
             continue
         chat_name = r["chat_name"] or ""
+        if whatsapp_chat_name_excluded(chat_name):
+            continue
         is_from_me = bool(r["is_from_me"])
         # 2026-04-21 pushname fix: raw JID senders in groups were surfacing
         # as "34084894028025" — noise. Resolve via phone → Mentions lookup
@@ -39392,7 +40016,7 @@ def _collect_morning_evidence(
                 inbox.append({
                     "path": rel, "title": title,
                     "modified": mtime.isoformat(timespec="seconds"),
-                    "snippet": clean_md(raw)[:160].strip(),
+                    "snippet": _home_public_snippet(raw, 160),
                 })
             if (
                 start <= mtime < now
@@ -39402,7 +40026,7 @@ def _collect_morning_evidence(
                 recent.append({
                     "path": rel, "title": title,
                     "modified": mtime.isoformat(timespec="seconds"),
-                    "snippet": clean_md(raw)[:220].strip(),
+                    "snippet": _home_public_snippet(raw, 220),
                 })
             t = fm.get("todo")
             d = fm.get("due")
@@ -40754,12 +41378,21 @@ def _collect_today_evidence(
             fm = parse_frontmatter(raw)
             title = p.stem
             in_window = start <= mtime < end
-            if in_window and rel.startswith(f"{_CAPTURE_FOLDER}/"):
+            if (
+                in_window
+                and rel.startswith(f"{_CAPTURE_FOLDER}/")
+                and not rel.startswith(f"{MORNING_FOLDER}/")
+                and not _is_daemon_generated_path(rel)
+                and not _home_is_sensitive_path(rel)
+            ):
                 tags = _normalize_fm_tags(fm)
+                snippet = _home_public_snippet(raw, 180)
+                if not snippet and not tags:
+                    continue
                 inbox_today.append({
                     "path": rel, "title": title,
                     "modified": mtime.isoformat(timespec="seconds"),
-                    "snippet": clean_md(raw)[:180].strip(),
+                    "snippet": snippet,
                     "tags": tags,
                 })
             if (
@@ -40776,11 +41409,15 @@ def _collect_today_evidence(
                 # 33/60 recent_notes eran auto-saves a 99-AI/memory/, 19/60
                 # eran finance ETL, 0/60 eran notas reales del user.
                 and not _is_daemon_generated_path(rel)
+                and not _home_is_sensitive_path(rel)
             ):
+                snippet = _home_public_snippet(raw, 220)
+                if not snippet:
+                    continue
                 recent.append({
                     "path": rel, "title": title,
                     "modified": mtime.isoformat(timespec="seconds"),
-                    "snippet": clean_md(raw)[:220].strip(),
+                    "snippet": snippet,
                 })
             if in_window and not _is_system_path(rel):
                 t = fm.get("todo")
@@ -41575,10 +42212,14 @@ def _render_today_prompt(
         sections_hint,
         "",
         "## 🪞 Lo que pasó hoy",
-        "(3-4 líneas concretas: qué notas tocaste, qué temas aparecieron, "
-        "qué mails/mensajes movieron la aguja. Si no hubo casi nada, decilo "
-        "breve. Mezclá señales — no listés solo notas. Esta sección SIEMPRE "
-        "va, aun si es 1 línea breve.)",
+        "(2-3 párrafos breves, sin viñetas: en el primer párrafo contá el "
+        "hilo principal del día; en el segundo conectá las señales concretas "
+        "más relevantes entre notas, WhatsApp, Gmail, Calendar, Chrome, "
+        "YouTube u otras fuentes disponibles; si hay suficiente evidencia, "
+        "usá un tercer párrafo para matizar qué quedó abierto o qué cambió "
+        "de foco. No escribas un listado: explicá qué pasó y por qué importa "
+        "según la evidencia. Si no hubo casi nada, usá 1 párrafo honesto. "
+        "Mezclá señales — no listés solo notas. Esta sección SIEMPRE va.)",
         "",
         "## 📥 Sin procesar",
         "(listar capturas de hoy que todavía no tienen carpeta/tags + mails "
@@ -43254,6 +43895,21 @@ _FOLLOWUP_IMPERATIVE_RE = re.compile(
 _CHECKBOX_OPEN_RE = re.compile(r"^\s*[-*]\s*\[\s\]\s+(.+?)\s*$", re.MULTILINE)
 
 
+def _strip_followup_non_action_lines(text: str) -> str:
+    """Drop quoted/example lines before scanning prose for follow-up loops."""
+    out: list[str] = []
+    for line in text.splitlines(keepends=True):
+        stripped = line.lstrip()
+        lower = stripped.lower()
+        if stripped.startswith(">") or re.match(
+            r"^(?:[-*]\s+)?(?:\*\*)?(ejemplo|example)\b", lower,
+        ):
+            out.append("\n" if line.endswith("\n") else "")
+        else:
+            out.append(line)
+    return "".join(out)
+
+
 def _coerce_loop_items(value) -> list[str]:
     """Flatten a frontmatter `todo:` / `due:` value into a list of strings.
     Accepts str, list of str, list of dicts with common keys."""
@@ -43321,8 +43977,9 @@ def _extract_followup_loops(
     body_no_fences = CODE_FENCE_RE.sub(
         lambda m: "\n" * m.group(0).count("\n"), body,
     )
+    body_scan = _strip_followup_non_action_lines(body_no_fences)
 
-    for m in _CHECKBOX_OPEN_RE.finditer(body_no_fences):
+    for m in _CHECKBOX_OPEN_RE.finditer(body_scan):
         text = m.group(1).strip()
         if not text:
             continue
@@ -43333,12 +43990,12 @@ def _extract_followup_loops(
             "kind": "checkbox",
         })
 
-    checkbox_spans = [m.span() for m in _FOLLOWUP_CHECKBOX_LINE_RE.finditer(body_no_fences)]
+    checkbox_spans = [m.span() for m in _FOLLOWUP_CHECKBOX_LINE_RE.finditer(body_scan)]
     def _in_checkbox(pos: int) -> bool:
         return any(s <= pos < e for s, e in checkbox_spans)
 
     seen_inline: set[str] = set()
-    for m in _FOLLOWUP_IMPERATIVE_RE.finditer(body_no_fences):
+    for m in _FOLLOWUP_IMPERATIVE_RE.finditer(body_scan):
         if _in_checkbox(m.start()):
             continue
         verb = m.group(1).strip().rstrip(":").lower()
@@ -43538,6 +44195,7 @@ def find_followup_loops(
     now: datetime | None = None,
     judge_fn=None,
     completed_reminders: list[dict] | None = None,
+    resolve: bool = True,
 ) -> list[dict]:
     """Walk the vault for notes modified in the last `days`, extract every
     open loop, and classify each. Returns a list sorted stale→activo→resolved,
@@ -43547,6 +44205,11 @@ def find_followup_loops(
     `_fetch_completed_reminders`), el classifier prioriza matches Jaccard
     contra ellas antes de caer al retrieval + LLM judge. None → fetch
     automático con ventana = `days`.
+
+    `resolve=False` devuelve solo loops extraídos con status por edad, sin
+    retrieval ni LLM judge. Es para surfaces proactivas baratas como
+    `anticipate-commitment`, donde clasificar todos los loops puede cold-loadear
+    varios modelos en paralelo y exceder el presupuesto de memoria del daemon.
 
     Cache TTL 10min + invalidación por max(mtime) del vault. Se inhabilita
     cuando el caller pasa now/judge_fn/completed_reminders explícitos para
@@ -43571,6 +44234,7 @@ def find_followup_loops(
                 and c["days"] == days
                 and c["stale_days"] == stale_days
                 and c["min_score"] == min_score
+                and c.get("resolve", True) == resolve
             ):
                 return list(c["result"])  # copia superficial — evita mutación del cache
 
@@ -43601,6 +44265,36 @@ def find_followup_loops(
             continue
         extracted_ts = _note_created_ts(raw, mtime)
         all_loops.extend(_extract_followup_loops(raw, rel, extracted_ts))
+
+    if not resolve:
+        classified = []
+        for loop in all_loops:
+            try:
+                extracted_dt = datetime.fromisoformat(loop["extracted_at"])
+            except Exception:
+                extracted_dt = now
+            age_days = max(0, int((now - extracted_dt).total_seconds() // 86400))
+            out = dict(loop)
+            out["age_days"] = age_days
+            out["status"] = "stale" if age_days > stale_days else "activo"
+            out["resolution_path"] = None
+            out["reason"] = None
+            out["resolved_by"] = None
+            classified.append(out)
+        order = {"stale": 0, "activo": 1, "resolved": 2}
+        classified.sort(key=lambda r: (order.get(r["status"], 3), -r["age_days"]))
+        if _use_cache and current_max_mtime is not None:
+            with _followup_loops_cache_lock:
+                _followup_loops_cache = {
+                    "ts": datetime.now().timestamp(),
+                    "max_mtime": current_max_mtime,
+                    "days": days,
+                    "stale_days": stale_days,
+                    "min_score": min_score,
+                    "resolve": resolve,
+                    "result": list(classified),
+                }
+        return classified
 
     # One osascript call para toda la corrida — evita N calls en
     # `_classify_followup_loop`. Ventana de reminders = ventana de loops
@@ -43668,6 +44362,7 @@ def find_followup_loops(
                 "days": days,
                 "stale_days": stale_days,
                 "min_score": min_score,
+                "resolve": resolve,
                 "result": list(classified),
             }
 
@@ -43833,7 +44528,7 @@ del _cli_group_pin_dc, _dc_module, _importlib
 # Re-export shim al final del módulo via cli.add_command(...) preserva
 # `rag.setup`, `rag.start`, `rag.stop`, `rag._setup_install`,
 # `rag._run_catch_up_index`, `rag._MINIMAL_MANAGED_LABELS`,
-# `rag._RAG_NET_LABELS`, `rag._QDRANT_LABELS` para tests + callers
+# `rag._RAG_NET_LABELS` para tests + callers
 # internos que monkeypatch o leen estos símbolos via `rag.X`.
 
 
@@ -44959,6 +45654,8 @@ def _enrich_wa(entities: dict, days: int = 7, max_hits: int = 2) -> list[dict]:
     seen_chats: set[str] = set()
     hits: list[dict] = []
     for jid, content, ts, chat_name in rows:
+        if whatsapp_chat_name_excluded(chat_name):
+            continue
         if jid in seen_chats:
             continue
         seen_chats.add(jid)
@@ -51035,11 +51732,18 @@ def get_nli_model():
             # reranker. Override: RAG_NLI_NO_CLEANUP=1.
             if device == "mps" and os.environ.get("RAG_NLI_NO_CLEANUP", "").strip() not in ("1", "true", "yes"):
                 _orig_nli_predict = _nli_model.predict
+                try:
+                    from rag.llm_backend import _MLX_FORWARD_LOCK as _nli_fwd_lock
+                except ImportError:
+                    _nli_fwd_lock = None
+
                 def _nli_predict_with_cleanup(*args, **kwargs):
                     try:
+                        if _nli_fwd_lock is not None:
+                            with _nli_fwd_lock:
+                                return _orig_nli_predict(*args, **kwargs)
                         return _orig_nli_predict(*args, **kwargs)
                     finally:
-                        # MLX-aware: skipea cuando backend full-MLX (no-op).
                         _torch_mps_empty_cache()
                 _nli_model.predict = _nli_predict_with_cleanup
         except ImportError as exc:
@@ -51256,9 +51960,9 @@ def _validate_location_or_demote(etext: str, elabel: str) -> str | None:
     - Si es `location` Y el `etext` matchea el allowlist (countries,
       provinces, ciudades) → devuelve `"location"`.
     - Si NO matchea → devuelve `None`. Caller debe SKIPpear la entity
-      (no agregarla a ningún tipo). Se loguea via `_silent_log` para que
-      el user pueda ampliar el allowlist si descubre un real-place que
-      esté quedando filtrado.
+      (no agregarla a ningún tipo). Esto es un filtro esperado, no un error:
+      no lo mandamos a `silent_errors` porque un backfill grande puede filtrar
+      cientos de falsos lugares y disparar alertas operativas falsas.
 
     El override `_override_entity_label` corre ANTES en el pipeline, así
     que si el user mapea explícitamente "mac → organization", entra
@@ -51271,10 +51975,6 @@ def _validate_location_or_demote(etext: str, elabel: str) -> str | None:
     places = _load_known_places()
     if norm in places:
         return "location"
-    try:
-        _silent_log("entity_location_skipped", ValueError(f"not in known_places: {etext!r}"))
-    except Exception:
-        pass
     return None
 
 _gliner_model = None
@@ -52245,6 +52945,7 @@ from rag.integrations.whatsapp import (  # noqa: E402, F401
     WHATSAPP_BOT_JID,
     WHATSAPP_BRIDGE_DB_PATH,
     WHATSAPP_DB_PATH,
+    WHATSAPP_EXCLUDED_CHAT_NAMES,
     WHATSAPP_NOTE_MAX_CHARS,
     _ambient_whatsapp_send,
     _fetch_whatsapp_today,
@@ -52257,6 +52958,8 @@ from rag.integrations.whatsapp import (  # noqa: E402, F401
     _wa_chat_month_link,
     _wa_extract_actions,
     _wa_extract_combined,
+    normalize_whatsapp_chat_name,
+    whatsapp_chat_name_excluded,
     _wa_extract_promises,
     _wa_promises_persist,
     _wa_tasks_load_state,
@@ -52457,7 +53160,6 @@ cli.add_command(daemons_group, name="daemons")  # `rag daemons {...}` (Phase 2b)
 
 from rag.cli.setup import (  # noqa: E402, F401
     _MINIMAL_MANAGED_LABELS,
-    _QDRANT_LABELS,
     _RAG_NET_LABELS,
     _run_catch_up_index,
     _setup_install,

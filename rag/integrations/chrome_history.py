@@ -107,9 +107,8 @@ def _chrome_history_paths() -> list[tuple[str, Path]]:
     import sys
     rag_mod = sys.modules.get("rag")
     legacy = getattr(rag_mod, "_CHROME_HISTORY_PATH", _CHROME_HISTORY_PATH)
-    default_path = Path.home() / "Library/Application Support/Google/Chrome/Default/History"
     try:
-        is_default = Path(legacy).resolve(strict=False) == default_path.resolve(strict=False)
+        is_default = Path(legacy).resolve(strict=False) == _CHROME_HISTORY_PATH.resolve(strict=False)
     except (TypeError, ValueError):
         is_default = False
     if not is_default:

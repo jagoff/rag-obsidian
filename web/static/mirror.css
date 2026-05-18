@@ -143,6 +143,16 @@ header #refresh-btn.spinning { animation: spin 1s linear infinite; }
   padding: 8px 0;
 }
 
+.source-note {
+  color: var(--text-muted);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 0 0 8px;
+  border-bottom: 1px dotted var(--border-soft);
+  margin-bottom: 2px;
+}
+
 /* ── tables ─────────────────────────────────────────── */
 
 .row {
@@ -153,16 +163,39 @@ header #refresh-btn.spinning { animation: spin 1s linear infinite; }
   gap: 12px;
 }
 .row:last-child { border-bottom: none; }
-.row .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.row .meta { color: var(--text-dim); font-size: 11px; flex-shrink: 0; }
+.row .name {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.row .name-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.row .meta {
+  color: var(--text-dim);
+  font-size: 11px;
+  flex-shrink: 0;
+  max-width: 44%;
+  overflow: hidden;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .row .badge {
   display: inline-block;
+  flex-shrink: 0;
   padding: 1px 6px;
   border: 1px solid var(--border);
   border-radius: 3px;
   font-size: 10px;
   color: var(--text-dim);
-  margin-left: 6px;
 }
 .row .badge.warn {
   color: var(--accent-warm);

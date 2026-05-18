@@ -17,11 +17,11 @@ import pytest
 
 
 def test_mlx_reranker_aliases_table_resolves_qwen3_06b():
-    """The default 0.6B alias maps to the mxfp8 mlx-community port."""
+    """The default 0.6B alias maps to the locally cached int8 MLX port."""
     from rag.mlx_reranker import MLX_RERANKER_ALIASES, DEFAULT_MLX_RERANKER
 
     assert MLX_RERANKER_ALIASES["qwen3-reranker:0.6b"] == DEFAULT_MLX_RERANKER
-    assert DEFAULT_MLX_RERANKER == "mlx-community/Qwen3-Reranker-0.6B-mxfp8"
+    assert DEFAULT_MLX_RERANKER == "mku64/Qwen3-Reranker-0.6B-mlx-8Bit"
 
 
 def test_resolve_mlx_reranker_path_falls_back_for_baseline():
@@ -50,10 +50,16 @@ def test_resolve_mlx_reranker_path_alias():
         "mlx-community/Qwen3-Reranker-4B-mxfp8"
 
 
-def test_is_mlx_reranker_enabled_default_off(monkeypatch):
-    """Default `RAG_RERANKER_BACKEND=torch` → MLX off. Production stays on
-    bge-reranker until a deliberate cutover."""
+def test_is_mlx_reranker_enabled_default_on(monkeypatch):
+    """Default backend is MLX after the cutover; torch is the rollback."""
     monkeypatch.delenv("RAG_RERANKER_BACKEND", raising=False)
+    from rag.mlx_reranker import is_mlx_reranker_enabled
+
+    assert is_mlx_reranker_enabled() is True
+
+
+def test_is_mlx_reranker_disabled_when_env_set_to_torch(monkeypatch):
+    monkeypatch.setenv("RAG_RERANKER_BACKEND", "torch")
     from rag.mlx_reranker import is_mlx_reranker_enabled
 
     assert is_mlx_reranker_enabled() is False
@@ -80,7 +86,7 @@ def test_mlx_reranker_class_constructor_no_load():
     from rag.mlx_reranker import MLXReranker
 
     rr = MLXReranker()
-    assert rr.model_path == "mlx-community/Qwen3-Reranker-0.6B-mxfp8"
+    assert rr.model_path == "mku64/Qwen3-Reranker-0.6B-mlx-8Bit"
     assert rr._model is None
     assert rr._tokenizer is None
 

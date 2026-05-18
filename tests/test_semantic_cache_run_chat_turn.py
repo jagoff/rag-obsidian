@@ -61,6 +61,7 @@ def test_cache_hit_short_circuits_llm(clean_cache_env, monkeypatch):
     invocar retrieve() ni multi_retrieve() ni ollama.chat.
     """
     vault = clean_cache_env
+    (vault / "note.md").write_text("ikigai", encoding="utf-8")
 
     # Seed el cache con una entry matcheable.
     emb = _emb_vec(1.0)

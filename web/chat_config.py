@@ -41,7 +41,14 @@ WEB_CHAT_MODEL = settings.web_chat_model
 # models from the UI without editing the launchd plist or redeploying.
 # Format: {"model": "qwen3.6", "set_at": "2026-04-20T15:00:00"}. Absent or
 # malformed → no override active.
-_CHAT_MODEL_OVERRIDE_PATH = Path.home() / ".local/share/obsidian-rag" / "chat-model.json"
+def _default_chat_model_override_path() -> Path:
+    state_dir = os.environ.get("OBSIDIAN_RAG_STATE_DIR", "").strip()
+    if state_dir:
+        return Path(state_dir).expanduser() / "chat-model.json"
+    return Path.home() / ".local/share/obsidian-rag" / "chat-model.json"
+
+
+_CHAT_MODEL_OVERRIDE_PATH = _default_chat_model_override_path()
 
 
 def _read_chat_model_override() -> str | None:
@@ -244,7 +251,11 @@ _WEB_WORK_SYSTEM_PROMPT = (
     "aunque el CONTEXTO esté vacío, pobre o tangencial. Usá el CONTEXTO/"
     "Obsidian como memoria cuando aporte; si no aporta, respondé igual con "
     "criterio técnico y no digas 'no tengo info en tus notas' salvo que el "
-    "usuario pregunte explícitamente por sus notas.\n\n"
+    "usuario pregunte explícitamente por sus notas. Tratá fechas, reuniones, "
+    "eventos y deadlines dentro de reportes o documentos pegados como "
+    "contenido a resumir/analizar, no como pedidos de agenda. No emitas "
+    "tool calls ni pidas datos para agendar salvo que el usuario arranque "
+    "con un comando explícito tipo 'agendá', 'recordame' o 'calendarizá'.\n\n"
     "Para AWS/FinOps: priorizá supuestos explícitos, riesgos, trade-offs, "
     "costos, seguridad, operación, impacto y próximos pasos. Si una "
     "recomendación depende de precios, límites, features, APIs o políticas "

@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -117,6 +119,79 @@ def test_whatsapp_pending_clamps_args(monkeypatch):
     tools_mod.whatsapp_pending(hours=0, max_chats=0)
     assert captured["hours"] == 1
     assert captured["max_chats"] == 1
+
+
+def test_whatsapp_pending_respects_chat_blacklist(monkeypatch, tmp_path):
+    """Dashboard/tool pending WA must not surface default-blacklisted chats."""
+    import rag.exclusions as exclusions
+
+    monkeypatch.setattr(exclusions, "_DB_PATH", tmp_path / "blacklist.db")
+    monkeypatch.setattr(exclusions, "_CONFIG_PATH", tmp_path / "missing-blacklist.json")
+    monkeypatch.setattr(exclusions, "_LEGACY_IGNORED_PATH", tmp_path / "ignored_notes.json")
+    monkeypatch.setattr(exclusions, "_CACHE", None)
+    monkeypatch.setattr(exclusions, "_LEGACY_CACHE", None)
+
+    bridge = tmp_path / "messages.db"
+    con = sqlite3.connect(bridge)
+    try:
+        con.executescript(
+            """
+            CREATE TABLE chats (jid TEXT PRIMARY KEY, name TEXT);
+            CREATE TABLE messages (
+              chat_jid TEXT,
+              content TEXT,
+              is_from_me INTEGER,
+              timestamp TEXT
+            );
+            """
+        )
+        now = datetime.now()
+        con.executemany(
+            "INSERT INTO chats (jid, name) VALUES (?, ?)",
+            [
+                ("120363003@g.us", "Cloud Services"),
+                ("120363004@g.us", "Grecia's group"),
+                ("120363005@g.us", "Recursos"),
+                ("5491111@s.whatsapp.net", "Juan"),
+            ],
+        )
+        con.executemany(
+            "INSERT INTO messages (chat_jid, content, is_from_me, timestamp) VALUES (?, ?, ?, ?)",
+            [
+                (
+                    "120363003@g.us",
+                    "terminaron las tareas post update",
+                    0,
+                    now.isoformat(sep=" "),
+                ),
+                (
+                    "5491111@s.whatsapp.net",
+                    "podés revisar esto?",
+                    0,
+                    (now - timedelta(minutes=5)).isoformat(sep=" "),
+                ),
+                (
+                    "120363004@g.us",
+                    "Vos papu?",
+                    0,
+                    (now - timedelta(minutes=3)).isoformat(sep=" "),
+                ),
+                (
+                    "120363005@g.us",
+                    "https://example.com/not-actionable",
+                    0,
+                    (now - timedelta(minutes=2)).isoformat(sep=" "),
+                ),
+            ],
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    monkeypatch.setattr(server_mod, "WHATSAPP_DB_PATH", bridge)
+    out = server_mod._fetch_whatsapp_unreplied(hours=48, max_chats=5)
+
+    assert [x["name"] for x in out] == ["Juan"]
 
 
 # ── 2. Pre-router regex ────────────────────────────────────────────────────
@@ -261,7 +336,7 @@ def test_whatsapp_source_intent_hint():
 _EVENT_RE = re.compile(r"event: (?P<event>[^\n]+)\ndata: (?P<data>[^\n]*)\n\n")
 
 
-def test_whatsapp_sources_emitted_in_sse_with_wa_me_link(monkeypatch):
+def test_whatsapp_sources_emitted_in_sse_with_wa_me_link(monkeypatch, tmp_path):
     """El stream SSE emite un segundo evento `sources` con links wa.me
     prepended cuando whatsapp_pending encuentra chats. Verifica el mismo
     patrón que drive_search pero para WA."""
@@ -275,6 +350,11 @@ def test_whatsapp_sources_emitted_in_sse_with_wa_me_link(monkeypatch):
     monkeypatch.setattr(server_mod, "_is_tasks_query", lambda q: False)
 
     import rag as _rag_mod
+    vault_root = tmp_path / "vault"
+    (vault_root / "03-Resources").mkdir(parents=True)
+    (vault_root / "03-Resources" / "test.md").write_text("vault doc\n", encoding="utf-8")
+    monkeypatch.setattr(server_mod, "VAULT_PATH", vault_root)
+    monkeypatch.setattr(_rag_mod, "VAULT_PATH", vault_root)
     monkeypatch.setattr(_rag_mod, "build_person_context", lambda q: None)
     monkeypatch.setattr(
         server_mod, "multi_retrieve",

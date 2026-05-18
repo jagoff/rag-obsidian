@@ -23,8 +23,11 @@ No testeamos:
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import os
+import sqlite3
+import uuid
 from pathlib import Path
 
 import pytest
@@ -88,7 +91,17 @@ def _bypass_admin_token():
         'INFO:     127.0.0.1 - "GET /api/logs/file?name=foo.error.log HTTP/1.1" 200 OK',
         "info",
     ),
+    # Watch stdout can contain wrapped markdown note paths whose slug includes
+    # "error"; those are filenames, not failures.
+    (
+        "99-obsidian/99-AI/memory/2026-05-16-fixing-jsondecodeerror-in-jsondecodeerrorfix",
+        "info",
+    ),
+    ("jsondecodeerrorfix.md", "info"),
     ("INFO: Application startup complete.", "info"),
+    ("[error-queue worker] processing warn id=9 service=supervisor count=2", "info"),
+    ("[error-queue worker] processing error id=8 service=web count=1", "info"),
+    ("[error-queue scanner] enqueued 2 new log issues (errors=0 warns=4)", "info"),
     ("DEBUG: foo bar baz", "info"),
     # Líneas neutras → info.
     ("whatsapp: 14732 · 0.07s", "info"),
@@ -171,15 +184,14 @@ def test_resolve_log_path_rejects_traversal_and_invalid(name):
     assert _server._resolve_log_path(name) is None
 
 
-def test_resolve_log_path_accepts_real_log_in_obsidian_rag_dir():
-    """Tomá un .log que exista en el dir; sino esquipear (ej. en CI)."""
-    log_dir = Path.home() / ".local/share/obsidian-rag"
-    if not log_dir.is_dir():
-        pytest.skip("no obsidian-rag log dir on this machine")
-    candidates = [p for p in log_dir.iterdir() if p.is_file() and p.suffix == ".log"]
-    if not candidates:
-        pytest.skip("no .log files to validate against")
-    sample = candidates[0]
+def test_resolve_log_path_accepts_log_in_isolated_obsidian_rag_dir(tmp_path: Path, monkeypatch):
+    """Valida resolución sin depender de los logs reales del usuario."""
+    log_dir = tmp_path / "obsidian-rag"
+    log_dir.mkdir()
+    sample = log_dir / "watch.log"
+    sample.write_text("ok\n", encoding="utf-8")
+    monkeypatch.setattr(_server, "_LOG_DIRS", (log_dir,))
+
     resolved = _server._resolve_log_path(f"obsidian-rag/{sample.name}")
     assert resolved == sample.resolve()
 
@@ -265,6 +277,35 @@ def test_api_logs_index_orders_errors_first(monkeypatch, tmp_path: Path):
     # alpha tenga mtime más reciente.
     names_in_order = [s["service"] for s in services]
     assert names_in_order.index("beta") < names_in_order.index("alpha")
+
+
+def test_api_logs_clean_all_truncates_current_log_files(monkeypatch, tmp_path: Path):
+    """clean-all vacía sólo los logs visibles por /logs, no otros archivos."""
+    fake_dir = tmp_path / "obsidian-rag"
+    fake_dir.mkdir()
+    watch = fake_dir / "watch.log"
+    err = fake_dir / "watch.error.log"
+    stdout = fake_dir / "web.stdout.log"
+    keep = fake_dir / "queries.jsonl"
+    watch.write_text("abc\n", encoding="utf-8")
+    err.write_text("boom\n", encoding="utf-8")
+    stdout.write_text("out\n", encoding="utf-8")
+    keep.write_text("keep\n", encoding="utf-8")
+    expected_bytes = watch.stat().st_size + err.stat().st_size + stdout.stat().st_size
+
+    monkeypatch.setattr(_server, "_LOG_DIRS", (fake_dir,))
+
+    resp = _client.post("/api/logs/clean-all?clear_queue=0")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert data["files_truncated"] == 3
+    assert data["bytes_cleared"] == expected_bytes
+    assert data["queue_cleared"] is False
+    assert watch.read_text(encoding="utf-8") == ""
+    assert err.read_text(encoding="utf-8") == ""
+    assert stdout.read_text(encoding="utf-8") == ""
+    assert keep.read_text(encoding="utf-8") == "keep\n"
 
 
 # ── /api/logs/file viewer ─────────────────────────────────────────────
@@ -433,6 +474,8 @@ def test_logs_page_served():
     body = resp.text
     assert "rag" in body and "logs" in body
     assert "/static/logs.js" in body
+    assert "/static/admin-auth.js" in body
+    assert "clean-all-logs" in body
     assert "manifest.webmanifest" in body
     assert "register-sw.js" in body
 
@@ -606,9 +649,6 @@ def test_diagnose_error_prompt_caps_context_at_20():
     "launchctl kickstart -k gui/501/com.fer.obsidian-rag-watch",
     "launchctl kickstart -k com.fer.obsidian-rag-watch",
     "launchctl list com.fer.obsidian-rag-watch",
-    "tail -50 /Users/fer/.local/share/obsidian-rag/watch.log",
-    "tail -n 100 /Users/fer/.local/share/obsidian-rag/watch.log",
-    "wc -l /Users/fer/.local/share/obsidian-rag/watch.log",
     "rag stats",
     "rag vault list",
 ])
@@ -616,6 +656,23 @@ def test_validate_safe_command_accepts_whitelist(cmd):
     argv, reason = _server._validate_safe_command(cmd)
     assert argv is not None, f"esperaba aceptar {cmd!r}, rechazó: {reason}"
     assert reason == ""
+
+
+def test_validate_safe_command_accepts_isolated_log_commands(tmp_path: Path, monkeypatch):
+    log_dir = tmp_path / "obsidian-rag"
+    log_dir.mkdir()
+    sample = log_dir / "watch.log"
+    sample.write_text("ok\n", encoding="utf-8")
+    monkeypatch.setattr(_server, "_LOG_DIR_ABS", log_dir.resolve())
+
+    for cmd in (
+        f"tail -50 {sample}",
+        f"tail -n 100 {sample}",
+        f"wc -l {sample}",
+    ):
+        argv, reason = _server._validate_safe_command(cmd)
+        assert argv is not None, f"esperaba aceptar {cmd!r}, rechazó: {reason}"
+        assert reason == ""
 
 
 @pytest.mark.parametrize("cmd, expected_reason_substr", [
@@ -681,13 +738,11 @@ def test_api_diagnose_error_execute_runs_safe_command(tmp_path: Path, monkeypatc
     audit_path = tmp_path / "diagnose_executions.jsonl"
     monkeypatch.setattr(_server, "_DIAGNOSE_AUDIT_LOG", audit_path)
 
-    log_dir = Path.home() / ".local/share/obsidian-rag"
-    if not log_dir.is_dir():
-        pytest.skip("no obsidian-rag log dir on this machine")
-    candidates = [p for p in log_dir.iterdir() if p.is_file() and p.suffix == ".log"]
-    if not candidates:
-        pytest.skip("no .log files to test against")
-    sample = candidates[0]
+    log_dir = tmp_path / "obsidian-rag"
+    log_dir.mkdir()
+    sample = log_dir / "watch.log"
+    sample.write_text("uno\ndos\n", encoding="utf-8")
+    monkeypatch.setattr(_server, "_LOG_DIR_ABS", log_dir.resolve())
     cmd = f"wc -l {sample}"
 
     resp = _client.post("/api/diagnose-error/execute", json={"command": cmd})
@@ -754,6 +809,236 @@ def test_api_logs_queue_config_toggles_worker():
     resp = _client.post("/api/logs/queue/config", json={"enabled": False})
     assert resp.status_code == 200
     assert resp.json()["worker_enabled"] is False
+
+
+def test_error_queue_incremental_scanner_enqueues_new_no_timestamp_log(
+    monkeypatch, tmp_path: Path,
+):
+    """El scanner automático procesa líneas nuevas aunque no tengan timestamp."""
+    fake_dir = tmp_path / "obsidian-rag"
+    fake_dir.mkdir()
+    log = fake_dir / "listener.log"
+    err_log = fake_dir / "listener.error.log"
+    log.write_text("RuntimeError: old historical\n", encoding="utf-8")
+    err_log.write_text("stderr sibling clue\n", encoding="utf-8")
+    monkeypatch.setattr(_server, "_LOG_DIRS", (fake_dir,))
+
+    captured: list[dict] = []
+
+    def fake_enqueue(**kwargs):
+        captured.append(kwargs)
+        return 123, True
+
+    monkeypatch.setattr(_server, "_enqueue_error", fake_enqueue)
+    _server._initialize_error_queue_scan_cursors()
+
+    with log.open("a", encoding="utf-8") as fh:
+        fh.write("OperationalError: fresh no-ts line\n")
+
+    summary = _server._scan_new_log_errors()
+
+    assert summary["seen_errors"] == 1
+    assert summary["new_entries"] == 1
+    assert len(captured) == 1
+    assert captured[0]["service"] == "listener"
+    assert captured[0]["file_ref"] == "obsidian-rag/listener.log"
+    assert captured[0]["error_text"] == "OperationalError: fresh no-ts line"
+    assert captured[0]["level"] == "error"
+    assert captured[0]["reopen_terminal"] is True
+    ctx = captured[0]["context_lines"]
+    assert any("[source] service=listener" in line for line in ctx)
+    assert any("[tail:listener.log]" in line for line in ctx)
+    assert any("stderr sibling clue" in line for line in ctx)
+
+
+def test_error_queue_incremental_scanner_enqueues_warning_lower_priority(
+    monkeypatch, tmp_path: Path,
+):
+    """Warnings nuevos entran a la queue como warn para procesarlos después."""
+    fake_dir = tmp_path / "obsidian-rag"
+    fake_dir.mkdir()
+    log = fake_dir / "listener.log"
+    log.write_text("boot ok\n", encoding="utf-8")
+    monkeypatch.setattr(_server, "_LOG_DIRS", (fake_dir,))
+
+    captured: list[dict] = []
+
+    def fake_enqueue(**kwargs):
+        captured.append(kwargs)
+        return 456, True
+
+    monkeypatch.setattr(_server, "_enqueue_error", fake_enqueue)
+    _server._initialize_error_queue_scan_cursors()
+
+    with log.open("a", encoding="utf-8") as fh:
+        fh.write("WARNING: model warmup retry scheduled\n")
+
+    summary = _server._scan_new_log_errors()
+
+    assert summary["seen_errors"] == 0
+    assert summary["seen_warns"] == 1
+    assert summary["new_entries"] == 1
+    assert captured[0]["level"] == "warn"
+    assert captured[0]["error_text"] == "WARNING: model warmup retry scheduled"
+
+
+def test_error_queue_incremental_scanner_ignores_worker_meta_warning(
+    monkeypatch, tmp_path: Path,
+):
+    """El scanner no debe encolar sus propias líneas `processing warn`."""
+    fake_dir = tmp_path / "obsidian-rag"
+    fake_dir.mkdir()
+    log = fake_dir / "web.log"
+    log.write_text("boot ok\n", encoding="utf-8")
+    monkeypatch.setattr(_server, "_LOG_DIRS", (fake_dir,))
+
+    captured: list[dict] = []
+
+    def fake_enqueue(**kwargs):
+        captured.append(kwargs)
+        return 789, True
+
+    monkeypatch.setattr(_server, "_enqueue_error", fake_enqueue)
+    _server._initialize_error_queue_scan_cursors()
+
+    with log.open("a", encoding="utf-8") as fh:
+        fh.write("[error-queue worker] processing warn id=9 service=supervisor count=2\n")
+
+    summary = _server._scan_new_log_errors()
+
+    assert summary["seen_errors"] == 0
+    assert summary["seen_warns"] == 0
+    assert summary["new_entries"] == 0
+    assert captured == []
+
+
+def test_enqueue_error_reopens_terminal_status_only_when_requested():
+    """Una ocurrencia nueva de una signature resuelta debe volver a pending."""
+    service = f"auto-reopen-{uuid.uuid4().hex}"
+    text = "RuntimeError: synthetic auto-fix regression"
+    row_id, was_new = _server._enqueue_error(service, "obsidian-rag/demo.log", text)
+    assert row_id > 0
+    assert was_new is True
+    _server._finalize_error(row_id, 0, "STATUS: resolved\nREASON: ok", "resolved", "ok", 0.1)
+
+    same_id, should_process = _server._enqueue_error(
+        service, "obsidian-rag/demo.log", text,
+    )
+    assert same_id == row_id
+    assert should_process is False
+    with _server._ragvec_state_conn() as conn:
+        row = conn.execute(
+            "SELECT status, attempts, completed_at, resolution_status "
+            "FROM rag_error_queue WHERE id = ?",
+            (row_id,),
+        ).fetchone()
+    assert row[0] == "resolved"
+    assert row[2] is not None
+    assert row[3] == "resolved"
+
+    same_id, should_process = _server._enqueue_error(
+        service, "obsidian-rag/demo.log", text, reopen_terminal=True,
+    )
+    assert same_id == row_id
+    assert should_process is True
+    with _server._ragvec_state_conn() as conn:
+        row = conn.execute(
+            "SELECT status, attempts, completed_at, resolution_status "
+            "FROM rag_error_queue WHERE id = ?",
+            (row_id,),
+        ).fetchone()
+    assert row[0] == "pending"
+    assert row[1] == 0
+    assert row[2] is None
+    assert row[3] is None
+
+
+def test_get_next_pending_error_prioritizes_errors_before_warnings(
+    monkeypatch, tmp_path: Path,
+):
+    """El worker procesa errores antes que warnings aunque el warning sea frecuente."""
+    db_path = tmp_path / "queue.sqlite"
+
+    @contextmanager
+    def fake_state_conn():
+        conn = sqlite3.connect(db_path)
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    monkeypatch.setattr(_server, "_ragvec_state_conn", fake_state_conn)
+    monkeypatch.setattr(_server, "_ERROR_QUEUE_DDL_DONE", False)
+
+    service = f"auto-priority-{uuid.uuid4().hex}"
+    warn_text = "WARNING: synthetic warning retry scheduled"
+    error_text = "RuntimeError: synthetic critical regression"
+    warn_id, was_new = _server._enqueue_error(
+        service, "obsidian-rag/demo.log", warn_text, level="warn"
+    )
+    assert warn_id > 0
+    assert was_new is True
+    for _ in range(5):
+        _server._enqueue_error(
+            service, "obsidian-rag/demo.log", warn_text, level="warn"
+        )
+    error_id, was_new = _server._enqueue_error(
+        service, "obsidian-rag/demo.log", error_text, level="error"
+    )
+    assert error_id > 0
+    assert was_new is True
+
+    next_error = _server._get_next_pending_error()
+
+    assert next_error is not None
+    assert next_error["id"] == error_id
+    assert next_error["level"] == "error"
+
+
+def test_recover_stale_processing_marks_non_actionable_as_no_action(
+    monkeypatch, tmp_path: Path,
+):
+    """Rows stuck in processing that are now false positives should not invoke Codex."""
+    db_path = tmp_path / "queue.sqlite"
+
+    @contextmanager
+    def fake_state_conn():
+        conn = sqlite3.connect(db_path)
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    monkeypatch.setattr(_server, "_ragvec_state_conn", fake_state_conn)
+    monkeypatch.setattr(_server, "_ERROR_QUEUE_DDL_DONE", False)
+
+    row_id, was_new = _server._enqueue_error(
+        f"auto-stale-{uuid.uuid4().hex}",
+        "obsidian-rag/watch.log",
+        "99-obsidian/99-AI/memory/2026-05-16-fixing-jsondecodeerror-in-jsondecodeerrorfix",
+        level="error",
+    )
+    assert row_id > 0
+    assert was_new is True
+    with _server._ragvec_state_conn() as conn:
+        conn.execute(
+            "UPDATE rag_error_queue SET status = 'processing', started_at = ? WHERE id = ?",
+            ("2000-01-01 00:00:00", row_id),
+        )
+        conn.commit()
+
+    recovered = _server._recover_stale_processing_errors(stale_after_s=1)
+
+    assert recovered == {"reopened": 0, "no_action": 1}
+    with _server._ragvec_state_conn() as conn:
+        row = conn.execute(
+            "SELECT status, resolution_status, resolution_reason "
+            "FROM rag_error_queue WHERE id = ?",
+            (row_id,),
+        ).fetchone()
+    assert row[0] == "no-action"
+    assert row[1] == "no-action"
+    assert "no longer classified" in row[2]
 
 
 def test_api_logs_queue_get_404():
@@ -837,13 +1122,11 @@ def test_execute_whitelisted_command_runs_safe(tmp_path: Path, monkeypatch):
     audit_path = tmp_path / "diagnose_executions.jsonl"
     monkeypatch.setattr(_server, "_DIAGNOSE_AUDIT_LOG", audit_path)
 
-    log_dir = Path.home() / ".local/share/obsidian-rag"
-    if not log_dir.is_dir():
-        pytest.skip("no obsidian-rag log dir on this machine")
-    candidates = [p for p in log_dir.iterdir() if p.is_file() and p.suffix == ".log"]
-    if not candidates:
-        pytest.skip("no .log files")
-    sample = candidates[0]
+    log_dir = tmp_path / "obsidian-rag"
+    log_dir.mkdir()
+    sample = log_dir / "watch.log"
+    sample.write_text("uno\ndos\n", encoding="utf-8")
+    monkeypatch.setattr(_server, "_LOG_DIR_ABS", log_dir.resolve())
 
     result = _server._execute_whitelisted_command(f"wc -l {sample}")
     assert result["rejected"] is False
@@ -1133,23 +1416,20 @@ class TestCandidateLogPathsForLabel:
       - `com.fer.whatsapp-Y` → `Y.log` y `Y.error.log`.
     """
 
-    def test_obsidian_rag_prefix_strip(self):
-        log_dir = Path.home() / ".local/share/obsidian-rag"
-        if not log_dir.is_dir():
-            pytest.skip("no obsidian-rag log dir on this machine")
-        # web.log existe en el sistema vivo del user.
-        if not (log_dir / "web.log").is_file():
-            pytest.skip("no web.log on this machine")
+    def test_obsidian_rag_prefix_strip(self, tmp_path: Path, monkeypatch):
+        log_dir = tmp_path / "obsidian-rag"
+        log_dir.mkdir()
+        (log_dir / "web.log").write_text("ok\n", encoding="utf-8")
+        monkeypatch.setattr(_server, "_LOG_DIRS", (log_dir,))
         paths = _server._candidate_log_paths_for_label("com.fer.obsidian-rag-web")
         names = {p.name for p in paths}
         assert "web.log" in names
 
-    def test_whatsapp_prefix_strip(self):
-        log_dir = Path.home() / ".local/share/whatsapp-listener"
-        if not log_dir.is_dir():
-            pytest.skip("no whatsapp-listener log dir on this machine")
-        if not (log_dir / "listener.log").is_file():
-            pytest.skip("no listener.log on this machine")
+    def test_whatsapp_prefix_strip(self, tmp_path: Path, monkeypatch):
+        log_dir = tmp_path / "whatsapp-listener"
+        log_dir.mkdir()
+        (log_dir / "listener.log").write_text("ok\n", encoding="utf-8")
+        monkeypatch.setattr(_server, "_LOG_DIRS", (log_dir,))
         paths = _server._candidate_log_paths_for_label("com.fer.whatsapp-listener")
         names = {p.name for p in paths}
         assert "listener.log" in names

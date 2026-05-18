@@ -268,10 +268,12 @@ def _export_body(svc, file_id: str, mime: str, body_cap: int, file_meta: dict | 
     if not export_mime:
         return "", f"unsupported_mime:{mime}"
 
-    # Skip very large files before attempting export (can timeout at 30s).
+    # Skip very large uploaded files before attempting export. Google-native
+    # Docs/Sheets/Slides do not expose a meaningful binary size for export,
+    # and Drive can still export them quickly even when metadata has `size`.
     if file_meta:
         file_size = int((file_meta.get("size") or "0") or "0")
-        if file_size > 50_000_000:  # 50 MB
+        if file_size > 50_000_000 and not mime.startswith("application/vnd.google-apps."):
             return "", "file_too_large:>50MB"
 
     try:

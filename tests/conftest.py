@@ -1,4 +1,5 @@
 import os
+import json
 import sys
 import warnings
 from pathlib import Path
@@ -255,6 +256,71 @@ def _block_real_whatsapp_send(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_web_rate_limit_buckets():
+    """Keep FastAPI rate-limit buckets from leaking between tests.
+
+    TestClient requests all come from the same synthetic IP ("testclient").
+    Without clearing the process-global buckets, endpoint tests that are
+    individually below the limit can trip a 429 after earlier tests in the
+    same module/suite. Production behavior is unchanged; this only resets
+    in-memory test state around each test.
+    """
+    def _clear_loaded_buckets() -> None:
+        for mod_name in ("web.rate_limit", "web.server"):
+            mod = sys.modules.get(mod_name)
+            if mod is None:
+                continue
+            for attr in ("_BEHAVIOR_BUCKETS", "_CHAT_BUCKETS"):
+                bucket = getattr(mod, attr, None)
+                clear = getattr(bucket, "clear", None)
+                if callable(clear):
+                    try:
+                        clear()
+                    except Exception:
+                        pass
+
+    _clear_loaded_buckets()
+    yield
+    _clear_loaded_buckets()
+
+
+@pytest.fixture(autouse=True)
+def _sync_web_interaction_route_deps():
+    """Keep web.interaction_routes callbacks aligned with web.server.
+
+    The full suite imports every test module during collection. A few web
+    tests reload or re-register server routes, and ``web.interaction_routes``
+    stores its callbacks in a module-level singleton. Before each test, if
+    both modules are already loaded, refresh the singleton so patches against
+    ``web.server`` (for example ``log_behavior_event`` mocks) are seen by the
+    actual FastAPI route handler.
+    """
+    server = sys.modules.get("web.server")
+    routes = sys.modules.get("web.interaction_routes")
+    deps = getattr(routes, "_DEPS", None) if routes is not None else None
+    if server is not None and routes is not None and deps is not None:
+        try:
+            from dataclasses import replace
+
+            routes._DEPS = replace(
+                deps,
+                rate_limit_behavior=lambda request, _server=server: _server._check_rate_limit(
+                    _server._BEHAVIOR_BUCKETS,
+                    request.client.host if request.client else "unknown",
+                    _server._BEHAVIOR_RATE_LIMIT,
+                    _server._BEHAVIOR_RATE_WINDOW,
+                ),
+                record_feedback=lambda _server=server, **kwargs: _server.record_feedback(**kwargs),
+                vault_path=lambda _server=server: _server.VAULT_PATH,
+                ragvec_state_conn=lambda _server=server: _server._ragvec_state_conn(),
+                log_behavior_event=lambda event, _server=server: _server.log_behavior_event(event),
+            )
+        except Exception:
+            pass
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_reminders_cache(request, monkeypatch):
     """2026-05-01: el TTL cache de `_fetch_reminders_due` (rag/integrations/
     reminders.py) puede compartir el mismo raw output de `_osascript` entre
@@ -385,8 +451,19 @@ def _isolate_vault_path(tmp_path_factory, request, monkeypatch):
     # `test_queries_yaml_all_paths_exist_or_placeholder` en full suite
     # run (passa en isolation, fallaba solo tras que otros tests
     # movieran VAULT_PATH).
+    import rag as _rag
+
+    def _clear_vaults_config_memo() -> None:
+        try:
+            with _rag._VAULTS_CFG_LOCK:
+                _rag._VAULTS_CFG_MEMO["data"] = None
+                _rag._VAULTS_CFG_MEMO["mtime_ns"] = 0
+        except Exception:
+            pass
+
+    _clear_vaults_config_memo()
+
     if request.node.get_closest_marker("real_vault"):
-        import rag as _rag
         # Forzar VAULT_PATH al default real (el que había en import-time).
         # Usamos `monkeypatch.setattr` en lugar de mutación directa para
         # que `monkeypatch.undo()` (en teardown) lo restaure correctamente
@@ -394,10 +471,20 @@ def _isolate_vault_path(tmp_path_factory, request, monkeypatch):
         # fixtures autouse.
         monkeypatch.setattr(_rag, "VAULT_PATH", _rag._DEFAULT_VAULT)
         yield None
+        _clear_vaults_config_memo()
         return
 
-    import rag as _rag
     tmp = tmp_path_factory.mktemp("vault_isolated")
+    registry = tmp_path_factory.mktemp("vault_registry") / "vaults.json"
+    # `resolve_vault_paths(None)` reads the persistent multi-vault registry,
+    # not `VAULT_PATH`. Keep both surfaces pointed at per-test tmp paths so
+    # tests do not depend on the developer machine's real vaults.json.
+    monkeypatch.setattr(_rag, "VAULTS_CONFIG_PATH", registry)
+    registry.write_text(
+        json.dumps({"vaults": {"default": str(tmp)}, "current": "default"}),
+        encoding="utf-8",
+    )
+    _clear_vaults_config_memo()
     # `monkeypatch.setattr` registra el undo automáticamente. Si el test
     # hace su propio `monkeypatch.setattr(rag, "VAULT_PATH", X)` encima,
     # el stack de undos se desenrolla LIFO en el teardown del monkeypatch
@@ -406,6 +493,7 @@ def _isolate_vault_path(tmp_path_factory, request, monkeypatch):
     # detectar drift acá — eso lo hace `pytest_runtest_protocol` al final.
     monkeypatch.setattr(_rag, "VAULT_PATH", tmp)
     yield tmp
+    _clear_vaults_config_memo()
 
 
 @pytest.fixture(autouse=True)
@@ -546,6 +634,20 @@ def _bypass_anticipate_quiet_hours(monkeypatch):
     hace `delenv` para deshacer este override en su scope.
     """
     monkeypatch.setenv("RAG_ANTICIPATE_BYPASS_QUIET", "1")
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_anticipate_lockfile(tmp_path, monkeypatch):
+    """Keep tests off the production anticipate scheduler lock.
+
+    `anticipate_run_impl()` uses a non-blocking flock so launchd cannot run
+    overlapping scheduler ticks. In tests, the real daemon can legitimately
+    hold `~/.local/share/obsidian-rag/anticipate.lock`, which makes otherwise
+    deterministic orchestrator tests return `lockfile_busy`.
+    """
+    lock_path = tmp_path / "anticipate.lock"
+    monkeypatch.setenv("RAG_ANTICIPATE_LOCK_PATH", str(lock_path))
     yield
 
 

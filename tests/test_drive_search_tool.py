@@ -413,7 +413,7 @@ def test_resolve_person_aliases_cached(monkeypatch):
     assert call_counter["n"] == first_count, "cache should have prevented the 2nd WA lookup"
 
 
-def test_drive_search_emits_sources_sse_with_drive_link(monkeypatch):
+def test_drive_search_emits_sources_sse_with_drive_link(monkeypatch, tmp_path):
     """End-to-end: cuando el pre-router dispara drive_search y el tool
     encuentra archivos con link, el servidor emite un segundo evento SSE
     `sources` con los links de Drive *prepended* al listado de fuentes.
@@ -447,6 +447,11 @@ def test_drive_search_emits_sources_sse_with_drive_link(monkeypatch):
     monkeypatch.setattr(server_mod, "_is_tasks_query", lambda q: False)
 
     import rag as _rag_mod
+    vault_root = tmp_path / "vault"
+    (vault_root / "03-Resources").mkdir(parents=True)
+    (vault_root / "03-Resources" / "test.md").write_text("vault content\n", encoding="utf-8")
+    monkeypatch.setattr(server_mod, "VAULT_PATH", vault_root)
+    monkeypatch.setattr(_rag_mod, "VAULT_PATH", vault_root)
     monkeypatch.setattr(_rag_mod, "build_person_context", lambda q: None)
     monkeypatch.setattr(
         server_mod, "multi_retrieve",

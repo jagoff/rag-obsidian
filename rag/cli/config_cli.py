@@ -67,7 +67,7 @@ _CONFIG_VARS: tuple[tuple[str, str, str, str], ...] = (
      "Activa el pipeline adaptativo — fast-path dispatch + skip reformulate para metadata intents."),
     ("RAG_EXPLORE", "", "bool",
      "ε-exploration: 10% chance de swap top-3 con rank 4-7. Generado counterfactuals para tune online."),
-    ("RAG_EXPAND_MIN_TOKENS", "4", "int",
+    ("RAG_EXPAND_MIN_TOKENS", "6", "int",
      "Queries con <N tokens skippean expand_queries() (paraphrase)."),
     ("RAG_ANAPHORA_RESOLVER", "1", "bool",
      "Quick Win #1: resolver de anáfora upstream del retrieve para "
@@ -173,7 +173,7 @@ _CONFIG_VARS: tuple[tuple[str, str, str, str], ...] = (
 
 @functools.lru_cache(maxsize=1)
 def _collect_env_var_names_from_source() -> set[str]:
-    """Scan `rag/__init__.py` for all RAG_*/OBSIDIAN_RAG_*/OLLAMA_* env var refs.
+    """Scan the rag package for all RAG_*/OBSIDIAN_RAG_*/OLLAMA_* env var refs.
 
     Returns a set of var names. Used to surface env vars in `rag config`
     output that aren't in the curated `_CONFIG_VARS` — gives them
@@ -182,20 +182,27 @@ def _collect_env_var_names_from_source() -> set[str]:
     Best-effort: parses via regex, not AST. Result is cached
     (lru_cache maxsize=1) — same process → same source.
 
-    Resolves the parent package's `__init__.py` path explicitly because
-    `__file__` of this module is `rag/cli/config_cli.py`, not the
-    target source.
+    The config CLI was extracted out of `rag/__init__.py`; new env vars now
+    live across `rag/cli/*`, integrations, runtime jobs, and web helpers.
+    Scanning the package keeps discovered vars visible after modularization.
     """
-    init_py = Path(__file__).parent.parent / "__init__.py"
-    try:
-        src = init_py.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        return set()
     pattern = re.compile(
         r'(?:os\.environ\.get|os\.environ\[)\s*\(?\s*["\']'
         r'((?:OBSIDIAN_RAG|RAG|OLLAMA)_[A-Z][A-Z0-9_]*)["\']'
     )
-    return set(pattern.findall(src))
+    package_dir = Path(__file__).parent.parent
+    out: set[str] = set()
+    try:
+        files = list(package_dir.rglob("*.py"))
+    except Exception:
+        files = [package_dir / "__init__.py"]
+    for py in files:
+        try:
+            src = py.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        out.update(pattern.findall(src))
+    return out
 
 
 @click.command("config")

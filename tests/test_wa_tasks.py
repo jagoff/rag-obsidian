@@ -204,6 +204,34 @@ class TestWindowFetch:
         out = rag._fetch_whatsapp_window(now - timedelta(hours=2), now, set())
         assert {e["label"] for e in out} == {"Luis"}
 
+    def test_ocr_image_safe_accepts_text_source_tuple(self, tmp_path, monkeypatch):
+        from rag.integrations.whatsapp import fetch as wa_fetch
+        import rag.ocr as ocr_mod
+
+        image = tmp_path / "image.png"
+        image.write_bytes(b"fake")
+        monkeypatch.setattr(
+            ocr_mod,
+            "_image_text_or_caption",
+            lambda path: ("hola\nmundo", "ocr"),
+        )
+
+        assert wa_fetch._ocr_image_safe(image) == "hola mundo"
+
+    def test_ocr_image_safe_accepts_legacy_string(self, tmp_path, monkeypatch):
+        from rag.integrations.whatsapp import fetch as wa_fetch
+        import rag.ocr as ocr_mod
+
+        image = tmp_path / "image.png"
+        image.write_bytes(b"fake")
+        monkeypatch.setattr(
+            ocr_mod,
+            "_image_text_or_caption",
+            lambda path: "texto\nlegacy",
+        )
+
+        assert wa_fetch._ocr_image_safe(image) == "texto legacy"
+
 
 class TestWriteNote:
     def test_empty_extractions_skips_write(self, tmp_path):

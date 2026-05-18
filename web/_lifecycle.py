@@ -208,7 +208,6 @@ def _warmup() -> None:
                         _ws.get_pagerank(col)
                 except Exception:
                     pass
-                break
             # End-to-end warmup: load the expensive singletons that the
             # first /api/chat would otherwise pay for (reranker on MPS +
             # bge-m3 SentenceTransformer + one dummy embed pass). Only

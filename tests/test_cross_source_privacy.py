@@ -25,9 +25,16 @@ import rag
 def _reset_filter_cache(monkeypatch, tmp_path):
     """Cada test arranca con DB_PATH apuntando a tmp_path y el cache
     de filters limpio para no contaminar entre tests."""
+    import rag.exclusions as _exclusions
+
     monkeypatch.setattr(rag, "DB_PATH", tmp_path)
     monkeypatch.setattr(rag, "_CROSS_SOURCE_FILTERS_CACHE", None)
     monkeypatch.setattr(rag, "_CROSS_SOURCE_FILTERS_MTIME", 0.0)
+    monkeypatch.setattr(_exclusions, "_DB_PATH", tmp_path / "blacklist.db")
+    monkeypatch.setattr(_exclusions, "_CONFIG_PATH", tmp_path / "blacklist.json")
+    monkeypatch.setattr(_exclusions, "_LEGACY_IGNORED_PATH", tmp_path / "ignored_notes.json")
+    monkeypatch.setattr(_exclusions, "_CACHE", None)
+    monkeypatch.setattr(_exclusions, "_LEGACY_CACHE", None)
     yield
 
 
@@ -168,3 +175,30 @@ def test_filter_passthrough_when_no_yaml(tmp_path):
     ]
     out = rag._filter_excluded_chunks(pairs)
     assert len(out) == 1
+
+
+def test_filter_applies_global_whatsapp_blacklist_without_yaml(tmp_path):
+    """La blacklist general se aplica aunque no exista cross-source.yaml."""
+    pairs = [
+        _mk_pair({"source": "whatsapp", "chat_name": "Cloud Services"}, 0.95),
+        _mk_pair({"source": "whatsapp", "chat_name": "Maria"}, 0.85),
+    ]
+    out = rag._filter_excluded_chunks(pairs)
+    assert len(out) == 1
+    assert out[0][0][1]["chat_name"] == "Maria"
+
+
+def test_filter_applies_global_topic_blacklist_to_text(tmp_path):
+    import rag.exclusions as _exclusions
+
+    _exclusions.save_blacklist({"topics": ["japon"]})
+    pairs = [
+        _mk_pair({"source": "vault", "file": "nota.md"}, 0.95),
+        _mk_pair({"source": "vault", "file": "otra.md"}, 0.85),
+    ]
+    pairs[0] = (pairs[0][0], "ideas sobre japon", pairs[0][2])
+    pairs[1] = (pairs[1][0], "ideas sobre kubernetes", pairs[1][2])
+
+    out = rag._filter_excluded_chunks(pairs)
+    assert len(out) == 1
+    assert out[0][0][1]["file"] == "otra.md"

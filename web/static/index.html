@@ -385,6 +385,16 @@
             </svg>
             <span class="icon-btn-label">fine_tunning</span>
           </a>
+          <a class="icon-btn sidebar-link" href="/blacklist" title="Blacklist global">
+            <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"
+                 fill="none" stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="9"/>
+              <line x1="5.6" y1="18.4" x2="18.4" y2="5.6"/>
+              <path d="M8 9h6M8 12h4M8 15h2"/>
+            </svg>
+            <span class="icon-btn-label">blacklist</span>
+          </a>
           <a class="icon-btn sidebar-link" href="https://ra.ai/agents/" title="Agents (devin-monitor)">
             <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"
                  fill="none" stroke="currentColor" stroke-width="2"
@@ -799,7 +809,7 @@
   <!-- Bundle legado — vanilla JS, global scope. Debe ir ANTES del módulo
        para que los globals (messagesEl, send, etc.) estén definidos cuando
        app.mjs y los módulos ES se evalúan. -->
-  <script src="/static/app.js?v=2026-05-09-esm-phase3"></script>
+  <script src="/static/app.js?v=2026-05-17-chat-422"></script>
   <!-- Entry point del módulo ES — carga utils/markdown/settings/voice/session
        (phase 1) + state/messages-render/sidebar/mobile-ui con implementaciones
        reales (phase 3). type="module" implica defer. -->

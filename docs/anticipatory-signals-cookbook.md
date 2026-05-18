@@ -410,9 +410,10 @@ API pública:
 - `with anticipate_lock(*, timeout_seconds=0.0) as acquired: ...`
 - `lock_status() -> dict`
 
-Path: `~/.local/share/obsidian-rag/anticipate.lock`. Cooperative via
-`fcntl.flock(LOCK_EX | LOCK_NB)`. Default non-blocking (timeout=0); con
-`timeout_seconds>0` espera hasta N segundos antes de devolver `False`.
+Path default: `~/.local/share/obsidian-rag/anticipate.lock`; override:
+`RAG_ANTICIPATE_LOCK_PATH`. Cooperative via `fcntl.flock(LOCK_EX | LOCK_NB)`.
+Default non-blocking (timeout=0); con `timeout_seconds>0` espera hasta N
+segundos antes de devolver `False`.
 
 El lockfile contiene `pid=N ts=T` (texto) para diagnostics. `lock_status()`
 parsea sin acquirir y reporta `{"held": bool, "pid": int|None, "ts": int|None}`.

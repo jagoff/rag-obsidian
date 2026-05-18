@@ -162,9 +162,13 @@ def test_apply_frontmatter_handles_malformed_yaml(tmp_path):
 
 def test_triage_returns_full_plan(vault_with_corpus, monkeypatch):
     vault, col = vault_with_corpus
+    class _FakeClient:
+        def chat(self, **kw):
+            return _FakeResponse("- coaching")
+
     monkeypatch.setattr(
-        rag.ollama, "chat",
-        lambda **kw: _FakeResponse("- coaching"),
+        rag, "_helper_client",
+        lambda: _FakeClient(),
     )
     (vault / "00-Inbox" / "fresh.md").write_text("Hablando de Ikigai en coaching.")
     rag._invalidate_corpus_cache()

@@ -57,11 +57,14 @@ from rag.integrations.whatsapp._constants import (  # noqa: F401
     WHATSAPP_BOT_JID,
     WHATSAPP_BRIDGE_DB_PATH,
     WHATSAPP_DB_PATH,
+    WHATSAPP_EXCLUDED_CHAT_NAMES,
     WHATSAPP_NOTE_MAX_CHARS,
     _APPLE_LABEL_ES_TO_EN,
     _CONTACT_OBS_STANDARD_CATEGORIES,
     _OBSERVATIONS_HEADING,
     _RELATIONSHIP_HINT_MAP,
+    normalize_whatsapp_chat_name,
+    whatsapp_chat_name_excluded,
 )
 
 # ── Send paths ──────────────────────────────────────────────────────────────
@@ -211,6 +214,7 @@ __all__ = [
     "WHATSAPP_BRIDGE_DB_PATH",
     "WHATSAPP_DB_PATH",
     "WHATSAPP_BOT_JID",
+    "WHATSAPP_EXCLUDED_CHAT_NAMES",
     "WA_TASKS_STATE_PATH",
     "WA_TASKS_LOG_PATH",
     "WA_TASKS_MAX_CHATS",
@@ -222,6 +226,8 @@ __all__ = [
     "_APPLE_LABEL_ES_TO_EN",
     "_OBSERVATIONS_HEADING",
     "_CONTACT_OBS_STANDARD_CATEGORIES",
+    "normalize_whatsapp_chat_name",
+    "whatsapp_chat_name_excluded",
     "_POSSESSIVE_PREFIX_RE",
     "_WA_APPLESCRIPT_SAFE_RE",
     "_GROUP_PREFIX_RE",

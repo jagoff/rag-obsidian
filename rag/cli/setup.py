@@ -12,8 +12,7 @@ había movido los 7 helpers stdlib-only a `rag/cli/daemons_control.py`).
 - `setup` (Click cmd) — instala/desinstala los managed daemons del
   `_services_spec`. Idempotente.
 - `stop` (Click cmd) — bootout + plist archiving de TODO el stack
-  (managed + manual + RagNet + cloudflared). Default omite qdrant
-  (compartido con mem-vault).
+  (managed + manual + RagNet + cloudflared).
 - `start` (Click cmd) — arranque mínimo viable con supervisor/watch/web
   + catch-up index si hay backlog. `--full` instala todo `_services_spec`
   (hoy mismo set post-supervisor, más explícito para compat CLI).
@@ -33,7 +32,7 @@ el monkeypatch sobre el binding de `rag.__init__` flow-throughea al
 
 ## Constantes locales
 
-`_RAG_NET_LABELS`, `_QDRANT_LABELS`, `_MINIMAL_MANAGED_LABELS` viven
+`_RAG_NET_LABELS`, `_MINIMAL_MANAGED_LABELS` viven
 top-level acá (datos puros, sin refs dinámicos a `rag`). Se re-exportan
 en `rag/__init__.py` para que `rag._MINIMAL_MANAGED_LABELS` siga
 respondiendo (tests `test_launchd_plists.py:154` lo leen así).
@@ -44,7 +43,6 @@ respondiendo (tests `test_launchd_plists.py:154` lo leen así).
 
     from rag.cli.setup import (
         _MINIMAL_MANAGED_LABELS,
-        _QDRANT_LABELS,
         _RAG_NET_LABELS,
         _run_catch_up_index,
         _setup_install,
@@ -76,7 +74,6 @@ import click
 
 __all__ = [
     "_MINIMAL_MANAGED_LABELS",
-    "_QDRANT_LABELS",
     "_RAG_NET_LABELS",
     "_run_catch_up_index",
     "_setup_install",
@@ -86,7 +83,7 @@ __all__ = [
 ]
 
 
-# ── Daemons RagNet (whatsapp-*) y dep externa qdrant ──────────────────────
+# ── Daemons RagNet (whatsapp-*) ───────────────────────────────────────────
 #
 # Estos labels NO están en `_services_spec` (vienen del repo `whatsapp-listener`
 # y de instaladores externos), pero `rag stop` necesita poder bootoutearlos
@@ -100,15 +97,12 @@ __all__ = [
 #               bridge, MLX Whisper, healthcheck. Default ON en `rag stop`
 #               porque sin RagNet la UX del sistema queda a medias (web sí,
 #               WhatsApp no).
-#  - qdrant   → vector store de mem-vault. Default OFF: compartido con
-#               mem-vault y otros agentes locales.
 _RAG_NET_LABELS: tuple[str, ...] = (
     "com.fer.whatsapp-bridge",
     "com.fer.whatsapp-listener-mlx-whisper",
     "com.fer.whatsapp-listener",
     "com.fer.whatsapp-listener-healthcheck",
 )
-_QDRANT_LABELS: tuple[str, ...] = ("com.fer.qdrant",)
 
 # Set mínimo viable que `rag start --minimal` (default ON desde 2026-05-08)
 # instala. Post-supervisor refactor, minimal == all managed: supervisor,
@@ -171,17 +165,27 @@ def _start_safe_env_overrides() -> dict[str, str]:
         defaults = dict(_index_safe_defaults())
     except Exception:
         defaults = {
-            "RAG_INDEX_EMBED_SLICE_SIZE": "16",
+            "RAG_INDEX_EMBED_SLICE_SIZE": "auto",
             "RAG_INDEX_FILE_CHUNK_SLICE_SIZE": "128",
-            "RAG_INDEX_LOCAL_EMBED_BATCH": "16",
+            "RAG_INDEX_LOCAL_EMBED_BATCH": "auto",
+            "RAG_INDEX_BATCH_EMBEDS": "1",
+            "RAG_INDEX_BATCH_SIZE": "auto",
+            "RAG_EXTRACT_ENTITIES": "0",
             "RAG_INDEX_PREFLIGHT_MEMORY_GUARD": "1",
             "RAG_INDEX_MEMORY_GUARD_INTERVAL_S": "5",
-            "RAG_INDEX_MEMORY_PRESSURE_SLEEP_S": "10",
+            "RAG_MEMORY_PRESSURE_SWAP_GB": "0",
+            "RAG_INDEX_MEMORY_PRESSURE_SLEEP_S": "1",
             "RAG_INDEX_ABORT_ON_MEMORY_PRESSURE": "1",
-            "RAG_INDEX_ABORT_USED_PCT": "92",
-            "RAG_INDEX_ABORT_SWAP_GB": "2.0",
+            "RAG_INDEX_ABORT_USED_PCT": "0",
+            "RAG_INDEX_ABORT_SWAP_GB": "0",
             "RAG_INDEX_ABORT_SELF_RSS_GB": "18.0",
             "RAG_INDEX_BATCH_SLEEP_MS": "50",
+            "RAG_INDEX_ETL_FRESHNESS": "1",
+            "RAG_INDEX_ETL_FRESH_TTL_S": "600",
+            "RAG_INDEX_ETL_PARALLEL": "1",
+            "RAG_INDEX_ETL_MAX_WORKERS": "6",
+            "RAG_REMINDERS_OSASCRIPT_TIMEOUT_S": "5",
+            "RAG_INDEX_SKIP_CONTRADICTIONS": "1",
         }
     defaults.update({
         # Force safe mode for start's catch-up even if the interactive shell
@@ -262,7 +266,11 @@ def _start_memory_guard(console, where: str) -> bool:
 
     used_pct, swap_gb = _start_memory_snapshot()
     abort_used_pct = _start_float_env("RAG_START_ABORT_USED_PCT", 92.0)
-    abort_swap_gb = _start_float_env("RAG_START_ABORT_SWAP_GB", 2.0)
+    # macOS can keep swap allocated long after real pressure has cleared.
+    # Treat swap-only aborts as an explicit operator opt-in; the default guard
+    # uses memory_pressure's free% signal so stale swap does not make `rag start`
+    # skip every daemon on an otherwise idle machine.
+    abort_swap_gb = _start_float_env("RAG_START_ABORT_SWAP_GB", 0.0)
 
     def _danger(pct: float | None, swap: float | None) -> bool:
         return (
@@ -976,17 +984,11 @@ def setup(remove: bool):
     "mlx-whisper/healthcheck). Default: sí.",
 )
 @click.option(
-    "--with-qdrant",
-    is_flag=True,
-    default=False,
-    help="Detener también qdrant (com.fer.qdrant). Default OFF: compartido con mem-vault.",
-)
-@click.option(
     "--all",
     "stop_all",
     is_flag=True,
     default=False,
-    help="Atajo para --with-qdrant + --with-rag-net.",
+    help="Atajo de compatibilidad: incluye todos los externos actuales (RagNet).",
 )
 @click.option(
     "--yes",
@@ -1001,7 +1003,6 @@ def setup(remove: bool):
 )
 def stop(
     with_rag_net: bool,
-    with_qdrant: bool,
     stop_all: bool,
     yes: bool,
     dry_run: bool,
@@ -1016,14 +1017,9 @@ def stop(
     2. Después el resto de daemons managed (`_services_spec`) y manual
        (cloudflare-tunnel, lgbm-train, etc).
     3. Opcional: RagNet (whatsapp-*) si `--with-rag-net` (default ON).
-    4. Opcional: qdrant si `--with-qdrant` (default OFF — compartido
-       con mem-vault).
 
     Para volver a levantar todo: `rag start` (regenera plists desde
-    código + bootstrap + catch-up index). Qdrant lo volvés a arrancar
-    con su propio `launchctl bootstrap` o desde su repo origen — NO se
-    archiva aunque esté en los targets porque es compartido con
-    mem-vault y otros agentes locales.
+    código + bootstrap + catch-up index).
 
     Archivado de plists: después del bootout, los `.plist` de
     `obsidian-rag-*` y `rag-net` se mueven a
@@ -1042,7 +1038,6 @@ def stop(
     )
 
     if stop_all:
-        with_qdrant = True
         with_rag_net = True
 
     # ── Detectar cloudflare tunnel plists dinámicamente ──────────────────
@@ -1074,8 +1069,6 @@ def stop(
 
     if with_rag_net:
         targets.extend((lbl, "rag-net") for lbl in _RAG_NET_LABELS)
-    if with_qdrant:
-        targets.extend((lbl, "qdrant") for lbl in _QDRANT_LABELS)
 
     if not targets:
         console.print("[yellow]No hay nada que parar.[/yellow]")
@@ -1100,9 +1093,8 @@ def stop(
     a_obs, p_obs = _split("obsidian-rag")
     a_cf, p_cf = _split("cloudflare")
     a_rn, p_rn = _split("rag-net")
-    a_qd, p_qd = _split("qdrant")
-    n_active = a_watch + a_obs + a_cf + a_rn + a_qd
-    n_stopped = p_watch + p_obs + p_cf + p_rn + p_qd
+    n_active = a_watch + a_obs + a_cf + a_rn
+    n_stopped = p_watch + p_obs + p_cf + p_rn
     n_total = n_active + n_stopped
 
     def _fmt(active: int, stopped: int) -> str:
@@ -1134,12 +1126,6 @@ def stop(
     else:
         console.print(
             "  [dim]·[/dim] RagNet (whatsapp-*): [yellow]skip[/yellow] (--without-rag-net)"
-        )
-    if with_qdrant:
-        console.print(f"  [dim]·[/dim] qdrant             : {_fmt(a_qd, p_qd)}")
-    else:
-        console.print(
-            "  [dim]·[/dim] qdrant             : [yellow]skip[/yellow] (default — compartido con mem-vault)"
         )
     console.print()
     if loaded_known and n_active == 0:
@@ -1247,7 +1233,7 @@ def stop(
         _LAUNCH_AGENTS_DIR / f".archive-rag-stop-{_dt.datetime.now().strftime('%Y%m%d-%H%M%S')}"
     )
     archived = 0
-    archive_skip_categories = {"qdrant"}  # compartidos con mem-vault
+    archive_skip_categories: set[str] = set()
     for label, category in targets:
         if category in archive_skip_categories:
             continue
@@ -1279,12 +1265,6 @@ def stop(
             "[cyan]launchctl bootstrap gui/$(id -u) "
             "~/Library/LaunchAgents/com.fer.whatsapp-listener.plist[/cyan] "
             "(idem bridge / mlx-whisper / healthcheck)"
-        )
-    if with_qdrant:
-        console.print(
-            "  [dim]·[/dim] qdrant       : "
-            "[cyan]launchctl bootstrap gui/$(id -u) "
-            "~/Library/LaunchAgents/com.fer.qdrant.plist[/cyan]"
         )
     console.print(
         "[dim](Plists quedan en disco; macOS los re-loadea solo al próximo "
@@ -1409,17 +1389,11 @@ def _run_catch_up_index(ctx: click.Context) -> None:
     "del sistema queda a medias (web sí, WhatsApp no).",
 )
 @click.option(
-    "--with-qdrant",
-    is_flag=True,
-    default=False,
-    help="Levantar también qdrant (com.fer.qdrant). Default OFF.",
-)
-@click.option(
     "--all",
     "start_all",
     is_flag=True,
     default=False,
-    help="Atajo para --with-rag-net + --with-qdrant.",
+    help="Atajo de compatibilidad: incluye todos los externos actuales (RagNet).",
 )
 @click.option(
     "--no-index",
@@ -1453,7 +1427,6 @@ def start(
     ctx: click.Context,
     minimal: bool,
     with_rag_net: bool,
-    with_qdrant: bool,
     start_all: bool,
     no_index: bool,
     yes: bool,
@@ -1472,13 +1445,11 @@ def start(
     2. `rag setup` — regenera + carga los `obsidian-rag-*` managed desde
        código (post-supervisor: supervisor/watch/web).
     3. Externos vía `launchctl bootstrap` desde `~/Library/LaunchAgents/`:
-       qdrant (si `--with-qdrant`), RagNet (whatsapp-*) si `--with-rag-net`
-       (default ON).
+       RagNet (whatsapp-*) si `--with-rag-net` (default ON).
 
     Si un externo no tiene plist en disco, lo reporta como "missing" y
     sigue — instalalo desde su repo origen ([whatsapp-listener](https://github.com/jagoff/whatsapp-listener)
-    para RagNet, [mem-vault](https://github.com/jagoff/mem-vault) para
-    qdrant) y re-corré `rag start`.
+    para RagNet) y re-corré `rag start`.
     """
     from rag import (  # noqa: PLC0415
         _bootstrap_label,
@@ -1491,7 +1462,6 @@ def start(
     )
 
     if start_all:
-        with_qdrant = True
         with_rag_net = True
 
     rag_bin = _rag_binary()
@@ -1524,12 +1494,6 @@ def start(
     else:
         console.print(
             "  [dim]·[/dim] RagNet (whatsapp-*)     : [yellow]skip[/yellow] (--without-rag-net)"
-        )
-    if with_qdrant:
-        console.print(f"  [dim]·[/dim] qdrant                  : {len(_QDRANT_LABELS)} daemons")
-    else:
-        console.print(
-            "  [dim]·[/dim] qdrant                  : [yellow]skip[/yellow] (default — usalo si bajaste qdrant)"
         )
     if no_index:
         console.print("  [dim]·[/dim] catch-up index          : [yellow]skip[/yellow] (--no-index)")
@@ -1615,9 +1579,6 @@ def start(
             console.print(
                 f"  [dim]would-install[/dim] [managed-full] {len(_services_spec(rag_bin))} labels"
             )
-        if with_qdrant:
-            for lbl in _QDRANT_LABELS:
-                console.print(f"  [dim]would-bootstrap[/dim] [qdrant] {lbl}")
         if with_rag_net:
             for lbl in _RAG_NET_LABELS:
                 console.print(f"  [dim]would-bootstrap[/dim] [rag-net] {lbl}")
@@ -1695,6 +1656,8 @@ def start(
     # del disco (mismo trato que `_DEPRECATED_LABELS`).
     console.print()
     console.print("[bold cyan]▸ obsidian-rag-* (managed daemons)[/bold cyan]")
+    managed_skipped = False
+    managed_failed = False
     try:
         if _start_memory_guard(console, "obsidian-rag managed daemons"):
             _setup_install(
@@ -1703,18 +1666,16 @@ def start(
                 only_labels=only_labels,
                 bootstrap_stagger_s=_start_bootstrap_stagger_s(),
             )
+        else:
+            managed_skipped = True
     except Exception as exc:
+        managed_failed = True
         console.print(f"[red]✗[/red] setup falló: {exc!r}")
         # No abortar — los externos podrían levantarse igual.
         _silent_log("rag_start_setup_failed", exc)
 
-    # ── 2. Externos: qdrant → rag-net ────────────────────────────────────
-    # Orden: qdrant primero (si el user lo pidió, quiere que esté up antes
-    # de que RagNet arranque a chatear con mem-vault). Después RagNet
-    # (consume web).
+    # ── 2. Externos: RagNet ──────────────────────────────────────────────
     ext_targets: list[tuple[str, str]] = []
-    if with_qdrant:
-        ext_targets.extend((lbl, "qdrant") for lbl in _QDRANT_LABELS)
     if with_rag_net:
         ext_targets.extend((lbl, "rag-net") for lbl in _RAG_NET_LABELS)
 
@@ -1773,13 +1734,29 @@ def start(
 
     # ── Summary ──────────────────────────────────────────────────────────
     console.print()
-    if ext_fail == 0:
+    if not managed_failed and not managed_skipped and ext_fail == 0 and ext_skipped == 0:
         console.print("[bold green]✓ sistema levantado[/bold green]")
     else:
+        issues = []
+        if managed_skipped:
+            issues.append("[yellow]managed skip por memoria[/yellow]")
+        if managed_failed:
+            issues.append("[red]managed falló[/red]")
+        if ext_skipped:
+            issues.append(f"[yellow]{ext_skipped} externo(s) skip por memoria[/yellow]")
+        if ext_fail:
+            issues.append(f"[red]{ext_fail} externo(s) fallidos[/red]")
         console.print(
-            f"[yellow]sistema levantado parcialmente — "
-            f"[red]{ext_fail} externo(s) fallidos[/red][/yellow]"
+            "[yellow]sistema levantado parcialmente[/yellow] — "
+            + ", ".join(issues)
         )
+    if managed_skipped or managed_failed:
+        managed_parts = []
+        if managed_skipped:
+            managed_parts.append("[yellow]skip por memoria[/yellow]")
+        if managed_failed:
+            managed_parts.append("[red]falló[/red]")
+        console.print(f"  [dim]managed:[/dim] {', '.join(managed_parts)}")
     if ext_targets:
         parts = []
         if ext_ok:

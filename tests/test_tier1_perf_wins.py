@@ -33,6 +33,7 @@ contrato que los fixes promueven.
 from __future__ import annotations
 
 import sys
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -55,27 +56,28 @@ def test_import_rag_does_not_load_ocrmac_or_vision():
     """`import rag` NO debe cargar ocrmac/Vision/Quartz/CoreML/AppKit en
     sys.modules. Ese era el cold-start tax de ~130ms que el CLI pagaba
     cada vez que se invocaba — incluso para subcomandos sin OCR."""
-    # rag ya está importado por el test runner; verificamos que los
-    # módulos pesados no hayan aterrizado como side-effect.
-    #
-    # NOTA: si otro test previo dispara _load_ocrmac_module() o
-    # _ocr_image(), ocrmac SÍ va a estar en sys.modules. Este test
-    # asume orden de ejecución donde ningún test previo tocó OCR —
-    # en la práctica, los ocrmac tests aislan via monkeypatch y no
-    # dejan el módulo real cargado. Si este test rompe por contamination
-    # de otro test, el fix es `pytest -x tests/test_tier1_perf_wins.py`
-    # aislado.
-    heavy_modules = [
-        "ocrmac.ocrmac",  # el import lazy
-        "Vision",  # pyobjc framework, ~116ms
-        "CoreML",  # pyobjc framework, ~4ms
-    ]
-    for mod in heavy_modules:
-        assert mod not in sys.modules or _ocrmac_test_previously_fired(), (
-            f"{mod} cargado al import de rag — el lazy-import no está "
-            f"funcionando. sys.modules contiene: "
-            f"{[m for m in heavy_modules if m in sys.modules]}"
-        )
+    # El proceso principal del suite puede haber cargado OCR por tests
+    # anteriores y luego recargado `rag`, reseteando
+    # `_ocrmac_import_attempted`. Verificamos el contrato real en un
+    # intérprete limpio: `import rag` no debe introducir módulos OCR que no
+    # estuvieran ya presentes.
+    script = """
+import sys
+heavy = ["ocrmac.ocrmac", "Vision", "CoreML"]
+before = set(sys.modules)
+import rag  # noqa: F401
+new = [m for m in heavy if m not in before and m in sys.modules]
+if new:
+    raise SystemExit("heavy OCR modules loaded by import rag: " + repr(new))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
 
 
 def _ocrmac_test_previously_fired() -> bool:

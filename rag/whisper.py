@@ -153,12 +153,15 @@ class _MLXWhisperModelWrapper:
                 "`uv tool install --reinstall --editable '.[stt]'`"
             ) from exc
 
-        result = mlx_whisper.transcribe(
-            str(audio_path),
-            path_or_hf_repo=self._hf_repo,
-            language=language,
-            verbose=False,
-        )
+        from rag.llm_backend import _MLX_FORWARD_LOCK  # noqa: PLC0415
+
+        with _MLX_FORWARD_LOCK:
+            result = mlx_whisper.transcribe(
+                str(audio_path),
+                path_or_hf_repo=self._hf_repo,
+                language=language,
+                verbose=False,
+            )
 
         class _Segment:
             __slots__ = ("text",)

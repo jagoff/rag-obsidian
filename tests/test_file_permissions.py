@@ -35,6 +35,7 @@ def test_ensure_state_dir_secure_tightens_existing_loose_perms(tmp_path, monkeyp
     """If the state dir pre-exists with umask-022 perms (0o755),
     a fresh import (via re-running the helper) must chmod to 0o700."""
     fake_home = tmp_path
+    monkeypatch.delenv("OBSIDIAN_RAG_STATE_DIR", raising=False)
     monkeypatch.setattr(Path, "home", lambda: fake_home)
 
     # Simulate a user whose state dir was created before hardening.

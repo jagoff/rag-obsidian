@@ -3,6 +3,13 @@
 
 import { escapeHTML, fmtTimeAgo, youtubeUrl, renderPanelList } from "./core.mjs";
 
+const dateKey = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+const isTodayValue = (value) => {
+  if (!value) return false;
+  const d = new Date(value);
+  return !Number.isNaN(d.getTime()) && dateKey(d) === dateKey(new Date());
+};
+
 export function renderWeather(payload) {
   const wf = payload.weather_forecast;
   const panel = document.getElementById("p-weather");
@@ -120,7 +127,7 @@ export function renderBookmarks(payload) {
 }
 
 export function renderYouTube(payload) {
-  const items = payload.signals?.youtube_watched || [];
+  const items = (payload.signals?.youtube_watched || []).filter((it) => isTodayValue(it.last_visit_iso));
   const rows = items.slice(0, 5).map((it) => ({
     title: it.title || "",
     meta: [
@@ -148,19 +155,16 @@ export function renderSpotify(payload) {
   const sp = payload.signals?.spotify;
   const panel = document.getElementById("p-spotify");
   if (!panel) return;
-  // Caso "empty" (server siempre devuelve payload desde 2026-05-13):
-  // tabla `rag_spotify_log` vacía + Spotify cerrado. Mostrar placeholder
-  // accionable en vez de hidear (UX previo era confuso — user no sabía
-  // si el panel estaba roto o feature off).
+  // Si no hay señal real, no ocupar una caja vacía en el dashboard. El
+  // panel vuelve a aparecer solo cuando now_playing o el historial tienen
+  // contenido.
   if (!sp || sp.state === "empty" || (!sp.now_playing && !(sp.recent_today || []).length)) {
-    panel.hidden = false;
+    panel.hidden = true;
+    panel.classList.remove("is-empty");
     const body = panel.querySelector("[data-body]");
     const count = panel.querySelector("[data-count]");
     if (count) count.textContent = "—";
-    if (body) {
-      const msg = sp?.message || "Sin historial — daemon spotify-poll no corriendo.";
-      body.innerHTML = `<div class="empty">${escapeHTML(msg)}</div>`;
-    }
+    if (body) body.innerHTML = "";
     return;
   }
   panel.hidden = false;
@@ -360,7 +364,7 @@ export function renderHealth(payload) {
     const count = panel.querySelector("[data-count]");
     if (count) count.textContent = "—";
     if (body) {
-      body.innerHTML = `<div class="empty">Sin export Apple Health · correr <code>rag health-import</code> después de Export Health Data desde iPhone</div>`;
+      body.innerHTML = `<div class="empty">Sin datos Apple Health · exportá desde iPhone y corré <code>rag index --source health</code></div>`;
     }
     return;
   }

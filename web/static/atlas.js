@@ -116,11 +116,19 @@ const PULSE_THRESHOLDS = [
 
 // Detectar mobile para cap del graph_top_notes (perf en iPhone con 500+ nodos
 // + force-sim 3D es pesado). 720px es el breakpoint del rest del proyecto.
-// Subimos el cap desktop a 500 para que el "preguntale al vault" pueda
-// matchear más fuentes contra el grafo visible — three.js maneja 500
-// esferas + 1000 links sin sudar en una Mac de los últimos 5 años.
+// Desktop pide bastante más porque Atlas ahora agrega home + work y 500 nodos
+// dejaba fuera demasiadas notas visibles.
 const IS_MOBILE = window.matchMedia("(max-width: 720px)").matches;
-const GRAPH_TOP_NOTES = IS_MOBILE ? 200 : 500;
+const GRAPH_TOP_NOTES = IS_MOBILE ? 250 : 1200;
+
+function nodePath(node) {
+  return node?.path || node?.id || "";
+}
+
+function nodeMatchesPath(node, path) {
+  if (!node || !path) return false;
+  return node.id === path || node.path === path || `${node.vault_name || ""}:${node.path || ""}` === path;
+}
 
 // ── Theme toggle (mismo patrón que dashboard/finance) ────────────────────
 function applyTheme() {
@@ -975,7 +983,7 @@ function _refreshPulseButton() {
 
 async function _fetchPulseData() {
   if (!state.graphNodes || !state.graphNodes.length) return;
-  const paths = state.graphNodes.map((n) => n.id);
+  const paths = Array.from(new Set(state.graphNodes.map((n) => nodePath(n)).filter(Boolean)));
   try {
     const r = await fetch("/api/atlas/pulse-data", {
       method: "POST",
@@ -984,7 +992,13 @@ async function _fetchPulseData() {
     });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
-    state.pulseRecency = data.recency || {};
+    const rawRecency = data.recency || {};
+    const byNodeId = {};
+    for (const n of state.graphNodes) {
+      const ts = rawRecency[nodePath(n)] || rawRecency[n.id];
+      if (ts) byNodeId[n.id] = ts;
+    }
+    state.pulseRecency = byNodeId;
     state.pulseNow = data.now || (Date.now() / 1000);
     refreshGraphVisuals();
     // Inicializar el last_id al máximo actual para que el polling solo
@@ -1053,10 +1067,13 @@ async function _pollPulseRecent() {
     let touched = false;
     for (const ev of events) {
       for (const p of (ev.paths || [])) {
-        if ((state.pulseRecency?.[p] || 0) < ev.ts) {
-          if (!state.pulseRecency) state.pulseRecency = {};
-          state.pulseRecency[p] = ev.ts;
-          touched = true;
+        for (const n of (state.graphNodes || [])) {
+          if (!nodeMatchesPath(n, p)) continue;
+          if ((state.pulseRecency?.[n.id] || 0) < ev.ts) {
+            if (!state.pulseRecency) state.pulseRecency = {};
+            state.pulseRecency[n.id] = ev.ts;
+            touched = true;
+          }
         }
       }
     }
@@ -1075,7 +1092,7 @@ async function _pollPulseRecent() {
 // (estaba dimmed por search/entity filter), se ve igual porque el
 // scale se aplica al material que SIEMPRE renderiza.
 function _pulseWave(path) {
-  const node = state.graphNodes?.find?.((n) => n.id === path);
+  const node = state.graphNodes?.find?.((n) => nodeMatchesPath(n, path));
   if (!node || !node._material) return;
   // Buscar el sphere mesh — three.js lo tiene como parent del material.
   // Más simple: lo guardamos en buildNodeObject vía node._sphere.
@@ -1172,7 +1189,7 @@ async function openSidePanel(node) {
   inner.innerHTML = `
     <button class="gp-close" id="gp-close" type="button" aria-label="Cerrar panel">×</button>
     <div class="gp-title">${escapeHtml(node.label || "(sin título)")}</div>
-    <div class="gp-folder">${escapeHtml(node.folder || "—")}</div>
+    <div class="gp-folder">${escapeHtml([node.vault_name, node.folder || "—"].filter(Boolean).join(" · "))}</div>
     <div class="gp-loading">Cargando detalle…</div>
   `;
   document.getElementById("gp-close").addEventListener("click", () => clearSelection());
@@ -1180,7 +1197,9 @@ async function openSidePanel(node) {
   // Fetch detalle.
   let detail;
   try {
-    const r = await fetch(`/api/atlas/note?path=${encodeURIComponent(node.id)}`);
+    const params = new URLSearchParams({ path: nodePath(node) });
+    if (node.vault_name) params.set("vault", node.vault_name);
+    const r = await fetch(`/api/atlas/note?${params.toString()}`);
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     detail = await r.json();
   } catch (e) {
@@ -1229,7 +1248,7 @@ async function openSidePanel(node) {
   inner.innerHTML = `
     <button class="gp-close" id="gp-close" type="button" aria-label="Cerrar panel">×</button>
     <div class="gp-title">${escapeHtml(node.label || "(sin título)")}</div>
-    <div class="gp-folder">${escapeHtml(node.folder || "—")} · ${node.degree} conexión${node.degree === 1 ? "" : "es"} · ${node.n_chunks} chunk${node.n_chunks === 1 ? "" : "s"}</div>
+    <div class="gp-folder">${escapeHtml([node.vault_name, node.folder || "—"].filter(Boolean).join(" · "))} · ${node.degree} conexión${node.degree === 1 ? "" : "es"} · ${node.n_chunks} chunk${node.n_chunks === 1 ? "" : "s"}</div>
     <div class="gp-actions">${obsLink}</div>
     ${previewBlock}
     ${entitiesBlock}
@@ -1253,7 +1272,7 @@ async function openSidePanel(node) {
     row.addEventListener("click", () => {
       const path = row.dataset.neighborPath;
       if (!state.graphNodes) return;
-      const target = state.graphNodes.find((n) => n.id === path);
+      const target = state.graphNodes.find((n) => nodeMatchesPath(n, path));
       if (target && state.graph3d) {
         // Mismo flujo que un click en una esfera del 3D.
         const distance = 90;
@@ -1327,7 +1346,7 @@ function applySearch(query) {
   // (ej. buscar "01-Projects" highlightea todas las notas en proyectos).
   const matchIds = new Set();
   (state.graphNodes || []).forEach((n) => {
-    const hay = ((n.label || "") + " " + (n.folder || "")).toLowerCase();
+    const hay = ((n.label || "") + " " + (n.folder || "") + " " + (n.vault_name || "")).toLowerCase();
     if (hay.includes(state.searchQuery)) matchIds.add(n.id);
   });
   state.searchHits = matchIds;
@@ -1584,7 +1603,7 @@ function _highlightAskNodes(paths) {
   const matches = new Set();
   let cx = 0, cy = 0, cz = 0, count = 0;
   state.graphNodes.forEach((n) => {
-    if (pathSet.has(n.id)) {
+    if (pathSet.has(n.id) || pathSet.has(nodePath(n))) {
       matches.add(n.id);
       if (n.x != null && n.y != null && n.z != null) {
         cx += n.x; cy += n.y; cz += n.z; count++;

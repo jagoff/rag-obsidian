@@ -39,10 +39,10 @@ Verified on `mlx-community/Qwen3-Reranker-0.6B-mxfp8`:
 
 ## Threading
 
-`MLXReranker` is thread-safe for concurrent `.predict()` calls — the
-underlying `mlx_lm` model is reentrant for forward passes (no shared
-mutable state in the model.eval() path). The lazy `load()` is guarded
-by `_load_lock` so only one thread pays the cold-load cost.
+`MLXReranker` is thread-safe for concurrent `.predict()` calls. MLX work is
+serialized with the process-wide `_MLX_FORWARD_LOCK` shared by chat/embed/VLM
+so Metal cache clears and forwards cannot overlap. The lazy `load()` is
+guarded by `_load_lock` so only one thread pays the cold-load cost.
 """
 
 from __future__ import annotations
@@ -110,7 +110,11 @@ class MLXReranker:
             if self._model is not None:
                 return
             from mlx_lm import load as _mlx_load
-            self._model, self._tokenizer = _mlx_load(self.model_path)
+            from rag.llm_backend import _MLX_FORWARD_LOCK, clear_mlx_cache_safely
+
+            clear_mlx_cache_safely(collect=True)
+            with _MLX_FORWARD_LOCK:
+                self._model, self._tokenizer = _mlx_load(self.model_path)
             # The model emits literal "yes" / "no" tokens — capture their IDs
             # once so each predict() call doesn't re-tokenize the string.
             # `add_special_tokens=False` matters: with default the encode adds
@@ -169,14 +173,19 @@ class MLXReranker:
         from rag.llm_backend import _MLX_FORWARD_LOCK
 
         ids = self._tokenize_truncated(query, doc)
-        arr = mx.array([ids])
         with _MLX_FORWARD_LOCK:
-            logits = self._model(arr)[0, -1, :]
-            yes = float(logits[self._yes_id])
-            no = float(logits[self._no_id])
-            mx.eval(logits)
-        result = 1.0 / (1.0 + math.exp(-(yes - no)))
-        mx.clear_cache()
+            try:
+                arr = mx.array([ids])
+                logits = self._model(arr)[0, -1, :]
+                yes = float(logits[self._yes_id])
+                no = float(logits[self._no_id])
+                mx.eval(logits)
+                result = 1.0 / (1.0 + math.exp(-(yes - no)))
+            finally:
+                try:
+                    mx.clear_cache()
+                except Exception:
+                    pass
         return result
 
     def _score_batch(self, pairs: list[tuple[str, str]]) -> list[float]:
@@ -206,23 +215,28 @@ class MLXReranker:
         if pad_id is None:
             pad_id = getattr(self._tokenizer, "eos_token_id", None) or 0
         padded = [ids + [int(pad_id)] * (max_len - len(ids)) for ids in ids_list]
-        arr = mx.array(padded)
         b = len(pairs)
         with _MLX_FORWARD_LOCK:
-            logits = self._model(arr)  # (B, T, V)
-            batch_idx = mx.arange(b)
-            last_idx = mx.array([L - 1 for L in lengths])
-            last = logits[batch_idx, last_idx, :]  # (B, V)
-            yes_col = last[:, self._yes_id]
-            no_col = last[:, self._no_id]
-            diff = yes_col - no_col
-            mx.eval(diff)
-        # Convertir a Python scalars y liberar tensores MLX.
-        # Sin clear_cache(), cada mini-batch de rerank acumula buffers Metal
-        # (logits: B×T×V, last: B×V, diff: B) → durante `rag tune` con 200
-        # samples × ceil(25/8)=4 batches = 800 forwards sin release → OOM.
-        diffs = [float(d) for d in diff]
-        mx.clear_cache()
+            try:
+                arr = mx.array(padded)
+                logits = self._model(arr)  # (B, T, V)
+                batch_idx = mx.arange(b)
+                last_idx = mx.array([L - 1 for L in lengths])
+                last = logits[batch_idx, last_idx, :]  # (B, V)
+                yes_col = last[:, self._yes_id]
+                no_col = last[:, self._no_id]
+                diff = yes_col - no_col
+                mx.eval(diff)
+                # Convertir a Python scalars bajo el lock: la copia puede
+                # sincronizar con Metal.
+                diffs = [float(d) for d in diff]
+            finally:
+                # Sin clear_cache(), cada mini-batch de rerank acumula buffers
+                # Metal (logits: B×T×V, last: B×V, diff: B).
+                try:
+                    mx.clear_cache()
+                except Exception:
+                    pass
         return [1.0 / (1.0 + math.exp(-x)) for x in diffs]
 
     # -- public -------------------------------------------------------------
@@ -266,13 +280,30 @@ class MLXReranker:
     def unload(self) -> None:
         """Drop the model from memory + clear MLX cache. Idempotent."""
         with self._load_lock:
-            self._model = None
-            self._tokenizer = None
-            self._yes_id = None
-            self._no_id = None
             try:
-                import mlx.core as mx
-                mx.clear_cache()
+                from rag.llm_backend import _MLX_FORWARD_LOCK
+            except Exception:
+                _MLX_FORWARD_LOCK = None
+            if _MLX_FORWARD_LOCK is None:
+                self._model = None
+                self._tokenizer = None
+                self._yes_id = None
+                self._no_id = None
+            else:
+                with _MLX_FORWARD_LOCK:
+                    self._model = None
+                    self._tokenizer = None
+                    self._yes_id = None
+                    self._no_id = None
+                    try:
+                        import mlx.core as mx
+                        mx.clear_cache()
+                    except Exception:
+                        pass
+                return
+            try:
+                from rag.llm_backend import clear_mlx_cache_safely
+                clear_mlx_cache_safely()
             except Exception:
                 pass
 

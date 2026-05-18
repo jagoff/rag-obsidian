@@ -29,7 +29,12 @@ stderr_lines/last_stderr en ``rag_supervisor_jobs.signals``.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
+import signal
+import shlex
+import subprocess
+import time
 from typing import Any
 
 from rag.runtime.jobs.nightly import _RAG_BIN, _run_subprocess
@@ -41,6 +46,360 @@ logger = logging.getLogger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 _VENV_PY = _REPO_ROOT / ".venv" / "bin" / "python"
 _UV_TOOL_PY = Path.home() / ".local/share/uv/tools/obsidian-rag/bin/python3"
+_ANTICIPATE_PROCESS_NEEDLE = "rag anticipate run"
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _poller_python() -> Path:
+    """Python for lightweight poller scripts.
+
+    Prefer the repo venv. The uv-tool interpreter can exist on disk while
+    being unusable after a Python upgrade (`No module named encodings`), which
+    silently breaks mood/spotify subprocess jobs under the supervisor.
+    """
+    return _VENV_PY if _VENV_PY.exists() else _UV_TOOL_PY
+
+
+def _env_flag(name: str, *, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in _TRUTHY
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _swap_pressure_active(
+    memory_pct: float | None,
+    swap_gb: float | None,
+    max_swap_gb: float,
+    *,
+    floor_env: str = "RAG_ANTICIPATE_SWAP_MEMORY_FLOOR_PCT",
+    floor_default: float = 70.0,
+) -> bool:
+    """Treat swap as pressure only when current memory pressure agrees.
+
+    macOS can keep swap files allocated long after pressure cleared. The
+    supervisor should not suppress anticipate forever on stale swap alone.
+    """
+    if swap_gb is None or max_swap_gb <= 0 or swap_gb < max_swap_gb:
+        return False
+    if memory_pct is None:
+        return True
+    min_memory_pct = _env_float(floor_env, floor_default)
+    return memory_pct >= min_memory_pct
+
+
+def _skip_result(reason: str, **signals: Any) -> dict[str, Any]:
+    return {
+        "exit_code": 0,
+        "stdout_lines": 0,
+        "stderr_lines": 0,
+        "last_stderr": None,
+        "skipped": True,
+        "skip_reason": reason,
+        **signals,
+    }
+
+
+def _runtime_pressure_snapshot() -> tuple[float | None, float | None]:
+    try:
+        from rag._memory_pressure_watchdog import (  # noqa: PLC0415
+            _system_memory_used_pct,
+            _system_swap_used_gb,
+        )
+        return _system_memory_used_pct(), _system_swap_used_gb()
+    except Exception as exc:  # noqa: BLE001 — telemetry guard must be silent
+        logger.warning("anticipate pressure check failed: %s", exc)
+        return None, None
+
+
+def _command_is_anticipate_run(cmd: str) -> bool:
+    """Match only real ``rag anticipate run`` processes.
+
+    ``ps`` returns a flattened command string, so a broad substring check can
+    match unrelated workers whose prompt/log text mentions the command.
+    """
+    try:
+        parts = shlex.split(cmd)
+    except ValueError:
+        parts = cmd.split()
+    if len(parts) < 3:
+        return False
+
+    def _name(idx: int) -> str:
+        return Path(parts[idx]).name
+
+    if _name(0) == "rag":
+        return parts[1:3] == ["anticipate", "run"]
+    if _name(0).startswith("python") and len(parts) >= 4 and _name(1) == "rag":
+        return parts[2:4] == ["anticipate", "run"]
+    if _name(0).startswith("python") and len(parts) >= 5 and parts[1:3] == ["-m", "rag"]:
+        return parts[3:5] == ["anticipate", "run"]
+    return False
+
+
+def _command_matches_needle(cmd: str, needle: str) -> bool:
+    if needle == _ANTICIPATE_PROCESS_NEEDLE:
+        return _command_is_anticipate_run(cmd)
+    return needle in cmd
+
+
+def _running_process_count(needle: str) -> int:
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("process scan failed for %s: %s", needle, exc)
+        return 0
+    if result.returncode != 0:
+        return 0
+    current_pid = os.getpid()
+    count = 0
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        cmd = parts[1]
+        if pid == current_pid:
+            continue
+        if " rg " in f" {cmd} " or " grep " in f" {cmd} ":
+            continue
+        if _command_matches_needle(cmd, needle):
+            count += 1
+    return count
+
+
+def _anticipate_preflight_skip() -> dict[str, Any] | None:
+    if _env_flag("RAG_ANTICIPATE_DISABLED"):
+        return _skip_result("disabled")
+
+    running = _running_process_count(_ANTICIPATE_PROCESS_NEEDLE)
+    if running > 0:
+        logger.warning("skip anticipate: %d existing run(s) still active", running)
+        return _skip_result("already_running", running_instances=running)
+
+    if os.environ.get("RAG_ANTICIPATE_PRESSURE_GUARD", "1").strip() == "0":
+        return None
+
+    memory_pct, swap_gb = _runtime_pressure_snapshot()
+    max_memory_pct = _env_float("RAG_ANTICIPATE_MAX_MEMORY_PCT", 70.0)
+    max_swap_gb = _env_float("RAG_ANTICIPATE_MAX_SWAP_GB", 1.5)
+
+    if memory_pct is not None and memory_pct >= max_memory_pct:
+        logger.warning(
+            "skip anticipate: memory pressure %.1f%% >= %.1f%%",
+            memory_pct,
+            max_memory_pct,
+        )
+        return _skip_result(
+            "memory_pressure",
+            memory_pct=memory_pct,
+            max_memory_pct=max_memory_pct,
+            swap_gb=swap_gb,
+        )
+    if _swap_pressure_active(memory_pct, swap_gb, max_swap_gb):
+        min_memory_pct = _env_float("RAG_ANTICIPATE_SWAP_MEMORY_FLOOR_PCT", 70.0)
+        logger.debug(
+            "skip anticipate: swap pressure %.2fGB >= %.2fGB "
+            "(memory %.1f%% >= %.1f%%)",
+            swap_gb,
+            max_swap_gb,
+            memory_pct if memory_pct is not None else -1.0,
+            min_memory_pct,
+        )
+        return _skip_result(
+            "swap_pressure",
+            memory_pct=memory_pct,
+            swap_gb=swap_gb,
+            max_swap_gb=max_swap_gb,
+            min_memory_pct_for_swap=min_memory_pct,
+        )
+    return None
+
+
+def _process_tree_pids(root_pid: int) -> list[int]:
+    seen: set[int] = set()
+    pending = [root_pid]
+    while pending:
+        pid = pending.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        try:
+            result = subprocess.run(
+                ["pgrep", "-P", str(pid)],
+                capture_output=True,
+                text=True,
+                timeout=1,
+                check=False,
+            )
+        except Exception:
+            continue
+        for raw in result.stdout.split():
+            try:
+                child_pid = int(raw)
+            except ValueError:
+                continue
+            if child_pid not in seen:
+                pending.append(child_pid)
+    return sorted(seen)
+
+
+def _process_tree_rss_gb(root_pid: int) -> float | None:
+    pids = _process_tree_pids(root_pid)
+    if not pids:
+        return None
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "rss=", "-p", ",".join(str(p) for p in pids)],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except Exception:
+        return None
+    total_kb = 0
+    for raw in result.stdout.split():
+        try:
+            total_kb += int(raw)
+        except ValueError:
+            continue
+    if total_kb <= 0:
+        return None
+    return total_kb / 1024.0 / 1024.0
+
+
+def _terminate_process_group(proc: subprocess.Popen[str]) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("failed to terminate process group %s: %s", proc.pid, exc)
+    try:
+        proc.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("failed to kill process group %s: %s", proc.pid, exc)
+
+
+def _run_guarded_subprocess(
+    args: list[str],
+    *,
+    timeout: int,
+    extra_env: dict[str, str] | None = None,
+    poll_interval: float = 5.0,
+) -> dict[str, Any]:
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
+
+    started = time.monotonic()
+    proc = subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        start_new_session=True,
+    )
+    abort_reason: str | None = None
+    exit_code: int | None = None
+    stdout = ""
+    stderr = ""
+
+    while True:
+        elapsed = time.monotonic() - started
+        remaining = max(0.1, timeout - elapsed)
+        try:
+            stdout, stderr = proc.communicate(timeout=min(poll_interval, remaining))
+            exit_code = proc.returncode
+            break
+        except subprocess.TimeoutExpired:
+            elapsed = time.monotonic() - started
+            rss_gb = _process_tree_rss_gb(proc.pid)
+            memory_pct, swap_gb = _runtime_pressure_snapshot()
+            max_rss_gb = _env_float("RAG_ANTICIPATE_MAX_RSS_GB", 10.0)
+            abort_memory_pct = _env_float("RAG_ANTICIPATE_ABORT_MEMORY_PCT", 82.0)
+            abort_swap_gb = _env_float("RAG_ANTICIPATE_ABORT_SWAP_GB", 2.0)
+            if elapsed >= timeout:
+                abort_reason = f"timeout after {timeout}s"
+                exit_code = -1
+            elif rss_gb is not None and rss_gb >= max_rss_gb:
+                abort_reason = f"rss {rss_gb:.2f}GB >= {max_rss_gb:.2f}GB"
+                exit_code = -9
+            elif _swap_pressure_active(
+                memory_pct,
+                swap_gb,
+                abort_swap_gb,
+                floor_env="RAG_ANTICIPATE_ABORT_SWAP_MEMORY_FLOOR_PCT",
+                floor_default=70.0,
+            ):
+                abort_reason = f"swap {swap_gb:.2f}GB >= {abort_swap_gb:.2f}GB"
+                exit_code = -9
+            elif memory_pct is not None and memory_pct >= abort_memory_pct:
+                abort_reason = (
+                    f"memory {memory_pct:.1f}% >= {abort_memory_pct:.1f}%"
+                )
+                exit_code = -9
+
+            if abort_reason is None:
+                continue
+
+            logger.warning("abort guarded job %s: %s", " ".join(args), abort_reason)
+            _terminate_process_group(proc)
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except Exception:
+                    pass
+                stdout, stderr = proc.communicate()
+            break
+
+    stdout_lines = stdout.count("\n") if stdout else 0
+    stderr_lines = stderr.count("\n") if stderr else 0
+    last_err = (stderr or "")[-200:] if exit_code != 0 else None
+    if abort_reason:
+        last_err = f"{abort_reason}; stderr={last_err or ''}"[:200]
+    if exit_code != 0:
+        logger.warning(
+            "guarded job exit=%d: %s — stderr tail: %s",
+            exit_code,
+            " ".join(args),
+            last_err,
+        )
+    return {
+        "exit_code": int(exit_code or 0),
+        "stdout_lines": stdout_lines,
+        "stderr_lines": stderr_lines,
+        "last_stderr": last_err,
+        "guarded": True,
+        "killed_reason": abort_reason,
+    }
 
 
 # ── VLM image captioner (Game-Changer G5, 2026-05-11) ──────────────────────
@@ -115,16 +474,22 @@ def anticipate_job() -> dict[str, Any]:
     """Equivalente a ``rag anticipate run`` del plist viejo. Schedule
     cada 15min. daily_cap=3 limita pushes; cadencia más alta no compra
     coverage adicional."""
-    return _run_subprocess(
+    skipped = _anticipate_preflight_skip()
+    if skipped is not None:
+        return skipped
+
+    timeout_s = int(_env_float("RAG_ANTICIPATE_TIMEOUT_S", 180.0))
+    return _run_guarded_subprocess(
         [_RAG_BIN, "anticipate", "run"],
         extra_env={
             "NO_COLOR": "1",
             "TERM": "dumb",
             "RAG_LLM_BACKEND": "mlx",
+            "RAG_ANTICIPATE_PRESSURE_GUARD": "1",
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
         },
-        timeout=600,  # 10 min — anticipate típicamente <30s, margen amplio
+        timeout=timeout_s,  # anticipate típicamente <30s; cap duro por OOM
     )
 
 
@@ -237,7 +602,7 @@ def mood_poll_job() -> dict[str, Any]:
 
     F4.4 lo va a reemplazar con on-demand TTL cache via IPC desde el
     web UI; por ahora cron 30min."""
-    py = _UV_TOOL_PY if _UV_TOOL_PY.exists() else _VENV_PY
+    py = _poller_python()
     script = _REPO_ROOT / "scripts" / "mood_poll.py"
     return _run_subprocess(
         [str(py), str(script)],
@@ -265,7 +630,7 @@ def spotify_poll_job() -> dict[str, Any]:
     F4.5 lo va a reemplazar con macOS NSDistributedNotificationCenter
     listener para ``com.spotify.client.PlaybackStateChanged``; por ahora
     cron 5min (down de 60s, audit 2026-05-09)."""
-    py = _UV_TOOL_PY if _UV_TOOL_PY.exists() else _VENV_PY
+    py = _poller_python()
     script = _REPO_ROOT / "scripts" / "spotify_poll.py"
     return _run_subprocess(
         [str(py), str(script)],

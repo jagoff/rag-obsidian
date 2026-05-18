@@ -343,6 +343,33 @@ No genera el context summary del documento (usado en el prefix de embeddings). L
 ### `OBSIDIAN_RAG_SKIP_SYNTHETIC_Q=1`
 No genera synthetic questions. Mismo uso que el anterior.
 
+### `RAG_INDEX_LLM_ENRICHMENTS=1`
+Opt-in para que `rag index` vuelva a generar enriquecimientos LLM opcionales, incluidos synthetic questions, context summary, contextual retrieval y checks de contradicción. Por default safe mode los saltea para que el index sea mucho más rápido. Para context summary además hace falta `RAG_CONTEXT_SUMMARY=1`; para contextual retrieval usá `rag index --contextual`.
+
+### `RAG_INDEX_SKIP_CONTRADICTIONS=1`
+Saltea checks de contradicción durante `rag index`. Safe mode lo setea por default; usá `RAG_INDEX_SKIP_CONTRADICTIONS=0` si querés correr ese detector en el index incremental.
+
+### `RAG_INDEX_EMBED_CACHE=1`
+Activa la cache persistente de embeddings del index. La clave incluye texto exacto, modelo, backend y max sequence length; si el chunk no cambió, un `rag index --full` puede reconstruir la colección sin recalcular ese vector. `RAG_INDEX_EMBED_CACHE=0` la desactiva.
+
+### `RAG_INDEX_ETL_FRESHNESS=1` / `RAG_INDEX_ETL_FRESH_TTL_S=600`
+Evita repetir pre-syncs cross-source que ya terminaron bien hace pocos minutos y cuyo snapshot sigue escrito en el vault. No pierde información: el `rag index --full` vuelve a leer esos `.md`; solo saltea volver a consultar Gmail/Calendar/GitHub/etc. El estado queda en `index_etl_state.json` dentro de `OBSIDIAN_RAG_DB_PATH`.
+
+Para medir una corrida fresca de ETLs:
+
+```bash
+RAG_INDEX_ETL_FRESH_TTL_S=0 rag index --full
+```
+
+### `RAG_INDEX_ETL_PARALLEL=1` / `RAG_INDEX_ETL_MAX_WORKERS=6`
+Corre en paralelo los pre-syncs externos independientes. El output de `rag index` imprime `Cross-source timing: total=...` y los ETLs más lentos, así podés ver si el cuello está en Gmail, Reminders, Bookmarks o el parse/embed del vault.
+
+### `RAG_REMINDERS_OSASCRIPT_TIMEOUT_S=45`
+Timeout del AppleScript de Reminders. Durante safe index se setea a `5` para que un Reminders colgado no agregue 45s al `rag index`.
+
+### `RAG_INDEX_BATCH_SIZE=auto` / `RAG_INDEX_EMBED_SLICE_SIZE=auto` / `RAG_INDEX_LOCAL_EMBED_BATCH=auto`
+Safe mode ajusta el batching según backend y RAM. En MLX con una Mac de ~36 GB usa `batch=96`, `slice=48` y `local_batch=48`, manteniendo el mismo modelo y texto de entrada.
+
 ### `HF_HUB_OFFLINE=1` / `TRANSFORMERS_OFFLINE=1`
 El reranker se carga del caché local de HuggingFace, sin tocar la red.
 
@@ -350,32 +377,6 @@ El reranker se carga del caché local de HuggingFace, sin tocar la red.
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 ```
-
-### `FASTEMBED_CACHE_PATH=$HOME/.cache/fastembed`
-Pinea el cache de [fastembed](https://github.com/qdrant/fastembed) (usado por
-`mem0` para BM25 sparse / hybrid search en Qdrant) a un directorio persistente.
-El default upstream es `tempfile.gettempdir()/fastembed_cache` que en macOS cae
-en `/var/folders/.../T/fastembed_cache` y el SO lo limpia cada tanto. Combinado
-con `HF_HUB_OFFLINE=1`, una limpieza del tmpdir deja al encoder sin poder
-descargar el modelo de nuevo y `mem0` cae a búsqueda sólo-semántica:
-
-```text
-ERROR fastembed.common.model_management:retrieve_model_gcs:362 - Could not
-find the model tar.gz file at /var/folders/.../T/fastembed_cache/bm25 and
-local_files_only=True.
-Failed to load BM25 encoder: Could not load model Qdrant/bm25 from any source.
-```
-
-Población inicial (corré una vez con offline mode apagado):
-
-```bash
-HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 \
-  python -c 'from fastembed import SparseTextEmbedding; SparseTextEmbedding("Qdrant/bm25")'
-```
-
-`rag/__init__.py` ya hace `setdefault` con `~/.cache/fastembed` y los plists
-(`com.fer.obsidian-rag-web`, `com.fer.obsidian-rag-serve`) lo exportan
-explícitamente para evitar la race con el módulo init.
 
 ---
 

@@ -434,8 +434,13 @@ def test_endpoint_happy_path_with_reply_to(monkeypatch):
         captured["reply_to"] = reply_to
         return True
 
-    monkeypatch.setattr(_server, "_whatsapp_send_to_jid", _fake_send, raising=False)
-    monkeypatch.setattr(rag, "_whatsapp_send_to_jid", _fake_send)
+    def _fake_send_detailed(jid, text, anti_loop=True, reply_to=None):
+        return (_fake_send(jid, text, anti_loop=anti_loop, reply_to=reply_to), "ok")
+
+    monkeypatch.setattr(
+        "rag.integrations.whatsapp._whatsapp_send_to_jid_detailed",
+        _fake_send_detailed,
+    )
 
     resp = _client.post("/api/whatsapp/send", json={
         "jid": "5491155555555@s.whatsapp.net",
@@ -464,7 +469,13 @@ def test_endpoint_backward_compat_without_reply_to(monkeypatch):
         captured["reply_to"] = reply_to
         return True
 
-    monkeypatch.setattr(rag, "_whatsapp_send_to_jid", _fake_send)
+    def _fake_send_detailed(jid, text, anti_loop=True, reply_to=None):
+        return (_fake_send(jid, text, anti_loop=anti_loop, reply_to=reply_to), "ok")
+
+    monkeypatch.setattr(
+        "rag.integrations.whatsapp._whatsapp_send_to_jid_detailed",
+        _fake_send_detailed,
+    )
     resp = _client.post("/api/whatsapp/send", json={
         "jid": "5491155555555@s.whatsapp.net",
         "message_text": "hola",
@@ -474,8 +485,10 @@ def test_endpoint_backward_compat_without_reply_to(monkeypatch):
 
 
 def test_endpoint_rejects_empty_reply_to_message_id(monkeypatch):
-    monkeypatch.setattr(rag, "_whatsapp_send_to_jid",
-                        lambda *a, **kw: True)
+    monkeypatch.setattr(
+        "rag.integrations.whatsapp._whatsapp_send_to_jid_detailed",
+        lambda *a, **kw: (True, "ok"),
+    )
     resp = _client.post("/api/whatsapp/send", json={
         "jid": "5491155555555@s.whatsapp.net",
         "message_text": "ahí",
@@ -486,8 +499,10 @@ def test_endpoint_rejects_empty_reply_to_message_id(monkeypatch):
 
 
 def test_endpoint_bridge_down_with_reply_to_returns_502(monkeypatch):
-    monkeypatch.setattr(rag, "_whatsapp_send_to_jid",
-                        lambda *a, **kw: False)
+    monkeypatch.setattr(
+        "rag.integrations.whatsapp._whatsapp_send_to_jid_detailed",
+        lambda *a, **kw: (False, "rejected"),
+    )
     resp = _client.post("/api/whatsapp/send", json={
         "jid": "5491155555555@s.whatsapp.net",
         "message_text": "ok",
@@ -500,8 +515,10 @@ def test_endpoint_audit_log_distinguishes_reply(monkeypatch):
     """When reply_to is present, the audit event must use
     `cmd=whatsapp_user_reply` so logs / dashboards can split the two
     flows. Plain sends keep `cmd=whatsapp_user_send`."""
-    monkeypatch.setattr(rag, "_whatsapp_send_to_jid",
-                        lambda *a, **kw: True)
+    monkeypatch.setattr(
+        "rag.integrations.whatsapp._whatsapp_send_to_jid_detailed",
+        lambda *a, **kw: (True, "ok"),
+    )
     captured = {}
     def _fake_log(event):
         captured.setdefault("events", []).append(event)

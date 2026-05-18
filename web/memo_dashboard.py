@@ -53,6 +53,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 try:
     import sqlite_vec  # type: ignore
@@ -114,10 +115,60 @@ _DEAD_MIN_AGE_DAYS = 2
 
 
 def _memo_dir() -> Path:
+    override = os.environ.get("MEMO_STATE_DIR")
+    if override:
+        return Path(override).expanduser().resolve()
+    data_override = os.environ.get("MEMO_DATA_DIR")
+    if data_override:
+        data_dir = Path(data_override).expanduser().resolve()
+        # Test/dev installs often keep state DBs beside MEMO_DATA_DIR. Real
+        # memo >=0.7 separates markdown data_dir from sqlite state_dir.
+        if (data_dir / "memvec.db").exists() or (data_dir / "history.db").exists():
+            return data_dir
+    cfg = _memo_storage_config()
+    if cfg.get("state_dir"):
+        return Path(cfg["state_dir"]).expanduser().resolve()
+    return Path.home() / ".local/share/memo"
+
+
+def _memo_storage_config() -> dict[str, str]:
+    cfg_path = Path(os.environ.get("MEMO_CONFIG", "~/.config/memo/config.toml")).expanduser()
+    if not cfg_path.exists():
+        return {}
+    out: dict[str, str] = {}
+    in_storage = False
+    try:
+        for raw in cfg_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                in_storage = line == "[storage]"
+                continue
+            if not in_storage or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            if key in {"data_dir", "state_dir", "vault_path", "memory_subdir"}:
+                out[key] = val
+    except OSError:
+        return {}
+    return out
+
+
+def _memory_dir() -> Path:
     override = os.environ.get("MEMO_DATA_DIR")
     if override:
         return Path(override).expanduser().resolve()
-    return Path.home() / ".local/share/memo"
+    cfg = _memo_storage_config()
+    if cfg.get("data_dir"):
+        return Path(cfg["data_dir"]).expanduser().resolve()
+    vault = os.environ.get("MEMO_VAULT_PATH") or cfg.get("vault_path")
+    subdir = os.environ.get("MEMO_MEMORY_SUBDIR") or cfg.get("memory_subdir")
+    if vault and subdir:
+        return (Path(vault).expanduser() / subdir).resolve()
+    return Path.home() / "Documents/memo"
 
 
 def _memvec_db() -> Path:
@@ -129,12 +180,7 @@ def _history_db() -> Path:
 
 
 def _vault_path() -> Path:
-    try:
-        from rag import VAULT_PATH  # type: ignore
-
-        return VAULT_PATH
-    except Exception:
-        return Path.home() / "Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes"
+    return _memory_dir()
 
 
 def _open_ro(db: Path, *, with_vec: bool = False) -> sqlite3.Connection | None:
@@ -211,16 +257,94 @@ def _safe_resolve(rel_path: str) -> Path | None:
     if _PATH_TRAVERSAL_RE.search(rel_path):
         return None
     p = Path(rel_path)
-    if p.is_absolute():
-        return None
-    vault = _vault_path()
+    vault = _memory_dir().resolve()
     try:
-        full = (vault / rel_path).resolve()
-        if not str(full).startswith(str(vault.resolve())):
-            return None
+        full = p.expanduser().resolve() if p.is_absolute() else (vault / rel_path).resolve()
+        full.relative_to(vault)
         return full
     except Exception:
         return None
+
+
+def _path_fields(rel_path: str) -> dict[str, str]:
+    full = _safe_resolve(rel_path)
+    full_path = str(full) if full else ""
+    return {
+        "path": rel_path,
+        "full_path": full_path,
+        "obsidian_url": f"obsidian://open?path={quote(full_path, safe='')}" if full_path else "",
+    }
+
+
+def _invalidate_caches() -> None:
+    with _DUPE_LOCK:
+        _DUPE_CACHE["key"] = None
+        _DUPE_CACHE["payload"] = None
+    with _RECALL_LOCK:
+        _RECALL_CACHE["ts"] = 0.0
+        _RECALL_CACHE["payload"] = None
+
+
+def _resolve_meta_row(conn: sqlite3.Connection, memo_id: str) -> sqlite3.Row | None:
+    memo_id = (memo_id or "").strip()
+    if len(memo_id) < 4:
+        return None
+    row = conn.execute(
+        "SELECT id, title, type, tags, created, updated, body_hash, path, extra_json "
+        "FROM meta WHERE id = ?",
+        (memo_id,),
+    ).fetchone()
+    if row is not None:
+        return row
+    rows = conn.execute(
+        "SELECT id, title, type, tags, created, updated, body_hash, path, extra_json "
+        "FROM meta WHERE id LIKE ? ORDER BY updated DESC LIMIT 2",
+        (memo_id + "%",),
+    ).fetchall()
+    if len(rows) == 1:
+        return rows[0]
+    return None
+
+
+def _body_for_path(rel_path: str) -> str:
+    full = _safe_resolve(rel_path)
+    if not full or not full.exists():
+        return ""
+    try:
+        return _strip_frontmatter(full.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return ""
+
+
+def _yaml_scalar(value: Any) -> str:
+    return json.dumps("" if value is None else str(value), ensure_ascii=False)
+
+
+def _frontmatter(row: dict[str, Any], tags: list[str], updated: str) -> str:
+    tag_lines = "\n".join(f"- {_yaml_scalar(t)}" for t in tags)
+    if not tag_lines:
+        tag_lines = "[]"
+    return (
+        "---\n"
+        f"created: {_yaml_scalar(row.get('created', ''))}\n"
+        f"id: {_yaml_scalar(row.get('id', ''))}\n"
+        "tags:\n"
+        f"{tag_lines}\n"
+        f"title: {_yaml_scalar(row.get('title', ''))}\n"
+        f"type: {_yaml_scalar(row.get('type', 'note'))}\n"
+        f"updated: {_yaml_scalar(updated)}\n"
+        "---\n\n"
+    )
+
+
+def _rewrite_frontmatter(row: dict[str, Any], tags: list[str], updated: str) -> None:
+    full = _safe_resolve(str(row.get("path") or ""))
+    if not full:
+        raise OSError("path invalido")
+    body = ""
+    if full.exists():
+        body = _strip_frontmatter(full.read_text(encoding="utf-8", errors="replace"))
+    full.write_text(_frontmatter(row, tags, updated) + body.lstrip(), encoding="utf-8")
 
 
 def _read_body_meta(rel_path: str) -> tuple[int, str]:
@@ -576,6 +700,7 @@ def snapshot(limit: int = _RECENT_DEFAULT, type_filter: str | None = None) -> di
     out: dict[str, Any] = {
         "ok": True,
         "memo_dir": str(_memo_dir()),
+        "memory_dir": str(_memory_dir()),
         "vault_path": str(_vault_path()),
         "totals": {"all": 0, "by_type": []},
         "activity": {
@@ -608,6 +733,11 @@ def snapshot(limit: int = _RECENT_DEFAULT, type_filter: str | None = None) -> di
             "total_recall_events": 0,
             "top_recalled": [],
             "dead_memorias": [],
+        },
+        "utility": {
+            "coverage": {},
+            "quality_buckets": [],
+            "type_usefulness": [],
         },
         "verdict": {"outcome": "unknown", "summary": "", "criteria": []},
         "tags_top": [],
@@ -652,8 +782,20 @@ def snapshot(limit: int = _RECENT_DEFAULT, type_filter: str | None = None) -> di
 
         tagless = tiny = huge = stale = actionable = 0
         scores_sum = 0
+        quality_counts: Counter[str] = Counter()
+        type_stats: dict[str, dict[str, Any]] = defaultdict(
+            lambda: {
+                "count": 0,
+                "recalled": 0,
+                "active_7d": 0,
+                "recall_events": 0,
+                "score_sum": 0,
+            }
+        )
         tag_counter: Counter[str] = Counter()
         body_meta_cache: dict[str, tuple[int, str]] = {}
+        now_utc = datetime.now(timezone.utc)
+        cutoff_7d_for_types = now_utc - timedelta(days=_ACTIVE_DAYS)
 
         for r in all_rows:
             tags = _parse_tags(r["tags"])
@@ -688,7 +830,33 @@ def snapshot(limit: int = _RECENT_DEFAULT, type_filter: str | None = None) -> di
                 updated_dt=updated_dt,
                 in_dupe_cluster=r["id"] in near_dupe_ids,
             )
-            scores_sum += scored["score"]
+            score = int(scored["score"])
+            scores_sum += score
+            if score >= 80:
+                quality_counts["Alta"] += 1
+            elif score >= 60:
+                quality_counts["Media"] += 1
+            elif score >= 40:
+                quality_counts["Baja"] += 1
+            else:
+                quality_counts["Ruido"] += 1
+
+            rinfo = recall_index.get(r["id"], {})
+            cnt = int(rinfo.get("count", 0))
+            tstat = type_stats[type_ or "unknown"]
+            tstat["count"] += 1
+            tstat["score_sum"] += score
+            tstat["recall_events"] += cnt
+            if cnt > 0:
+                tstat["recalled"] += 1
+            last_recalled = rinfo.get("last_recalled", "")
+            if last_recalled:
+                last_dt = _parse_iso(last_recalled)
+                if last_dt:
+                    if last_dt.tzinfo is None:
+                        last_dt = last_dt.replace(tzinfo=timezone.utc)
+                    if last_dt >= cutoff_7d_for_types:
+                        tstat["active_7d"] += 1
 
         total = out["totals"]["all"] or 1  # avoid /0
         out["health"] = {
@@ -706,6 +874,29 @@ def snapshot(limit: int = _RECENT_DEFAULT, type_filter: str | None = None) -> di
         }
         out["tags_top"] = [
             {"tag": t, "count": c} for t, c in tag_counter.most_common(20)
+        ]
+        out["utility"]["quality_buckets"] = [
+            {
+                "label": label,
+                "count": int(quality_counts.get(label, 0)),
+                "pct": round(quality_counts.get(label, 0) * 100 / total, 1),
+            }
+            for label in ("Alta", "Media", "Baja", "Ruido")
+        ]
+        out["utility"]["type_usefulness"] = [
+            {
+                "type": type_,
+                "count": int(stats["count"]),
+                "recalled": int(stats["recalled"]),
+                "active_7d": int(stats["active_7d"]),
+                "recall_events": int(stats["recall_events"]),
+                "recall_rate_pct": round(stats["recalled"] * 100 / (stats["count"] or 1), 1),
+                "avg_score": round(stats["score_sum"] / (stats["count"] or 1), 1),
+            }
+            for type_, stats in sorted(
+                type_stats.items(),
+                key=lambda item: (-item[1]["recall_events"], -item[1]["recalled"], item[0]),
+            )
         ]
 
         # ── Recent list con scoring + previews.
@@ -740,7 +931,7 @@ def snapshot(limit: int = _RECENT_DEFAULT, type_filter: str | None = None) -> di
                 "updated": r["updated"],
                 "created": r["created"],
                 "ago": _humanize_ago(updated_dt),
-                "path": r["path"],
+                **_path_fields(r["path"]),
                 "body_size": size,
                 "body_preview": preview,
                 "score": scored["score"],
@@ -833,9 +1024,6 @@ def snapshot(limit: int = _RECENT_DEFAULT, type_filter: str | None = None) -> di
     active_7d_count = 0
     dead_memorias: list[dict[str, Any]] = []
     top_recalled_raw: list[dict[str, Any]] = []
-    title_by_id = {r["id"]: r["title"] for r in all_rows}
-    type_by_id = {r["id"]: (r["type"] or "") for r in all_rows}
-    created_by_id = {r["id"]: r["created"] for r in all_rows}
     for r in all_rows:
         rinfo = recall_index.get(r["id"], {})
         cnt = int(rinfo.get("count", 0))
@@ -853,6 +1041,7 @@ def snapshot(limit: int = _RECENT_DEFAULT, type_filter: str | None = None) -> di
                 "id": r["id"],
                 "title": r["title"] or "(sin título)",
                 "type": (r["type"] or "").lower(),
+                **_path_fields(r["path"]),
                 "count": cnt,
                 "max_score": round(float(rinfo.get("max_score", 0.0)), 2),
                 "last_recalled_ago": _humanize_ago(_parse_iso(last_recalled)),
@@ -867,6 +1056,7 @@ def snapshot(limit: int = _RECENT_DEFAULT, type_filter: str | None = None) -> di
                         "id": r["id"],
                         "title": r["title"] or "(sin título)",
                         "type": (r["type"] or "").lower(),
+                        **_path_fields(r["path"]),
                         "created": r["created"],
                         "age": _humanize_ago(created_dt),
                     })
@@ -884,6 +1074,16 @@ def snapshot(limit: int = _RECENT_DEFAULT, type_filter: str | None = None) -> di
         "total_recall_events": total_recall_events,
         "top_recalled": top_recalled_raw[:15],
         "dead_memorias": dead_memorias[:30],
+    }
+    out["utility"]["coverage"] = {
+        "total": int(out["totals"]["all"]),
+        "recalled": recalled_count,
+        "active_7d": active_7d_count,
+        "never_recalled": max(0, int(out["totals"]["all"]) - recalled_count),
+        "dead": len(dead_memorias),
+        "recall_hit_rate_pct": round(recalled_count * 100 / total, 1),
+        "active_7d_pct": round(active_7d_count * 100 / total, 1),
+        "dead_pct": round(len(dead_memorias) * 100 / total, 1),
     }
     out["verdict"] = _compute_verdict(out["health"], out["usage"])
 
@@ -988,7 +1188,7 @@ def note_detail(memo_id: str | None = None, path: str | None = None) -> dict:
         "created": row["created"],
         "updated": row["updated"],
         "ago": _humanize_ago(updated_dt),
-        "path": row["path"],
+        **_path_fields(row["path"]),
         "body": body,
         "body_size": body_size,
         "score": scored["score"],
@@ -1065,7 +1265,7 @@ def search(query: str, limit: int = 20) -> dict:
                 "tags": tags,
                 "updated": r["updated"],
                 "ago": _humanize_ago(updated_dt),
-                "path": r["path"],
+                **_path_fields(r["path"]),
                 "body_size": size,
                 "body_preview": preview,
                 "score": scored["score"],

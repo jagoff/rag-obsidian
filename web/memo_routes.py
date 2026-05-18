@@ -1,9 +1,12 @@
 """Route registration for the memo dashboard endpoints."""
 from __future__ import annotations
 
+import json
+import sqlite3
 import subprocess
 import sys
 import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
@@ -11,6 +14,210 @@ from fastapi import Depends, Request
 from fastapi.responses import FileResponse, RedirectResponse
 
 _memo_cleanup_lock = threading.Lock()
+
+
+def _now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="milliseconds")
+
+
+def _open_memvec_rw() -> sqlite3.Connection:
+    from web.memo_dashboard import _HAVE_SQLITE_VEC, _memvec_db
+
+    db = _memvec_db()
+    conn = sqlite3.connect(str(db), timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=10000")
+    if _HAVE_SQLITE_VEC:
+        try:
+            import sqlite_vec  # type: ignore
+
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+        except Exception:
+            pass
+    return conn
+
+
+def _row_dict(row: sqlite3.Row) -> dict:
+    return {k: row[k] for k in row.keys()}
+
+
+def _history_event(op: str, row: dict, *, delta: dict | None = None) -> str | None:
+    from web.memo_dashboard import _history_db
+
+    try:
+        db = _history_db()
+        db.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(str(db), timeout=10.0) as conn:
+            conn.execute("PRAGMA busy_timeout=10000")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS events ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, "
+                "op TEXT NOT NULL, record_id TEXT NOT NULL, title TEXT, "
+                "type TEXT, delta_json TEXT)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_events_record ON events(record_id)"
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_events_op ON events(op)")
+            conn.execute(
+                "INSERT INTO events(ts, op, record_id, title, type, delta_json) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    _now_iso(),
+                    op,
+                    row.get("id", ""),
+                    row.get("title", ""),
+                    row.get("type", ""),
+                    json.dumps(delta, ensure_ascii=False) if delta else None,
+                ),
+            )
+    except Exception as exc:
+        return f"history log failed: {type(exc).__name__}: {exc}"
+    return None
+
+
+def _graph_drop_for_memoria(memo_id: str) -> str | None:
+    from web.memo_dashboard import _memo_dir
+
+    db = _memo_dir() / "graph.db"
+    if not db.exists():
+        return None
+    try:
+        with sqlite3.connect(str(db), timeout=10.0) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout=10000")
+            conn.execute("BEGIN IMMEDIATE")
+            old = [
+                r["entity_id"]
+                for r in conn.execute(
+                    "SELECT entity_id FROM entity_memoria WHERE memoria_id = ?",
+                    (memo_id,),
+                ).fetchall()
+            ]
+            conn.execute("DELETE FROM entity_memoria WHERE memoria_id = ?", (memo_id,))
+            for eid in old:
+                conn.execute(
+                    "UPDATE entities SET mention_count = MAX(0, mention_count - 1) "
+                    "WHERE id = ?",
+                    (eid,),
+                )
+            conn.commit()
+    except Exception as exc:
+        return f"graph cleanup failed: {type(exc).__name__}: {exc}"
+    return None
+
+
+def _delete_memo_direct(memo_id: str) -> tuple[str | None, list[str]]:
+    from web.memo_dashboard import _invalidate_caches, _resolve_meta_row, _safe_resolve
+
+    warnings: list[str] = []
+    conn = _open_memvec_rw()
+    try:
+        row = _resolve_meta_row(conn, memo_id)
+        if row is None:
+            raise ValueError(f"not found or ambiguous: {memo_id}")
+        payload = _row_dict(row)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("DELETE FROM meta WHERE id = ?", (payload["id"],))
+            conn.execute("DELETE FROM vec WHERE id = ?", (payload["id"],))
+            conn.execute("DELETE FROM fts WHERE id = ?", (payload["id"],))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
+
+    full = _safe_resolve(payload.get("path", ""))
+    if full and full.exists():
+        try:
+            full.unlink()
+        except OSError as exc:
+            warnings.append(f"file delete failed: {type(exc).__name__}: {exc}")
+
+    for maybe_warning in (
+        _history_event("delete", payload),
+        _graph_drop_for_memoria(payload["id"]),
+    ):
+        if maybe_warning:
+            warnings.append(maybe_warning)
+    _invalidate_caches()
+    try:
+        from web.memo_v06 import cache_invalidate
+
+        cache_invalidate()
+    except ImportError:
+        pass
+    return payload["id"], warnings
+
+
+def _update_memo_tags_direct(memo_id: str, tags: list[str]) -> tuple[str, list[str]]:
+    from web.memo_dashboard import (
+        _body_for_path,
+        _invalidate_caches,
+        _parse_tags,
+        _resolve_meta_row,
+        _rewrite_frontmatter,
+    )
+
+    warnings: list[str] = []
+    tags = sorted({str(t).strip() for t in tags if str(t).strip()})
+    conn = _open_memvec_rw()
+    try:
+        row = _resolve_meta_row(conn, memo_id)
+        if row is None:
+            raise ValueError(f"not found or ambiguous: {memo_id}")
+        payload = _row_dict(row)
+        old_tags = _parse_tags(payload.get("tags"))
+        updated = _now_iso()
+        body = _body_for_path(payload.get("path", ""))
+        tags_json = json.dumps(tags, ensure_ascii=False)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "UPDATE meta SET tags = ?, updated = ? WHERE id = ?",
+                (tags_json, updated, payload["id"]),
+            )
+            conn.execute("DELETE FROM fts WHERE id = ?", (payload["id"],))
+            conn.execute(
+                "INSERT INTO fts(id, title, tags, body) VALUES (?, ?, ?, ?)",
+                (payload["id"], payload.get("title", ""), " ".join(tags), body),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
+
+    payload["updated"] = updated
+    try:
+        _rewrite_frontmatter(payload, tags, updated)
+    except OSError as exc:
+        warnings.append(f"frontmatter update failed: {type(exc).__name__}: {exc}")
+    maybe_warning = _history_event("update", payload, delta={"tags": [old_tags, tags]})
+    if maybe_warning:
+        warnings.append(maybe_warning)
+    _invalidate_caches()
+    return payload["id"], warnings
+
+
+def _memo_score_for_merge(row: dict) -> tuple[int, str]:
+    from web.memo_dashboard import _parse_iso, _parse_tags, _read_body_meta, _score_memo
+
+    tags = _parse_tags(row.get("tags"))
+    size, _ = _read_body_meta(row.get("path", ""))
+    scored = _score_memo(
+        type_=(row.get("type") or "").lower(),
+        tags=tags,
+        body_size=size,
+        updated_dt=_parse_iso(row.get("updated")),
+        in_dupe_cluster=True,
+    )
+    return int(scored["score"]), str(row.get("updated") or "")
 
 
 def memo_api(limit: int = 30, type: str | None = None) -> dict:
@@ -78,32 +285,23 @@ def memo_temporal_stale_api(days: int = 90, limit: int = 30) -> dict:
 
 
 def memo_delete_api(ids: list[str]) -> dict:
-    """Borra una o más memorias por id. Llama `memo delete --yes` per id."""
+    """Borra una o más memorias por id."""
     deleted: list[str] = []
     errors: list[dict] = []
+    warnings: list[dict] = []
     for mid in ids:
         if not mid or len(mid) < 4:
             errors.append({"id": mid, "error": "id muy corto"})
             continue
         try:
-            r = subprocess.run(
-                ["memo", "delete", "--yes", mid],
-                capture_output=True,
-                timeout=30,
-            )
-            if r.returncode == 0:
-                deleted.append(mid)
-            else:
-                errors.append({"id": mid, "error": r.stderr.decode()[:300]})
-        except subprocess.SubprocessError as exc:
+            deleted_id, item_warnings = _delete_memo_direct(mid)
+            if deleted_id:
+                deleted.append(deleted_id)
+            for warning in item_warnings:
+                warnings.append({"id": deleted_id or mid, "warning": warning})
+        except Exception as exc:
             errors.append({"id": mid, "error": f"{type(exc).__name__}: {exc}"})
-    try:
-        from web.memo_v06 import cache_invalidate
-
-        cache_invalidate()
-    except ImportError:
-        pass
-    return {"ok": True, "deleted": deleted, "errors": errors}
+    return {"ok": True, "deleted": deleted, "errors": errors, "warnings": warnings}
 
 
 def memo_cleanup_api(apply_dead: bool = True, apply_dupes: bool = False) -> dict:
@@ -166,24 +364,26 @@ def memo_merge_api(pairs: list[dict[str, str]]) -> dict:
             continue
 
         try:
-            from web.memo_dashboard import note_detail
+            from web.memo_dashboard import _parse_tags, _resolve_meta_row
 
-            a_detail = note_detail(memo_id=a_id)
-            b_detail = note_detail(memo_id=b_id)
+            conn = _open_memvec_rw()
+            try:
+                a_row = _resolve_meta_row(conn, a_id)
+                b_row = _resolve_meta_row(conn, b_id)
+            finally:
+                conn.close()
 
-            if not a_detail.get("ok") or not b_detail.get("ok"):
+            if a_row is None or b_row is None:
                 skipped.append({
                     "pair": pair,
                     "reason": "memoria no encontrada (probablemente borrada por otro proceso)",
                 })
                 continue
 
-            a_memo = a_detail.get("memo", {})
-            b_memo = b_detail.get("memo", {})
-            a_score = a_memo.get("score", 0)
-            b_score = b_memo.get("score", 0)
-            a_updated = a_memo.get("updated", "")
-            b_updated = b_memo.get("updated", "")
+            a_memo = _row_dict(a_row)
+            b_memo = _row_dict(b_row)
+            a_score, a_updated = _memo_score_for_merge(a_memo)
+            b_score, b_updated = _memo_score_for_merge(b_memo)
 
             keep_id = a_id
             delete_id = b_id
@@ -192,39 +392,27 @@ def memo_merge_api(pairs: list[dict[str, str]]) -> dict:
             elif b_score == a_score and b_updated > a_updated:
                 keep_id, delete_id = b_id, a_id
 
-            keep_tags = set(a_memo.get("tags", []) if keep_id == a_id else b_memo.get("tags", []))
-            delete_tags = set(
-                b_memo.get("tags", []) if keep_id == a_id else a_memo.get("tags", [])
-            )
+            keep_raw_tags = a_memo.get("tags") if keep_id == a_id else b_memo.get("tags")
+            delete_raw_tags = b_memo.get("tags") if keep_id == a_id else a_memo.get("tags")
+            keep_tags = set(_parse_tags(keep_raw_tags))
+            delete_tags = set(_parse_tags(delete_raw_tags))
             merged_tags = sorted(list(keep_tags | delete_tags))
 
             if merged_tags:
-                tag_args: list[str] = []
-                for tag in merged_tags:
-                    tag_args.extend(["-t", tag])
-                upd = subprocess.run(
-                    ["memo", "update", keep_id, *tag_args],
-                    capture_output=True,
-                    timeout=30,
-                )
-                if upd.returncode != 0:
-                    warnings.append({
-                        "pair": pair,
-                        "warning": f"tag merge failed: {upd.stderr.decode()[:1500]}",
-                    })
+                _, item_warnings = _update_memo_tags_direct(keep_id, merged_tags)
+                for warning in item_warnings:
+                    warnings.append({"pair": pair, "warning": warning})
 
-            result = subprocess.run(
-                ["memo", "delete", "--yes", delete_id],
-                capture_output=True,
-                timeout=30,
-            )
-            if result.returncode == 0:
-                merged.append({"kept": keep_id, "deleted": delete_id})
-                deleted_in_batch.add(delete_id)
+            deleted_id, item_warnings = _delete_memo_direct(delete_id)
+            if deleted_id:
+                merged.append({"kept": keep_id, "deleted": deleted_id})
+                deleted_in_batch.add(deleted_id)
+                for warning in item_warnings:
+                    warnings.append({"pair": pair, "warning": warning})
             else:
-                errors.append({"pair": pair, "error": result.stderr.decode()})
-        except subprocess.SubprocessError as exc:
-            errors.append({"pair": pair, "error": str(exc)})
+                errors.append({"pair": pair, "error": f"delete failed: {delete_id}"})
+        except Exception as exc:
+            errors.append({"pair": pair, "error": f"{type(exc).__name__}: {exc}"})
 
     return {
         "ok": True,

@@ -1122,15 +1122,30 @@ def test_cli_mood_poll_runs_when_enabled(
     }
 
 
-# ─── _services_spec includes mood-poll plist ──────────────────────────────
+# ─── supervisor scheduling / legacy mood-poll plist ───────────────────────
 
 
-def test_services_spec_includes_mood_poll():
-    """El plist mood-poll está registrado en _services_spec — `rag setup`
-    lo va a generar + cargar."""
+def test_supervisor_registers_mood_poll_job():
+    """Post-refactor: mood_poll corre dentro del supervisor y el plist viejo
+    queda como label deprecado para cleanup de setup."""
+    import sys
+    from rag.runtime.scheduler import Scheduler
+    from rag.runtime.supervisor import _import_jobs
+
+    Scheduler.reset_global()
+    for mod in list(sys.modules):
+        if mod.startswith("rag.runtime.jobs"):
+            del sys.modules[mod]
+    sched = Scheduler.global_instance()
+    _import_jobs()
+    job = sched.jobs().get("mood_poll")
+    assert job is not None, "mood_poll job no registrado en supervisor"
+    assert job.trigger_kind == "interval"
+    assert job.trigger_args.get("minutes") == 30
     spec = rag._services_spec("/fake/path/to/rag")
     labels = {label for label, _, _ in spec}
-    assert "com.fer.obsidian-rag-mood-poll" in labels
+    assert "com.fer.obsidian-rag-mood-poll" not in labels
+    assert "com.fer.obsidian-rag-mood-poll" in rag._DEPRECATED_LABELS
 
 
 def test_mood_poll_plist_has_required_fields():

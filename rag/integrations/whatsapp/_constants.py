@@ -12,6 +12,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from rag.exclusions import (
+    DEFAULT_BLOCKED_CHATS,
+    is_chat_blocked,
+    normalize_blacklist_text,
+)
 
 # ── Paths del bridge SQLite + state files ───────────────────────────────────
 WHATSAPP_NOTE_MAX_CHARS = 4096  # WA hard limit per message
@@ -25,6 +30,23 @@ WHATSAPP_BRIDGE_DB_PATH = (
 )
 WHATSAPP_DB_PATH = WHATSAPP_BRIDGE_DB_PATH  # alias back-compat
 WHATSAPP_BOT_JID = "120363426178035051@g.us"  # RagNet — bot's own group, skip
+
+# Chat names that must never feed Ra/RAG contexts. Kept as a normalized
+# compat constant; the live decision comes from rag.exclusions so the web
+# blacklist applies to WhatsApp without duplicating policy.
+WHATSAPP_EXCLUDED_CHAT_NAMES = frozenset(
+    normalize_blacklist_text(name) for name in DEFAULT_BLOCKED_CHATS
+)
+
+
+def normalize_whatsapp_chat_name(name: str | None) -> str:
+    """Normalize bridge `chats.name` for exact privacy blacklist checks."""
+    return normalize_blacklist_text(name)
+
+
+def whatsapp_chat_name_excluded(name: str | None) -> bool:
+    """True when a WhatsApp chat name is in the exact-name blacklist."""
+    return is_chat_blocked(name)
 
 WA_TASKS_STATE_PATH = Path.home() / ".local/share/obsidian-rag/wa_tasks_state.json"
 WA_TASKS_LOG_PATH = Path.home() / ".local/share/obsidian-rag/wa_tasks.jsonl"
@@ -120,6 +142,9 @@ __all__ = [
     "WHATSAPP_BRIDGE_DB_PATH",
     "WHATSAPP_DB_PATH",
     "WHATSAPP_BOT_JID",
+    "WHATSAPP_EXCLUDED_CHAT_NAMES",
+    "normalize_whatsapp_chat_name",
+    "whatsapp_chat_name_excluded",
     "WA_TASKS_STATE_PATH",
     "WA_TASKS_LOG_PATH",
     "WA_TASKS_MAX_CHATS",

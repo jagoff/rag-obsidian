@@ -117,6 +117,25 @@ export function whatsappUrl(jid) {
   return `https://wa.me/${phone}`;
 }
 
+export function isActionableWhatsApp(item) {
+  const raw = String(item?.last_snippet || item?.snippet || item?.text || "").trim();
+  if (!raw) return false;
+  const s = raw.replace(/\s+/g, " ");
+  const lower = s.toLowerCase();
+  if (/^https?:\/\/\S+$/i.test(s)) return false;
+  if (/^[\p{Emoji_Presentation}\p{Extended_Pictographic}\s]+$/u.test(s)) return false;
+  if (/^(j+a+j+a+|jaja+|jeje+|ok|oka|dale|gracias|joya|perfecto|confirmo mi presencia)$/i.test(lower)) {
+    return false;
+  }
+  const hasActionWord = /\b(pod[eé]s|puedes|necesito|avisame|confirm[aá]s?|confirmame|dame|pasame|mandame|por favor|falta|pendiente|tra[eé]|llevar|comprar|resolver|revisar)\b/i.test(s);
+  if (hasActionWord) {
+    return true;
+  }
+  const wordCount = lower.split(/\s+/).filter(Boolean).length;
+  if (/[?¿]/.test(s)) return wordCount >= 4;
+  return s.length >= 48;
+}
+
 export function youtubeUrl(videoId) {
   if (!videoId) return null;
   return `https://youtube.com/watch?v=${encodeURIComponent(videoId)}`;

@@ -135,7 +135,7 @@ def test_agenda_precedence_over_recent():
     "diferencias entre qwen y command-r",
     "compará bge-m3 con nomic-embed",
     "comparar claude y gpt-4",
-    "comparame sqlite-vec vs qdrant",
+    "comparame sqlite-vec vs BM25",
     "qwen3 vs qwen2.5",
     "qwen3 versus qwen2.5",
     "compare LoRA and QLoRA",

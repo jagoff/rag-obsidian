@@ -105,6 +105,51 @@ def test_extract_inline_skipped_inside_checkbox():
     assert len(inlines) == 0
 
 
+def test_extract_inline_ignores_quoted_examples():
+    raw = (
+        "> **Ejemplo:** Para el próximo ciclo, mi objetivo es profundizar "
+        "mis conocimientos en Kubernetes.\n"
+        "**Ejemplo:** pendiente: revisar una plantilla ajena\n"
+        "tengo que revisar el presupuesto real.\n"
+    )
+    loops = rag._extract_followup_loops(raw, "02-Areas/x.md", 0)
+    inline = [l["loop_text"] for l in loops if l["kind"] == "inline"]
+
+    assert not any("Kubernetes" in t for t in inline)
+    assert not any("plantilla ajena" in t for t in inline)
+    assert any("revisar el presupuesto real" in t for t in inline)
+
+
+def test_pendientes_fast_ignores_archive_notes(tmp_path):
+    archive_note = tmp_path / "04-Archive" / "old.md"
+    active_note = tmp_path / "01-Projects" / "active.md"
+    archive_note.parent.mkdir(parents=True)
+    active_note.parent.mkdir(parents=True)
+    archive_note.write_text("tengo que revisar texto viejo.\n", encoding="utf-8")
+    active_note.write_text("tengo que revisar texto activo.\n", encoding="utf-8")
+
+    loops = rag._pendientes_extract_loops_fast(tmp_path, days=14, max_items=20)
+    texts = [loop["loop_text"] for loop in loops]
+
+    assert any("texto activo" in text for text in texts)
+    assert not any("texto viejo" in text for text in texts)
+
+
+def test_pendientes_fast_ignores_prompt_templates(tmp_path):
+    prompt_note = tmp_path / "03-Resources" / "Prompts AI" / "Prompt - Issue format.md"
+    active_note = tmp_path / "01-Projects" / "active.md"
+    prompt_note.parent.mkdir(parents=True)
+    active_note.parent.mkdir(parents=True)
+    prompt_note.write_text("- [ ] All team names converted to @mentions\n", encoding="utf-8")
+    active_note.write_text("- [ ] revisar texto activo\n", encoding="utf-8")
+
+    loops = rag._pendientes_extract_loops_fast(tmp_path, days=14, max_items=20)
+    texts = [loop["loop_text"] for loop in loops]
+
+    assert "revisar texto activo" in texts
+    assert "All team names converted to @mentions" not in texts
+
+
 def test_extract_carries_iso_extracted_at():
     ts = datetime(2026, 1, 15, 10, 30).timestamp()
     raw = "---\ntodo:\n- algo\n---\n"
@@ -381,6 +426,22 @@ def test_find_followup_resolution_classifies_correctly(tmp_vault, monkeypatch):
     resolved = [it for it in items if it["status"] == "resolved"]
     assert len(resolved) == 1
     assert resolved[0]["resolution_path"] == "02-Areas/later.md"
+
+
+def test_find_followup_resolve_false_skips_retrieve(tmp_vault, monkeypatch):
+    vault, col = tmp_vault
+    _write(vault, "02-Areas/stale.md", "- [ ] revisar presupuesto\n", days_ago=25)
+
+    def _retrieve_boom(*args, **kwargs):
+        raise AssertionError("resolve=False should not call retrieve")
+
+    monkeypatch.setattr(rag, "retrieve", _retrieve_boom)
+    items = rag.find_followup_loops(col, vault, days=60, resolve=False)
+
+    assert len(items) == 1
+    assert items[0]["status"] == "stale"
+    assert items[0]["age_days"] >= 24
+    assert items[0]["resolution_path"] is None
 
 
 def test_find_followup_excludes_dot_dirs(tmp_vault, monkeypatch):

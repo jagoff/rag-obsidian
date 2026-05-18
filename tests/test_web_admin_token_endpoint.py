@@ -90,13 +90,14 @@ def test_is_localhost_request_no_client_returns_false():
     assert _is_localhost_request(fake_request) is False
 
 
-# ── 4. Frontend wiring — admin-auth.js está cargado en los 3 HTML ─────
+# ── 4. Frontend wiring — admin-auth.js está cargado en HTML admin ─────
 
 
 @pytest.mark.parametrize("html_path", [
     "web/static/index.html",
     "web/static/dashboard.html",
     "web/static/home.html",
+    "web/static/logs.html",
 ])
 def test_html_loads_admin_auth_js(html_path):
     repo = Path(__file__).resolve().parent.parent
@@ -115,6 +116,8 @@ def test_admin_auth_js_exists_and_has_monkey_patch():
     assert "window.fetch" in js
     assert "/api/admin/token" in js
     assert "/api/auto-fix-devin" in js
+    assert "/api/logs/clean-all" in js
+    assert "/api/logs/queue" in js
     assert "/api/reindex" in js
     assert "Authorization" in js
     assert "Bearer" in js
@@ -127,6 +130,7 @@ def test_admin_auth_js_exists_and_has_monkey_patch():
     "web/static/index.html",
     "web/static/dashboard.html",
     "web/static/home.html",
+    "web/static/logs.html",
 ])
 def test_admin_auth_js_not_deferred(html_path):
     """Si admin-auth.js carga con defer, app.js puede ejecutar antes y

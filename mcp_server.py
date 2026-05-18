@@ -21,6 +21,7 @@ Write tools (create files / Apple DB rows — use when the user asks to
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import re
 import sys
 import threading
@@ -165,6 +166,88 @@ def _load_rag():
     return _rag
 
 
+def _mcp_default_vaults(rag) -> list[tuple[str, Path]]:
+    """Return the configured read scope, with a single-vault fallback.
+
+    In production `rag.resolve_vault_paths(None)` is the source of truth for
+    the operational scope (currently home + work). Tests often pass a
+    MagicMock-style rag object where arbitrary attributes appear callable; only
+    accept a concrete list of `(name, path)` tuples from the resolver.
+    """
+    resolver = getattr(rag, "resolve_vault_paths", None)
+    if callable(resolver):
+        try:
+            resolved = resolver(None)
+        except Exception:
+            resolved = None
+        if isinstance(resolved, list):
+            out: list[tuple[str, Path]] = []
+            for item in resolved:
+                if not isinstance(item, tuple) or len(item) != 2:
+                    continue
+                name, path = item
+                try:
+                    out.append((str(name), Path(path)))
+                except TypeError:
+                    continue
+            if out:
+                return out
+    vault = getattr(rag, "VAULT_PATH", None)
+    if vault is None:
+        return []
+    return [("default", Path(vault))]
+
+
+def _mcp_db_for(rag, vault_path: Path):
+    """Open the vector collection for `vault_path`.
+
+    Falls back to `get_db()` for legacy/single-vault mocks and for the active
+    vault, preserving old behavior while allowing multi-vault reads.
+    """
+    try:
+        active = Path(getattr(rag, "VAULT_PATH")).resolve()
+        if vault_path.resolve() == active:
+            return rag.get_db()
+    except Exception:
+        pass
+    getter = getattr(rag, "get_db_for", None)
+    if callable(getter):
+        try:
+            return getter(vault_path)
+        except Exception:
+            pass
+    return rag.get_db()
+
+
+def _mcp_collection_name_for(rag, vault_path: Path) -> str:
+    namer = getattr(rag, "_collection_name_for_vault", None)
+    if callable(namer):
+        try:
+            return str(namer(vault_path))
+        except Exception:
+            pass
+    return str(getattr(rag, "COLLECTION_NAME", ""))
+
+
+def _mcp_with_vault(rag, vault_path: Path):
+    cm = getattr(rag, "_with_vault", None)
+    if callable(cm):
+        return cm(vault_path)
+    import contextlib
+    return contextlib.nullcontext()
+
+
+def _split_vault_prefixed_path(path: str, vaults: list[tuple[str, Path]]) -> tuple[str | None, str]:
+    """Accept `vault:path.md` when `vault` is part of the active scope."""
+    if ":" not in path:
+        return None, path
+    maybe_vault, rest = path.split(":", 1)
+    names = {name for name, _ in vaults}
+    if maybe_vault in names and rest:
+        return maybe_vault, rest
+    return None, path
+
+
 @_maybe_tool
 def rag_query(
     question: str,
@@ -207,8 +290,14 @@ def rag_query(
     if session_id is not None and not _SESSION_ID_RE.match(session_id):
         return []
     rag = _load_rag()
-    col = rag.get_db()
-    if col.count() == 0:
+    vaults = _mcp_default_vaults(rag)
+    total_chunks = 0
+    for _, vault_path in vaults:
+        try:
+            total_chunks += int(_mcp_db_for(rag, vault_path).count())
+        except Exception:
+            continue
+    if total_chunks == 0:
         return []
     k = max(1, min(k, 15))
 
@@ -248,21 +337,32 @@ def rag_query(
                 pass
             effective_question = question
 
-    result = rag.retrieve(
-        col, effective_question, k, folder,
-        tag=tag, precise=False, multi_query=multi_query, auto_filter=True,
-        variants=pre_variants,
-    )
+    if len(vaults) > 1 and callable(getattr(rag, "multi_retrieve", None)):
+        result = rag.multi_retrieve(
+            vaults, effective_question, k, folder,
+            tag=tag, precise=False, multi_query=multi_query,
+            auto_filter=True, caller="mcp",
+        )
+    else:
+        col = _mcp_db_for(rag, vaults[0][1]) if vaults else rag.get_db()
+        result = rag.retrieve(
+            col, effective_question, k, folder,
+            tag=tag, precise=False, multi_query=multi_query, auto_filter=True,
+            variants=pre_variants,
+        )
     out = []
     for doc, meta, score in zip(result["docs"], result["metas"], result["scores"]):
-        out.append({
+        item = {
             "note": meta.get("note", ""),
             "path": meta.get("file", ""),
             "folder": meta.get("folder", ""),
             "tags": meta.get("tags", ""),
             "score": round(float(score), 2),
             "content": doc,
-        })
+        }
+        if meta.get("_vault"):
+            item["vault"] = meta.get("_vault")
+        out.append(item)
 
     if sess is not None:
         # MCP side: we don't have the final Claude answer (Claude is what's
@@ -303,18 +403,39 @@ def rag_read_note(path: str) -> str:
     the MCP transport as "Internal error" — the LLM saw no useful hint.
     """
     _touch()
-    if not path.endswith(".md"):
-        return "Error: path must end in .md"
     rag = _load_rag()
-    if not rag.VAULT_PATH.exists():
-        return f"Error: vault not found at {rag.VAULT_PATH}"
-    try:
-        full = (rag.VAULT_PATH / path).resolve()
-        full.relative_to(rag.VAULT_PATH.resolve())
-    except (ValueError, OSError) as e:
-        return f"Error: path invalid or escapes the vault root ({e})"
-    if not full.is_file():
-        return f"Error: note not found at {path}"
+    vaults = _mcp_default_vaults(rag)
+    requested_vault, rel_path = _split_vault_prefixed_path(path, vaults)
+    if not rel_path.endswith(".md"):
+        return "Error: path must end in .md"
+    candidates = [
+        (name, root) for name, root in vaults
+        if requested_vault is None or name == requested_vault
+    ]
+    if not candidates:
+        return f"Error: vault not found for {requested_vault}"
+    matches: list[tuple[str, Path]] = []
+    last_error = ""
+    for name, root in candidates:
+        if not root.exists():
+            last_error = f"Error: vault not found at {root}"
+            continue
+        try:
+            full = (root / rel_path).resolve()
+            full.relative_to(root.resolve())
+        except (ValueError, OSError) as e:
+            return f"Error: path invalid or escapes the vault root ({e})"
+        if full.is_file():
+            matches.append((name, full))
+    if not matches:
+        return last_error or f"Error: note not found at {path}"
+    if requested_vault is None and len(matches) > 1:
+        names = ", ".join(name for name, _ in matches)
+        return (
+            "Error: note path is ambiguous across vaults "
+            f"({names}); use '<vault>:{rel_path}'"
+        )
+    _, full = matches[0]
     try:
         return full.read_text(encoding="utf-8", errors="ignore")
     except OSError as e:
@@ -339,26 +460,33 @@ def rag_list_notes(
     """
     _touch()
     rag = _load_rag()
-    col = rag.get_db()
-    c = rag._load_corpus(col)
+    vaults = _mcp_default_vaults(rag)
+    multi = len(vaults) > 1
     seen: dict[str, dict] = {}
-    for m in c["metas"]:
-        file_ = m.get("file", "")
-        if file_ in seen:
-            continue
-        if folder and folder not in file_:
-            continue
-        tags_str = m.get("tags", "")
-        if tag and tag not in [t.strip() for t in tags_str.split(",") if t.strip()]:
-            continue
-        seen[file_] = {
-            "note": m.get("note", ""),
-            "path": file_,
-            "folder": m.get("folder", ""),
-            "tags": tags_str,
-        }
-        if len(seen) >= limit:
-            break
+    for vault_name, vault_path in vaults:
+        col = _mcp_db_for(rag, vault_path)
+        c = rag._load_corpus(col)
+        for m in c["metas"]:
+            file_ = m.get("file", "")
+            key = f"{vault_name}:{file_}" if multi else file_
+            if key in seen:
+                continue
+            if folder and folder not in file_:
+                continue
+            tags_str = m.get("tags", "")
+            if tag and tag not in [t.strip() for t in tags_str.split(",") if t.strip()]:
+                continue
+            item = {
+                "note": m.get("note", ""),
+                "path": file_,
+                "folder": m.get("folder", ""),
+                "tags": tags_str,
+            }
+            if multi:
+                item["vault"] = vault_name
+            seen[key] = item
+            if len(seen) >= limit:
+                return list(seen.values())
     return list(seen.values())
 
 
@@ -385,7 +513,21 @@ def rag_links(
     _touch()
     k = max(1, min(k, 30))
     rag = _load_rag()
-    items = rag.find_urls(query, k=k, folder=folder, tag=tag)
+    vaults = _mcp_default_vaults(rag)
+    multi = len(vaults) > 1
+    items: list[dict] = []
+    for vault_name, vault_path in vaults:
+        try:
+            with _mcp_with_vault(rag, vault_path):
+                found = rag.find_urls(query, k=k, folder=folder, tag=tag)
+        except Exception:
+            continue
+        for it in found:
+            row = dict(it)
+            if multi:
+                row["vault"] = vault_name
+            items.append(row)
+    items.sort(key=lambda it: float(it.get("score", 0.0) or 0.0), reverse=True)
     return [
         {
             "url": it["url"],
@@ -395,8 +537,9 @@ def rag_links(
             "line": it.get("line", 0),
             "context": it.get("context", ""),
             "score": round(float(it.get("score", 0.0)), 3),
+            **({"vault": it["vault"]} if it.get("vault") else {}),
         }
-        for it in items
+        for it in items[:k]
     ]
 
 
@@ -405,13 +548,30 @@ def rag_stats() -> dict:
     """Return indexing metadata: chunk count, models, collection name."""
     _touch()
     rag = _load_rag()
-    col = rag.get_db()
+    vaults = _mcp_default_vaults(rag)
+    per_vault = []
+    total_chunks = 0
+    for name, vault_path in vaults:
+        chunks = 0
+        try:
+            chunks = int(_mcp_db_for(rag, vault_path).count())
+        except Exception:
+            chunks = 0
+        total_chunks += chunks
+        per_vault.append({
+            "name": name,
+            "path": str(vault_path),
+            "collection": _mcp_collection_name_for(rag, vault_path),
+            "chunks": chunks,
+        })
     return {
-        "chunks": col.count(),
+        "chunks": total_chunks,
         "collection": rag.COLLECTION_NAME,
         "embed_model": rag.EMBED_MODEL,
         "reranker": rag.RERANKER_MODEL,
         "vault_path": str(rag.VAULT_PATH),
+        "vault_scope": [name for name, _ in vaults],
+        "vaults": per_vault,
     }
 
 
@@ -725,8 +885,21 @@ def rag_followup(
     """
     _touch()
     rag = _load_rag()
-    col = rag.get_db()
-    items = rag.find_followup_loops(col, rag.VAULT_PATH, days=days)
+    vaults = _mcp_default_vaults(rag)
+    multi = len(vaults) > 1
+    items: list[dict] = []
+    for vault_name, vault_path in vaults:
+        try:
+            with _mcp_with_vault(rag, vault_path):
+                col = _mcp_db_for(rag, vault_path)
+                found = rag.find_followup_loops(col, vault_path, days=days)
+        except Exception:
+            continue
+        for it in found:
+            row = dict(it)
+            if multi:
+                row["vault"] = vault_name
+            items.append(row)
     if status:
         items = [it for it in items if it.get("status") == status]
     return items[: max(1, int(limit))]

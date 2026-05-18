@@ -20,12 +20,51 @@ const sheetTtsToggle = document.getElementById("sheet-tts-toggle");
 const SESSION_KEY = "obsidian-rag:session";
 const VAULT_KEY = "obsidian-rag:vault";
 const TTS_KEY = "obsidian-rag:tts";
+const SESSION_ID_RE = /^[A-Za-z0-9_.:@-]{1,80}$/;
+const VAULT_SCOPE_RE = /^[A-Za-z0-9_-]{1,80}$/;
+
+function isValidSessionId(id) {
+  return typeof id === "string" && SESSION_ID_RE.test(id);
+}
+
+function clearStoredSessionId() {
+  try { sessionStorage.removeItem(SESSION_KEY); } catch {}
+  try { localStorage.removeItem(SESSION_KEY); } catch {}
+}
+
+function loadInitialSessionId() {
+  const sid = sessionStorage.getItem(SESSION_KEY) || null;
+  if (sid && !isValidSessionId(sid)) {
+    clearStoredSessionId();
+    return null;
+  }
+  return sid;
+}
+
+function sessionIdForRequest() {
+  if (!sessionId) return null;
+  if (isValidSessionId(sessionId)) return sessionId;
+  sessionId = null;
+  clearStoredSessionId();
+  return null;
+}
+
+function vaultScopeForRequest() {
+  const scope = (vaultScope || "").trim();
+  if (!scope) return null;
+  if (scope === "all" || VAULT_SCOPE_RE.test(scope)) return scope;
+  vaultScope = "";
+  try { localStorage.removeItem(VAULT_KEY); } catch {}
+  if (vaultPicker) vaultPicker.value = "";
+  return null;
+}
+
 // Session id lives in sessionStorage (per-tab), not localStorage. The DOM
 // doesn't restore prior turns on reload, but the server-side history was
 // being silently rehydrated — so a fresh-looking /chat tab inherited stale
 // FinOps/etc. context and biased every answer. Per-tab keeps multi-turn
 // across reloads while a new tab gets a clean slate.
-let sessionId = sessionStorage.getItem(SESSION_KEY) || null;
+let sessionId = loadInitialSessionId();
 // Legacy: prior versions stored session_id in localStorage, which leaked
 // stale history into fresh tabs. Drop any leftover entry on first load.
 try { localStorage.removeItem(SESSION_KEY); } catch {}
@@ -100,6 +139,23 @@ function _friendlyChatErrorMessage(err) {
     return "  conexión interrumpida — el servidor se reinició mid-respuesta";
   }
   return `  error: ${err.message}`;
+}
+
+async function _chatHttpError(res) {
+  const err = new Error(`HTTP ${res.status}`);
+  err.status = res.status;
+  try {
+    const data = await res.clone().json();
+    const first = Array.isArray(data.detail) ? data.detail[0] : null;
+    const loc = Array.isArray(first && first.loc) ? first.loc : [];
+    const field = loc.length ? loc[loc.length - 1] : null;
+    const rawMsg = first && first.msg ? first.msg : data.detail;
+    if (field) err.field = field;
+    if (typeof rawMsg === "string" && rawMsg.trim()) {
+      err.message = `HTTP ${res.status}: ${rawMsg.replace(/^Value error,\s*/i, "")}`;
+    }
+  } catch (_) {}
+  return err;
 }
 let currentAudio = null;           // In-flight <audio> playback
 let lastUserQuestion = "";         // For ⌘↑ edit-last
@@ -4412,8 +4468,8 @@ async function send(question, opts = {}) {
     const chatMode = getChatMode();
     const reqBody = {
       question,
-      session_id: sessionId,
-      vault_scope: vaultScope || null,
+      session_id: sessionIdForRequest(),
+      vault_scope: vaultScopeForRequest(),
       mode: chatMode,
     };
     if (attachmentsForTurn.length) reqBody.attachments = attachmentsForTurn;
@@ -4426,7 +4482,7 @@ async function send(question, opts = {}) {
       body: JSON.stringify(reqBody),
       signal: currentController.signal,
     });
-    if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+    if (!res.ok || !res.body) throw await _chatHttpError(res);
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder("utf-8");
@@ -4556,8 +4612,9 @@ async function send(question, opts = {}) {
     try { parsed = JSON.parse(data); } catch { return; }
 
     if (event === "session") {
-      sessionId = parsed.id;
-      sessionStorage.setItem(SESSION_KEY, sessionId);
+      sessionId = isValidSessionId(parsed.id) ? parsed.id : null;
+      if (sessionId) sessionStorage.setItem(SESSION_KEY, sessionId);
+      else clearStoredSessionId();
     } else if (event === "meta") {
       if (!metaShown) {
         appendMeta(turn, parsed.bits);
@@ -5163,7 +5220,7 @@ document.querySelectorAll(".topbar-title").forEach((brand) => {
   const params = new URLSearchParams(window.location.search);
   const seed = params.get("q");
   if (!seed) return;
-  history.replaceState({}, "", window.location.pathname);
+  window.history.replaceState({}, "", window.location.pathname);
   input.value = seed;
   setTimeout(() => send(seed), 50);
 })();
@@ -6470,14 +6527,28 @@ document.querySelectorAll(".quick-chip").forEach((chip) => {
 // el `reqBody` literal que está sepultado a 4500 lines arriba; el
 // monkey-patch es localizado y reversible.
 const SCOPE_KEY = "obsidian-rag:scope";
+
+function _isValidScopePath(path) {
+  if (typeof path !== "string") return false;
+  const v = path.trim();
+  if (!v || v.length > 512) return false;
+  if (v.includes("://") || v.startsWith("/")) return false;
+  return !v.split("/").includes("..");
+}
+
 window.activeScope = (function loadScope() {
   try {
     const raw = sessionStorage.getItem(SCOPE_KEY);
     if (!raw) return { kind: null, path: null };
     const obj = JSON.parse(raw);
-    if (obj && (obj.kind === "note" || obj.kind === "folder") && typeof obj.path === "string") {
-      return obj;
+    if (
+      obj &&
+      (obj.kind === "note" || obj.kind === "folder") &&
+      _isValidScopePath(obj.path)
+    ) {
+      return { kind: obj.kind, path: obj.path.trim() };
     }
+    sessionStorage.removeItem(SCOPE_KEY);
   } catch (_) {}
   return { kind: null, path: null };
 })();
@@ -6505,12 +6576,12 @@ function _renderScopeChip() {
 }
 
 window.setActiveScope = function setActiveScope(kind, path) {
-  if (!kind || !path) {
+  if (!kind || !_isValidScopePath(path)) {
     window.clearActiveScope();
     return;
   }
   if (kind !== "note" && kind !== "folder") return;
-  window.activeScope = { kind, path };
+  window.activeScope = { kind, path: path.trim() };
   try { sessionStorage.setItem(SCOPE_KEY, JSON.stringify(window.activeScope)); } catch (_) {}
   _renderScopeChip();
 };
@@ -6523,7 +6594,10 @@ window.clearActiveScope = function clearActiveScope() {
 
 window.getActiveScopePayload = function getActiveScopePayload() {
   const s = window.activeScope;
-  if (!s || !s.kind || !s.path) return {};
+  if (!s || !s.kind || !_isValidScopePath(s.path)) {
+    window.clearActiveScope();
+    return {};
+  }
   if (s.kind === "note") return { path: s.path };
   if (s.kind === "folder") return { folder: s.path };
   return {};

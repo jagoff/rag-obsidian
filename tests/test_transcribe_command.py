@@ -84,7 +84,7 @@ def test_transcribe_audio_happy_path(audio_file, telemetry_db, mock_whisper):
     assert result["text"] == "hola cómo estás che"
     assert result["language"] == "es"
     assert result["duration_s"] == 12.4
-    assert result["model"] == "small"
+    assert result["model"] == rag._WHISPER_MODEL_DEFAULT
     assert result["cached"] is False
     # Mock was called exactly once.
     mock_whisper.transcribe.assert_called_once()

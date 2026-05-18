@@ -56,6 +56,23 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 
+def _obsidian_rag_state_dir() -> Path:
+    return Path(
+        os.environ.get("OBSIDIAN_RAG_STATE_DIR")
+        or str(Path.home() / ".local/share/obsidian-rag")
+    ).expanduser()
+
+
+def _obsidian_rag_config_dir() -> Path:
+    explicit = os.environ.get("OBSIDIAN_RAG_CONFIG_DIR", "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    state_dir = os.environ.get("OBSIDIAN_RAG_STATE_DIR", "").strip()
+    if state_dir:
+        return Path(state_dir).expanduser() / "config"
+    return Path.home() / ".config" / "obsidian-rag"
+
+
 from rag import (  # noqa: E402
     CHAT_OPTIONS,
     CONFIDENCE_RERANK_MIN,
@@ -118,6 +135,7 @@ from rag import (  # noqa: E402
     find_wikilink_suggestions,
     get_db,
     get_pagerank,
+    is_user_query,
     log_behavior_event,
     log_query_event,
     multi_retrieve,
@@ -574,6 +592,16 @@ from web.memo_routes import register_memo_routes  # noqa: E402
 
 globals().update(register_memo_routes(app, STATIC_DIR, _require_admin_token))
 
+# System-wide blacklist admin UI.
+from web.blacklist_routes import register_blacklist_routes  # noqa: E402
+
+globals().update(register_blacklist_routes(app, STATIC_DIR, _require_admin_token))
+
+# Browser layout persistence (home window setup, sizes, collapsed state).
+from web.ui_layout_routes import register_ui_layout_routes  # noqa: E402
+
+globals().update(register_ui_layout_routes(app))
+
 # CORS: same-origin only. The server is bound to 127.0.0.1 by the
 # launchd plist, so cross-origin requests would come from a browser
 # running an untrusted origin (e.g. a malicious local webpage trying
@@ -938,7 +966,7 @@ globals().update(register_action_routes(
 # Cap defensivo de upload — fotos típicas de iPhone son 4-8MB, dejamos
 # margen de manija. Above this returns 413.
 _CHAT_UPLOAD_MAX_BYTES = 12 * 1024 * 1024  # 12 MB
-_CHAT_UPLOAD_DIR = Path.home() / ".local" / "share" / "obsidian-rag" / "chat-uploads"
+_CHAT_UPLOAD_DIR = _obsidian_rag_state_dir() / "chat-uploads"
 # Confidence threshold para auto-crear vs mostrar card de confirmación.
 # Decidido con el user 2026-04-25: ≥0.85 auto-crea con undo, <0.85
 # va a card. Mantiene el balance entre velocidad y seguridad — el
@@ -2198,13 +2226,12 @@ def wa_sender_override(req: _WASenderOverrideRequest) -> dict:
     próximo `_wa_display_name` call (sin restart).
     """
     import json as _json
-    from pathlib import Path as _Path  # noqa: PLC0415
 
     if not req.jid or "@" not in req.jid:
         raise HTTPException(status_code=400, detail="jid inválido")
     name = (req.name or "").strip()
 
-    path = _Path.home() / ".config/obsidian-rag/wa_sender_overrides.json"
+    path = _obsidian_rag_config_dir() / "wa_sender_overrides.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     data = {}
     if path.is_file():
@@ -3155,7 +3182,7 @@ def wa_media(message_id: str, jid: str) -> FileResponse:
     )
 
 
-_WA_MEDIA_OUT_DIR = Path.home() / ".local/share/obsidian-rag/wa-media/out"
+_WA_MEDIA_OUT_DIR = _obsidian_rag_state_dir() / "wa-media" / "out"
 
 
 @app.post("/api/wa/send_media", dependencies=[Depends(_require_admin_token)])
@@ -4645,7 +4672,7 @@ def trigger_reindex() -> dict:
     
     Lockfile previene múltiples procesos simultáneos (memory leak: cada proceso
     carga scipy/pandas/pyarrow/sklearn/torch/mlx ≈ 5-10GB)."""
-    lock_path = Path.home() / ".local/share/obsidian-rag/reindex.lock"
+    lock_path = _obsidian_rag_state_dir() / "reindex.lock"
     try:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         if lock_path.exists():
@@ -5451,6 +5478,7 @@ def list_vaults() -> dict:
     cfg = _load_vaults_config()
     active = resolve_vault_paths(None)
     active_name = active[0][0] if active else None
+    active_scope = [name for name, _path in active]
     registered = sorted(cfg.get("vaults", {}).keys())
     # Si el activo no está en el registry (p.ej. OBSIDIAN_RAG_VAULT apuntando
     # a uno no registrado), lo incluimos igual para que el picker lo muestre.
@@ -5458,6 +5486,7 @@ def list_vaults() -> dict:
         registered = [active_name] + registered
     return {
         "active": active_name,
+        "active_scope": active_scope,
         "registered": registered,
         "current": cfg.get("current"),
     }
@@ -7030,6 +7059,24 @@ def _today_cached_narrative(date_label: str) -> str | None:
     return body or None
 
 
+def _home_cached_narrative_is_noise(text: str) -> bool:
+    """Cached briefs can outlive the filters that generated them."""
+    body = (text or "").lower()
+    noisy_markers = (
+        "mercado libre",
+        "meli+",
+        "netflix",
+        "pinterest",
+        "youtube",
+        "prueba gratis",
+        "receipt",
+        "invoice",
+        "factura",
+        "comprobante",
+    )
+    return any(marker in body for marker in noisy_markers)
+
+
 def _fetch_pagerank_top(col, n: int = 5) -> list[dict]:
     """Top-n notes by wikilink PageRank authority. Normalized pr (pr/max_pr).
 
@@ -7174,6 +7221,120 @@ def _fetch_chrome_top_week(n: int = 5) -> list[dict]:
     return out
 
 
+_SPOTIFY_NOTE_TRACK_RE = re.compile(
+    r"^-\s+(?:`(?P<played>[^`]+)`\s+)?"
+    r"\[(?P<name>[^\]]+)\]\((?P<url>[^)]+)\)\s+—\s+"
+    r"(?P<meta>.+?)\s*$"
+)
+
+
+def _spotify_note_frontmatter(raw: str, key: str) -> str:
+    m = re.search(rf"^{re.escape(key)}:\s*(.+?)\s*$", raw, flags=re.MULTILINE)
+    return m.group(1).strip() if m else ""
+
+
+def _spotify_note_ts(played: str, fallback: float) -> float:
+    text = (played or "").strip().replace("Z", "+00:00")
+    if not text:
+        return fallback
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        try:
+            dt = datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return fallback
+    return float(dt.timestamp())
+
+
+def _parse_spotify_recent_note_for_home(path: Path, limit: int) -> dict:
+    if not path.is_file():
+        return {"items": []}
+    try:
+        raw = path.read_text(encoding="utf-8", errors="ignore")
+        fallback_ts = path.stat().st_mtime
+    except OSError:
+        return {"items": []}
+
+    items: list[dict] = []
+    for line in raw.splitlines():
+        m = _SPOTIFY_NOTE_TRACK_RE.match(line.strip())
+        if not m:
+            continue
+        meta = (m.group("meta") or "").strip()
+        album = ""
+        album_match = re.search(r"\s+·\s+_(?P<album>[^_]+)_\s*$", meta)
+        if album_match:
+            album = album_match.group("album").strip()
+            meta = meta[:album_match.start()].strip()
+        ts = _spotify_note_ts(m.group("played") or "", fallback_ts)
+        items.append({
+            "track_id": m.group("url").strip(),
+            "name": m.group("name").strip(),
+            "artist": meta,
+            "album": album,
+            "first_seen": ts,
+            "last_seen": ts,
+            "duration_played_s": 0,
+        })
+        if len(items) >= limit:
+            break
+
+    return {
+        "items": items,
+        "snapshot_date": _spotify_note_frontmatter(raw, "snapshot_date") or path.stem,
+        "source_path": str(path),
+    }
+
+
+def _fetch_spotify_vault_snapshot(limit: int = 10) -> dict | None:
+    """Fallback para el home: lee el último snapshot Spotify del vault.
+
+    `rag_spotify_log` solo se llena cuando Spotify Desktop está abierto y el
+    poller/listener observa playback. El historial sincronizado por la Web API
+    vive como notas Markdown en external-ingest/Spotify; usarlo evita que el
+    panel quede vacío cuando no hubo playback local reciente.
+    """
+    try:
+        vaults = resolve_vault_paths(["all"]) or resolve_vault_paths(None)
+    except Exception:
+        vaults = []
+    if not vaults:
+        vaults = [("current", VAULT_PATH)]
+
+    recent_files: list[Path] = []
+    seen_dirs: set[Path] = set()
+    for _name, vault in vaults:
+        spotify_dir = Path(vault) / "99-obsidian/99-AI/external-ingest/Spotify"
+        try:
+            resolved = spotify_dir.resolve()
+        except OSError:
+            resolved = spotify_dir
+        if resolved in seen_dirs or not spotify_dir.is_dir():
+            continue
+        seen_dirs.add(resolved)
+        recent_files.extend(p for p in spotify_dir.glob("*.md") if p.name != "_top.md")
+
+    recent_files.sort(
+        key=lambda p: p.stat().st_mtime if p.exists() else 0,
+        reverse=True,
+    )
+    for path in recent_files[:5]:
+        parsed = _parse_spotify_recent_note_for_home(path, limit)
+        items = parsed.get("items") or []
+        if not items:
+            continue
+        return {
+            "now_playing": None,
+            "recent_today": items,
+            "fallback": "vault_recent_snapshot",
+            "state": "history",
+            "snapshot_date": parsed.get("snapshot_date"),
+            "source_path": parsed.get("source_path"),
+        }
+    return None
+
+
 def _fetch_spotify(limit: int = 10) -> dict | None:
     """Spotify desktop app: track actual + tracks de hoy.
 
@@ -7217,6 +7378,10 @@ def _fetch_spotify(limit: int = 10) -> dict | None:
                     break
             except Exception:
                 recent = []
+    if not np and not recent:
+        snapshot = _fetch_spotify_vault_snapshot(limit=limit)
+        if snapshot:
+            return snapshot
     # Regla 2026-05-13: nunca devolver None. Si la tabla está completamente
     # vacía (daemon nunca corrió), igual devolvemos un payload con
     # `state=empty` así el frontend puede mostrar un placeholder con
@@ -7229,8 +7394,8 @@ def _fetch_spotify(limit: int = 10) -> dict | None:
             "fallback": "none",
             "state": "empty",
             "message": (
-                "Sin historial · daemon spotify-poll inactivo. "
-                "Activar con `rag start --full` (incluye spotify-poll)."
+                "Sin historial de Spotify todavía. Reproducí un tema en "
+                "Spotify Desktop para que el poller lo registre."
             ),
         }
     return {
@@ -7372,7 +7537,7 @@ def _fetch_screen_observations(limit: int = 6) -> list[dict]:
 def _fetch_health() -> dict | None:
     """Apple Health daily metrics — steps / kcal / exercise / stand /
     HR / HRV / workouts. Read-only desde `rag_apple_health_daily`,
-    poblada por `rag health-import` (manual o cron via supervisor).
+    poblada por `rag index --source health` (manual o cron via supervisor).
 
     Devuelve today + 14d sparklines + week_avgs. Cuando today no tiene
     datos (export del día no se hizo aún), fallback al último día con
@@ -7995,6 +8160,34 @@ def _fetch_drive_recent(now: datetime, max_items: int = 5) -> list[dict]:
     return ev.get("files") or []
 
 
+def _whatsapp_pending_is_actionable(snippet: str) -> bool:
+    s = str(snippet or "").strip()
+    if not s:
+        return False
+    s = re.sub(r"\s+", " ", s)
+    lower = s.lower()
+    if re.fullmatch(r"https?://\S+", s, flags=re.I):
+        return False
+    if not any(ch.isalnum() for ch in s):
+        return False
+    if re.fullmatch(
+        r"(j+a+j+a+|jaja+|jeje+|ok|oka|dale|gracias|joya|perfecto|confirmo mi presencia)",
+        lower,
+        flags=re.I,
+    ):
+        return False
+    if re.search(
+        r"\b(pod[eé]s|puedes|necesito|avisame|confirm[aá]s?|confirmame|dame|pasame|mandame|por favor|falta|pendiente|tra[eé]|llevar|comprar|resolver|revisar)\b",
+        s,
+        flags=re.I,
+    ):
+        return True
+    words = re.findall(r"\b\w+\b", lower)
+    if "?" in s or "¿" in s:
+        return len(words) >= 4
+    return len(s) >= 48
+
+
 def _fetch_whatsapp_unreplied(hours: int = 48, max_chats: int = 5) -> list[dict]:
     """Chats whose **last** message is inbound and sits without a reply.
 
@@ -8062,8 +8255,19 @@ def _fetch_whatsapp_unreplied(hours: int = 48, max_chats: int = 5) -> list[dict]
         if not any(ch.isalpha() for ch in display_name):
             continue
         snippet = (r["last_content"] or "").strip().replace("\n", " ")
+        try:
+            from rag.exclusions import is_chat_blocked, is_text_blocked  # noqa: PLC0415
+
+            if is_chat_blocked(display_name) or is_text_blocked(
+                f"{display_name} {snippet}".strip()
+            ):
+                continue
+        except Exception:
+            pass
         if len(snippet) > 120:
             snippet = snippet[:117] + "…"
+        if not _whatsapp_pending_is_actionable(snippet):
+            continue
         # Bridge stores naive local timestamps; `fromisoformat` parses either
         # naive or tz-aware and `.timestamp()` does the right thing for both.
         try:
@@ -8930,7 +9134,7 @@ def _diagnose_home_slowdown() -> dict:
 # Persist cache to disk so service restarts don't force a 30-45s cold
 # compute on the next user visit. Disk payload is served immediately
 # (stale OK — SWR refreshes in bg within seconds).
-_HOME_CACHE_PATH = Path.home() / ".local/share/obsidian-rag/home_cache.json"
+_HOME_CACHE_PATH = _obsidian_rag_state_dir() / "home_cache.json"
 _HOME_DISK_TTL = 6 * 3600   # ignore disk cache older than this (stale-but-useful window)
 
 _WARMING_BODY = json.dumps({
@@ -9602,7 +9806,6 @@ def _ensure_corpus_prewarmer() -> None:
                         print(f"[prewarm] corpus warm for {path}", flush=True)
                 except Exception:
                     pass
-                break
         except ImportError as exc:
             print(f"[prewarm] corpus skipped: {exc}", flush=True)
 
@@ -9837,7 +10040,7 @@ def _home_compute(
         # ~5ms (2 SELECTs + agg en memoria).
         fut_mood        = pool.submit(_timed, "mood", _fetch_mood)
         # Apple Health: read-only desde `rag_apple_health_daily`,
-        # poblada por `rag health-import` (manual o cron F4-followup).
+        # poblada por `rag index --source health` (manual o cron F4-followup).
         # Returns None cuando la tabla está vacía → frontend hidea
         # `p-health`. Hot path ~5ms (1 SELECT today + 1 SELECT 14d).
         fut_health      = pool.submit(_timed, "health", _fetch_health)
@@ -9981,8 +10184,40 @@ def _home_compute(
     # narró). El bug previo era `"" if today_total == 0 else ...` que
     # descartaba el cached en ese caso, dejando el hero del home en blanco
     # toda la tarde aunque el archivo `YYYY-MM-DD-evening.md` existiera.
-    narrative = _today_cached_narrative(date_label) or ""
-    narrative_source = "cached" if narrative else "none"
+    _brief_path = VAULT_PATH / MORNING_FOLDER / f"{date_label}-evening.md"
+    _brief_mtime: datetime | None = None
+    if _brief_path.is_file():
+        with suppress(OSError):
+            _brief_mtime = datetime.fromtimestamp(_brief_path.stat().st_mtime)
+
+    def _evidence_latest_mtime(ev: dict) -> datetime | None:
+        latest: datetime | None = None
+        for key in ("recent_notes", "inbox_today", "todos"):
+            for item in ev.get(key) or []:
+                raw = item.get("modified") or item.get("ts")
+                if not raw:
+                    continue
+                with suppress(Exception):
+                    ts = datetime.fromisoformat(str(raw))
+                    if latest is None or ts > latest:
+                        latest = ts
+        return latest
+
+    _latest_ev_mtime = _evidence_latest_mtime(today_ev)
+    _cached_is_stale = bool(
+        _brief_mtime
+        and _latest_ev_mtime
+        and _latest_ev_mtime > _brief_mtime
+    )
+    _cached_narrative = "" if _cached_is_stale else (_today_cached_narrative(date_label) or "")
+    _cached_is_noise = bool(_cached_narrative and _home_cached_narrative_is_noise(_cached_narrative))
+    narrative = "" if _cached_is_noise else _cached_narrative
+    narrative_source = (
+        "stale" if _cached_is_stale
+        else "filtered" if _cached_is_noise
+        else "cached" if narrative
+        else "none"
+    )
 
     # Correlations + highlights SIEMPRE — el cache path también los expone
     # al frontend para que los chips de "Lo que pasó hoy" tengan data sin
@@ -10269,10 +10504,18 @@ def pendientes_api(days: int = Query(default=14, ge=1, le=365)) -> dict:
     `?days=99999` cargaba toda la historia en RAM y saturaba el threadpool
     cuando los SSE streams del chat ya están consumiéndolo.
     """
-    col = get_db()
     now = datetime.now()
     try:
-        ev = _pendientes_collect(col, now, days=days)
+        vaults = resolve_vault_paths(None)
+        if vaults and len(vaults) > 1:
+            scope = {
+                "label": f"próximos {days}d + pendientes actuales",
+                "reminders_horizon": days,
+                "calendar_ahead": days,
+            }
+            ev = _rag_collect_scoped_tasks_evidence_multi(vaults, now, scope)
+        else:
+            ev = _pendientes_collect(get_db(), now, days=days)
     except Exception as exc:
         # Bug Hunt 2026-05-08 H2: NO exponer `str(exc)` que puede leakear
         # paths del vault o stack traces de SQLite. Loguear interno.
@@ -10288,7 +10531,7 @@ def pendientes_api(days: int = Query(default=14, ge=1, le=365)) -> dict:
     }
 
 
-_CONV_PENDING_PATH = Path.home() / ".local/share/obsidian-rag" / "conversation_turn_pending.jsonl"
+_CONV_PENDING_PATH = _obsidian_rag_state_dir() / "conversation_turn_pending.jsonl"
 
 # Track in-flight conversation-writer threads so the shutdown hook can
 # drain them. We stay with daemon=True (a wedged SQL write must not block
@@ -11696,7 +11939,12 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         if not history and not _has_chat_attachments:
             try:
                 from rag import get_db_for
-                _vault_chunks = get_db_for(vaults[0][1]).count() if vaults else 0
+                _vault_chunks = 0
+                for _name, _vpath in (vaults or []):
+                    try:
+                        _vault_chunks += int(get_db_for(_vpath).count() or 0)
+                    except Exception:
+                        pass
             except ImportError:
                 _vault_chunks = 0
             _cache_key = _chat_cache_key(
@@ -12011,6 +12259,9 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                                 "cache_age_seconds": int(_sem_hit["age_seconds"]),
                                 "paths": _sem_paths,
                                 "top_score": _sem_top,
+                                "answer_len": len(_sem_text),
+                                "t_retrieve": 0.0,
+                                "t_gen": 0.0,
                                 "device": _client_device,
                             })
                         except Exception:
@@ -14327,6 +14578,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             "top_score": round(_sanitize_confidence(result["confidence"]), 2),
             "t_retrieve": round(_t_retrieve_ms / 1000.0, 3),
             "t_gen": round(max(0, _t_total_ms - _t_retrieve_ms) / 1000.0, 3),
+            "answer_len": len(full),
             "topic_shifted": _topic_shifted,
             "topic_shift_reason": _topic_shift_reason,
             # Intent classified in the pipeline, echoed back via
@@ -14776,7 +15028,7 @@ def atlas_api(window_days: int = 30, top_entities: int = 50, graph_top_notes: in
 
 
 @app.get("/api/atlas/note")
-def atlas_note_api(path: str) -> dict:
+def atlas_note_api(path: str, vault: str | None = None) -> dict:
     """Detalle de UNA nota — preview, entidades mencionadas, vecinos 1-hop +
     `obsidian://` deep link. Lo consume el side-panel del frontend cuando
     el user hace click en un nodo del grafo. Sin cache (es cheap, ~50ms).
@@ -14786,7 +15038,15 @@ def atlas_note_api(path: str) -> dict:
     if not path or len(path) > 500:
         return {"error": "invalid_path", "preview": "", "entities": [], "neighbors": []}
     from web.atlas_dashboard import note_detail
-    return note_detail(path=path)
+    vault_path = None
+    if vault:
+        try:
+            from rag import resolve_vault_paths  # type: ignore
+
+            vault_path = dict(resolve_vault_paths(["all"]) or []).get(vault)
+        except Exception:
+            vault_path = None
+    return note_detail(path=path, vault_path=vault_path)
 
 
 class SemanticLayoutRequest(BaseModel):
@@ -15524,6 +15784,7 @@ def transcripts_dashboard(nofresh: int = 0) -> HTMLResponse:
     <a href="/status">status</a>
     <a href="/transcripts" class="active">transcripts</a>
     <a href="/fine_tunning">fine_tunning</a>
+    <a href="/blacklist">blacklist</a>
     <a href="https://ra.ai/agents/">agents</a>
   </nav>
   <h1>whisper transcripts <a href="/transcripts" class="refresh-btn" title="recargar ahora">↻</a></h1>
@@ -15846,7 +16107,7 @@ def _status_probe_tunnel_url() -> dict:
     file whenever it re-establishes the quick-tunnel.
     """
     try:
-        url_file = Path.home() / ".local/share/obsidian-rag/cloudflared-url.txt"
+        url_file = _obsidian_rag_state_dir() / "cloudflared-url.txt"
         if not url_file.is_file():
             return {"id": "tunnel-url", "name": "Tunnel URL", "kind": "probe",
                     "status": "warn", "detail": "sin archivo cloudflared-url.txt"}
@@ -16716,7 +16977,7 @@ def _status_freshness_build_payload() -> dict:
     """Build the freshness matrix payload. One row per _FRESHNESS_SOURCES
     entry. Errors per-row are logged but don't fail the whole endpoint —
     una fuente caída no debería impedir que las otras 5 se muestren."""
-    log_dir = Path.home() / ".local" / "share" / "obsidian-rag"
+    log_dir = _obsidian_rag_state_dir()
     now = time.time()
     rows: list[dict] = []
     healthy = 0
@@ -17501,7 +17762,7 @@ def status_page() -> FileResponse:
 # Directorios donde viven los logs de los daemons del stack. Si en algún
 # futuro se agrega otro stack, sumarlo acá.
 _LOG_DIRS: tuple[Path, ...] = (
-    Path.home() / ".local/share/obsidian-rag",
+    _obsidian_rag_state_dir(),
     Path.home() / ".local/share/whatsapp-listener",
 )
 
@@ -17559,6 +17820,13 @@ _LOG_RE_OK = re.compile(r"^\[heartbeat\]|alive=true|✓\s|status=ok\b", re.IGNOR
 # `INFO:    "GET /api/logs/file?name=...error.log... 200 OK"` aparecía
 # como ERROR sólo porque la URL contenía "error.log".
 _LOG_RE_INFO_PREFIX = re.compile(r"^\s*(INFO|DEBUG|TRACE|NOTICE)[\s:]", re.IGNORECASE)
+# Fragmentos de rutas markdown del watcher. Rich puede partir una ruta larga
+# en stdout y dejar una línea que contiene "jsondecodeerror" sólo por el slug.
+_LOG_RE_MARKDOWN_PATH_FRAGMENT = re.compile(
+    r"^\s*(?=.*(?:/|\.md\b))(?=.*(?:^|/)\d{4}-\d{2}-\d{2}-)[^:]*\s*$",
+    re.IGNORECASE,
+)
+_LOG_RE_MARKDOWN_FILENAME_FRAGMENT = re.compile(r"^\s*[^:\s/]+\.md\s*$", re.IGNORECASE)
 # Meta-eventos del propio error-queue subsystem. Skip explícito en el
 # classifier para evitar el self-feedback loop (scanner enqueueando su
 # propio "enqueued N new errors", worker enqueueando su propio
@@ -17567,7 +17835,7 @@ _LOG_RE_INFO_PREFIX = re.compile(r"^\s*(INFO|DEBUG|TRACE|NOTICE)[\s:]", re.IGNOR
 # subsystema y siguen clasificándose como error por el regex general.
 _LOG_RE_ERROR_QUEUE_META = re.compile(
     r"\[error-queue (scanner|worker)\]\s+"
-    r"(enqueued |processing error id=|done id=)",
+    r"(enqueued |processing (?:error|warn) id=|done id=)",
 )
 # Cloudflared reconnection / DNS / update-check noise. Per usuario:
 # "Los errores típicos del tunnel `com.fer.obsidian-rag-cloudflare-tunnel`
@@ -17706,6 +17974,11 @@ def _classify_log_line(line: str) -> str:
         return "ok"
     # `INFO:`/`DEBUG:` prefix gana sobre los matches de "error" en URLs.
     if _LOG_RE_INFO_PREFIX.match(line):
+        return "info"
+    if (
+        _LOG_RE_MARKDOWN_PATH_FRAGMENT.match(line)
+        or _LOG_RE_MARKDOWN_FILENAME_FRAGMENT.match(line)
+    ):
         return "info"
     # Meta-events del propio error-queue scanner/worker — NO son errores.
     # Bug histórico (2026-04-26): el scanner emite cada 5min "enqueued N new
@@ -17904,8 +18177,8 @@ def _resolve_log_path(name: str) -> Path | None:
             return None
         # dir_slug → mapear a uno de _LOG_DIRS por el último componente
         # del path.
-        for d in _LOG_DIRS:
-            if d.name == dir_slug:
+        for idx, d in enumerate(_LOG_DIRS):
+            if d.name == dir_slug or (idx == 0 and dir_slug == "obsidian-rag"):
                 candidate = (d / filename).resolve()
                 try:
                     candidate.relative_to(d.resolve())
@@ -18075,6 +18348,119 @@ def logs_index(nocache: int = 0) -> dict:
     payload = _build_logs_index_payload()
     _cache_put_compat(_LOGS_INDEX_CACHE, payload)
     return payload
+
+
+def _iter_current_log_files() -> list[Path]:
+    """Return current dashboard log files under the configured log dirs."""
+    out: list[Path] = []
+    for log_dir in _LOG_DIRS:
+        if not log_dir.is_dir():
+            continue
+        for path in sorted(log_dir.iterdir()):
+            if not path.is_file():
+                continue
+            name = path.name
+            if (
+                name.endswith(".log")
+                or name.endswith(".stdout.log")
+                or name.endswith(".stderr.log")
+            ):
+                out.append(path)
+    return out
+
+
+def _log_ref_for_path(path: Path) -> str:
+    for log_dir in _LOG_DIRS:
+        try:
+            rel = path.resolve().relative_to(log_dir.resolve())
+        except (OSError, ValueError):
+            continue
+        return f"{log_dir.name}/{rel.name}"
+    return path.name
+
+
+def _clear_logs_dashboard_caches() -> None:
+    """Clear /logs caches after destructive log maintenance."""
+    for cache_obj in (_LOGS_INDEX_CACHE, _LOG_GLOBAL_CACHE, _RANKINGS_CACHE):
+        try:
+            clear = getattr(cache_obj, "clear", None)
+            if callable(clear):
+                clear()
+                continue
+            if isinstance(cache_obj, dict):
+                cache_obj.clear()
+                cache_obj.update({"ts": 0.0, "payload": None})
+        except Exception:
+            continue
+
+
+def _truncate_current_log_files() -> tuple[list[dict], int, list[dict]]:
+    """Truncate all log files currently visible in /logs.
+
+    We truncate in place rather than unlinking so launchd/file handles keep
+    writing to the same inode.
+    """
+    truncated: list[dict] = []
+    errors: list[dict] = []
+    bytes_cleared = 0
+    for path in _iter_current_log_files():
+        try:
+            before = path.stat().st_size
+            with path.open("r+b") as fh:
+                fh.truncate(0)
+            bytes_cleared += before
+            truncated.append({
+                "ref": _log_ref_for_path(path),
+                "path": str(path),
+                "bytes_cleared": before,
+            })
+        except Exception as exc:
+            errors.append({
+                "ref": _log_ref_for_path(path),
+                "path": str(path),
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+    return truncated, bytes_cleared, errors
+
+
+@app.post(
+    "/api/logs/clean-all",
+    dependencies=[Depends(_require_admin_token)],
+)
+def logs_clean_all(clear_queue: int = 1) -> dict:
+    """Vaciar todos los logs actuales que ve /logs.
+
+    Auth: admin token. Es una operación destructiva de mantenimiento: deja los
+    archivos existentes en cero bytes y opcionalmente limpia la queue derivada
+    de esos logs para que el panel arranque desde un estado fresco.
+    """
+    truncated, bytes_cleared, errors = _truncate_current_log_files()
+    queue_deleted = 0
+    queue_error = ""
+    if clear_queue:
+        try:
+            _ensure_error_queue_table()
+            with _ragvec_state_conn() as conn:
+                cursor = conn.execute("DELETE FROM rag_error_queue")
+                queue_deleted = int(cursor.rowcount or 0)
+                conn.commit()
+        except Exception as exc:
+            queue_error = f"{type(exc).__name__}: {exc}"
+            errors.append({"ref": "rag_error_queue", "error": queue_error})
+    try:
+        _initialize_error_queue_scan_cursors()
+    except Exception:
+        pass
+    _clear_logs_dashboard_caches()
+    return {
+        "status": "ok" if not errors else "partial",
+        "files_truncated": len(truncated),
+        "bytes_cleared": bytes_cleared,
+        "queue_cleared": bool(clear_queue) and not queue_error,
+        "queue_deleted": queue_deleted,
+        "errors": errors,
+        "logs": truncated,
+    }
 
 
 @app.get("/api/logs/file")
@@ -19174,7 +19560,7 @@ async def diagnose_error(req: _DiagnoseErrorRequest, request: Request) -> Stream
 #     mata el daemon target específico de forma controlada)
 #   - cualquier cosa con stdin redirigido o pipes
 
-_LOG_DIR_ABS = (Path.home() / ".local/share/obsidian-rag").resolve()
+_LOG_DIR_ABS = _obsidian_rag_state_dir().resolve()
 _DIAGNOSE_AUDIT_LOG = _LOG_DIR_ABS / "diagnose_executions.jsonl"
 _DIAGNOSE_TIMEOUT_S = 15.0
 _DIAGNOSE_OUTPUT_TRUNCATE = 8000  # bytes por stdout/stderr
@@ -19823,6 +20209,11 @@ _DEVIN_BIN = _which_safe("devin", (
     str(Path.home() / ".local/bin/devin"),
     "/usr/local/bin/devin",
 ))
+_CODEX_BIN = _which_safe("codex", (
+    str(Path.home() / ".local/bin/codex"),
+    "/opt/homebrew/bin/codex",
+    "/usr/local/bin/codex",
+))
 _AUTO_FIX_DEVIN_TIMEOUT_S = 600.0  # 10min cap — Devin tasks reales tardan
                                     # 5-8min (investigar + fixear + commit + push).
                                     # Antes era 300s y matábamos al subprocess
@@ -19831,6 +20222,7 @@ _AUTO_FIX_DEVIN_TIMEOUT_S = 600.0  # 10min cap — Devin tasks reales tardan
                                     # ya había cerrado la modal hacía rato.
                                     # Aprendido el 2026-04-29 con un fix de
                                     # spaCy que tardó 5m12s end-to-end.
+_AUTO_FIX_CODEX_TIMEOUT_S = 600.0
 
 
 def _recover_devin_final_message(pid: int) -> str | None:
@@ -19889,10 +20281,9 @@ def _recover_devin_final_message(pid: int) -> str | None:
 
 
 def _build_devin_prompt(req: "_AutoFixRequest") -> str:
-    """Arma el prompt para pasar a `devin -p`. En una sola línea porque
-    el CLI acepta el prompt como string positional arg."""
+    """Arma el prompt para el agente auto-fix."""
     parts = [
-        "Error detectado en el stack obsidian-rag. Diagnosticá Y resolvé:",
+        "Problema detectado en el stack obsidian-rag. Diagnosticá Y resolvé:",
     ]
     if req.service:
         parts.append(f"service={req.service}")
@@ -19900,10 +20291,10 @@ def _build_devin_prompt(req: "_AutoFixRequest") -> str:
         parts.append(f"archivo={req.file}")
     if req.timestamp:
         parts.append(f"ts={req.timestamp}")
-    parts.append(f"error='{req.error_text[:500]}'")
+    parts.append(f"error='{req.error_text[:1000]}'")
     if req.context_lines:
-        ctx = " | ".join(ln[:120] for ln in req.context_lines[-6:])
-        parts.append(f"contexto_previo='{ctx[:600]}'")
+        ctx = "\n".join(str(ln)[:320] for ln in req.context_lines[-30:])
+        parts.append(f"contexto_previo='''\n{ctx[:6000]}\n'''")
     parts.append(
         "Investigá el problema (launchctl list, tail del log), identificá "
         "la causa, aplicá el fix (kickstart del daemon si aplica, o fix "
@@ -19940,8 +20331,8 @@ def auto_fix_devin(req: _AutoFixRequest, request: Request) -> StreamingResponse:
 
     prompt = _build_devin_prompt(req)
     # Limitamos el prompt para no pasarle miles de chars a un arg de CLI.
-    if len(prompt) > 3000:
-        prompt = prompt[:3000] + "…(truncado)"
+    if len(prompt) > 9000:
+        prompt = prompt[:9000] + "…(truncado)"
 
     cmd = [
         _DEVIN_BIN,
@@ -20100,18 +20491,18 @@ def auto_fix_devin(req: _AutoFixRequest, request: Request) -> StreamingResponse:
 #      todos los logs (reusa `_build_global_errors_payload`) y hace UPSERT.
 #   3. Worker: OTRO thread interno que cada M minutos toma el siguiente
 #      error con status=pending (ordenado por occurrence_count desc,
-#      luego last_seen_at desc), marca processing, spawn `devin -p`,
+#      luego last_seen_at desc), marca processing, spawn `codex exec`,
 #      parsea el STATUS de la respuesta, marca resolved/failed/etc.
-#   4. Hard cap: max N invocaciones de Devin por hora para controlar
-#      ACUs. Default conservador: 5/hora.
+#   4. Hard cap: max N invocaciones de Codex por hora. Default
+#      conservador: 5/hora.
 #
 # Estados:
 #   pending      — nuevo, esperando worker
-#   processing   — Devin está trabajando
-#   resolved     — Devin reportó STATUS: resolved
-#   needs-human  — Devin reportó STATUS: needs-human (fix requiere decisión)
-#   no-action    — Devin reportó STATUS: no-action (falso positivo / transient)
-#   failed       — Devin crashó, exit != 0, o output sin STATUS
+#   processing   — Codex está trabajando
+#   resolved     — Codex reportó STATUS: resolved
+#   needs-human  — Codex reportó STATUS: needs-human (fix requiere decisión)
+#   no-action    — Codex reportó STATUS: no-action (falso positivo / transient)
+#   failed       — Codex crashó, exit != 0, o output sin STATUS
 #   skipped      — el worker decidió no procesar (ya tuvo attempts >= 3)
 #
 # Idempotencia: si un error resuelto vuelve a aparecer, NO volvemos a
@@ -20126,6 +20517,7 @@ _ERROR_QUEUE_DDL = (
     " service TEXT NOT NULL,"
     " file_ref TEXT NOT NULL,"
     " error_signature TEXT NOT NULL UNIQUE,"
+    " level TEXT NOT NULL DEFAULT 'error',"
     " error_text TEXT NOT NULL,"
     " context_lines TEXT,"
     " error_ts TEXT,"
@@ -20145,6 +20537,8 @@ _ERROR_QUEUE_DDL = (
 )
 _ERROR_QUEUE_INDEXES = (
     "CREATE INDEX IF NOT EXISTS ix_error_queue_status ON rag_error_queue(status)",
+    "CREATE INDEX IF NOT EXISTS ix_error_queue_status_level "
+    "ON rag_error_queue(status, level)",
     "CREATE INDEX IF NOT EXISTS ix_error_queue_signature ON rag_error_queue(error_signature)",
     "CREATE INDEX IF NOT EXISTS ix_error_queue_service_ts "
     "ON rag_error_queue(service, last_seen_at DESC)",
@@ -20165,6 +20559,15 @@ def _ensure_error_queue_table() -> None:
         try:
             with _ragvec_state_conn() as conn:
                 conn.execute(_ERROR_QUEUE_DDL)
+                cols = {
+                    str(row[1])
+                    for row in conn.execute("PRAGMA table_info(rag_error_queue)").fetchall()
+                }
+                if "level" not in cols:
+                    conn.execute(
+                        "ALTER TABLE rag_error_queue "
+                        "ADD COLUMN level TEXT NOT NULL DEFAULT 'error'"
+                    )
                 for idx in _ERROR_QUEUE_INDEXES:
                     conn.execute(idx)
                 conn.commit()
@@ -20203,42 +20606,85 @@ def _compute_error_signature(service: str, error_text: str) -> str:
     return hashlib.sha256(f"{service}:{t}".encode("utf-8")).hexdigest()[:16]
 
 
+def _normalize_error_queue_level(level: str | None) -> str:
+    """Normalize log queue levels to the two levels the worker prioritizes."""
+    value = str(level or "").strip().lower()
+    return "warn" if value in {"warn", "warning"} else "error"
+
+
+def _merge_error_queue_level(current: str | None, incoming: str | None) -> str:
+    """Keep an entry at error priority if it has ever been seen as an error."""
+    current_norm = _normalize_error_queue_level(current)
+    incoming_norm = _normalize_error_queue_level(incoming)
+    return "error" if "error" in {current_norm, incoming_norm} else "warn"
+
+
 def _enqueue_error(
     service: str, file_ref: str, error_text: str,
     context_lines: list[str] | None = None, error_ts: str | None = None,
+    *,
+    level: str = "error",
+    reopen_terminal: bool = False,
 ) -> tuple[int, bool]:
-    """UPSERT del error. Retorna `(row_id, was_new)`.
+    """UPSERT del error/warning. Retorna `(row_id, should_process)`.
 
     Si el signature ya existía:
       - Incrementa occurrence_count
       - Actualiza last_seen_at
-      - NO toca status (errores ya resueltos que vuelven quedan resolved)
+      - Mantiene prioridad error si alguna ocurrencia fue error
+      - Por default NO toca status (manual/full scans no reabren errores viejos)
+      - Si `reopen_terminal=True`, una línea NUEVA con la misma signature
+        reabre statuses terminales para que Codex la procese de nuevo
     Si es nuevo: inserta con status='pending'.
     """
     _ensure_error_queue_table()
+    level = _normalize_error_queue_level(level)
     sig = _compute_error_signature(service, error_text)
-    ctx_json = json.dumps(context_lines or [], ensure_ascii=False)[:2000]
+    ctx_json = json.dumps(context_lines or [], ensure_ascii=False)[:8000]
     try:
         with _ragvec_state_conn() as conn:
             existing = conn.execute(
-                "SELECT id FROM rag_error_queue WHERE error_signature = ?",
+                "SELECT id, status, level FROM rag_error_queue WHERE error_signature = ?",
                 (sig,),
             ).fetchone()
             if existing:
+                row_id, status = existing[0], existing[1]
+                merged_level = _merge_error_queue_level(existing[2], level)
+                terminal = {"resolved", "needs-human", "no-action", "failed", "skipped"}
+                if reopen_terminal and status in terminal:
+                    conn.execute(
+                        "UPDATE rag_error_queue SET "
+                        "service = ?, file_ref = ?, error_text = ?, "
+                        "context_lines = ?, error_ts = ?, level = ?, "
+                        "status = 'pending', attempts = 0, "
+                        "started_at = NULL, completed_at = NULL, duration_s = NULL, "
+                        "devin_exit_code = NULL, devin_output = NULL, "
+                        "resolution_status = NULL, resolution_reason = NULL, "
+                        "occurrence_count = occurrence_count + 1, "
+                        "last_seen_at = CURRENT_TIMESTAMP "
+                        "WHERE id = ?",
+                        (
+                            service, file_ref, error_text[:4000], ctx_json, error_ts,
+                            merged_level, row_id,
+                        ),
+                    )
+                    conn.commit()
+                    return row_id, True
                 conn.execute(
                     "UPDATE rag_error_queue SET "
+                    "level = ?, "
                     "occurrence_count = occurrence_count + 1, "
                     "last_seen_at = CURRENT_TIMESTAMP "
                     "WHERE id = ?",
-                    (existing[0],),
+                    (merged_level, row_id),
                 )
                 conn.commit()
-                return existing[0], False
+                return row_id, False
             cursor = conn.execute(
                 "INSERT INTO rag_error_queue "
                 "(service, file_ref, error_signature, error_text, "
-                " context_lines, error_ts) VALUES (?, ?, ?, ?, ?, ?)",
-                (service, file_ref, sig, error_text[:4000], ctx_json, error_ts),
+                " context_lines, error_ts, level) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (service, file_ref, sig, error_text[:4000], ctx_json, error_ts, level),
             )
             conn.commit()
             return cursor.lastrowid, True
@@ -20248,16 +20694,16 @@ def _enqueue_error(
         return -1, False
 
 
-# Rate limit del worker — max N invocaciones de Devin por hora.
-# Cada invocación tarda ~60-120s y consume ACUs pagas, así que el cap
-# es conservador. Ajustable con env var.
+# Rate limit del worker — max N invocaciones de Codex por hora.
+# Cada invocación puede tardar varios minutos, así que el cap es
+# conservador. Ajustable con env var.
 _AUTO_FIX_WORKER_HOURLY_CAP = settings.auto_fix_hourly_cap
 _AUTO_FIX_WORKER_INVOCATIONS: list[float] = []  # monotonic ts de invocaciones
 _AUTO_FIX_WORKER_LOCK = threading.Lock()
 
 
 def _worker_can_invoke_devin() -> tuple[bool, str]:
-    """¿El worker puede disparar otra invocación de Devin ahora?"""
+    """¿El worker puede disparar otra invocación de Codex ahora?"""
     now = time.monotonic()
     one_hour_ago = now - 3600
     with _AUTO_FIX_WORKER_LOCK:
@@ -20271,7 +20717,7 @@ def _worker_can_invoke_devin() -> tuple[bool, str]:
 
 
 def _parse_devin_resolution_status(output: str) -> tuple[str, str]:
-    """Extraer STATUS: y REASON: del output de Devin. Retorna
+    """Extraer STATUS: y REASON: del output del agente. Retorna
     `(status, reason)` donde status ∈ {resolved, no-action, needs-human, failed}.
 
     Si no encuentra un STATUS: marker, devuelve ('failed', 'no status marker').
@@ -20287,20 +20733,22 @@ def _parse_devin_resolution_status(output: str) -> tuple[str, str]:
 
 
 def _get_next_pending_error() -> dict | None:
-    """Siguiente error para procesar. Prioridad:
-    1. occurrence_count DESC (errores más frecuentes primero)
-    2. last_seen_at DESC (más recientes primero)
-    3. attempts < 3 (si ya falló 3 veces, skip)
+    """Siguiente problema para procesar. Prioridad:
+    1. level error antes que warn
+    2. occurrence_count DESC (más frecuentes primero)
+    3. last_seen_at DESC (más recientes primero)
+    4. attempts < 3 (si ya falló 3 veces, skip)
     """
     _ensure_error_queue_table()
     try:
         with _ragvec_state_conn() as conn:
             row = conn.execute(
                 "SELECT id, service, file_ref, error_text, context_lines, "
-                "error_ts, occurrence_count, attempts "
+                "error_ts, occurrence_count, attempts, level "
                 "FROM rag_error_queue "
                 "WHERE status = 'pending' AND attempts < 3 "
-                "ORDER BY occurrence_count DESC, last_seen_at DESC "
+                "ORDER BY CASE level WHEN 'error' THEN 0 WHEN 'warn' THEN 1 ELSE 2 END, "
+                "occurrence_count DESC, last_seen_at DESC "
                 "LIMIT 1"
             ).fetchone()
             if not row:
@@ -20311,6 +20759,7 @@ def _get_next_pending_error() -> dict | None:
                 "context_lines": json.loads(row[4]) if row[4] else [],
                 "error_ts": row[5],
                 "occurrence_count": row[6], "attempts": row[7],
+                "level": _normalize_error_queue_level(row[8]),
             }
     except (json.JSONDecodeError, TypeError) as e:
         print(f"[error-queue] get_next failed: {type(e).__name__}: {e}",
@@ -20319,16 +20768,17 @@ def _get_next_pending_error() -> dict | None:
 
 
 def _process_error_with_devin(error_id: int) -> dict:
-    """Spawn `devin -p` con el contexto del error en la DB y update la row.
+    """Spawn Codex con el contexto del error en la DB y update la row.
 
-    Retorna el resultado `{exit_code, output, resolution_status, ...}`.
+    El nombre de la función queda por compatibilidad con tests/schema
+    históricos; el agente operativo de la queue es Codex.
     """
     _ensure_error_queue_table()
     # Fetch error row.
     try:
         with _ragvec_state_conn() as conn:
             row = conn.execute(
-                "SELECT service, file_ref, error_text, context_lines, error_ts, attempts "
+                "SELECT service, file_ref, error_text, context_lines, error_ts, attempts, level "
                 "FROM rag_error_queue WHERE id = ?",
                 (error_id,),
             ).fetchone()
@@ -20337,11 +20787,13 @@ def _process_error_with_devin(error_id: int) -> dict:
     if not row:
         return {"error": "row no existe"}
 
-    service, file_ref, error_text, context_json, error_ts, attempts = row
+    service, file_ref, error_text, context_json, error_ts, attempts, level = row
+    level = _normalize_error_queue_level(level)
     try:
         context_lines = json.loads(context_json) if context_json else []
     except (json.JSONDecodeError, TypeError):
         context_lines = []
+    context_lines = [f"[queue] level={level}"] + context_lines
 
     # Marcar como processing + increment attempts.
     with _ragvec_state_conn() as conn:
@@ -20353,7 +20805,7 @@ def _process_error_with_devin(error_id: int) -> dict:
         )
         conn.commit()
 
-    # Build prompt + ejecutar devin.
+    # Build prompt + ejecutar Codex.
     req = _AutoFixRequest(
         error_text=error_text,
         service=service,
@@ -20369,34 +20821,27 @@ def _process_error_with_devin(error_id: int) -> dict:
         "Esto es CRÍTICO para que el worker autónomo pueda clasificar "
         "tu respuesta."
     )
-    if len(prompt) > 3000:
-        prompt = prompt[:3000] + "…(truncado)"
+    if len(prompt) > 9000:
+        prompt = prompt[:9000] + "…(truncado)"
 
-    if _DEVIN_BIN is None:
-        _finalize_error(error_id, -1, "", "failed", "devin CLI no encontrado", 0.0)
+    if _CODEX_BIN is None:
+        _finalize_error(error_id, -1, "", "failed", "codex CLI no encontrado", 0.0)
         with _AUTO_FIX_WORKER_LOCK:
             _AUTO_FIX_WORKER_INVOCATIONS.append(time.monotonic())
         return {"error_id": error_id, "exit_code": -1, "resolution_status": "failed"}
 
-    # Worker autónomo: mismas flags que el endpoint `/api/auto-fix-devin`.
-    # --permission-mode dangerous es obligatorio acá — sin ello el subprocess
-    # se cuelga indefinidamente cuando Devin intenta un edit/exec y pide
-    # aprobación (no hay humano leyendo stdin).
     cmd = [
-        _DEVIN_BIN, "-p", prompt,
-        "--respect-workspace-trust", "false",
-        "--permission-mode", "dangerous",
+        _CODEX_BIN,
+        "exec",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "-C", str(ROOT),
+        "--color", "never",
+        prompt,
     ]
     with _AUTO_FIX_WORKER_LOCK:
         _AUTO_FIX_WORKER_INVOCATIONS.append(time.monotonic())
     t0 = time.monotonic()
-    proc_pid: int | None = None
     try:
-        # Usamos Popen + wait en lugar de subprocess.run() porque queremos
-        # capturar el PID del subprocess para poder recuperar el transcript
-        # JSON aunque Devin no haya escrito nada a stdout (block-buffering
-        # en modo no-TTY — mismo bug que rompía el SSE endpoint /api/auto-
-        # fix-devin antes del fix del 2026-04-29).
         proc = subprocess.Popen(
             cmd,
             cwd=str(ROOT),
@@ -20407,9 +20852,8 @@ def _process_error_with_devin(error_id: int) -> dict:
             shell=False,
             env={**os.environ, "TERM": "dumb", "NO_COLOR": "1"},
         )
-        proc_pid = proc.pid
         try:
-            stdout_str, stderr_str = proc.communicate(timeout=_AUTO_FIX_DEVIN_TIMEOUT_S)
+            stdout_str, stderr_str = proc.communicate(timeout=_AUTO_FIX_CODEX_TIMEOUT_S)
         except subprocess.TimeoutExpired:
             proc.terminate()
             try:
@@ -20419,19 +20863,10 @@ def _process_error_with_devin(error_id: int) -> dict:
                 stdout_str, stderr_str = proc.communicate(timeout=2)
             output_partial = (stdout_str or "") + (
                 "\n" + stderr_str if stderr_str else "")
-            recovered = _recover_devin_final_message(proc_pid)
-            if recovered and recovered not in output_partial:
-                output_partial = (output_partial + "\n\n" + recovered).strip()
             duration_s = round(time.monotonic() - t0, 3)
-            # Si el transcript SÍ tiene STATUS (Devin alcanzó a terminar
-            # antes del SIGTERM), parseamos ese; si no, marcamos failed
-            # con razón "timeout".
-            if recovered:
-                resolution_status, reason = _parse_devin_resolution_status(output_partial)
-                if resolution_status == "failed" and "no status marker" in reason:
-                    reason = f"timeout {_AUTO_FIX_DEVIN_TIMEOUT_S}s, transcript recuperado sin STATUS"
-            else:
-                resolution_status, reason = "failed", f"timeout {_AUTO_FIX_DEVIN_TIMEOUT_S}s"
+            resolution_status, reason = _parse_devin_resolution_status(output_partial)
+            if resolution_status == "failed" and "sin marker" in reason:
+                reason = f"timeout {_AUTO_FIX_CODEX_TIMEOUT_S}s"
             _finalize_error(error_id, 124, output_partial, resolution_status, reason, duration_s)
             return {
                 "error_id": error_id, "exit_code": 124,
@@ -20440,14 +20875,6 @@ def _process_error_with_devin(error_id: int) -> dict:
             }
         output = (stdout_str or "") + ("\n" + stderr_str if stderr_str else "")
         exit_code = proc.returncode
-        # Recovery del transcript JSON: si el output está vacío (típico:
-        # Devin block-buffera stdout cuando el parent es pipe), o si no
-        # tiene STATUS marker, intentamos recuperar el final assistant
-        # message del transcript que Devin escribe siempre al disco.
-        if proc_pid is not None:
-            recovered = _recover_devin_final_message(proc_pid)
-            if recovered and recovered not in output:
-                output = (output + "\n\n" + recovered).strip() if output.strip() else recovered
         duration_s = round(time.monotonic() - t0, 3)
         if exit_code == 0:
             resolution_status, reason = _parse_devin_resolution_status(output)
@@ -20496,50 +20923,293 @@ def _finalize_error(
               file=sys.stderr, flush=True)
 
 
+_ERROR_QUEUE_PROCESSING_STALE_S = 15 * 60
+
+
+def _recover_stale_processing_errors(
+    stale_after_s: float = _ERROR_QUEUE_PROCESSING_STALE_S,
+) -> dict:
+    """Recover queue rows left in processing after a web daemon restart."""
+    _ensure_error_queue_table()
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(seconds=max(1.0, stale_after_s))
+    ).strftime("%Y-%m-%d %H:%M:%S")
+    reopened = 0
+    no_action = 0
+    try:
+        with _ragvec_state_conn() as conn:
+            rows = conn.execute(
+                "SELECT id, error_text FROM rag_error_queue "
+                "WHERE status = 'processing' "
+                "AND (started_at IS NULL OR started_at <= ?)",
+                (cutoff,),
+            ).fetchall()
+            for row_id, error_text in rows:
+                if _classify_log_line(str(error_text or "")) not in ("error", "warn"):
+                    conn.execute(
+                        "UPDATE rag_error_queue SET "
+                        "status = 'no-action', completed_at = CURRENT_TIMESTAMP, "
+                        "duration_s = 0, resolution_status = 'no-action', "
+                        "resolution_reason = ?, devin_output = ? "
+                        "WHERE id = ?",
+                        (
+                            "stale processing row no longer classified as actionable",
+                            "Recovered on startup: stale processing row no longer "
+                            "classifies as error/warn.",
+                            row_id,
+                        ),
+                    )
+                    no_action += 1
+                else:
+                    conn.execute(
+                        "UPDATE rag_error_queue SET "
+                        "status = 'pending', started_at = NULL "
+                        "WHERE id = ?",
+                        (row_id,),
+                    )
+                    reopened += 1
+            conn.commit()
+        return {"reopened": reopened, "no_action": no_action}
+    except sqlite3.Error as e:
+        print(f"[error-queue] processing recovery failed: {type(e).__name__}: {e}",
+              file=sys.stderr, flush=True)
+        return {"reopened": 0, "no_action": 0, "error": str(e)}
+
+
 # ── Scanner + Worker threads ──────────────────────────────────────────
 # Dos daemon threads — uno popla la queue, el otro la procesa. Ambos
-# despiertan periódicamente y corren una iteración.
+# despiertan periódicamente y corren una iteración. El scanner es
+# incremental: arranca desde EOF y sólo encola líneas nuevas para evitar
+# reprocesar errores históricos cada vez que reinicia el web daemon.
 
-_SCANNER_PERIOD_S = 300.0  # 5min
-_WORKER_PERIOD_S = 120.0   # 2min
+_SCANNER_PERIOD_S = max(5.0, float(settings.auto_fix_scanner_period_s))
+_WORKER_PERIOD_S = max(5.0, float(settings.auto_fix_worker_period_s))
 _SCANNER_THREAD: "threading.Thread | None" = None
 _WORKER_THREAD: "threading.Thread | None" = None
 _ERROR_QUEUE_STOP = threading.Event()
-# Flag para habilitar el worker automático. Default: off para que el user
-# explícitamente lo active (evita sorpresas con ACUs). Se controla via
-# env var o via /api/logs/queue/config.
+# Flag para habilitar el worker automático. Se controla via env var o via
+# /api/logs/queue/config; el LaunchAgent de ra.ai lo setea en 1.
 _WORKER_AUTO_ENABLED = settings.auto_fix_worker
+_ERROR_QUEUE_SCAN_LOCK = threading.Lock()
+_ERROR_QUEUE_SCAN_CURSORS: dict[str, tuple[int, int]] = {}
+_ERROR_QUEUE_SCAN_PARTIALS: dict[str, str] = {}
+_ERROR_QUEUE_SCAN_STARTED_AT = time.time()
+
+
+def _log_service_kind_from_name(name: str) -> tuple[str, str]:
+    base = name
+    kind = "stdout"
+    if base.endswith(".error.log"):
+        base = base[: -len(".error.log")]
+        kind = "stderr"
+    elif base.endswith(".stderr.log"):
+        base = base[: -len(".stderr.log")]
+        kind = "stderr"
+    elif base.endswith(".stdout.log"):
+        base = base[: -len(".stdout.log")]
+        kind = "stdout"
+    elif base.endswith(".log"):
+        base = base[: -len(".log")]
+        kind = "stdout"
+    return base, kind
+
+
+def _initialize_error_queue_scan_cursors() -> None:
+    """Start the auto-fix scanner at EOF for all current log files."""
+    cursors: dict[str, tuple[int, int]] = {}
+    partials: dict[str, str] = {}
+    for path in _iter_current_log_files():
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        cursors[str(path)] = (int(getattr(st, "st_ino", 0)), int(st.st_size))
+    with _ERROR_QUEUE_SCAN_LOCK:
+        _ERROR_QUEUE_SCAN_CURSORS.clear()
+        _ERROR_QUEUE_SCAN_CURSORS.update(cursors)
+        _ERROR_QUEUE_SCAN_PARTIALS.clear()
+        _ERROR_QUEUE_SCAN_PARTIALS.update(partials)
+
+
+def _read_new_log_lines_for_queue(path: Path) -> list[str]:
+    """Read only bytes appended since the last auto-fix scan for `path`."""
+    key = str(path)
+    try:
+        st = path.stat()
+    except OSError:
+        return []
+    inode = int(getattr(st, "st_ino", 0))
+    size = int(st.st_size)
+    with _ERROR_QUEUE_SCAN_LOCK:
+        cursor = _ERROR_QUEUE_SCAN_CURSORS.get(key)
+        if cursor is None:
+            # New file after startup: if it looks newly written, process it
+            # from byte 0; otherwise start at EOF to avoid historical noise.
+            start = 0 if st.st_mtime >= (_ERROR_QUEUE_SCAN_STARTED_AT - 1.0) else size
+            partial = ""
+        else:
+            old_inode, old_size = cursor
+            rotated_or_truncated = (old_inode and old_inode != inode) or size < old_size
+            start = 0 if rotated_or_truncated else old_size
+            partial = "" if rotated_or_truncated else _ERROR_QUEUE_SCAN_PARTIALS.get(key, "")
+        _ERROR_QUEUE_SCAN_CURSORS[key] = (inode, size)
+    if size <= start:
+        return []
+    try:
+        with path.open("rb") as fh:
+            fh.seek(start)
+            chunk = fh.read(size - start)
+    except OSError:
+        return []
+    text = partial + chunk.decode("utf-8", errors="replace")
+    if not text:
+        return []
+    if text.endswith(("\n", "\r")):
+        lines = text.splitlines()
+        next_partial = ""
+    else:
+        lines = text.splitlines()
+        next_partial = lines.pop() if lines else text
+    with _ERROR_QUEUE_SCAN_LOCK:
+        _ERROR_QUEUE_SCAN_PARTIALS[key] = next_partial
+    return lines
+
+
+def _cap_auto_fix_context(lines: list[str], *, max_chars: int = 8000) -> list[str]:
+    out: list[str] = []
+    used = 0
+    for raw in lines:
+        line = str(raw)
+        if len(line) > 600:
+            line = line[:600] + "…"
+        next_used = used + len(line) + 1
+        if next_used > max_chars:
+            break
+        out.append(line)
+        used = next_used
+    return out
+
+
+def _sibling_logs_for_service(path: Path, service: str) -> list[Path]:
+    names = (
+        f"{service}.log",
+        f"{service}.error.log",
+        f"{service}.stdout.log",
+        f"{service}.stderr.log",
+    )
+    out: list[Path] = []
+    for name in names:
+        candidate = path.parent / name
+        if candidate == path or not candidate.is_file():
+            continue
+        if candidate not in out:
+            out.append(candidate)
+    return out
+
+
+def _build_auto_fix_log_context(
+    path: Path,
+    *,
+    service: str,
+    kind: str,
+    error_line: str,
+    previous_lines: list[str],
+) -> list[str]:
+    """Capture useful nearby log information for the autonomous Codex run."""
+    ctx: list[str] = []
+    try:
+        st = path.stat()
+        mtime = datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds")
+        ctx.append(
+            f"[source] service={service} kind={kind} ref={_log_ref_for_path(path)} "
+            f"path={path} size={st.st_size}B mtime={mtime}"
+        )
+    except OSError:
+        ctx.append(f"[source] service={service} kind={kind} ref={_log_ref_for_path(path)} path={path}")
+    ctx.append(f"[error-line] {error_line}")
+    if previous_lines:
+        ctx.append("[new-lines-before-error]")
+        ctx.extend(previous_lines[-8:])
+
+    tail = _read_tail_lines(path, 30)
+    if tail:
+        ctx.append(f"[tail:{path.name}]")
+        ctx.extend(tail[-30:])
+
+    for sibling in _sibling_logs_for_service(path, service):
+        sibling_tail = _read_tail_lines(sibling, 20)
+        if not sibling_tail:
+            continue
+        ctx.append(f"[sibling-tail:{sibling.name}]")
+        ctx.extend(sibling_tail[-20:])
+    return _cap_auto_fix_context(ctx)
+
+
+def _scan_new_log_errors() -> dict:
+    """Incrementally enqueue newly appended error/warn lines from log files."""
+    enqueued = 0
+    seen_errors = 0
+    seen_warns = 0
+    files_scanned = 0
+    for path in _iter_current_log_files():
+        raw_lines = _read_new_log_lines_for_queue(path)
+        if not raw_lines:
+            continue
+        files_scanned += 1
+        service, kind = _log_service_kind_from_name(path.name)
+        ref = _log_ref_for_path(path)
+        last_ts: str | None = None
+        context: list[str] = []
+        for ln in raw_lines:
+            ts = _extract_log_ts(ln)
+            if ts:
+                last_ts = ts
+            elif last_ts is not None:
+                ts = last_ts
+            else:
+                ts = datetime.now().isoformat(timespec="seconds")
+            level = _classify_log_line(ln)
+            if level in ("error", "warn") and not _LOG_RE_ERROR_QUEUE_META.search(ln):
+                if level == "error":
+                    seen_errors += 1
+                else:
+                    seen_warns += 1
+                _, should_process = _enqueue_error(
+                    service=service,
+                    file_ref=ref,
+                    error_text=ln,
+                    context_lines=_build_auto_fix_log_context(
+                        path,
+                        service=service,
+                        kind=kind,
+                        error_line=ln,
+                        previous_lines=context,
+                    ),
+                    error_ts=ts,
+                    level=level,
+                    reopen_terminal=True,
+                )
+                if should_process:
+                    enqueued += 1
+            context.append(ln)
+            if len(context) > 8:
+                context = context[-8:]
+    return {
+        "files_scanned": files_scanned,
+        "seen_errors": seen_errors,
+        "seen_warns": seen_warns,
+        "new_entries": enqueued,
+    }
 
 
 def _scanner_loop() -> None:
     """Loop: cada _SCANNER_PERIOD_S, escanea logs + enqueue errores nuevos."""
     while not _ERROR_QUEUE_STOP.is_set():
         try:
-            payload = _build_global_errors_payload(3600, "error")
-            enqueued = 0
-            seen = 0
-            for ln in payload.get("lines", []):
-                seen += 1
-                text = ln.get("text") or ""
-                # Defensa-en-profundidad contra el self-feedback loop.
-                # _classify_log_line ya filtra estos meta-events del feed
-                # de errores, pero si un día alguien cambia el clasificador
-                # y se cuela uno, queremos que el scanner lo skipee igual.
-                # Ver _LOG_RE_ERROR_QUEUE_META para el pattern.
-                if _LOG_RE_ERROR_QUEUE_META.search(text):
-                    continue
-                _, was_new = _enqueue_error(
-                    service=ln.get("service") or "unknown",
-                    file_ref=ln.get("ref") or "",
-                    error_text=text,
-                    context_lines=[],  # Scanner no tiene contexto líneas; el feed global no lo provee
-                    error_ts=ln.get("ts"),
-                )
-                if was_new:
-                    enqueued += 1
-            if enqueued > 0:
-                print(f"[error-queue scanner] enqueued {enqueued} new errors "
-                      f"(seen {seen})", flush=True)
+            summary = _scan_new_log_errors()
+            if summary["new_entries"] > 0:
+                print(f"[error-queue scanner] enqueued {summary['new_entries']} new log issues "
+                      f"(errors={summary['seen_errors']} warns={summary['seen_warns']})", flush=True)
         except Exception as e:
             print(f"[error-queue scanner] tick failed: {type(e).__name__}: {e}",
                   file=sys.stderr, flush=True)
@@ -20548,7 +21218,7 @@ def _scanner_loop() -> None:
 
 def _worker_loop() -> None:
     """Loop: cada _WORKER_PERIOD_S, si hay pending + bajo el rate limit,
-    procesa 1 error con Devin."""
+    procesa 1 error con Codex."""
     while not _ERROR_QUEUE_STOP.is_set():
         try:
             if not _WORKER_AUTO_ENABLED:
@@ -20562,7 +21232,7 @@ def _worker_loop() -> None:
             if not next_error:
                 _ERROR_QUEUE_STOP.wait(timeout=_WORKER_PERIOD_S)
                 continue
-            print(f"[error-queue worker] processing error id={next_error['id']} "
+            print(f"[error-queue worker] processing {next_error['level']} id={next_error['id']} "
                   f"service={next_error['service']} "
                   f"count={next_error['occurrence_count']}", flush=True)
             result = _process_error_with_devin(next_error["id"])
@@ -20580,6 +21250,15 @@ def _start_error_queue_threads() -> None:
     """Arrancar scanner + worker threads al boot del web daemon."""
     global _SCANNER_THREAD, _WORKER_THREAD
     _ERROR_QUEUE_STOP.clear()
+    recovered = _recover_stale_processing_errors()
+    if recovered.get("reopened") or recovered.get("no_action"):
+        print(
+            "[error-queue startup] recovered stale processing rows "
+            f"reopened={recovered.get('reopened', 0)} "
+            f"no_action={recovered.get('no_action', 0)}",
+            flush=True,
+        )
+    _initialize_error_queue_scan_cursors()
     _SCANNER_THREAD = threading.Thread(
         target=_scanner_loop, name="error-queue-scanner", daemon=True)
     _SCANNER_THREAD.start()
@@ -20614,7 +21293,7 @@ def logs_queue_list(status: str = "all", limit: int = 100) -> dict:
         with _ragvec_state_conn() as conn:
             if status == "all":
                 rows = conn.execute(
-                    "SELECT id, service, file_ref, error_text, status, "
+                    "SELECT id, service, file_ref, error_text, status, level, "
                     "occurrence_count, attempts, first_seen_at, last_seen_at, "
                     "completed_at, duration_s, resolution_status, resolution_reason "
                     "FROM rag_error_queue "
@@ -20625,22 +21304,27 @@ def logs_queue_list(status: str = "all", limit: int = 100) -> dict:
                     "  WHEN 'failed' THEN 3 "
                     "  WHEN 'resolved' THEN 4 "
                     "  ELSE 5 END, "
+                    "CASE level WHEN 'error' THEN 0 WHEN 'warn' THEN 1 ELSE 2 END, "
                     "last_seen_at DESC "
                     "LIMIT ?",
                     (lim,),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT id, service, file_ref, error_text, status, "
+                    "SELECT id, service, file_ref, error_text, status, level, "
                     "occurrence_count, attempts, first_seen_at, last_seen_at, "
                     "completed_at, duration_s, resolution_status, resolution_reason "
                     "FROM rag_error_queue WHERE status = ? "
-                    "ORDER BY last_seen_at DESC LIMIT ?",
+                    "ORDER BY CASE level WHEN 'error' THEN 0 WHEN 'warn' THEN 1 ELSE 2 END, "
+                    "last_seen_at DESC LIMIT ?",
                     (status, lim),
                 ).fetchall()
             # Counts por status.
             counts = dict(conn.execute(
                 "SELECT status, COUNT(*) FROM rag_error_queue GROUP BY status"
+            ).fetchall())
+            level_counts = dict(conn.execute(
+                "SELECT level, COUNT(*) FROM rag_error_queue GROUP BY level"
             ).fetchall())
     except sqlite3.Error as e:
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}") from e
@@ -20648,17 +21332,20 @@ def logs_queue_list(status: str = "all", limit: int = 100) -> dict:
     entries = [{
         "id": r[0], "service": r[1], "file_ref": r[2],
         "error_text": r[3], "status": r[4],
-        "occurrence_count": r[5], "attempts": r[6],
-        "first_seen_at": r[7], "last_seen_at": r[8],
-        "completed_at": r[9], "duration_s": r[10],
-        "resolution_status": r[11], "resolution_reason": r[12],
+        "level": _normalize_error_queue_level(r[5]),
+        "occurrence_count": r[6], "attempts": r[7],
+        "first_seen_at": r[8], "last_seen_at": r[9],
+        "completed_at": r[10], "duration_s": r[11],
+        "resolution_status": r[12], "resolution_reason": r[13],
     } for r in rows]
 
     can_invoke, rate_reason = _worker_can_invoke_devin()
     return {
         "entries": entries,
         "counts_by_status": counts,
+        "counts_by_level": level_counts,
         "total": sum(counts.values()),
+        "worker_agent": "codex",
         "worker_enabled": _WORKER_AUTO_ENABLED,
         "worker_rate_limit": {
             "hourly_cap": _AUTO_FIX_WORKER_HOURLY_CAP,
@@ -20677,7 +21364,7 @@ def logs_queue_get(error_id: int) -> dict:
         with _ragvec_state_conn() as conn:
             row = conn.execute(
                 "SELECT id, service, file_ref, error_signature, error_text, "
-                "context_lines, error_ts, first_seen_at, last_seen_at, "
+                "level, context_lines, error_ts, first_seen_at, last_seen_at, "
                 "occurrence_count, status, attempts, started_at, completed_at, "
                 "duration_s, devin_exit_code, devin_output, "
                 "resolution_status, resolution_reason "
@@ -20691,13 +21378,14 @@ def logs_queue_get(error_id: int) -> dict:
     return {
         "id": row[0], "service": row[1], "file_ref": row[2],
         "error_signature": row[3], "error_text": row[4],
-        "context_lines": json.loads(row[5]) if row[5] else [],
-        "error_ts": row[6], "first_seen_at": row[7], "last_seen_at": row[8],
-        "occurrence_count": row[9], "status": row[10], "attempts": row[11],
-        "started_at": row[12], "completed_at": row[13],
-        "duration_s": row[14], "devin_exit_code": row[15],
-        "devin_output": row[16], "resolution_status": row[17],
-        "resolution_reason": row[18],
+        "level": _normalize_error_queue_level(row[5]),
+        "context_lines": json.loads(row[6]) if row[6] else [],
+        "error_ts": row[7], "first_seen_at": row[8], "last_seen_at": row[9],
+        "occurrence_count": row[10], "status": row[11], "attempts": row[12],
+        "started_at": row[13], "completed_at": row[14],
+        "duration_s": row[15], "devin_exit_code": row[16],
+        "devin_output": row[17], "resolution_status": row[18],
+        "resolution_reason": row[19],
     }
 
 
@@ -20709,7 +21397,7 @@ def logs_queue_process_next() -> dict:
     """Procesar manualmente el siguiente pending. Útil para testing y
     para cuando el worker está desactivado.
 
-    Auth: admin token (audit 2026-05-10 U15) — invoca Devin → ejecuta
+    Auth: admin token (audit 2026-05-10 U15) — invoca Codex → ejecuta
     código que reescribe archivos del repo. Sin auth = RCE remoto si LAN.
     """
     can, reason = _worker_can_invoke_devin()
@@ -20731,24 +21419,19 @@ def logs_queue_scan_now() -> dict:
     un daemon empezó a fallar y querés ver los errores en la queue ya.
 
     Auth: admin token (audit 2026-05-10 U15) — enqueue puede disparar
-    auto-fix worker downstream que invoca Devin. Misma threat surface
+    auto-fix worker downstream que invoca Codex. Misma threat surface
     que `/api/logs/queue/process-next`.
     """
     try:
-        payload = _build_global_errors_payload(3600, "error")
-        enqueued = 0
-        for ln in payload.get("lines", []):
-            _, was_new = _enqueue_error(
-                service=ln.get("service") or "unknown",
-                file_ref=ln.get("ref") or "",
-                error_text=ln.get("text") or "",
-                context_lines=[], error_ts=ln.get("ts"),
-            )
-            if was_new:
-                enqueued += 1
+        summary = _scan_new_log_errors()
         return {
-            "status": "ok", "scanned": len(payload.get("lines", [])),
-            "new_entries": enqueued,
+            "status": "ok",
+            "mode": "incremental",
+            "scanned": summary["seen_errors"] + summary["seen_warns"],
+            "seen_errors": summary["seen_errors"],
+            "seen_warns": summary["seen_warns"],
+            "new_entries": summary["new_entries"],
+            "files_scanned": summary["files_scanned"],
         }
     except Exception as e:
         raise HTTPException(status_code=500,
@@ -21271,7 +21954,7 @@ def _dashboard_aggregate(
     import statistics
     from collections import defaultdict
 
-    data_dir = Path.home() / ".local/share/obsidian-rag"
+    data_dir = _obsidian_rag_state_dir()
     cutoff = datetime.now() - timedelta(days=days)
 
     def _ts(e: dict) -> datetime | None:
@@ -21291,7 +21974,15 @@ def _dashboard_aggregate(
         return round(s[min(idx, len(s) - 1)], 3)
 
     # ── Queries ──────────────────────────────────────────────────────
-    scores = [float(e["top_score"]) for e in queries if isinstance(e.get("top_score"), (int, float))]
+    def _is_user_query_event(e: dict) -> bool:
+        return is_user_query(e.get("cmd"), e.get("q"))
+
+    user_query_events = [e for e in queries if _is_user_query_event(e)]
+    user_scored_events = [
+        e for e in user_query_events
+        if isinstance(e.get("top_score"), (int, float))
+    ]
+    scores = [float(e["top_score"]) for e in user_scored_events]
     t_retrieves = [float(e["t_retrieve"]) for e in queries if isinstance(e.get("t_retrieve"), (int, float))]
     t_gens = [float(e["t_gen"]) for e in queries if isinstance(e.get("t_gen"), (int, float)) and e["t_gen"] > 0]
     t_totals = [
@@ -21425,23 +22116,32 @@ def _dashboard_aggregate(
         }
 
     # ── Health metrics ───────────────────────────────────────────────
-    # Only count queries that actually go through retrieval (have scores)
-    retrieval_queries = [e for e in queries if isinstance(e.get("top_score"), (int, float)) and e.get("cmd") in ("query", "chat", "web", None)]
+    # Only count user-facing queries that actually went through retrieval
+    # (have scores). Keep this tied to rag.is_user_query() so new job cmds
+    # cannot silently pollute the retrieval health panel.
+    retrieval_queries = user_scored_events
     n_retrieval = len(retrieval_queries)
 
-    gated = sum(1 for e in queries if e.get("gated_low_confidence"))
+    gated = sum(1 for e in retrieval_queries if e.get("gated_low_confidence"))
     gate_rate = round(gated / n_retrieval * 100, 1) if n_retrieval else 0
 
-    bad_citation_queries = sum(1 for e in queries if e.get("bad_citations"))
+    bad_citation_queries = sum(1 for e in retrieval_queries if e.get("bad_citations"))
     bad_citation_rate = round(bad_citation_queries / n_retrieval * 100, 1) if n_retrieval else 0
-    bad_citation_total = sum(len(e.get("bad_citations", [])) for e in queries)
+    bad_citation_total = sum(len(e.get("bad_citations", [])) for e in retrieval_queries)
 
     # Score quality bands
-    retrieval_scores = [float(e["top_score"]) for e in retrieval_queries if isinstance(e.get("top_score"), (int, float))]
+    retrieval_scores = scores
     n_scored = len(retrieval_scores)
     score_high = sum(1 for s in retrieval_scores if s >= 0.3)     # strong match
     score_mid = sum(1 for s in retrieval_scores if 0.05 <= s < 0.3)  # acceptable
     score_low = sum(1 for s in retrieval_scores if s < 0.05)      # weak/miss
+    score_low_pct = round(score_low / n_scored * 100, 1) if n_scored else 0
+    score_low_issue_min_count = 10
+    score_low_issue_pct = 40.0
+    score_low_issue = (
+        score_low >= score_low_issue_min_count
+        and score_low_pct > score_low_issue_pct
+    )
 
     # Score trend per day (daily mean)
     score_per_day: dict[str, list[float]] = defaultdict(list)
@@ -21456,8 +22156,16 @@ def _dashboard_aggregate(
     }
 
     # Latency ratio (retrieve vs generate dominance)
-    avg_ret = statistics.mean(t_retrieves) if t_retrieves else 0
-    avg_gen = statistics.mean(t_gens) if t_gens else 0
+    retrieval_t_retrieves = [
+        float(e["t_retrieve"]) for e in retrieval_queries
+        if isinstance(e.get("t_retrieve"), (int, float))
+    ]
+    retrieval_t_gens = [
+        float(e["t_gen"]) for e in retrieval_queries
+        if isinstance(e.get("t_gen"), (int, float)) and e["t_gen"] > 0
+    ]
+    avg_ret = statistics.mean(retrieval_t_retrieves) if retrieval_t_retrieves else 0
+    avg_gen = statistics.mean(retrieval_t_gens) if retrieval_t_gens else 0
     retrieve_pct = round(avg_ret / (avg_ret + avg_gen) * 100, 1) if (avg_ret + avg_gen) > 0 else 0
 
     # Answer length trend (is the LLM being verbose or terse?)
@@ -21476,7 +22184,10 @@ def _dashboard_aggregate(
         "score_low": score_low,
         "score_high_pct": round(score_high / n_scored * 100, 1) if n_scored else 0,
         "score_mid_pct": round(score_mid / n_scored * 100, 1) if n_scored else 0,
-        "score_low_pct": round(score_low / n_scored * 100, 1) if n_scored else 0,
+        "score_low_pct": score_low_pct,
+        "score_low_issue": score_low_issue,
+        "score_low_issue_min_count": score_low_issue_min_count,
+        "score_low_issue_pct": score_low_issue_pct,
         "score_trend": score_trend,
         "retrieve_pct": retrieve_pct,
         "generate_pct": round(100 - retrieve_pct, 1),
@@ -22356,7 +23067,7 @@ async def learning_stream(request: Request = None) -> StreamingResponse:  # type
 # trends are what the chart is for.
 from collections import deque
 
-_MEMORY_STATE_PATH = Path.home() / ".local/share/obsidian-rag/rag_memory.jsonl"
+_MEMORY_STATE_PATH = _obsidian_rag_state_dir() / "rag_memory.jsonl"
 _MEMORY_BUFFER_MAX = 1440  # 24h @ 60s
 _MEMORY_SAMPLE_INTERVAL = 60.0
 _MEMORY_BUFFER: deque = deque(maxlen=_MEMORY_BUFFER_MAX)
@@ -22779,7 +23490,7 @@ async def system_memory_stream(request: Request = None) -> StreamingResponse:  #
 # Returned percentages are in "% of one core" (can exceed 100 on
 # multi-threaded processes — ollama runners routinely peg several
 # cores during generation).
-_CPU_STATE_PATH = Path.home() / ".local/share/obsidian-rag/rag_cpu.jsonl"
+_CPU_STATE_PATH = _obsidian_rag_state_dir() / "rag_cpu.jsonl"
 _CPU_BUFFER_MAX = 1440  # 24h @ 60s
 _CPU_SAMPLE_INTERVAL = 60.0
 _CPU_LIVE_INTERVAL = 2.0
@@ -23294,7 +24005,7 @@ def fine_tunning_queue(limit: int = 20, days: int = 30) -> dict:
             _silent_log,
         )
         days = max(1, min(int(days), 90))
-        max(1, min(int(limit), 50))
+        limit = max(1, min(int(limit), 50))
         with _ragvec_state_conn() as conn:
             # NOTE: streams `brief`, `anticipate`, `proactive_push` removidos el
             # 2026-05-01 evening (post user feedback): los pushes son difíciles
@@ -23309,8 +24020,13 @@ def fine_tunning_queue(limit: int = 20, days: int = 30) -> dict:
             # preguntó). Filtros relajados 2026-05-12:
             #   - top_score IS NULL OR >= 0.15 (antes >= 0.5 excluía 99% — los NULL
             #     son turnos legítimos sin score, e.g. fast-path tool-calls).
-            #   - answer_len > 0 (LLM respondió, mantener).
+            #   - Respuesta detectada por answer_len, cache, response_hash o
+            #     conversación escrita. Live DB 2026-05-17 tenía 0 rows con
+            #     answer_len pese a tener conversaciones válidas: usar sólo
+            #     esa columna dejaba el panel casi vacío.
             #   - DROP length(q) > 4 (queries cortas tipo "agenda?" son válidas).
+            #   - DROP top_score >= 0.15: los lowscore/borderline son justamente
+            #     los más informativos para active learning.
             #   - Ventana configurable via ?days=N (default 30, antes 7).
             # Active learning sort: ORDER BY priorizar borderline (top_score 0.15-0.5
             # tiene mayor valor de información que casos confidence-collapse).
@@ -23320,13 +24036,18 @@ def fine_tunning_queue(limit: int = 20, days: int = 30) -> dict:
             try:
                 cur = conn.execute(f"""
                     SELECT q.id, q.q, q.top_score, q.ts, q.paths_json, q.session,
-                           rc.response,
+                           (
+                             SELECT rc.response
+                             FROM rag_response_cache rc
+                             WHERE rc.question = q.q
+                               AND ABS(julianday(rc.ts) - julianday(q.ts)) < 1.0
+                               AND length(rc.response) > 0
+                             ORDER BY rc.ts DESC
+                             LIMIT 1
+                           ) AS response,
                            ci.relative_path,
                            q.answer_len
                     FROM rag_queries q
-                    LEFT JOIN rag_response_cache rc
-                      ON rc.question = q.q
-                      AND ABS(julianday(rc.ts) - julianday(q.ts)) < 1.0
                     LEFT JOIN rag_conversations_index ci
                       ON ci.session_id = q.session
                     LEFT JOIN rag_ft_panel_ratings ftr
@@ -23336,14 +24057,23 @@ def fine_tunning_queue(limit: int = 20, days: int = 30) -> dict:
                       ON fts.stream = 'retrieval_answer'
                       AND fts.item_id = CAST(q.id AS TEXT)
                     WHERE q.ts >= datetime('now', '-{days} days')
-                      AND (q.top_score IS NULL OR q.top_score >= 0.15)
-                      AND q.answer_len > 0
-                      AND q.cmd IS NOT NULL
-                      AND q.cmd NOT LIKE 'listener.%'
-                      AND q.cmd NOT LIKE 'api_query.%'
-                      AND q.cmd NOT IN (
-                          'contradictions', 'followup', 'read', 'pendientes',
-                          'web.chat.low_conf_bypass', 'web.chat.metachat'
+                      AND (q.top_score IS NULL OR q.top_score >= 0.0)
+                      AND q.cmd IN (
+                          'web',
+                          'web.chat',
+                          'web.chat.cached_semantic'
+                      )
+                      AND (
+                          COALESCE(q.answer_len, 0) > 0
+                          OR ci.relative_path IS NOT NULL
+                          OR json_extract(q.extra_json, '$.response_hash') IS NOT NULL
+                          OR json_extract(q.extra_json, '$.answered') = 1
+                          OR EXISTS (
+                              SELECT 1 FROM rag_response_cache rc
+                              WHERE rc.question = q.q
+                                AND ABS(julianday(rc.ts) - julianday(q.ts)) < 1.0
+                                AND length(rc.response) > 0
+                          )
                       )
                       AND ftr.id IS NULL
                       AND (fts.snoozed_until_ts IS NULL
@@ -23356,17 +24086,24 @@ def fine_tunning_queue(limit: int = 20, days: int = 30) -> dict:
                     ORDER BY
                       CASE
                         WHEN q.top_score IS NOT NULL
-                          AND q.top_score BETWEEN 0.15 AND 0.5
+                          AND q.top_score BETWEEN 0.01 AND 0.5
                           THEN 0
+                        WHEN q.top_score IS NULL
+                          THEN 1
                         ELSE 1
                       END,
                       q.ts DESC
-                    LIMIT 15
+                    LIMIT {limit}
                 """)
                 import json as _json_ra
+                seen_retrieval_questions: set[str] = set()
                 for row in cur.fetchall():
                     (qid, qtext, ts_score, ts_q, paths_json, sess,
                      response_text, conv_relpath, answer_len) = row
+                    norm_q = " ".join((qtext or "").split()).lower()
+                    if norm_q in seen_retrieval_questions:
+                        continue
+                    seen_retrieval_questions.add(norm_q)
                     try:
                         paths = _json_ra.loads(paths_json) if paths_json else []
                     except Exception:
@@ -23727,20 +24464,38 @@ def fine_tunning_stats() -> dict:
             # Pending counts por stream (ballpark, mismos filtros que /queue)
             try:
                 cnt = conn.execute("""
-                    SELECT COUNT(*) FROM rag_queries q
+                    SELECT COUNT(DISTINCT q.q)
+                    FROM rag_queries q
+                    LEFT JOIN rag_conversations_index ci
+                      ON ci.session_id = q.session
+                    LEFT JOIN rag_ft_active_queue_state fts
+                      ON fts.stream='retrieval_answer'
+                      AND fts.item_id = CAST(q.id AS TEXT)
                     WHERE q.ts >= datetime('now','-30 days')
-                      AND (q.top_score IS NULL OR q.top_score >= 0.15)
-                      AND q.answer_len > 0
-                      AND q.cmd IS NOT NULL
-                      AND q.cmd NOT LIKE 'listener.%'
-                      AND q.cmd NOT LIKE 'api_query.%'
-                      AND q.cmd NOT IN (
-                          'contradictions','followup','read','pendientes',
-                          'web.chat.low_conf_bypass','web.chat.metachat')
+                      AND (q.top_score IS NULL OR q.top_score >= 0.0)
+                      AND q.cmd IN ('web','web.chat','web.chat.cached_semantic')
+                      AND (
+                          COALESCE(q.answer_len, 0) > 0
+                          OR ci.relative_path IS NOT NULL
+                          OR json_extract(q.extra_json, '$.response_hash') IS NOT NULL
+                          OR json_extract(q.extra_json, '$.answered') = 1
+                          OR EXISTS (
+                              SELECT 1 FROM rag_response_cache rc
+                              WHERE rc.question = q.q
+                                AND ABS(julianday(rc.ts) - julianday(q.ts)) < 1.0
+                                AND length(rc.response) > 0
+                          )
+                      )
+                      AND (fts.snoozed_until_ts IS NULL
+                           OR fts.snoozed_until_ts < datetime('now'))
                       AND NOT EXISTS (
                         SELECT 1 FROM rag_ft_panel_ratings ftr
                         WHERE ftr.stream='retrieval_answer'
                           AND ftr.item_id = CAST(q.id AS TEXT))
+                      AND NOT EXISTS (
+                        SELECT 1 FROM rag_feedback f
+                        WHERE f.q = q.q
+                          AND ABS(julianday(f.ts) - julianday(q.ts)) < 0.5)
                 """).fetchone()
                 out["pending_by_stream"]["retrieval_answer"] = int(cnt[0]) if cnt else 0
             except sqlite3.Error:

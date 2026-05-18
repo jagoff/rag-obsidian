@@ -4,7 +4,7 @@ Cubre:
 - ``assemble_mirror()`` paralelo con 8 sources, cache hit/miss,
   cache_hit flag, source failure isolation, timeout per-source.
 - ``generate_insights()`` JSON parsing (strict + markdown fence),
-  truncation a 5×500 chars, error path cuando LLM falla.
+  truncation a 5×800 chars, error path cuando LLM falla.
 - ``cache_invalidate()`` clear total.
 - ``_source_screen_time()`` DB inexistente, DB locked (timeout),
   conn leak (conn.close() en excepción).
@@ -27,6 +27,9 @@ from rag.mirror import (
     _source_active_projects,
     _source_dormant_notes,
     _source_mood_today,
+    _source_pendientes,
+    _source_spotify_top,
+    _source_top_entities,
     _source_whatsapp,
     _summarize_for_llm,
     _source_screen_time,
@@ -42,6 +45,18 @@ def _reset_cache():
     cache_invalidate()
     yield
     cache_invalidate()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_blacklist(monkeypatch, tmp_path):
+    import rag.exclusions as _exclusions
+
+    monkeypatch.setattr(_exclusions, "_DB_PATH", tmp_path / "blacklist.db")
+    monkeypatch.setattr(_exclusions, "_CONFIG_PATH", tmp_path / "blacklist.json")
+    monkeypatch.setattr(_exclusions, "_LEGACY_IGNORED_PATH", tmp_path / "ignored_notes.json")
+    monkeypatch.setattr(_exclusions, "_CACHE", None)
+    monkeypatch.setattr(_exclusions, "_LEGACY_CACHE", None)
+    yield
 
 
 # ── assemble_mirror ────────────────────────────────────────────────────
@@ -80,6 +95,35 @@ def test_assemble_mirror_cache_hit_on_second_call(monkeypatch):
     assert r2["sources"] == r1["sources"]
     # No alias bug: r1 sigue siendo cache_hit=False.
     assert r1["cache_hit"] is False
+
+
+def test_assemble_mirror_cache_hit_refreshes_live_whatsapp(monkeypatch):
+    calls = {"stable": 0, "whatsapp": 0}
+
+    def stable(_date):
+        calls["stable"] += 1
+        return {"n": calls["stable"]}
+
+    def whatsapp(_date):
+        calls["whatsapp"] += 1
+        return {"counts": {"today_chats": calls["whatsapp"]}}
+
+    monkeypatch.setattr(
+        mirror_mod,
+        "_SOURCES",
+        {"stable": stable, "whatsapp": whatsapp},
+    )
+    monkeypatch.setattr(mirror_mod, "_is_live_mirror_date", lambda _date: True)
+
+    r1 = assemble_mirror(date="2026-05-09")
+    r2 = assemble_mirror(date="2026-05-09")
+
+    assert r1["cache_hit"] is False
+    assert r2["cache_hit"] is True
+    assert calls == {"stable": 1, "whatsapp": 2}
+    assert r2["sources"]["stable"]["n"] == 1
+    assert r2["sources"]["whatsapp"]["counts"]["today_chats"] == 2
+    assert r2["live_refreshed"] == ["whatsapp"]
 
 
 def test_assemble_mirror_use_cache_false_recomputes(monkeypatch):
@@ -236,6 +280,110 @@ def test_source_mood_today_uses_latest_score_when_today_has_no_signal(monkeypatc
     assert out["stale"] is True
 
 
+def test_source_top_entities_falls_back_to_whatsapp_when_entities_empty(monkeypatch):
+    import rag.integrations.whatsapp as _wa
+
+    monkeypatch.setattr(mirror_mod, "_open_telemetry_ro", lambda: None)
+    monkeypatch.setattr(
+        _wa,
+        "_fetch_whatsapp_today",
+        lambda max_chats=8: [
+            {"name": "Cloud Services", "count": 71, "last_snippet": "ceph"},
+            {"name": "Maria", "count": 32, "last_snippet": "No entendí"},
+        ],
+    )
+
+    out = _source_top_entities("2026-05-16")
+
+    assert out["fallback"] == "whatsapp_today"
+    assert out["items"][0]["name"] == "Maria"
+    assert out["items"][0]["kind"] == "chat"
+    assert out["items"][0]["meta"] == "32 msgs hoy"
+
+
+def test_source_pendientes_uses_fast_vault_scope(monkeypatch, tmp_path):
+    import rag as _rag
+
+    monkeypatch.setattr(
+        mirror_mod,
+        "_source_pendientes_light",
+        lambda date: {
+            "items": [{
+                "category": "reminder",
+                "title": "Contratar el pelotero",
+                "meta": "undated",
+                "when": "",
+            }],
+            "counts": {"reminders": 1},
+            "services_consulted": ["Reminders"],
+            "reason": "collector_failed_fallback",
+        },
+    )
+    monkeypatch.setattr(_rag, "resolve_vault_paths", lambda names: [("work", tmp_path)])
+    monkeypatch.setattr(
+        _rag,
+        "_pendientes_extract_loops_fast",
+        lambda vault, days, max_items: [
+            {
+                "source_note": "01-Projects/x.md",
+                "loop_text": "cerrar staging urls",
+                "age_days": 2,
+            },
+        ],
+    )
+
+    out = _source_pendientes("2026-05-16")
+
+    assert out["counts"]["reminders"] == 1
+    assert out["counts"]["loops"] == 1
+    assert out["vault_scope"] == ["work"]
+    assert out["reason"] == "mirror_fast_collector"
+    categories = [item["category"] for item in out["items"]]
+    assert "reminder" in categories
+    assert "vault loop" in categories
+
+
+def test_source_spotify_falls_back_to_vault_top_snapshot(monkeypatch, tmp_path):
+    import rag as _rag
+
+    vault = tmp_path / "vault"
+    spotify_dir = vault / "99-obsidian/99-AI/external-ingest/Spotify"
+    spotify_dir.mkdir(parents=True)
+    (spotify_dir / "_top.md").write_text(
+        """---
+source: spotify-top
+refreshed_date: 2026-05-12
+---
+
+# Spotify Top
+
+## Top tracks (2)
+
+- [Lo siento](https://open.spotify.com/track/1) — Beret
+- [Pensando en Ti](https://open.spotify.com/track/2) — Canserbero
+
+## Top artists (1)
+
+- [Canserbero](https://open.spotify.com/artist/1)
+""",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(mirror_mod, "_open_telemetry_ro", lambda: None)
+    monkeypatch.setattr(
+        _rag,
+        "resolve_vault_paths",
+        lambda names: [("home", vault)] if names == ["all"] else [("home", vault)],
+    )
+
+    out = _source_spotify_top("2026-05-16")
+
+    assert out["mode"] == "top_snapshot"
+    assert out["snapshot_date"] == "2026-05-12"
+    assert out["items"][0]["track"] == "Lo siento"
+    assert out["items"][0]["artist"] == "Beret"
+
+
 def test_source_whatsapp_collects_today_recent_and_unreplied(monkeypatch):
     import rag.integrations.whatsapp as _wa
 
@@ -267,6 +415,103 @@ def test_source_whatsapp_collects_today_recent_and_unreplied(monkeypatch):
     assert out["unreplied"][0]["name"] == "Joana"
 
 
+def test_source_whatsapp_applies_global_chat_blacklist(monkeypatch):
+    import rag.integrations.whatsapp as _wa
+
+    monkeypatch.setattr(
+        _wa,
+        "_fetch_whatsapp_today",
+        lambda max_chats=6: [
+            {"name": "Cloud Services", "count": 10, "last_snippet": "noise"},
+            {"name": "Maria", "count": 2, "last_snippet": "ok"},
+        ],
+    )
+    monkeypatch.setattr(
+        _wa,
+        "_fetch_whatsapp_unread",
+        lambda hours=24, max_chats=6: [
+            {"name": "Cloud Services", "count": 10, "last_snippet": "noise"},
+            {"name": "Maria", "count": 2, "last_snippet": "ok"},
+        ],
+    )
+    monkeypatch.setattr(
+        mirror_mod,
+        "_mirror_whatsapp_unreplied",
+        lambda hours=48, max_chats=5: [
+            {"name": "Cloud Services", "last_snippet": "noise", "hours_waiting": 1.0},
+            {"name": "Maria", "last_snippet": "ok", "hours_waiting": 0.1},
+        ],
+    )
+
+    out = _source_whatsapp("2026-05-17")
+
+    assert [x["name"] for x in out["today"]] == ["Maria"]
+    assert [x["name"] for x in out["recent_inbound"]] == ["Maria"]
+    assert [x["name"] for x in out["unreplied"]] == ["Maria"]
+    assert out["counts"] == {
+        "today_chats": 1,
+        "recent_inbound_chats": 1,
+        "unreplied_chats": 1,
+    }
+
+
+def test_source_whatsapp_enriches_recent_context_and_media(monkeypatch, tmp_path):
+    import rag as _rag
+    import rag.integrations.whatsapp as _wa
+
+    db = tmp_path / "messages.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE chats (jid TEXT PRIMARY KEY, name TEXT, last_message_time TIMESTAMP)")
+    con.execute(
+        "CREATE TABLE messages ("
+        "id TEXT, chat_jid TEXT, sender TEXT, content TEXT, timestamp TIMESTAMP, "
+        "is_from_me BOOLEAN, media_type TEXT, filename TEXT, url TEXT, media_key BLOB, "
+        "file_sha256 BLOB, file_enc_sha256 BLOB, file_length INTEGER, "
+        "quoted_message_id TEXT, quoted_text TEXT, PRIMARY KEY (id, chat_jid))"
+    )
+    con.execute("CREATE INDEX idx_messages_chat_ts ON messages(chat_jid, timestamp DESC)")
+    jid = "galaxia@lid"
+    con.execute("INSERT INTO chats VALUES (?, ?, datetime('now'))", (jid, "Galaxia Kids"))
+    rows = [
+        ("m1", jid, "them", "Buenísimo! Ahora voy a necesitar los datos del cumple", "-25 minutes", 0, "", ""),
+        ("m2", jid, "me", "Astor Ferrari 5 años De blade blade", "-20 minutes", 1, "", ""),
+        ("m3", jid, "them", "Me pasas alguna foto de referencia del dibujo?", "-15 minutes", 0, "", ""),
+        ("m4", jid, "me", "gracias!", "-10 minutes", 1, "", ""),
+        ("m5", jid, "them", "", "-5 minutes", 0, "image", "ref.jpg"),
+    ]
+    for row in rows:
+        con.execute(
+            "INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename) "
+            "VALUES (?, ?, ?, ?, datetime('now', ?), ?, ?, ?)",
+            row,
+        )
+    con.commit()
+    con.close()
+
+    monkeypatch.setattr(_rag, "WHATSAPP_DB_PATH", db)
+    monkeypatch.setattr(_rag, "WHATSAPP_BOT_JID", "bot@jid")
+    monkeypatch.setattr(
+        _wa,
+        "_fetch_whatsapp_today",
+        lambda max_chats=6: [{"jid": jid, "name": "Galaxia Kids", "count": 3, "last_snippet": ""}],
+    )
+    monkeypatch.setattr(
+        _wa,
+        "_fetch_whatsapp_unread",
+        lambda hours=24, max_chats=6: [{"jid": jid, "name": "Galaxia Kids", "count": 3, "last_snippet": ""}],
+    )
+
+    out = _source_whatsapp("2026-05-17")
+
+    chat = out["unreplied"][0]
+    assert chat["last_snippet"].startswith("[imagen]")
+    assert "invitaciones y referencia visual" in chat["topic_hint"]
+    assert "intercambio de medios" in chat["topic_hint"]
+    assert any(msg["snippet"].startswith("[imagen]") for msg in chat["recent_context"])
+    assert out["today"][0]["topic_hint"] == chat["topic_hint"]
+    assert out["today"][0]["recent_context"] == chat["recent_context"]
+
+
 def test_summarize_for_llm_includes_whatsapp_context():
     summary = _summarize_for_llm({
         "date": "2026-05-16",
@@ -286,6 +531,26 @@ def test_summarize_for_llm_includes_whatsapp_context():
     assert "me llamás?" in summary
 
 
+def test_summarize_for_llm_marks_pendientes_as_detected_not_mentions():
+    summary = _summarize_for_llm({
+        "date": "2026-05-16",
+        "sources": {
+            "pendientes": {
+                "items": [{
+                    "category": "vault loop",
+                    "title": "profundizar mis conocimientos en Kubernetes",
+                    "meta": "[work] 0d · Guía Práctica - Performance Review",
+                    "when": "",
+                }],
+            },
+        },
+    })
+
+    assert "Pendientes detectados" in summary
+    assert "no asumir que fueron mencionados hoy" in summary
+    assert "vault loop; [work] 0d" in summary
+
+
 # ── generate_insights ──────────────────────────────────────────────────
 
 
@@ -301,26 +566,38 @@ def _fake_chat_response(content: str):
 
 
 def test_generate_insights_parses_strict_json(monkeypatch):
-    payload = {"insights": ["uno", "dos", "tres"]}
+    payload = {
+        "insights": [
+            "Insight uno con suficiente detalle para pasar el filtro.",
+            "Insight dos con suficiente detalle para pasar el filtro.",
+            "Insight tres con suficiente detalle para pasar el filtro.",
+        ]
+    }
     _patch_backend(monkeypatch, json.dumps(payload))
 
     r = generate_insights({"date": "2026-05-09", "sources": {}})
 
-    assert r["insights"] == ["uno", "dos", "tres"]
+    assert r["insights"] == payload["insights"]
     assert "model" in r
 
 
 def test_generate_insights_strips_markdown_fence(monkeypatch):
-    fenced = "```json\n" + json.dumps({"insights": ["a", "b"]}) + "\n```"
+    raw = {
+        "insights": [
+            "Insight A con suficiente detalle para pasar el filtro.",
+            "Insight B con suficiente detalle para pasar el filtro.",
+        ]
+    }
+    fenced = "```json\n" + json.dumps(raw) + "\n```"
     _patch_backend(monkeypatch, fenced)
 
     r = generate_insights({"date": "2026-05-09", "sources": {}})
 
-    assert r["insights"] == ["a", "b"]
+    assert r["insights"] == raw["insights"]
 
 
 def test_generate_insights_caps_at_5_items(monkeypatch):
-    raw = {"insights": [f"i{i}" for i in range(20)]}
+    raw = {"insights": [f"Insight {i} con suficiente detalle para pasar el filtro." for i in range(20)]}
     _patch_backend(monkeypatch, json.dumps(raw))
 
     r = generate_insights({"date": "2026-05-09", "sources": {}})
@@ -334,7 +611,90 @@ def test_generate_insights_truncates_long_items(monkeypatch):
 
     r = generate_insights({"date": "2026-05-09", "sources": {}})
 
-    assert len(r["insights"][0]) == 500
+    assert len(r["insights"][0]) == 800
+
+
+def test_generate_insights_filters_unsupported_mention_claims(monkeypatch):
+    raw = {
+        "insights": [
+            "Hoy mencionaste 'profundizar mis conocimientos en Kubernetes' — sigue sin dedicar tiempo a ello.",
+            "Cloud Services tiene un mensaje esperando hace 1.3h. Conviene revisarlo antes de que se pierda entre otros chats.",
+        ],
+    }
+    _patch_backend(monkeypatch, json.dumps(raw))
+
+    r = generate_insights({
+        "date": "2026-05-09",
+        "sources": {
+            "whatsapp": {
+                "counts": {"today_chats": 1, "unreplied_chats": 1},
+                "unreplied": [
+                    {
+                        "name": "Cloud Services",
+                        "hours_waiting": 1.3,
+                        "last_snippet": "terminaron las tareas post update",
+                    }
+                ],
+            },
+        },
+    })
+
+    joined = "\n".join(r["insights"])
+    assert "Hoy mencionaste" not in joined
+    assert "sigue sin dedicar tiempo" not in joined
+    assert "Cloud Services tiene un mensaje esperando hace 1.3h" not in joined
+    assert not any("WZP está movido" in item for item in r["insights"])
+
+
+def test_generate_insights_uses_grounded_rules_when_enough_signal(monkeypatch):
+    class _BackendShouldNotRun:
+        def chat(self, **kw):
+            raise AssertionError("LLM should not run when grounded snapshot is enough")
+
+    monkeypatch.setattr("rag.llm_backend.get_backend", lambda: _BackendShouldNotRun())
+    r = generate_insights({
+        "date": "2026-05-09",
+        "sources": {
+            "whatsapp": {
+                "counts": {"today_chats": 2, "unreplied_chats": 1},
+                "unreplied": [
+                    {
+                        "name": "Maria",
+                        "hours_waiting": 0.4,
+                        "last_snippet": "terminaron las tareas post update",
+                    }
+                ],
+            },
+            "pendientes": {
+                "items": [{
+                    "category": "reminder",
+                    "title": "Enviar reporte",
+                    "meta": "today",
+                }],
+            },
+            "mood_today": {"score": 0.3, "n_signals": 2},
+            "active_projects": {
+                "items": [{
+                    "name": "finops-aws-report",
+                    "note_count_30d": 8,
+                    "days_ago": 0,
+                }],
+            },
+        },
+    })
+
+    assert r["model"] == "grounded-rules"
+    assert len(r["insights"]) >= 3
+    assert any("WZP está movido" in item for item in r["insights"])
+    assert any("Enviar reporte" in item for item in r["insights"])
+
+
+def test_insights_prompt_requires_grounding():
+    prompt = mirror_mod._INSIGHTS_PROMPT
+
+    assert "Usá SOLO datos presentes en el snapshot" in prompt
+    assert "vault loop" in prompt
+    assert "llamar al dentista" not in prompt
 
 
 def test_generate_insights_handles_non_json_response(monkeypatch):

@@ -114,7 +114,7 @@ __all__ = [
 # 0.93 is sweet spot — false positives stay rare (unrelated queries
 # typically cosine ~0.80). Override `RAG_CACHE_COSINE`.
 
-_SEMANTIC_CACHE_COSINE = float(os.environ.get("RAG_CACHE_COSINE", "0.90"))
+_SEMANTIC_CACHE_COSINE = float(os.environ.get("RAG_CACHE_COSINE", "0.93"))
 _SEMANTIC_CACHE_DEFAULT_TTL = int(os.environ.get("RAG_CACHE_TTL_DEFAULT", "86400"))  # 24h
 _SEMANTIC_CACHE_RECENT_TTL = int(os.environ.get("RAG_CACHE_TTL_RECENT", "600"))  # 10 min
 _SEMANTIC_CACHE_MAX_ROWS = int(os.environ.get("RAG_CACHE_MAX_ROWS", "2000"))

@@ -68,6 +68,11 @@ def _supervisor_plist(rag_bin: str) -> str:
         "RAG_MEMORY_PRESSURE_THRESHOLD": "75",
         "RAG_MEMORY_PRESSURE_SWAP_GB": "4.0",
         "RAG_MEMORY_PRESSURE_INTERVAL": "30",
+        "RAG_ANTICIPATE_PRESSURE_GUARD": "1",
+        "RAG_ANTICIPATE_MAX_MEMORY_PCT": "70",
+        "RAG_ANTICIPATE_MAX_SWAP_GB": "4.0",
+        "RAG_ANTICIPATE_MAX_RSS_GB": "10",
+        "RAG_ANTICIPATE_TIMEOUT_S": "180",
         "RAG_STATE_SQL": "1",
         "HF_HUB_OFFLINE": "1",
         "TRANSFORMERS_OFFLINE": "1",
@@ -247,7 +252,6 @@ def _web_plist(rag_bin: str) -> str:
             "RAG_STATE_SQL": "1",
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
-            "FASTEMBED_CACHE_PATH": f"{Path.home()}/.cache/fastembed",
             "RAG_MEMORY_PRESSURE_INTERVAL": "20",
             # 80 → 75 (memory game-changer 2026-05-10): match supervisor+watch
             # threshold post-fix 1eae161, evicción proactiva 5pp antes del jetsam.

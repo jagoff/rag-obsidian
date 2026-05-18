@@ -602,6 +602,7 @@ RAG_START_SAFE=0 rag start --full           # opt-out de guardas de start (no re
 ```
 
 Safe mode de `start` fuerza `RAG_INDEX_SAFE=1` para el catch-up aunque tu shell tenga un opt-out viejo, usa `--no-contradict` y apaga context/synthetic/entities durante el bootstrap, chequea memory pressure antes de indexar y antes de levantar servicios, y escalona los bootstraps.
+El guard de `start` no bloquea por swap viejo de macOS por default; si querés un corte explícito por swap, seteá `RAG_START_ABORT_SWAP_GB`.
 
 ### `rag setup`
 Instala o desinstala los servicios launchd que mantienen el sistema vivo.

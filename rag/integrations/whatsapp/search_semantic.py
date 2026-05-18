@@ -40,6 +40,8 @@ from typing import Any
 
 import sqlite_vec  # type: ignore[import-not-found]
 
+from ._constants import whatsapp_chat_name_excluded
+
 logger = logging.getLogger("rag.wa.search_semantic")
 
 _INDEX_BATCH = 64
@@ -261,6 +263,7 @@ def search(
                 "distance": float(r["distance"] or 0.0),
             }
             for r in rows
+            if not whatsapp_chat_name_excluded(r["chat_name"] or "")
         ]
     except sqlite3.Error as e:
         logger.warning("search_semantic failed: %s", e)

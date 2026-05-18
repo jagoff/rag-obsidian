@@ -7,6 +7,8 @@ it exercises MLXBackend.__init__ which does `import mlx_lm` eagerly.
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -212,3 +214,22 @@ def test_reset_backend_clears_singleton(monkeypatch):
     assert isinstance(b2, MLXBackend)
     # They're different objects because reset_backend cleared the singleton
     assert b1 is not b2
+
+
+def test_mlx_forward_lock_survives_module_reload():
+    """Reloads must not split the process-wide Metal critical section."""
+    code = (
+        "import importlib; "
+        "import rag.llm_backend as lb; "
+        "lock = lb._MLX_FORWARD_LOCK; "
+        "reloaded = importlib.reload(lb); "
+        "raise SystemExit(0 if reloaded._MLX_FORWARD_LOCK is lock else 1)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).resolve().parent.parent,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

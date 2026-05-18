@@ -133,6 +133,7 @@ _ANTICIPATE_COMMITMENT_MIN_AGE_DAYS = int(
 _ANTICIPATE_SCREEN_TIME_MIN_SCORE = float(
     os.environ.get("RAG_ANTICIPATE_SCREEN_TIME_MIN_SCORE", "0.50")
 )
+_TRUTHY = {"1", "true", "yes", "on"}
 
 
 @dataclass(frozen=True)
@@ -151,6 +152,75 @@ class AnticipatoryCandidate:
     target_name: str | None = None      # display name (para logs human-friendly)
     draft: str | None = None            # texto listo para mandar al target
     draft_meta: dict | None = None      # {confidence, style_snapshot_hash, reason}
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _anticipate_swap_pressure_active(
+    memory_pct: float | None,
+    swap_gb: float | None,
+    max_swap_gb: float,
+) -> bool:
+    """macOS swap can stay allocated after pressure clears."""
+    if swap_gb is None or max_swap_gb <= 0 or swap_gb < max_swap_gb:
+        return False
+    if memory_pct is None:
+        return True
+    min_memory_pct = _env_float("RAG_ANTICIPATE_SWAP_MEMORY_FLOOR_PCT", 70.0)
+    return memory_pct >= min_memory_pct
+
+
+def _anticipate_pressure_snapshot() -> tuple[float | None, float | None]:
+    try:
+        from rag._memory_pressure_watchdog import (  # noqa: PLC0415
+            _system_memory_used_pct,
+            _system_swap_used_gb,
+        )
+        return _system_memory_used_pct(), _system_swap_used_gb()
+    except Exception:
+        return None, None
+
+
+def _anticipate_pressure_guard_skip() -> dict | None:
+    """Optional guard for launchd/supervisor invocations.
+
+    Manual/test runs keep the historical behavior unless
+    `RAG_ANTICIPATE_PRESSURE_GUARD=1` is set by the caller.
+    """
+    guard = os.environ.get("RAG_ANTICIPATE_PRESSURE_GUARD", "")
+    if guard.strip().lower() not in _TRUTHY:
+        return None
+    memory_pct, swap_gb = _anticipate_pressure_snapshot()
+    max_memory_pct = _env_float("RAG_ANTICIPATE_MAX_MEMORY_PCT", 70.0)
+    max_swap_gb = _env_float("RAG_ANTICIPATE_MAX_SWAP_GB", 1.5)
+    if memory_pct is not None and memory_pct >= max_memory_pct:
+        return {
+            "selected": None,
+            "sent": False,
+            "all": [],
+            "skip_reason": "memory_pressure",
+            "memory_pct": memory_pct,
+            "max_memory_pct": max_memory_pct,
+        }
+    if _anticipate_swap_pressure_active(memory_pct, swap_gb, max_swap_gb):
+        return {
+            "selected": None,
+            "sent": False,
+            "all": [],
+            "skip_reason": "swap_pressure",
+            "swap_gb": swap_gb,
+            "max_swap_gb": max_swap_gb,
+            "memory_pct": memory_pct,
+            "min_memory_pct_for_swap": _env_float(
+                "RAG_ANTICIPATE_SWAP_MEMORY_FLOOR_PCT", 70.0
+            ),
+        }
+    return None
 
 
 def _anticipate_dedup_seen(dedup_key: str,
@@ -577,7 +647,7 @@ def _anticipate_signal_commitment(now: datetime) -> list["AnticipatoryCandidate"
     try:
         loops = find_followup_loops(
             col, vault, days=60, stale_days=_ANTICIPATE_COMMITMENT_MIN_AGE_DAYS,
-            now=now,
+            now=now, resolve=False,
         )
     except Exception as exc:
         _silent_log("anticipate_commitment_scan", exc)
@@ -781,6 +851,10 @@ def anticipate_run_impl(
     from rag import _silent_log
     if os.environ.get("RAG_ANTICIPATE_DISABLED", "").strip() in ("1", "true", "yes"):
         return {"selected": None, "sent": False, "all": [], "disabled": True}
+    if not force:
+        guarded_skip = _anticipate_pressure_guard_skip()
+        if guarded_skip is not None:
+            return guarded_skip
     # Bug Hunt 2026-05-08 M Brief 2: lockfile PID-based para evitar
     # ejecuciones concurrentes. El daemon `com.fer.obsidian-rag-anticipate`
     # corre cada 10min via launchd. Si una corrida tarda >10min (calendar
@@ -790,13 +864,14 @@ def anticipate_run_impl(
     # un archivo bajo `~/.local/share/obsidian-rag/anticipate.lock`
     # serializa los runs sin bloquear (LOCK_NB → skip si ocupado).
     import fcntl as _fcntl
-    from pathlib import Path as _Path
-    _lock_dir = _Path.home() / ".local/share/obsidian-rag"
+    from rag_anticipate import lockfile as _anticipate_lockfile
+
+    _lock_path = _anticipate_lockfile.resolve_lock_path()
+    _lock_dir = _lock_path.parent
     try:
         _lock_dir.mkdir(parents=True, exist_ok=True)
     except OSError:
         pass
-    _lock_path = _lock_dir / "anticipate.lock"
     _lock_fh = None
     if not force:
         # Sólo serializar runs scheduled. `--force` (manual) bypassa
@@ -828,6 +903,12 @@ def anticipate_run_impl(
         nonlocal _lock_fh
         if _lock_fh is None:
             return
+        try:
+            _lock_fh.seek(0)
+            _lock_fh.truncate()
+            _lock_fh.flush()
+        except Exception:
+            pass
         try:
             _fcntl.flock(_lock_fh.fileno(), _fcntl.LOCK_UN)
         except Exception:
@@ -1277,7 +1358,10 @@ def anticipate_diagnose_cmd(days: int):
     try:
         from rag import AMBIENT_CONFIG_PATH as _amb_path  # noqa: PLC0415
     except Exception:
-        _amb_path = Path.home() / ".local/share/obsidian-rag/ambient.json"
+        _amb_path = Path(
+            os.environ.get("OBSIDIAN_RAG_STATE_DIR")
+            or str(Path.home() / ".local/share/obsidian-rag")
+        ).expanduser() / "ambient.json"
     if _amb_path.is_file():
         try:
             cfg = json.loads(_amb_path.read_text(encoding="utf-8"))

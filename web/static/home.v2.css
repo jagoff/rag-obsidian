@@ -247,6 +247,82 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
   z-index: 2;
 }
 
+/* ── Quick free-text entry ───────────────────────────────── */
+
+.quick-chat {
+  margin-bottom: var(--space-4);
+}
+
+.quick-chat-form {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.quick-chat-label {
+  color: var(--text-dim);
+  font-size: var(--fs-mini);
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+.quick-chat-shell {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 52px;
+  align-items: stretch;
+  min-height: 54px;
+  background: var(--bg-elev-1);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  box-shadow: var(--shadow-1);
+  transition: border-color var(--dur-fast) var(--ease-out),
+              box-shadow var(--dur-fast) var(--ease-out);
+}
+
+.quick-chat-shell:focus-within {
+  border-color: var(--border-focus);
+  box-shadow: var(--shadow-focus);
+}
+
+.quick-chat-input {
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: var(--fs-md);
+  padding: 0 var(--space-4);
+}
+
+.quick-chat-input::placeholder {
+  color: var(--text-faint);
+  opacity: 1;
+}
+
+.quick-chat-submit {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 52px;
+  min-width: 52px;
+  border: 0;
+  border-left: 1px solid var(--border);
+  border-radius: 0;
+  color: var(--cyan);
+  font-size: var(--fs-lg);
+}
+
+.quick-chat-submit:hover {
+  background: var(--bg-elev-3);
+  color: var(--phosphor);
+}
+
+.quick-chat-submit:focus-visible {
+  border-color: var(--border-focus);
+}
+
 /* ── Command bar (KPIs en fila — top de la página) ─────────
    auto-fit en vez de repeat(N, 1fr) para que cuando algunos KPIs
    tengan valor 0 (y JS los oculta con `hidden`), los visibles se
@@ -256,7 +332,7 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
   display: grid;
   grid-template-columns: repeat(6, 1fr);
   grid-auto-rows: 110px;
-  grid-auto-flow: dense;
+  grid-auto-flow: row;
   gap: var(--space-3);
   margin-bottom: var(--space-5);
 }
@@ -275,13 +351,27 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
   min-height: 110px;
   transition: border-color var(--dur-base) var(--ease-out);
 }
-.cmdbar > .kpi[data-w="half"] { grid-column: span 2; }
-.cmdbar > .kpi[data-w="full"] { grid-column: span 6; }
-.cmdbar > .kpi[data-h="half"] { grid-row: span 1; }
-.cmdbar > .kpi[data-h="full"] { grid-row: span 2; }
-.cmdbar > .kpi[data-h="xl"] { grid-row: span 3; }
-.cmdbar > .kpi:not([data-w]) { grid-column: span 2; }
-.cmdbar > .kpi:not([data-h]) { grid-row: span 1; }
+.cmdbar > .kpi[data-w="half"],
+.cmdbar > .panel[data-w="half"],
+.cmdbar > .hero-section[data-w="half"] { grid-column: span 2; }
+.cmdbar > .kpi[data-w="full"],
+.cmdbar > .panel[data-w="full"],
+.cmdbar > .hero-section[data-w="full"] { grid-column: span 6; }
+.cmdbar > .kpi[data-h="half"],
+.cmdbar > .panel[data-h="half"],
+.cmdbar > .hero-section[data-h="half"] { grid-row: span 1; }
+.cmdbar > .kpi[data-h="full"],
+.cmdbar > .panel[data-h="full"],
+.cmdbar > .hero-section[data-h="full"] { grid-row: span 2; }
+.cmdbar > .kpi[data-h="xl"],
+.cmdbar > .panel[data-h="xl"],
+.cmdbar > .hero-section[data-h="xl"] { grid-row: span 3; }
+.cmdbar > .kpi:not([data-w]),
+.cmdbar > .panel:not([data-w]),
+.cmdbar > .hero-section:not([data-w]) { grid-column: span 2; }
+.cmdbar > .kpi:not([data-h]),
+.cmdbar > .panel:not([data-h]),
+.cmdbar > .hero-section:not([data-h]) { grid-row: span 1; }
 .kpi:hover { border-color: var(--border-strong); }
 .kpi.is-critical {
   border-color: rgba(255, 94, 94, 0.35);
@@ -371,7 +461,9 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
   min-height: 44px;
   justify-content: center;
 }
-.cmdbar > .kpi[data-collapsed="true"] {
+.cmdbar > .kpi[data-collapsed="true"],
+.cmdbar > .panel[data-collapsed="true"],
+.cmdbar > .hero-section[data-collapsed="true"] {
   grid-row: span 1 !important;
 }
 .kpi[data-collapsed="true"] .kpi-value,
@@ -437,27 +529,41 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
   grid-auto-rows: 280px;
   gap: var(--space-3);
   align-items: stretch;
-  /* `dense` permite que cajas chicas (half×half) rellenen huecos que
-     dejarían cajas grandes (half×full) si estuvieran solas. Sin esto,
-     el grid deja huecos en filas con un panel full y otro half. */
-  grid-auto-flow: dense;
+  /* Layout configurable: respetar estrictamente el DOM/order guardado.
+     `dense` rellena huecos pero puede mostrar una caja en una línea distinta
+     a su orden real, rompiendo la expectativa del drag/drop. */
+  grid-auto-flow: row;
 }
 
-.section-body > .panel[data-w="half"] { grid-column: span 2; }
-.section-body > .panel[data-w="full"] { grid-column: span 6; }
-.section-body > .panel[data-h="half"] { grid-row: span 1; }
-.section-body > .panel[data-h="full"] { grid-row: span 2; }
+.section-body > .panel[data-w="half"],
+.section-body > .kpi[data-w="half"],
+.section-body > .hero-section[data-w="half"] { grid-column: span 2; }
+.section-body > .panel[data-w="full"],
+.section-body > .kpi[data-w="full"],
+.section-body > .hero-section[data-w="full"] { grid-column: span 6; }
+.section-body > .panel[data-h="half"],
+.section-body > .kpi[data-h="half"],
+.section-body > .hero-section[data-h="half"] { grid-row: span 1; }
+.section-body > .panel[data-h="full"],
+.section-body > .kpi[data-h="full"],
+.section-body > .hero-section[data-h="full"] { grid-row: span 2; }
 /* xl = 3 filas (3a "medida de largo" pedida 2026-05-13). Solo opt-in
    manual via chip cycle half → full → xl → half. Autosizer no
    promotea a xl automáticamente — el threshold de content height
    topea en full. */
-.section-body > .panel[data-h="xl"] { grid-row: span 3; }
+.section-body > .panel[data-h="xl"],
+.section-body > .kpi[data-h="xl"],
+.section-body > .hero-section[data-h="xl"] { grid-row: span 3; }
 
 /* Default antes que el autosizer corra: half×full evita layout shift
    feo (los paneles arrancan medianos, luego promote/demote según
    content). */
-.section-body > .panel:not([data-w]) { grid-column: span 2; }
+.section-body > .panel:not([data-w]),
+.section-body > .kpi:not([data-w]),
+.section-body > .hero-section:not([data-w]) { grid-column: span 2; }
 .section-body > .panel:not([data-h]) { grid-row: span 2; }
+.section-body > .kpi:not([data-h]),
+.section-body > .hero-section:not([data-h]) { grid-row: span 1; }
 
 /* Mobile: 1-col, force span 1 — cada panel ocupa todo el ancho y
    altura natural. */
@@ -470,9 +576,17 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
     grid-auto-rows: auto;
   }
   .section-body > .panel[data-w],
-  .section-body > .panel:not([data-w]) { grid-column: span 1; }
+  .section-body > .panel:not([data-w]),
+  .section-body > .kpi[data-w],
+  .section-body > .kpi:not([data-w]),
+  .section-body > .hero-section[data-w],
+  .section-body > .hero-section:not([data-w]) { grid-column: span 1; }
   .section-body > .panel[data-h],
-  .section-body > .panel:not([data-h]) { grid-row: auto; }
+  .section-body > .panel:not([data-h]),
+  .section-body > .kpi[data-h],
+  .section-body > .kpi:not([data-h]),
+  .section-body > .hero-section[data-h],
+  .section-body > .hero-section:not([data-h]) { grid-row: auto; }
 }
 
 /* ── Panel (componente base) ─────────────────────────────── */
@@ -1081,16 +1195,18 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 .today-hero-body {
   /* Grid 6-col + auto-rows fijos (mismo sistema que las .section-body
      post-2026-05-13 — 3 paneles por fila cuando half), para que cada
-     hero-section sea resizable independiente snap a half/full ancho y
-     alto. grid-auto-flow: dense rellena huecos. */
+     hero-section sea resizable independiente snap a half/full ancho y alto.
+     El flujo row mantiene el orden manual visible y persistible. */
   display: grid;
   grid-template-columns: repeat(6, 1fr);
   grid-auto-rows: 220px;
   gap: var(--space-2);
   align-items: stretch;
-  grid-auto-flow: dense;
+  grid-auto-flow: row;
 }
-.today-hero-body > .hero-section {
+.today-hero-body > .hero-section,
+.cmdbar > .hero-section,
+.section-body > .hero-section {
   padding: var(--space-3) var(--space-4);
   border: 1px solid var(--border);
   border-radius: 4px;
@@ -1106,24 +1222,46 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 }
 /* Data-w/data-h: misma lógica que panels. Hero arranca con narrative
    en full ancho + full alto (LO QUE PASÓ), demás en half/half. */
-.today-hero-body > .hero-section[data-w="half"] { grid-column: span 2; }
-.today-hero-body > .hero-section[data-w="full"] { grid-column: span 6; }
-.today-hero-body > .hero-section[data-h="half"] { grid-row: span 1; }
-.today-hero-body > .hero-section[data-h="full"] { grid-row: span 2; }
-.today-hero-body > .hero-section[data-h="xl"]   { grid-row: span 3; }
-.today-hero-body > .hero-section:not([data-w]) { grid-column: span 2; }
-.today-hero-body > .hero-section:not([data-h]) { grid-row: span 1; }
+.today-hero-body > .hero-section[data-w="half"],
+.today-hero-body > .panel[data-w="half"],
+.today-hero-body > .kpi[data-w="half"] { grid-column: span 2; }
+.today-hero-body > .hero-section[data-w="full"],
+.today-hero-body > .panel[data-w="full"],
+.today-hero-body > .kpi[data-w="full"] { grid-column: span 6; }
+.today-hero-body > .hero-section[data-h="half"],
+.today-hero-body > .panel[data-h="half"],
+.today-hero-body > .kpi[data-h="half"] { grid-row: span 1; }
+.today-hero-body > .hero-section[data-h="full"],
+.today-hero-body > .panel[data-h="full"],
+.today-hero-body > .kpi[data-h="full"] { grid-row: span 2; }
+.today-hero-body > .hero-section[data-h="xl"],
+.today-hero-body > .panel[data-h="xl"],
+.today-hero-body > .kpi[data-h="xl"] { grid-row: span 3; }
+.today-hero-body > .hero-section:not([data-w]),
+.today-hero-body > .panel:not([data-w]),
+.today-hero-body > .kpi:not([data-w]) { grid-column: span 2; }
+.today-hero-body > .hero-section:not([data-h]),
+.today-hero-body > .kpi:not([data-h]) { grid-row: span 1; }
+.today-hero-body > .panel:not([data-h]) { grid-row: span 2; }
 @media (max-width: 720px) {
   .today-hero-body { grid-template-columns: 1fr; grid-auto-rows: auto; }
   .today-hero-body > .hero-section[data-w],
-  .today-hero-body > .hero-section:not([data-w]) { grid-column: span 1; }
+  .today-hero-body > .hero-section:not([data-w]),
+  .today-hero-body > .panel[data-w],
+  .today-hero-body > .panel:not([data-w]),
+  .today-hero-body > .kpi[data-w],
+  .today-hero-body > .kpi:not([data-w]) { grid-column: span 1; }
   .today-hero-body > .hero-section[data-h],
-  .today-hero-body > .hero-section:not([data-h]) { grid-row: auto; }
+  .today-hero-body > .hero-section:not([data-h]),
+  .today-hero-body > .panel[data-h],
+  .today-hero-body > .panel:not([data-h]),
+  .today-hero-body > .kpi[data-h],
+  .today-hero-body > .kpi:not([data-h]) { grid-row: auto; }
 }
 /* Cuando una hero-section está colapsada, ocultamos la prose + sub-bodies,
    solo queda el header con su botón ▶/▼ + contador. */
-.today-hero-body > .hero-section[data-collapsed="true"] .prose,
-.today-hero-body > .hero-section[data-collapsed="true"] .hero-sub {
+.hero-section[data-collapsed="true"] .prose,
+.hero-section[data-collapsed="true"] .hero-sub {
   display: none;
 }
 .hero-section h3 {
@@ -1147,6 +1285,7 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 /* Drag affordances + collapse btn dentro del header de cada hero-section.
    El header (h3) ya es flex con count al final; agregamos grip a la
    izquierda y collapse-btn entre el label y el count. */
+.hero-section h3 .drag-grip,
 .hero-section h3 .hero-drag-grip {
   cursor: grab;
   color: var(--text-faint);
@@ -1155,10 +1294,9 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
   user-select: none;
   padding: 0 2px;
 }
+.hero-section h3 .drag-grip:hover,
 .hero-section h3 .hero-drag-grip:hover { color: var(--text-dim); }
 .hero-section.is-dragging { opacity: 0.4; }
-.hero-section.drop-before { box-shadow: inset 2px 0 0 var(--cyan); }
-.hero-section.drop-after  { box-shadow: inset -2px 0 0 var(--cyan); }
 .hero-section h3 .hero-collapse-btn {
   background: transparent;
   border: none;
@@ -1454,15 +1592,6 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
   margin-left: auto;
 }
 
-/* Tablet: 2x2 (4 cajas: narrative / inbox / questions / agenda) */
-@media (max-width: 1100px) {
-  .today-hero-body { grid-template-columns: repeat(2, 1fr); }
-  .today-hero-body > .hero-section:nth-child(2n) { border-right: none; }
-  .today-hero-body > .hero-section:nth-child(2n+1) { border-right: 1px solid var(--border); }
-  .today-hero-body > .hero-section:not(:nth-last-child(-n+2)) {
-    border-bottom: 1px solid var(--border);
-  }
-}
 /* Mobile: stack */
 @media (max-width: 720px) {
   .today-hero-body { grid-template-columns: 1fr; }
@@ -1693,9 +1822,17 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
     gap: var(--space-2);
   }
   .cmdbar > .kpi[data-w],
-  .cmdbar > .kpi:not([data-w]) { grid-column: span 1; }
+  .cmdbar > .kpi:not([data-w]),
+  .cmdbar > .panel[data-w],
+  .cmdbar > .panel:not([data-w]),
+  .cmdbar > .hero-section[data-w],
+  .cmdbar > .hero-section:not([data-w]) { grid-column: span 1; }
   .cmdbar > .kpi[data-h],
-  .cmdbar > .kpi:not([data-h]) { grid-row: auto; }
+  .cmdbar > .kpi:not([data-h]),
+  .cmdbar > .panel[data-h],
+  .cmdbar > .panel:not([data-h]),
+  .cmdbar > .hero-section[data-h],
+  .cmdbar > .hero-section:not([data-h]) { grid-row: auto; }
   .kpi { padding: var(--space-2) var(--space-3); min-height: 88px; }
 
   /* En mobile, todas las sections en una sola columna para no comprimir */
@@ -1716,7 +1853,13 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
     order: 4;
     justify-content: flex-start;
     gap: var(--space-2);
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    padding-bottom: var(--space-1);
+    scrollbar-width: none;
   }
+  .topbar .topnav::-webkit-scrollbar { display: none; }
+  .topbar .topnav-link { flex: 0 0 auto; }
 
   /* Mobile collapsibility: en mobile el cmdbar ocupa una columna y
      algunos panels pierden contexto. Colapsar Monitoring + Ambiente
@@ -1779,9 +1922,12 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 
 /* Grip visual al inicio del .panel-head — affordance discreta de
    "este bloque se puede arrastrar". Cursor grab sobre todo el head. */
-.panel-head { cursor: grab; }
-.panel-head:active { cursor: grabbing; }
-.panel-head .drag-grip {
+.panel-head,
+.hero-section > h3 { cursor: grab; }
+.panel-head:active,
+.hero-section > h3:active { cursor: grabbing; }
+.panel-head .drag-grip,
+.hero-section > h3 .drag-grip {
   display: inline-block;
   font-family: var(--font-mono);
   font-size: 12px;
@@ -1796,14 +1942,16 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
               color var(--dur-fast) var(--ease-out);
 }
 .panel:hover .panel-head .drag-grip,
-.kpi:hover .kpi-drag-grip {
+.kpi:hover .kpi-drag-grip,
+.hero-section:hover > h3 .drag-grip {
   opacity: 1;
   color: var(--cyan);
 }
 
 /* Panel siendo arrastrado — fantasmal */
 .panel.is-dragging,
-.kpi.is-dragging {
+.kpi.is-dragging,
+.hero-section.is-dragging {
   opacity: 0.35;
   border-style: dashed;
   border-color: var(--border-focus);
@@ -1813,13 +1961,17 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 .panel.drop-before,
 .panel.drop-after,
 .kpi.drop-before,
-.kpi.drop-after {
+.kpi.drop-after,
+.hero-section.drop-before,
+.hero-section.drop-after {
   position: relative;
 }
 .panel.drop-before::before,
 .panel.drop-after::after,
 .kpi.drop-before::before,
-.kpi.drop-after::after {
+.kpi.drop-after::after,
+.hero-section.drop-before::before,
+.hero-section.drop-after::after {
   content: "";
   position: absolute;
   background: var(--cyan);
@@ -1829,26 +1981,28 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 }
 /* Indicador horizontal (single-col / mobile): línea arriba o abajo */
 .panel.drop-before::before,
-.kpi.drop-before::before {
+.kpi.drop-before::before,
+.hero-section.drop-before::before {
   left: -4px; right: -4px;
   top: -4px;
   height: 2px;
   border-radius: 1px;
 }
 .panel.drop-after::after,
-.kpi.drop-after::after {
+.kpi.drop-after::after,
+.hero-section.drop-after::after {
   left: -4px; right: -4px;
   bottom: -4px;
   height: 2px;
   border-radius: 1px;
 }
-/* Indicador vertical (desktop multi-col): línea izquierda o derecha.
-   Detectamos con media query — si la sección renderiza >1 col de panel,
-   la altura del panel es similar al ancho y la heurística JS (useX)
-   pone before/after en horizontal. Esto pinta verticales. */
+/* Indicador vertical (desktop multi-col): línea izquierda o derecha. El JS
+   marca el eje para que una grilla de varias filas permita subir/bajar cajas
+   y también ordenar lateralmente dentro de la misma línea. */
 @media (min-width: 720px) {
-  .panel.drop-before::before,
-  .kpi.drop-before::before {
+  .panel.drop-axis-x.drop-before::before,
+  .kpi.drop-axis-x.drop-before::before,
+  .hero-section.drop-axis-x.drop-before::before {
     top: -4px; bottom: -4px;
     left: -4px;
     width: 2px;
@@ -1856,8 +2010,9 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
     right: auto;
     border-radius: 1px;
   }
-  .panel.drop-after::after,
-  .kpi.drop-after::after {
+  .panel.drop-axis-x.drop-after::after,
+  .kpi.drop-axis-x.drop-after::after,
+  .hero-section.drop-axis-x.drop-after::after {
     top: -4px; bottom: -4px;
     right: -4px;
     width: 2px;
@@ -1870,7 +2025,8 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 /* Drop zone sobre toda la section-body (cuando el cursor está en un
    espacio libre del grid, fuera de cualquier panel — appendea al final). */
 .section-body.drop-zone,
-.cmdbar.drop-zone {
+.cmdbar.drop-zone,
+.today-hero-body.drop-zone {
   outline: 2px dashed var(--border-focus);
   outline-offset: 4px;
   border-radius: 4px;
@@ -1903,7 +2059,9 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 @media (prefers-reduced-motion: reduce) {
   .panel-head .drag-grip { transition: none; }
   .panel.drop-before::before,
-  .panel.drop-after::after { box-shadow: none; }
+  .panel.drop-after::after,
+  .hero-section.drop-before::before,
+  .hero-section.drop-after::after { box-shadow: none; }
 }
 
 /* ── Panel Sueño (p-sleep) ───────────────────────────────────────── */
@@ -2216,14 +2374,24 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 .panel[data-collapsed="true"] .drag-grip,
 .panel[data-collapsed="true"] .count,
 .panel[data-collapsed="true"] .panel-size-chip,
-.panel[data-collapsed="true"] .panel-resize-handle {
+.panel[data-collapsed="true"] .panel-resize-handle,
+.hero-section[data-collapsed="true"] .drag-grip,
+.hero-section[data-collapsed="true"] .hero-drag-grip,
+.hero-section[data-collapsed="true"] .count,
+.hero-section[data-collapsed="true"] .panel-size-chip,
+.hero-section[data-collapsed="true"] .panel-resize-handle {
   display: none !important;
 }
 /* Forzar grid-row: span 1 — overrides manual data-h="full" que dejaba
    la celda en 560px (2 rows) con la caja chiquita arriba y gap gigante
    abajo. Con span 1, la celda es 280px y la caja colapsada queda
    compacta gracias a `align-self: start`. */
-.section-body > .panel[data-collapsed="true"] {
+.section-body > .panel[data-collapsed="true"],
+.section-body > .kpi[data-collapsed="true"],
+.section-body > .hero-section[data-collapsed="true"],
+.today-hero-body > .panel[data-collapsed="true"],
+.today-hero-body > .kpi[data-collapsed="true"],
+.today-hero-body > .hero-section[data-collapsed="true"] {
   grid-row: span 1 !important;
 }
 
@@ -2270,7 +2438,9 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 /* Indicador estado: panel ya está en full en esa dimensión → chip
    pintado cyan tenue (informa "esto se puede achicar"). */
 .panel[data-w="full"] .panel-size-chip-w,
-.panel[data-h="full"] .panel-size-chip-h {
+.panel[data-h="full"] .panel-size-chip-h,
+.hero-section[data-w="full"] .panel-size-chip-w,
+.hero-section[data-h="full"] .panel-size-chip-h {
   color: var(--cyan);
   border-color: var(--cyan);
 }

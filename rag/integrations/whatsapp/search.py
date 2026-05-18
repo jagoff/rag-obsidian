@@ -26,6 +26,8 @@ import re
 import sqlite3
 from typing import Any
 
+from ._constants import whatsapp_chat_name_excluded
+
 logger = logging.getLogger("rag.wa.search")
 
 _BACKFILL_BATCH = 1000
@@ -57,6 +59,87 @@ def _attach_bridge(con: sqlite3.Connection) -> bool:
         return False
 
 
+def _excluded_chat_jids(con: sqlite3.Connection) -> list[str]:
+    """Resolve exact-name blacklisted chats from the attached bridge DB."""
+    try:
+        rows = con.execute("SELECT jid, COALESCE(name, '') AS name FROM br.chats").fetchall()
+    except sqlite3.Error:
+        return []
+    return [r["jid"] for r in rows if whatsapp_chat_name_excluded(r["name"])]
+
+
+def _purge_semantic_vec_rowids(con: sqlite3.Connection, rowids: list[int]) -> None:
+    """Best-effort delete for the optional WA semantic vec sidecar."""
+    if not rowids:
+        return
+    try:
+        exists = con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='rag_wa_messages_vec'"
+        ).fetchone()
+        if not exists:
+            return
+        try:
+            import sqlite_vec  # type: ignore[import-not-found]  # noqa: PLC0415
+            con.enable_load_extension(True)
+            sqlite_vec.load(con)
+            con.enable_load_extension(False)
+        except Exception:
+            pass
+        placeholders = ",".join("?" * len(rowids))
+        con.execute(
+            f"DELETE FROM rag_wa_messages_vec WHERE rowid IN ({placeholders})",
+            rowids,
+        )
+    except sqlite3.Error as e:
+        logger.warning("semantic vec purge failed: %s", e)
+
+
+def _purge_excluded_chats_attached(con: sqlite3.Connection) -> int:
+    """Delete already-mirrored rows for currently blacklisted chat names."""
+    excluded_jids = _excluded_chat_jids(con)
+    if not excluded_jids:
+        return 0
+    placeholders = ",".join("?" * len(excluded_jids))
+    try:
+        rowids = [
+            int(r["rowid"])
+            for r in con.execute(
+                f"SELECT rowid FROM rag_wa_messages_mirror "
+                f"WHERE chat_jid IN ({placeholders})",
+                excluded_jids,
+            ).fetchall()
+        ]
+        if not rowids:
+            return 0
+        _purge_semantic_vec_rowids(con, rowids)
+        row_ph = ",".join("?" * len(rowids))
+        cur = con.execute(
+            f"DELETE FROM rag_wa_messages_mirror WHERE rowid IN ({row_ph})",
+            rowids,
+        )
+        con.commit()
+        return int(cur.rowcount or len(rowids))
+    except sqlite3.Error as e:
+        logger.warning("excluded chat purge failed: %s", e)
+        return 0
+
+
+def purge_excluded_chats() -> int:
+    """Public maintenance hook: remove blacklisted chats from WA mirror/FTS."""
+    con = _open_telemetry_rw()
+    if not _attach_bridge(con):
+        con.close()
+        return 0
+    try:
+        return _purge_excluded_chats_attached(con)
+    finally:
+        try:
+            con.execute("DETACH DATABASE br")
+        except sqlite3.Error:
+            pass
+        con.close()
+
+
 def backfill_mirror() -> int:
     """One-shot backfill: copia TODOS los messages del bridge al mirror.
 
@@ -74,6 +157,10 @@ def backfill_mirror() -> int:
     bot_jid = _rag.WHATSAPP_BOT_JID
     total_inserted = 0
     try:
+        purged = _purge_excluded_chats_attached(con)
+        if purged:
+            logger.info("backfill: purgué %s rows de chats WA excluidos", purged)
+
         # Cuántos rows tenemos ya en el mirror
         cnt = con.execute("SELECT count(*) AS n FROM rag_wa_messages_mirror").fetchone()
         had = cnt["n"] if cnt else 0
@@ -81,8 +168,10 @@ def backfill_mirror() -> int:
 
         # Pull todos los messages (batched para no levantar TODO a memoria).
         sql_select = """
-            SELECT m.id, m.chat_jid, m.timestamp, m.sender, m.content
+            SELECT m.id, m.chat_jid, m.timestamp, m.sender, m.content,
+                   COALESCE(c.name, '') AS chat_name
             FROM br.messages m
+            LEFT JOIN br.chats c ON c.jid = m.chat_jid
             WHERE m.chat_jid != ?
               AND m.chat_jid NOT LIKE '%status@broadcast'
               AND (m.content IS NOT NULL AND m.content != '')
@@ -97,7 +186,10 @@ def backfill_mirror() -> int:
             batch = [
                 (r["id"], r["chat_jid"], r["timestamp"], r["sender"] or "", r["content"] or "")
                 for r in rows
+                if not whatsapp_chat_name_excluded(r["chat_name"])
             ]
+            if not batch:
+                continue
             cur2 = con.executemany(
                 "INSERT OR IGNORE INTO rag_wa_messages_mirror "
                 "(id, chat_jid, ts, sender, content) VALUES (?, ?, ?, ?, ?)",
@@ -132,10 +224,13 @@ def sync_recent(since_ts: str) -> int:
     bot_jid = _rag.WHATSAPP_BOT_JID
     inserted = 0
     try:
+        _purge_excluded_chats_attached(con)
         rows = con.execute(
             """
-            SELECT m.id, m.chat_jid, m.timestamp, m.sender, m.content
+            SELECT m.id, m.chat_jid, m.timestamp, m.sender, m.content,
+                   COALESCE(c.name, '') AS chat_name
             FROM br.messages m
+            LEFT JOIN br.chats c ON c.jid = m.chat_jid
             WHERE m.timestamp > ?
               AND m.chat_jid != ?
               AND m.chat_jid NOT LIKE '%status@broadcast'
@@ -143,6 +238,9 @@ def sync_recent(since_ts: str) -> int:
             """,
             (since_ts, bot_jid),
         ).fetchall()
+        if not rows:
+            return 0
+        rows = [r for r in rows if not whatsapp_chat_name_excluded(r["chat_name"])]
         if not rows:
             return 0
         cur = con.executemany(
@@ -259,6 +357,7 @@ def search(q: str, jid: str | None = None, limit: int = 50) -> list[dict]:
                 "snippet": r["snippet"],
             }
             for r in rows
+            if not whatsapp_chat_name_excluded(r["chat_name"] or "")
         ]
     except sqlite3.Error as e:
         logger.warning("search failed: %s", e)

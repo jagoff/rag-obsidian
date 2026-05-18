@@ -1016,7 +1016,8 @@ function renderHealth(d) {
   if (!h) return;
 
   const issues = [];
-  if (h.score_low_pct > 40) issues.push("retrieval débil en muchas queries");
+  const lowScoreIssue = h.score_low_issue ?? (h.score_low >= 10 && h.score_low_pct > 40);
+  if (lowScoreIssue) issues.push("retrieval débil en muchas queries");
   if (h.bad_citation_rate > 10) issues.push("LLM inventando citations");
   if (h.gate_rate > 20) issues.push("gate rate alto");
   if (d.latency_stats.total_p50 > 60) issues.push("latencia alta");
@@ -1031,7 +1032,7 @@ function renderHealth(d) {
       <h3>Calidad del retrieval</h3>
       <div class="health-row"><span class="health-label">Score alto (≥0.3)</span><span class="health-value good">${h.score_high} (${h.score_high_pct}%)</span></div>
       <div class="health-row"><span class="health-label">Score medio (0.05–0.3)</span><span class="health-value warn">${h.score_mid} (${h.score_mid_pct}%)</span></div>
-      <div class="health-row"><span class="health-label">Score bajo (&lt;0.05)</span><span class="health-value ${h.score_low_pct > 30 ? 'bad' : 'warn'}">${h.score_low} (${h.score_low_pct}%)</span></div>
+      <div class="health-row"><span class="health-label">Score bajo (&lt;0.05)</span><span class="health-value ${lowScoreIssue ? 'bad' : h.score_low > 0 ? 'warn' : 'good'}">${h.score_low} (${h.score_low_pct}%)</span></div>
       <div class="health-bar">
         <div style="flex:${h.score_high};background:var(--green)"></div>
         <div style="flex:${h.score_mid};background:var(--yellow)"></div>

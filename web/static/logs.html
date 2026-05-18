@@ -28,6 +28,7 @@
     })();
   </script>
   <script src="/static/pwa/register-sw.js" defer></script>
+  <script src="/static/admin-auth.js?v=2026-05-17-logs-clean"></script>
   <style>
     /* Paleta heredada de status.html / dashboard. Mantener sincronizado
        si el aesthetic cambia — esa página es la "fuente" canónica. */
@@ -175,6 +176,18 @@
     .header-meta button[aria-pressed="true"] {
       border-color: var(--cyan);
       color: var(--cyan);
+    }
+    .header-meta button.danger {
+      border-color: color-mix(in srgb, var(--red) 45%, var(--border));
+      color: var(--red);
+    }
+    .header-meta button.danger:hover {
+      background: color-mix(in srgb, var(--red) 12%, var(--hover));
+      border-color: var(--red);
+    }
+    .header-meta button:disabled {
+      cursor: wait;
+      opacity: 0.65;
     }
 
     /* Resumen arriba: chip por status agregado. */
@@ -1089,6 +1102,18 @@
     @media (max-width: 800px) {
       .container { padding: 16px 12px 40px; }
       header h1 { font-size: 16px; }
+      .header-meta {
+        width: 100%;
+        gap: 8px;
+        flex-wrap: nowrap;
+        overflow-x: auto;
+        padding-bottom: 4px;
+        white-space: nowrap;
+        scrollbar-width: none;
+      }
+      .header-meta::-webkit-scrollbar { display: none; }
+      .header-meta > * { flex: 0 0 auto; }
+      #meta-updated { max-width: 150px; overflow: hidden; text-overflow: ellipsis; }
       .sidebar { max-height: 40vh; }
       .viewer { max-height: none; }
       /* Mobile: ocultamos lnum + ts para no perder ancho útil en el text. */
@@ -1250,6 +1275,8 @@
     .queue-status.needs-human { background: color-mix(in srgb, var(--yellow) 22%, transparent); color: var(--yellow); }
     .queue-status.failed      { background: color-mix(in srgb, var(--red) 18%, transparent); color: var(--red); }
     .queue-status.skipped     { background: var(--border); color: var(--text-faint); }
+    .queue-status.q-level-error { background: color-mix(in srgb, var(--red) 18%, transparent); color: var(--red); }
+    .queue-status.q-level-warn  { background: color-mix(in srgb, var(--yellow) 20%, transparent); color: var(--yellow); }
 
     .queue-error-text {
       font-family: "SF Mono", "Menlo", monospace;
@@ -1341,19 +1368,25 @@
           <span id="live-label">auto ON</span>
         </button>
         <button id="refresh-now" type="button" aria-label="Refrescar ahora">↻</button>
+        <button id="clean-all-logs" type="button" class="danger"
+                aria-label="Borrar todos los logs actuales">clean all</button>
         <button id="theme-toggle" type="button" aria-label="Alternar tema claro/oscuro">
           <span id="theme-icon" aria-hidden="true">◐</span>
         </button>
         <a href="/">home</a>
         <a href="/mirror">mirror</a>
         <a href="/chat">chat</a>
+        <a href="/wzp">wzp</a>
         <a href="/dashboard">dashboard</a>
         <a href="/status">status</a>
         <a href="/learning">learning</a>
         <a href="/finance">finance</a>
         <a href="/atlas">atlas</a>
         <a href="/memo">memory</a>
+        <a href="/transcripts">transcripts</a>
         <a href="/fine_tunning">fine_tunning</a>
+        <a href="/blacklist">blacklist</a>
+        <a href="https://ra.ai/agents/">agents</a>
       </div>
     </header>
 
@@ -1523,15 +1556,15 @@
           <span class="qs-chip failed"><strong id="qc-failed">0</strong> failed</span>
           <div class="queue-controls">
             <button class="qc-toggle" id="qc-worker-toggle" type="button" aria-pressed="false"
-                    title="habilitar/deshabilitar el worker automático que procesa errores con Devin">
+                    title="habilitar/deshabilitar el worker automático que procesa errores con Codex">
               <span id="qc-worker-label">worker OFF</span>
             </button>
             <button class="qc-action" id="qc-scan-now" type="button"
-                    title="escanear logs ahora + insertar errores nuevos en la queue">
+                    title="escanear logs ahora + insertar errores/warnings nuevos en la queue">
               ↻ escanear
             </button>
             <button class="qc-action" id="qc-process-next" type="button"
-                    title="procesar manualmente el siguiente error pending con Devin (ignora el worker toggle)">
+                    title="procesar manualmente el siguiente error pending con Codex (ignora el worker toggle)">
               ▶ procesar siguiente
             </button>
           </div>
@@ -1542,15 +1575,16 @@
             <tr>
               <th style="width:50px">id</th>
               <th style="width:100px">status</th>
+              <th style="width:70px">level</th>
               <th style="width:130px">service</th>
-              <th>error</th>
+              <th>log</th>
               <th style="width:60px">occ.</th>
               <th style="width:80px">last seen</th>
               <th style="width:90px">resolution</th>
             </tr>
           </thead>
           <tbody id="queue-tbody">
-            <tr><td colspan="7" class="queue-empty">cargando queue…</td></tr>
+            <tr><td colspan="8" class="queue-empty">cargando queue…</td></tr>
           </tbody>
         </table>
       </section>
@@ -1559,6 +1593,6 @@
 
   <link rel="stylesheet" href="/static/diagnose-modal.css?v=2026-04-29-recovery">
   <script src="/static/diagnose-modal.js?v=2026-04-29-recovery" defer></script>
-  <script src="/static/logs.js?v=2026-05-01-rankings-v2" defer></script>
+  <script src="/static/logs.js?v=2026-05-17-clean-all-codex" defer></script>
 </body>
 </html>

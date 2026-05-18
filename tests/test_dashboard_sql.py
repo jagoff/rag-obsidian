@@ -170,6 +170,90 @@ def test_dashboard_sql_empty_returns_zero_shape(sql_env):
     assert d["chat_keywords"] == []
 
 
+def test_dashboard_score_health_ignores_non_user_scored_rows(sql_env):
+    """Score health must not count technical/event rows as retrieval misses."""
+    now = datetime.now().replace(hour=10, minute=0, second=0, microsecond=0)
+    events = [
+        {
+            "ts": now.isoformat(timespec="seconds"),
+            "cmd": "api_query.retrieve_only",
+            "q": "internal retrieve-only probe",
+            "top_score": 0.0,
+            "t_retrieve": 0.1,
+        },
+        {
+            "ts": (now - timedelta(minutes=1)).isoformat(timespec="seconds"),
+            "cmd": "web",
+            "q": "real user question",
+            "top_score": 0.6,
+            "t_retrieve": 0.2,
+            "t_gen": 1.0,
+        },
+    ]
+    _seed_sql(sql_env["tmp"], "rag_queries", events, rag._map_queries_row)
+
+    d = web_server._dashboard_compute_sql(days=7)
+
+    assert d["health"]["retrieval_queries"] == 1
+    assert d["health"]["score_low"] == 0
+    assert d["health"]["score_high"] == 1
+    assert d["score_stats"]["p50"] == pytest.approx(0.6, abs=1e-3)
+    assert d["score_distribution"][0] == 0
+
+
+def test_dashboard_low_score_issue_requires_many_low_queries(sql_env):
+    """A tiny sample can show a high low-score pct without being "many"."""
+    now = datetime.now().replace(hour=10, minute=0, second=0, microsecond=0)
+    events = []
+    for i in range(5):
+        events.append({
+            "ts": (now - timedelta(minutes=i)).isoformat(timespec="seconds"),
+            "cmd": "web",
+            "q": f"low score question {i}",
+            "top_score": 0.02,
+        })
+    for i in range(3):
+        events.append({
+            "ts": (now - timedelta(minutes=10 + i)).isoformat(timespec="seconds"),
+            "cmd": "web",
+            "q": f"high score question {i}",
+            "top_score": 0.6,
+        })
+    _seed_sql(sql_env["tmp"], "rag_queries", events, rag._map_queries_row)
+
+    d = web_server._dashboard_compute_sql(days=7)
+
+    assert d["health"]["score_low"] == 5
+    assert d["health"]["score_low_pct"] == pytest.approx(62.5, abs=1e-3)
+    assert d["health"]["score_low_issue"] is False
+
+
+def test_dashboard_low_score_issue_fires_after_min_count(sql_env):
+    """The verdict issue should fire only once enough low-score rows exist."""
+    now = datetime.now().replace(hour=10, minute=0, second=0, microsecond=0)
+    events = []
+    for i in range(10):
+        events.append({
+            "ts": (now - timedelta(minutes=i)).isoformat(timespec="seconds"),
+            "cmd": "web",
+            "q": f"low score question {i}",
+            "top_score": 0.02,
+        })
+    for i in range(10):
+        events.append({
+            "ts": (now - timedelta(minutes=20 + i)).isoformat(timespec="seconds"),
+            "cmd": "web",
+            "q": f"high score question {i}",
+            "top_score": 0.6,
+        })
+    _seed_sql(sql_env["tmp"], "rag_queries", events, rag._map_queries_row)
+
+    d = web_server._dashboard_compute_sql(days=7)
+
+    assert d["health"]["score_low_pct"] == pytest.approx(50.0, abs=1e-3)
+    assert d["health"]["score_low_issue"] is True
+
+
 def test_dashboard_sql_cutoff_filters_properly(sql_env):
     """5 rows within 7d + 5 outside → only 5 counted in window (windowed KPI).
 

@@ -55,6 +55,7 @@ __all__ = [
     "_migrate_audio_transcripts_phase2",
     "_migrate_cita_detections_add_kind",
     "_migrate_trace_id_columns",
+    "_migrate_anticipate_message_full",
     "_ensure_telemetry_tables",
 ]
 
@@ -297,6 +298,28 @@ def _migrate_screen_obs_add_image_path(conn) -> None:
                 pass
 
 
+def _migrate_anticipate_message_full(conn) -> None:
+    """Idempotent ALTER para conservar el cuerpo completo de Anticipate.
+
+    `message_preview` queda como columna compacta para dashboards históricos,
+    pero el envío manual necesita el body completo para no reenviar mensajes
+    truncados a 120 chars.
+    """
+    import sqlite3 as _sqlite3  # noqa: PLC0415
+
+    from rag import _silent_log  # noqa: PLC0415
+
+    try:
+        conn.execute("ALTER TABLE rag_anticipate_candidates ADD COLUMN message_full TEXT")
+    except _sqlite3.OperationalError as exc:
+        low = str(exc).lower()
+        if "duplicate column" not in low and "no such table" not in low:
+            try:
+                _silent_log("migration_anticipate_message_full_failed", exc)
+            except Exception:
+                pass
+
+
 def _ensure_telemetry_tables(conn) -> None:
     """Create all rag_* telemetry tables + indexes + schema_version rows.
 
@@ -490,6 +513,14 @@ def _ensure_telemetry_tables(conn) -> None:
         except Exception as _migrate_exc:
             try:
                 _silent_log("migration_screen_obs_image_path_failed", _migrate_exc)
+            except Exception:  # pragma: no cover
+                pass
+        try:
+            import rag as _rag  # noqa: PLC0415
+            getattr(_rag, "_migrate_anticipate_message_full", _migrate_anticipate_message_full)(conn)
+        except Exception as _migrate_exc:
+            try:
+                _silent_log("migration_anticipate_message_full_failed", _migrate_exc)
             except Exception:  # pragma: no cover
                 pass
         # Versioned schema migrations (2026-04-29). Single source of truth para

@@ -58,6 +58,8 @@ def _run_subprocess(
     *,
     timeout: int = _SUBPROCESS_TIMEOUT_S,
     extra_env: dict[str, str] | None = None,
+    benign_failure_markers: tuple[str, ...] = (),
+    benign_skip_reason: str = "benign_failure",
 ) -> dict[str, Any]:
     """Ejecuta ``args`` y captura stdout/stderr para telemetría.
 
@@ -65,7 +67,9 @@ def _run_subprocess(
     - ``exit_code``: int
     - ``stdout_lines``: int (count de líneas, no el contenido)
     - ``stderr_lines``: int
-    - ``last_stderr``: str | None — primeros 200 chars del último stderr
+    - ``last_stderr``: str | None — últimos 500 chars del stderr
+      si exit_code != 0.
+    - ``last_stdout``: str | None — últimos 500 chars del stdout
       si exit_code != 0 (para diagnóstico rápido).
     """
     import os  # noqa: PLC0415
@@ -88,23 +92,44 @@ def _run_subprocess(
             "exit_code": -1,
             "stdout_lines": 0,
             "stderr_lines": 0,
+            "last_stdout": None,
             "last_stderr": f"timeout after {timeout}s",
         }
 
     stdout_lines = result.stdout.count("\n") if result.stdout else 0
     stderr_lines = result.stderr.count("\n") if result.stderr else 0
-    last_err = (result.stderr or "")[-200:] if result.returncode != 0 else None
+    last_out = (result.stdout or "")[-500:] if result.returncode != 0 else None
+    last_err = (result.stderr or "")[-500:] if result.returncode != 0 else None
+
+    if result.returncode != 0 and benign_failure_markers:
+        combined = f"{last_out or ''}\n{last_err or ''}"
+        if any(marker and marker in combined for marker in benign_failure_markers):
+            logger.info(
+                "nightly job skipped: %s — %s",
+                " ".join(args), benign_skip_reason,
+            )
+            return {
+                "exit_code": 0,
+                "raw_exit_code": result.returncode,
+                "stdout_lines": stdout_lines,
+                "stderr_lines": stderr_lines,
+                "last_stdout": last_out,
+                "last_stderr": last_err,
+                "skipped": True,
+                "skip_reason": benign_skip_reason,
+            }
 
     if result.returncode != 0:
         logger.warning(
-            "nightly job exit=%d: %s — stderr tail: %s",
-            result.returncode, " ".join(args), last_err,
+            "nightly job exit=%d: %s — stdout tail: %s — stderr tail: %s",
+            result.returncode, " ".join(args), last_out, last_err,
         )
 
     return {
         "exit_code": result.returncode,
         "stdout_lines": stdout_lines,
         "stderr_lines": stderr_lines,
+        "last_stdout": last_out,
         "last_stderr": last_err,
     }
 

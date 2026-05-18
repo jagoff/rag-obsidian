@@ -163,6 +163,19 @@ def chat_env(monkeypatch, tmp_path):
     monkeypatch.setattr(server_mod, "_chat_cache_put", lambda key, val: None)
     # Tasks intent detection off — we want the full chat path every time.
     monkeypatch.setattr(server_mod, "_is_tasks_query", lambda q: False)
+    monkeypatch.setattr(
+        server_mod,
+        "_duckduckgo_search_for_chat",
+        lambda q: {
+            "docs": [],
+            "metas": [],
+            "scores": [],
+            "sources": [],
+            "status": "empty",
+            "reason": "test_default",
+            "ms": 0,
+        },
+    )
     return monkeypatch
 
 
@@ -1391,6 +1404,19 @@ def chat_env_prod(monkeypatch, tmp_path):
     monkeypatch.setattr(server_mod, "_chat_cache_get", lambda key: None)
     monkeypatch.setattr(server_mod, "_chat_cache_put", lambda key, val: None)
     monkeypatch.setattr(server_mod, "_is_tasks_query", lambda q: False)
+    monkeypatch.setattr(
+        server_mod,
+        "_duckduckgo_search_for_chat",
+        lambda q: {
+            "docs": [],
+            "metas": [],
+            "scores": [],
+            "sources": [],
+            "status": "empty",
+            "reason": "test_default",
+            "ms": 0,
+        },
+    )
     return monkeypatch
 
 

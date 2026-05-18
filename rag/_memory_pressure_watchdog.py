@@ -248,6 +248,32 @@ def _system_swap_used_gb() -> float | None:
         return None
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _swap_pressure_active(
+    memory_pct: float | None,
+    swap_gb: float | None,
+    swap_gb_threshold: float,
+) -> bool:
+    """Treat swap as active pressure only when current memory agrees.
+
+    macOS can keep swap files allocated after pressure has cleared. A stale
+    high swap counter should not make every watchdog tick unload models forever.
+    If memory pressure cannot be sampled, keep the old conservative behavior.
+    """
+    if swap_gb is None or swap_gb_threshold <= 0 or swap_gb < swap_gb_threshold:
+        return False
+    if memory_pct is None:
+        return True
+    floor_pct = _env_float("RAG_MEMORY_PRESSURE_SWAP_MEMORY_FLOOR_PCT", 70.0)
+    return memory_pct >= floor_pct
+
+
 def _handle_memory_pressure(pct_before: float, threshold: float) -> dict:
     """Respuesta escalonada a un evento de memory pressure.
 
@@ -261,6 +287,7 @@ def _handle_memory_pressure(pct_before: float, threshold: float) -> dict:
     """
     from rag import (  # noqa: PLC0415
         _silent_log,
+        maybe_unload_local_embedder,
         maybe_unload_nli_model,
         maybe_unload_reranker,
         resolve_chat_model,
@@ -269,9 +296,11 @@ def _handle_memory_pressure(pct_before: float, threshold: float) -> dict:
         "pct_before": round(pct_before, 2),
         "threshold": threshold,
         "chat_unloaded": False,
+        "local_embedder_unloaded": False,
         "reranker_unloaded": False,
         "chat_model": None,
         "pct_after_chat": None,
+        "pct_after_local_embedder": None,
         "pct_after_reranker": None,
     }
 
@@ -300,8 +329,21 @@ def _handle_memory_pressure(pct_before: float, threshold: float) -> dict:
             actions["chat_unload_timeout"] = True
             _silent_log("memory_watchdog_unload_chat_mlx", exc)
 
+    # Paso 1b: local embedder. `rag watch` y el web query path cargan el
+    # embedder por fuera de MLXBackend, así que `backend.unload()` no lo
+    # libera. Bajo pressure hay que desalojarlo explícitamente.
+    try:
+        if maybe_unload_local_embedder(force=True):
+            actions["local_embedder_unloaded"] = True
+    except Exception as exc:
+        _silent_log("memory_watchdog_unload_local_embedder", exc)
+    pct_after_local = _system_memory_used_pct()
+    actions["pct_after_local_embedder"] = (
+        round(pct_after_local, 2) if pct_after_local is not None else None
+    )
+
     # Paso 2: re-medir y decidir reranker
-    pct_after = _system_memory_used_pct()
+    pct_after = pct_after_local if pct_after_local is not None else _system_memory_used_pct()
     actions["pct_after_chat"] = round(pct_after, 2) if pct_after is not None else None
     if pct_after is not None and pct_after >= threshold:
         # Audit 2026-04-26: respetar RAG_RERANKER_NEVER_UNLOAD=1 también
@@ -401,11 +443,7 @@ def _memory_pressure_watchdog_loop(threshold: float, interval: int) -> None:
             if pct is None and swap_gb is None:
                 continue
             trigger_pct = pct is not None and pct >= threshold
-            trigger_swap = (
-                swap_gb is not None
-                and swap_gb_threshold > 0
-                and swap_gb >= swap_gb_threshold
-            )
+            trigger_swap = _swap_pressure_active(pct, swap_gb, swap_gb_threshold)
             # Cooldown: tras una acción, no volver a actuar hasta que pase
             # cooldown_s. Evita el thrash loop unload→reload→unload→...
             # cada `interval` segundos cuando el sistema está bajo presión
@@ -428,6 +466,7 @@ def _memory_pressure_watchdog_loop(threshold: float, interval: int) -> None:
                         f"threshold={threshold}% swap={actions.get('swap_gb')}GB "
                         f"trigger_pct={trigger_pct} trigger_swap={trigger_swap} "
                         f"chat_unloaded={actions['chat_unloaded']} "
+                        f"local_embedder_unloaded={actions['local_embedder_unloaded']} "
                         f"reranker_unloaded={actions['reranker_unloaded']} "
                         f"pct_after={actions.get('pct_after_chat')}%",
                         flush=True,

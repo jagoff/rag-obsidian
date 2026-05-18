@@ -4820,7 +4820,8 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             " selected INTEGER NOT NULL,"
             " sent INTEGER NOT NULL,"
             " reason TEXT,"
-            " message_preview TEXT"
+            " message_preview TEXT,"
+            " message_full TEXT"
             ")",
             "CREATE INDEX IF NOT EXISTS ix_rag_anticipate_candidates_ts"
             " ON rag_anticipate_candidates(ts)",
@@ -23575,6 +23576,56 @@ def _do_index(reset: bool, no_contradict: bool, source_opt: str | None,
         return _run_index(reset=reset, no_contradict=no_contradict)
 
 
+def _apply_env_defaults(defaults: dict[str, str]) -> dict[str, str]:
+    """Set env defaults for long-lived daemons without overriding operators."""
+    applied: dict[str, str] = {}
+    for key, value in defaults.items():
+        current = os.environ.get(key)
+        if current is None or current.strip() == "":
+            os.environ[key] = value
+            applied[key] = value
+    return applied
+
+
+def _watch_safe_defaults() -> dict[str, str]:
+    """Conservative defaults for the realtime watcher.
+
+    `rag watch` indexes one file at a time, so it should stay lightweight:
+    no optional enrichment models in-process, smaller MLX embed batches, and
+    memory pressure handling enabled even when launched manually.
+    """
+    return {
+        "RAG_INDEX_DEFER_CONTRADICTIONS": "1",
+        "RAG_EXTRACT_ENTITIES": "0",
+        "OBSIDIAN_RAG_SKIP_CONTEXT_SUMMARY": "1",
+        "OBSIDIAN_RAG_SKIP_SYNTHETIC_Q": "1",
+        "RAG_CONTEXTUAL_RETRIEVAL": "0",
+        "RAG_INDEX_LOCAL_EMBED_BATCH": "16",
+        "RAG_MEMORY_PRESSURE_DISABLE": "0",
+        "RAG_MEMORY_PRESSURE_THRESHOLD": "75",
+        "RAG_MEMORY_PRESSURE_SWAP_GB": "1.5",
+        "RAG_MEMORY_PRESSURE_INTERVAL": "15",
+        "RAG_MEMORY_PRESSURE_COOLDOWN_S": "45",
+    }
+
+
+def _watch_unload_idle_models() -> bool:
+    """Unload every MLX resident path used by `rag watch` after idle."""
+    unloaded = False
+    try:
+        from rag.llm_backend import get_backend  # noqa: PLC0415
+        if get_backend().unload():
+            unloaded = True
+    except Exception as exc:
+        _silent_log("watch_idle_unload_backend_failed", exc)
+    try:
+        if maybe_unload_local_embedder(force=True):
+            unloaded = True
+    except Exception as exc:
+        _silent_log("watch_idle_unload_local_embedder_failed", exc)
+    return unloaded
+
+
 def _watch_filter_path(
     raw_path: str,
     vault_path: Path,
@@ -23942,16 +23993,21 @@ def watch(debounce: float, all_vaults: bool):
     from watchdog.observers import Observer
     from watchdog.events import FileSystemEventHandler
 
-    # Exclude high-churn folders from real-time reindexing. The native
-    # WhatsApp ETL writes monthly rollups under this tree; without this, one
-    # sync can re-fire the handler many times and each reindex hits the
-    # backend twice (context summary via qwen2.5:3b + contradiction detector),
-    # saturating the daemon and making /api/chat queue for minutes. WA files
-    # are still refreshed by periodic `rag index` (cron or manual). Override with
-    # OBSIDIAN_RAG_WATCH_EXCLUDE_FOLDERS="a,b,c" (relative to vault root).
+    _apply_env_defaults(_watch_safe_defaults())
+    try:
+        start_memory_pressure_watchdog(quiet=True)
+    except Exception as exc:
+        _silent_log("watch_memory_watchdog_start", exc)
+
+    # Exclude high-churn ETL folders from real-time reindexing. Cross-source
+    # ingesters can rewrite several daily/monthly rollups in one burst
+    # (Chrome/Gmail/Screentime/Spotify/YouTube/WhatsApp). Let periodic
+    # `rag index` absorb those; watch should stay for human-edited notes.
+    # Override with OBSIDIAN_RAG_WATCH_EXCLUDE_FOLDERS="a,b,c"
+    # (relative to vault root).
     _exclude_env = os.environ.get(
         "OBSIDIAN_RAG_WATCH_EXCLUDE_FOLDERS",
-        "99-obsidian/99-AI/external-ingest/WhatsApp",
+        "99-obsidian/99-AI/external-ingest",
     )
     exclude_folders = tuple(
         f.strip().rstrip("/") for f in _exclude_env.split(",") if f.strip()
@@ -24102,16 +24158,12 @@ def watch(debounce: float, all_vaults: bool):
             else:
                 empty_cycles += 1
                 if empty_cycles == UNLOAD_IDLE_CYCLES and not unloaded_after_idle:
-                    try:
-                        from rag.llm_backend import get_backend  # noqa: PLC0415
-                        if get_backend().unload():
-                            print(
-                                f"[watch] mlx unloaded after "
-                                f"{empty_cycles * debounce:.0f}s idle",
-                                flush=True,
-                            )
-                    except ImportError as exc:
-                        _silent_log("watch_idle_unload_failed", exc)
+                    if _watch_unload_idle_models():
+                        print(
+                            f"[watch] mlx unloaded after "
+                            f"{empty_cycles * debounce:.0f}s idle",
+                            flush=True,
+                        )
                     unloaded_after_idle = True
             now_t = time.time()
             if now_t - last_heartbeat >= HEARTBEAT_S:

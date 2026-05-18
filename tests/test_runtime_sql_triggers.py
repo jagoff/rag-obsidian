@@ -10,6 +10,7 @@ Verifica:
 from __future__ import annotations
 
 import sys
+import threading
 
 import pytest
 
@@ -112,6 +113,37 @@ def test_wa_handler_skips_below_threshold(monkeypatch):
     mod._on_wa_message_inbound({"new_rows": 1})
     assert n_calls["i"] == 0
     mod._on_wa_message_inbound({"new_rows": 5})
+    assert n_calls["i"] == 1
+
+
+def test_wa_handler_is_single_flight(monkeypatch):
+    import rag.runtime.jobs._sql_triggers as mod
+    started = threading.Event()
+    release = threading.Event()
+    n_calls = {"i": 0}
+
+    def slow_wa():
+        n_calls["i"] += 1
+        started.set()
+        assert release.wait(timeout=2)
+        return {"exit_code": 0}
+
+    monkeypatch.setattr(
+        "rag.runtime.jobs.frequent.wa_tasks_job",
+        slow_wa,
+    )
+
+    first = threading.Thread(
+        target=mod._on_wa_message_inbound,
+        args=({"new_rows": 5},),
+    )
+    first.start()
+    assert started.wait(timeout=2)
+
+    mod._on_wa_message_inbound({"new_rows": 5})
+    release.set()
+    first.join(timeout=2)
+
     assert n_calls["i"] == 1
 
 

@@ -260,6 +260,7 @@ def _anticipate_log_candidate(c: "AnticipatoryCandidate", *,
         "sent": int(bool(sent)),
         "reason": c.reason,
         "message_preview": (c.message or "")[:120],
+        "message_full": c.message or "",
     }
 
     def _do() -> None:

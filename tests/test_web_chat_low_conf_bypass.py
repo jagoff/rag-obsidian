@@ -170,6 +170,19 @@ def chat_env(monkeypatch):
     monkeypatch.setattr(server_mod, "_chat_cache_get", lambda key: None)
     monkeypatch.setattr(server_mod, "_chat_cache_put", lambda key, val: None)
     monkeypatch.setattr(server_mod, "_is_tasks_query", lambda q: False)
+    monkeypatch.setattr(
+        server_mod,
+        "_duckduckgo_search_for_chat",
+        lambda q: {
+            "docs": [],
+            "metas": [],
+            "scores": [],
+            "sources": [],
+            "status": "empty",
+            "reason": "test_default",
+            "ms": 0,
+        },
+    )
     # Expose the events collector on the monkeypatch for test access.
     monkeypatch.log_events = _events  # type: ignore[attr-defined]
     return monkeypatch
@@ -253,6 +266,111 @@ def test_bypass_done_event_payload(chat_env):
     assert isinstance(done.get("retrieve_ms"), int) and done["retrieve_ms"] >= 0
     assert isinstance(done.get("total_ms"), int) and done["total_ms"] >= 0
     assert "turn_id" in done and done["turn_id"]
+
+
+def test_low_conf_uses_duckduckgo_when_available(chat_env):
+    """Conf baja + DuckDuckGo con resultados → no usar el bypass canned.
+
+    El backend emite una segunda lista de sources con `source_kind=internet`
+    y deja que el LLM sintetice la respuesta con ese contexto.
+    """
+    chat_env.setattr(
+        server_mod,
+        "_duckduckgo_search_for_chat",
+        lambda q: {
+            "docs": ["TITULO: Resultado\nURL: https://example.com/a\n\ntexto web"],
+            "metas": [{
+                "file": "https://example.com/a",
+                "note": "Resultado",
+                "folder": "DuckDuckGo · example.com",
+                "source": "duckduckgo",
+                "source_kind": "internet",
+                "url": "https://example.com/a",
+                "domain": "example.com",
+                "snippet": "texto web",
+            }],
+            "scores": [1.0],
+            "sources": [],
+            "status": "ok",
+            "reason": "",
+            "ms": 12,
+        },
+    )
+    mock = _OllamaMock([
+        _mk_stream(["respuesta ", "desde duckduckgo"]),
+    ])
+    chat_env.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
+    chat_env.setattr(_rag_mod, "_mlx_chat", mock)
+    chat_env.setattr(_rag_mod, "_chat_stream_dispatch", mock)
+
+    events, _ = _post_chat("query sin match local")
+
+    assert len(mock.calls) >= 1, mock.calls
+    done = next(data for ev, data in events if ev == "done")
+    assert done.get("low_conf_bypass") is not True, done
+    assert done.get("web_search_used") is True, done
+
+    sources_events = [data for ev, data in events if ev == "sources"]
+    assert sources_events, events
+    internet_items = [
+        item
+        for payload in sources_events
+        for item in payload.get("items", [])
+        if item.get("source_kind") == "internet"
+    ]
+    assert internet_items, sources_events
+    assert internet_items[0]["file"] == "https://example.com/a"
+
+
+def test_empty_local_uses_duckduckgo_when_available(chat_env):
+    """Retrieve vacío + DuckDuckGo con resultados → continuar por síntesis LLM."""
+    chat_env.setattr(
+        server_mod,
+        "multi_retrieve",
+        lambda *a, **kw: _canned_retrieve_result(
+            a[1] if len(a) >= 2 else "x",
+            confidence=0.0,
+            n_docs=0,
+        ),
+    )
+    chat_env.setattr(
+        server_mod,
+        "_duckduckgo_search_for_chat",
+        lambda q: {
+            "docs": ["TITULO: Web\nURL: https://example.com/b\n\ntexto externo"],
+            "metas": [{
+                "file": "https://example.com/b",
+                "note": "Web",
+                "folder": "DuckDuckGo · example.com",
+                "source": "duckduckgo",
+                "source_kind": "internet",
+                "url": "https://example.com/b",
+                "domain": "example.com",
+                "snippet": "texto externo",
+            }],
+            "scores": [1.0],
+            "sources": [],
+            "status": "ok",
+            "reason": "",
+            "ms": 7,
+        },
+    )
+    mock = _OllamaMock([
+        _mk_stream(["respuesta ", "web"]),
+    ])
+    chat_env.setattr(_rag_mod, "_mlx_chat_via_backend", mock)
+    chat_env.setattr(_rag_mod, "_mlx_chat", mock)
+    chat_env.setattr(_rag_mod, "_chat_stream_dispatch", mock)
+
+    events, _ = _post_chat("query sin resultados locales")
+
+    assert "empty" not in [ev for ev, _ in events]
+    assert len(mock.calls) >= 1, mock.calls
+    done = next(data for ev, data in events if ev == "done")
+    assert done.get("web_search_used") is True, done
+    sources = next(data for ev, data in events if ev == "sources")
+    assert sources["items"][0]["source_kind"] == "internet"
+    assert sources["items"][0]["file"] == "https://example.com/b"
 
 
 # ── 2. Mention hits override the bypass ────────────────────────────────────

@@ -82,6 +82,18 @@ def _bypass_admin_token():
     ("warnings.warn(", "warn"),
     ("UserWarning: resource_tracker: leaked semaphore", "warn"),
     ("DeprecationWarning: foo is deprecated", "warn"),
+    # ggml/whisper.cpp native-backtrace advice is not actionable by itself;
+    # the preceding GGML_ASSERT/fatal line remains the real queued error.
+    ("WARNING: Using native backtrace. Set GGML_BACKTRACE_LLDB for more info.", "info"),
+    ("WARNING: GGML_BACKTRACE_LLDB may cause native MacOS Terminal.app to crash.", "info"),
+    (
+        '12:31:44.768\x1b[33m [Client WARN] Unavailable message A5A63 from 289@lid (type: "")\x1b[0m',
+        "info",
+    ),
+    (
+        '14:33:58.224\x1b[33m [Client WARN] Unavailable message 3A9A87532DF57D45BAF5 from 242253922623556@lid (type: "view_once")\x1b[0m',
+        "info",
+    ),
     # OK heartbeat / status normales.
     ("[heartbeat] 2026-04-26T19:07:34 alive=true vaults=2", "ok"),
     ("  ✓ [5] 01-Projects: Punto clave", "ok"),

@@ -210,7 +210,7 @@ body {
 }
 
 /* Chat mode toggle (sidebar) ---------------------------------------
-   Segmented 3-state radio group. Replaces the old #model_picker select.
+   Segmented 4-state radio group. Replaces the old #model_picker select.
    Active state uses the same accent treatment as other "active" chips
    in the UI. Keep ARIA radiogroup contract intact (keyboard nav lives
    in app.js).                                                       */
@@ -218,7 +218,8 @@ body {
   color: var(--text-faint);
 }
 .chat-mode-toggle {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   border: 1px solid var(--border);
   border-radius: 6px;
   overflow: hidden;
@@ -233,10 +234,15 @@ body {
   font: inherit;
   font-size: 0.8rem;
   cursor: pointer;
+  min-width: 0;
+  white-space: nowrap;
   transition: background 120ms ease, color 120ms ease;
 }
-.chat-mode-btn:not(:last-child) {
+.chat-mode-btn:nth-child(odd) {
   border-right: 1px solid var(--border);
+}
+.chat-mode-btn:nth-child(n + 3) {
+  border-top: 1px solid var(--border);
 }
 .chat-mode-btn:hover {
   background: var(--bg-elev);

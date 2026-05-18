@@ -59,21 +59,22 @@ body.chat-empty #quick-chips {
   opacity: 1;
 }
 
-/* Mobile: chips scrollean horizontal (row) en vez de wrap para caber
-   en pantallas angostas sin parecer una lista vertical apretada. */
+/* Mobile: mantener chips visibles sin scroll horizontal accidental. */
 @media (max-width: 767px) {
   #quick-chips {
-    flex-wrap: nowrap;
-    overflow-x: auto;
-    justify-content: flex-start;
-    padding: 0 16px 12px;
+    flex-wrap: wrap;
+    overflow-x: visible;
+    justify-content: center;
+    padding: 0 16px;
     margin-top: 12px;
-    -webkit-overflow-scrolling: touch;
-    /* Scrollbar super sutil — apenas visible. */
+    max-width: 100%;
     scrollbar-width: none;
   }
   #quick-chips::-webkit-scrollbar { display: none; }
-  .quick-chip { flex-shrink: 0; }
+  .quick-chip {
+    flex: 0 1 auto;
+    max-width: calc(100vw - 32px);
+  }
 }
 
 /* ═══════════════════════════════════════════════════════════════════

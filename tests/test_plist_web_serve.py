@@ -141,12 +141,27 @@ def test_web_plist_has_rag_local_embed():
     assert d["EnvironmentVariables"].get("RAG_LOCAL_EMBED") == "1"
 
 
-def test_web_plist_lazy_loads_local_embedder():
-    """Web should not pin the query embedder before the first search."""
+def test_web_plist_defaults_to_safe_chat_model(monkeypatch):
+    """Web hot path should default to the 7B chat tier, not the 30B HQ tier."""
+    monkeypatch.delenv("OBSIDIAN_RAG_WEB_CHAT_MODEL", raising=False)
     d = _parse(rag_module._web_plist(RAG_BIN))
     env = d["EnvironmentVariables"]
-    assert env.get("RAG_WEB_LOCAL_EMBED_PREWARM") == "0"
-    assert env.get("RAG_WEB_BLOCK_ON_EMBED_WARMUP") == "0"
+    assert env.get("OBSIDIAN_RAG_WEB_CHAT_MODEL") == "qwen2.5:7b"
+
+
+def test_web_plist_honors_explicit_chat_model_override(monkeypatch):
+    monkeypatch.setenv("OBSIDIAN_RAG_WEB_CHAT_MODEL", "qwen3:30b-a3b")
+    d = _parse(rag_module._web_plist(RAG_BIN))
+    env = d["EnvironmentVariables"]
+    assert env.get("OBSIDIAN_RAG_WEB_CHAT_MODEL") == "qwen3:30b-a3b"
+
+
+def test_web_plist_prewarms_local_embedder():
+    """Web should finish embedder warmup before accepting first chat traffic."""
+    d = _parse(rag_module._web_plist(RAG_BIN))
+    env = d["EnvironmentVariables"]
+    assert env.get("RAG_WEB_LOCAL_EMBED_PREWARM") == "1"
+    assert env.get("RAG_WEB_BLOCK_ON_EMBED_WARMUP") == "1"
     assert env.get("RAG_LOCAL_EMBED_WAIT_MS") == "0"
     assert env.get("RAG_LOCAL_EMBED_IDLE_TTL") == "300"
 
@@ -219,6 +234,16 @@ def test_indexers_have_local_embed_and_no_ollama_keepalive():
             f"{name}: falta RAG_INDEX_LOCAL_EMBED=1 (Ola 6 cero-Ollama)"
         assert "LLM_KEEP_ALIVE" not in env, \
             f"{name}: LLM_KEEP_ALIVE no debe estar (Ola 6 cero-Ollama)"
+
+
+def test_watch_plist_memory_guardrails_are_conservative():
+    d = _parse(rag_module._watch_plist(RAG_BIN))
+    env = d["EnvironmentVariables"]
+    assert env["RAG_INDEX_LOCAL_EMBED_BATCH"] == "16"
+    assert env["RAG_MEMORY_PRESSURE_SWAP_GB"] == "1.5"
+    assert env["RAG_MEMORY_PRESSURE_INTERVAL"] == "15"
+    assert env["RAG_EXTRACT_ENTITIES"] == "0"
+    assert env["OBSIDIAN_RAG_WATCH_EXCLUDE_FOLDERS"] == "99-obsidian/99-AI/external-ingest"
 
 
 def test_web_plist_keepalive_runatload():

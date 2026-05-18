@@ -72,6 +72,7 @@ def _supervisor_plist(rag_bin: str) -> str:
         "RAG_ANTICIPATE_MAX_MEMORY_PCT": "70",
         "RAG_ANTICIPATE_MAX_SWAP_GB": "4.0",
         "RAG_ANTICIPATE_MAX_RSS_GB": "10",
+        "RAG_ANTICIPATE_ABORT_SWAP_GB": "4.0",
         "RAG_ANTICIPATE_TIMEOUT_S": "180",
         "RAG_STATE_SQL": "1",
         "HF_HUB_OFFLINE": "1",
@@ -132,11 +133,18 @@ def _watch_plist(rag_bin: str) -> str:
         "program_arguments": [rag_bin, "watch", "--all-vaults"],
         "env": {
             "RAG_INDEX_LOCAL_EMBED": "1",
+            "RAG_INDEX_LOCAL_EMBED_BATCH": "16",
             "RAG_MLX_IDLE_TTL": "600",
             "RAG_MEMORY_PRESSURE_DISABLE": "0",
             "RAG_MEMORY_PRESSURE_THRESHOLD": "75",
-            "RAG_MEMORY_PRESSURE_SWAP_GB": "4.0",
-            "RAG_MEMORY_PRESSURE_INTERVAL": "30",
+            "RAG_MEMORY_PRESSURE_SWAP_GB": "1.5",
+            "RAG_MEMORY_PRESSURE_INTERVAL": "15",
+            "RAG_MEMORY_PRESSURE_COOLDOWN_S": "45",
+            "RAG_EXTRACT_ENTITIES": "0",
+            "OBSIDIAN_RAG_SKIP_CONTEXT_SUMMARY": "1",
+            "OBSIDIAN_RAG_SKIP_SYNTHETIC_Q": "1",
+            "RAG_CONTEXTUAL_RETRIEVAL": "0",
+            "OBSIDIAN_RAG_WATCH_EXCLUDE_FOLDERS": "99-obsidian/99-AI/external-ingest",
             # Defer contradiction check (2026-05-10): cada nota indexada
             # disparaba el helper LLM (qwen2.5:3b, ~1.5 GB VRAM) en un
             # daemon thread del MISMO proceso watch — peak observado
@@ -200,7 +208,7 @@ def _web_plist(rag_bin: str) -> str:
         f"    <key>YOUTUBE_API_KEY</key><string>{youtube_key}</string>\n"
         if youtube_key else ""
     )
-    chat_model = os.environ.get("OBSIDIAN_RAG_WEB_CHAT_MODEL", "qwen3:30b-a3b")
+    chat_model = os.environ.get("OBSIDIAN_RAG_WEB_CHAT_MODEL", "qwen2.5:7b")
     # 2026-04-28 (eval Playwright MEDIUM #12 — server crashes mid-conversation):
     # `launchctl print` mostraba `runs = 46` en 2h con un mix de SIGKILL by
     # launchd[1] + SIGTERM-then-SIGKILL escalado. Diagnóstico:
@@ -228,13 +236,14 @@ def _web_plist(rag_bin: str) -> str:
             "PYTHONUNBUFFERED": "1",
             "OBSIDIAN_RAG_WEB_CHAT_MODEL": chat_model,
             "RAG_LOCAL_EMBED": "1",
-            "RAG_WEB_LOCAL_EMBED_PREWARM": "0",
-            "RAG_WEB_BLOCK_ON_EMBED_WARMUP": "0",
+            "RAG_WEB_LOCAL_EMBED_PREWARM": "1",
+            "RAG_WEB_BLOCK_ON_EMBED_WARMUP": "1",
             "RAG_LOCAL_EMBED_WAIT_MS": "0",
             "RAG_LOCAL_EMBED_IDLE_TTL": "300",
             # Idle baseline: do not pin the 7B MLX chat model or reranker at
-            # boot. First chat/retrieve can lazy-load; RAG_MLX_IDLE_TTL then
-            # frees MLX Metal buffers after ~3min idle.
+            # boot. The query embedder is prewarmed so first post-restart chat
+            # does not cold-load it inside the SSE stream; RAG_MLX_IDLE_TTL
+            # still frees chat Metal buffers after ~3min idle.
             "RAG_MLX_NO_PREWARM": "1",
             "RAG_MLX_IDLE_TTL": "180",
             "RAG_WEB_RERANKER_PREWARM": "0",

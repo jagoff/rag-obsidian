@@ -31,6 +31,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
+import threading
 from typing import Any
 
 from rag.runtime._sql_watcher import SqlChangeWatcher
@@ -137,6 +138,7 @@ _WA_WATCHER = SqlChangeWatcher(
     event_name="wa.message.inbound",
     poll_interval_s=30,
 )
+_WA_TASKS_TRIGGER_LOCK = threading.Lock()
 
 
 @bus.subscribe("wa.message.inbound", async_dispatch=True)
@@ -164,12 +166,19 @@ def _on_wa_message_inbound(payload: dict[str, Any]) -> None:
         "f4.3: %d wa messages detected, triggering wa-tasks extractor",
         new_rows,
     )
+    if not _WA_TASKS_TRIGGER_LOCK.acquire(blocking=False):
+        logger.info(
+            "f4.3: skipping wa-tasks trigger — previous extractor still running"
+        )
+        return
     try:
         result = wa_tasks_job()
         logger.info("f4.3: wa-tasks done — exit_code=%s",
                     result.get("exit_code"))
     except Exception:
         logger.exception("f4.3: wa-tasks handler crashed")
+    finally:
+        _WA_TASKS_TRIGGER_LOCK.release()
 
 
 # ── Lifecycle ───────────────────────────────────────────────────────────────

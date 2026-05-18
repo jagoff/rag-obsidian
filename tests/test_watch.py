@@ -135,6 +135,51 @@ def test_drain_empty_pending_returns_empty_list(vstate):
     assert out == []
 
 
+def test_watch_safe_defaults_keep_realtime_index_light(monkeypatch):
+    """The watcher should not load optional enrichment models by default."""
+    for key in rag._watch_safe_defaults():
+        monkeypatch.delenv(key, raising=False)
+
+    applied = rag._apply_env_defaults(rag._watch_safe_defaults())
+
+    assert applied["RAG_EXTRACT_ENTITIES"] == "0"
+    assert applied["RAG_INDEX_DEFER_CONTRADICTIONS"] == "1"
+    assert applied["RAG_INDEX_LOCAL_EMBED_BATCH"] == "16"
+    assert rag.os.environ["RAG_MEMORY_PRESSURE_SWAP_GB"] == "1.5"
+
+
+def test_watch_safe_defaults_respect_operator_override(monkeypatch):
+    """Explicit env values win over watcher defaults."""
+    monkeypatch.setenv("RAG_INDEX_LOCAL_EMBED_BATCH", "4")
+
+    applied = rag._apply_env_defaults(rag._watch_safe_defaults())
+
+    assert "RAG_INDEX_LOCAL_EMBED_BATCH" not in applied
+    assert rag.os.environ["RAG_INDEX_LOCAL_EMBED_BATCH"] == "4"
+
+
+def test_watch_idle_unload_includes_local_embedder(monkeypatch):
+    """Regression: backend unload did not evict the standalone MLX embedder."""
+    calls: list[str] = []
+
+    class _FakeBackend:
+        def unload(self):
+            calls.append("backend")
+            return False
+
+    import rag.llm_backend as lb
+
+    monkeypatch.setattr(lb, "get_backend", lambda: _FakeBackend())
+    monkeypatch.setattr(
+        rag,
+        "maybe_unload_local_embedder",
+        lambda force=False: calls.append(f"local:{force}") or True,
+    )
+
+    assert rag._watch_unload_idle_models() is True
+    assert calls == ["backend", "local:True"]
+
+
 def test_drain_returns_status_per_file(vstate, tmp_path, monkeypatch):
     """Each queued file produces one tuple. `status` is propagated verbatim
     from `_index_single_file` so the caller can colourise output."""

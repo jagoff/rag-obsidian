@@ -199,6 +199,66 @@ def test_chats_pagination_accepts_iso_before_ts(tmp_path, monkeypatch):
     assert [c["label"] for c in page2] == ["Grecia"]
 
 
+def test_chats_includes_ragnet_bot_chat_for_wzp_ui(tmp_path, monkeypatch):
+    """La UI `/wzp` debe mostrar el grupo Ra/RagNet aunque las ingestas
+    lo filtren para evitar loops de contexto.
+    """
+    import rag as _rag
+
+    bridge = tmp_path / "bridge" / "messages.db"
+    jid = "120363426178035051@g.us"
+    con = _seed_bridge_db(bridge)
+    con.execute("INSERT INTO chats (jid, name) VALUES (?, ?)", (jid, "Ra"))
+    con.execute(
+        "INSERT INTO messages "
+        "(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, "
+        "quoted_message_id, quoted_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "ra1", jid, "5491111111111@s.whatsapp.net", "hola desde Ra",
+            "2026-05-18 12:00:00-03:00", 0, "", "", "", "",
+        ),
+    )
+    con.commit()
+    con.close()
+    monkeypatch.setattr(_rag, "WHATSAPP_DB_PATH", bridge)
+    monkeypatch.setattr(_rag, "WHATSAPP_BOT_JID", jid)
+
+    from rag.integrations.whatsapp import fetch as _wa_fetch
+
+    chats = _wa_fetch.list_chats_for_ui(limit=10, q="Ra")
+    assert [c["jid"] for c in chats] == [jid]
+    assert chats[0]["label"] == "Ra"
+
+
+def test_thread_includes_ragnet_bot_chat_messages_for_wzp_ui(tmp_path, monkeypatch):
+    """Abrir el canal Ra en `/wzp` debe devolver su historial real."""
+    import rag as _rag
+
+    bridge = tmp_path / "bridge" / "messages.db"
+    jid = "120363426178035051@g.us"
+    con = _seed_bridge_db(bridge)
+    con.execute("INSERT INTO chats (jid, name) VALUES (?, ?)", (jid, "Ra"))
+    con.execute(
+        "INSERT INTO messages "
+        "(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, "
+        "quoted_message_id, quoted_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "ra1", jid, "5491111111111@s.whatsapp.net", "draft listo",
+            "2026-05-18 12:00:00-03:00", 1, "", "", "", "",
+        ),
+    )
+    con.commit()
+    con.close()
+    monkeypatch.setattr(_rag, "WHATSAPP_DB_PATH", bridge)
+    monkeypatch.setattr(_rag, "WHATSAPP_BOT_JID", jid)
+
+    from rag.integrations.whatsapp import fetch as _wa_fetch
+
+    thread = _wa_fetch.fetch_thread_for_ui(jid, limit=10)
+    assert thread["label"] == "Ra"
+    assert [m["content"] for m in thread["messages"]] == ["draft listo"]
+
+
 def test_mark_read_same_day_unread_comparison_uses_bridge_format(tmp_path, monkeypatch):
     """Unread usa comparación string contra bridge timestamps. Guardar `T`
     hacía que mensajes nuevos del mismo día no contaran como unread.

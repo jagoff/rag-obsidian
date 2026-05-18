@@ -25,13 +25,13 @@
  * El orden importa: specificity cascada de base → componentes → overrides.
  */
 
-@import url("./css/_base.css");
+@import url("./css/_base.css?v=2026-05-18-chat-ui-2");
 @import url("./css/_messages.css");
 @import url("./css/_chat.css");
 @import url("./css/_proposals.css");
 @import url("./css/_misc.css");
 @import url("./css/_modals.css");
 @import url("./css/_sidebar.css");
-@import url("./css/_mobile.css");
-@import url("./css/_quick_chips.css");
+@import url("./css/_mobile.css?v=2026-05-18-chat-ui-2");
+@import url("./css/_quick_chips.css?v=2026-05-18-chat-ui-2");
 @import url("./css/_whatsapp.css");

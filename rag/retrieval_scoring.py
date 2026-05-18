@@ -856,13 +856,12 @@ def _filter_excluded_chunks(scored_pairs: list[tuple]) -> list[tuple]:
     """Aplica los filtros cross-source de privacidad. Returns una lista
     sin los chunks que matchean alguna regla de exclusión.
 
-    Logguea cuántos chunks se filtraron en silent_errors para
-    observabilidad — si el user reporta "no encuentro mi mail bancario",
-    el log dice "filtered N gmail chunks por exclude_labels".
+    Las exclusiones son el comportamiento esperado de la política de
+    privacidad. No se registran en ``silent_errors.jsonl``: ese sink alimenta
+    alertas operativas y un filtro activo puede excluir chunks en cada query.
     """
     filters = _load_cross_source_filters()
     out: list[tuple] = []
-    excluded_count = 0
     for pair in scored_pairs:
         cand = pair[0]
         meta = (
@@ -879,17 +878,8 @@ def _filter_excluded_chunks(scored_pairs: list[tuple]) -> list[tuple]:
                 break
         text = " ".join(bit for bit in text_bits if bit)
         if _should_exclude_chunk(meta, filters, text=text):
-            excluded_count += 1
             continue
         out.append(pair)
-    if excluded_count > 0:
-        try:
-            _deps().silent_log(
-                "cross_source_filter_applied",
-                Exception(f"excluded {excluded_count} chunks by privacy filters"),
-            )
-        except Exception:
-            pass
     return out
 
 

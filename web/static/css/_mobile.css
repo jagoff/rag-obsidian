@@ -72,7 +72,11 @@
     display: block;
     width: 100%;
   }
-  #sidebar #chat-mode-toggle { display: flex; width: 100%; }
+  #sidebar #chat-mode-toggle {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
+  }
 
   /* Collapse button → hide in mobile (no makes sense when drawer).
      Close button (X) takes over. Specificity con #sidebar prefix para
@@ -122,14 +126,14 @@
   font-size: clamp(22px, 3.4vw, 30px);
   font-weight: 600;
   color: var(--text);
-  letter-spacing: -0.01em;
+  letter-spacing: 0;
   line-height: 1.2;
 }
 .empty-hero-sub {
   margin: 0;
   color: var(--text-dim);
   font-size: 13px;
-  letter-spacing: 0.01em;
+  letter-spacing: 0;
   line-height: 1.5;
 }
 .empty-hero-sub kbd {
@@ -197,6 +201,10 @@ body.chat-empty #input-wrap {
   }
   body.chat-empty #empty-hero {
     padding: 24px 16px 24px;
+  }
+  body.chat-empty #composer {
+    width: calc(100% - 32px);
+    margin-top: 0;
   }
   body.chat-empty #input {
     min-height: 72px;

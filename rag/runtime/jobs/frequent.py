@@ -34,6 +34,7 @@ from pathlib import Path
 import signal
 import shlex
 import subprocess
+import threading
 import time
 from typing import Any
 
@@ -47,6 +48,8 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 _VENV_PY = _REPO_ROOT / ".venv" / "bin" / "python"
 _UV_TOOL_PY = Path.home() / ".local/share/uv/tools/obsidian-rag/bin/python3"
 _ANTICIPATE_PROCESS_NEEDLE = "rag anticipate run"
+_INDEX_LOCK_BUSY_MARKER = "Otro `rag index` ya está activo"
+_WA_TASKS_JOB_LOCK = threading.Lock()
 _TRUTHY = {"1", "true", "yes", "on"}
 
 
@@ -326,6 +329,7 @@ def _run_guarded_subprocess(
         start_new_session=True,
     )
     abort_reason: str | None = None
+    abort_kind: str | None = None
     exit_code: int | None = None
     stdout = ""
     stderr = ""
@@ -346,9 +350,11 @@ def _run_guarded_subprocess(
             abort_swap_gb = _env_float("RAG_ANTICIPATE_ABORT_SWAP_GB", 2.0)
             if elapsed >= timeout:
                 abort_reason = f"timeout after {timeout}s"
+                abort_kind = "timeout"
                 exit_code = -1
             elif rss_gb is not None and rss_gb >= max_rss_gb:
                 abort_reason = f"rss {rss_gb:.2f}GB >= {max_rss_gb:.2f}GB"
+                abort_kind = "rss_pressure"
                 exit_code = -9
             elif _swap_pressure_active(
                 memory_pct,
@@ -358,17 +364,23 @@ def _run_guarded_subprocess(
                 floor_default=70.0,
             ):
                 abort_reason = f"swap {swap_gb:.2f}GB >= {abort_swap_gb:.2f}GB"
+                abort_kind = "swap_pressure"
                 exit_code = -9
             elif memory_pct is not None and memory_pct >= abort_memory_pct:
                 abort_reason = (
                     f"memory {memory_pct:.1f}% >= {abort_memory_pct:.1f}%"
                 )
+                abort_kind = "memory_pressure"
                 exit_code = -9
 
             if abort_reason is None:
                 continue
 
-            logger.warning("abort guarded job %s: %s", " ".join(args), abort_reason)
+            pressure_skip = abort_kind in {"memory_pressure", "swap_pressure"}
+            if pressure_skip:
+                logger.info("skip guarded job %s: %s", " ".join(args), abort_reason)
+            else:
+                logger.warning("abort guarded job %s: %s", " ".join(args), abort_reason)
             _terminate_process_group(proc)
             try:
                 stdout, stderr = proc.communicate(timeout=5)
@@ -382,24 +394,34 @@ def _run_guarded_subprocess(
 
     stdout_lines = stdout.count("\n") if stdout else 0
     stderr_lines = stderr.count("\n") if stderr else 0
-    last_err = (stderr or "")[-200:] if exit_code != 0 else None
-    if abort_reason:
+    pressure_skip = abort_kind in {"memory_pressure", "swap_pressure"}
+    reported_exit_code = 0 if pressure_skip else int(exit_code or 0)
+    last_err = (stderr or "")[-200:] if reported_exit_code != 0 else None
+    if abort_reason and not pressure_skip:
         last_err = f"{abort_reason}; stderr={last_err or ''}"[:200]
-    if exit_code != 0:
+    if reported_exit_code != 0:
         logger.warning(
             "guarded job exit=%d: %s — stderr tail: %s",
-            exit_code,
+            reported_exit_code,
             " ".join(args),
             last_err,
         )
-    return {
-        "exit_code": int(exit_code or 0),
+    payload = {
+        "exit_code": reported_exit_code,
         "stdout_lines": stdout_lines,
         "stderr_lines": stderr_lines,
         "last_stderr": last_err,
         "guarded": True,
         "killed_reason": abort_reason,
     }
+    if pressure_skip:
+        payload.update({
+            "skipped": True,
+            "skip_reason": abort_kind,
+            "raw_exit_code": int(exit_code or 0),
+            "pressure_reason": abort_reason,
+        })
+    return payload
 
 
 # ── VLM image captioner (Game-Changer G5, 2026-05-11) ──────────────────────
@@ -553,9 +575,12 @@ def ingest_whatsapp_job() -> dict[str, Any]:
             "NO_COLOR": "1",
             "TERM": "dumb",
             "RAG_INDEX_LOCAL_EMBED": "1",
+            "RAG_INDEX_LOCK_WAIT_SECONDS": "0",
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
         },
+        benign_failure_markers=(_INDEX_LOCK_BUSY_MARKER,),
+        benign_skip_reason="index_lock_busy",
         timeout=900,  # 15min — primer run full scan tarda ~1min, margen
     )
 
@@ -578,6 +603,9 @@ def ingest_cross_source_job() -> dict[str, Any]:
             "NO_COLOR": "1",
             "TERM": "dumb",
             "RAG_INDEX_LOCAL_EMBED": "1",
+            "RAG_INDEX_LOCK_WAIT_SECONDS": "0",
+            "RAG_SAFARI_BOOKMARK_LOCK_BUDGET_S": "60",
+            "RAG_SAFARI_BOOKMARK_MAX_WRITE": "250",
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
         },
@@ -655,17 +683,23 @@ def wa_tasks_job() -> dict[str, Any]:
     """Equivalente a ``rag wa-tasks`` del plist viejo. LLM-heavy:
     1 qwen2.5:3b call per chat con mensajes nuevos (cap 12 chats).
     F4.3 puede reemplazarlo con sqlite trigger del bridge SQLite."""
-    return _run_subprocess(
-        [_RAG_BIN, "wa-tasks"],
-        extra_env={
-            "NO_COLOR": "1",
-            "TERM": "dumb",
-            "RAG_LLM_BACKEND": "mlx",
-            "HF_HUB_OFFLINE": "1",
-            "TRANSFORMERS_OFFLINE": "1",
-        },
-        timeout=900,  # 15min — 12 chats × ~30s LLM call worst case
-    )
+    if not _WA_TASKS_JOB_LOCK.acquire(blocking=False):
+        logger.info("skip wa-tasks: previous extractor still running")
+        return _skip_result("already_running")
+    try:
+        return _run_subprocess(
+            [_RAG_BIN, "wa-tasks"],
+            extra_env={
+                "NO_COLOR": "1",
+                "TERM": "dumb",
+                "RAG_LLM_BACKEND": "mlx",
+                "HF_HUB_OFFLINE": "1",
+                "TRANSFORMERS_OFFLINE": "1",
+            },
+            timeout=900,  # 15min — 12 chats × ~30s LLM call worst case
+        )
+    finally:
+        _WA_TASKS_JOB_LOCK.release()
 
 
 # ── Peekaboo screen observer (Fase 2c, 2026-05-13) ─────────────────────────

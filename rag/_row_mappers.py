@@ -335,7 +335,7 @@ def _map_anticipate_row(ev: dict) -> dict:
     """Mapper para rag_anticipate_candidates. Los flags 0/1 se normalizan
     desde bool si vienen así."""
     out: dict = {}
-    for k in ("ts", "kind", "score", "dedup_key", "reason", "message_preview"):
+    for k in ("ts", "kind", "score", "dedup_key", "reason", "message_preview", "message_full"):
         if k in ev and ev[k] is not None:
             out[k] = ev[k]
     if "ts" not in out:

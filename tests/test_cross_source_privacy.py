@@ -168,6 +168,26 @@ gmail:
     assert ["work"] in [out[0][0][1].get("labels"), out[1][0][1].get("labels")]
 
 
+def test_filter_excluded_chunks_does_not_log_expected_exclusions(tmp_path, monkeypatch):
+    """Privacy policy hits are normal filtering, not silent errors."""
+    _write_filters(tmp_path, """
+gmail:
+  exclude_labels: [banking]
+""")
+    calls = []
+    monkeypatch.setattr(rag, "_silent_log", lambda where, exc: calls.append((where, exc)))
+
+    pairs = [
+        _mk_pair({"source": "gmail", "labels": ["banking"]}, 0.95),
+        _mk_pair({"source": "gmail", "labels": ["work"]}, 0.85),
+    ]
+
+    out = rag._filter_excluded_chunks(pairs)
+
+    assert len(out) == 1
+    assert calls == []
+
+
 def test_filter_passthrough_when_no_yaml(tmp_path):
     """Sin yaml → todos los pairs pasan sin tocarse."""
     pairs = [

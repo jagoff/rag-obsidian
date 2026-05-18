@@ -442,6 +442,19 @@ def test_run_skip_bookmarks_flag(tmp_vault_col):
     assert summary["history_indexed"] == 1
 
 
+def test_run_caps_bookmark_writes_from_env(tmp_vault_col, monkeypatch):
+    monkeypatch.setenv("RAG_SAFARI_BOOKMARK_MAX_WRITE", "2")
+
+    summary = s.run(
+        dry_run=True,
+        history_fetch_fn=lambda: [],
+        bookmarks_fetch_fn=lambda: [_mk_bm("u1"), _mk_bm("u2"), _mk_bm("u3")],
+    )
+
+    assert summary["bookmarks_indexed"] == 2
+    assert summary["bookmarks_deferred"] == 1
+
+
 def test_run_second_pass_unchanged_is_noop(tmp_vault_col):
     h = _mk_hist(1)
     s.run(history_fetch_fn=lambda: [h], bookmarks_fetch_fn=lambda: [])
@@ -590,7 +603,7 @@ def test_run_bookmarks_locked_does_not_raise(tmp_vault_col, monkeypatch):
     _real_add_batched = s._add_batched
     call_count = [0]
 
-    def _locked_add_batched(col, ids, embeddings, bodies, metas, source):
+    def _locked_add_batched(col, ids, embeddings, bodies, metas, source, **kwargs):
         call_count[0] += 1
         # First call (history) succeeds; second call (bookmarks) raises locked.
         if call_count[0] >= 2:
@@ -618,6 +631,24 @@ def test_run_bookmarks_locked_does_not_raise(tmp_vault_col, monkeypatch):
     assert any(c["tag"] == "safari_bookmarks_locked" for c in silent_calls)
     locked_call = next(c for c in silent_calls if c["tag"] == "safari_bookmarks_locked")
     assert "locked" in locked_call["exc"]
+
+
+def test_upsert_bookmarks_honors_lock_retry_budget(monkeypatch):
+    class LockedCol:
+        def get(self, **kwargs):
+            return {"ids": []}
+
+        def delete(self, ids):
+            raise AssertionError("delete should not be called")
+
+        def add(self, **kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setenv("RAG_SAFARI_BOOKMARK_LOCK_BUDGET_S", "0")
+    monkeypatch.setattr(rag, "embed", lambda texts: [[0.0] * 8 for _ in texts])
+
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        s.upsert_bookmarks(LockedCol(), [_mk_bm("u1")])
 
 
 # ── Integration ─────────────────────────────────────────────────────────

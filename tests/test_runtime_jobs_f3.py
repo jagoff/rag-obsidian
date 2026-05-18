@@ -13,7 +13,9 @@ NO testeamos invocación real — eso es shadow A/B en producción.
 """
 from __future__ import annotations
 
+import logging
 import sys
+import threading
 
 import pytest
 
@@ -93,6 +95,84 @@ def test_frequent_intervals():
             assert job.trigger_args.get(k) == v, (
                 f"{label}: {k}={job.trigger_args.get(k)} esperado {v}"
             )
+
+
+def test_ingest_whatsapp_treats_index_lock_busy_as_skip(monkeypatch):
+    import rag.runtime.jobs.frequent as frequent
+
+    seen: dict[str, object] = {}
+
+    def fake_run(args, *, timeout, extra_env=None, benign_failure_markers=(),
+                 benign_skip_reason=""):
+        seen["args"] = args
+        seen["timeout"] = timeout
+        seen["extra_env"] = extra_env
+        seen["benign_failure_markers"] = benign_failure_markers
+        seen["benign_skip_reason"] = benign_skip_reason
+        return {"exit_code": 0, "skipped": True, "skip_reason": benign_skip_reason}
+
+    monkeypatch.setattr(frequent, "_run_subprocess", fake_run)
+
+    result = frequent.ingest_whatsapp_job()
+
+    assert result["exit_code"] == 0
+    assert result["skip_reason"] == "index_lock_busy"
+    assert seen["args"][-2:] == ["--source", "whatsapp"]
+    assert seen["extra_env"]["RAG_INDEX_LOCK_WAIT_SECONDS"] == "0"
+    assert frequent._INDEX_LOCK_BUSY_MARKER in seen["benign_failure_markers"]
+    assert seen["benign_skip_reason"] == "index_lock_busy"
+
+
+def test_ingest_cross_source_does_not_wait_on_index_lock(monkeypatch):
+    import rag.runtime.jobs.frequent as frequent
+
+    seen: dict[str, object] = {}
+
+    def fake_run(args, *, timeout, extra_env=None, **kwargs):
+        seen["args"] = args
+        seen["timeout"] = timeout
+        seen["extra_env"] = extra_env
+        return {"exit_code": 0}
+
+    monkeypatch.setattr(frequent, "_run_subprocess", fake_run)
+
+    result = frequent.ingest_cross_source_job()
+
+    assert result["exit_code"] == 0
+    assert seen["args"][-1] == "ingest-cross-source"
+    assert seen["timeout"] == 1800
+    assert seen["extra_env"]["RAG_INDEX_LOCK_WAIT_SECONDS"] == "0"
+    assert seen["extra_env"]["RAG_SAFARI_BOOKMARK_LOCK_BUDGET_S"] == "60"
+    assert seen["extra_env"]["RAG_SAFARI_BOOKMARK_MAX_WRITE"] == "250"
+
+
+def test_wa_tasks_job_is_single_flight(monkeypatch):
+    import rag.runtime.jobs.frequent as frequent
+
+    started = threading.Event()
+    release = threading.Event()
+    n_calls = {"i": 0}
+
+    def slow_run(args, *, timeout, extra_env=None, **kwargs):
+        n_calls["i"] += 1
+        started.set()
+        assert release.wait(timeout=2)
+        return {"exit_code": 0}
+
+    monkeypatch.setattr(frequent, "_run_subprocess", slow_run)
+
+    first = threading.Thread(target=frequent.wa_tasks_job)
+    first.start()
+    assert started.wait(timeout=2)
+
+    second = frequent.wa_tasks_job()
+    release.set()
+    first.join(timeout=2)
+
+    assert not first.is_alive()
+    assert n_calls["i"] == 1
+    assert second["skipped"] is True
+    assert second["skip_reason"] == "already_running"
 
 
 def test_anticipate_skips_when_swap_pressure(monkeypatch):
@@ -209,6 +289,44 @@ def test_anticipate_uses_guarded_runner_when_pressure_clear(monkeypatch):
     assert seen["args"][-2:] == ["anticipate", "run"]
     assert seen["timeout"] == 123
     assert seen["extra_env"]["RAG_ANTICIPATE_PRESSURE_GUARD"] == "1"
+
+
+def test_guarded_anticipate_swap_abort_is_reported_as_skip(monkeypatch, caplog):
+    import rag.runtime.jobs.frequent as frequent
+
+    class FakeProc:
+        pid = 12345
+        returncode = None
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def communicate(self, timeout=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise frequent.subprocess.TimeoutExpired(["rag"], timeout)
+            self.returncode = -15
+            return "", ""
+
+    monkeypatch.setenv("RAG_ANTICIPATE_ABORT_SWAP_GB", "1.5")
+    monkeypatch.setattr(frequent.subprocess, "Popen", lambda *a, **kw: FakeProc())
+    monkeypatch.setattr(frequent, "_process_tree_rss_gb", lambda pid: None)
+    monkeypatch.setattr(frequent, "_runtime_pressure_snapshot", lambda: (75.0, 5.1))
+    monkeypatch.setattr(frequent, "_terminate_process_group", lambda proc: None)
+
+    with caplog.at_level(logging.WARNING):
+        result = frequent._run_guarded_subprocess(
+            ["rag", "anticipate", "run"],
+            timeout=30,
+            poll_interval=0.01,
+        )
+
+    assert result["exit_code"] == 0
+    assert result["skipped"] is True
+    assert result["skip_reason"] == "swap_pressure"
+    assert result["raw_exit_code"] == -9
+    assert result["pressure_reason"] == "swap 5.10GB >= 1.50GB"
+    assert "guarded job exit" not in caplog.text
 
 
 def test_proactive_calendar_schedules():

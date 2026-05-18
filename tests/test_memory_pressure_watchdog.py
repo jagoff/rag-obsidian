@@ -139,6 +139,41 @@ def test_memory_pct_zero_total_returns_none(monkeypatch):
     assert rag._system_memory_used_pct() is None
 
 
+# ── swap pressure gate ─────────────────────────────────────────────────────
+
+
+def test_swap_pressure_ignores_stale_swap_when_memory_low(monkeypatch):
+    """macOS keeps swap allocated after pressure clears; don't react forever."""
+    import rag._memory_pressure_watchdog as _mpw
+
+    monkeypatch.delenv("RAG_MEMORY_PRESSURE_SWAP_MEMORY_FLOOR_PCT", raising=False)
+    assert _mpw._swap_pressure_active(29.0, 11.5, 4.0) is False
+
+
+def test_swap_pressure_triggers_when_memory_floor_is_met(monkeypatch):
+    """High swap is still an early-warning signal near real pressure."""
+    import rag._memory_pressure_watchdog as _mpw
+
+    monkeypatch.delenv("RAG_MEMORY_PRESSURE_SWAP_MEMORY_FLOOR_PCT", raising=False)
+    assert _mpw._swap_pressure_active(72.0, 11.5, 4.0) is True
+
+
+def test_swap_pressure_keeps_conservative_behavior_without_memory_sample(monkeypatch):
+    """If pct cannot be sampled, preserve the old swap-only guard."""
+    import rag._memory_pressure_watchdog as _mpw
+
+    monkeypatch.delenv("RAG_MEMORY_PRESSURE_SWAP_MEMORY_FLOOR_PCT", raising=False)
+    assert _mpw._swap_pressure_active(None, 11.5, 4.0) is True
+
+
+def test_swap_pressure_floor_is_configurable(monkeypatch):
+    import rag._memory_pressure_watchdog as _mpw
+
+    monkeypatch.setenv("RAG_MEMORY_PRESSURE_SWAP_MEMORY_FLOOR_PCT", "80")
+    assert _mpw._swap_pressure_active(72.0, 11.5, 4.0) is False
+    assert _mpw._swap_pressure_active(81.0, 11.5, 4.0) is True
+
+
 # ── _handle_memory_pressure ────────────────────────────────────────────────
 
 
@@ -259,6 +294,37 @@ def test_handle_pressure_mlx_exception_logged(monkeypatch):
     # Should NOT raise
     actions = rag._handle_memory_pressure(pct_before=90.0, threshold=85.0)
     assert actions["chat_unloaded"] is False
+
+
+def test_handle_pressure_force_unloads_local_embedder(monkeypatch):
+    """`rag watch` usa un embedder standalone; pressure debe desalojarlo."""
+    monkeypatch.setattr(rag, "resolve_chat_model", lambda: "qwen2.5:7b")
+
+    import rag._memory_pressure_watchdog as _mpw
+
+    monkeypatch.setattr(rag, "_system_memory_used_pct", lambda: 70.0)
+    monkeypatch.setattr(_mpw, "_system_memory_used_pct", lambda: 70.0)
+
+    class _FakeMLXBackend:
+        name = "mlx"
+        def unload(self, model):
+            return False
+
+    from rag import llm_backend as _lb
+    monkeypatch.setattr(_lb, "get_backend", lambda: _FakeMLXBackend())
+
+    calls: list[bool] = []
+
+    def _fake_unload_local(*, force=False):
+        calls.append(force)
+        return True
+
+    monkeypatch.setattr(rag, "maybe_unload_local_embedder", _fake_unload_local)
+
+    actions = rag._handle_memory_pressure(pct_before=90.0, threshold=85.0)
+
+    assert calls == [True]
+    assert actions["local_embedder_unloaded"] is True
 
 
 # ── start_memory_pressure_watchdog ─────────────────────────────────────────

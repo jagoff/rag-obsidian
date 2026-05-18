@@ -133,6 +133,19 @@ def chat_env(monkeypatch, tmp_path):
     monkeypatch.setattr(server_mod, "_chat_cache_get", lambda key: None)
     monkeypatch.setattr(server_mod, "_chat_cache_put", lambda key, val: None)
     monkeypatch.setattr(server_mod, "_is_tasks_query", lambda q: False)
+    monkeypatch.setattr(
+        server_mod,
+        "_duckduckgo_search_for_chat",
+        lambda q: {
+            "docs": [],
+            "metas": [],
+            "scores": [],
+            "sources": [],
+            "status": "empty",
+            "reason": "test_default",
+            "ms": 0,
+        },
+    )
     # Limpiar el bucket del rate limiter — TestClient usa IP fija, y
     # las N tests consecutivos llenan el bucket de 30/60s y a partir
     # del test 31 devuelven 429.

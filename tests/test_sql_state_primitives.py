@@ -133,6 +133,35 @@ def test_schema_version_registered(conn):
         assert registered.get(name) == 1, f"{name} missing or wrong version"
 
 
+def test_anticipate_message_full_migration_adds_legacy_column(tmp_path):
+    db = tmp_path / rag._TELEMETRY_DB_FILENAME
+    conn = sqlite3.connect(str(db), isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(
+        "CREATE TABLE rag_schema_version ("
+        " table_name TEXT PRIMARY KEY, version INTEGER NOT NULL DEFAULT 0)"
+    )
+    conn.execute(
+        "CREATE TABLE rag_anticipate_candidates ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " ts TEXT NOT NULL,"
+        " kind TEXT NOT NULL,"
+        " score REAL NOT NULL,"
+        " dedup_key TEXT NOT NULL,"
+        " selected INTEGER NOT NULL,"
+        " sent INTEGER NOT NULL,"
+        " reason TEXT,"
+        " message_preview TEXT"
+        ")"
+    )
+
+    rag._ensure_telemetry_tables(conn)
+
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(rag_anticipate_candidates)")}
+    assert "message_full" in cols
+    conn.close()
+
+
 def test_schema_version_skipped_when_table_absent(tmp_path):
     """If rag_schema_version doesn't exist, _ensure_telemetry_tables must not
     fail — it just skips the registration branch. This mirrors the scenario

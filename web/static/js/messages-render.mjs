@@ -228,7 +228,10 @@ export function buildMarkdownExport(question, answer, sources) {
       const note = s.note || s.file.replace(/\.md$/, "").split("/").pop();
       const score = Number.isFinite(s.score) ? ` · ${(s.score >= 0 ? "+" : "") + s.score.toFixed(1)}` : "";
       const isExternalSrc = /^https?:\/\//i.test(s.file);
-      if (isExternalSrc) {
+      const isModelSrc = (s.source_kind || s.sourceKind) === "model" || /^model:\/\//i.test(s.file);
+      if (isModelSrc) {
+        lines.push(`- Modelo — ${s.folder || "conocimiento general"}${score}`);
+      } else if (isExternalSrc) {
         const label = note || s.folder || "link";
         lines.push(`- [${label}](${s.file})${score}`);
       } else {
@@ -619,21 +622,24 @@ export function appendSources(parent, items, confidence) {
   const parentTurn = parent.closest ? parent.closest(".turn") : null;
   let rank = 0;
   for (const s of items) {
-    if (seen.has(s.file)) continue;
-    seen.add(s.file);
+    const sourceKind = s.source_kind || s.sourceKind || "";
+    const dedupeKey = s.file || `${sourceKind}:${s.note || rank}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
     rank += 1;
     const row = el("div", "source-row");
-    const filled = (s.bar.match(/■/g) || []).length;
+    const filled = ((s.bar || "").match(/■/g) || []).length;
     const tone = filled >= 3 ? "good" : filled >= 1 ? "mid" : "low";
     const bar = el("span", `bar bar-${tone}`);
-    bar.textContent = s.bar;
+    bar.textContent = s.bar || "■■■■■";
     row.appendChild(bar);
 
     const isExternal = typeof s.file === "string" && /^https?:\/\//i.test(s.file);
+    const isModel = sourceKind === "model" || (typeof s.file === "string" && s.file.indexOf("model://") === 0);
     const isWA = typeof s.file === "string" && s.file.indexOf("whatsapp://") === 0;
     const waUrl = isWA ? waHref(s.file) : "";
     const wantsBlank = isExternal || (isWA && waUrl);
-    const linkable = isExternal || waUrl || !isWA;
+    const linkable = !isModel && (isExternal || waUrl || !isWA);
 
     let noteEl;
     if (linkable) {
@@ -647,7 +653,8 @@ export function appendSources(parent, items, confidence) {
     row.appendChild(noteEl);
 
     let pathLabel;
-    if (isExternal) pathLabel = s.folder || "externo";
+    if (isModel) pathLabel = s.folder || "conocimiento general";
+    else if (isExternal) pathLabel = s.folder || s.domain || "internet";
     else if (isWA) pathLabel = s.folder || "WhatsApp";
     else pathLabel = s.file;
 
@@ -662,14 +669,14 @@ export function appendSources(parent, items, confidence) {
     pathEl.title = s.file;
     row.appendChild(pathEl);
 
-    if (s.file && s.file.indexOf("://") === -1) {
+    if (!isModel && s.file && s.file.indexOf("://") === -1) {
       row.dataset.path = s.file;
       row.dataset.rank = String(rank);
       if (parentTurn && parentTurn.dataset.q) row.dataset.q = parentTurn.dataset.q;
       if (parentTurn && parentTurn.dataset.session) row.dataset.session = parentTurn.dataset.session;
     }
 
-    if (s.file && s.file.indexOf("://") === -1 && parentTurn?.dataset?.turnId) {
+    if (!isModel && s.file && s.file.indexOf("://") === -1 && parentTurn?.dataset?.turnId) {
       const thumb = document.createElement("button");
       thumb.type = "button";
       thumb.className = "source-thumb";
@@ -812,7 +819,7 @@ export async function appendRelated(parent, query) {
 }
 
 /**
- * Link inline "↗ buscar en internet" (Google).
+ * Link inline "↗ buscar en internet" (DuckDuckGo).
  * @param {HTMLElement} parent
  * @param {string} query
  * @param {boolean} inline
@@ -820,11 +827,11 @@ export async function appendRelated(parent, query) {
 export function appendWebSearch(parent, query, inline = false) {
   const link = document.createElement("a");
   link.className = "web-search-link" + (inline ? " inline" : "");
-  link.href = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
+  link.href = `https://duckduckgo.com/?q=${encodeURIComponent(query)}`;
   link.target = "_blank";
   link.rel = "noopener noreferrer";
   link.textContent = "↗ buscar en internet";
-  link.title = `Google: ${query}`;
+  link.title = `DuckDuckGo: ${query}`;
   if (inline) {
     parent.appendChild(document.createTextNode(" "));
     parent.appendChild(link);
@@ -836,7 +843,7 @@ export function appendWebSearch(parent, query, inline = false) {
 }
 
 /**
- * Cluster prominente de fallback (Google/YouTube/Wikipedia).
+ * Cluster prominente de fallback (DuckDuckGo/YouTube/Wikipedia).
  * @param {HTMLElement} parent
  * @param {string} query
  */
@@ -847,7 +854,7 @@ export function appendFallbackCluster(parent, query) {
   const buttons = el("div", "fallback-buttons");
   const q = encodeURIComponent(query);
   const specs = [
-    { cls: "fallback-google",  label: "🔍 Google",    url: `https://www.google.com/search?q=${q}` },
+    { cls: "fallback-duckduckgo", label: "🔍 DuckDuckGo", url: `https://duckduckgo.com/?q=${q}` },
     { cls: "fallback-youtube", label: "▶ YouTube",    url: `https://www.youtube.com/results?search_query=${q}` },
     { cls: "fallback-wiki",    label: "📖 Wikipedia", url: `https://es.wikipedia.org/wiki/Special:Search?search=${q}` },
   ];

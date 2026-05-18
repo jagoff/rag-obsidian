@@ -597,10 +597,27 @@ from web.blacklist_routes import register_blacklist_routes  # noqa: E402
 
 globals().update(register_blacklist_routes(app, STATIC_DIR, _require_admin_token))
 
+# Prompt catalog/editor admin UI.
+from web.prompt_routes import register_prompt_routes  # noqa: E402
+
+globals().update(register_prompt_routes(app, STATIC_DIR, _require_admin_token))
+
 # Browser layout persistence (home window setup, sizes, collapsed state).
 from web.ui_layout_routes import register_ui_layout_routes  # noqa: E402
 
 globals().update(register_ui_layout_routes(app))
+
+# Proactive/operations route modules. Keep these slices outside this file so
+# the product surfaces can evolve without growing the FastAPI monolith.
+from web.anticipate_routes import register_anticipate_routes  # noqa: E402
+from web.memory_routes import register_memory_routes  # noqa: E402
+from web.mission_control import register_mission_control_routes  # noqa: E402
+from web.negotiation_routes import register_negotiation_routes  # noqa: E402
+
+globals().update(register_anticipate_routes(app, _require_admin_token))
+globals().update(register_mission_control_routes(app, _require_admin_token))
+globals().update(register_memory_routes(app, _require_admin_token))
+globals().update(register_negotiation_routes(app, _require_admin_token))
 
 # CORS: same-origin only. The server is bound to 127.0.0.1 by the
 # launchd plist, so cross-origin requests would come from a browser
@@ -719,6 +736,55 @@ from web import chat_config as _chat_config  # noqa: E402
 # live endpoints after the extraction to `web.chat_config`.
 WEB_CHAT_MODEL = _chat_config.WEB_CHAT_MODEL
 _CHAT_MODEL_OVERRIDE_PATH = _chat_config._CHAT_MODEL_OVERRIDE_PATH
+_WEB_SAFE_CHAT_MODEL = os.environ.get("RAG_WEB_SAFE_CHAT_MODEL", "qwen2.5:7b").strip() or "qwen2.5:7b"
+_WEB_HEAVY_CHAT_MODELS = {
+    "qwen3:30b",
+    "qwen3:30b-a3b",
+}
+_WEB_HEAVY_MODEL_WARNED: set[tuple[str, str]] = set()
+# DuckDuckGo internet fallback. Default OFF: the DDG path makes synchronous
+# blocking HTTP calls (instant API + HTML scraping + page fetches) that can
+# total 10-20s per chat turn and cause the system to freeze under memory
+# pressure. Enable only when you want internet-augmented answers and the
+# machine is not under load: RAG_WEB_SEARCH_ENABLED=1.
+_WEB_SEARCH_ENABLED: bool = (
+    os.environ.get("RAG_WEB_SEARCH_ENABLED", "0").strip().lower() in ("1", "true", "yes")
+)
+
+
+def _web_env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def _web_mlx_model_available(alias: str) -> bool:
+    try:
+        from rag.llm_backend import MLX_MODEL_ALIAS, list_cached_mlx_models
+        hf_id = MLX_MODEL_ALIAS.get(alias, alias)
+        return hf_id in set(list_cached_mlx_models())
+    except Exception:
+        return False
+
+
+def _guard_web_chat_model(model: str) -> str:
+    model = (model or "").strip()
+    if (
+        model in _WEB_HEAVY_CHAT_MODELS
+        and not _web_env_truthy("RAG_WEB_ALLOW_HEAVY_CHAT_MODEL")
+        and _WEB_SAFE_CHAT_MODEL
+        and _WEB_SAFE_CHAT_MODEL != model
+        and _web_mlx_model_available(_WEB_SAFE_CHAT_MODEL)
+    ):
+        warn_key = (model, _WEB_SAFE_CHAT_MODEL)
+        if warn_key not in _WEB_HEAVY_MODEL_WARNED:
+            _WEB_HEAVY_MODEL_WARNED.add(warn_key)
+            print(
+                f"[chat-model-safety] {model} guarded for web; using "
+                f"{_WEB_SAFE_CHAT_MODEL}. Set RAG_WEB_ALLOW_HEAVY_CHAT_MODEL=1 "
+                f"to opt in.",
+                flush=True,
+            )
+        return _WEB_SAFE_CHAT_MODEL
+    return model
 
 
 def _read_chat_model_override() -> str | None:
@@ -750,8 +816,12 @@ def _write_chat_model_override(model: str | None) -> None:
 def _resolve_web_chat_model() -> str:
     override = _read_chat_model_override()
     if override:
-        return override
-    return WEB_CHAT_MODEL or resolve_chat_model()
+        return _guard_web_chat_model(override)
+    if WEB_CHAT_MODEL:
+        return _guard_web_chat_model(WEB_CHAT_MODEL)
+    if _web_mlx_model_available(_WEB_SAFE_CHAT_MODEL):
+        return _WEB_SAFE_CHAT_MODEL
+    return _guard_web_chat_model(resolve_chat_model())
 
 # ── Lifecycle: idle sweeper + warmup ─────────────────────────────────────────
 # La lógica vive ahora en `web/_lifecycle.py` (refactor W3c 2026-05-09).
@@ -5654,7 +5724,10 @@ def query_history(limit: int = 200) -> dict:
 
 def _resolve_scope(scope: str | None) -> list[tuple[str, "Path"]]:
     if scope is None or scope == "":
-        return resolve_vault_paths(None)
+        # Web chat default: search the full configured local read scope.
+        # This covers both Obsidian vaults plus every indexed local source
+        # (WhatsApp, bookmarks, Gmail/Drive snapshots, reminders, etc.).
+        return resolve_vault_paths(["all"])
     if scope == "all":
         return resolve_vault_paths(["all"])
     return resolve_vault_paths([scope])
@@ -6321,11 +6394,321 @@ def _maybe_emit_proposal(name: str, out: str) -> str | None:
 
 
 def _source_payload(meta: dict, score: float) -> dict:
+    source_kind = meta.get("source_kind")
+    if not source_kind:
+        file_value = str(meta.get("file", ""))
+        source_kind = (
+            "internet"
+            if file_value.startswith(("http://", "https://"))
+            else "local"
+        )
     return {
         "file": meta.get("file", ""),
         "note": meta.get("note", ""),
         "folder": meta.get("folder", ""),
         "score": round(float(score), 3),
+        "source": meta.get("source", ""),
+        "source_kind": source_kind,
+        "vault": meta.get("_vault", ""),
+        "url": meta.get("url", meta.get("file", "")),
+        "domain": meta.get("domain", ""),
+        "snippet": meta.get("snippet", ""),
+    }
+
+
+def _model_source_payload() -> dict:
+    return {
+        "file": "model://llm",
+        "note": "Modelo",
+        "folder": "conocimiento general",
+        "score": 1.0,
+        "bar": "■■■■■",
+        "source": "model",
+        "source_kind": "model",
+    }
+
+
+def _duckduckgo_int_env(name: str, default: int, lo: int, hi: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(lo, min(value, hi))
+
+
+def _duckduckgo_float_env(name: str, default: float, lo: float, hi: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return max(lo, min(value, hi))
+
+
+def _duckduckgo_clean_text(value: str, cap: int = 600) -> str:
+    if not value:
+        return ""
+    import html as _html
+    text = _html.unescape(str(value))
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:cap].rstrip()
+
+
+def _duckduckgo_domain(url: str) -> str:
+    try:
+        from urllib.parse import urlparse
+        return (urlparse(url).netloc or "").removeprefix("www.")
+    except Exception:
+        return ""
+
+
+def _duckduckgo_unwrap_url(url: str) -> str:
+    import html as _html
+    from urllib.parse import parse_qs, unquote, urlparse
+
+    value = _html.unescape(str(url or "")).strip()
+    if value.startswith("//"):
+        value = "https:" + value
+    parsed = urlparse(value)
+    if parsed.netloc.endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
+        target = (parse_qs(parsed.query).get("uddg") or [""])[0]
+        if target:
+            return unquote(target)
+    return value
+
+
+def _duckduckgo_fetch_page_text(url: str, timeout: float) -> tuple[str, str]:
+    try:
+        import rag as _rag_mod  # noqa: PLC0415
+        html, _headers = _rag_mod._read_fetch_url(url, timeout=int(max(1, timeout)))
+        title, text = _rag_mod._read_extract(html)
+    except Exception:
+        return "", ""
+    text = re.sub(r"\s+", " ", (text or "")).strip()
+    return (title or "").strip(), text[:4000].rstrip()
+
+
+def _duckduckgo_instant_candidates(query: str, limit: int, timeout: float) -> list[dict]:
+    import urllib.parse
+    import urllib.request
+
+    params = urllib.parse.urlencode({
+        "q": query,
+        "format": "json",
+        "no_redirect": "1",
+        "no_html": "1",
+        "skip_disambig": "1",
+    })
+    req = urllib.request.Request(
+        f"https://api.duckduckgo.com/?{params}",
+        headers={"Accept": "application/json", "User-Agent": "obsidian-rag/1.0"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8", errors="replace").strip()
+    if not raw:
+        return []
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        return []
+
+    candidates: list[dict] = []
+
+    def _add(title: str, url: str, snippet: str) -> None:
+        url = _duckduckgo_unwrap_url(url)
+        snippet = _duckduckgo_clean_text(snippet, cap=900)
+        if not snippet or not url.startswith(("http://", "https://")):
+            return
+        candidates.append({
+            "title": _duckduckgo_clean_text(title or url, cap=220),
+            "url": url,
+            "snippet": snippet,
+            "domain": _duckduckgo_domain(url),
+        })
+
+    _add(
+        str(data.get("Heading") or data.get("AbstractSource") or ""),
+        str(data.get("AbstractURL") or ""),
+        str(data.get("AbstractText") or ""),
+    )
+    _add(
+        str(data.get("DefinitionSource") or data.get("Heading") or ""),
+        str(data.get("DefinitionURL") or ""),
+        str(data.get("Definition") or ""),
+    )
+    if data.get("Answer"):
+        search_url = "https://duckduckgo.com/?" + urllib.parse.urlencode({"q": query})
+        _add(str(data.get("AnswerType") or "DuckDuckGo"), search_url, str(data.get("Answer") or ""))
+
+    def _walk_related(items: list) -> None:
+        for item in items:
+            if len(candidates) >= limit:
+                return
+            if not isinstance(item, dict):
+                continue
+            nested = item.get("Topics")
+            if isinstance(nested, list):
+                _walk_related(nested)
+                continue
+            _add(str(item.get("Text") or ""), str(item.get("FirstURL") or ""), str(item.get("Text") or ""))
+
+    related = data.get("RelatedTopics")
+    if isinstance(related, list):
+        _walk_related(related)
+    return candidates[:limit]
+
+
+def _duckduckgo_html_candidates(query: str, limit: int, timeout: float) -> list[dict]:
+    import urllib.parse
+    import urllib.request
+
+    params = {"q": query}
+    region = os.environ.get("RAG_DDG_REGION", "").strip()
+    if region:
+        params["kl"] = region
+    req = urllib.request.Request(
+        "https://html.duckduckgo.com/html/?" + urllib.parse.urlencode(params),
+        headers={"Accept": "text/html", "User-Agent": "Mozilla/5.0 obsidian-rag/1.0"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        page = resp.read().decode("utf-8", errors="replace")
+
+    anchors = list(re.finditer(
+        r'<a[^>]+class=["\'][^"\']*\bresult__a\b[^"\']*["\'][^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+        page,
+        re.IGNORECASE | re.DOTALL,
+    ))
+    candidates: list[dict] = []
+    for idx, match in enumerate(anchors):
+        if len(candidates) >= limit:
+            break
+        url = _duckduckgo_unwrap_url(match.group(1))
+        if not url.startswith(("http://", "https://")):
+            continue
+        title = _duckduckgo_clean_text(match.group(2), cap=220)
+        next_start = anchors[idx + 1].start() if idx + 1 < len(anchors) else len(page)
+        block = page[match.end():next_start]
+        snippet_match = re.search(
+            r'class=["\'][^"\']*\bresult__snippet\b[^"\']*["\'][^>]*>(.*?)</a>',
+            block,
+            re.IGNORECASE | re.DOTALL,
+        )
+        snippet = _duckduckgo_clean_text(snippet_match.group(1) if snippet_match else "", cap=900)
+        domain = _duckduckgo_domain(url)
+        candidates.append({
+            "title": title or domain or url,
+            "url": url,
+            "snippet": snippet,
+            "domain": domain,
+        })
+    return candidates
+
+
+def _duckduckgo_search_for_chat(query: str, limit: int | None = None) -> dict:
+    """DuckDuckGo fallback for `/api/chat`.
+
+    Returns a shape intentionally close to RetrieveResult so the normal chat
+    synthesis path can reuse it: {docs, metas, scores, sources, status, ms}.
+    Uses Instant Answer first, then DuckDuckGo's lightweight HTML endpoint for
+    organic links. No credentials are required.
+    """
+    q = (query or "").strip()
+    if len(q) < 3:
+        return {
+            "docs": [],
+            "metas": [],
+            "scores": [],
+            "sources": [],
+            "status": "skipped",
+            "reason": "short_query",
+            "ms": 0,
+        }
+
+    import urllib.error
+
+    max_results = limit or _duckduckgo_int_env("RAG_DDG_SEARCH_MAX_RESULTS", 4, 1, 10)
+    timeout = _duckduckgo_float_env("RAG_DDG_SEARCH_TIMEOUT", 6.0, 1.0, 20.0)
+    fetch_pages = (
+        os.environ.get("RAG_DDG_FETCH_PAGES", "1").strip().lower()
+        not in ("0", "false", "no")
+    )
+    fetch_max = _duckduckgo_int_env("RAG_DDG_FETCH_MAX_PAGES", 2, 0, max_results)
+    fetch_timeout = _duckduckgo_float_env("RAG_DDG_FETCH_TIMEOUT", 4.0, 1.0, 15.0)
+    t0 = time.perf_counter()
+
+    candidates: list[dict] = []
+    errors: list[str] = []
+    try:
+        candidates.extend(_duckduckgo_instant_candidates(q, max_results, timeout))
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+        errors.append(type(exc).__name__)
+    if len(candidates) < max_results:
+        try:
+            candidates.extend(_duckduckgo_html_candidates(q, max_results, timeout))
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            errors.append(type(exc).__name__)
+
+    docs: list[str] = []
+    metas: list[dict] = []
+    scores: list[float] = []
+    seen_urls: set[str] = set()
+    for item in candidates:
+        url = str(item.get("url") or "").strip()
+        if not url.startswith(("http://", "https://")) or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        idx = len(docs)
+        title = _duckduckgo_clean_text(str(item.get("title") or url), cap=220)
+        snippet = _duckduckgo_clean_text(str(item.get("snippet") or ""), cap=900)
+        domain = str(item.get("domain") or _duckduckgo_domain(url))
+        fetched_title = ""
+        fetched_text = ""
+        if fetch_pages and idx < fetch_max:
+            fetched_title, fetched_text = _duckduckgo_fetch_page_text(url, fetch_timeout)
+        if fetched_title and (not title or title == url):
+            title = _duckduckgo_clean_text(fetched_title, cap=220)
+        evidence = fetched_text or snippet
+        if not evidence:
+            evidence = url
+        doc = (
+            f"TITULO: {title or domain or url}\n"
+            f"URL: {url}\n"
+            f"DOMINIO: {domain or '(desconocido)'}\n"
+            f"SNIPPET DUCKDUCKGO: {snippet or '(sin snippet)'}\n\n"
+            f"{evidence}"
+        )
+        meta = {
+            "file": url,
+            "note": title or domain or url,
+            "folder": f"DuckDuckGo · {domain}" if domain else "DuckDuckGo",
+            "source": "duckduckgo",
+            "source_kind": "internet",
+            "url": url,
+            "domain": domain,
+            "snippet": snippet,
+        }
+        docs.append(doc)
+        metas.append(meta)
+        scores.append(round(1.0 - (idx * 0.05), 3))
+        if len(docs) >= max_results:
+            break
+
+    return {
+        "docs": docs,
+        "metas": metas,
+        "scores": scores,
+        "sources": [
+            {**_source_payload(m, s), "bar": _score_bar(float(s))}
+            for m, s in zip(metas, scores)
+        ],
+        "status": "ok" if docs else "empty",
+        "reason": "" if docs else (errors[0] if errors else "no_results"),
+        "ms": int((time.perf_counter() - t0) * 1000),
     }
 
 
@@ -11409,6 +11792,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
     sid = req.session_id or f"web:{uuid.uuid4().hex[:12]}"
     sess = ensure_session(sid, mode="chat")
     vaults = _resolve_scope(req.vault_scope)
+    _effective_vault_scope = req.vault_scope or "all"
     if not vaults:
         raise HTTPException(status_code=400, detail=f"vault '{req.vault_scope}' no encontrado")
 
@@ -11764,7 +12148,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 # confidence ALTA explícita evita que el frontend marque
                 # `weakAnswer=true` y dispare el link "↗ buscar en internet"
                 # — la respuesta es exacta, viene del banco, NO necesita
-                # fallback a Google. Bug observado 2026-04-26.
+                # fallback a internet. Bug observado 2026-04-26.
                 "confidence": 1.0,
                 "intent": "finance",
             })
@@ -11783,7 +12167,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 "elapsed_ms": total_ms,
                 "mode": "finance",
                 # `source_specific: true` = bypass del fallback de
-                # "buscar en internet" / cluster Google/YouTube/Wiki.
+                # "buscar en internet" / cluster DuckDuckGo/YouTube/Wiki.
                 # Mismo flag que usan los tools gmail_recent /
                 # calendar_ahead / reminders_due — la data es local,
                 # autoritativa, no necesita escape a la web.
@@ -11948,7 +12332,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             except ImportError:
                 _vault_chunks = 0
             _cache_key = _chat_cache_key(
-                question, req.vault_scope or "", _resolve_web_chat_model(), _vault_chunks
+                question, _effective_vault_scope, _resolve_web_chat_model(), _vault_chunks
             )
             _cached = _chat_cache_get(_cache_key)
             if _cached:
@@ -12736,7 +13120,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             )
             yield _sse("error", {"message": _sanitized_msg})
             # BUG #31 wave-2 (2026-04-28): top_score=0.0 dispara fallback
-            # cluster en frontend (Google/YouTube/Wikipedia) — sin esto el
+            # cluster en frontend (DuckDuckGo/YouTube/Wikipedia) — sin esto el
             # user ve solo el banner de error rojo sin escape hatch.
             yield _sse("done", {"error": True, "top_score": 0.0})  # BUG #31 — emitir done
             return
@@ -12776,7 +13160,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 "elapsed_ms": total_ms,
                 "top_score": 0.0,
                 # `source_specific: true` apaga los CTAs de fallback al
-                # web (Google/YouTube/Wiki). El user pidió scope explícito
+                # web (DuckDuckGo/YouTube/Wiki). El user pidió scope explícito
                 # — no querés un escape a internet.
                 "source_specific": True,
                 "scope_no_match": True,
@@ -12887,6 +13271,10 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     flush=True,
                 )
         _has_forced_tools = bool(_forced_tool_pairs)
+        _web_search_used = False
+        _web_search_ms = 0
+        _web_search_status = ""
+        _web_search_reason = ""
         # Capturamos location de weather si el pre-router la trajo —
         # para persistir en el next turn.
         for _n, _a in _forced_tool_pairs:
@@ -12909,7 +13297,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             # finance_summary, gmail_recent, weather). El retrieve puede
             # venir vacío por razones transitorias (cold-start, corpus
             # sin notas lexicalmente cercanas al query social) y bailar
-            # con "Sin resultados relevantes." + link a Google cuando
+            # con "Sin resultados relevantes." + link a internet cuando
             # los tools hubieran listado los pendientes/eventos reales
             # es user-hostile. El tool loop abajo reemplaza CONTEXTO
             # entero con la salida de los tools, así que el LLM responde
@@ -12920,8 +13308,34 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 and not _force_answer
                 and not _has_chat_attachments
             ):
-                yield _sse("empty", {"message": "Sin resultados relevantes."})
-                return
+                if _WEB_SEARCH_ENABLED:
+                    yield _sse("status", {"stage": "retrieving", "hint": "Buscando en DuckDuckGo…"})
+                    _web_rr = _duckduckgo_search_for_chat(question)
+                    _web_search_ms = int(_web_rr.get("ms") or 0)
+                    _web_search_status = str(_web_rr.get("status") or "")
+                    _web_search_reason = str(_web_rr.get("reason") or "")
+                    if _web_rr.get("docs"):
+                        result["docs"] = list(_web_rr.get("docs") or [])
+                        result["metas"] = list(_web_rr.get("metas") or [])
+                        result["scores"] = list(_web_rr.get("scores") or [])
+                        result["confidence"] = 1.0
+                        result["query_variants"] = [question]
+                        result["filters_applied"] = {
+                            **(result.get("filters_applied") or {}),
+                            "internet": "duckduckgo",
+                        }
+                        _web_search_used = True
+                        print(
+                            f"[chat-duckduckgo] reason=empty_local results="
+                            f"{len(result['docs'])} ms={_web_search_ms}",
+                            flush=True,
+                        )
+                    else:
+                        yield _sse("empty", {"message": "Sin resultados relevantes."})
+                        return
+                else:
+                    yield _sse("empty", {"message": "Sin resultados relevantes."})
+                    return
 
         # Retrieval signals — previously surfaced as a UI meta bar
         # ("🟡 media · 0.8 · N variantes · M nota(s)"). Removed from the
@@ -13045,13 +13459,29 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             "items": (
                 []
                 if is_propose_intent
-                else _attachment_sources + _mention_sources + [
-                    {**_source_payload(m, s), "bar": _score_bar(float(s))}
-                    for m, s in zip(result["metas"], result["scores"])
-                ]
+                else (
+                    _attachment_sources
+                    + _mention_sources
+                    + [
+                        {**_source_payload(m, s), "bar": _score_bar(float(s))}
+                        for m, s in zip(result["metas"], result["scores"])
+                    ]
+                    + (
+                        [_model_source_payload()]
+                        if (
+                            not result.get("metas")
+                            and not _attachment_sources
+                            and not _mention_sources
+                            and (_force_answer or mode == "work")
+                        )
+                        else []
+                    )
+                )
             ),
             "confidence": round(_sanitize_confidence(result["confidence"]), 3),
             "propose_intent": is_propose_intent,
+            "web_search_used": _web_search_used,
+            "web_search_status": _web_search_status,
         })
 
         # Low-confidence bypass — cuando el vault no tiene info útil
@@ -13077,7 +13507,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         #     vault.
         # El `low_conf_bypass=True` en el `done` payload le indica al
         # frontend que renderee el cluster de fallback ("¿querés buscar
-        # en Google/YouTube/Wikipedia?") en lugar del inline web-search
+        # en DuckDuckGo/YouTube/Wikipedia?") en lugar del inline web-search
         # link del path weakAnswer.
         # 2026-04-22: gate extra `not _has_forced_tools`. Queries que
         # matchean el pre-router deterministic (e.g. "qué tengo para hacer
@@ -13100,114 +13530,151 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         )
         if _low_conf_bypass:
             _t_retrieve_ms = int((_t_retrieve_end - _t_retrieve_start) * 1000)
-            # Escape mínimo de `"` para no romper el template cuando el
-            # usuario mandó comillas literales. UTF-8 + emojis intactos.
-            _q_safe = question.replace('"', '\\"')
-            _bypass_text = f'No tengo info sobre "{_q_safe}" en tus notas.'
-            print(
-                f"[chat-bypass] conf={float(result['confidence']):.4f} "
-                f"reason=low_conf q_words={len(question.split())} "
-                f"retrieve_ms={_t_retrieve_ms}",
-                flush=True,
-            )
-            yield _sse("status", {"stage": "generating"})
-            # Stream en chunks de 40 chars — mismo shape que el
-            # cache-hit path (~línea 3800). El UI ya dispara el
-            # token-ticker en el primer delta, así que la percepción
-            # es idéntica a una respuesta "en vivo" aunque sea canned.
-            for _i in range(0, len(_bypass_text), 40):
-                yield _sse("token", {"delta": _bypass_text[_i:_i + 40]})
-            _bypass_turn_id = new_turn_id()
-            _bypass_total_ms = int((time.perf_counter() - _t0) * 1000)
-            _bypass_top_score = round(
-                _sanitize_confidence(result["confidence"]), 3,
-            )
-            yield _sse("done", {
-                "turn_id": _bypass_turn_id,
-                "top_score": _bypass_top_score,
-                "total_ms": _bypass_total_ms,
-                "retrieve_ms": _t_retrieve_ms,
-                "ttft_ms": _bypass_total_ms,
-                "llm_ms": 0,
-                "low_conf_bypass": True,
-                "bypassed": True,
-            })
-            # Emitimos un `[chat-timing]` shape-stable para los parsers
-            # downstream (dashboards + grep-tooling asumen una línea por
-            # turn). Mismo approach que el cache-hit path (~3820).
-            # `bypassed=1` como tag terminal distingue del cached=1.
-            print(
-                f"[chat-timing] model={_resolve_web_chat_model()} "
-                f"retrieve={_t_retrieve_ms}ms "
-                f"reform=0ms reform_outcome=skipped "
-                f"q_words={len(question.split())} "
-                f"wa=0ms llm_prefill=0ms llm_decode=0ms "
-                f"ttft={_bypass_total_ms}ms total={_bypass_total_ms}ms "
-                f"ctx_chars=0 tokens≈{len(_bypass_text.split())} "
-                f"confidence={_bypass_top_score:.3f} variants=0 "
-                f"tool_rounds=0 tool_ms=0 tool_names= bypassed=1",
-                flush=True,
-            )
-            # Persistimos la conversación + logueamos igual que el path
-            # normal para que analytics y el episodic writer vean el
-            # turno. Tests garantizan que bypass=True queda en el log.
-            try:
-                append_turn(sess, {
-                    "q": question,
-                    "a": _bypass_text,
-                    "paths": [],
-                    "top_score": _bypass_top_score,
+            if _WEB_SEARCH_ENABLED:
+                yield _sse("status", {"stage": "retrieving", "hint": "Buscando en DuckDuckGo…"})
+                _web_rr = _duckduckgo_search_for_chat(question)
+                _web_search_ms = int(_web_rr.get("ms") or 0)
+                _web_search_status = str(_web_rr.get("status") or "")
+                _web_search_reason = str(_web_rr.get("reason") or "")
+                if _web_rr.get("docs"):
+                    result["docs"] = list(_web_rr.get("docs") or [])
+                    result["metas"] = list(_web_rr.get("metas") or [])
+                    result["scores"] = list(_web_rr.get("scores") or [])
+                    result["confidence"] = 1.0
+                    result["query_variants"] = [question]
+                    result["filters_applied"] = {
+                        **(result.get("filters_applied") or {}),
+                        "internet": "duckduckgo",
+                    }
+                    _web_search_used = True
+                    _low_conf_bypass = False
+                    print(
+                        f"[chat-duckduckgo] reason=low_conf_local results="
+                        f"{len(result['docs'])} ms={_web_search_ms}",
+                        flush=True,
+                    )
+                    yield _sse("sources", {
+                        "items": [
+                            {**_source_payload(m, s), "bar": _score_bar(float(s))}
+                            for m, s in zip(result["metas"], result["scores"])
+                        ],
+                        "confidence": round(_sanitize_confidence(result["confidence"]), 3),
+                        "propose_intent": False,
+                        "web_search_used": True,
+                        "web_search_status": _web_search_status,
+                    })
+
+            if _low_conf_bypass:
+                # Escape mínimo de `"` para no romper el template cuando el
+                # usuario mandó comillas literales. UTF-8 + emojis intactos.
+                _q_safe = question.replace('"', '\\"')
+                _bypass_text = f'No tengo info sobre "{_q_safe}" en tus notas.'
+                print(
+                    f"[chat-bypass] conf={float(result['confidence']):.4f} "
+                    f"reason=low_conf q_words={len(question.split())} "
+                    f"retrieve_ms={_t_retrieve_ms} "
+                    f"web_status={_web_search_status or 'skipped'} "
+                    f"web_reason={_web_search_reason}",
+                    flush=True,
+                )
+                yield _sse("status", {"stage": "generating"})
+                # Stream en chunks de 40 chars — mismo shape que el
+                # cache-hit path (~línea 3800). El UI ya dispara el
+                # token-ticker en el primer delta, así que la percepción
+                # es idéntica a una respuesta "en vivo" aunque sea canned.
+                for _i in range(0, len(_bypass_text), 40):
+                    yield _sse("token", {"delta": _bypass_text[_i:_i + 40]})
+                _bypass_turn_id = new_turn_id()
+                _bypass_total_ms = int((time.perf_counter() - _t0) * 1000)
+                _bypass_top_score = round(
+                    _sanitize_confidence(result["confidence"]), 3,
+                )
+                yield _sse("done", {
                     "turn_id": _bypass_turn_id,
-                    "low_conf_bypass": True,
-                })
-                save_session(sess)
-            except Exception:
-                pass
-            try:
-                log_query_event({
-                    "cmd": "web.chat.low_conf_bypass",
-                    "turn_id": _bypass_turn_id,
-                    "session": sess["id"],
-                    "q": question,
-                    "paths": [],
-                    "scores": [],
                     "top_score": _bypass_top_score,
-                    "t_retrieve": round(_t_retrieve_ms / 1000.0, 3),
-                    "t_gen": 0.0,
+                    "total_ms": _bypass_total_ms,
+                    "retrieve_ms": _t_retrieve_ms,
+                    "ttft_ms": _bypass_total_ms,
+                    "llm_ms": 0,
                     "low_conf_bypass": True,
-                    # Intent echoed from the retrieve result so telemetry
-                    # is symmetric with the `cmd=web` path above.
-                    "intent": result.get("intent") if isinstance(result, dict) else None,
-                    "device": _client_device,
-                    # Stage timing parity with the main web path
-                    # (2026-04-22). In the bypass path there's no LLM
-                    # call — ttft_ms == total_ms and llm_* are zero.
-                    "ttft_ms": int(_bypass_total_ms),
-                    "llm_prefill_ms": 0,
-                    "llm_decode_ms": 0,
-                    "total_ms": int(_bypass_total_ms),
+                    "bypassed": True,
                 })
-            except Exception:
-                pass
-            _spawn_conversation_writer(
-                target_args=(
-                    VAULT_PATH,
-                    sess["id"],
-                    req.question,
-                    _bypass_text,
-                    result["metas"],
-                    result["scores"],
-                    result["confidence"],
-                ),
-                name=f"conv-writer-{_bypass_turn_id[:8]}",
-            )
-            _enrich_evt = _emit_enrich(
-                _bypass_turn_id, question, _bypass_text,
-                float(result["confidence"]),
-            )
-            if _enrich_evt:
-                yield _enrich_evt
-            return
+                # Emitimos un `[chat-timing]` shape-stable para los parsers
+                # downstream (dashboards + grep-tooling asumen una línea por
+                # turn). Mismo approach que el cache-hit path (~3820).
+                # `bypassed=1` como tag terminal distingue del cached=1.
+                print(
+                    f"[chat-timing] model={_resolve_web_chat_model()} "
+                    f"retrieve={_t_retrieve_ms}ms "
+                    f"reform=0ms reform_outcome=skipped "
+                    f"q_words={len(question.split())} "
+                    f"wa=0ms llm_prefill=0ms llm_decode=0ms "
+                    f"ttft={_bypass_total_ms}ms total={_bypass_total_ms}ms "
+                    f"ctx_chars=0 tokens≈{len(_bypass_text.split())} "
+                    f"confidence={_bypass_top_score:.3f} variants=0 "
+                    f"tool_rounds=0 tool_ms=0 tool_names= bypassed=1",
+                    flush=True,
+                )
+                # Persistimos la conversación + logueamos igual que el path
+                # normal para que analytics y el episodic writer vean el
+                # turno. Tests garantizan que bypass=True queda en el log.
+                try:
+                    append_turn(sess, {
+                        "q": question,
+                        "a": _bypass_text,
+                        "paths": [],
+                        "top_score": _bypass_top_score,
+                        "turn_id": _bypass_turn_id,
+                        "low_conf_bypass": True,
+                    })
+                    save_session(sess)
+                except Exception:
+                    pass
+                try:
+                    log_query_event({
+                        "cmd": "web.chat.low_conf_bypass",
+                        "turn_id": _bypass_turn_id,
+                        "session": sess["id"],
+                        "q": question,
+                        "paths": [],
+                        "scores": [],
+                        "top_score": _bypass_top_score,
+                        "t_retrieve": round(_t_retrieve_ms / 1000.0, 3),
+                        "t_gen": 0.0,
+                        "low_conf_bypass": True,
+                        # Intent echoed from the retrieve result so telemetry
+                        # is symmetric with the `cmd=web` path above.
+                        "intent": result.get("intent") if isinstance(result, dict) else None,
+                        "device": _client_device,
+                        # Stage timing parity with the main web path
+                        # (2026-04-22). In the bypass path there's no LLM
+                        # call — ttft_ms == total_ms and llm_* are zero.
+                        "ttft_ms": int(_bypass_total_ms),
+                        "llm_prefill_ms": 0,
+                        "llm_decode_ms": 0,
+                        "total_ms": int(_bypass_total_ms),
+                    })
+                except Exception:
+                    pass
+                _spawn_conversation_writer(
+                    target_args=(
+                        VAULT_PATH,
+                        sess["id"],
+                        req.question,
+                        _bypass_text,
+                        result["metas"],
+                        result["scores"],
+                        result["confidence"],
+                    ),
+                    name=f"conv-writer-{_bypass_turn_id[:8]}",
+                )
+                _enrich_evt = _emit_enrich(
+                    _bypass_turn_id, question, _bypass_text,
+                    float(result["confidence"]),
+                )
+                if _enrich_evt:
+                    yield _enrich_evt
+                return
 
         is_multi = len(vaults) > 1
         # Cap each chunk at 500 chars on the fast path. With 4 chunks that's
@@ -13311,8 +13778,16 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             _docs = _dedup_docs
             _metas = _dedup_metas
         context = "\n\n---\n\n".join(
-            (f"[vault: {m.get('_vault', '?')}]\n" if is_multi else "")
-            + _rag_format_chunk(d[:_WEB_CHUNK_CAP], m, role="nota")
+            (
+                f"[vault: {m.get('_vault', '?')}]\n"
+                if is_multi and m.get("source_kind") != "internet"
+                else ""
+            )
+            + _rag_format_chunk(
+                d[:_WEB_CHUNK_CAP],
+                m,
+                role="fuente web" if m.get("source_kind") == "internet" else "nota",
+            )
             for d, m in zip(_docs, _metas)
         )
 
@@ -13397,6 +13872,13 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # propose_* tool. Skip the CONTEXTO block entirely in that case.
         if is_propose_intent:
             user_content = f"{_person_block}{question}"
+        elif not context.strip():
+            user_content = (
+                f"{_person_block}No encontré contexto local útil para esta pregunta. "
+                "Si podés responder con conocimiento general del modelo, hacelo; "
+                "si no estás seguro, decilo explícitamente.\n\n"
+                f"PREGUNTA: {question}\n\nRESPUESTA:"
+            )
         else:
             user_content = (
                 f"{_person_block}CONTEXTO:\n{context}\n\n"
@@ -14702,6 +15184,11 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             "cache_probe": _semantic_cache_probe,
             "cache_hit": False,
             "cache_layer": None,
+            "web_search_used": bool(_web_search_used),
+            "web_search_provider": "duckduckgo" if _web_search_used else None,
+            "web_search_ms": int(_web_search_ms),
+            "web_search_status": _web_search_status,
+            "web_search_reason": _web_search_reason,
             # Audit 2026-04-25: trackeamos cuántas iteraciones del
             # sufficiency loop corrieron y por qué exit-eamos. `None`
             # cuando `deep_retrieve()` no se invocó (top_score >=
@@ -14755,7 +15242,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             # reminders_due — las que viven en `_SOURCE_INTENT_META`).
             # El frontend lo usa para apagar CTAs de "buscar en internet"
             # y el cluster YouTube, que no tienen sentido cuando la
-            # pregunta es inherentemente sobre data local — Google no
+            # pregunta es inherentemente sobre data local — internet no
             # sabe qué mails pendientes tengo yo, ni qué recordatorios
             # cargué en Apple Reminders. Tools como `weather` /
             # `finance_summary` NO flaguean (no son "fuentes" buscables,
@@ -14768,7 +15255,9 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             # 0/0 cuando RAG_NLI_MODE="off" (default) — zero-cost readthrough.
             "nli_verified_count": _nli_verified_count,
             "nli_unverified_count": _nli_unverified_count,
-        })
+            "web_search_used": bool(_web_search_used),
+            "web_search_provider": "duckduckgo" if _web_search_used else None,
+            })
 
         _spawn_conversation_writer(
             target_args=(
@@ -17812,6 +18301,18 @@ _LOG_RE_ERROR = re.compile(
     re.IGNORECASE,
 )
 _LOG_RE_WARN = re.compile(r"(warning|warn|deprec|retry)\b", re.IGNORECASE)
+# ggml/whisper.cpp prints these advisory lines after a native crash/backtrace.
+# The actionable line is the assert/fatal frame itself; these two warnings only
+# explain how to get a deeper backtrace and otherwise create duplicate auto-fix
+# queue rows for the same incident.
+_LOG_RE_GGML_BACKTRACE_ADVISORY = re.compile(
+    r"WARNING:\s+(Using native backtrace|GGML_BACKTRACE_LLDB\b)",
+    re.IGNORECASE,
+)
+_LOG_RE_WHATSAPP_UNAVAILABLE_PLACEHOLDER = re.compile(
+    r"\[Client WARN\]\s+Unavailable message\b.*\(type:\s*\"(?:|view_once)\"\)",
+    re.IGNORECASE,
+)
 # Heartbeat / status normales — overrideamos cualquier match accidental.
 _LOG_RE_OK = re.compile(r"^\[heartbeat\]|alive=true|✓\s|status=ok\b", re.IGNORECASE)
 # Líneas claramente informacionales (uvicorn / stdlib logging). Si una
@@ -17987,6 +18488,10 @@ def _classify_log_line(line: str) -> str:
     # Loop de auto-feedback. Mantener "tick failed" / "DDL failed" /
     # "finalize failed" como error (esos sí son fallas reales del subsistema).
     if _LOG_RE_ERROR_QUEUE_META.search(line):
+        return "info"
+    if _LOG_RE_GGML_BACKTRACE_ADVISORY.search(line):
+        return "info"
+    if _LOG_RE_WHATSAPP_UNAVAILABLE_PLACEHOLDER.search(line):
         return "info"
     # Cloudflared QUIC / DNS reconnection noise — known transient,
     # self-healing. Per memoria del user. Demoteo a "info" para que
@@ -23981,6 +24486,25 @@ class FineTunningSnoozeRequest(BaseModel):
     hours: int = 24
 
 
+class LearningCorrectivePathRequest(BaseModel):
+    turn_id: str
+    q: str | None = Field(None, max_length=2000)
+    corrective_path: str = Field(..., min_length=1, max_length=512)
+    paths: list[str] | None = Field(None, max_length=50)
+    session_id: str | None = None
+    reason: str | None = Field(None, max_length=500)
+
+    @field_validator("corrective_path")
+    @classmethod
+    def _valid_corrective_path(cls, v: str) -> str:
+        value = (v or "").strip()
+        if not value:
+            raise ValueError("corrective_path required")
+        if "://" in value or value.startswith("/") or ".." in value.split("/"):
+            raise ValueError("corrective_path must be vault-relative")
+        return value
+
+
 @app.get("/api/fine_tunning/queue")
 def fine_tunning_queue(limit: int = 20, days: int = 30) -> dict:
     """Cola unificada de OUTPUTS DEL MODELO en contexto de conversación.
@@ -24801,6 +25325,38 @@ def fine_tunning_snooze(req: FineTunningSnoozeRequest) -> dict:
         raise HTTPException(status_code=500, detail="snooze failed") from exc
 
     return {"ok": True, "snoozed_until": snoozed_until}
+
+
+@app.get("/api/learning/queue")
+def learning_queue_alias(limit: int = 20, days: int = 30) -> dict:
+    """Roadmap-facing alias for the active-learning labeling queue.
+
+    The implementation remains `/api/fine_tunning/queue`; this name makes the
+    public API match the "Active Learning Autopilot" surface without splitting
+    the existing panel logic.
+    """
+    payload = fine_tunning_queue(limit=limit, days=days)
+    return {**payload, "source": "fine_tunning"}
+
+
+@app.post("/api/learning/corrective-path")
+def learning_corrective_path(req: LearningCorrectivePathRequest) -> dict:
+    """Persist a clean corrective_path for reranker LoRA training.
+
+    This is a thin product-facing wrapper over `rag_feedback`: a corrective
+    path is a negative rating on the surfaced answer plus the vault-relative
+    path that should have been retrieved instead.
+    """
+    record_feedback(
+        turn_id=req.turn_id,
+        rating=-1,
+        q=(req.q or "").strip(),
+        paths=req.paths or [],
+        reason=(req.reason or "corrective").strip() or "corrective",
+        corrective_path=req.corrective_path,
+        session_id=req.session_id,
+    )
+    return {"ok": True}
 
 
 # ── Fin Fine-tunning panel ──────────────────────────────────────────────

@@ -116,6 +116,45 @@ def test_run_subprocess_captures_failure(monkeypatch):
     assert "aborted" in out["last_stderr"]
 
 
+def test_run_subprocess_keeps_stdout_tail_on_failure(monkeypatch):
+    mod = _import_nightly()
+    import subprocess as sp
+
+    class _Result:
+        def __init__(self):
+            self.returncode = 1
+            self.stdout = "first line\nOtro `rag index` ya está activo\n"
+            self.stderr = ""
+
+    monkeypatch.setattr(sp, "run", lambda *a, **kw: _Result())
+    out = mod._run_subprocess(["rag", "index"])
+    assert out["exit_code"] == 1
+    assert out["last_stdout"] is not None
+    assert "rag index" in out["last_stdout"]
+
+
+def test_run_subprocess_can_treat_known_failure_as_skip(monkeypatch):
+    mod = _import_nightly()
+    import subprocess as sp
+
+    class _Result:
+        def __init__(self):
+            self.returncode = 1
+            self.stdout = "Otro `rag index` ya está activo\n"
+            self.stderr = ""
+
+    monkeypatch.setattr(sp, "run", lambda *a, **kw: _Result())
+    out = mod._run_subprocess(
+        ["rag", "index"],
+        benign_failure_markers=("Otro `rag index` ya está activo",),
+        benign_skip_reason="index_lock_busy",
+    )
+    assert out["exit_code"] == 0
+    assert out["raw_exit_code"] == 1
+    assert out["skipped"] is True
+    assert out["skip_reason"] == "index_lock_busy"
+
+
 def test_run_subprocess_handles_timeout(monkeypatch):
     mod = _import_nightly()
     import subprocess as sp

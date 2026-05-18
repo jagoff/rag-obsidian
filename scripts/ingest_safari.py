@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import plistlib
 import sqlite3
 import sys
@@ -73,6 +74,8 @@ DEFAULT_MAX_URLS = 5000  # cap per-run to avoid multi-minute indexing
 # the server to slot its own writes in. Rationale mirrors the Chrome
 # sync (rag.py:_index_chrome_bookmarks batch_size=256 default).
 _ADD_BATCH_SIZE = 50
+_BOOKMARK_LOCK_RETRY_BUDGET_S = 90.0
+_BOOKMARK_MAX_WRITE_DEFAULT = 0
 
 COCOA_EPOCH_OFFSET = 978307200.0
 
@@ -393,7 +396,36 @@ def _bookmark_file_key(b: Bookmark) -> str:
 
 # ── Writer ─────────────────────────────────────────────────────────────────
 
-def _add_batched(col, ids, embeddings, bodies, metas, source: str) -> None:
+def _lock_retry_budget_s() -> float:
+    raw = os.environ.get("RAG_SAFARI_BOOKMARK_LOCK_BUDGET_S")
+    if raw is None:
+        return _BOOKMARK_LOCK_RETRY_BUDGET_S
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return _BOOKMARK_LOCK_RETRY_BUDGET_S
+
+
+def _bookmark_max_write() -> int:
+    raw = os.environ.get("RAG_SAFARI_BOOKMARK_MAX_WRITE")
+    if raw is None:
+        return _BOOKMARK_MAX_WRITE_DEFAULT
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return _BOOKMARK_MAX_WRITE_DEFAULT
+
+
+def _add_batched(
+    col,
+    ids,
+    embeddings,
+    bodies,
+    metas,
+    source: str,
+    *,
+    lock_retry_budget_s: float | None = None,
+) -> None:
     """Split a potentially large col.add() into `_ADD_BATCH_SIZE` chunks
     with an exponential-backoff retry loop on `database is locked`.
 
@@ -406,9 +438,12 @@ def _add_batched(col, ids, embeddings, bodies, metas, source: str) -> None:
 
     Retry: up to 12 attempts per batch, sleep = 0.25 × 2^attempt seconds
     (0.25, 0.5, 1, 2, 4, 8, 16, 32, 60, 60, 60, 60s → ~5min cumulative
-    max, capped at 60s per sleep). If the last attempt still fails,
-    re-raise — callers that need silent-fail behaviour (e.g. upsert_bookmarks
-    inside run()) wrap the call in their own try/except OperationalError.
+    max, capped at 60s per sleep). `lock_retry_budget_s` caps total
+    lock-wait wall time across all batches for callers that would otherwise
+    outlive the supervisor timeout. If the last attempt or the budget is
+    exhausted, re-raise — callers that need silent-fail behaviour (e.g.
+    upsert_bookmarks inside run()) wrap the call in their own try/except
+    OperationalError.
 
     Between batches sqlite-vec's writer lock releases briefly, letting
     the concurrent web server slot its own writes in.
@@ -426,6 +461,11 @@ def _add_batched(col, ids, embeddings, bodies, metas, source: str) -> None:
     all_bodies: list = []
     all_ids: list = []
     all_metas: list = []
+    lock_retry_deadline = (
+        _time.monotonic() + lock_retry_budget_s
+        if lock_retry_budget_s is not None
+        else None
+    )
     for i in range(0, len(ids), _ADD_BATCH_SIZE):
         j = i + _ADD_BATCH_SIZE
         last_exc: Exception | None = None
@@ -441,7 +481,13 @@ def _add_batched(col, ids, embeddings, bodies, metas, source: str) -> None:
                 if "locked" not in str(exc).lower():
                     raise
                 last_exc = exc
-                _time.sleep(min(60.0, 0.25 * (2 ** attempt)))
+                delay = min(60.0, 0.25 * (2 ** attempt))
+                if lock_retry_deadline is not None:
+                    remaining = lock_retry_deadline - _time.monotonic()
+                    if remaining <= 0:
+                        raise
+                    delay = min(delay, remaining)
+                _time.sleep(delay)
         if last_exc is not None:
             raise last_exc
         all_bodies.extend(bodies[i:j])
@@ -536,7 +582,15 @@ def upsert_bookmarks(col, marks: list[Bookmark]) -> int:
             "bookmark_uuid": b.uuid,
             "parent": body,
         })
-    _add_batched(col, ids, embeddings, bodies, metas, "safari")
+    _add_batched(
+        col,
+        ids,
+        embeddings,
+        bodies,
+        metas,
+        "safari",
+        lock_retry_budget_s=_lock_retry_budget_s(),
+    )
     return len(marks)
 
 
@@ -687,6 +741,11 @@ def run(
     for u in stale_bm_uuids:
         stale_bm_keys.append(f"{DOC_ID_PREFIX}://bm/{u}")
         stale_bm_keys.append(f"{DOC_ID_PREFIX}://rl/{u}")
+
+    bookmark_max_write = _bookmark_max_write()
+    if bookmark_max_write > 0 and len(bm_to_write) > bookmark_max_write:
+        summary["bookmarks_deferred"] = len(bm_to_write) - bookmark_max_write
+        bm_to_write = bm_to_write[:bookmark_max_write]
 
     now_iso = (now or datetime.now()).isoformat(timespec="seconds")
 

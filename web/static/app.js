@@ -1517,16 +1517,16 @@ async function appendRelated(parent, query) {
 }
 
 // Web-search escape hatch — surfaces when the vault has weak/no answer
-// (sin sources, o confianza baja). One click → Google búsqueda en pestaña
+// (sin sources, o confianza baja). One click → DuckDuckGo en pestaña
 // nueva. El usuario decide si vale la pena salir del vault.
 function appendWebSearch(parent, query, inline = false) {
   const link = document.createElement("a");
   link.className = "web-search-link" + (inline ? " inline" : "");
-  link.href = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
+  link.href = `https://duckduckgo.com/?q=${encodeURIComponent(query)}`;
   link.target = "_blank";
   link.rel = "noopener noreferrer";
   link.textContent = "↗ buscar en internet";
-  link.title = `Google: ${query}`;
+  link.title = `DuckDuckGo: ${query}`;
   if (inline) {
     parent.appendChild(document.createTextNode(" "));
     parent.appendChild(link);
@@ -1541,7 +1541,7 @@ function appendWebSearch(parent, query, inline = false) {
 // `low_conf_bypass=true`, el vault no tenía info útil y el sistema
 // devolvió un template fijo (no LLM call). En vez de ofrecer solo el
 // link sutil "↗ buscar en internet", renderamos un cluster prominente
-// de 3 botones (Google / YouTube / Wikipedia) para dar escape fácil.
+// de 3 botones (DuckDuckGo / YouTube / Wikipedia) para dar escape fácil.
 // Todos los botones son links directos (no API calls, no trackeo).
 // Sigue apareciendo el bloque `📎 contexto relacionado` (YouTube videos
 // de `/api/related`) cuando aplique, DEBAJO del cluster.
@@ -1555,7 +1555,7 @@ function appendFallbackCluster(parent, query) {
   const buttons = el("div", "fallback-buttons");
   const q = encodeURIComponent(query);
   const specs = [
-    { cls: "fallback-google",   label: "🔍 Google",    url: `https://www.google.com/search?q=${q}` },
+    { cls: "fallback-duckduckgo", label: "🔍 DuckDuckGo", url: `https://duckduckgo.com/?q=${q}` },
     { cls: "fallback-youtube",  label: "▶ YouTube",    url: `https://www.youtube.com/results?search_query=${q}` },
     { cls: "fallback-wiki",     label: "📖 Wikipedia", url: `https://es.wikipedia.org/wiki/Special:Search?search=${q}` },
   ];
@@ -3701,8 +3701,10 @@ function appendSources(parent, items, confidence) {
   const parentTurn = parent.closest ? parent.closest(".turn") : null;
   let rank = 0;
   for (const s of items) {
-    if (seen.has(s.file)) continue;
-    seen.add(s.file);
+    const sourceKind = s.source_kind || s.sourceKind || "";
+    const dedupeKey = s.file || `${sourceKind}:${s.note || rank}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
     rank += 1;
     const row = el("div", "source-row");
     // Source-row tone — post-2026-04-21 recalibration del score_bar (mapping
@@ -3710,10 +3712,10 @@ function appendSources(parent, items, confidence) {
     // badge: alta ≥ 0.50 ≈ 3+ cells · media ≥ 0.10 ≈ 1+ cell · baja < 1 cell.
     // Pre-calibración usaba filled >= 4/2/0 bajo un mapping [-5, 10] que
     // concentraba todas las respuestas en el bucket "mid" (2 cells).
-    const filled = (s.bar.match(/■/g) || []).length;
+    const filled = ((s.bar || "").match(/■/g) || []).length;
     const tone = filled >= 3 ? "good" : filled >= 1 ? "mid" : "low";
     const bar = el("span", `bar bar-${tone}`);
-    bar.textContent = s.bar;
+    bar.textContent = s.bar || "■■■■■";
     row.appendChild(bar);
     // Tres tipos de fuente con tratamiento distinto:
     //  - External URL (Drive, web docs, etc.): href directo a `target="_blank"`.
@@ -3722,13 +3724,14 @@ function appendSources(parent, items, confidence) {
     //    (`@g.us`) no tienen deep-link público — se renderean como texto.
     //  - Vault-local (.md path): obsidian:// para que doble-click abra la nota.
     const isExternal = typeof s.file === "string" && /^https?:\/\//i.test(s.file);
+    const isModel = sourceKind === "model" || (typeof s.file === "string" && s.file.indexOf("model://") === 0);
     const isWA = typeof s.file === "string" && s.file.indexOf("whatsapp://") === 0;
     const waUrl = isWA ? waHref(s.file) : "";
     // `wantsBlank` = true para external + WA-with-link → target=_blank.
     const wantsBlank = isExternal || (isWA && waUrl);
     // `linkable` = true cuando podemos generar un href útil. Si es WA
     // group (sin waUrl) renderemos el row sin <a>.
-    const linkable = isExternal || waUrl || !isWA;
+    const linkable = !isModel && (isExternal || waUrl || !isWA);
 
     let noteEl;
     if (linkable) {
@@ -3750,7 +3753,8 @@ function appendSources(parent, items, confidence) {
     // Drive"), en WA mostramos "WhatsApp" en lugar del JID feo, en
     // vault el path .md original.
     let pathLabel;
-    if (isExternal) pathLabel = s.folder || "externo";
+    if (isModel) pathLabel = s.folder || "conocimiento general";
+    else if (isExternal) pathLabel = s.folder || s.domain || "internet";
     else if (isWA) pathLabel = s.folder || "WhatsApp";
     else pathLabel = s.file;
 
@@ -3770,7 +3774,7 @@ function appendSources(parent, items, confidence) {
     // Dwell tracking metadata — vault-relative paths only (the server
     // rejects ones with :// since commit db2a169). Cross-source ids
     // get the attrs dropped so the observer skips them entirely.
-    if (s.file && s.file.indexOf("://") === -1) {
+    if (!isModel && s.file && s.file.indexOf("://") === -1) {
       row.dataset.path = s.file;
       row.dataset.rank = String(rank);
       if (parentTurn && parentTurn.dataset.q) row.dataset.q = parentTurn.dataset.q;
@@ -3785,6 +3789,7 @@ function appendSources(parent, items, confidence) {
     // calendar, gmail) y solo cuando hay turn_id resolveable.
     if (
       s.file
+      && !isModel
       && s.file.indexOf("://") === -1
       && parentTurn
       && parentTurn.dataset
@@ -3865,7 +3870,10 @@ function buildMarkdownExport(question, answer, sources) {
       // Obsidian wikilink — un `[[Wikilink]]` a un URL externo se
       // rompe cuando pasa por Obsidian o por un pipeline markdown.
       const isExternalSrc = /^https?:\/\//i.test(s.file);
-      if (isExternalSrc) {
+      const isModelSrc = (s.source_kind || s.sourceKind) === "model" || /^model:\/\//i.test(s.file);
+      if (isModelSrc) {
+        lines.push(`- Modelo — ${s.folder || "conocimiento general"}${score}`);
+      } else if (isExternalSrc) {
         const label = note || s.folder || "link";
         lines.push(`- [${label}](${s.file})${score}`);
       } else {
@@ -4631,7 +4639,7 @@ async function send(question, opts = {}) {
       // ("Hola", "gracias"), el backend marca `metachat: true` acá. La
       // bandera apaga todos los CTAs de fallback (buscar en internet,
       // YouTube related, fallback cluster) para que el saludo no termine
-      // con un link a Google "Hola" al costado.
+      // con un link a DuckDuckGo "Hola" al costado.
       if (parsed.metachat) isMetachat = true;
     } else if (event === "proposal") {
       // The server emits this when the tool returned `needs_clarification`
@@ -4713,7 +4721,7 @@ async function send(question, opts = {}) {
       const mentionMatched = (sources || []).some((s) => s.score >= 5.0);
       // Low-confidence bypass (backend skipped the LLM call entirely):
       // mostrar el cluster prominente de "¿querés que busque en...?" con
-      // 3 botones (Google/YouTube/Wikipedia) en vez del link sutil
+      // 3 botones (DuckDuckGo/YouTube/Wikipedia) en vez del link sutil
       // inline. Razón: si el sistema directamente saltó al template
       // fijo, el usuario necesita un escape visible, no un hint tímido.
       // Cuando hay weakAnswer pero NO bypass (el LLM intentó y no
@@ -4723,7 +4731,7 @@ async function send(question, opts = {}) {
       // `isSourceSpecific` (2026-04-24, Fer F. user report iter 4): el
       // backend marca `source_specific: true` en el done event cuando
       // el pre-router disparó un tool de fuente concreta del user
-      // (gmail_recent / calendar_ahead / reminders_due). Google no tiene
+      // (gmail_recent / calendar_ahead / reminders_due). Internet no tiene
       // acceso a mis mails pendientes ni a mis recordatorios de Apple —
       // el CTA "↗ buscar en internet" y el cluster YouTube son ruido en
       // esas queries. El gate apaga ambos.
@@ -4731,7 +4739,7 @@ async function send(question, opts = {}) {
       // `isMetachat` bloquea los 3 fallbacks abajo. Un canned reply de
       // metachat ("Hola") viene sin sources y con confidence=null — sin
       // el gate, la lógica de `weakAnswer` dispara `↗ buscar en internet`
-      // (link a Google) + `appendRelated` (YouTube). Absurdo para un
+      // (link a DuckDuckGo) + `appendRelated` (YouTube). Absurdo para un
       // saludo; el backend ya dio una respuesta conversacional canned.
       // BUG #31 wave-2 (2026-04-28): cuando el backend emitió `error`
       // antes del done (timeout LLM, ollama stuck, retrieve falló, etc.),
@@ -4739,7 +4747,7 @@ async function send(question, opts = {}) {
       // un token. Pre-fix: el banner rojo era lo único visible, sin
       // escape hatch. Fix: tratar el caso "error real" igual que el
       // low-conf-bypass — `appendFallbackCluster` muestra los 3
-      // botones (Google/YouTube/Wikipedia) sin necesitar `ragText`.
+      // botones (DuckDuckGo/YouTube/Wikipedia) sin necesitar `ragText`.
       // Hace short-circuit antes de las otras gates para que el cluster
       // sea lo principal que ve el user (no se mezcla con sources/
       // YouTube random aunque vaultReallyFailed=true).
@@ -4780,7 +4788,7 @@ async function send(question, opts = {}) {
       // `isSourceSpecific` también bloquea YouTube — preguntar por
       // mails/calendar/reminders nunca debería terminar en una playlist.
       // `isErrorTerminal` (BUG #31 wave-2): cuando ya mostramos el
-      // cluster fallback (Google/YouTube/Wikipedia 3-botones) arriba,
+      // cluster fallback (DuckDuckGo/YouTube/Wikipedia 3-botones) arriba,
       // appendRelated agregaría una segunda lista de videos genéricos
       // redundante con el botón YouTube del cluster. Skip.
       if (!hadProposal && !isMetachat && !isSourceSpecific && !isErrorTerminal && question && vaultReallyFailed && !mentionMatched) {

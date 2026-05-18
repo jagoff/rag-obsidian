@@ -883,7 +883,6 @@ def list_chats_for_ui(
 
     _db_local.ensure_schema()
     db_path = _rag.WHATSAPP_DB_PATH
-    bot_jid = _rag.WHATSAPP_BOT_JID
     if not db_path.is_file():
         return []
 
@@ -918,10 +917,9 @@ def list_chats_for_ui(
         view_norm = (view or "default").lower()
 
         where_clauses = [
-            "c.jid != ?",
             "c.jid NOT LIKE '%status@broadcast'",
         ]
-        params: list = [bot_jid]
+        params: list = []
         if q:
             where_clauses.append("LOWER(COALESCE(c.name, '')) LIKE ?")
             params.append(f"%{q.lower()}%")
@@ -1138,7 +1136,6 @@ def fetch_thread_for_ui(
         return empty
 
     db_path = _rag.WHATSAPP_DB_PATH
-    bot_jid = _rag.WHATSAPP_BOT_JID
     if not db_path.is_file():
         return empty
 
@@ -1157,8 +1154,8 @@ def fetch_thread_for_ui(
         label = _wa_display_name(jid, chat_name)
         is_group = jid.endswith("@g.us")
 
-        where_clauses = ["m.chat_jid = ?", "m.chat_jid != ?"]
-        params: list = [jid, bot_jid]
+        where_clauses = ["m.chat_jid = ?"]
+        params: list = [jid]
         if before_ts:
             where_clauses.append("m.timestamp < ?")
             params.append(before_ts)
